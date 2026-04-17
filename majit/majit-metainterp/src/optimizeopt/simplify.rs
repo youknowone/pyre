@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_guard_future_condition_removed() {
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::GuardFutureCondition, &[]),
             Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
             Op::new(OpCode::Finish, &[]),
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_assert_not_none_removed() {
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::AssertNotNone, &[OpRef(100)]),
             Op::new(OpCode::Finish, &[]),
         ];
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_record_exact_class_removed() {
-        let mut ops = vec![
+        let ops = vec![
             Op::new(OpCode::RecordExactClass, &[OpRef(100), OpRef(200)]),
             Op::new(OpCode::Finish, &[]),
         ];

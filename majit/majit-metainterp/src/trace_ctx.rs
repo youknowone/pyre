@@ -7,7 +7,6 @@ use majit_trace::recorder::{Trace, TracePosition};
 
 use majit_backend::JitCellToken;
 
-use crate::TraceAction;
 use crate::call_descr::{
     make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,
     make_call_may_force_descr,

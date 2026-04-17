@@ -338,7 +338,7 @@ impl PyreMetaInterp {
         let callee_code = pending.concrete_frame.pycode;
         let mut owned_sym = Box::new(pending.sym);
         let sym_ptr = owned_sym.as_mut() as *mut PyreSym;
-        let mut owned_cf = Box::new(pending.concrete_frame);
+        let owned_cf = Box::new(pending.concrete_frame);
         let cf_addr = &*owned_cf as *const pyre_interpreter::pyframe::PyFrame as usize;
 
         // executioncontext.py:76 / pyjitpl.py:1789: virtual_ref for callee frame.
@@ -558,7 +558,7 @@ impl PyreMetaInterp {
                 // Unwind symbolic + concrete state to handler.
                 let top = self.framestack.last_mut().unwrap();
                 let sym = unsafe { &mut *top.sym };
-                let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+                let ncells = code.cellvars.len() + code.freevars.len();
                 let nlocals = sym.nlocals;
                 let target_stack_len = ncells + handler_depth;
 

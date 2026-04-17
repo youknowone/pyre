@@ -63,7 +63,7 @@ pub unsafe fn is_count(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid `W_Count`.
 pub unsafe fn w_count_get_c(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_Count)).w_c
+    unsafe { (*(obj as *const W_Count)).w_c }
 }
 
 /// Write the current `w_c` field.
@@ -71,7 +71,9 @@ pub unsafe fn w_count_get_c(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_Count`.
 pub unsafe fn w_count_set_c(obj: PyObjectRef, v: PyObjectRef) {
-    (*(obj as *mut W_Count)).w_c = v;
+    unsafe {
+        (*(obj as *mut W_Count)).w_c = v;
+    }
 }
 
 /// Read the `w_step` field.
@@ -79,7 +81,7 @@ pub unsafe fn w_count_set_c(obj: PyObjectRef, v: PyObjectRef) {
 /// # Safety
 /// `obj` must point to a valid `W_Count`.
 pub unsafe fn w_count_get_step(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_Count)).w_step
+    unsafe { (*(obj as *const W_Count)).w_step }
 }
 
 // ── W_Repeat — pypy/module/itertools/interp_itertools.py:class W_Repeat ──
@@ -145,7 +147,7 @@ pub unsafe fn is_repeat(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid `W_Repeat`.
 pub unsafe fn w_repeat_get_obj(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_Repeat)).w_obj
+    unsafe { (*(obj as *const W_Repeat)).w_obj }
 }
 
 /// Read the `counting` field.
@@ -153,7 +155,7 @@ pub unsafe fn w_repeat_get_obj(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_Repeat`.
 pub unsafe fn w_repeat_get_counting(obj: PyObjectRef) -> bool {
-    (*(obj as *const W_Repeat)).counting
+    unsafe { (*(obj as *const W_Repeat)).counting }
 }
 
 /// Read the `count` field.
@@ -161,7 +163,7 @@ pub unsafe fn w_repeat_get_counting(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid `W_Repeat`.
 pub unsafe fn w_repeat_get_count(obj: PyObjectRef) -> i64 {
-    (*(obj as *const W_Repeat)).count
+    unsafe { (*(obj as *const W_Repeat)).count }
 }
 
 /// Decrement the `count` field by 1.
@@ -169,5 +171,7 @@ pub unsafe fn w_repeat_get_count(obj: PyObjectRef) -> i64 {
 /// # Safety
 /// `obj` must point to a valid `W_Repeat`.
 pub unsafe fn w_repeat_dec_count(obj: PyObjectRef) {
-    (*(obj as *mut W_Repeat)).count -= 1;
+    unsafe {
+        (*(obj as *mut W_Repeat)).count -= 1;
+    }
 }

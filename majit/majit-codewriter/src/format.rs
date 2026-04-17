@@ -45,7 +45,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
     // first-seen order).
     let mut seenlabels: HashMap<Label, usize> = HashMap::new();
     let mut next_label = 0usize;
-    let mut name_label = |label: Label, seen: &mut HashMap<Label, usize>, next: &mut usize| {
+    let name_label = |label: Label, seen: &mut HashMap<Label, usize>, next: &mut usize| {
         *seen.entry(label).or_insert_with(|| {
             *next += 1;
             *next

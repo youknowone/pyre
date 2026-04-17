@@ -169,7 +169,6 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     })
 }
 
-
 /// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
 /// with no additional fields or method overrides. Type tag only.
 ///

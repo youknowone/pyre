@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use majit_backend::ExitRecoveryLayout;
-use majit_ir::{AccumVectorInfo, Descr, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
+use majit_ir::{Descr, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
 
 /// assembler.py: ResumeGuardDescr concrete type for dynasm backend.
 pub struct DynasmFailDescr {

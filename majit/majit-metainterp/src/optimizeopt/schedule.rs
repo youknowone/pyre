@@ -1009,7 +1009,7 @@ pub fn prepare_fail_arguments(
         let mut new_fail_args = fail_args.clone();
         for arg in new_fail_args.iter_mut() {
             // schedule.py:393-394: look up if arg is in a vector box
-            let (pos, newarg) = state.getvector_of_box(*arg).unwrap_or((0, *arg));
+            let (_pos, newarg) = state.getvector_of_box(*arg).unwrap_or((0, *arg));
             if newarg != *arg {
                 // schedule.py:396-397: vector box → unpack at position 0
                 let unpacked = unpack_from_vector(state, newarg, 0, 1);

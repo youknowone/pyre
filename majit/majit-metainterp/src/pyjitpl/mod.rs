@@ -10,13 +10,10 @@ pub(crate) use dispatch::{
 };
 pub use frame::{MIFrame, MIFrameStack};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::optimizeopt::optimizer::Optimizer;
-use majit_backend::{
-    Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
-    TerminalExitLayout,
-};
+use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
 #[cfg(feature = "cranelift")]
 pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
 #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
@@ -32,9 +29,7 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 use majit_trace::history::TreeLoop;
 use majit_trace::warmstate::{HotResult, WarmEnterState};
 
-use crate::blackhole::{
-    BlackholeResult, ExceptionState, blackhole_execute_with_state, blackhole_execute_with_state_ca,
-};
+use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
 pub use crate::compile::{
     CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
@@ -44,8 +39,7 @@ use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
 use crate::resume::{
     EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
-    ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
-    ResumeLayoutSummary,
+    ResumeData, ResumeDataLoopMemo, ResumeLayoutSummary,
 };
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
@@ -674,7 +668,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     #[inline]
-    fn finish_compiled_run_io(_is_finish: bool) {
+    fn finish_compiled_run_io() {
         // Guard exits hand control back to the interpreter or blackhole after
         // the already-executed prefix of the trace. Any traced I/O in that
         // prefix is semantically committed and must survive deoptimization.
@@ -747,7 +741,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id
     }
 
-    pub fn normalize_trace_id(compiled: &CompiledEntry<M>, trace_id: u64) -> u64 {
+    pub(crate) fn normalize_trace_id(compiled: &CompiledEntry<M>, trace_id: u64) -> u64 {
         if trace_id == 0 {
             compiled.root_trace_id
         } else {
@@ -1864,7 +1858,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:1819-1831 opimpl_virtual_ref_finish parity.
     /// Checks is_virtual_ref() on concrete vref before recording.
-    pub fn opimpl_virtual_ref_finish(&mut self, vref: OpRef, virtual_obj: OpRef) {
+    pub fn opimpl_virtual_ref_finish(&mut self, vref: OpRef, _virtual_obj: OpRef) {
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
@@ -2037,7 +2031,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
-    pub fn compile_loop(&mut self, jump_args: &[OpRef], mut meta: M) -> CompileOutcome {
+    pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -2570,7 +2564,6 @@ impl<M: Clone> MetaInterp<M> {
                         &inputargs,
                         &compiled_ops,
                         green_key,
-                        &compiled_constants,
                         &compiled_constant_types,
                     );
                 let mut terminal_exit_layouts =
@@ -3259,7 +3252,6 @@ impl<M: Clone> MetaInterp<M> {
                         &inputargs,
                         &combined_ops,
                         green_key,
-                        &compiled_constants,
                         &compiled_constant_types,
                     );
                 let mut terminal_exit_layouts =
@@ -3513,7 +3505,7 @@ impl<M: Clone> MetaInterp<M> {
         // RPython optimizer.py:552-556 (flush=True): Finish/Jump is sent
         // through passes inside propagate_all_forward and ends up in
         // new_operations naturally — no restoration needed.
-        let mut optimized_ops = optimized_ops;
+        let optimized_ops = optimized_ops;
         let num_ops_after = optimized_ops.len();
         // RPython compile.py:234 parity: transfer quasi-immutable deps
         // from optimizer to MetaInterp for post-compile watcher registration.
@@ -3558,7 +3550,7 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
-        let mut final_num_inputs = optimizer.final_num_inputs();
+        let final_num_inputs = optimizer.final_num_inputs();
         let mut inputargs = trace.inputargs.clone();
         while inputargs.len() < final_num_inputs {
             inputargs.push(majit_ir::InputArg {
@@ -3629,7 +3621,6 @@ impl<M: Clone> MetaInterp<M> {
                         &inputargs,
                         &optimized_ops,
                         green_key,
-                        &compiled_constants,
                         &compiled_constant_types,
                     );
                 let mut terminal_exit_layouts =
@@ -3693,7 +3684,7 @@ impl<M: Clone> MetaInterp<M> {
                         .get(&green_key)
                         .map(|c| c.retraced_count)
                         .unwrap_or(0);
-                    let had_old = self.compiled_loops.contains_key(&green_key);
+                    let _had_old = self.compiled_loops.contains_key(&green_key);
                     if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                         previous_tokens.push(old_entry.token);
                         previous_tokens.extend(old_entry.previous_tokens);
@@ -3860,7 +3851,7 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         // Allocate token and compile.
         let token_num = self.warm_state.alloc_token_number();
@@ -3926,7 +3917,6 @@ impl<M: Clone> MetaInterp<M> {
                         &inputargs,
                         &compiled_ops,
                         green_key,
-                        &compiled_constants,
                         &compiled_constant_types,
                     );
                 let mut terminal_exit_layouts =
@@ -4074,10 +4064,9 @@ impl<M: Clone> MetaInterp<M> {
         let result = self
             .backend
             .execute_token_ints_raw(&compiled.token, live_values);
-        Self::finish_compiled_run_io(result.is_finish);
+        Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
-        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if Self::should_record_guard_failure(result.is_finish, fail_index) {
             self.record_guard_failure_event(green_key, fail_index);
@@ -4103,10 +4092,9 @@ impl<M: Clone> MetaInterp<M> {
         let result = self
             .backend
             .execute_token_ints_raw(&compiled.token, live_values);
-        Self::finish_compiled_run_io(result.is_finish);
+        Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
-        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if Self::should_record_guard_failure(result.is_finish, fail_index) {
             self.record_guard_failure_event(green_key, fail_index);
@@ -4128,10 +4116,9 @@ impl<M: Clone> MetaInterp<M> {
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&compiled.token, live_values);
-        Self::finish_compiled_run_io(result.is_finish);
+        Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
-        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if Self::should_record_guard_failure(result.is_finish, fail_index) {
             self.record_guard_failure_event(green_key, fail_index);
@@ -4152,10 +4139,9 @@ impl<M: Clone> MetaInterp<M> {
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&compiled.token, live_values);
-        Self::finish_compiled_run_io(result.is_finish);
+        Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
-        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
 
         if Self::should_record_guard_failure(result.is_finish, fail_index) {
             self.record_guard_failure_event(green_key, fail_index);
@@ -4181,7 +4167,7 @@ impl<M: Clone> MetaInterp<M> {
         let result = self
             .backend
             .execute_token_ints_raw(&compiled.token, live_values);
-        Self::finish_compiled_run_io(result.is_finish);
+        Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
@@ -4201,7 +4187,6 @@ impl<M: Clone> MetaInterp<M> {
                 compile::enrich_resume_layout_with_frame_stack(
                     &mut resume_layout,
                     layout.frame_stack.as_deref(),
-                    &layout.fail_arg_types,
                 );
                 CompiledExitLayout {
                     rd_loop_token: green_key, // compile.py:186
@@ -4302,7 +4287,7 @@ impl<M: Clone> MetaInterp<M> {
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&compiled.token, live_values);
-        Self::finish_compiled_run_io(result.is_finish);
+        Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
         let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
@@ -4322,7 +4307,6 @@ impl<M: Clone> MetaInterp<M> {
                 compile::enrich_resume_layout_with_frame_stack(
                     &mut resume_layout,
                     layout.frame_stack.as_deref(),
-                    &layout.fail_arg_types,
                 );
                 CompiledExitLayout {
                     rd_loop_token: green_key, // compile.py:186
@@ -4442,7 +4426,7 @@ impl<M: Clone> MetaInterp<M> {
         let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
         let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
-        Self::finish_compiled_run_io(is_finish);
+        Self::finish_compiled_run_io();
 
         if Self::should_record_guard_failure(is_finish, fail_index) {
             self.record_guard_failure_event(green_key, fail_index);
@@ -4556,7 +4540,7 @@ impl<M: Clone> MetaInterp<M> {
         let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
         let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
-        Self::finish_compiled_run_io(is_finish);
+        Self::finish_compiled_run_io();
 
         // RPython: guard failure counter tick and bridge compilation happen
         // in handle_fail → must_compile (compile.py:701-784).
@@ -5055,7 +5039,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
     /// result_type == INT.
-    pub fn has_raw_int_finish(&self, _green_key: u64) -> bool {
+    pub fn has_raw_int_finish(&self) -> bool {
         self.result_type == Type::Int
     }
 
@@ -5239,7 +5223,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key
     }
 
-    pub fn bridge_fail_descr_proxy(
+    pub(crate) fn bridge_fail_descr_proxy(
         &self,
         compiled: &CompiledEntry<M>,
         trace_id: u64,
@@ -5281,8 +5265,6 @@ impl<M: Clone> MetaInterp<M> {
             gc_ref_slots,
             force_token_slots: exit_layout.force_token_slots.clone(),
             is_finish: exit_layout.is_finish,
-            rd_numb: None,
-            rd_consts: None,
         })
     }
 
@@ -5640,7 +5622,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -5685,7 +5667,6 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_inputargs,
                         &optimized_ops,
                         original_green_key,
-                        &compiled_constants,
                         &compiled_constant_types,
                     );
                 let mut terminal_exit_layouts =
@@ -6069,7 +6050,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
@@ -6185,7 +6166,6 @@ impl<M: Clone> MetaInterp<M> {
                             bridge_inputargs,
                             &optimized_ops,
                             green_key,
-                            &compiled_constants,
                             &compiled_constant_types,
                         );
                     let mut terminal_exit_layouts =
@@ -9856,7 +9836,7 @@ mod metainterp_static_data_tests {
         builder_caller.load_const_i_value(0, 0);
         builder_caller.load_const_i_value(1, 0);
         let caller = std::sync::Arc::new(builder_caller.finish());
-        let mut builder_callee = JitCodeBuilder::new();
+        let builder_callee = JitCodeBuilder::new();
         let callee = std::sync::Arc::new(builder_callee.finish());
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -10111,7 +10091,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            not_in_trace_record_arg_helper as i64,
+            not_in_trace_record_arg_helper as *const () as i64,
         );
         let argbox = (JitArgKind::Int, OpRef(1), 0xc0ffee);
         let allboxes = [funcbox, argbox];
@@ -10172,7 +10152,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            raising_not_in_trace_helper as i64,
+            raising_not_in_trace_helper as *const () as i64,
         );
 
         // Simulate the production exception plumbing by pre-setting
@@ -10233,7 +10213,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            execute_varargs_int_helper as i64,
+            execute_varargs_int_helper as *const () as i64,
         );
         let argboxes = [
             (JitArgKind::Int, OpRef(1), 4),
@@ -10460,7 +10440,7 @@ mod metainterp_static_data_tests {
 
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         jd.is_recursive = true;
-        jd.portal_runner_adr = portal_runner_helper as i64;
+        jd.portal_runner_adr = portal_runner_helper as *const () as i64;
 
         let result = meta.do_recursive_call_full(
             &jd,
@@ -10504,7 +10484,11 @@ mod metainterp_static_data_tests {
             majit_ir::EffectInfo::default(),
         );
         let condbox = (JitArgKind::Int, OpRef(50), 1);
-        let funcbox = (JitArgKind::Ref, OpRef(100), cond_call_void_helper as i64);
+        let funcbox = (
+            JitArgKind::Ref,
+            OpRef(100),
+            cond_call_void_helper as *const () as i64,
+        );
         let result = meta.do_conditional_call_full(
             condbox,
             funcbox,
@@ -10548,7 +10532,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            execute_varargs_int_helper as i64,
+            execute_varargs_int_helper as *const () as i64,
         );
         let result = meta.do_conditional_call_full(
             condbox,
@@ -10596,7 +10580,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            execute_varargs_int_helper as i64,
+            execute_varargs_int_helper as *const () as i64,
         );
 
         let result =
@@ -10643,7 +10627,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            execute_varargs_int_helper as i64,
+            execute_varargs_int_helper as *const () as i64,
         );
         let argboxes = [
             funcbox,
@@ -10689,7 +10673,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            execute_varargs_int_helper as i64,
+            execute_varargs_int_helper as *const () as i64,
         );
         let argboxes = [
             funcbox,
@@ -10738,7 +10722,7 @@ mod metainterp_static_data_tests {
         let funcbox = (
             JitArgKind::Ref,
             OpRef(100),
-            execute_varargs_void_helper as i64,
+            execute_varargs_void_helper as *const () as i64,
         );
         let result =
             meta.execute_and_record_varargs(OpCode::CallN, &[funcbox], descr_ref, &descr_view);
@@ -10775,7 +10759,6 @@ mod metainterp_static_data_tests {
     #[test]
     fn handle_possible_overflow_error_records_guard_overflow_when_flag_set() {
         // pyjitpl.py:1882-1886 — ovf_flag → GUARD_OVERFLOW + pc=label, return None
-        use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
         meta.force_start_tracing(0, None, &[]);
@@ -11156,17 +11139,13 @@ mod metainterp_static_data_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
+    #[cfg(feature = "cranelift")]
     use majit_backend::DeadFrame;
-    use majit_backend::{Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
     #[cfg(feature = "cranelift")]
     use majit_backend_cranelift::compiler::{
         force_token_to_dead_frame, get_int_from_deadframe, get_latest_descr_from_deadframe,
         set_savedata_ref_on_deadframe,
     };
-    #[cfg(feature = "cranelift")]
-    use majit_backend_cranelift::guard::CraneliftFailDescr;
-    use majit_gc::collector::MiniMarkGC;
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -11329,7 +11308,7 @@ mod tests {
             .compile_loop(inputargs, &ops, &mut token)
             .expect("loop should compile");
         let (mut resume_data, guard_op_indices, mut exit_layouts) =
-            compile::build_guard_metadata(inputargs, &ops, green_key, &constants, &HashMap::new());
+            compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);

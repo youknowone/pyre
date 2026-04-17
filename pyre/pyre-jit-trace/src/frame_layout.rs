@@ -61,10 +61,12 @@ const _: () = {
 /// virtualizable.py:45-46: clear_vable_ptr — C-ABI helper that writes
 /// TOKEN_NONE (0) to the vable_token field of a PyFrame.
 unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
-    let ptr = obj_ptr as *mut u8;
-    if !ptr.is_null() {
-        let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut u64;
-        *token_ptr = 0;
+    unsafe {
+        let ptr = obj_ptr as *mut u8;
+        if !ptr.is_null() {
+            let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut u64;
+            *token_ptr = 0;
+        }
     }
 }
 

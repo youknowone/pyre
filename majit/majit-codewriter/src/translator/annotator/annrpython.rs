@@ -6,9 +6,7 @@
 //! each op's inputs and computing the output type. Iterates to
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
-use crate::model::{
-    BlockId, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId, ValueType,
-};
+use crate::model::{FunctionGraph, OpKind, Terminator, ValueId, ValueType};
 use std::collections::HashMap;
 
 /// Annotation state: maps ValueId → inferred ValueType.

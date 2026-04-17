@@ -9,10 +9,7 @@ use std::sync::Mutex;
 /// rpython/jit/backend/x86/runner.py AbstractX86CPU.
 use std::sync::atomic::Ordering;
 
-use majit_backend::{
-    AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
-    RawExecResult, TerminalExitLayout,
-};
+use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
@@ -576,7 +573,7 @@ impl Backend for DynasmBackend {
         let mut asm = Asm::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
-        let orig_compiled = Self::get_compiled(original_token);
+        let _orig_compiled = Self::get_compiled(original_token);
 
         let guard_descr = Self::find_descr(
             original_token,

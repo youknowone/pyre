@@ -1268,11 +1268,6 @@ fn jump_target_forward(
     target.min(num_instrs)
 }
 
-/// Backward jump target: next_instr - delta.
-fn jump_target_backward(next_instr: usize, delta: usize) -> usize {
-    next_instr.saturating_sub(delta)
-}
-
 /// Match pyre-interpreter/pyopcode.rs:skip_caches.
 fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
     let mut state = OpArgState::default();

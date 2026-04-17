@@ -40,8 +40,6 @@ struct VableField {
     role: VableRole,
     /// For `#[vable(static_field = N)]`: the VirtualizableInfo field index.
     static_field_index: Option<usize>,
-    /// Field IR type: "int", "ref", or "float". Used for typed heap reads.
-    field_type: Option<String>,
 }
 
 fn parse_vable_role(s: &str) -> Option<VableRole> {
@@ -64,7 +62,6 @@ fn parse_vable_role(s: &str) -> Option<VableRole> {
 struct ParsedVableAttr {
     role: VableRole,
     static_field_index: Option<usize>,
-    field_type: Option<String>,
 }
 
 /// Parse `#[vable(...)]` attribute content. Supports:
@@ -76,7 +73,6 @@ fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
     // Check if it contains '=' (key-value pairs)
     if s.contains('=') {
         let mut static_idx = None;
-        let mut field_type = None;
         for part in s.split(',') {
             let part = part.trim();
             if let Some((key, val)) = part.split_once('=') {
@@ -84,7 +80,7 @@ fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
                 let val = val.trim();
                 match key {
                     "static_field" => static_idx = val.parse().ok(),
-                    "type" => field_type = Some(val.to_string()),
+                    "type" => {}
                     _ => {}
                 }
             }
@@ -93,7 +89,6 @@ fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
             return Some(ParsedVableAttr {
                 role: VableRole::Frame, // overridden below
                 static_field_index: static_idx,
-                field_type,
             });
         }
         return None;
@@ -104,26 +99,23 @@ fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
         let keyword = parts[0].trim();
         let rest = parts.get(1).copied().unwrap_or("");
         if let Some(role) = parse_vable_role(keyword) {
-            let mut field_type = None;
             for part in rest.split(',') {
                 let part = part.trim();
                 if let Some((key, val)) = part.split_once('=') {
                     if key.trim() == "type" {
-                        field_type = Some(val.trim().to_string());
+                        let _ = val.trim();
                     }
                 }
             }
             return Some(ParsedVableAttr {
                 role,
                 static_field_index: None,
-                field_type,
             });
         }
     }
     parse_vable_role(s).map(|role| ParsedVableAttr {
         role,
         static_field_index: None,
-        field_type: None,
     })
 }
 
@@ -156,7 +148,6 @@ fn extract_vable_fields(input: &DeriveInput) -> Vec<VableField> {
                     ident: ident.clone(),
                     role: parsed.role,
                     static_field_index: parsed.static_field_index,
-                    field_type: parsed.field_type,
                 });
             }
         }
@@ -323,9 +314,6 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
     } else {
         quote! {}
     };
-
-    // Number of scalar inputargs for collect_jump_args capacity
-    let num_scalar_inputargs = 1 + inputarg_fields.len(); // frame + inputarg fields
 
     // Typed inputargs for collect_typed_jump_args (inputargs are always Int)
     let collect_typed_inputargs: Vec<TokenStream> = inputarg_fields

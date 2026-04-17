@@ -266,12 +266,6 @@ impl MiniMarkGC {
         (length + (8 << self.card_page_shift) - 1) >> (self.card_page_shift as usize + 3)
     }
 
-    /// incminimark.py:1029: card header size in bytes for a given array length.
-    fn card_header_size_for_length(&self, length: usize) -> usize {
-        const WORD: usize = 8;
-        WORD * self.card_marking_words_for_length(length)
-    }
-
     /// incminimark.py:1622-1625: address of card byte at `byteindex`.
     /// Card bytes are stored in reverse order before the GcHeader.
     /// `obj` is the payload address (after GcHeader).

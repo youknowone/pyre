@@ -34,17 +34,17 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
 
 #[inline]
 pub unsafe fn is_super(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &SUPER_TYPE)
+    unsafe { py_type_check(obj, &SUPER_TYPE) }
 }
 
 /// Get the super_type (cls) from a super proxy.
 #[inline]
 pub unsafe fn w_super_get_type(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_SuperObject)).super_type
+    unsafe { (*(obj as *const W_SuperObject)).super_type }
 }
 
 /// Get the bound object (self) from a super proxy.
 #[inline]
 pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_SuperObject)).obj
+    unsafe { (*(obj as *const W_SuperObject)).obj }
 }

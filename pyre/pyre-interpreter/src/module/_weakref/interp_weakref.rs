@@ -1697,7 +1697,7 @@ mod tests {
     #[test]
     fn test_isinstance_through_proxy() {
         crate::typedef::init_typeobjects();
-        let int_type = unsafe { crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap() };
+        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
         let proxy = W_Proxy_new(int_type, PY_NULL);
         // 7 is an int — through the proxy it must still resolve.
         let yes = crate::baseobjspace::isinstance(pyre_object::w_int_new(7), proxy).unwrap();
@@ -1712,8 +1712,8 @@ mod tests {
     #[test]
     fn test_issubclass_through_proxy() {
         crate::typedef::init_typeobjects();
-        let int_type = unsafe { crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap() };
-        let str_type = unsafe { crate::typedef::r#type(pyre_object::w_str_new("")).unwrap() };
+        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
+        let str_type = crate::typedef::r#type(pyre_object::w_str_new("")).unwrap();
         let proxy = W_Proxy_new(int_type, PY_NULL);
         let yes = crate::baseobjspace::issubclass(int_type, proxy).unwrap();
         assert!(yes);
@@ -1756,7 +1756,7 @@ mod tests {
             );
         });
         let checker = pyre_object::instanceobject::w_instance_new(user_type);
-        let int_type = unsafe { crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap() };
+        let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
         let yes = crate::baseobjspace::issubclass(int_type, checker).unwrap();
         assert!(yes);
     }
@@ -1774,7 +1774,7 @@ mod tests {
                 ns,
                 "__pow__",
                 crate::make_builtin_function("__pow__", |_args| {
-                    Ok(unsafe { pyre_object::w_not_implemented() })
+                    Ok(pyre_object::w_not_implemented())
                 }),
             );
         });
@@ -1805,7 +1805,7 @@ mod tests {
                 ns,
                 "__pow__",
                 crate::make_builtin_function("__pow__", |_args| {
-                    Ok(unsafe { pyre_object::w_not_implemented() })
+                    Ok(pyre_object::w_not_implemented())
                 }),
             );
         });
@@ -1838,7 +1838,7 @@ mod tests {
                 ns,
                 "__divmod__",
                 crate::make_builtin_function("__divmod__", |_args| {
-                    Ok(unsafe { pyre_object::w_not_implemented() })
+                    Ok(pyre_object::w_not_implemented())
                 }),
             );
         });

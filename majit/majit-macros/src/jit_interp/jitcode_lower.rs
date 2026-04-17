@@ -39,8 +39,6 @@ where
 /// to recognize state-field reads/writes, virtualizable accesses, I/O shims,
 /// and helper-call policies.
 pub struct LowererConfig {
-    /// Method name → IR OpCode ident (e.g., "add" → IntAdd).
-    binops: HashMap<String, Ident>,
     /// Canonical I/O func path → shim ident.
     io_shims: Vec<(Vec<String>, Ident)>,
     /// Canonical helper func path → explicit or inferred call policy.
@@ -121,17 +119,12 @@ impl ValueKind {
 
 impl LowererConfig {
     pub fn new(
-        binops: &[(Ident, Ident)],
         io_shims: &[(Path, Ident)],
         calls: &[(Path, Option<crate::jit_interp::CallPolicyKind>)],
         auto_calls: bool,
         vable_decl: Option<&crate::jit_interp::VirtualizableDecl>,
         state_fields_cfg: Option<&crate::jit_interp::StateFieldsConfig>,
     ) -> Self {
-        let binops = binops
-            .iter()
-            .map(|(m, o)| (m.to_string(), o.clone()))
-            .collect();
         let io_shims = io_shims
             .iter()
             .map(|(p, s)| (canonical_path_segments(p), s.clone()))
@@ -198,7 +191,6 @@ impl LowererConfig {
             (HashMap::new(), HashMap::new(), HashMap::new())
         };
         Self {
-            binops,
             io_shims,
             calls,
             auto_calls,
@@ -1278,55 +1270,6 @@ impl<'c> Lowerer<'c> {
             Expr::Paren(ExprParen { expr, .. }) | Expr::Reference(ExprReference { expr, .. }) => {
                 self.expr_is_state_root(expr)
             }
-            _ => false,
-        }
-    }
-
-    fn expr_uses_stack_bindings(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::Path(ExprPath { path, .. }) => path
-                .get_ident()
-                .and_then(|ident| self.bindings.get(&ident.to_string()))
-                .is_some_and(|binding| binding.depends_on_stack),
-            Expr::Assign(ExprAssign { left, right, .. }) => {
-                self.expr_uses_stack_bindings(left) || self.expr_uses_stack_bindings(right)
-            }
-            Expr::Binary(ExprBinary { left, right, .. }) => {
-                self.expr_uses_stack_bindings(left) || self.expr_uses_stack_bindings(right)
-            }
-            Expr::Call(ExprCall { func, args, .. }) => {
-                self.expr_uses_stack_bindings(func)
-                    || args.iter().any(|arg| self.expr_uses_stack_bindings(arg))
-            }
-            Expr::Cast(ExprCast { expr, .. })
-            | Expr::Paren(ExprParen { expr, .. })
-            | Expr::Unary(ExprUnary { expr, .. }) => self.expr_uses_stack_bindings(expr),
-            Expr::If(ExprIf {
-                cond,
-                then_branch,
-                else_branch,
-                ..
-            }) => {
-                self.expr_uses_stack_bindings(cond)
-                    || then_branch
-                        .stmts
-                        .iter()
-                        .any(|stmt| self.stmt_uses_stack_bindings(stmt))
-                    || else_branch
-                        .as_ref()
-                        .is_some_and(|(_, expr)| self.expr_uses_stack_bindings(expr))
-            }
-            _ => false,
-        }
-    }
-
-    fn stmt_uses_stack_bindings(&self, stmt: &Stmt) -> bool {
-        match stmt {
-            Stmt::Expr(expr, _) => self.expr_uses_stack_bindings(expr),
-            Stmt::Local(local) => local
-                .init
-                .as_ref()
-                .is_some_and(|init| self.expr_uses_stack_bindings(&init.expr)),
             _ => false,
         }
     }
@@ -2867,10 +2810,6 @@ fn opcode_for_binop(op: &BinOp) -> Option<Ident> {
         _ => return None,
     };
     Some(Ident::new(name, proc_macro2::Span::call_site()))
-}
-
-fn is_overflow_binop(opcode: &Ident) -> bool {
-    opcode == "IntAddOvf" || opcode == "IntSubOvf" || opcode == "IntMulOvf"
 }
 
 // ── Public entry points ──────────────────────────────────────────────

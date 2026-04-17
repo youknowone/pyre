@@ -2,20 +2,8 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::Expr;
 
 use super::{JitInterpConfig, StateFieldKind};
-use crate::virtualizable::codegen as codegen_virtualizable;
-
-/// Extract the member field name from a field access expression.
-/// e.g., `state.storage` → `storage`, `state.selected` → `selected`.
-fn extract_field_member(expr: &Expr) -> &syn::Member {
-    if let Expr::Field(field) = expr {
-        &field.member
-    } else {
-        panic!("expected field access expression like `state.field`, got other expression form")
-    }
-}
 
 /// Generate the JitState types and implementation.
 pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
@@ -669,7 +657,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
 mod tests {
     use super::generate_jit_state;
     use crate::jit_interp::JitInterpConfig;
-    use quote::quote;
 
     fn render(config: proc_macro2::TokenStream) -> String {
         let parsed = syn::parse2::<JitInterpConfig>(config).expect("valid jit_interp config");

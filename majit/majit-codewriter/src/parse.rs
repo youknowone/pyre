@@ -451,6 +451,7 @@ pub fn extract_opcode_dispatch_receiver_traits(
 }
 
 /// Collect canonical function names and graphs for the active pipeline path.
+#[cfg(test)]
 pub fn collect_function_graphs(
     parsed: &ParsedInterpreter,
     graphs: &mut std::collections::HashMap<CallPath, crate::model::FunctionGraph>,

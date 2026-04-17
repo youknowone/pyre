@@ -215,7 +215,7 @@ impl DependencyGraph {
     /// dependency.py:556-572: Build a dependency graph from loop operations.
     /// Uses DefTracker and IntegralForwardModification for precise analysis.
     pub fn build(ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) -> Self {
-        let mut nodes: Vec<Node> = ops
+        let nodes: Vec<Node> = ops
             .iter()
             .enumerate()
             .map(|(idx, op)| Node::new(op.clone(), idx))
@@ -296,7 +296,12 @@ impl DependencyGraph {
     }
 
     /// dependency.py:708-735: build_guard_dependencies
-    fn build_guard_dependencies(&mut self, guard_idx: usize, tracker: &mut DefTracker, ops: &[Op]) {
+    fn build_guard_dependencies(
+        &mut self,
+        guard_idx: usize,
+        tracker: &mut DefTracker,
+        _ops: &[Op],
+    ) {
         let op = self.nodes[guard_idx].op.clone();
         // dependency.py:710-712: ignore invalidated & future condition & early exit guards
         if matches!(

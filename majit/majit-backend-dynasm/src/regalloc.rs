@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::regloc::*;
-use majit_ir::{InputArg, LoopTargetDescr, Op, OpCode, OpRef, TargetArgLoc, Type, descr_identity};
+use majit_ir::{InputArg, Op, OpCode, OpRef, Type, descr_identity};
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -2574,24 +2574,27 @@ impl RegAlloc {
         {
             return self.consider_binop(op, i, output);
         }
-        let y = op.args[1];
-        let loc2 = if y.is_constant() {
-            self.rm.convert_to_imm(y, &self.constants)
-        } else {
-            self.make_sure_var_in_reg(y, Type::Int, &[], Some(ECX), false)
-        };
-        let args: Vec<OpRef> = op.args.iter().copied().collect();
-        let loc1 = self.rm.force_result_in_reg(
-            op.pos,
-            op.args[0],
-            Type::Int,
-            &args,
-            &mut self.longevity,
-            &mut self.fm,
-            &self.constants,
-            &mut self.pending_moves,
-        );
-        self.perform(i, vec![loc1, loc2], Some(loc1), output);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let y = op.args[1];
+            let loc2 = if y.is_constant() {
+                self.rm.convert_to_imm(y, &self.constants)
+            } else {
+                self.make_sure_var_in_reg(y, Type::Int, &[], Some(ECX), false)
+            };
+            let args: Vec<OpRef> = op.args.iter().copied().collect();
+            let loc1 = self.rm.force_result_in_reg(
+                op.pos,
+                op.args[0],
+                Type::Int,
+                &args,
+                &mut self.longevity,
+                &mut self.fm,
+                &self.constants,
+                &mut self.pending_moves,
+            );
+            self.perform(i, vec![loc1, loc2], Some(loc1), output);
+        }
     }
 
     /// x86/regalloc.py int_neg / int_invert / int_is_true / int_is_zero / int_signext
@@ -2617,43 +2620,46 @@ impl RegAlloc {
         {
             return self.consider_binop_symm(op, i, output);
         }
-        let mut arg1 = op.args[0];
-        let mut arg2 = op.args[1];
-        // x86/regalloc.py:594 — optimized for (box, const)
-        if arg1.is_constant() {
-            std::mem::swap(&mut arg1, &mut arg2);
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut arg1 = op.args[0];
+            let mut arg2 = op.args[1];
+            // x86/regalloc.py:594 — optimized for (box, const)
+            if arg1.is_constant() {
+                std::mem::swap(&mut arg1, &mut arg2);
+            }
+            // arg2 must be in eax
+            self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
+            let l1 = self.loc(arg1, Type::Int);
+            // eax will be trash after the operation
+            self.possibly_free_var(arg2, Type::Int);
+            // allocate temporary in eax (will be trashed by MUL)
+            let tmp = OpRef(u32::MAX - 1); // temp var
+            if !self.longevity.contains(tmp) {
+                self.longevity
+                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+            }
+            self.rm.force_allocate_reg(
+                tmp,
+                &[],
+                Some(EAX),
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            );
+            self.rm
+                .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+            // result in edx
+            self.rm.force_allocate_reg(
+                op.pos,
+                &[],
+                Some(EDX),
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            );
+            self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
         }
-        // arg2 must be in eax
-        self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
-        let l1 = self.loc(arg1, Type::Int);
-        // eax will be trash after the operation
-        self.possibly_free_var(arg2, Type::Int);
-        // allocate temporary in eax (will be trashed by MUL)
-        let tmp = OpRef(u32::MAX - 1); // temp var
-        if !self.longevity.contains(tmp) {
-            self.longevity
-                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
-        }
-        self.rm.force_allocate_reg(
-            tmp,
-            &[],
-            Some(EAX),
-            false,
-            &mut self.longevity,
-            &mut self.fm,
-        );
-        self.rm
-            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
-        // result in edx
-        self.rm.force_allocate_reg(
-            op.pos,
-            &[],
-            Some(EDX),
-            false,
-            &mut self.longevity,
-            &mut self.fm,
-        );
-        self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
     }
 
     /// x86/regalloc.py:618 consider_int_signext

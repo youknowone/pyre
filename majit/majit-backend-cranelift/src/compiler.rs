@@ -11,8 +11,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, StackSlot, StackSlotData,
-    StackSlotKind,
+    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -27,7 +26,7 @@ use majit_backend::{
 };
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
-use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr, flags as gc_flags};
+use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
     AccumVectorInfo, CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode,
     OpRef, Type, Value,
@@ -2032,7 +2031,7 @@ fn register_call_assembler_target(
             let size = GcHeader::SIZE as isize + base_ofs + depth * 8;
             // RPython: frame_info is allocated once, updated in place.
             // Reuse the pending target's allocation if it exists.
-            let mut registry = call_assembler_registry().lock().unwrap();
+            let registry = call_assembler_registry().lock().unwrap();
             let fi = if let Some(existing) = registry.get(&token.number) {
                 let fi = existing.frame_info;
                 unsafe {
@@ -2395,7 +2394,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let fail_descr_arc =
             direct_descr.unwrap_or_else(|| cur_fail_descrs[fail_index as usize].clone());
         let fail_descr = &fail_descr_arc;
-        let _fail_count = fail_descr.increment_fail_count();
+        fail_descr.increment_fail_count();
         ACTIVE_GC_RUNTIME_ID.with(|c| c.set(cur_gc_runtime_id));
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
@@ -2615,7 +2614,7 @@ fn call_assembler_guard_failure_inner(
     let target = unsafe { &*fast_lookup_ca_target(token_number) };
     let fail_index = fail_descr_ref.fail_index();
     let fail_descr = &target.fail_descrs[fail_index as usize];
-    let _fail_count = fail_descr.increment_fail_count();
+    fail_descr.increment_fail_count();
 
     // compile.py:701-717 handle_fail → must_compile → bridge tracing.
     // Check jitcounter threshold; if reached, trace alternate path and
@@ -5772,13 +5771,12 @@ impl CraneliftBackend {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        // jf_ptr serves as both inputs_ptr (entry) and outputs_ptr (exits).
+        // jf_ptr serves as both inputs_ptr (entry) and the exit-frame base.
         // RPython: EBP = jitframe pointer throughout compiled code.
         // After a collecting call, _reload_frame_if_necessary reloads
         // jf_ptr from the shadow stack (GC may have moved the jitframe).
         let mut jf_ptr = builder.block_params(entry_block)[0];
         let inputs_ptr = jf_ptr; // alias for entry loading
-        let mut outputs_ptr = jf_ptr; // alias for guard exit stores (updated after reload)
 
         // assembler.py:1074 _call_header_shadowstack — inline MOVs:
         //   MOV ebx, [root_stack_top_addr]
@@ -6176,14 +6174,13 @@ impl CraneliftBackend {
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
 
             // RPython parity: ebp is the live register at every instruction
-            // boundary. Refresh the cached jf_ptr/outputs_ptr CValues from
+            // boundary. Refresh the cached jf_ptr CValue from
             // the Cranelift Variable so the FunctionBuilder threads the
             // correct value through any merge blocks introduced by the
             // previous opcode (LABEL, brif, etc.). Without this, opcode
             // handlers that emit IR directly using the cached locals can
             // reference an SSA value defined in a non-dominating block.
             jf_ptr = builder.use_var(jf_ptr_var);
-            outputs_ptr = jf_ptr;
 
             // regalloc.py:1089-1106 get_gcmap: per-call-site gcmap
             // marking only alive ref root slots at this position.
@@ -7287,7 +7284,6 @@ impl CraneliftBackend {
                         builder.def_var(var(vi), result);
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                 }
 
@@ -7473,17 +7469,6 @@ impl CraneliftBackend {
                     let ca_merge_block = builder.create_block();
                     builder.append_block_param(ca_merge_block, cl_types::I64);
 
-                    // Try direct call if target is resolved and has a known
-                    // finish exit with primitive result type. This inlines the
-                    // hot path (call target → check finish → extract result)
-                    // into Cranelift IR, bypassing the shim entirely.
-                    let finish_descr = resolved_target.as_ref().and_then(|t| {
-                        t.fail_descrs.iter().find(|d| {
-                            d.is_finish()
-                                && matches!(d.fail_arg_types(), [Type::Int] | [Type::Float])
-                        })
-                    });
-
                     // Direct call via dispatch table: load code_ptr from a
                     // stable slot (AtomicPtr). For self-recursion (target not
                     // yet registered), pre-create the slot with null — compile
@@ -7503,7 +7488,6 @@ impl CraneliftBackend {
                         None
                     };
 
-                    let has_primitive_result = finish_descr.is_some() || resolved_target.is_none();
                     let use_direct = dispatch_slot_addr.is_some();
 
                     if use_direct {
@@ -7703,7 +7687,6 @@ impl CraneliftBackend {
                     // jitframe pointer through the Variable so Cranelift
                     // threads it through the necessary block params.
                     jf_ptr = builder.use_var(jf_ptr_var);
-                    outputs_ptr = jf_ptr;
                     spill_ref_roots(
                         &mut builder,
                         jf_ptr,
@@ -7729,7 +7712,6 @@ impl CraneliftBackend {
                     // GC may have moved the jitframe during the shim call.
                     // Reload jf_ptr from shadow stack before reading from it.
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                     emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     reload_ref_roots(
@@ -7761,7 +7743,7 @@ impl CraneliftBackend {
                     builder.ins().store(
                         MemFlags::trusted(),
                         deadframe_handle,
-                        outputs_ptr,
+                        jf_ptr,
                         JF_FRAME_ITEM0_OFS,
                     );
                     let sentinel = builder
@@ -7769,22 +7751,15 @@ impl CraneliftBackend {
                         .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), sentinel, outputs_ptr, JF_DESCR_OFS);
+                        .store(MemFlags::trusted(), sentinel, jf_ptr, JF_DESCR_OFS);
                     // assembler.py:1130-1136 _call_footer_shadowstack — inline SUB
                     emit_call_footer_shadowstack(&mut builder, ptr_type);
-                    builder.ins().return_(&[outputs_ptr]);
+                    builder.ins().return_(&[jf_ptr]);
 
                     // ── Merge: result from cache or shim ──
                     builder.switch_to_block(ca_merge_block);
                     builder.seal_block(ca_merge_block);
                     let merged_result = builder.block_params(ca_merge_block)[0];
-
-                    // _reload_frame_if_necessary parity: refresh jf_ptr after
-                    // the merge so GuardNotForced (and subsequent ops) read
-                    // from the correct caller jitframe, not a stale SSA value
-                    // from one of the predecessor blocks.
-                    jf_ptr = builder.use_var(jf_ptr_var);
-                    outputs_ptr = jf_ptr;
 
                     if op.result_type() != Type::Void {
                         builder.def_var(var(vi), merged_result);
@@ -7864,7 +7839,6 @@ impl CraneliftBackend {
                         builder.def_var(var(vi), result);
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                 }
 
@@ -8254,7 +8228,6 @@ impl CraneliftBackend {
                         let params = builder.block_params(merge_block).to_vec();
                         let result = params[0];
                         jf_ptr = params[1];
-                        outputs_ptr = jf_ptr;
                         builder.def_var(jf_ptr_var, jf_ptr);
                         for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
                             builder.def_var(var(var_idx), params[2 + i]);
@@ -8283,7 +8256,6 @@ impl CraneliftBackend {
                         )
                         .expect("alloc");
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                        outputs_ptr = jf_ptr;
                         builder.def_var(jf_ptr_var, jf_ptr);
                         builder.def_var(var(vi), result);
                     }
@@ -8319,7 +8291,6 @@ impl CraneliftBackend {
                     )
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
@@ -8422,7 +8393,6 @@ impl CraneliftBackend {
                     let result = params[0];
                     jf_ptr = params[1];
                     emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                     for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
                         builder.def_var(var(var_idx), params[2 + i]);
@@ -9973,7 +9943,6 @@ impl CraneliftBackend {
                         // GC may have moved the jitframe during allocation.
                         // Reload jf_ptr so subsequent spill/reload use the correct address.
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                        outputs_ptr = jf_ptr;
                         builder.def_var(jf_ptr_var, jf_ptr);
                         if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
@@ -10045,7 +10014,6 @@ impl CraneliftBackend {
                     )
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
@@ -10177,7 +10145,6 @@ impl CraneliftBackend {
                     )
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
@@ -10203,7 +10170,6 @@ impl CraneliftBackend {
                     )
                     .expect("GC varsize allocation helper must return a value");
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    outputs_ptr = jf_ptr;
                     builder.def_var(jf_ptr_var, jf_ptr);
                     builder.def_var(var(vi), result);
                 }
@@ -11870,143 +11836,146 @@ impl majit_backend::Backend for CraneliftBackend {
 ///
 /// Safety: func must be a valid function pointer matching the described ABI.
 unsafe fn bh_call_i_dispatch(func: usize, int_args: &[i64], float_args: &[f64]) -> i64 {
-    type I = i64;
-    type F = f64;
-    match (int_args.len(), float_args.len()) {
-        // No float args — integer-only calls.
-        (0, 0) => {
-            let f: unsafe extern "C" fn() -> I = std::mem::transmute(func);
-            f()
-        }
-        (1, 0) => {
-            let f: unsafe extern "C" fn(I) -> I = std::mem::transmute(func);
-            f(int_args[0])
-        }
-        (2, 0) => {
-            let f: unsafe extern "C" fn(I, I) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1])
-        }
-        (3, 0) => {
-            let f: unsafe extern "C" fn(I, I, I) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], int_args[2])
-        }
-        (4, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], int_args[2], int_args[3])
-        }
-        (5, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-            )
-        }
-        (6, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-                int_args[5],
-            )
-        }
-        // Float-only calls.
-        (0, 1) => {
-            let f: unsafe extern "C" fn(F) -> I = std::mem::transmute(func);
-            f(float_args[0])
-        }
-        (0, 2) => {
-            let f: unsafe extern "C" fn(F, F) -> I = std::mem::transmute(func);
-            f(float_args[0], float_args[1])
-        }
-        // Mixed int + float calls.
-        (1, 1) => {
-            let f: unsafe extern "C" fn(I, F) -> I = std::mem::transmute(func);
-            f(int_args[0], float_args[0])
-        }
-        (2, 1) => {
-            let f: unsafe extern "C" fn(I, I, F) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], float_args[0])
-        }
-        (1, 2) => {
-            let f: unsafe extern "C" fn(I, F, F) -> I = std::mem::transmute(func);
-            f(int_args[0], float_args[0], float_args[1])
-        }
-        (2, 2) => {
-            let f: unsafe extern "C" fn(I, I, F, F) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], float_args[0], float_args[1])
-        }
-        (3, 1) => {
-            let f: unsafe extern "C" fn(I, I, I, F) -> I = std::mem::transmute(func);
-            f(int_args[0], int_args[1], int_args[2], float_args[0])
-        }
-        (4, 1) => {
-            let f: unsafe extern "C" fn(I, I, I, I, F) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                float_args[0],
-            )
-        }
-        (3, 2) => {
-            let f: unsafe extern "C" fn(I, I, I, F, F) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                float_args[0],
-                float_args[1],
-            )
-        }
-        (0, 3) => {
-            let f: unsafe extern "C" fn(F, F, F) -> I = std::mem::transmute(func);
-            f(float_args[0], float_args[1], float_args[2])
-        }
-        (0, 4) => {
-            let f: unsafe extern "C" fn(F, F, F, F) -> I = std::mem::transmute(func);
-            f(float_args[0], float_args[1], float_args[2], float_args[3])
-        }
-        (1, 3) => {
-            let f: unsafe extern "C" fn(I, F, F, F) -> I = std::mem::transmute(func);
-            f(int_args[0], float_args[0], float_args[1], float_args[2])
-        }
-        (7, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-                int_args[5],
-                int_args[6],
-            )
-        }
-        (8, 0) => {
-            let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
-            f(
-                int_args[0],
-                int_args[1],
-                int_args[2],
-                int_args[3],
-                int_args[4],
-                int_args[5],
-                int_args[6],
-                int_args[7],
-            )
-        }
-        (ni, nf) => {
-            panic!(
-                "bh_call_i: unsupported arg combination ({ni} ints, {nf} floats); \
+    unsafe {
+        type I = i64;
+        type F = f64;
+        match (int_args.len(), float_args.len()) {
+            // No float args — integer-only calls.
+            (0, 0) => {
+                let f: unsafe extern "C" fn() -> I = std::mem::transmute(func);
+                f()
+            }
+            (1, 0) => {
+                let f: unsafe extern "C" fn(I) -> I = std::mem::transmute(func);
+                f(int_args[0])
+            }
+            (2, 0) => {
+                let f: unsafe extern "C" fn(I, I) -> I = std::mem::transmute(func);
+                f(int_args[0], int_args[1])
+            }
+            (3, 0) => {
+                let f: unsafe extern "C" fn(I, I, I) -> I = std::mem::transmute(func);
+                f(int_args[0], int_args[1], int_args[2])
+            }
+            (4, 0) => {
+                let f: unsafe extern "C" fn(I, I, I, I) -> I = std::mem::transmute(func);
+                f(int_args[0], int_args[1], int_args[2], int_args[3])
+            }
+            (5, 0) => {
+                let f: unsafe extern "C" fn(I, I, I, I, I) -> I = std::mem::transmute(func);
+                f(
+                    int_args[0],
+                    int_args[1],
+                    int_args[2],
+                    int_args[3],
+                    int_args[4],
+                )
+            }
+            (6, 0) => {
+                let f: unsafe extern "C" fn(I, I, I, I, I, I) -> I = std::mem::transmute(func);
+                f(
+                    int_args[0],
+                    int_args[1],
+                    int_args[2],
+                    int_args[3],
+                    int_args[4],
+                    int_args[5],
+                )
+            }
+            // Float-only calls.
+            (0, 1) => {
+                let f: unsafe extern "C" fn(F) -> I = std::mem::transmute(func);
+                f(float_args[0])
+            }
+            (0, 2) => {
+                let f: unsafe extern "C" fn(F, F) -> I = std::mem::transmute(func);
+                f(float_args[0], float_args[1])
+            }
+            // Mixed int + float calls.
+            (1, 1) => {
+                let f: unsafe extern "C" fn(I, F) -> I = std::mem::transmute(func);
+                f(int_args[0], float_args[0])
+            }
+            (2, 1) => {
+                let f: unsafe extern "C" fn(I, I, F) -> I = std::mem::transmute(func);
+                f(int_args[0], int_args[1], float_args[0])
+            }
+            (1, 2) => {
+                let f: unsafe extern "C" fn(I, F, F) -> I = std::mem::transmute(func);
+                f(int_args[0], float_args[0], float_args[1])
+            }
+            (2, 2) => {
+                let f: unsafe extern "C" fn(I, I, F, F) -> I = std::mem::transmute(func);
+                f(int_args[0], int_args[1], float_args[0], float_args[1])
+            }
+            (3, 1) => {
+                let f: unsafe extern "C" fn(I, I, I, F) -> I = std::mem::transmute(func);
+                f(int_args[0], int_args[1], int_args[2], float_args[0])
+            }
+            (4, 1) => {
+                let f: unsafe extern "C" fn(I, I, I, I, F) -> I = std::mem::transmute(func);
+                f(
+                    int_args[0],
+                    int_args[1],
+                    int_args[2],
+                    int_args[3],
+                    float_args[0],
+                )
+            }
+            (3, 2) => {
+                let f: unsafe extern "C" fn(I, I, I, F, F) -> I = std::mem::transmute(func);
+                f(
+                    int_args[0],
+                    int_args[1],
+                    int_args[2],
+                    float_args[0],
+                    float_args[1],
+                )
+            }
+            (0, 3) => {
+                let f: unsafe extern "C" fn(F, F, F) -> I = std::mem::transmute(func);
+                f(float_args[0], float_args[1], float_args[2])
+            }
+            (0, 4) => {
+                let f: unsafe extern "C" fn(F, F, F, F) -> I = std::mem::transmute(func);
+                f(float_args[0], float_args[1], float_args[2], float_args[3])
+            }
+            (1, 3) => {
+                let f: unsafe extern "C" fn(I, F, F, F) -> I = std::mem::transmute(func);
+                f(int_args[0], float_args[0], float_args[1], float_args[2])
+            }
+            (7, 0) => {
+                let f: unsafe extern "C" fn(I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
+                f(
+                    int_args[0],
+                    int_args[1],
+                    int_args[2],
+                    int_args[3],
+                    int_args[4],
+                    int_args[5],
+                    int_args[6],
+                )
+            }
+            (8, 0) => {
+                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I) -> I =
+                    std::mem::transmute(func);
+                f(
+                    int_args[0],
+                    int_args[1],
+                    int_args[2],
+                    int_args[3],
+                    int_args[4],
+                    int_args[5],
+                    int_args[6],
+                    int_args[7],
+                )
+            }
+            (ni, nf) => {
+                panic!(
+                    "bh_call_i: unsupported arg combination ({ni} ints, {nf} floats); \
                  needs libffi for general dispatch"
-            );
+                );
+            }
         }
     }
 }
@@ -14573,7 +14542,7 @@ mod tests {
         let mut data: Vec<i64> = vec![0, 0];
         let ptr = data.as_mut_ptr() as usize;
 
-        let _frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Int(99)]);
+        backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Int(99)]);
         assert_eq!(data[1], 99);
     }
 
@@ -14666,7 +14635,7 @@ mod tests {
         let ptr = data.as_mut_ptr() as usize;
 
         // Set item at index 2 to 42
-        let _frame = backend.execute_token(
+        backend.execute_token(
             &token,
             &[Value::Ref(GcRef(ptr)), Value::Int(2), Value::Int(42)],
         );
@@ -15160,7 +15129,7 @@ mod tests {
         let ptr = data.as_mut_ptr() as usize;
 
         let stored = GcRef(0xFEED_FACEusize);
-        let _frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Ref(stored)]);
+        backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Ref(stored)]);
         assert_eq!(data[1] as usize, stored.0);
     }
 
@@ -15473,7 +15442,7 @@ mod tests {
 
         // Execute with x = 0 (guard fails) multiple times
         for i in 1..=5 {
-            let _frame = backend.execute_token(&token, &[Value::Int(0)]);
+            backend.execute_token(&token, &[Value::Int(0)]);
             let compiled = token
                 .compiled
                 .as_ref()
@@ -15485,7 +15454,7 @@ mod tests {
         }
 
         // Execute with x = 1 (guard passes, reaches finish)
-        let _frame = backend.execute_token(&token, &[Value::Int(1)]);
+        backend.execute_token(&token, &[Value::Int(1)]);
         let compiled = token
             .compiled
             .as_ref()
@@ -15663,7 +15632,7 @@ mod tests {
         ];
         let ptr = data.as_mut_ptr() as usize;
 
-        let _frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
         assert_eq!(&data[16..20], &[1, 2, 3, 4]);
         assert_eq!(&data[20..28], &[0, 0, 0, 0, 0, 0, 0, 0]);
     }
@@ -16531,7 +16500,7 @@ mod tests {
         }
         let obj = GcRef(raw.as_mut_ptr() as usize + GcHeader::SIZE);
 
-        let _frame = backend.execute_token(&token, &[Value::Ref(obj)]);
+        backend.execute_token(&token, &[Value::Ref(obj)]);
         assert!(!unsafe { header_of(obj.0).has_flag(flags::TRACK_YOUNG_PTRS) });
     }
 

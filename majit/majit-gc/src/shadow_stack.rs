@@ -217,11 +217,9 @@ pub fn pop_jf_to(depth: usize) {
 /// Current depth of the jitframe shadow stack.
 pub fn jf_depth() -> usize {
     ensure_root_stack_init();
-    unsafe {
-        let base = JF_ROOT_STACK.data.get() as usize;
-        let top = ROOT_STACK_TOP.load(Ordering::Acquire);
-        (top - base) / (2 * WORD)
-    }
+    let base = JF_ROOT_STACK.data.get() as usize;
+    let top = ROOT_STACK_TOP.load(Ordering::Acquire);
+    (top - base) / (2 * WORD)
 }
 
 /// Walk jitframe shadow stack entries as GC roots.

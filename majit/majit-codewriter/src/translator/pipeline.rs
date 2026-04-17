@@ -11,10 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::OpcodeDispatchSelector;
 use crate::flatten::{self, SSARepr};
 use crate::front::SemanticFunction;
-use crate::jtransform::{GraphTransformConfig, GraphTransformResult, rewrite_graph};
-use crate::model::FunctionGraph;
-use crate::translator::annotator::annrpython::{AnnotationState, annotate};
-use crate::translator::rtyper::rtyper::{TypeResolutionState, resolve_types};
+use crate::jtransform::{GraphTransformConfig, rewrite_graph};
+use crate::translator::annotator::annrpython::annotate;
+use crate::translator::rtyper::rtyper::resolve_types;
 
 /// Configuration for the full analysis pipeline.
 ///

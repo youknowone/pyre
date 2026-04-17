@@ -1302,7 +1302,7 @@ mod tests {
         let i0 = rec2.record_input_arg(Type::Int);
         rec2.close_loop(&[i0]);
         // Manually break the invariant for testing the assertion message
-        let mut rec3 = Trace {
+        let rec3 = Trace {
             ops: vec![],
             inputargs: vec![InputArg::from_type(Type::Int, 0)],
             op_count: 1,

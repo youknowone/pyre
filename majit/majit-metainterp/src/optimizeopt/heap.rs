@@ -1737,7 +1737,7 @@ impl OptHeap {
             }
         }
 
-        let struct_ref = ctx.ensure_ptr_info_arg0(op);
+        let _struct_ref = ctx.ensure_ptr_info_arg0(op);
 
         // heap.py:103-120: getfield_from_cache — 3-way aliasing check.
         let (raw_obj, field_idx) = key;
@@ -2346,7 +2346,6 @@ impl OptHeap {
                 // heap.py:316-317 cache_varindex_write -- cache this write so that
                 // a subsequent read with the same variable index can hit.
                 if let Some(descr) = op.descr.as_ref() {
-                    let descr_idx = descr.index();
                     let arrayinfo = ctx.get_box_replacement(op.arg(0));
                     let indexbox = ctx.get_box_replacement(op.arg(1));
                     let resbox = ctx.get_box_replacement(op.arg(2));
@@ -2769,7 +2768,6 @@ impl OptHeap {
                 for pending_op in pending_virtual {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
                         let descr = pending_op.descr.as_ref().unwrap().clone();
-                        let descr_idx = descr.index();
                         if let Some(index) = ctx.get_constant_int(pending_op.arg(1)) {
                             let array = ctx.get_box_replacement(pending_op.arg(0));
                             let cai = self.arrayitem_cache(&descr, index);
@@ -3336,7 +3334,6 @@ impl Optimization for OptHeap {
             if box1.is_none() || box2.is_none() {
                 continue;
             }
-            let descr_idx = descr.index();
             let resolved = ctx.get_box_replacement(*box1);
             // heap.py:886-892:
             //     if box1.is_constant(): arrayinfo = info.ConstPtrInfo(box1)
@@ -3381,7 +3378,7 @@ mod tests {
 
     use majit_ir::{
         CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, FieldDescr, OopSpecIndex, Op, OpCode,
-        OpRef, SimpleCallDescr, SizeDescr, Type,
+        OpRef, SizeDescr, Type,
     };
 
     use crate::optimizeopt::info::PtrInfo;
@@ -3684,7 +3681,6 @@ mod tests {
     #[test]
     fn test_imported_short_field_not_reused_after_invalidation() {
         let d_head = object_descr(10); // head field
-        let d_size = descr(11); // size field (different)
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 4);
         initialize_imported_short_heap_field(
@@ -4357,7 +4353,6 @@ mod tests {
         let descr =
             majit_ir::make_field_descr(55, 8, majit_ir::Type::Ref, majit_ir::ArrayFlag::Pointer);
         let mut pass = OptHeap::new();
-        let key = (OpRef(100), descr.index());
         pass.cache_field(OpRef(100), descr.index(), Some(&descr));
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[

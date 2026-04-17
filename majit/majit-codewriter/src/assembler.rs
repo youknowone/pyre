@@ -395,21 +395,21 @@ impl Assembler {
             // RPython jtransform.py:414-435: rewrite_call splits args
             // by kind via make_three_lists.
             OpKind::CallResidual {
-                descriptor,
+                descriptor: _,
                 args_i,
                 args_r,
                 args_f,
                 result_kind,
             }
             | OpKind::CallMayForce {
-                descriptor,
+                descriptor: _,
                 args_i,
                 args_r,
                 args_f,
                 result_kind,
             }
             | OpKind::CallElidable {
-                descriptor,
+                descriptor: _,
                 args_i,
                 args_r,
                 args_f,
@@ -755,7 +755,7 @@ impl Assembler {
     fn kinds_suffix(
         &self,
         args_i: &[ValueId],
-        args_r: &[ValueId],
+        _args_r: &[ValueId],
         args_f: &[ValueId],
     ) -> &'static str {
         if !args_f.is_empty() {

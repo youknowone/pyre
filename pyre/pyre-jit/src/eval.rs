@@ -1115,6 +1115,8 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
             // warmspot.py:998-1005: ExitFrameWithExceptionRef → re-raise.
             #[cfg(feature = "cranelift")]
             majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
+            #[cfg(not(feature = "cranelift"))]
+            let _ = err;
             pyre_object::PY_NULL
         }
     }
@@ -1384,7 +1386,7 @@ enum HandleFailOutcome {
 /// pyre: returns BlackholeResult (equivalent to RPython's exceptions).
 fn handle_fail(
     frame: &mut PyFrame,
-    green_key: u64,
+    _green_key: u64,
     trace_id: u64,
     fail_index: u32,
     should_bridge: bool,
@@ -1561,7 +1563,7 @@ fn execute_assembler(
             raw_int_result,
             ..
         } => {
-            let raw_int_result = raw_int_result || driver.has_raw_int_finish(green_key);
+            let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
@@ -1898,7 +1900,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 green_key,
                 debug_first_arg_int(frame),
                 call_depth(),
-                driver.has_raw_int_finish(green_key)
+                driver.has_raw_int_finish()
             );
         }
         let env = PyreEnv;
@@ -2067,7 +2069,7 @@ fn handle_jit_outcome(
             ..
         } => {
             let (driver, _) = driver_pair();
-            let raw_int_result = raw_int_result || driver.has_raw_int_finish(green_key);
+            let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
@@ -2915,25 +2917,6 @@ pub(crate) fn build_blackhole_frames_from_deadframe(
     LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
 }
 
-/// resume.py:1312 blackhole_from_resumedata parity:
-/// Build resumed frames directly from deadframe without thread-local storage.
-/// Used by call_assembler_guard_failure path where the thread-local may be
-/// consumed by try_function_entry_jit's resume path.
-pub(crate) fn build_resumed_frames_from_deadframe(
-    raw_values: &[i64],
-    exit_layout: &CompiledExitLayout,
-) -> Vec<crate::call_jit::ResumedFrame> {
-    let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
-    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-    if !rd_numb.is_empty() {
-        // consume_vable=true: blackhole path.
-        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, true)
-    } else {
-        let typed = decode_exit_layout_values(raw_values, exit_layout);
-        build_blackhole_frames_fallback(&typed)
-    }
-}
-
 fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::ResumedFrame> {
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_LAST_INSTR_IDX as usize;
@@ -2996,7 +2979,7 @@ fn rebuild_typed_from_rd_numb(
     rd_consts: &[(i64, majit_ir::Type)],
     exit_layout: &CompiledExitLayout,
 ) -> (Vec<Value>, Option<usize>) {
-    use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+    use majit_ir::resumedata::rebuild_from_numbering;
 
     let (_num_failargs, vable_values, _vref_values, frames) =
         rebuild_from_numbering(rd_numb, rd_consts, &exit_layout.exit_types, None);
@@ -3083,7 +3066,6 @@ fn rebuild_typed_from_rd_numb(
     if let Some(outermost) = frames.last() {
         _prepare_next_section(
             outermost,
-            raw_values,
             &dead_frame_typed,
             exit_layout,
             &mut typed,
@@ -3192,7 +3174,6 @@ fn build_resumed_frames(
         let mut values = Vec::new();
         _prepare_next_section(
             frame,
-            raw_values,
             &dead_frame_typed,
             exit_layout,
             &mut values,
@@ -3249,7 +3230,7 @@ fn build_resumed_frames(
         );
     }
 
-    let mut vable_frame_ptr = resolved_vable
+    let vable_frame_ptr = resolved_vable
         .first()
         .map(|v| match v {
             Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
@@ -3530,7 +3511,6 @@ fn build_resumed_frames(
 /// from rd_numb tagged values into typed Value vector.
 fn _prepare_next_section(
     frame: &majit_ir::resumedata::RebuiltFrame,
-    raw_values: &[i64],
     dead_frame_typed: &[Value],
     exit_layout: &CompiledExitLayout,
     typed: &mut Vec<Value>,

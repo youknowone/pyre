@@ -860,7 +860,7 @@ impl<S: JitState> JitDriver<S> {
                     // pyjitpl.py:2993-3007: compile_loop checks
                     // has_partial_trace internally and dispatches to
                     // compile_retrace when appropriate.
-                    let _outcome = self.meta.compile_loop(&jump_args, meta);
+                    self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!("[mp] abort:validate_close");
@@ -943,7 +943,7 @@ impl<S: JitState> JitDriver<S> {
                     // pyjitpl.py:2993-3007: compile_loop checks
                     // has_partial_trace internally and dispatches to
                     // compile_retrace when appropriate.
-                    let _outcome = self.meta.compile_loop(&jump_args, meta);
+                    self.meta.compile_loop(&jump_args, meta);
                 } else {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -976,7 +976,7 @@ impl<S: JitState> JitDriver<S> {
                     }
                     // pyjitpl.py:3217: record FINISH + compile via compile_trace.
                     let finish_descr = crate::make_fail_descr_typed(finish_arg_types.clone());
-                    let _outcome = self.meta.compile_trace_finish(
+                    self.meta.compile_trace_finish(
                         bridge_key,
                         &finish_args,
                         Some((bridge_trace_id, bridge_fail_index)),
@@ -1145,7 +1145,7 @@ impl<S: JitState> JitDriver<S> {
     /// and compiled-code entry belong to `can_enter_jit`/function-entry paths.
     pub fn jit_merge_point_keyed<F>(
         &mut self,
-        green_key: u64,
+        _green_key: u64,
         target_pc: usize,
         _state: &mut S,
         _env: &S::Env,
@@ -1290,7 +1290,6 @@ impl<S: JitState> JitDriver<S> {
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
             let descr_addr = result.descr_addr;
-            let _exit_meta = result.meta.clone();
             drop(result);
 
             // must_compile tick for bridge threshold counting.
@@ -2082,7 +2081,7 @@ impl<S: JitState> JitDriver<S> {
             return DetailedDriverRunOutcome::Finished {
                 typed_values: result.typed_values,
                 via_blackhole: false,
-                raw_int_result: self.meta.has_raw_int_finish(green_key),
+                raw_int_result: self.meta.has_raw_int_finish(),
             };
         }
 
@@ -2106,7 +2105,7 @@ impl<S: JitState> JitDriver<S> {
         green_key: u64,
         target_pc: usize,
         state: &mut S,
-        env: &S::Env,
+        _env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> DetailedDriverRunOutcome {
         let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
@@ -2228,7 +2227,7 @@ impl<S: JitState> JitDriver<S> {
             return DetailedDriverRunOutcome::Finished {
                 typed_values,
                 via_blackhole: false,
-                raw_int_result: self.meta.has_raw_int_finish(green_key),
+                raw_int_result: self.meta.has_raw_int_finish(),
             };
         }
 
@@ -2413,8 +2412,8 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
-    pub fn has_raw_int_finish(&self, green_key: u64) -> bool {
-        self.meta.has_raw_int_finish(green_key)
+    pub fn has_raw_int_finish(&self) -> bool {
+        self.meta.has_raw_int_finish()
     }
 
     /// Get the loop token number for a compiled loop.
@@ -3019,7 +3018,7 @@ impl<S: JitState> JitDriver<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resume::{ReconstructedFrame, ReconstructedState, ReconstructedValue};
+    use crate::resume::ReconstructedFrame;
     use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
 
     #[derive(Default)]
@@ -3471,7 +3470,7 @@ mod tests {
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0);
-            let _val = ctx.const_int(42);
+            ctx.const_int(42);
             ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[i0]);
         }
         driver.meta.compile_loop(&[OpRef(0)], ());
@@ -3683,7 +3682,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
             let i0 = OpRef(0); // bridge input from start_retrace
             let c2 = ctx.const_int(2);
-            let _sum = ctx.record_op(OpCode::IntAdd, &[i0, c2]);
+            ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
         let trace_id = 0u64; // will be normalized to root_trace_id
         let result = driver

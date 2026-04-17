@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -624,7 +624,7 @@ impl UnrollOptimizer {
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
         // `phase1_value_types` untranslated.
-        let mut p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
+        let p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
             &p2_ops_in,
             &mut consts_p2,
             body_num_inputs,
@@ -3395,7 +3395,6 @@ impl OptUnroll {
                     // Register type for the new OpRef (RPython Box.type parity).
                     ctx.value_types.insert(value.0, result_type);
                     ctx.replace_op(source, value);
-                    let descr_idx = descr.index();
                     // shortpreamble.py:72,84 parity: canonicalize obj through
                     // get_box_replacement so the key matches heap.py lookup
                     // which also canonicalizes array via get_box_replacement.
@@ -3687,7 +3686,7 @@ fn assemble_peeled_trace_with_jump_args(
         filtered_extra_jump_args.push(jump_arg);
     }
 
-    let mut next_free_pos = |mut next: u32| {
+    let next_free_pos = |mut next: u32| {
         next = next.max(inputarg_base + body_num_inputs as u32);
         while constants.contains_key(&next) {
             next += 1;
@@ -3888,8 +3887,6 @@ fn assemble_peeled_trace_with_jump_args(
             max_pos = max_pos.max(entry.result.0.saturating_add(1));
         }
     }
-    max_pos = next_free_pos(max_pos);
-
     // RPython compile.py:327 extra_same_as parity. Every extra label arg
     // must be defined before the label — either by a preamble op or by
     // an explicit SameAs bridge between preamble and label. In RPython
@@ -4621,6 +4618,7 @@ impl Optimization for OptUnroll {
 mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::GcRef;
 
     /// Assign sequential positions to ops starting from `base`.
     fn assign_positions(ops: &mut [Op], base: u32) {
@@ -5148,7 +5146,7 @@ mod tests {
         // Peeled iteration refs:
         let p0 = result[0].pos;
         let p1 = result[1].pos;
-        let p2 = result[2].pos;
+        let _p2 = result[2].pos;
         assert_eq!(result[1].args[0], p0, "peeled v1 should ref peeled v0");
         assert_eq!(result[2].args[0], p1, "peeled v2 should ref peeled v1");
         assert_eq!(result[2].args[1], p0, "peeled v2 should ref peeled v0");

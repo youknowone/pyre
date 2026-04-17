@@ -4,7 +4,7 @@ use crate::optimizeopt::intutils::IntBound;
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()

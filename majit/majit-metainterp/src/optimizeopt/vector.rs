@@ -30,9 +30,9 @@
 /// - Only operates on loop bodies (Label..Jump)
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use majit_ir::{AccumVectorInfo, Op, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -164,7 +164,7 @@ impl VectorLoop {
 
         // Update jump args
         if let Some(ref mut jump) = self.jump {
-            for arg in &mut jump.args {
+            for _arg in &mut jump.args {
                 // Use latest remap if available
             }
         }
@@ -182,7 +182,7 @@ pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<u
     }
 
     let mut current_refs = vec![result_ref];
-    for depth in 0..max_depth {
+    for _depth in 0..max_depth {
         let mut next_refs = Vec::new();
         for (i, op) in ops.iter().enumerate() {
             if chain.contains(&i) {

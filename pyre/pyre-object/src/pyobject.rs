@@ -158,7 +158,7 @@ pub fn ll_cast_to_object(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must be a valid non-null `PyObject`.
 #[inline]
 pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
-    (*obj).ob_type
+    unsafe { (*obj).ob_type }
 }
 
 /// rclass.py:1133-1137 `ll_issubclass(subcls, cls)`.
@@ -215,10 +215,12 @@ pub unsafe fn ll_isinstance(obj: PyObjectRef, cls: &PyType) -> bool {
 /// If non-null, `obj` must be a valid `PyObject`.
 #[inline]
 pub unsafe fn ll_inst_type(obj: PyObjectRef) -> *const PyType {
-    if !obj.is_null() {
-        (*obj).ob_type
-    } else {
-        std::ptr::null()
+    unsafe {
+        if !obj.is_null() {
+            (*obj).ob_type
+        } else {
+            std::ptr::null()
+        }
     }
 }
 

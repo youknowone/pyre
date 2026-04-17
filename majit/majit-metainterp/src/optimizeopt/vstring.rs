@@ -1539,7 +1539,7 @@ mod tests {
     #[test]
     fn test_slice_get_char() {
         // Build a virtual plain string, create a slice, get a character.
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
         // source = "abc" (chars at indices 0, 1, 2)
@@ -1895,7 +1895,6 @@ mod tests {
         pass.setup();
 
         let left = OpRef(100);
-        let right = OpRef(101);
 
         // Simulate: NEWSTR(2) for left
         let mut left_op = Op::new(OpCode::Newstr, &[OpRef(200)]);

@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
-use crate::model::{Block, FunctionGraph, OpKind, Terminator, ValueId};
+use crate::model::{Block, FunctionGraph, Terminator, ValueId};
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 
@@ -206,7 +206,7 @@ impl RegAllocator {
     fn process_block(
         &mut self,
         block: &Block,
-        graph: &FunctionGraph,
+        _graph: &FunctionGraph,
         consider: &dyn Fn(ValueId) -> bool,
     ) {
         // die_at: last usage index of each variable in this block.

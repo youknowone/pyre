@@ -6,7 +6,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Expr, Fields, Ident, LitStr, Meta, Path, Token, braced,
+    Expr, Ident, LitStr, Path, Token, braced,
     ext::IdentExt,
     parse::{Parse, ParseStream},
 };
@@ -33,7 +33,7 @@ struct InputArgField {
 // Parsed macro configuration.
 // ═══════════════════════════════════════════════════════════════
 
-struct VirtualizableMacroInput {
+pub(crate) struct VirtualizableMacroInput {
     state_type: Ident,
     decl: VirtualizableDecl,
     heap_ptr_expr: Expr,
@@ -265,7 +265,7 @@ fn ir_value_ctor(ir_type: &Ident, expr: TokenStream) -> TokenStream {
     }
 }
 
-pub fn expand(input: VirtualizableMacroInput) -> TokenStream {
+pub(crate) fn expand(input: VirtualizableMacroInput) -> TokenStream {
     let state_type = &input.state_type;
     let decl = &input.decl;
     let heap_ptr_expr = &input.heap_ptr_expr;

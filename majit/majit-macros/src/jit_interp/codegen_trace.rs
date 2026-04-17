@@ -26,7 +26,6 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let promote_preamble = quote! {}; // arm preamble not used; promote goes in trace fn
 
     let lowerer_config = LowererConfig::new(
-        &config.binops,
         &config.io_shims,
         &config.calls,
         config.auto_calls,

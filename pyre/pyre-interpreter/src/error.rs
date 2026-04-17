@@ -252,12 +252,14 @@ impl PyError {
     /// # Safety
     /// `obj` must point to a valid `W_ExceptionObject`.
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
-        let kind = pyre_object::excobject::w_exception_get_kind(obj);
-        let message = pyre_object::excobject::w_exception_get_message(obj).to_string();
-        PyError {
-            kind: Self::kind_from_exc(kind),
-            message,
-            exc_object: obj,
+        unsafe {
+            let kind = pyre_object::excobject::w_exception_get_kind(obj);
+            let message = pyre_object::excobject::w_exception_get_message(obj).to_string();
+            PyError {
+                kind: Self::kind_from_exc(kind),
+                message,
+                exc_object: obj,
+            }
         }
     }
 

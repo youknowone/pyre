@@ -88,10 +88,7 @@ pub(crate) fn info_type_matches(expected: Type, incoming: &VirtualStateInfo) -> 
 }
 
 use crate::optimizeopt::OptContext;
-use crate::optimizeopt::info::{
-    PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
-    VirtualStructInfo,
-};
+use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::intutils::IntBound;
 
 /// virtualstate.py: GenerateGuardState — context for guard generation
@@ -2134,7 +2131,8 @@ fn append_sequential_slots_rc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Descr, FieldDescr, GcRef, Op, OpCode, Type};
+    use crate::optimizeopt::info::VirtualStructInfo;
+    use majit_ir::{Descr, FieldDescr, GcRef, Type};
     use std::sync::Arc;
 
     #[derive(Debug)]

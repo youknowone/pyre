@@ -5,11 +5,10 @@
 
 use crate::state::*;
 
-use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, OpCode, OpRef, Type};
 use majit_metainterp::{TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
-use pyre_object::pyobject::{is_int_or_long, is_long};
 
 /// floatobject.py:561 `descr_pow` → `_pow(space, x, y)` parity.
 ///
@@ -56,43 +55,31 @@ pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
 }
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
-    ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
-    IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
-    PyError, PyNamespace, SharedOpcodeHandler, StackOpcodeHandler, TruthOpcodeHandler,
-    builtin_code_name, decode_instruction_at, execute_opcode_step, function_get_code,
-    function_get_globals, is_builtin_code, is_function, range_iter_continues,
+    OpcodeStepExecutor, PyError, PyNamespace, SharedOpcodeHandler, decode_instruction_at,
+    execute_opcode_step, function_get_globals, is_builtin_code, is_function, range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
-use pyre_object::boolobject::w_bool_get_value;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::pyobject::{
-    BOOL_TYPE, DICT_TYPE, FLOAT_TYPE, INT_TYPE, LIST_TYPE, NONE_TYPE, PyType, TUPLE_TYPE, is_bool,
-    is_dict, is_float, is_int, is_list, is_none, is_tuple,
+    FLOAT_TYPE, INT_TYPE, LIST_TYPE, PyType, TUPLE_TYPE, is_float, is_int, is_list, is_tuple,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
-use pyre_object::strobject::is_str;
 use pyre_object::tupleobject::w_tuple_getitem;
 use pyre_object::{
-    PY_NULL, w_bool_from, w_float_get_value, w_int_get_value, w_int_new,
-    w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len, w_list_new,
-    w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage,
-    w_str_get_value, w_tuple_len,
+    PY_NULL, w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len,
+    w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage, w_tuple_len,
 };
 
 use crate::descr::{
-    bool_boolval_descr, dict_len_descr, float_floatval_descr, int_intval_descr,
-    list_float_items_heap_cap_descr, list_float_items_len_descr, list_float_items_ptr_descr,
-    list_int_items_heap_cap_descr, list_int_items_len_descr, list_int_items_ptr_descr,
-    list_items_heap_cap_descr, list_items_len_descr, list_items_ptr_descr, list_strategy_descr,
-    namespace_values_len_descr, namespace_values_ptr_descr, ob_type_descr,
-    range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr, str_len_descr,
+    float_floatval_descr, int_intval_descr, list_items_len_descr, list_items_ptr_descr,
+    list_strategy_descr, namespace_values_len_descr, namespace_values_ptr_descr, ob_type_descr,
     tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
 };
-use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
+use crate::helpers::TraceHelperAccess;
 use crate::liveness::liveness_for;
 
 impl MIFrame {
@@ -144,7 +131,6 @@ impl MIFrame {
         Self {
             ctx,
             sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc,
             concrete_frame_addr: concrete_frame,
             orgpc,
@@ -619,7 +605,7 @@ impl MIFrame {
 
     pub(crate) fn store_local_value(
         &mut self,
-        ctx: &mut TraceCtx,
+        _ctx: &mut TraceCtx,
         idx: usize,
         value: OpRef,
     ) -> Result<(), PyError> {
@@ -1103,8 +1089,8 @@ impl MIFrame {
             nlocals,
             locals,
             stack,
-            local_types,
-            stack_types,
+            _local_types,
+            _stack_types,
         ) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();
@@ -1981,7 +1967,7 @@ impl MIFrame {
     pub(crate) fn record_branch_guard(
         &mut self,
         ctx: &mut TraceCtx,
-        branch_value: OpRef,
+        _branch_value: OpRef,
         truth: OpRef,
         concrete_truth: bool,
     ) {
@@ -2440,17 +2426,15 @@ impl MIFrame {
         // guard_class + getfield_gc_i/f + int_LT/float_LT, with
         // goto_if_not fusion truth caching).
         let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(unsafe {
-                crate::generated_compare_value_direct(
-                    this,
-                    ctx,
-                    a,
-                    b,
-                    op,
-                    concrete_lhs,
-                    concrete_rhs,
-                )
-            })
+            Ok::<_, PyError>(crate::generated_compare_value_direct(
+                this,
+                ctx,
+                a,
+                b,
+                op,
+                concrete_lhs,
+                concrete_rhs,
+            ))
         })?;
         if let Some(result) = gen_result {
             return Ok(result);
@@ -2567,9 +2551,12 @@ impl MIFrame {
         // Delegate to auto-generated function (RPython jitcode parity:
         // guard_class + getfield(length) for str/dict/list/tuple).
         let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(unsafe {
-                crate::generated_direct_len_value(this, ctx, value, concrete_value)
-            })
+            Ok::<_, PyError>(crate::generated_direct_len_value(
+                this,
+                ctx,
+                value,
+                concrete_value,
+            ))
         })?;
         if let Some(result) = gen_result {
             return Ok(result);
@@ -2584,9 +2571,12 @@ impl MIFrame {
         concrete_value: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(unsafe {
-                crate::generated_direct_abs_value(this, ctx, value, concrete_value)
-            })
+            Ok::<_, PyError>(crate::generated_direct_abs_value(
+                this,
+                ctx,
+                value,
+                concrete_value,
+            ))
         })?;
         if let Some(result) = gen_result {
             return Ok(result);
@@ -2601,9 +2591,12 @@ impl MIFrame {
         concrete_value: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(unsafe {
-                crate::generated_direct_type_value(this, ctx, value, concrete_value)
-            })
+            Ok::<_, PyError>(crate::generated_direct_type_value(
+                this,
+                ctx,
+                value,
+                concrete_value,
+            ))
         })?;
         if let Some(result) = gen_result {
             return Ok(result);
@@ -2620,16 +2613,14 @@ impl MIFrame {
         concrete_type_name: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(unsafe {
-                crate::generated_direct_isinstance_value(
-                    this,
-                    ctx,
-                    obj,
-                    type_name,
-                    concrete_obj,
-                    concrete_type_name,
-                )
-            })
+            Ok::<_, PyError>(crate::generated_direct_isinstance_value(
+                this,
+                ctx,
+                obj,
+                type_name,
+                concrete_obj,
+                concrete_type_name,
+            ))
         })?;
         if let Some(result) = gen_result {
             return Ok(result);
@@ -2647,11 +2638,9 @@ impl MIFrame {
         concrete_b: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(unsafe {
-                crate::generated_direct_minmax_value(
-                    this, ctx, a, b, choose_max, concrete_a, concrete_b,
-                )
-            })
+            Ok::<_, PyError>(crate::generated_direct_minmax_value(
+                this, ctx, a, b, choose_max, concrete_a, concrete_b,
+            ))
         })?;
         if let Some(result) = gen_result {
             return Ok(result);
@@ -2727,12 +2716,11 @@ impl MIFrame {
                 });
             }
             if is_function(concrete_callable) {
-                let w_callee_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
+                let w_callee_code = pyre_interpreter::getcode(concrete_callable);
                 let callee_key = crate::driver::make_green_key(w_callee_code, 0);
-                let callee_code = unsafe {
+                let callee_code =
                     &*(pyre_interpreter::w_code_get_ptr(w_callee_code as pyre_object::PyObjectRef)
-                        as *const CodeObject)
-                };
+                        as *const CodeObject);
                 let callee_has_loop = code_has_backward_jump(callee_code);
                 let (driver, _) = crate::driver::driver_pair();
                 let nargs = args.len();
@@ -2744,7 +2732,7 @@ impl MIFrame {
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
                 let current_function_key =
-                    crate::driver::make_green_key(unsafe { (*self.sym().jitcode).code }, 0);
+                    crate::driver::make_green_key((*self.sym().jitcode).code, 0);
                 let is_self_recursive = callee_key == current_function_key;
                 let inline_decision = driver.should_inline(callee_key);
                 let inline_framestack_active = !self.parent_frames.is_empty();
@@ -2898,7 +2886,7 @@ impl MIFrame {
                     );
                 }
                 if let Some(token_number) = driver.get_pending_token_number(callee_key) {
-                    let callee_nlocals = unsafe {
+                    let callee_nlocals = {
                         let code_ptr =
                             pyre_interpreter::get_pycode(concrete_callable) as *const CodeObject;
                         let code = &*code_ptr;
@@ -2913,7 +2901,7 @@ impl MIFrame {
                             }
                             let self_recursive_raw_arg = if is_self_recursive
                                 && nargs == 1
-                                && matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) })
+                                && matches!(concrete_arg0, Some(arg) if is_int(arg))
                             {
                                 Some(this.trace_guarded_int_payload(ctx, args[0]))
                             } else {
@@ -3289,7 +3277,7 @@ impl MIFrame {
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
-        let raw_code = unsafe {
+        let _raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                 as *const CodeObject
         };
@@ -3728,9 +3716,12 @@ impl MIFrame {
         // Delegate to auto-generated function (RPython jitcode parity:
         // type-specialized is_true via guard_class + getfield → int_ne).
         let gen_result: Option<OpRef> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(unsafe {
-                crate::generated_truth_value_direct(this, ctx, value, concrete_val)
-            })
+            Ok::<_, PyError>(crate::generated_truth_value_direct(
+                this,
+                ctx,
+                value,
+                concrete_val,
+            ))
         })?;
         if let Some(result) = gen_result {
             return Ok(result);
@@ -4044,7 +4035,7 @@ impl MIFrame {
 
             // pyjitpl.py:2506 finishframe_exception: unwind stack to handler,
             // pyjitpl.py:2517: frame.pc = target; raise ChangeFrame
-            let ncells = unsafe { (&*code).cellvars.len() + (&*code).freevars.len() };
+            let ncells = code.cellvars.len() + code.freevars.len();
             let nlocals = self.sym().nlocals;
             let target_stack_len = ncells + handler_depth;
             {

@@ -26,17 +26,17 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
 }
 
 pub unsafe fn is_slice(obj: PyObjectRef) -> bool {
-    !obj.is_null() && (*obj).ob_type == &SLICE_TYPE as *const PyType
+    unsafe { !obj.is_null() && (*obj).ob_type == &SLICE_TYPE as *const PyType }
 }
 
 pub unsafe fn w_slice_get_start(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_SliceObject)).start
+    unsafe { (*(obj as *const W_SliceObject)).start }
 }
 
 pub unsafe fn w_slice_get_stop(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_SliceObject)).stop
+    unsafe { (*(obj as *const W_SliceObject)).stop }
 }
 
 pub unsafe fn w_slice_get_step(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_SliceObject)).step
+    unsafe { (*(obj as *const W_SliceObject)).step }
 }

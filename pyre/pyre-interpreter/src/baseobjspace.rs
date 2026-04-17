@@ -3218,7 +3218,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             // then ATTR_TABLE for slot values and legacy attributes.
             let w_dict = getdict(obj);
             if !w_dict.is_null() {
-                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
+                if let Some(value) = pyre_object::w_dict_getitem_str(w_dict, name) {
                     return Ok(value);
                 }
             }
@@ -4817,7 +4817,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // For type objects, type(X) is the metaclass.
         if is_type(obj) {
             // baseobjspace.py:76 — metaclass from w_class
-            let w_metaclass = unsafe {
+            let w_metaclass = {
                 let w_class = (*obj).w_class;
                 let w_type_type = crate::typedef::w_type();
                 if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
@@ -5487,7 +5487,7 @@ mod tests {
     #[test]
     fn test_isinstance_tuple_with_non_class_raises_typeerror() {
         crate::typedef::init_typeobjects();
-        let float_type = unsafe { crate::typedef::r#type(w_float_new(0.0)).unwrap() };
+        let float_type = crate::typedef::r#type(w_float_new(0.0)).unwrap();
         let bad = w_tuple_new(vec![float_type, w_int_new(6)]);
         let err = super::isinstance(w_int_new(5), bad).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
@@ -5498,7 +5498,7 @@ mod tests {
     #[test]
     fn test_issubclass_non_class_arg1_raises_typeerror() {
         crate::typedef::init_typeobjects();
-        let int_type = unsafe { crate::typedef::r#type(w_int_new(0)).unwrap() };
+        let int_type = crate::typedef::r#type(w_int_new(0)).unwrap();
         let err = super::issubclass(w_int_new(5), int_type).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
         assert!(err.message.contains("issubclass() arg 1"));
@@ -5509,7 +5509,7 @@ mod tests {
     #[test]
     fn test_issubclass_non_class_arg2_raises_typeerror() {
         crate::typedef::init_typeobjects();
-        let int_type = unsafe { crate::typedef::r#type(w_int_new(0)).unwrap() };
+        let int_type = crate::typedef::r#type(w_int_new(0)).unwrap();
         let err = super::issubclass(int_type, w_int_new(6)).unwrap_err();
         assert!(matches!(err.kind, PyErrorKind::TypeError));
         assert!(err.message.contains("issubclass() arg 2"));
@@ -5528,7 +5528,7 @@ mod tests {
             crate::namespace_store(ns, "__bases__", w_tuple_new(vec![]));
         });
         let inner = pyre_object::instanceobject::w_instance_new(inner_type);
-        let outer_type = crate::typedef::make_builtin_type("PseudoOuter", |ns| {
+        let outer_type = crate::typedef::make_builtin_type("PseudoOuter", |_ns| {
             // closure capture is fine — make_builtin_type runs init eagerly.
         });
         // Stash __bases__ on outer's type dict pointing at the inner instance.
@@ -5602,18 +5602,16 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         }
     }
     // Fallback: try iterating with getitem(obj, i) for i=0,1,...
-    unsafe {
-        let mut i = 0i64;
-        loop {
-            match getitem(haystack, pyre_object::w_int_new(i)) {
-                Ok(item) => {
-                    if eq_w(item, needle) {
-                        return Ok(true);
-                    }
-                    i += 1;
+    let mut i = 0i64;
+    loop {
+        match getitem(haystack, pyre_object::w_int_new(i)) {
+            Ok(item) => {
+                if eq_w(item, needle) {
+                    return Ok(true);
                 }
-                Err(_) => return Ok(false), // IndexError → not found
+                i += 1;
             }
+            Err(_) => return Ok(false), // IndexError → not found
         }
     }
 }

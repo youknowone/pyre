@@ -40,46 +40,58 @@ pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
 }
 
 pub unsafe fn is_bytearray(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &BYTEARRAY_TYPE)
+    unsafe { py_type_check(obj, &BYTEARRAY_TYPE) }
 }
 
 pub unsafe fn w_bytearray_len(obj: PyObjectRef) -> usize {
-    let ba = &*(obj as *const W_BytearrayObject);
-    (*ba.data).len()
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        (*ba.data).len()
+    }
 }
 
 pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
-    let ba = &*(obj as *const W_BytearrayObject);
-    (&*ba.data)[index]
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        (&*ba.data)[index]
+    }
 }
 
 pub unsafe fn w_bytearray_setitem(obj: PyObjectRef, index: usize, value: u8) {
-    let ba = &mut *(obj as *mut W_BytearrayObject);
-    (&mut *ba.data)[index] = value;
+    unsafe {
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        (&mut *ba.data)[index] = value;
+    }
 }
 
 /// bytearray.find(sub, start) — find first occurrence of byte value.
 pub unsafe fn w_bytearray_find(obj: PyObjectRef, value: u8, start: usize) -> i64 {
-    let ba = &*(obj as *const W_BytearrayObject);
-    let data = &*ba.data;
-    for i in start..data.len() {
-        if data[i] == value {
-            return i as i64;
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        let data = &*ba.data;
+        for i in start..data.len() {
+            if data[i] == value {
+                return i as i64;
+            }
         }
+        -1
     }
-    -1
 }
 
 /// Concatenate bytearray + bytes (b'\0' * N pattern).
 pub unsafe fn w_bytearray_extend(obj: PyObjectRef, other: &[u8]) {
-    let ba = &mut *(obj as *mut W_BytearrayObject);
-    (*ba.data).extend_from_slice(other);
+    unsafe {
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        (*ba.data).extend_from_slice(other);
+    }
 }
 
 /// Get a reference to the internal data.
 pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
-    let ba = &*(obj as *const W_BytearrayObject);
-    &*ba.data
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        &*ba.data
+    }
 }
 
 #[cfg(test)]

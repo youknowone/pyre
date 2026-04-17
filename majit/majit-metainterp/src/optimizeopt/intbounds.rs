@@ -1758,7 +1758,7 @@ mod tests {
             make_op(OpCode::GuardTrue, &[OpRef(2)], 3),
         ];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         // INT_LT should be removed (replaced by constant 1)
         // GUARD_TRUE on a known constant 1 should also be removed
         assert!(
@@ -1787,7 +1787,7 @@ mod tests {
             make_op(OpCode::GuardFalse, &[OpRef(2)], 3),
         ];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty()
                 || result
@@ -1865,7 +1865,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         // The OVF should be replaced with IntAdd, and the guard removed
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntAdd),
@@ -1894,7 +1894,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntAddOvf),
             "INT_ADD_OVF should remain when overflow is possible"
@@ -1916,7 +1916,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntSub),
             "INT_SUB_OVF should be transformed to INT_SUB"
@@ -1938,7 +1938,7 @@ mod tests {
             make_op(OpCode::GuardNoOverflow, &[], 3),
         ];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.iter().any(|op| op.opcode == OpCode::IntMul),
             "INT_MUL_OVF should be transformed to INT_MUL"
@@ -1965,7 +1965,7 @@ mod tests {
             make_op(OpCode::Jump, &[OpRef(5), OpRef(5), OpRef(7)], 9),
         ];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         let guard_count = result
             .iter()
             .filter(|op| op.opcode == OpCode::GuardNoOverflow)
@@ -2049,7 +2049,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntLe, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "INT_LE should be removed when known true"
@@ -2064,7 +2064,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntGe, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "INT_GE should be removed when known true"
@@ -2206,7 +2206,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::UintLt, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "UINT_LT should be removed when known true"
@@ -2253,7 +2253,7 @@ mod tests {
     fn test_int_is_true_passthrough() {
         // RPython: IntIsTrue has no postprocess — just passes through.
         let ops = vec![make_op(OpCode::IntIsTrue, &[OpRef(0)], 1)];
-        let (result, _ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, _) = run_pass_with_bounds(&ops, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntIsTrue);
     }
@@ -2262,7 +2262,7 @@ mod tests {
     fn test_int_is_zero_passthrough() {
         // RPython: IntIsZero has no postprocess — just passes through.
         let ops = vec![make_op(OpCode::IntIsZero, &[OpRef(0)], 1)];
-        let (result, _ctx) = run_pass_with_bounds(&ops, &[]);
+        let (result, _) = run_pass_with_bounds(&ops, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntIsZero);
     }
@@ -2277,7 +2277,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntLt, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(
             result.len(),
             1,
@@ -2297,7 +2297,7 @@ mod tests {
         ];
         let ops = vec![make_op(OpCode::IntSignext, &[OpRef(0), OpRef(1)], 2)];
 
-        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, _) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(
             result.is_empty(),
             "signext should be eliminated when value fits"
@@ -2339,7 +2339,7 @@ mod tests {
             make_op(OpCode::IntLt, &[OpRef(2), OpRef(3)], 4),
         ];
 
-        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        let (result, ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // INT_ADD should remain, INT_LT should be eliminated as constant true
         assert_eq!(result.len(), 1, "only INT_ADD should remain");
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -2456,7 +2456,7 @@ mod tests {
     fn test_guard_true_int_lt_enables_add_ovf_removal() {
         use crate::optimizeopt::optimizer::Optimizer;
 
-        let mut ops = vec![
+        let ops = vec![
             make_op(OpCode::IntLt, &[OpRef(0), OpRef(1)], 2),
             make_op(OpCode::GuardTrue, &[OpRef(2)], 3),
             make_op(OpCode::IntAddOvf, &[OpRef(0), OpRef(200)], 4),

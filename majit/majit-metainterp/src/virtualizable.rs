@@ -382,9 +382,11 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn tracing_before_residual_call(&self, obj_ptr: *mut u8) {
-        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
-        assert_eq!(*token_ptr, 0, "token should be NONE before residual call");
-        *token_ptr = TOKEN_TRACING_RESCALL;
+        unsafe {
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+            assert_eq!(*token_ptr, 0, "token should be NONE before residual call");
+            *token_ptr = TOKEN_TRACING_RESCALL;
+        }
     }
 
     /// Check after residual call whether the virtualizable was forced.
@@ -395,15 +397,17 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn tracing_after_residual_call(&self, obj_ptr: *mut u8) -> bool {
-        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
-        if *token_ptr != 0 {
-            // Not forced — still TOKEN_TRACING_RESCALL
-            assert_eq!(*token_ptr, TOKEN_TRACING_RESCALL);
-            *token_ptr = 0; // Clear back to TOKEN_NONE
-            false
-        } else {
-            // Was forced — token was cleared by the force path
-            true
+        unsafe {
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+            if *token_ptr != 0 {
+                // Not forced — still TOKEN_TRACING_RESCALL
+                assert_eq!(*token_ptr, TOKEN_TRACING_RESCALL);
+                *token_ptr = 0; // Clear back to TOKEN_NONE
+                false
+            } else {
+                // Was forced — token was cleared by the force path
+                true
+            }
         }
     }
 
@@ -416,15 +420,17 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_now(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
-        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
-        let token = *token_ptr;
-        if token == TOKEN_TRACING_RESCALL {
-            // During tracing — just clear the marker
-            *token_ptr = 0;
-        } else if token != 0 {
-            // Active JIT frame — force it, then verify it cleared the token
-            force_fn(token);
-            assert_eq!(*token_ptr, 0, "force_fn should have cleared the token");
+        unsafe {
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+            let token = *token_ptr;
+            if token == TOKEN_TRACING_RESCALL {
+                // During tracing — just clear the marker
+                *token_ptr = 0;
+            } else if token != 0 {
+                // Active JIT frame — force it, then verify it cleared the token
+                force_fn(token);
+                assert_eq!(*token_ptr, 0, "force_fn should have cleared the token");
+            }
         }
     }
 
@@ -433,8 +439,10 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn read_token(&self, obj_ptr: *const u8) -> VableToken {
-        let token_ptr = obj_ptr.add(self.token_offset) as *const u64;
-        VableToken::from_raw(*token_ptr)
+        unsafe {
+            let token_ptr = obj_ptr.add(self.token_offset) as *const u64;
+            VableToken::from_raw(*token_ptr)
+        }
     }
 
     /// Write a token state to the heap.
@@ -442,8 +450,10 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_token(&self, obj_ptr: *mut u8, token: VableToken) {
-        let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
-        *token_ptr = token.to_raw();
+        unsafe {
+            let token_ptr = obj_ptr.add(self.token_offset) as *mut u64;
+            *token_ptr = token.to_raw();
+        }
     }
 
     /// virtualizable.py:71-72: self.static_field_descrs
@@ -479,7 +489,9 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn reset_vable_token(&self, obj_ptr: *mut u8) {
-        self.write_token(obj_ptr, VableToken::None);
+        unsafe {
+            self.write_token(obj_ptr, VableToken::None);
+        }
     }
 
     /// RPython parity surface: reset token from a GCREF/object pointer path.
@@ -487,7 +499,9 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn reset_token_gcref(&self, obj_ptr: *mut u8) {
-        self.reset_vable_token(obj_ptr);
+        unsafe {
+            self.reset_vable_token(obj_ptr);
+        }
     }
 
     /// RPython parity surface: force only if a token is still attached.
@@ -499,8 +513,10 @@ impl VirtualizableInfo {
         obj_ptr: *mut u8,
         force_fn: impl FnOnce(u64),
     ) {
-        if !matches!(self.read_token(obj_ptr), VableToken::None) {
-            self.force_now(obj_ptr, force_fn);
+        unsafe {
+            if !matches!(self.read_token(obj_ptr), VableToken::None) {
+                self.force_now(obj_ptr, force_fn);
+            }
         }
     }
 
@@ -510,11 +526,13 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn clear_vable_token(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
-        self.force_virtualizable_if_necessary(obj_ptr, force_fn);
-        assert!(
-            matches!(self.read_token(obj_ptr), VableToken::None),
-            "clear_vable_token must leave TOKEN_NONE"
-        );
+        unsafe {
+            self.force_virtualizable_if_necessary(obj_ptr, force_fn);
+            assert!(
+                matches!(self.read_token(obj_ptr), VableToken::None),
+                "clear_vable_token must leave TOKEN_NONE"
+            );
+        }
     }
 
     /// Convert to optimizer-level config (byte offsets only).
@@ -650,15 +668,17 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn read_field(&self, obj_ptr: *const u8, field_index: usize) -> i64 {
-        let field = &self.static_fields[field_index];
-        match field.field_type {
-            Type::Float => {
-                let ptr = obj_ptr.add(field.offset) as *const f64;
-                f64::to_bits(*ptr) as i64
-            }
-            _ => {
-                let ptr = obj_ptr.add(field.offset) as *const i64;
-                *ptr
+        unsafe {
+            let field = &self.static_fields[field_index];
+            match field.field_type {
+                Type::Float => {
+                    let ptr = obj_ptr.add(field.offset) as *const f64;
+                    f64::to_bits(*ptr) as i64
+                }
+                _ => {
+                    let ptr = obj_ptr.add(field.offset) as *const i64;
+                    *ptr
+                }
             }
         }
     }
@@ -670,15 +690,17 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_field(&self, obj_ptr: *mut u8, field_index: usize, value: i64) {
-        let field = &self.static_fields[field_index];
-        match field.field_type {
-            Type::Float => {
-                let ptr = obj_ptr.add(field.offset) as *mut f64;
-                *ptr = f64::from_bits(value as u64);
-            }
-            _ => {
-                let ptr = obj_ptr.add(field.offset) as *mut i64;
-                *ptr = value;
+        unsafe {
+            let field = &self.static_fields[field_index];
+            match field.field_type {
+                Type::Float => {
+                    let ptr = obj_ptr.add(field.offset) as *mut f64;
+                    *ptr = f64::from_bits(value as u64);
+                }
+                _ => {
+                    let ptr = obj_ptr.add(field.offset) as *mut i64;
+                    *ptr = value;
+                }
             }
         }
     }
@@ -693,19 +715,21 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn get_array_length(&self, obj_ptr: *const u8, array_index: usize) -> usize {
-        let ai = &self.array_fields[array_index];
-        match ai.storage {
-            VableArrayStorage::DirectPointer => {
-                let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
-                if array_ptr.is_null() {
-                    0
-                } else {
-                    *(array_ptr.add(ai.length_offset) as *const usize)
+        unsafe {
+            let ai = &self.array_fields[array_index];
+            match ai.storage {
+                VableArrayStorage::DirectPointer => {
+                    let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
+                    if array_ptr.is_null() {
+                        0
+                    } else {
+                        *(array_ptr.add(ai.length_offset) as *const usize)
+                    }
                 }
-            }
-            VableArrayStorage::EmbeddedArray { .. } => {
-                let container = *(obj_ptr.add(ai.field_offset) as *const *const u8);
-                *(container.add(ai.length_offset) as *const usize)
+                VableArrayStorage::EmbeddedArray { .. } => {
+                    let container = *(obj_ptr.add(ai.field_offset) as *const *const u8);
+                    *(container.add(ai.length_offset) as *const usize)
+                }
             }
         }
     }
@@ -722,17 +746,19 @@ impl VirtualizableInfo {
         array_index: usize,
         item_index: usize,
     ) -> i64 {
-        let ai = &self.array_fields[array_index];
-        let array_ptr = ai.data_ptr(obj_ptr);
-        let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
-        match ai.item_type {
-            Type::Float => {
-                let ptr = array_ptr.add(item_offset) as *const f64;
-                f64::to_bits(*ptr) as i64
-            }
-            _ => {
-                let ptr = array_ptr.add(item_offset) as *const i64;
-                *ptr
+        unsafe {
+            let ai = &self.array_fields[array_index];
+            let array_ptr = ai.data_ptr(obj_ptr);
+            let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
+            match ai.item_type {
+                Type::Float => {
+                    let ptr = array_ptr.add(item_offset) as *const f64;
+                    f64::to_bits(*ptr) as i64
+                }
+                _ => {
+                    let ptr = array_ptr.add(item_offset) as *const i64;
+                    *ptr
+                }
             }
         }
     }
@@ -750,17 +776,19 @@ impl VirtualizableInfo {
         item_index: usize,
         value: i64,
     ) {
-        let ai = &self.array_fields[array_index];
-        let array_ptr = ai.data_ptr(obj_ptr.cast_const()) as *mut u8;
-        let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
-        match ai.item_type {
-            Type::Float => {
-                let ptr = array_ptr.add(item_offset) as *mut f64;
-                *ptr = f64::from_bits(value as u64);
-            }
-            _ => {
-                let ptr = array_ptr.add(item_offset) as *mut i64;
-                *ptr = value;
+        unsafe {
+            let ai = &self.array_fields[array_index];
+            let array_ptr = ai.data_ptr(obj_ptr.cast_const()) as *mut u8;
+            let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
+            match ai.item_type {
+                Type::Float => {
+                    let ptr = array_ptr.add(item_offset) as *mut f64;
+                    *ptr = f64::from_bits(value as u64);
+                }
+                _ => {
+                    let ptr = array_ptr.add(item_offset) as *mut i64;
+                    *ptr = value;
+                }
             }
         }
     }
@@ -775,24 +803,26 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn load_list_of_boxes(&self, obj_ptr: *const u8) -> (Vec<i64>, Vec<usize>) {
-        let mut boxes = Vec::new();
-        let mut array_lengths = Vec::new();
+        unsafe {
+            let mut boxes = Vec::new();
+            let mut array_lengths = Vec::new();
 
-        // Static fields
-        for i in 0..self.static_fields.len() {
-            boxes.push(self.read_field(obj_ptr, i));
-        }
-
-        // Array fields — read lengths from actual object
-        for ai in 0..self.array_fields.len() {
-            let len = self.get_array_length(obj_ptr, ai);
-            array_lengths.push(len);
-            for ei in 0..len {
-                boxes.push(self.read_array_item(obj_ptr, ai, ei));
+            // Static fields
+            for i in 0..self.static_fields.len() {
+                boxes.push(self.read_field(obj_ptr, i));
             }
-        }
 
-        (boxes, array_lengths)
+            // Array fields — read lengths from actual object
+            for ai in 0..self.array_fields.len() {
+                let len = self.get_array_length(obj_ptr, ai);
+                array_lengths.push(len);
+                for ei in 0..len {
+                    boxes.push(self.read_array_item(obj_ptr, ai, ei));
+                }
+            }
+
+            (boxes, array_lengths)
+        }
     }
 
     /// Read only the array lengths from the heap object.
@@ -802,11 +832,13 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn read_array_lengths_from_heap(&self, obj_ptr: *const u8) -> Vec<usize> {
-        self.array_fields
-            .iter()
-            .enumerate()
-            .map(|(index, _)| self.get_array_length(obj_ptr, index))
-            .collect()
+        unsafe {
+            self.array_fields
+                .iter()
+                .enumerate()
+                .map(|(index, _)| self.get_array_length(obj_ptr, index))
+                .collect()
+        }
     }
 
     /// RPython parity surface: read static boxes only.
@@ -814,11 +846,13 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn read_boxes(&self, obj_ptr: *const u8) -> Vec<i64> {
-        self.static_fields
-            .iter()
-            .enumerate()
-            .map(|(index, _)| self.read_field(obj_ptr, index))
-            .collect()
+        unsafe {
+            self.static_fields
+                .iter()
+                .enumerate()
+                .map(|(index, _)| self.read_field(obj_ptr, index))
+                .collect()
+        }
     }
 
     /// RPython parity surface: write static boxes only.
@@ -826,11 +860,13 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
-        for (index, &value) in boxes.iter().enumerate() {
-            if index >= self.static_fields.len() {
-                break;
+        unsafe {
+            for (index, &value) in boxes.iter().enumerate() {
+                if index >= self.static_fields.len() {
+                    break;
+                }
+                self.write_field(obj_ptr, index, value);
             }
-            self.write_field(obj_ptr, index, value);
         }
     }
 
@@ -843,17 +879,19 @@ impl VirtualizableInfo {
         obj_ptr: *const u8,
         array_lengths: &[usize],
     ) -> (Vec<i64>, Vec<Vec<i64>>) {
-        let static_boxes = self.read_boxes(obj_ptr);
-        let mut array_boxes = Vec::with_capacity(self.array_fields.len());
-        for (index, _) in self.array_fields.iter().enumerate() {
-            let length = array_lengths.get(index).copied().unwrap_or(0);
-            let mut values = Vec::with_capacity(length);
-            for item_index in 0..length {
-                values.push(self.read_array_item(obj_ptr, index, item_index));
+        unsafe {
+            let static_boxes = self.read_boxes(obj_ptr);
+            let mut array_boxes = Vec::with_capacity(self.array_fields.len());
+            for (index, _) in self.array_fields.iter().enumerate() {
+                let length = array_lengths.get(index).copied().unwrap_or(0);
+                let mut values = Vec::with_capacity(length);
+                for item_index in 0..length {
+                    values.push(self.read_array_item(obj_ptr, index, item_index));
+                }
+                array_boxes.push(values);
             }
-            array_boxes.push(values);
+            (static_boxes, array_boxes)
         }
-        (static_boxes, array_boxes)
     }
 
     /// Write static boxes and array boxes back to the heap object.
@@ -866,10 +904,12 @@ impl VirtualizableInfo {
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
     ) {
-        self.write_boxes(obj_ptr, static_boxes);
-        for (array_index, values) in array_boxes.iter().enumerate() {
-            for (item_index, &value) in values.iter().enumerate() {
-                self.write_array_item(obj_ptr, array_index, item_index, value);
+        unsafe {
+            self.write_boxes(obj_ptr, static_boxes);
+            for (array_index, values) in array_boxes.iter().enumerate() {
+                for (item_index, &value) in values.iter().enumerate() {
+                    self.write_array_item(obj_ptr, array_index, item_index, value);
+                }
             }
         }
     }
@@ -886,28 +926,30 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
-        let mut i = 0;
-        // Static fields
-        for fi in 0..self.static_fields.len() {
-            self.write_field(obj_ptr, fi, boxes[i]);
-            i += 1;
-        }
-        // Array elements — read actual length from heap (RPython: len(lst))
-        for ai in 0..self.array_fields.len() {
-            let len = self.get_array_length(obj_ptr, ai);
-            for ei in 0..len {
-                self.write_array_item(obj_ptr, ai, ei, boxes[i]);
+        unsafe {
+            let mut i = 0;
+            // Static fields
+            for fi in 0..self.static_fields.len() {
+                self.write_field(obj_ptr, fi, boxes[i]);
                 i += 1;
             }
+            // Array elements — read actual length from heap (RPython: len(lst))
+            for ai in 0..self.array_fields.len() {
+                let len = self.get_array_length(obj_ptr, ai);
+                for ei in 0..len {
+                    self.write_array_item(obj_ptr, ai, ei, boxes[i]);
+                    i += 1;
+                }
+            }
+            // virtualizable.py:113: assert len(boxes) == i + 1
+            assert_eq!(
+                boxes.len(),
+                i + 1,
+                "write_boxes_to_heap: boxes count mismatch (expected {}, got {})",
+                i + 1,
+                boxes.len()
+            );
         }
-        // virtualizable.py:113: assert len(boxes) == i + 1
-        assert_eq!(
-            boxes.len(),
-            i + 1,
-            "write_boxes_to_heap: boxes count mismatch (expected {}, got {})",
-            i + 1,
-            boxes.len()
-        );
     }
 
     /// Force virtualizable: write boxes to heap and clear token.
@@ -917,8 +959,10 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_from_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
-        self.write_boxes_to_heap(obj_ptr, boxes);
-        self.reset_vable_token(obj_ptr);
+        unsafe {
+            self.write_boxes_to_heap(obj_ptr, boxes);
+            self.reset_vable_token(obj_ptr);
+        }
     }
 }
 
@@ -933,15 +977,17 @@ impl VableArrayInfo {
     }
 
     unsafe fn data_ptr(&self, obj_ptr: *const u8) -> *const u8 {
-        match self.storage {
-            VableArrayStorage::DirectPointer => {
-                *(obj_ptr.add(self.field_offset) as *const *const u8)
-            }
-            VableArrayStorage::EmbeddedArray { ptr_offset } => {
-                // 2-level: field_offset → pointer to container struct,
-                // then ptr_offset within that struct → data pointer.
-                let container = *(obj_ptr.add(self.field_offset) as *const *const u8);
-                *(container.add(ptr_offset) as *const *const u8)
+        unsafe {
+            match self.storage {
+                VableArrayStorage::DirectPointer => {
+                    *(obj_ptr.add(self.field_offset) as *const *const u8)
+                }
+                VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                    // 2-level: field_offset → pointer to container struct,
+                    // then ptr_offset within that struct → data pointer.
+                    let container = *(obj_ptr.add(self.field_offset) as *const *const u8);
+                    *(container.add(ptr_offset) as *const *const u8)
+                }
             }
         }
     }
@@ -1029,8 +1075,10 @@ unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
 pub unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
-    let token_ptr = obj_ptr.add(info.token_offset) as *const u64;
-    *token_ptr != 0
+    unsafe {
+        let token_ptr = obj_ptr.add(info.token_offset) as *const u64;
+        *token_ptr != 0
+    }
 }
 
 /// Force a virtualizable: flush JIT-held values back to the heap.
@@ -2222,18 +2270,20 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 /// Read the length of a virtualizable array field.
 /// blackhole.py:1406-1409 bhimpl_arraylen_vable parity.
 pub unsafe fn vable_array_len(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
-    match array.storage {
-        VableArrayStorage::EmbeddedArray { .. } => {
-            // Pointer to container struct: deref then read length
-            let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
-            *(container.add(array.length_offset) as *const usize)
-        }
-        VableArrayStorage::DirectPointer => {
-            let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
-            if arr_ptr.is_null() {
-                0
-            } else {
-                *(arr_ptr.add(array.length_offset) as *const usize)
+    unsafe {
+        match array.storage {
+            VableArrayStorage::EmbeddedArray { .. } => {
+                // Pointer to container struct: deref then read length
+                let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                *(container.add(array.length_offset) as *const usize)
+            }
+            VableArrayStorage::DirectPointer => {
+                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                if arr_ptr.is_null() {
+                    0
+                } else {
+                    *(arr_ptr.add(array.length_offset) as *const usize)
+                }
             }
         }
     }
@@ -2246,22 +2296,24 @@ pub unsafe fn vable_read_array_item(
     array: &VableArrayInfo,
     index: usize,
 ) -> i64 {
-    let item_size = 8usize; // i64/ptr size
-    let data_ptr = match array.storage {
-        VableArrayStorage::EmbeddedArray { ptr_offset } => {
-            let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
-            *(container.add(ptr_offset) as *const *const u8)
+    unsafe {
+        let item_size = 8usize; // i64/ptr size
+        let data_ptr = match array.storage {
+            VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                *(container.add(ptr_offset) as *const *const u8)
+            }
+            VableArrayStorage::DirectPointer => {
+                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                arr_ptr.add(array.items_offset)
+            }
+        };
+        if data_ptr.is_null() {
+            0
+        } else {
+            let src = data_ptr.add(index * item_size);
+            std::ptr::read(src as *const i64)
         }
-        VableArrayStorage::DirectPointer => {
-            let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
-            arr_ptr.add(array.items_offset)
-        }
-    };
-    if data_ptr.is_null() {
-        0
-    } else {
-        let src = data_ptr.add(index * item_size);
-        std::ptr::read(src as *const i64)
     }
 }
 
@@ -2273,20 +2325,22 @@ pub unsafe fn vable_write_array_item(
     index: usize,
     value: i64,
 ) {
-    let item_size = 8usize; // i64/ptr size
-    let data_ptr = match array.storage {
-        VableArrayStorage::EmbeddedArray { ptr_offset } => {
-            let container = *(vable_ptr.add(array.field_offset) as *const *mut u8);
-            *(container.add(ptr_offset) as *const *mut u8)
+    unsafe {
+        let item_size = 8usize; // i64/ptr size
+        let data_ptr = match array.storage {
+            VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                let container = *(vable_ptr.add(array.field_offset) as *const *mut u8);
+                *(container.add(ptr_offset) as *const *mut u8)
+            }
+            VableArrayStorage::DirectPointer => {
+                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *mut u8);
+                arr_ptr.add(array.items_offset)
+            }
+        };
+        if !data_ptr.is_null() {
+            let dest = data_ptr.add(index * item_size);
+            std::ptr::write(dest as *mut i64, value);
         }
-        VableArrayStorage::DirectPointer => {
-            let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *mut u8);
-            arr_ptr.add(array.items_offset)
-        }
-    };
-    if !data_ptr.is_null() {
-        let dest = data_ptr.add(index * item_size);
-        std::ptr::write(dest as *mut i64, value);
     }
 }
 
@@ -2299,11 +2353,13 @@ pub unsafe fn vable_write_array_item(
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
 pub unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
-    let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut u64;
-    let token = *token_ptr;
-    if token != 0 {
-        // TOKEN_TRACING_RESCALL or stale Active — clear unconditionally.
-        // In the blackhole, no JIT frame is active so forcing is not needed.
-        *token_ptr = 0;
+    unsafe {
+        let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut u64;
+        let token = *token_ptr;
+        if token != 0 {
+            // TOKEN_TRACING_RESCALL or stale Active — clear unconditionally.
+            // In the blackhole, no JIT frame is active so forcing is not needed.
+            *token_ptr = 0;
+        }
     }
 }

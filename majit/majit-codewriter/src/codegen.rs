@@ -1048,8 +1048,6 @@ pub fn generated_compare_value_direct(
     concrete_lhs: pyre_object::PyObjectRef,
     concrete_rhs: pyre_object::PyObjectRef,
 ) -> Option<majit_ir::OpRef> {
-    use majit_ir::OpCode;
-
     if concrete_lhs.is_null() || concrete_rhs.is_null() {
         return None;
     }

@@ -580,7 +580,7 @@ impl CallControl {
         };
         // RPython: basesize, itemsize, _ = symbolic.get_array_token(ARRAY, tsc)
         let base_size = self.array_header_size;
-        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+        let ad = majit_ir::descr::SimpleArrayDescr::with_flag(
             idx, base_size, item_size, 0, ir_type, flag,
         );
         // RPython: descr.py:372-375 — struct arrays get interior field descriptors.
@@ -1191,12 +1191,6 @@ impl CallControl {
     /// - `analyze_external_call`: `getattr(fnobj, 'canraise', True)`
     /// - `analyze_exceptblock_in_graph`: checks except blocks
     ///
-    /// In majit we check per-operation canraise metadata via `op_can_raise()`,
-    /// Abort terminators, and transitive Call analysis.
-    fn analyze_can_raise(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
-        self.analyze_can_raise_impl(path, seen, false)
-    }
-
     /// Shared implementation for both raise analyzers.
     ///
     /// RPython has two separate RaiseAnalyzer instances (call.py:34-36):
@@ -2489,7 +2483,7 @@ fn get_type_flag(type_str: &str) -> (majit_ir::descr::ArrayFlag, majit_ir::value
 /// Returns true if the operation itself (not counting transitive calls)
 /// can raise an exception. When `ignore_memoryerror` is true, operations
 /// that can only raise MemoryError are treated as non-raising.
-fn op_can_raise(op: &OpKind, ignore_memoryerror: bool) -> bool {
+fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
     // RPython canraise.py:14-17:
     //   canraise = LL_OPERATIONS[op.opname].canraise
     //   return bool(canraise) and canraise != (self.ignore_exact_class,)
@@ -2626,34 +2620,12 @@ pub fn is_generic_receiver(receiver: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallTargetPattern {
-    Method {
-        name: &'static str,
-        receiver_root: Option<&'static str>,
-    },
     FunctionPath(&'static [&'static str]),
 }
 
 impl CallTargetPattern {
     fn matches(self, target: &CallTarget) -> bool {
         match (self, target) {
-            (
-                CallTargetPattern::Method {
-                    name,
-                    receiver_root,
-                },
-                CallTarget::Method {
-                    name: target_name,
-                    receiver_root: target_root,
-                },
-            ) => {
-                if target_name != name {
-                    return false;
-                }
-                receiver_root.is_none_or(|root| {
-                    target_root.as_deref() == Some(root)
-                        || target_root.as_ref().is_some_and(|r| is_generic_receiver(r))
-                })
-            }
             (CallTargetPattern::FunctionPath(path), CallTarget::FunctionPath { segments }) => {
                 segments.iter().map(String::as_str).eq(path.iter().copied())
             }
@@ -3000,7 +2972,7 @@ mod tests {
 
     // ── getcalldescr tests ───────────────────────────���──────────────
 
-    use crate::model::{Block, SpaceOperation, Terminator, ValueId, ValueType};
+    use crate::model::{Terminator, ValueType};
 
     /// Helper: create a FunctionGraph with just a return.
     fn simple_graph(name: &str) -> FunctionGraph {

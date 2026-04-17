@@ -21,13 +21,6 @@ fn vb_insert(v: &mut Vec<bool>, opref: OpRef) {
     v[i] = true;
 }
 #[inline(always)]
-fn vb_contains(v: &[bool], opref: &OpRef) -> bool {
-    if opref.is_constant() {
-        return false;
-    }
-    v.get(opref.0 as usize).copied().unwrap_or(false)
-}
-#[inline(always)]
 fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
     if opref.is_constant() {
         return false;
@@ -133,6 +126,7 @@ impl CacheEntry {
     }
 
     /// heapcache.py:90-94 do_write_with_aliasing
+    #[allow(dead_code)]
     pub fn do_write_with_aliasing(&mut self, ref_box: OpRef, fieldbox: OpRef, cache: &HeapCache) {
         let ref_box = self._unique_const_heuristic(ref_box);
         let seen_alloc = self._seen_alloc(ref_box, cache);
@@ -152,6 +146,7 @@ impl CacheEntry {
     }
 
     /// heapcache.py:106-114 read
+    #[allow(dead_code)]
     pub fn read(&mut self, ref_box: OpRef, cache: &HeapCache) -> Option<OpRef> {
         let ref_box = self._unique_const_heuristic(ref_box);
         let seen_alloc = self._seen_alloc(ref_box, cache);
@@ -162,6 +157,7 @@ impl CacheEntry {
     }
 
     /// heapcache.py:116-119 read_now_known
+    #[allow(dead_code)]
     pub fn read_now_known(&mut self, ref_box: OpRef, fieldbox: OpRef, cache: &HeapCache) {
         let ref_box = self._unique_const_heuristic(ref_box);
         let seen_alloc = self._seen_alloc(ref_box, cache);

@@ -166,24 +166,26 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
 
 /// Format for str() — tries __str__ first, then __repr__.
 pub unsafe fn py_str(obj: PyObjectRef) -> String {
-    let obj = crate::baseobjspace::unwrap_cell(obj);
-    if obj.is_null() {
-        return "NULL".to_string();
-    }
-    let tp = (*obj).ob_type;
-    // For strings, return the value directly (no quotes).
-    if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-        return pyre_object::w_str_get_value(obj).to_string();
-    }
-    if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
-        if let Some(s) = try_call_dunder(obj, "__str__") {
-            return s;
+    unsafe {
+        let obj = crate::baseobjspace::unwrap_cell(obj);
+        if obj.is_null() {
+            return "NULL".to_string();
         }
-        if let Some(s) = try_call_dunder(obj, "__repr__") {
-            return s;
+        let tp = (*obj).ob_type;
+        // For strings, return the value directly (no quotes).
+        if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
+            return pyre_object::w_str_get_value(obj).to_string();
         }
+        if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
+            if let Some(s) = try_call_dunder(obj, "__str__") {
+                return s;
+            }
+            if let Some(s) = try_call_dunder(obj, "__repr__") {
+                return s;
+            }
+        }
+        py_repr(obj)
     }
-    py_repr(obj)
 }
 
 /// Display wrapper for PyObjectRef.

@@ -833,7 +833,7 @@ use crate::pyjitpl::{
 /// Each handler decodes operands from `code[position..]` based on its
 /// argcodes, calls the corresponding `bhimpl_*` method on `bh`, writes
 /// results, and returns the updated position.
-pub type BhOpcodeHandler =
+pub(crate) type BhOpcodeHandler =
     fn(bh: &mut BlackholeInterpreter, code: &[u8], position: usize) -> Result<usize, DispatchError>;
 
 /// Return type of a blackhole frame.
@@ -856,7 +856,7 @@ pub use majit_codewriter::jitcode::{BhCallDescr, BhDescr};
 ///
 /// RPython: `LeaveFrame` exception + `except Exception` in blackhole.py run()
 #[derive(Debug)]
-enum DispatchError {
+pub(crate) enum DispatchError {
     /// Normal return from frame (RPython: LeaveFrame).
     LeaveFrame,
     /// Exception raised — must call handle_exception_in_frame.
@@ -2544,7 +2544,7 @@ pub struct BlackholeInterpBuilder {
     /// Dispatch table: opcode byte → handler fn pointer.
     /// RPython builds `dispatch_loop` closure via `unrolling_iterable`;
     /// Rust uses indirect call through this table.
-    pub dispatch_table: Vec<BhOpcodeHandler>,
+    pub(crate) dispatch_table: Vec<BhOpcodeHandler>,
 }
 
 impl Default for BlackholeInterpBuilder {
@@ -2623,7 +2623,7 @@ impl BlackholeInterpBuilder {
         self.dispatch_table = self
             ._insns
             .iter()
-            .map(|key| {
+            .map(|_key| {
                 // Default: panic identifying the unimplemented opcode.
                 // RPython would raise AttributeError at setup time; we
                 // defer to dispatch time but with the same crash semantics.
@@ -2685,7 +2685,8 @@ impl BlackholeInterpBuilder {
     /// Runs the codewriter-orthodox bytecode dispatch loop. Each iteration
     /// reads one opcode byte, looks up the handler in `dispatch_table`,
     /// and calls it to advance position.
-    pub fn dispatch_loop(
+    #[cfg(test)]
+    pub(crate) fn dispatch_loop(
         &self,
         bh: &mut BlackholeInterpreter,
         code: &[u8],
@@ -2712,7 +2713,7 @@ impl BlackholeInterpBuilder {
     /// Returns true if the key was found in the insns table.
     /// Callers in wire_bhimpl_handlers use `try_wire_handler` for optional
     /// keys (aliases that may not exist in all assembler configurations).
-    pub fn wire_handler(&mut self, opname_key: &str, handler: BhOpcodeHandler) -> bool {
+    pub(crate) fn wire_handler(&mut self, opname_key: &str, handler: BhOpcodeHandler) -> bool {
         for (i, key) in self._insns.iter().enumerate() {
             if key == opname_key {
                 self.dispatch_table[i] = handler;
@@ -2720,18 +2721,6 @@ impl BlackholeInterpBuilder {
             }
         }
         false
-    }
-
-    /// Wire a handler, panicking if the key is not found.
-    /// Use for mandatory opcodes that MUST exist in every assembler
-    /// configuration. Matches RPython's _get_method raising AttributeError.
-    pub fn wire_handler_required(&mut self, opname_key: &str, handler: BhOpcodeHandler) {
-        if !self.wire_handler(opname_key, handler) {
-            panic!(
-                "wire_handler_required: opname {:?} not found in insns table",
-                opname_key
-            );
-        }
     }
 
     /// Acquire an interpreter from the pool or create a new one.
@@ -2926,8 +2915,8 @@ fn handle_jitexception(
 /// Returns the JitException that terminated execution.
 pub fn run_forever(
     builder: &mut BlackholeInterpBuilder,
-    mut bh: BlackholeInterpreter,
-    mut current_exc: i64,
+    bh: BlackholeInterpreter,
+    current_exc: i64,
 ) -> JitException {
     run_forever_with_portal(builder, bh, current_exc, None)
 }
@@ -3063,10 +3052,6 @@ pub fn resume_in_blackhole(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resume::{
-        PendingFieldInfo as ResumePendingFieldInfo, VirtualFieldSource,
-        VirtualInfo as ResumeVirtualInfo,
-    };
     use majit_ir::OpRef;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
@@ -4398,9 +4383,9 @@ bhhandler_ii_i!(handler_int_ge, bhimpl_int_ge);
 
 // ── control flow + copy handlers ─────────────────────────────────────
 
-/// blackhole.py:638-640 `bhimpl_int_copy(a): return a` — @arguments("i", returns="i").
-/// Decoded as `i>i` (same as int_same_as). Already have handler_int_same_as.
-/// Wire as alias.
+// blackhole.py:638-640 `bhimpl_int_copy(a): return a` — @arguments("i", returns="i").
+// Decoded as `i>i` (same as int_same_as). Already have handler_int_same_as.
+// Wire as alias.
 bhhandler_i_i!(handler_int_copy, bhimpl_int_same_as);
 
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler

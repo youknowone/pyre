@@ -3,11 +3,10 @@
 //! Mirrors RPython's `compile.py`: guard metadata building, exit layout
 //! management, backend layout merging, and trace post-processing (unboxing).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use majit_backend::{
-    Backend, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, JitCellToken,
-    TerminalExitLayout,
+    CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout,
 };
 use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
@@ -157,14 +156,13 @@ pub struct DeadFrameArtifacts {
 /// The backend numbers every guard and finish in a single exit table, so this
 /// helper mirrors that numbering and records only the guard entries that need
 /// resume data plus the corresponding op index for blackhole fallback.
-/// resume.py ResumeDataLoopMemo parity: `constants` maps OpRef.0 → raw i64,
-/// `constant_types` maps OpRef.0 → Type. Used by `getconst` to encode
-/// virtual field constants as TAGINT/TAGCONST instead of TAGBOX.
+/// resume.py ResumeDataLoopMemo parity: `constant_types` maps OpRef.0 → Type.
+/// Used by `getconst` to encode virtual field constants as TAGINT/TAGCONST
+/// instead of TAGBOX.
 pub(crate) fn build_guard_metadata(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     pc: u64,
-    constants: &std::collections::HashMap<u32, i64>,
     constant_types: &std::collections::HashMap<u32, Type>,
 ) -> (
     HashMap<u32, StoredResumeData>,
@@ -258,16 +256,6 @@ pub(crate) fn build_guard_metadata(
                     })
                     .collect::<Vec<_>>();
                 builder.set_vable_array(vable_array);
-                let vref_array = _vref_values
-                    .iter()
-                    .map(|val| match val {
-                        RebuiltValue::Box(idx, _) => ResumeValueSource::FailArg(*idx),
-                        RebuiltValue::Const(c, _tp) => ResumeValueSource::Constant(*c),
-                        RebuiltValue::Int(i) => ResumeValueSource::Constant(*i as i64),
-                        RebuiltValue::Virtual(vidx) => ResumeValueSource::Virtual(*vidx),
-                        RebuiltValue::Unassigned => ResumeValueSource::Unavailable,
-                    })
-                    .collect::<Vec<_>>();
                 let add_slot =
                     |builder: &mut ResumeDataVirtualAdder, slot_idx: usize, val: &RebuiltValue| {
                         match val {
@@ -294,7 +282,7 @@ pub(crate) fn build_guard_metadata(
                 // RPython resume.py keeps vable_array/vref_array/framestack
                 // as separate sections. Do not merge vable_array entries into
                 // the innermost frame slots here.
-                for (orig_idx, frame) in frames.iter().enumerate().rev() {
+                for frame in frames.iter().rev() {
                     builder.push_frame(frame.jitcode_index, frame.pc as u64);
                     let mut slot_idx = 0usize;
                     for val in &frame.values {
@@ -359,7 +347,7 @@ pub(crate) fn build_guard_metadata(
                             .iter()
                             .enumerate()
                             .rev()
-                            .map(|(orig_idx, frame)| {
+                            .map(|(_orig_idx, frame)| {
                                 let mut slots = Vec::new();
                                 slots.extend(frame.values.iter().map(to_exit_source));
                                 let slot_types = derive_slot_types(&slots, &exit_types);
@@ -829,7 +817,6 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
 pub(crate) fn enrich_resume_layout_with_frame_stack(
     resume_layout: &mut Option<ResumeLayoutSummary>,
     frame_stack: Option<&[ExitFrameLayout]>,
-    exit_types: &[Type],
 ) {
     let Some(frame_stack) = frame_stack else {
         return;
@@ -1527,11 +1514,6 @@ pub(crate) struct BridgeFailDescrProxy {
     pub(crate) gc_ref_slots: Vec<usize>,
     pub(crate) force_token_slots: Vec<usize>,
     pub(crate) is_finish: bool,
-    // resume.py:1042 rebuild_from_resumedata: rd_numb encodes the full
-    // frame layout (TAGBOX/TAGCONST/TAGINT per slot). Bridge tracing
-    // decodes this to reconstruct the complete frame, not just fail_args.
-    pub(crate) rd_numb: Option<Vec<u8>>,
-    pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
 }
 
 impl majit_ir::Descr for BridgeFailDescrProxy {
@@ -1615,7 +1597,7 @@ mod tests {
         guard.rd_consts = Some(rd_consts);
 
         let (_resume_data, _guard_indices, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new(), &HashMap::new());
+            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new());
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");

@@ -6,9 +6,7 @@
 
 use std::collections::HashMap;
 
-use majit_ir::{DescrRef, Op, OpRef};
-
-use crate::fail_descr;
+use majit_ir::{Op, OpRef};
 
 /// version.py:9-86: LoopVersionInfo(BasicLoopInfo)
 ///

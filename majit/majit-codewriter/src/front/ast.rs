@@ -1176,12 +1176,6 @@ fn lower_expr(
                         false_args: vec![],
                     },
                 );
-                // Chain remaining arms as fallthrough branches
-                for i in 1..arm_results.len().saturating_sub(1) {
-                    let next = arm_results.get(i + 1).map(|a| a.0).unwrap_or(merge);
-                    // Each arm could branch to next or fall to merge
-                    // (simplified: all goto merge)
-                }
             }
 
             *block = merge;
@@ -1491,38 +1485,6 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
     }
 }
 
-/// RPython: `GcArray(T)` — extract the element type `T` from an
-/// array-like container type.
-///
-/// For `Vec<Point>`, returns `"Point"`.  For `[i64]`, returns `"i64"`.
-/// This is the Rust equivalent of RPython's ARRAY.OF, which is the
-/// element type that determines the ARRAY identity.  Two arrays with
-/// the same element type share one `cpu.arraydescrof()` descriptor.
-fn array_element_type(ty: &syn::Type) -> Option<String> {
-    match ty {
-        syn::Type::Path(path) => {
-            // Vec<T>, Box<[T]>, etc. — extract first generic type arg
-            let last_seg = path.path.segments.last()?;
-            if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
-                for arg in &args.args {
-                    if let syn::GenericArgument::Type(inner_ty) = arg {
-                        return full_type_string(inner_ty);
-                    }
-                }
-            }
-            None
-        }
-        syn::Type::Reference(r) => array_element_type(&r.elem),
-        syn::Type::Paren(p) => array_element_type(&p.elem),
-        syn::Type::Group(g) => array_element_type(&g.elem),
-        // [T] slice → element type is T
-        syn::Type::Slice(s) => full_type_string(&s.elem),
-        // [T; N] array → element type is T
-        syn::Type::Array(a) => full_type_string(&a.elem),
-        _ => None,
-    }
-}
-
 /// Canonical type string for a syn::Type.
 ///
 /// Produces a string that includes generic arguments,
@@ -1654,15 +1616,6 @@ pub(crate) fn qualified_full_type_string(
             Some(format!("[{};{}]", elem, len_str))
         }
         _ => None,
-    }
-}
-
-/// RPython: annotator resolves function return types for op.result.concretetype.
-/// Extract return type string from a function signature.
-fn return_type_string(sig: &syn::Signature) -> Option<String> {
-    match &sig.output {
-        syn::ReturnType::Type(_, ty) => full_type_string(ty),
-        syn::ReturnType::Default => None,
     }
 }
 

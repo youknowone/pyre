@@ -8,9 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{
-    BlockId, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId, ValueType,
-};
+use crate::model::{BlockId, FunctionGraph, SpaceOperation, Terminator, ValueId};
 
 /// A label in the flattened instruction stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -187,7 +185,7 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
                 }
                 ops.push(FlatOp::Jump(false_label));
             }
-            Terminator::Return(val) => {
+            Terminator::Return(_val) => {
                 // Return is implicit at the end (no jump needed)
                 // Could emit a FlatOp::Return if needed
             }
@@ -281,7 +279,7 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{FunctionGraph, OpKind, Terminator};
 
     #[test]
     fn flatten_single_block() {

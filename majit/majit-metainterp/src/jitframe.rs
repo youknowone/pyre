@@ -180,12 +180,14 @@ impl JitFrame {
     /// # Safety
     /// `ptr` must point to at least `alloc_size(depth)` zero-filled bytes.
     pub unsafe fn init(ptr: *mut JitFrame, info: *const JitFrameInfo, depth: usize) {
-        // RPython: frame.jf_frame_info = frame_info
-        // (other fields are zero from malloc)
-        (*ptr).jf_frame_info = info;
-        // Write the jf_frame array length
-        let len_ptr = (ptr as *mut u8).add(JF_FRAME_OFS) as *mut isize;
-        *len_ptr = depth as isize;
+        unsafe {
+            // RPython: frame.jf_frame_info = frame_info
+            // (other fields are zero from malloc)
+            (*ptr).jf_frame_info = info;
+            // Write the jf_frame array length
+            let len_ptr = (ptr as *mut u8).add(JF_FRAME_OFS) as *mut isize;
+            *len_ptr = depth as isize;
+        }
     }
 
     /// Get a mutable slice of the jf_frame items (excluding length field).
@@ -193,28 +195,36 @@ impl JitFrame {
     /// # Safety
     /// `ptr` must be a valid JitFrame with at least `len` trailing slots.
     pub unsafe fn frame_slots_mut(ptr: *mut JitFrame, len: usize) -> &'static mut [isize] {
-        let base = (ptr as *mut u8).add(JF_FRAME_OFS + BASEITEMOFS) as *mut isize;
-        std::slice::from_raw_parts_mut(base, len)
+        unsafe {
+            let base = (ptr as *mut u8).add(JF_FRAME_OFS + BASEITEMOFS) as *mut isize;
+            std::slice::from_raw_parts_mut(base, len)
+        }
     }
 
     /// Get an immutable slice of the jf_frame items.
     pub unsafe fn frame_slots(ptr: *const JitFrame, len: usize) -> &'static [isize] {
-        let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const isize;
-        std::slice::from_raw_parts(base, len)
+        unsafe {
+            let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const isize;
+            std::slice::from_raw_parts(base, len)
+        }
     }
 
     /// Read the jf_frame array length.
     pub unsafe fn frame_length(ptr: *const JitFrame) -> isize {
-        let len_ptr = (ptr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize;
-        *len_ptr
+        unsafe {
+            let len_ptr = (ptr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize;
+            *len_ptr
+        }
     }
 
     /// jitframe.py:54-57 — jitframe_resolve.
     pub unsafe fn resolve(mut frame: *mut JitFrame) -> *mut JitFrame {
-        while !(*frame).jf_forward.is_null() {
-            frame = (*frame).jf_forward;
+        unsafe {
+            while !(*frame).jf_forward.is_null() {
+                frame = (*frame).jf_forward;
+            }
+            frame
         }
-        frame
     }
 
     // ── llmodel.py:412-462 CPU value accessors ──────────────────
@@ -224,7 +234,7 @@ impl JitFrame {
     /// Returns the `jf_descr` field, which holds the descr pointer
     /// of the last GUARD or FINISH operation executed.
     pub unsafe fn get_latest_descr(ptr: *const JitFrame) -> usize {
-        (*ptr).jf_descr
+        unsafe { (*ptr).jf_descr }
     }
 
     /// llmodel.py:437-444 — get_int_value.
@@ -232,32 +242,40 @@ impl JitFrame {
     /// Read the `index`-th Signed slot from `jf_frame`.
     /// `index` is a slot index (not byte offset).
     pub unsafe fn get_int_value(ptr: *const JitFrame, index: usize) -> isize {
-        let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const isize;
-        *base.add(index)
+        unsafe {
+            let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const isize;
+            *base.add(index)
+        }
     }
 
     /// llmodel.py:446-453 — get_ref_value.
     ///
     /// Read the `index`-th slot as a reference (pointer-sized).
     pub unsafe fn get_ref_value(ptr: *const JitFrame, index: usize) -> usize {
-        let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const usize;
-        *base.add(index)
+        unsafe {
+            let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const usize;
+            *base.add(index)
+        }
     }
 
     /// llmodel.py:455-462 — get_float_value.
     pub unsafe fn get_float_value(ptr: *const JitFrame, index: usize) -> u64 {
-        let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const u64;
-        *base.add(index)
+        unsafe {
+            let base = (ptr as *const u8).add(JF_FRAME_OFS + BASEITEMOFS) as *const u64;
+            *base.add(index)
+        }
     }
 
     /// llmodel.py:248-251 — get_savedata_ref.
     pub unsafe fn get_savedata_ref(ptr: *const JitFrame) -> usize {
-        (*ptr).jf_savedata
+        unsafe { (*ptr).jf_savedata }
     }
 
     /// llmodel.py:252-257 — set_savedata_ref.
     pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
-        (*ptr).jf_savedata = value;
+        unsafe {
+            (*ptr).jf_savedata = value;
+        }
     }
 
     // ── warmspot.py:1021 assembler_call_helper parity ────────────
@@ -269,7 +287,7 @@ impl JitFrame {
     ///
     /// Returns true if jf_descr matches a known finish descr.
     pub unsafe fn is_done_with_this_frame(ptr: *const JitFrame, done_descr: usize) -> bool {
-        (*ptr).jf_descr == done_descr
+        unsafe { (*ptr).jf_descr == done_descr }
     }
 
     /// Read the integer result from a finished jitframe.
@@ -277,7 +295,7 @@ impl JitFrame {
     /// compile.py:632-638 — DoneWithThisFrameDescrInt.get_result
     /// reads `cpu.get_int_value(deadframe, 0)`.
     pub unsafe fn get_finish_result_int(ptr: *const JitFrame) -> isize {
-        Self::get_int_value(ptr, 0)
+        unsafe { Self::get_int_value(ptr, 0) }
     }
 }
 
@@ -291,53 +309,55 @@ impl JitFrame {
 /// `trace_callback` is called for each GCREF slot address that the
 /// GC needs to visit (read and potentially update).
 pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl FnMut(*mut usize)) {
-    // jitframe.py:105-109 — trace fixed GCREF header fields
-    trace_callback(&mut (*obj_addr).jf_descr);
-    trace_callback(&mut (*obj_addr).jf_force_descr);
-    trace_callback(&mut (*obj_addr).jf_savedata);
-    trace_callback(&mut (*obj_addr).jf_guard_exc);
-    trace_callback(&mut (*obj_addr).jf_forward as *mut *mut JitFrame as *mut usize);
+    unsafe {
+        // jitframe.py:105-109 — trace fixed GCREF header fields
+        trace_callback(&mut (*obj_addr).jf_descr);
+        trace_callback(&mut (*obj_addr).jf_force_descr);
+        trace_callback(&mut (*obj_addr).jf_savedata);
+        trace_callback(&mut (*obj_addr).jf_guard_exc);
+        trace_callback(&mut (*obj_addr).jf_forward as *mut *mut JitFrame as *mut usize);
 
-    // jitframe.py:111-114
-    let max: usize = if IS_32BIT { 32 } else { 64 };
+        // jitframe.py:111-114
+        let max: usize = if IS_32BIT { 32 } else { 64 };
 
-    // jitframe.py:115-116
-    let gcmap_raw = (*obj_addr).jf_gcmap;
-    if gcmap_raw.is_null() {
-        return; // done
-    }
-
-    // jitframe.py:118 — gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
-    let gcmap_lgt = *(gcmap_raw.add(GCMAPLENGTHOFS) as *const isize);
-
-    // jitframe.py:119-135
-    let mut no: isize = 0;
-    while no < gcmap_lgt {
-        // jitframe.py:121 — cur = (gcmap + GCMAPBASEOFS + UNSIGN_SIZE * no).unsigned[0]
-        let cur = *(gcmap_raw.add(GCMAPBASEOFS + UNSIGN_SIZE * no as usize) as *const usize);
-        let mut bitindex: usize = 0;
-        while bitindex < max {
-            if cur & (1usize << bitindex) != 0 {
-                // jitframe.py:126 — index = no * SIZEOFSIGNED * 8 + bitindex
-                let index = no as usize * SIZEOFSIGNED * 8 + bitindex;
-                // jitframe.py:128-130 — sanity check
-                let frame_lgt =
-                    *((obj_addr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize);
-                // jitframe.py:130 — ll_assert(index < frame_lgt, "bogus ...")
-                // RPython ll_assert = RPyAssert: real assertion, not no-op.
-                assert!(
-                    (index as isize) < frame_lgt,
-                    "bogus frame field get: index={index} >= frame_lgt={frame_lgt}"
-                );
-                // jitframe.py:131-133 — trace the slot
-                let slot_addr = (obj_addr as *mut u8)
-                    .add(JF_FRAME_OFS + BASEITEMOFS + SIGN_SIZE * index)
-                    as *mut usize;
-                trace_callback(slot_addr);
-            }
-            bitindex += 1;
+        // jitframe.py:115-116
+        let gcmap_raw = (*obj_addr).jf_gcmap;
+        if gcmap_raw.is_null() {
+            return; // done
         }
-        no += 1;
+
+        // jitframe.py:118 — gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
+        let gcmap_lgt = *(gcmap_raw.add(GCMAPLENGTHOFS) as *const isize);
+
+        // jitframe.py:119-135
+        let mut no: isize = 0;
+        while no < gcmap_lgt {
+            // jitframe.py:121 — cur = (gcmap + GCMAPBASEOFS + UNSIGN_SIZE * no).unsigned[0]
+            let cur = *(gcmap_raw.add(GCMAPBASEOFS + UNSIGN_SIZE * no as usize) as *const usize);
+            let mut bitindex: usize = 0;
+            while bitindex < max {
+                if cur & (1usize << bitindex) != 0 {
+                    // jitframe.py:126 — index = no * SIZEOFSIGNED * 8 + bitindex
+                    let index = no as usize * SIZEOFSIGNED * 8 + bitindex;
+                    // jitframe.py:128-130 — sanity check
+                    let frame_lgt =
+                        *((obj_addr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize);
+                    // jitframe.py:130 — ll_assert(index < frame_lgt, "bogus ...")
+                    // RPython ll_assert = RPyAssert: real assertion, not no-op.
+                    assert!(
+                        (index as isize) < frame_lgt,
+                        "bogus frame field get: index={index} >= frame_lgt={frame_lgt}"
+                    );
+                    // jitframe.py:131-133 — trace the slot
+                    let slot_addr = (obj_addr as *mut u8)
+                        .add(JF_FRAME_OFS + BASEITEMOFS + SIGN_SIZE * index)
+                        as *mut usize;
+                    trace_callback(slot_addr);
+                }
+                bitindex += 1;
+            }
+            no += 1;
+        }
     }
 }
 
@@ -350,10 +370,12 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
 ///
 /// jitframe.py:49 — `rgc.register_custom_trace_hook(JITFRAME, lambda_jitframe_trace)`
 unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    jitframe_trace(obj_addr as *mut JitFrame, |slot_ptr| {
-        // GcRef and usize are both word-sized; reinterpret the slot.
-        f(slot_ptr as *mut majit_ir::GcRef);
-    });
+    unsafe {
+        jitframe_trace(obj_addr as *mut JitFrame, |slot_ptr| {
+            // GcRef and usize are both word-sized; reinterpret the slot.
+            f(slot_ptr as *mut majit_ir::GcRef);
+        });
+    }
 }
 
 /// Build a `TypeInfo` for JitFrame with the custom trace hook registered.

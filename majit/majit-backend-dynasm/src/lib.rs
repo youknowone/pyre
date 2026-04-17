@@ -209,7 +209,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
 
 /// Return the address of the trampoline for embedding in generated code.
 pub fn call_assembler_helper_addr() -> usize {
-    call_assembler_helper_trampoline as usize
+    call_assembler_helper_trampoline as *const () as usize
 }
 
 /// rstack.stack_almost_full parity: CALL_ASSEMBLER recursive callee
@@ -232,7 +232,7 @@ pub extern "C" fn call_assembler_execute_trampoline(
 
 /// Return the address of the execute trampoline.
 pub fn call_assembler_execute_addr() -> usize {
-    call_assembler_execute_trampoline as usize
+    call_assembler_execute_trampoline as *const () as usize
 }
 
 // ── Pending CALL_ASSEMBLER targets ──
@@ -341,7 +341,7 @@ mod tests {
         // compile.py:701 parity: helper does NOT re-enter bridges.
         // Bridges are executed via patched guard jumps, not the helper.
         let descr = Arc::new(guard::DynasmFailDescr::new(3, 17, vec![Type::Int], false));
-        descr.set_bridge_addr(test_bridge_finish_int as usize);
+        descr.set_bridge_addr(test_bridge_finish_int as *const () as usize);
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_helper_trampoline_passes_green_key() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::AtomicU64;
         static OBSERVED_GREEN_KEY: AtomicU64 = AtomicU64::new(0);
 
         // We can't register a one-shot blackhole fn (OnceLock is set-once).

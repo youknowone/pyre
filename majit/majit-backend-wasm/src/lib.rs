@@ -17,7 +17,7 @@ use std::sync::Arc;
 use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, Value};
 
 thread_local! {
     /// llmodel.py self.gc_ll_descr — owned by the active wasm
@@ -335,34 +335,33 @@ impl majit_backend::Backend for WasmBackend {
         }
 
         // frame_ptr = byte offset of frame[0] in wasm linear memory
-        let frame_ptr = frame.as_mut_ptr() as usize as u32;
+        let _frame_ptr = frame.as_mut_ptr() as usize as u32;
 
-        // Execute the compiled wasm function
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        {
-            js_glue::execute(compiled.func_handle, frame_ptr);
-        }
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
             panic!("wasm backend execute_token requires JS runtime");
         }
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        {
+            js_glue::execute(compiled.func_handle, _frame_ptr);
 
-        // Read fail_index from frame[0]
-        let fail_index = frame[0] as u32;
-        let fail_descr = compiled
-            .fail_descrs
-            .get(fail_index as usize)
-            .expect("invalid fail_index from compiled wasm");
+            // Read fail_index from frame[0]
+            let fail_index = frame[0] as u32;
+            let fail_descr = compiled
+                .fail_descrs
+                .get(fail_index as usize)
+                .expect("invalid fail_index from compiled wasm");
 
-        // Read output values
-        let num_outputs = fail_descr.fail_arg_types.len();
-        let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
+            // Read output values
+            let num_outputs = fail_descr.fail_arg_types.len();
+            let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
 
-        DeadFrame {
-            data: Box::new(WasmFrameData {
-                raw_values,
-                fail_descr: fail_descr.clone(),
-            }),
+            DeadFrame {
+                data: Box::new(WasmFrameData {
+                    raw_values,
+                    fail_descr: fail_descr.clone(),
+                }),
+            }
         }
     }
 

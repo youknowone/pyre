@@ -2716,7 +2716,7 @@ impl OptContext {
 
         // optimizer.py:655-664: GUARD_(NO_)EXCEPTION following a guard that
         // is NOT GUARD_NOT_FORCED — give up sharing.
-        if (opnum == OpCode::GuardNoException || opnum == OpCode::GuardException) {
+        if opnum == OpCode::GuardNoException || opnum == OpCode::GuardException {
             if let Some(idx) = self.last_guard_idx {
                 if self.new_operations[idx].opcode != OpCode::GuardNotForced
                     && self.new_operations[idx].opcode != OpCode::GuardNotForced2
@@ -4576,9 +4576,7 @@ mod ensure_ptr_info_arg0_tests {
     use super::*;
     use crate::optimizeopt::info::{ArrayPtrInfo, EnsuredPtrInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::{
-        Descr, DescrRef, GcRef, Op, OpCode, OpRef, SimpleFieldDescr, SizeDescr, Type, Value,
-    };
+    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, SizeDescr, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]

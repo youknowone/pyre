@@ -313,7 +313,7 @@ impl ExecutionContext {
                 if next.is_null() {
                     return std::ptr::null_mut();
                 }
-                if !unsafe { (&*next).hide() } {
+                if !(&*next).hide() {
                     return next;
                 }
                 frame = next;
@@ -399,9 +399,7 @@ impl ExecutionContext {
             self._trace(frame, "call", pyre_object::PY_NULL, None);
             if !self.profilefunc.is_null() {
                 if !self.topframeref.is_null() {
-                    unsafe {
-                        self.topframeref = self.topframeref;
-                    }
+                    self.topframeref = self.topframeref;
                 }
             }
         }

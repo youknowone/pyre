@@ -163,31 +163,33 @@ impl PyObjectArray {
     /// # Safety
     /// All pointers in `new_values` and in the existing storage must be valid.
     pub unsafe fn splice(&mut self, start: usize, remove_count: usize, new_values: &[PyObjectRef]) {
-        let old_len = self.len;
-        let s = start.min(old_len);
-        let slicelength = remove_count.min(old_len - s);
-        let len2 = new_values.len();
-        let new_len = old_len - slicelength + len2;
-        if len2 > slicelength {
-            if new_len > self.capacity() {
-                self.grow(new_len);
+        unsafe {
+            let old_len = self.len;
+            let s = start.min(old_len);
+            let slicelength = remove_count.min(old_len - s);
+            let len2 = new_values.len();
+            let new_len = old_len - slicelength + len2;
+            if len2 > slicelength {
+                if new_len > self.capacity() {
+                    self.grow(new_len);
+                }
+                std::ptr::copy(
+                    self.ptr.add(s + slicelength),
+                    self.ptr.add(s + len2),
+                    old_len - s - slicelength,
+                );
+                self.len = new_len;
+            } else if slicelength > len2 {
+                std::ptr::copy(
+                    self.ptr.add(s + slicelength),
+                    self.ptr.add(s + len2),
+                    old_len - s - slicelength,
+                );
+                self.len = new_len;
             }
-            std::ptr::copy(
-                self.ptr.add(s + slicelength),
-                self.ptr.add(s + len2),
-                old_len - s - slicelength,
-            );
-            self.len = new_len;
-        } else if slicelength > len2 {
-            std::ptr::copy(
-                self.ptr.add(s + slicelength),
-                self.ptr.add(s + len2),
-                old_len - s - slicelength,
-            );
-            self.len = new_len;
-        }
-        if len2 > 0 {
-            self.as_mut_slice()[s..s + len2].copy_from_slice(new_values);
+            if len2 > 0 {
+                self.as_mut_slice()[s..s + len2].copy_from_slice(new_values);
+            }
         }
     }
 }

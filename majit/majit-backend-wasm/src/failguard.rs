@@ -3,7 +3,7 @@
 /// Simplified from CraneliftFailDescr — no bridge data, GC maps, or force tokens.
 use std::sync::Arc;
 
-use majit_ir::{Descr, DescrRef, FailDescr, Type};
+use majit_ir::{Descr, FailDescr, Type};
 
 /// Wasm-backend guard failure descriptor.
 #[derive(Debug)]

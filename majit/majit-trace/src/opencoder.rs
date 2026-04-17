@@ -333,7 +333,6 @@ pub struct SnapshotIterator<'a> {
 impl<'a> SnapshotIterator<'a> {
     pub fn new(storage: &'a SnapshotStorage, top_snapshot_idx: usize) -> Self {
         let start = if top_snapshot_idx < storage.top_snapshots.len() {
-            let _top = &storage.top_snapshots[top_snapshot_idx];
             Some(storage.snapshots.len() - 1) // start from innermost
         } else {
             None
@@ -1285,7 +1284,7 @@ impl TraceRecordBuffer {
         vable_array_index: Option<usize>,
         vref_array_index: Option<usize>,
     ) -> usize {
-        let _snap_idx = self.snapshots.add_snapshot(snapshot.clone());
+        self.snapshots.add_snapshot(snapshot.clone());
         self.snapshots.add_top_snapshot(TopSnapshot {
             snapshot,
             vable_array_index,

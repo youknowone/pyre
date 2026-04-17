@@ -468,7 +468,7 @@ impl PotentialShortOp {
         match self {
             PotentialShortOp::Preamble(op) => op.add_op_to_short(sb),
             PotentialShortOp::Compound(compound) => {
-                let mut produced = compound.flatten(sb, Vec::new());
+                let produced = compound.flatten(sb, Vec::new());
                 if produced.is_empty() {
                     None
                 } else {
@@ -1119,7 +1119,7 @@ impl AbstractShortPreambleBuilderState {
 
     /// Internal: append preamble_op to short (with ovf guard).
     /// Used by add_op_to_short (recursive export-time path).
-    fn append_to_short(&mut self, result: OpRef, produced: &ProducedShortOp) -> Op {
+    fn append_to_short(&mut self, _result: OpRef, produced: &ProducedShortOp) -> Op {
         let canonical_result = produced.preamble_op.pos;
         if self.short_results.contains(&canonical_result) {
             return produced.preamble_op.clone();

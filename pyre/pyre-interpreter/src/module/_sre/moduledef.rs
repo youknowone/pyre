@@ -5,7 +5,6 @@
 use crate::{PyNamespace, make_builtin_function, make_module_builtin_function, namespace_store};
 use pyre_object::*;
 use sre_engine::engine::{Request, State};
-use sre_engine::string::StrDrive;
 use std::cell::RefCell;
 
 thread_local! {

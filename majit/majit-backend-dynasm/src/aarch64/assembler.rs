@@ -144,12 +144,10 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
 }
 
 fn all_gen_regs() -> &'static [crate::regloc::RegLoc] {
-    use crate::regloc::*;
     &AARCH64_GEN_REGS
 }
 
 fn all_float_regs() -> &'static [crate::regloc::RegLoc] {
-    use crate::regloc::*;
     &AARCH64_FLOAT_REGS
 }
 
@@ -285,19 +283,11 @@ pub struct AssemblerARM64 {
 /// assembler.py GuardToken — represents a pending guard needing
 /// a recovery stub to be written after the main loop body.
 struct GuardToken {
-    /// Offset in machine code where the guard's conditional jump
-    /// was emitted. We'll patch this to point to the recovery stub.
-    jump_offset: AssemblyOffset,
     /// Dynamic label that the guard's Jcc jumps to — bound in
     /// write_pending_failure_recoveries to the recovery stub.
     fail_label: DynamicLabel,
     /// The fail descriptor for this guard.
     fail_descr: Arc<DynasmFailDescr>,
-    /// Fail argument OpRefs for recovery (to save to sequential output slots).
-    fail_args: Vec<OpRef>,
-    /// regalloc parity: snapshot of opref_to_slot at guard emission time.
-    /// Needed by recovery stubs to read fail_args from correct slots.
-    opref_to_slot_snapshot: HashMap<u32, usize>,
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
@@ -325,6 +315,7 @@ pub struct CompiledCode {
     pub frame_depth: std::sync::atomic::AtomicUsize,
 }
 
+#[allow(dead_code)]
 impl AssemblerARM64 {
     /// assembler.py:54 __init__
     pub fn new(
@@ -1111,7 +1102,7 @@ impl AssemblerARM64 {
     /// assembler.py:623 assemble_bridge: compile a bridge trace.
     pub fn assemble_bridge(
         mut self,
-        fail_descr: &dyn FailDescr,
+        _: &dyn FailDescr,
         inputargs: &[InputArg],
         ops: &[Op],
         arglocs: &[Loc],
@@ -2075,7 +2066,7 @@ impl AssemblerARM64 {
         op: &Op,
         op_index: usize,
         arglocs: &[Loc],
-        result_loc: Option<&Loc>,
+        _: Option<&Loc>,
         faillocs: &[Option<Loc>],
         fail_index: u32,
     ) {
@@ -2156,8 +2147,8 @@ impl AssemblerARM64 {
                 dynasm!(self.mc
                     ; .arch aarch64
                     ; ldr w16, [X(obj.value)]
-                    ; movz w17, #(typeid_w & 0xffff)
-                    ; movk w17, #((typeid_w >> 16) & 0xffff), lsl #16
+                    ; movz w17, #typeid_w & 0xffff
+                    ; movk w17, #(typeid_w >> 16) & 0xffff, lsl #16
                     ; cmp w16, w17
                 );
             }
@@ -2400,15 +2391,8 @@ impl AssemblerARM64 {
         let gcmap = self.guard_gcmap_from_faillocs(&descr.fail_arg_types, faillocs);
 
         self.pending_guard_tokens.push(GuardToken {
-            jump_offset: self.mc.offset(),
             fail_label,
             fail_descr: descr.clone(),
-            fail_args: op
-                .fail_args
-                .as_ref()
-                .map(|fa| fa.to_vec())
-                .unwrap_or_default(),
-            opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores,
             gcmap,
         });
@@ -2416,32 +2400,6 @@ impl AssemblerARM64 {
             self.finish_gcmap = Some(gcmap);
         }
         self.fail_descrs.push(descr);
-    }
-
-    /// Update fail_arg_locs on all pending guard descriptors.
-    /// Unmapped (virtual/dead) OpRefs get None — the resume system
-    /// handles them via rd_numb TAGVIRTUAL/TAGCONST encoding.
-    fn allocate_unmapped_fail_arg_slots(&mut self) {
-        for gt in &self.pending_guard_tokens {
-            let locs: Vec<Option<usize>> = gt
-                .fail_args
-                .iter()
-                .map(|opref| {
-                    if opref.is_none() || opref.is_constant() {
-                        None
-                    } else {
-                        self.opref_to_slot
-                            .get(&opref.0)
-                            .copied()
-                            .map(|slot| slot + JITFRAME_FIXED_SIZE)
-                    }
-                })
-                .collect();
-            unsafe {
-                let descr_mut = &mut *(Arc::as_ptr(&gt.fail_descr) as *mut DynasmFailDescr);
-                descr_mut.fail_arg_locs = locs;
-            }
-        }
     }
 
     // ----------------------------------------------------------------
@@ -2739,8 +2697,6 @@ impl AssemblerARM64 {
         );
         self.store_rax_to_result(op.pos);
         self.guard_success_cc = Some(CC_E);
-        return;
-        self.guard_success_cc = Some(CC_NO);
     }
 
     // ----------------------------------------------------------------
@@ -2866,8 +2822,8 @@ impl AssemblerARM64 {
             dynasm!(self.mc
                 ; .arch aarch64
                 ; ldr w0, [x0]
-                ; movz w1, #(typeid_w as u32 & 0xffff)
-                ; movk w1, #((typeid_w as u32 >> 16) & 0xffff), lsl #16
+                ; movz w1, #typeid_w as u32 & 0xffff
+                ; movk w1, #(typeid_w as u32 >> 16) & 0xffff, lsl #16
                 ; cmp w0, w1
             );
         }
@@ -3040,13 +2996,9 @@ impl AssemblerARM64 {
         descr.fail_arg_locs = fail_arg_locs;
         let descr = Arc::new(descr);
         let gcmap = self.gcmap_from_fail_arg_locs(&descr.fail_arg_types, &descr.fail_arg_locs);
-        let jump_offset = self.mc.offset();
         self.pending_guard_tokens.push(GuardToken {
-            jump_offset,
             fail_label,
             fail_descr: descr.clone(),
-            fail_args,
-            opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores: Vec::new(),
             gcmap,
         });
@@ -4794,7 +4746,6 @@ impl AssemblerARM64 {
         };
         let shift = 64 - num_bytes * 8;
         if shift > 0 && shift < 64 {
-            let sh = shift as u8;
             let sh32 = shift as u32;
             dynasm!(self.mc ; .arch aarch64
                 ; lsl x0, x0, sh32

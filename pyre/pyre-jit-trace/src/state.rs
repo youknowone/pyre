@@ -11,25 +11,13 @@ use majit_metainterp::{
     JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx,
 };
 
-use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
+use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 use pyre_interpreter::pyframe::{PendingInlineResult, PyFrame};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
-use pyre_object::listobject::w_list_getitem;
-use pyre_object::pyobject::{
-    BOOL_TYPE, DICT_TYPE, FLOAT_TYPE, INT_TYPE, LIST_TYPE, NONE_TYPE, PyType, TUPLE_TYPE, is_bool,
-    is_dict, is_float, is_int, is_int_or_long, is_list, is_long, is_none, is_tuple,
-};
-use pyre_object::rangeobject::RANGE_ITER_TYPE;
-use pyre_object::strobject::is_str;
-use pyre_object::tupleobject::w_tuple_getitem;
-use pyre_object::{
-    PY_NULL, w_bool_from, w_float_get_value, w_int_get_value, w_int_new,
-    w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len, w_list_new,
-    w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage,
-    w_str_get_value, w_tuple_len,
-};
+use pyre_object::pyobject::{FLOAT_TYPE, INT_TYPE, LIST_TYPE, is_bool, is_float, is_int};
+use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new, w_list_new};
 use std::collections::HashMap;
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
@@ -64,10 +52,13 @@ impl JitCode {
     /// Extract raw CodeObject from the W_CodeObject stored in this JitCode.
     #[inline]
     pub unsafe fn raw_code(&self) -> *const CodeObject {
-        if self.code.is_null() {
-            return std::ptr::null();
+        unsafe {
+            if self.code.is_null() {
+                return std::ptr::null();
+            }
+            pyre_interpreter::w_code_get_ptr(self.code as pyre_object::PyObjectRef)
+                as *const CodeObject
         }
-        pyre_interpreter::w_code_get_ptr(self.code as pyre_object::PyObjectRef) as *const CodeObject
     }
 }
 
@@ -610,30 +601,17 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
     }
 }
 
-use pyre_interpreter::{
-    ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
-    IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyBigInt,
-    PyError, PyNamespace, SharedOpcodeHandler, StackOpcodeHandler, TruthOpcodeHandler,
-    builtin_code_name, decode_instruction_at, execute_opcode_step, function_get_code,
-    function_get_globals, is_builtin_code, is_function, range_iter_continues,
-};
+use pyre_interpreter::{PyNamespace, decode_instruction_at};
 
 use crate::descr::{
-    bool_boolval_descr, dict_len_descr, float_floatval_descr, int_intval_descr,
-    list_float_items_heap_cap_descr, list_float_items_len_descr, list_float_items_ptr_descr,
-    list_int_items_heap_cap_descr, list_int_items_len_descr, list_int_items_ptr_descr,
-    list_items_heap_cap_descr, list_items_len_descr, list_items_ptr_descr, list_strategy_descr,
-    make_array_descr, make_size_descr, namespace_values_len_descr, namespace_values_ptr_descr,
-    ob_type_descr, range_iter_current_descr, range_iter_step_descr, range_iter_stop_descr,
-    str_len_descr, tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr,
+    float_floatval_descr, int_intval_descr, make_array_descr, make_size_descr, w_float_size_descr,
     w_int_size_descr,
 };
 use crate::frame_layout::{
-    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LAST_INSTR_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
-    PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET,
-    PYFRAME_W_GLOBALS_OFFSET,
+    PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+    PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
 };
-use crate::helpers::{TraceHelperAccess, emit_box_float_inline, emit_trace_bool_value_from_truth};
+use crate::helpers::emit_box_float_inline;
 
 // Re-export liveness items so downstream `pyre_jit_trace::state::*` keeps working.
 pub use crate::liveness::{LiveVars, expand_compact_to_dense, liveness_for};
@@ -823,7 +801,6 @@ pub struct PyreSym {
 pub struct MIFrame {
     pub(crate) ctx: *mut TraceCtx,
     pub(crate) sym: *mut PyreSym,
-    pub(crate) ob_type_fd: DescrRef,
     pub(crate) fallthrough_pc: usize,
     /// Concrete PyFrame address for exception table lookup.
     pub(crate) concrete_frame_addr: usize,
@@ -939,64 +916,12 @@ pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
     crate::descr::pyframe_locals_cells_stack_descr()
 }
 
-pub(crate) fn frame_stack_depth_descr() -> DescrRef {
-    crate::descr::pyframe_stack_depth_descr()
-}
-
-pub(crate) fn frame_next_instr_descr() -> DescrRef {
-    crate::descr::pyframe_next_instr_descr()
-}
-
-pub(crate) fn frame_code_descr() -> DescrRef {
-    crate::descr::pyframe_code_descr()
-}
-
 pub(crate) fn frame_namespace_descr() -> DescrRef {
     crate::descr::pyframe_namespace_descr()
 }
 
-pub(crate) fn trace_ob_type_descr() -> DescrRef {
-    ob_type_descr()
-}
-
 pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr())
-}
-
-pub(crate) fn note_inline_trace_too_long(
-    callee_key: u64,
-    caller_function_key: u64,
-    root_trace_key: u64,
-    err: &PyError,
-) {
-    if err.message != "inline trace aborted" {
-        return;
-    }
-    let (driver, _) = crate::driver::driver_pair();
-    let warm_state = driver.meta_interp_mut().warm_state_mut();
-    warm_state.disable_noninlinable_function(callee_key);
-    if callee_key == caller_function_key {
-        // RPython converges the next portal entry quickly after marking the
-        // huge function non-inlinable. Mirror that by priming the warmstate-
-        // owned function-entry counter instead of only bumping a backedge
-        // hot counter.
-        warm_state.boost_function_entry(caller_function_key);
-    } else {
-        warm_state.trace_next_iteration(root_trace_key);
-    }
-    if majit_metainterp::majit_log_enabled() {
-        eprintln!(
-            "[jit][trace-through] disable_noninlinable_function key={} caller_function_key={} root_trace_key={} same_key={}",
-            callee_key,
-            caller_function_key,
-            root_trace_key,
-            callee_key == caller_function_key
-        );
-    }
-}
-
-pub(crate) fn current_trace_green_key(state: &mut MIFrame) -> u64 {
-    state.with_ctx(|_, ctx| ctx.green_key())
 }
 
 /// pyjitpl.py:3514 find_biggest_function
@@ -1086,22 +1011,6 @@ pub(crate) fn try_trace_const_boxed_int(
     None
 }
 
-pub(crate) fn try_trace_const_boxed_float(
-    ctx: &mut TraceCtx,
-    value: OpRef,
-    concrete_value: PyObjectRef,
-) -> Option<OpRef> {
-    if ctx.const_value(value) != Some(concrete_value as i64) {
-        return None;
-    }
-    unsafe {
-        // The result is a raw f64 bit pattern. Use const_float so the
-        // constant pool tags it as Float, mirroring ConstFloat parity.
-        is_float(concrete_value)
-            .then(|| ctx.const_float(w_float_get_value(concrete_value).to_bits() as i64))
-    }
-}
-
 /// pyjitpl.py:750-758: read container length.
 ///
 /// RPython's `arraylen_gc` reads the GC array header — there is exactly one
@@ -1149,10 +1058,6 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     ctx.heap_cache_mut()
         .getfield_now_known(obj, field_index, result);
     result
-}
-
-pub(crate) fn trace_gc_object_type_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
-    opimpl_getfield_gc_i(ctx, obj, descr)
 }
 
 // Note: pyre does not currently route GetfieldGcF/GetfieldGcPureF through
@@ -1231,15 +1136,17 @@ pub(crate) unsafe fn objspace_compare_ints(
     rhs_obj: PyObjectRef,
     op: ComparisonOperator,
 ) -> bool {
-    let lhs = w_int_get_value(lhs_obj);
-    let rhs = w_int_get_value(rhs_obj);
-    match op {
-        ComparisonOperator::Less => lhs < rhs,
-        ComparisonOperator::LessOrEqual => lhs <= rhs,
-        ComparisonOperator::Greater => lhs > rhs,
-        ComparisonOperator::GreaterOrEqual => lhs >= rhs,
-        ComparisonOperator::Equal => lhs == rhs,
-        ComparisonOperator::NotEqual => lhs != rhs,
+    unsafe {
+        let lhs = w_int_get_value(lhs_obj);
+        let rhs = w_int_get_value(rhs_obj);
+        match op {
+            ComparisonOperator::Less => lhs < rhs,
+            ComparisonOperator::LessOrEqual => lhs <= rhs,
+            ComparisonOperator::Greater => lhs > rhs,
+            ComparisonOperator::GreaterOrEqual => lhs >= rhs,
+            ComparisonOperator::Equal => lhs == rhs,
+            ComparisonOperator::NotEqual => lhs != rhs,
+        }
     }
 }
 
@@ -1247,12 +1154,14 @@ pub(crate) unsafe fn objspace_compare_ints(
 /// Called only for int/float operands in the tracing fast path.
 /// Long operands are handled by residual fallback, not this function.
 unsafe fn as_float_for_trace(obj: PyObjectRef) -> f64 {
-    if is_float(obj) {
-        w_float_get_value(obj)
-    } else if is_int(obj) {
-        w_int_get_value(obj) as f64
-    } else {
-        0.0 // unreachable in trace fast path — long triggers residual
+    unsafe {
+        if is_float(obj) {
+            w_float_get_value(obj)
+        } else if is_int(obj) {
+            w_int_get_value(obj) as f64
+        } else {
+            0.0 // unreachable in trace fast path — long triggers residual
+        }
     }
 }
 
@@ -1264,15 +1173,17 @@ pub(crate) unsafe fn objspace_compare_floats(
     rhs_obj: PyObjectRef,
     op: ComparisonOperator,
 ) -> bool {
-    let lhs = as_float_for_trace(lhs_obj);
-    let rhs = as_float_for_trace(rhs_obj);
-    match op {
-        ComparisonOperator::Less => lhs < rhs,
-        ComparisonOperator::LessOrEqual => lhs <= rhs,
-        ComparisonOperator::Greater => lhs > rhs,
-        ComparisonOperator::GreaterOrEqual => lhs >= rhs,
-        ComparisonOperator::Equal => lhs == rhs,
-        ComparisonOperator::NotEqual => lhs != rhs,
+    unsafe {
+        let lhs = as_float_for_trace(lhs_obj);
+        let rhs = as_float_for_trace(rhs_obj);
+        match op {
+            ComparisonOperator::Less => lhs < rhs,
+            ComparisonOperator::LessOrEqual => lhs <= rhs,
+            ComparisonOperator::Greater => lhs > rhs,
+            ComparisonOperator::GreaterOrEqual => lhs >= rhs,
+            ComparisonOperator::Equal => lhs == rhs,
+            ComparisonOperator::NotEqual => lhs != rhs,
+        }
     }
 }
 
@@ -1377,37 +1288,8 @@ pub(crate) fn trace_raw_float_array_setitem_value(
     );
 }
 
-pub(crate) fn is_boxed_int_value(concrete_value: PyObjectRef) -> bool {
-    !concrete_value.is_null() && unsafe { is_int(concrete_value) }
-}
-
-pub(crate) fn frame_get_next_instr(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_next_instr_descr())
-}
-
-pub(crate) fn frame_get_code(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], frame_code_descr())
-}
-
-pub(crate) fn frame_get_stack_depth(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldRawI, &[frame], frame_stack_depth_descr())
-}
-
 pub(crate) fn frame_get_namespace(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], frame_namespace_descr())
-}
-
-/// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
-/// Get the concrete top-of-stack value for the RETURN_VALUE opcode.
-pub(crate) fn concrete_return_value(frame: usize) -> Option<PyObjectRef> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let vsd = unsafe {
-        *(frame_ptr.add(crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize)
-    };
-    if vsd == 0 {
-        return None;
-    }
-    concrete_stack_value(frame, vsd - 1)
 }
 
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
@@ -1442,45 +1324,10 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     Some(nlocals + ncells)
 }
 
-/// Return nlocals+ncells as the "locals_len" for virtualizable.
-pub(crate) fn concrete_locals_len(frame: usize) -> Option<usize> {
-    concrete_nlocals(frame)
-}
-
-/// virtualizable.py:86-98 read_boxes: len(locals_cells_stack_w).
-/// The total capacity of the frame's value array (nlocals + co_stacksize).
-pub(crate) fn concrete_locals_cells_stack_len(frame: usize) -> Option<usize> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let array_ptr = unsafe {
-        *(frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *const pyre_object::FixedObjectArray)
-    };
-    if array_ptr.is_null() {
-        return None;
-    }
-    Some(unsafe { (*array_ptr).len() })
-}
-
 /// Return the absolute valuestackdepth.
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
-}
-
-pub(crate) fn concrete_namespace_slot(frame: usize, name: &str) -> Option<usize> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let namespace_ptr =
-        unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut PyNamespace) };
-    let namespace = (!namespace_ptr.is_null()).then_some(unsafe { &*namespace_ptr })?;
-    namespace.slot_of(name)
-}
-
-pub(crate) fn concrete_namespace_value(frame: usize, idx: usize) -> Option<PyObjectRef> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let namespace_ptr =
-        unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut PyNamespace) };
-    let namespace = (!namespace_ptr.is_null()).then_some(unsafe { &*namespace_ptr })?;
-    namespace.get_slot(idx)
 }
 
 pub(crate) fn namespace_slot_direct(ns: *mut PyNamespace, name: &str) -> Option<usize> {
@@ -1495,26 +1342,6 @@ pub(crate) fn namespace_value_direct(ns: *mut PyNamespace, idx: usize) -> Option
         return None;
     }
     unsafe { &*ns }.get_slot(idx)
-}
-
-pub(crate) fn record_current_state_guard(
-    ctx: &mut TraceCtx,
-    frame: OpRef,
-    next_instr: OpRef,
-    code: OpRef,
-    stack_depth: OpRef,
-    namespace: OpRef,
-    locals: &[OpRef],
-    stack: &[OpRef],
-    opcode: OpCode,
-    args: &[OpRef],
-) {
-    let mut fail_args = vec![frame, next_instr, code, stack_depth, namespace];
-    fail_args.extend_from_slice(locals);
-    fail_args.extend_from_slice(stack);
-    let num_slots = fail_args.len() - crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    let fail_arg_types = crate::virtualizable_gen::virt_live_value_types(num_slots);
-    ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
 /// pyre slots are always GCREF (Ref) at the concrete frame level.
@@ -1610,35 +1437,6 @@ pub(crate) fn boxed_slot_value_for_type(_slot_type: Type, value: &Value) -> PyOb
 /// PyObjectRef that the optimizer typed as Int during unboxing). Zero/null
 /// values become PY_NULL. Only true small ints (non-zero, non-pointer)
 /// need boxing.
-pub(crate) fn boxed_slot_value_as_ref(value: &Value) -> PyObjectRef {
-    match value {
-        Value::Ref(r) => r.as_usize() as PyObjectRef,
-        Value::Int(v) => {
-            let addr = *v as usize;
-            if addr == 0 {
-                PY_NULL
-            } else if addr >= 0x1_0000 && addr < ((1u64 << 56) as usize) && (addr & 7) == 0 {
-                // Heap pointer — use as PyObjectRef directly
-                *v as PyObjectRef
-            } else {
-                // Small int — box it
-                w_int_new(*v)
-            }
-        }
-        Value::Float(v) => pyre_object::floatobject::w_float_new(*v),
-        Value::Void => PY_NULL,
-    }
-}
-
-pub(crate) fn boxed_slot_value_from_runtime_kind(value: &Value) -> PyObjectRef {
-    match value {
-        Value::Int(v) => w_int_new(*v),
-        Value::Float(v) => pyre_object::floatobject::w_float_new(*v),
-        Value::Ref(r) => r.as_usize() as PyObjectRef,
-        Value::Void => PY_NULL,
-    }
-}
-
 /// virtualizable.py:126/139 parity: box value for frame array slot.
 /// Frame array items (locals_cells_stack_w[*]) are declared as GCREF
 /// (interp_jit.py:25). The optimizer may unbox ints/floats in fail_args;
@@ -1719,61 +1517,6 @@ pub(crate) fn one_arg_callee_frame_helper(
 pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
     let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     crate::virtualizable_gen::virt_live_value_types(len.saturating_sub(n))
-}
-
-pub(crate) fn frame_entry_arg_types_from_slot_types(slot_types: &[Type]) -> Vec<Type> {
-    if slot_types.is_empty() {
-        vec![Type::Ref]
-    } else {
-        let mut types = crate::virtualizable_gen::virt_live_value_types(0);
-        types.extend(slot_types.iter().copied());
-        types
-    }
-}
-
-pub(crate) fn pending_entry_slot_types_from_args(
-    arg_types: &[Type],
-    callee_nlocals: usize,
-    callee_stack_only: usize,
-) -> Vec<Type> {
-    let mut slot_types = Vec::with_capacity(callee_nlocals + callee_stack_only);
-    slot_types.extend(arg_types.iter().copied().take(callee_nlocals));
-    while slot_types.len() < callee_nlocals {
-        slot_types.push(Type::Ref);
-    }
-    while slot_types.len() < callee_nlocals + callee_stack_only {
-        slot_types.push(Type::Ref);
-    }
-    slot_types
-}
-
-pub(crate) fn synthesize_fresh_callee_entry_args(
-    ctx: &mut TraceCtx,
-    callee_frame: OpRef,
-    args: &[OpRef],
-    callee_nlocals: usize,
-    callee_code_ptr: usize,
-    callee_namespace_ptr: usize,
-) -> Vec<OpRef> {
-    // Fresh entry: next_instr=0, valuestackdepth=nlocals (empty stack).
-    // virtualizable.py:86: read_boxes reads ALL static fields from the heap.
-    // interp_jit.py:25-31 scalar field order:
-    //   next_instr, code, valuestackdepth, debugdata, lastblock, namespace
-    let null = ctx.const_ref(PY_NULL as i64);
-    let mut ca_args = vec![
-        callee_frame,
-        ctx.const_int(0),                           // next_instr
-        ctx.const_ref(callee_code_ptr as i64),      // code
-        ctx.const_int(callee_nlocals as i64),       // valuestackdepth
-        null,                                       // debugdata (None)
-        null,                                       // lastblock (None)
-        ctx.const_ref(callee_namespace_ptr as i64), // namespace
-    ];
-    ca_args.extend(args.iter().copied().take(callee_nlocals));
-    while ca_args.len() < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + callee_nlocals {
-        ca_args.push(null);
-    }
-    ca_args
 }
 
 impl PyreSym {
@@ -1964,31 +1707,6 @@ impl PyreSym {
         self.valuestackdepth.saturating_sub(self.nlocals)
     }
 
-    pub(crate) fn value_type_of(&self, value: OpRef) -> Type {
-        if value.is_none() {
-            return Type::Ref;
-        }
-        if let Some(idx) = self.symbolic_locals.iter().position(|&slot| slot == value) {
-            return self
-                .symbolic_local_types
-                .get(idx)
-                .copied()
-                .unwrap_or(Type::Ref);
-        }
-        let stack_only = self.stack_only_depth().min(self.symbolic_stack.len());
-        if let Some(idx) = self.symbolic_stack[..stack_only]
-            .iter()
-            .position(|&slot| slot == value)
-        {
-            return self
-                .symbolic_stack_types
-                .get(idx)
-                .copied()
-                .unwrap_or(Type::Ref);
-        }
-        Type::Ref
-    }
-
     /// Read a concrete value from the Box arrays using an absolute
     /// unified-array index (0..nlocals = locals, nlocals.. = stack).
     pub(crate) fn concrete_value_at(&self, abs_idx: usize) -> ConcreteValue {
@@ -2004,10 +1722,6 @@ impl PyreSym {
                 .copied()
                 .unwrap_or(ConcreteValue::Null)
         }
-    }
-
-    pub(crate) fn concrete_pyobj_at(&self, abs_idx: usize) -> PyObjectRef {
-        self.concrete_value_at(abs_idx).to_pyobj()
     }
 }
 
@@ -2902,7 +2616,7 @@ impl JitState for PyreJitState {
     type Sym = PyreSym;
     type Env = PyreEnv;
 
-    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
+    fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {
         let num_locals = self.local_count();
         let vsd = self.valuestackdepth();
         let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
@@ -3261,7 +2975,7 @@ impl JitState for PyreJitState {
         unsafe { (*frame_ptr).pycode as usize }
     }
 
-    fn update_meta_for_cut(meta: &mut Self::Meta, header_pc: usize, original_box_types: &[Type]) {
+    fn update_meta_for_cut(meta: &mut Self::Meta, _header_pc: usize, original_box_types: &[Type]) {
         // Update valuestackdepth from the merge point's box layout.
         // Layout: [Ref(frame), Int(ni), Ref(code), Int(vsd), Ref(ns), locals..., stack...]
         // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
@@ -3279,7 +2993,7 @@ impl JitState for PyreJitState {
 
     fn build_meta_from_merge_point(
         provisional: &PyreMeta,
-        header_pc: usize,
+        _header_pc: usize,
         original_box_types: &[Type],
     ) -> PyreMeta {
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
@@ -3904,23 +3618,6 @@ fn materialize_virtual_raw_buffer(
     Some(majit_ir::GcRef(buffer as usize))
 }
 
-fn value_to_ptr(value: &Value) -> PyObjectRef {
-    match value {
-        Value::Ref(gc_ref) => gc_ref.0 as PyObjectRef,
-        Value::Int(n) => *n as PyObjectRef,
-        _ => std::ptr::null_mut(),
-    }
-}
-
-fn value_to_raw(value: &Value) -> usize {
-    match value {
-        Value::Ref(gc_ref) => gc_ref.0,
-        Value::Int(n) => *n as usize,
-        Value::Float(f) => f.to_bits() as usize,
-        Value::Void => 0,
-    }
-}
-
 fn value_to_usize(value: &Value) -> usize {
     match value {
         Value::Ref(gc_ref) => gc_ref.0,
@@ -3942,13 +3639,23 @@ fn extract_pyre_field_offset(descr_idx: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::descr::{list_float_items_len_descr, list_int_items_len_descr};
+    use crate::helpers::TraceHelperAccess;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
+    use pyre_interpreter::bytecode::BinaryOperator;
     use pyre_interpreter::eval::eval_frame_plain;
-    use pyre_interpreter::{OpcodeStepExecutor, SharedOpcodeHandler, compile_exec};
+    use pyre_interpreter::{
+        BranchOpcodeHandler, IterOpcodeHandler, LocalOpcodeHandler, OpcodeStepExecutor,
+        SharedOpcodeHandler, compile_exec,
+    };
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
-    use pyre_object::listobject::w_list_getitem;
+    use pyre_object::listobject::{
+        w_list_can_append_without_realloc, w_list_getitem, w_list_uses_float_storage,
+        w_list_uses_int_storage,
+    };
+    use pyre_object::pyobject::{PyType, is_list};
     use std::cell::{Cell, UnsafeCell};
     use std::rc::Rc;
 
@@ -4007,15 +3714,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_boxed_int_value_ignores_py_null_sentinel() {
-        assert!(!is_boxed_int_value(PY_NULL));
-        let boxed = w_int_new(7);
-        assert!(is_boxed_int_value(boxed));
-    }
-
-    #[test]
     fn test_trace_ob_type_descr_uses_immutable_header_field_descr() {
-        let descr = trace_ob_type_descr();
+        let descr = crate::descr::ob_type_descr();
         let field = descr
             .as_field_descr()
             .expect("ob_type descr must be a field descr");
@@ -4023,18 +3723,6 @@ mod tests {
         assert_eq!(field.field_type(), Type::Int);
         assert!(descr.is_always_pure());
         assert!(field.is_immutable());
-    }
-
-    #[test]
-    fn test_trace_gc_object_type_field_uses_pure_getfield_for_immutable_header() {
-        let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef(0);
-        let _ = trace_gc_object_type_field(&mut ctx, obj, trace_ob_type_descr());
-
-        let recorder = ctx.into_recorder();
-        let op = recorder.last_op().expect("getfield op should be present");
-        assert_eq!(op.opcode, OpCode::GetfieldGcPureI);
-        assert_eq!(op.args.as_slice(), &[obj]);
     }
 
     #[test]
@@ -4049,7 +3737,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4079,7 +3766,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4135,7 +3821,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4171,7 +3856,6 @@ mod tests {
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef(0));
         sym.init_vable_indices();
@@ -4428,7 +4112,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4456,7 +4139,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4485,8 +4167,6 @@ mod tests {
         let mut frame = Box::new(PyFrame::new(code));
         frame.locals_w_mut()[0] = w_int_new(41);
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(1);
         let raw = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -4497,7 +4177,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4532,7 +4211,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4561,7 +4239,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4600,7 +4277,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4660,7 +4336,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: branch_pc,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4740,7 +4415,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4832,7 +4506,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: compare_pc + 1,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4890,8 +4563,6 @@ mod tests {
 
         let mut frame = Box::new(PyFrame::new(code.clone()));
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.last_comparison_truth = Some(OpRef(123));
@@ -4899,7 +4570,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: compare_pc + 2,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4931,8 +4601,6 @@ mod tests {
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.nlocals = frame.nlocals();
@@ -4943,7 +4611,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -4968,8 +4635,6 @@ mod tests {
         let mut frame = Box::new(PyFrame::new(code));
         frame.push(w_int_new(7));
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(1);
         let raw_int = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -4979,7 +4644,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5010,11 +4674,7 @@ mod tests {
         let mut frame = Box::new(PyFrame::new(code));
         frame.set_last_instr_from_next_instr(456);
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(3);
-        let expected_pc = ctx.const_int(456);
-        let expected_vsd = ctx.const_int(2);
         let frame_ref = OpRef(0);
         let lower_stack = OpRef(1);
         let truth = OpRef(2);
@@ -5028,7 +4688,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 459,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5066,11 +4725,7 @@ mod tests {
         let mut frame = Box::new(PyFrame::new(code));
         frame.set_last_instr_from_next_instr(456);
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(3);
-        let expected_pc = ctx.const_int(456);
-        let expected_vsd = ctx.const_int(2);
         let frame_ref = OpRef(0);
         let lower_stack = OpRef(1);
         let truth = OpRef(2);
@@ -5085,7 +4740,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 459,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5135,7 +4789,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5181,7 +4834,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5238,7 +4890,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5294,7 +4945,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5334,8 +4984,6 @@ mod tests {
         let arg_idx = frame.stack_base() + 2;
         frame.locals_w_mut()[arg_idx] = list;
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
         let mut ctx = TraceCtx::for_test(2);
         let value = OpRef(0);
         let callable = OpRef(1);
@@ -5348,7 +4996,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5411,7 +5058,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5459,7 +5105,6 @@ mod tests {
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         unsafe {
             assert!(w_list_uses_int_storage(concrete_list));
             assert!(w_list_can_append_without_realloc(concrete_list));
@@ -5473,7 +5118,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5549,7 +5193,6 @@ mod tests {
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         unsafe {
             assert!(w_list_uses_float_storage(concrete_list));
             assert!(w_list_can_append_without_realloc(concrete_list));
@@ -5563,7 +5206,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5641,7 +5283,6 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            ob_type_fd: trace_ob_type_descr(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
@@ -5771,13 +5412,15 @@ pub fn execute_inline_residual_call(
 /// For large ints (outside small cache range), the strategy always keeps them
 /// as raw i64 values regardless of pointer identity.
 pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -> bool {
-    let v = pyre_object::w_int_get_value(value);
-    if pyre_object::w_int_small_cached(v) {
-        // Small cached range: only canonical pointer preserves int strategy.
-        std::ptr::eq(value, pyre_object::w_int_new(v))
-    } else {
-        // Large ints are always stored as raw i64 in int strategy.
-        true
+    unsafe {
+        let v = pyre_object::w_int_get_value(value);
+        if pyre_object::w_int_small_cached(v) {
+            // Small cached range: only canonical pointer preserves int strategy.
+            std::ptr::eq(value, pyre_object::w_int_new(v))
+        } else {
+            // Large ints are always stored as raw i64 in int strategy.
+            true
+        }
     }
 }
 

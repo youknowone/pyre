@@ -119,66 +119,78 @@ pub const GC_HEADER_SIZE: usize = 8;
 /// from frame code — that would violate the GC ref contract and cause
 /// dangling pointers when the JIT captures these refs in snapshots.
 unsafe fn alloc_with_gc_header<T>(value: T) -> *mut T {
-    let total = GC_HEADER_SIZE + std::mem::size_of::<T>();
-    let align = std::mem::align_of::<T>().max(8);
-    let layout = std::alloc::Layout::from_size_align(total, align).unwrap();
-    let raw = std::alloc::alloc_zeroed(layout);
-    if raw.is_null() {
-        std::alloc::handle_alloc_error(layout);
+    unsafe {
+        let total = GC_HEADER_SIZE + std::mem::size_of::<T>();
+        let align = std::mem::align_of::<T>().max(8);
+        let layout = std::alloc::Layout::from_size_align(total, align).unwrap();
+        let raw = std::alloc::alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let ptr = raw.add(GC_HEADER_SIZE) as *mut T;
+        std::ptr::write(ptr, value);
+        ptr
     }
-    let ptr = raw.add(GC_HEADER_SIZE) as *mut T;
-    std::ptr::write(ptr, value);
-    ptr
 }
 
 /// Allocate a `FixedObjectArray` with a zeroed GC header prepended.
 pub unsafe fn alloc_array_with_gc_header(array: FixedObjectArray) -> *mut FixedObjectArray {
-    alloc_with_gc_header(array)
+    unsafe { alloc_with_gc_header(array) }
 }
 
 /// Deallocate a `FixedObjectArray` allocated with [`alloc_array_with_gc_header`].
 pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
-    std::ptr::drop_in_place(ptr);
-    let raw = (ptr as *mut u8).sub(GC_HEADER_SIZE);
-    let total = GC_HEADER_SIZE + std::mem::size_of::<FixedObjectArray>();
-    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-    std::alloc::dealloc(raw, layout);
+    unsafe {
+        std::ptr::drop_in_place(ptr);
+        let raw = (ptr as *mut u8).sub(GC_HEADER_SIZE);
+        let total = GC_HEADER_SIZE + std::mem::size_of::<FixedObjectArray>();
+        let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+        std::alloc::dealloc(raw, layout);
+    }
 }
 
 unsafe fn clone_debugdata_ptr(ptr: *mut FrameDebugData) -> *mut FrameDebugData {
-    if ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        Box::into_raw(Box::new((*ptr).clone()))
+    unsafe {
+        if ptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            Box::into_raw(Box::new((*ptr).clone()))
+        }
     }
 }
 
 unsafe fn clear_debugdata_ptr(ptr: &mut *mut FrameDebugData) {
-    if !(*ptr).is_null() {
-        drop(Box::from_raw(*ptr));
-        *ptr = std::ptr::null_mut();
+    unsafe {
+        if !(*ptr).is_null() {
+            drop(Box::from_raw(*ptr));
+            *ptr = std::ptr::null_mut();
+        }
     }
 }
 
 unsafe fn clone_block_chain(ptr: *mut FrameBlock) -> *mut FrameBlock {
-    if ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        Box::into_raw(Box::new(FrameBlock {
-            handlerposition: (*ptr).handlerposition,
-            valuestackdepth: (*ptr).valuestackdepth,
-            previous: clone_block_chain((*ptr).previous),
-        }))
+    unsafe {
+        if ptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            Box::into_raw(Box::new(FrameBlock {
+                handlerposition: (*ptr).handlerposition,
+                valuestackdepth: (*ptr).valuestackdepth,
+                previous: clone_block_chain((*ptr).previous),
+            }))
+        }
     }
 }
 
 unsafe fn clear_block_chain(ptr: &mut *mut FrameBlock) {
-    let mut current = *ptr;
-    while !current.is_null() {
-        let block = Box::from_raw(current);
-        current = block.previous;
+    unsafe {
+        let mut current = *ptr;
+        while !current.is_null() {
+            let block = Box::from_raw(current);
+            current = block.previous;
+        }
+        *ptr = std::ptr::null_mut();
     }
-    *ptr = std::ptr::null_mut();
 }
 
 impl Drop for PyFrame {
@@ -214,7 +226,7 @@ impl PyFrame {
 /// pyre: W_CodeObject wraps a raw CodeObject — this extracts it.
 #[inline]
 pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
-    crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject
+    unsafe { crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject }
 }
 
 #[repr(C)]
@@ -480,7 +492,7 @@ impl PyFrame {
                 PY_NULL,
             ))
         };
-        self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(unsafe { &*raw }) };
+        self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(&*raw) };
         self.last_instr = -1;
         self.escaped = false;
         self.frame_finished_execution = false;

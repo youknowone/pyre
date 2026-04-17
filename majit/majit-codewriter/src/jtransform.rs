@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::call::CallDescriptor;
 use crate::model::{
-    BlockId, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, Terminator,
-    ValueId, ValueType,
+    CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
+    ValueType,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -155,6 +155,7 @@ pub struct Transformer<'a> {
     /// RPython: `Transformer.vable_array_vars`.
     vable_array_vars: std::collections::HashMap<ValueId, usize>,
     /// RPython: `Transformer.vable_flags`.
+    #[allow(dead_code)]
     vable_flags: std::collections::HashMap<ValueId, VableFlag>,
     /// Value aliases from identity rewrites (same_as / hint rewriting).
     aliases: std::collections::HashMap<ValueId, ValueId>,
@@ -995,7 +996,6 @@ impl<'a> Transformer<'a> {
             _ => {
                 // jtransform.py:1757
                 panic!("missing support for jit.* oopspec: {oopspec_name}");
-                RewriteResult::Keep
             }
         }
     }
@@ -1202,9 +1202,10 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
     /// (jtransform.py:292-313).
+    #[allow(dead_code)]
     fn rewrite_op_jit_record_known_result(
         &mut self,
-        op: &SpaceOperation,
+        _op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         _result_ty: &ValueType,
@@ -1214,7 +1215,6 @@ impl<'a> Transformer<'a> {
         for &arg in args {
             if self.get_value_kind(arg) == 'f' {
                 panic!("record_known_result does not support floats");
-                return RewriteResult::Keep;
             }
         }
         // jtransform.py:298-300: calldescr from function (args[1:] → args[0])
@@ -1227,7 +1227,6 @@ impl<'a> Transformer<'a> {
             'r' => majit_ir::value::Type::Ref,
             _ => {
                 panic!("record_known_result: unsupported result kind '{result_kind}'");
-                return RewriteResult::Keep;
             }
         };
         let non_void_args = resolve_non_void_arg_types(func_args, self.type_state);
@@ -1324,6 +1323,7 @@ impl<'a> Transformer<'a> {
 
     /// RPython: elidable call — pure function, result depends only on args.
     /// RPython jtransform.py:546-562.
+    #[allow(dead_code)]
     fn handle_elidable_call(
         &mut self,
         op: &SpaceOperation,
@@ -1353,6 +1353,7 @@ impl<'a> Transformer<'a> {
 
     /// RPython: may-force call — can trigger GC or force virtualizables.
     /// RPython jtransform.py:609-625.
+    #[allow(dead_code)]
     fn handle_may_force_call(
         &mut self,
         op: &SpaceOperation,
@@ -1861,33 +1862,6 @@ fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::Virtualizabl
         .and_then(|segments| crate::hints::classify_virtualizable_hint_segments(segments))
 }
 
-fn is_vable_identity_hint(target: &CallTarget) -> bool {
-    matches!(
-        classify_vable_hint(target),
-        Some(
-            crate::hints::VirtualizableHintKind::AccessDirectly
-                | crate::hints::VirtualizableHintKind::FreshVirtualizable
-        )
-    )
-}
-
-fn is_vable_force_hint(target: &CallTarget) -> bool {
-    matches!(
-        classify_vable_hint(target),
-        Some(crate::hints::VirtualizableHintKind::ForceVirtualizable)
-    )
-}
-
-impl CallEffectKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            CallEffectKind::Elidable => "elidable",
-            CallEffectKind::Residual => "residual",
-            CallEffectKind::MayForce => "may_force",
-        }
-    }
-}
-
 /// Match CallTarget loosely: generic receivers (lowercase like "handler",
 /// "self") match any pattern receiver type.
 fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool {
@@ -1969,7 +1943,7 @@ fn classify_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueId, ValueType};
+    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
     #[test]
     fn rewrite_graph_tags_vable_fields() {

@@ -50,8 +50,6 @@ pub struct JitInterpConfig {
     pub state_type: Ident,
     /// The environment type (e.g., `Program`).
     pub env_type: Ident,
-    /// Method name → IR opcode mapping for binary operations.
-    pub binops: Vec<(Ident, Ident)>,
     /// Interpreter I/O function → JIT shim function mapping.
     pub io_shims: Vec<(Path, Ident)>,
     /// Interpreter function call policies for helper calls.
@@ -241,7 +239,6 @@ impl Parse for JitInterpConfig {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut state_type = None;
         let mut env_type = None;
-        let mut binops = None;
         let mut io_shims = None;
         let mut calls: Vec<(Path, Option<CallPolicyKind>)> = Vec::new();
         let mut auto_calls = None;
@@ -259,9 +256,6 @@ impl Parse for JitInterpConfig {
                 }
                 "env" => {
                     env_type = Some(input.parse::<Ident>()?);
-                }
-                "binops" => {
-                    binops = Some(parse_binop_map(input)?);
                 }
                 "io_shims" => {
                     io_shims = Some(parse_io_shim_map(input)?);
@@ -310,7 +304,6 @@ impl Parse for JitInterpConfig {
         Ok(JitInterpConfig {
             state_type,
             env_type,
-            binops: binops.unwrap_or_default(),
             io_shims: io_shims.unwrap_or_default(),
             calls,
             auto_calls: auto_calls.unwrap_or(false),
@@ -540,21 +533,6 @@ fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl
     })
 }
 
-/// Parse `{ method => OpCode, ... }`.
-fn parse_binop_map(input: ParseStream) -> syn::Result<Vec<(Ident, Ident)>> {
-    let content;
-    braced!(content in input);
-    let mut map = Vec::new();
-    while !content.is_empty() {
-        let method: Ident = content.parse()?;
-        content.parse::<Token![=>]>()?;
-        let opcode: Ident = content.parse()?;
-        map.push((method, opcode));
-        let _ = content.parse::<Token![,]>();
-    }
-    Ok(map)
-}
-
 /// Parse `{ path::func => jit_func, ... }`.
 fn parse_io_shim_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
     let content;
@@ -664,11 +642,10 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let sig = &func.sig;
     let attrs = &func.attrs;
     let fn_name = &func.sig.ident;
-    let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
     let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
 
     // Rewrite the function body, replacing marker macros
-    let body = rewrite_body(&func.block, &trace_fn_name, &merge_fn_name, &config.greens);
+    let body = rewrite_body(&func.block, &merge_fn_name, &config.greens);
 
     quote! {
         #(#attrs)*
@@ -679,12 +656,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
 }
 
 /// Rewrite function body: replace jit_merge_point!() and can_enter_jit!() calls.
-fn rewrite_body(
-    block: &syn::Block,
-    trace_fn_name: &Ident,
-    merge_fn_name: &Ident,
-    default_greens: &[Expr],
-) -> TokenStream {
+fn rewrite_body(block: &syn::Block, merge_fn_name: &Ident, default_greens: &[Expr]) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
     #[derive(Default, Clone)]
@@ -692,7 +664,6 @@ fn rewrite_body(
         driver: Option<Expr>,
         env: Option<Expr>,
         pc: Option<Expr>,
-        greens: Vec<Expr>,
     }
 
     impl Parse for MergePointArgs {
@@ -705,18 +676,15 @@ fn rewrite_body(
             let env: Expr = input.parse()?;
             input.parse::<Token![,]>()?;
             let pc: Expr = input.parse()?;
-            let mut greens = Vec::new();
             if input.peek(Token![;]) {
                 input.parse::<Token![;]>()?;
-                let exprs: Punctuated<Expr, Token![,]> =
+                let _: Punctuated<Expr, Token![,]> =
                     input.parse_terminated(Expr::parse, Token![,])?;
-                greens = exprs.into_iter().collect();
             }
             Ok(Self {
                 driver: Some(driver),
                 env: Some(env),
                 pc: Some(pc),
-                greens,
             })
         }
     }
@@ -785,7 +753,6 @@ fn rewrite_body(
     }
 
     struct MarkerRewriter {
-        trace_fn_name: Ident,
         merge_fn_name: Ident,
         default_greens: Vec<Expr>,
     }
@@ -915,7 +882,6 @@ fn rewrite_body(
 
     let mut cloned_block = block.clone();
     let mut rewriter = MarkerRewriter {
-        trace_fn_name: trace_fn_name.clone(),
         merge_fn_name: merge_fn_name.clone(),
         default_greens: default_greens.to_vec(),
     };

@@ -1152,40 +1152,40 @@ unsafe fn apply_pending_field_write(
     item_index: Option<usize>,
     value: i64,
 ) {
-    match layout {
-        PendingFieldWriteLayout::Field { offset, value_type } => {
-            let ptr = (target as *mut u8).add(offset);
-            write_typed_value(ptr, value, value_type);
-        }
-        PendingFieldWriteLayout::ArrayItem {
-            base_offset,
-            item_size,
-            item_type,
-        } => {
-            let index = item_index.unwrap_or(0);
-            let ptr = (target as *mut u8).add(base_offset + index * item_size);
-            write_typed_value(ptr, value, item_type);
+    unsafe {
+        match layout {
+            PendingFieldWriteLayout::Field { offset, value_type } => {
+                let ptr = (target as *mut u8).add(offset);
+                write_typed_value(ptr, value, value_type);
+            }
+            PendingFieldWriteLayout::ArrayItem {
+                base_offset,
+                item_size,
+                item_type,
+            } => {
+                let index = item_index.unwrap_or(0);
+                let ptr = (target as *mut u8).add(base_offset + index * item_size);
+                write_typed_value(ptr, value, item_type);
+            }
         }
     }
 }
 
 unsafe fn write_typed_value(ptr: *mut u8, value: i64, value_type: Type) {
-    match value_type {
-        Type::Int => (ptr as *mut i64).write(value),
-        Type::Ref => (ptr as *mut usize).write(value as usize),
-        Type::Float => (ptr as *mut f64).write(f64::from_bits(value as u64)),
-        Type::Void => {}
+    unsafe {
+        match value_type {
+            Type::Int => (ptr as *mut i64).write(value),
+            Type::Ref => (ptr as *mut usize).write(value as usize),
+            Type::Float => (ptr as *mut f64).write(f64::from_bits(value as u64)),
+            Type::Void => {}
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resume::{
-        MaterializedValue, MaterializedVirtual, ReconstructedFrame, ReconstructedState,
-        ReconstructedValue, ResumeFrameLayoutSummary,
-    };
-    use majit_backend::ExitFrameLayout;
+    use crate::resume::{MaterializedValue, MaterializedVirtual};
     use std::cell::Cell;
 
     /// Test state that tracks how many times `materialize_virtual_ref` was

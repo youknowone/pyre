@@ -2,7 +2,7 @@
 /// Stores saved values and descriptor reference from guard failure.
 use std::sync::Arc;
 
-use majit_ir::{GcRef, Type};
+use majit_ir::GcRef;
 
 use crate::guard::DynasmFailDescr;
 

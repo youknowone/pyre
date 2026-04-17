@@ -1,7 +1,3 @@
-/// JitCodeMachine -- jitcode bytecode interpreter for tracing.
-///
-/// RPython pyjitpl.py: MIFrame._interpret equivalent.
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 

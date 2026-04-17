@@ -155,10 +155,6 @@ fn helper_call_kind_for_return(output: &ReturnType) -> HelperCallKind {
     }
 }
 
-fn is_supported_helper_return_type(ty: &Type) -> bool {
-    matches!(helper_call_kind_for_type(ty), HelperCallKind::Int)
-}
-
 fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::TokenStream> {
     if is_gc_ref_type(ty) {
         return Some(quote! { #ty((#arg_ident) as usize) });
@@ -1287,10 +1283,6 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         selector: state.selected,
 ///         untraceable: [VAL_QUEUE, VAL_PORT],
 ///         scan: find_used_storages,
-///     },
-///     binops = {
-///         add => IntAdd, sub => IntSub, mul => IntMul,
-///         div => IntFloorDiv, modulo => IntMod, cmp => IntGe,
 ///     },
 ///     io_shims = {
 ///         aheui_io::write_number => jit_write_number,

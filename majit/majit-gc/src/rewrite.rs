@@ -866,6 +866,7 @@ impl GcRewriterImpl {
     ///   2. gen_initialize_tid + zero GC fields
     ///   3. store each arg at _ll_initial_locs[i] offset
     ///   4. replace multi-arg CALL_ASSEMBLER with single-arg [frame]
+    #[allow(dead_code)]
     fn handle_call_assembler(&self, op: &Op, st: &mut RewriteState) {
         let descrs = self.jitframe_info.as_ref().unwrap();
         let lookup = self.call_assembler_callee_locs.as_ref().unwrap();
@@ -1560,7 +1561,7 @@ mod tests {
             // We build the SetfieldGc referencing pos=0 from the CallMallocNursery result.
         ];
 
-        let _result = rw.rewrite_for_gc(&ops);
+        rw.rewrite_for_gc(&ops);
 
         // Now rewrite a SetfieldGc that stores a ref into the new object.
         let ops2 = vec![

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
-    PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo,
-    VirtualStructInfo, VirtualizableFieldState,
+    PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,
+    VirtualizableFieldState,
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -1743,6 +1743,7 @@ fn set_array_element(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimizeopt::info::VirtualRawBufferInfo;
     use crate::optimizeopt::optimizer::Optimizer;
     use std::collections::HashMap;
     use std::sync::Arc;

@@ -7,8 +7,8 @@ use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use crate::{
-    PyError, PyErrorKind, PyNamespace, PyResult, builtin_code_get, dispatch_callable,
-    function_get_closure, function_get_code, function_get_globals,
+    PyError, PyNamespace, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
+    function_get_globals,
 };
 
 thread_local! {
@@ -1750,18 +1750,20 @@ unsafe fn copy_flags_from_bases(
     w_type: pyre_object::PyObjectRef,
     w_bases: pyre_object::PyObjectRef,
 ) {
-    if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
-        return;
-    }
-    let len = pyre_object::w_tuple_len(w_bases);
-    for i in 0..len {
-        if let Some(base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
-            if pyre_object::is_type(base) {
-                if pyre_object::w_type_get_hasdict(base) {
-                    pyre_object::w_type_set_hasdict(w_type, true);
-                }
-                if pyre_object::w_type_get_weakrefable(base) {
-                    pyre_object::w_type_set_weakrefable(w_type, true);
+    unsafe {
+        if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
+            return;
+        }
+        let len = pyre_object::w_tuple_len(w_bases);
+        for i in 0..len {
+            if let Some(base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+                if pyre_object::is_type(base) {
+                    if pyre_object::w_type_get_hasdict(base) {
+                        pyre_object::w_type_set_hasdict(w_type, true);
+                    }
+                    if pyre_object::w_type_get_weakrefable(base) {
+                        pyre_object::w_type_set_weakrefable(w_type, true);
+                    }
                 }
             }
         }
@@ -1779,123 +1781,125 @@ pub unsafe fn create_all_slots(
     ns: &crate::PyNamespace,
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    use pyre_object::typeobject::{Layout, leak_layout};
+    unsafe {
+        use pyre_object::typeobject::{Layout, leak_layout};
 
-    // typeobject.py:1245: w_bestbase = check_and_find_best_base(space, bases_w)
-    let w_bestbase = check_and_find_best_base(w_bases)?;
+        // typeobject.py:1245: w_bestbase = check_and_find_best_base(space, bases_w)
+        let w_bestbase = check_and_find_best_base(w_bases)?;
 
-    // typeobject.py:1254: copy_flags_from_bases — inherit hasdict/weakrefable
-    copy_flags_from_bases(w_type, w_bases);
+        // typeobject.py:1254: copy_flags_from_bases — inherit hasdict/weakrefable
+        copy_flags_from_bases(w_type, w_bases);
 
-    // typeobject.py:1146: base_layout = w_bestbase.layout
-    let base_layout = if w_bestbase.is_null() {
-        std::ptr::null()
-    } else {
-        pyre_object::w_type_get_layout_ptr(w_bestbase)
-    };
-    let base_nslots = if base_layout.is_null() {
-        0
-    } else {
-        (*base_layout).nslots
-    };
+        // typeobject.py:1146: base_layout = w_bestbase.layout
+        let base_layout = if w_bestbase.is_null() {
+            std::ptr::null()
+        } else {
+            pyre_object::w_type_get_layout_ptr(w_bestbase)
+        };
+        let base_nslots = if base_layout.is_null() {
+            0
+        } else {
+            (*base_layout).nslots
+        };
 
-    // typeobject.py:1150-1204 create_all_slots
-    let mut newslotnames = Vec::new();
-    let (mut wantdict, mut wantweakref);
-    if let Some(&w_slots) = ns.get("__slots__") {
-        // typeobject.py:1154-1176: has __slots__
-        wantdict = false;
-        wantweakref = false;
-        let all_names = collect_slot_names(w_slots)?;
-        for slot_name in &all_names {
-            match slot_name.as_str() {
-                // typeobject.py:1165-1169: __dict__ slot
-                "__dict__" => {
-                    if wantdict || pyre_object::w_type_get_hasdict(w_type) {
-                        return Err(crate::PyError::type_error(
-                            "__dict__ slot disallowed: we already got one".to_string(),
-                        ));
+        // typeobject.py:1150-1204 create_all_slots
+        let mut newslotnames = Vec::new();
+        let (mut wantdict, mut wantweakref);
+        if let Some(&w_slots) = ns.get("__slots__") {
+            // typeobject.py:1154-1176: has __slots__
+            wantdict = false;
+            wantweakref = false;
+            let all_names = collect_slot_names(w_slots)?;
+            for slot_name in &all_names {
+                match slot_name.as_str() {
+                    // typeobject.py:1165-1169: __dict__ slot
+                    "__dict__" => {
+                        if wantdict || pyre_object::w_type_get_hasdict(w_type) {
+                            return Err(crate::PyError::type_error(
+                                "__dict__ slot disallowed: we already got one".to_string(),
+                            ));
+                        }
+                        wantdict = true;
                     }
-                    wantdict = true;
-                }
-                // typeobject.py:1170-1174: __weakref__ slot
-                "__weakref__" => {
-                    if wantweakref || pyre_object::w_type_get_weakrefable(w_type) {
-                        return Err(crate::PyError::type_error(
-                            "__weakref__ slot disallowed: we already got one".to_string(),
-                        ));
+                    // typeobject.py:1170-1174: __weakref__ slot
+                    "__weakref__" => {
+                        if wantweakref || pyre_object::w_type_get_weakrefable(w_type) {
+                            return Err(crate::PyError::type_error(
+                                "__weakref__ slot disallowed: we already got one".to_string(),
+                            ));
+                        }
+                        wantweakref = true;
                     }
-                    wantweakref = true;
+                    // typeobject.py:1175-1176: regular slot name
+                    _ => newslotnames.push(slot_name.clone()),
                 }
-                // typeobject.py:1175-1176: regular slot name
-                _ => newslotnames.push(slot_name.clone()),
             }
-        }
-        // typeobject.py:1178: string_sort(newslotnames)
-        newslotnames.sort();
+            // typeobject.py:1178: string_sort(newslotnames)
+            newslotnames.sort();
 
-        // typeobject.py:1183-1189: create_slot loop
-        let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
-        let type_name = pyre_object::w_type_get_name(w_type);
-        let mut slot_index = base_nslots;
-        let mut i = 0;
-        while i < newslotnames.len() {
-            // typeobject.py:1208-1209: valid_slot_name check
-            if !valid_slot_name(&newslotnames[i]) {
-                return Err(crate::PyError::type_error(
-                    "__slots__ must be identifiers".to_string(),
-                ));
-            }
-            // typeobject.py:1211: slot_name = mangle(slot_name, w_self.name)
-            let mangled = mangle(&newslotnames[i], type_name);
-            if !type_ns.is_null() && (*type_ns).get(mangled.as_str()).is_some() {
-                // typeobject.py:1219-1220: name conflict → skip this slot
-                newslotnames.remove(i);
-            } else {
-                // typeobject.py:1216-1217: create_slot
-                newslotnames[i] = mangled.clone();
-                if !type_ns.is_null() {
-                    let member = pyre_object::w_member_new(slot_index, mangled.clone(), w_type);
-                    (*type_ns).insert(mangled, member);
+            // typeobject.py:1183-1189: create_slot loop
+            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+            let type_name = pyre_object::w_type_get_name(w_type);
+            let mut slot_index = base_nslots;
+            let mut i = 0;
+            while i < newslotnames.len() {
+                // typeobject.py:1208-1209: valid_slot_name check
+                if !valid_slot_name(&newslotnames[i]) {
+                    return Err(crate::PyError::type_error(
+                        "__slots__ must be identifiers".to_string(),
+                    ));
                 }
-                slot_index += 1;
-                i += 1;
+                // typeobject.py:1211: slot_name = mangle(slot_name, w_self.name)
+                let mangled = mangle(&newslotnames[i], type_name);
+                if !type_ns.is_null() && (*type_ns).get(mangled.as_str()).is_some() {
+                    // typeobject.py:1219-1220: name conflict → skip this slot
+                    newslotnames.remove(i);
+                } else {
+                    // typeobject.py:1216-1217: create_slot
+                    newslotnames[i] = mangled.clone();
+                    if !type_ns.is_null() {
+                        let member = pyre_object::w_member_new(slot_index, mangled.clone(), w_type);
+                        (*type_ns).insert(mangled, member);
+                    }
+                    slot_index += 1;
+                    i += 1;
+                }
             }
+        } else {
+            // typeobject.py:1151-1153: no __slots__
+            wantdict = true;
+            wantweakref = true;
         }
-    } else {
-        // typeobject.py:1151-1153: no __slots__
-        wantdict = true;
-        wantweakref = true;
-    }
 
-    // typeobject.py:1192-1195: create_dict_slot / create_weakref_slot
-    if wantdict {
-        create_dict_slot(w_type);
-    }
-    if wantweakref {
-        create_weakref_slot(w_type);
-    }
+        // typeobject.py:1192-1195: create_dict_slot / create_weakref_slot
+        if wantdict {
+            create_dict_slot(w_type);
+        }
+        if wantweakref {
+            create_weakref_slot(w_type);
+        }
 
-    // typeobject.py:1199-1204: layout computation
-    let nslots = base_nslots + newslotnames.len() as u32;
-    let typedef = if base_layout.is_null() {
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _
-    } else {
-        (*base_layout).typedef
-    };
-    let layout = if nslots == base_nslots && !base_layout.is_null() {
-        base_layout
-    } else {
-        leak_layout(Layout {
-            typedef,
-            nslots,
-            newslotnames,
-            base_layout,
-            acceptable_as_base_class: true,
-        })
-    };
-    pyre_object::w_type_set_layout(w_type, layout);
-    Ok(())
+        // typeobject.py:1199-1204: layout computation
+        let nslots = base_nslots + newslotnames.len() as u32;
+        let typedef = if base_layout.is_null() {
+            &pyre_object::pyobject::INSTANCE_TYPE as *const _
+        } else {
+            (*base_layout).typedef
+        };
+        let layout = if nslots == base_nslots && !base_layout.is_null() {
+            base_layout
+        } else {
+            leak_layout(Layout {
+                typedef,
+                nslots,
+                newslotnames,
+                base_layout,
+                acceptable_as_base_class: true,
+            })
+        };
+        pyre_object::w_type_set_layout(w_type, layout);
+        Ok(())
+    }
 }
 
 /// objspace/std/typeobject.py:1222-1226 create_dict_slot.
@@ -1908,13 +1912,16 @@ pub unsafe fn create_all_slots(
 ///         w_self.hasdict = True
 /// ```
 unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
-    if !pyre_object::w_type_get_hasdict(w_type) {
-        let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
-        let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
-        if !type_ns.is_null() && (*type_ns).get("__dict__").is_none() {
-            (*type_ns).insert("__dict__".to_string(), descr);
+    unsafe {
+        if !pyre_object::w_type_get_hasdict(w_type) {
+            let descr =
+                crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
+            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+            if !type_ns.is_null() && (*type_ns).get("__dict__").is_none() {
+                (*type_ns).insert("__dict__".to_string(), descr);
+            }
+            pyre_object::w_type_set_hasdict(w_type, true);
         }
-        pyre_object::w_type_set_hasdict(w_type, true);
     }
 }
 
@@ -1928,44 +1935,48 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
 ///         w_self.weakrefable = True
 /// ```
 unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
-    if !pyre_object::w_type_get_weakrefable(w_type) {
-        let descr =
-            crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
-        let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
-        if !type_ns.is_null() && (*type_ns).get("__weakref__").is_none() {
-            (*type_ns).insert("__weakref__".to_string(), descr);
+    unsafe {
+        if !pyre_object::w_type_get_weakrefable(w_type) {
+            let descr =
+                crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
+            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+            if !type_ns.is_null() && (*type_ns).get("__weakref__").is_none() {
+                (*type_ns).insert("__weakref__".to_string(), descr);
+            }
+            pyre_object::w_type_set_weakrefable(w_type, true);
         }
-        pyre_object::w_type_set_weakrefable(w_type, true);
     }
 }
 
 /// typeobject.py:1089-1105 find_best_base.
 unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
-    if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
-        return std::ptr::null_mut();
-    }
-    let len = pyre_object::w_tuple_len(w_bases);
-    let mut w_bestbase: pyre_object::PyObjectRef = std::ptr::null_mut();
-    for i in 0..len {
-        if let Some(w_candidate) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
-            if !pyre_object::is_type(w_candidate) {
-                continue;
-            }
-            if w_bestbase.is_null() {
-                w_bestbase = w_candidate;
-                continue;
-            }
-            let cand_layout = pyre_object::w_type_get_layout_ptr(w_candidate);
-            let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
-            if cand_layout != best_layout
-                && !cand_layout.is_null()
-                && (*cand_layout).issublayout(best_layout)
-            {
-                w_bestbase = w_candidate;
+    unsafe {
+        if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
+            return std::ptr::null_mut();
+        }
+        let len = pyre_object::w_tuple_len(w_bases);
+        let mut w_bestbase: pyre_object::PyObjectRef = std::ptr::null_mut();
+        for i in 0..len {
+            if let Some(w_candidate) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+                if !pyre_object::is_type(w_candidate) {
+                    continue;
+                }
+                if w_bestbase.is_null() {
+                    w_bestbase = w_candidate;
+                    continue;
+                }
+                let cand_layout = pyre_object::w_type_get_layout_ptr(w_candidate);
+                let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
+                if cand_layout != best_layout
+                    && !cand_layout.is_null()
+                    && (*cand_layout).issublayout(best_layout)
+                {
+                    w_bestbase = w_candidate;
+                }
             }
         }
+        w_bestbase
     }
-    w_bestbase
 }
 
 /// typeobject.py:1107-1129 check_and_find_best_base:
@@ -1976,45 +1987,47 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
 unsafe fn check_and_find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let w_bestbase = find_best_base(w_bases);
-    // typeobject.py:1113-1115
-    if w_bestbase.is_null() {
-        return Err(crate::PyError::type_error(
-            "a new-style class can't have only classic bases".to_string(),
-        ));
-    }
-    // typeobject.py:1116-1118: acceptable_as_base_class check.
-    // typedef.py:43: acceptable = '__new__' in rawdict.
-    // bool and NoneType are not acceptable in Python 3.
-    if !is_acceptable_base_class(w_bestbase) {
-        return Err(crate::PyError::type_error(format!(
-            "type '{}' is not an acceptable base class",
-            pyre_object::w_type_get_name(w_bestbase),
-        )));
-    }
-    // typeobject.py:1122-1128: check layout conflicts
-    let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
-    if !best_layout.is_null() && !w_bases.is_null() && pyre_object::is_tuple(w_bases) {
-        let len = pyre_object::w_tuple_len(w_bases);
-        for i in 0..len {
-            if let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
-                if !pyre_object::is_type(w_base) {
-                    continue;
-                }
-                let layout = pyre_object::w_type_get_layout_ptr(w_base);
-                if !layout.is_null() && !(*best_layout).issublayout(layout) {
-                    return Err(crate::PyError::type_error(
-                        "instance layout conflicts in multiple inheritance".to_string(),
-                    ));
+    unsafe {
+        let w_bestbase = find_best_base(w_bases);
+        // typeobject.py:1113-1115
+        if w_bestbase.is_null() {
+            return Err(crate::PyError::type_error(
+                "a new-style class can't have only classic bases".to_string(),
+            ));
+        }
+        // typeobject.py:1116-1118: acceptable_as_base_class check.
+        // typedef.py:43: acceptable = '__new__' in rawdict.
+        // bool and NoneType are not acceptable in Python 3.
+        if !is_acceptable_base_class(w_bestbase) {
+            return Err(crate::PyError::type_error(format!(
+                "type '{}' is not an acceptable base class",
+                pyre_object::w_type_get_name(w_bestbase),
+            )));
+        }
+        // typeobject.py:1122-1128: check layout conflicts
+        let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
+        if !best_layout.is_null() && !w_bases.is_null() && pyre_object::is_tuple(w_bases) {
+            let len = pyre_object::w_tuple_len(w_bases);
+            for i in 0..len {
+                if let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
+                    if !pyre_object::is_type(w_base) {
+                        continue;
+                    }
+                    let layout = pyre_object::w_type_get_layout_ptr(w_base);
+                    if !layout.is_null() && !(*best_layout).issublayout(layout) {
+                        return Err(crate::PyError::type_error(
+                            "instance layout conflicts in multiple inheritance".to_string(),
+                        ));
+                    }
                 }
             }
         }
+        Ok(w_bestbase)
     }
-    Ok(w_bestbase)
 }
 
 /// typedef.py:43 `acceptable_as_base_class = '__new__' in rawdict`.
 /// typeobject.py:1116 checks this flag on the bestbase.
 unsafe fn is_acceptable_base_class(w_type: pyre_object::PyObjectRef) -> bool {
-    pyre_object::w_type_get_acceptable_as_base_class(w_type)
+    unsafe { pyre_object::w_type_get_acceptable_as_base_class(w_type) }
 }

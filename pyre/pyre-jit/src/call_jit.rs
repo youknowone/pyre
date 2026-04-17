@@ -34,32 +34,6 @@ thread_local! {
 // FinishProtocol and normalize_direct_finish_result removed — they
 // were dead code since result_type is always Type::Ref.
 
-fn debug_instruction_window(frame: &PyFrame) -> String {
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    let mut out = String::new();
-    let mut arg_state = OpArgState::default();
-    let current = frame.next_instr();
-    let start = current.saturating_sub(6);
-    let end = (current + 6).min(code.instructions.len());
-    for idx in 0..code.instructions.len() {
-        let code_unit = code.instructions[idx];
-        let (instruction, op_arg) = arg_state.get(code_unit);
-        if idx >= start && idx < end {
-            let marker = if idx == current { ">>" } else { "  " };
-            let _ = std::fmt::Write::write_fmt(
-                &mut out,
-                format_args!("{marker} {idx:>3}: {:?} arg={:?}\n", instruction, op_arg),
-            );
-        }
-    }
-    out
-}
-
-#[inline]
-pub(crate) extern "C" fn jit_loop_arg_box_int(raw: i64) -> i64 {
-    w_int_new(raw) as i64
-}
-
 #[inline]
 pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
     unsafe {
@@ -372,7 +346,6 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         (code, ns, ec)
     };
 
-    let green_key = crate::eval::make_green_key(code, 0);
     let mut func_frame = PyFrame::new_for_call(code, &[], namespace, exec_ctx);
     func_frame.fix_array_ptrs();
 
@@ -430,77 +403,6 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     // The caller_frame is in inputs[0] which was the JitFrame's first
     // virtualizable input. For now, fall back to the existing force path.
     jit_force_self_recursive_call_raw_1(jitframe_ptr, raw_local0)
-}
-
-fn jit_force_callee_frame_raw(frame_ptr: i64) -> i64 {
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-
-    let green_key = crate::eval::make_green_key(frame.pycode, frame.next_instr());
-
-    let (driver, _) = crate::eval::driver_pair();
-    if let Some(token) = driver.get_loop_token(green_key) {
-        let token_num = token.number;
-        let nlocals = unsafe {
-            (&*pyre_interpreter::pyframe_get_pycode(frame))
-                .varnames
-                .len()
-        };
-        let mut inputs = vec![
-            frame_ptr,
-            frame.last_instr as i64,
-            frame.valuestackdepth as i64,
-        ];
-        for i in 0..nlocals {
-            inputs.push(frame.locals_w()[i] as i64);
-        }
-        #[cfg(feature = "cranelift")]
-        if let Some(raw) = majit_backend_cranelift::execute_call_assembler_direct(
-            token_num,
-            &inputs,
-            jit_force_callee_frame_interp,
-        ) {
-            // result_type=REF: fast path returns boxed Ref as-is
-            // (compiler.rs:2655 [Type::Ref] => outputs[0])
-            return raw;
-        }
-    }
-
-    // warmspot.py:1021 assembler_call_helper: force path runs in
-    // plain interpreter, no JIT re-entry.
-    match pyre_interpreter::eval::eval_frame_plain(frame) {
-        Ok(result) => {
-            // warmspot.py:449 result_type=REF: always boxed Ref
-            result as i64
-        }
-        Err(err) => {
-            // warmspot.py:998 parity: propagate exception via JIT_EXC_VALUE.
-            #[cfg(feature = "cranelift")]
-            majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
-            0
-        }
-    }
-}
-
-/// Interpreter-only force: used by execute_call_assembler_direct
-/// to handle guard failures without recursive compiled dispatch.
-extern "C" fn jit_force_callee_frame_interp(frame_ptr: i64) -> i64 {
-    // RPython: blackhole interp — no blackhole_entry_bump needed.
-    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-
-    let green_key = crate::eval::make_green_key(frame.pycode, frame.next_instr());
-
-    // warmspot.py:1021-1028 assembler_call_helper parity: calls
-    // handle_fail → JitException → handle_jitexception, which handles
-    // CRN by calling portal_ptr (JIT-aware). The blackhole is the
-    // primary path; portal_runner is the fallback when the blackhole
-    // cannot run (pc_map miss).
-    let result = match blackhole_from_jit_frame(frame) {
-        Some(r) => r,
-        None => crate::eval::portal_runner(frame),
-    };
-
-    // warmspot.py:449 result_type=REF: always boxed Ref
-    result as i64
 }
 
 /// RPython: FieldDescr.offset is resolved at rtyper time. In pyre, Rust struct
@@ -969,8 +871,6 @@ pub fn resume_in_blackhole(
         // RPython parity: vsd from vable_values (snapshot), stored in
         // ResumedFrame.vsd by build_resumed_frames.
         let vsd = section.vsd;
-        let stack_only = vsd.saturating_sub(nlocals);
-
         // call.py:148: jitcode via get_jitcode (jitdriver_sd set on portal).
         // virtualizable.py:126-137: code from resume data, not heap.
         let w_code = section.code;
@@ -999,7 +899,8 @@ pub fn resume_in_blackhole(
         // After Phase A's `Arc<JitCode>` migration `bh.jitcode` is shared
         // with the originating `PyJitCode`; `Arc::make_mut` clones-on-write
         // so the fnaddr override does not leak back into the cached entry.
-        std::sync::Arc::make_mut(&mut bh.jitcode).fnaddr = bh_portal_runner as usize as i64;
+        std::sync::Arc::make_mut(&mut bh.jitcode).fnaddr =
+            bh_portal_runner as *const () as usize as i64;
         // RPython: descrs carry FieldDescr.offset (byte offset from rtyper).
         // pyre: field offsets are resolved from Rust struct layout at runtime.
         bh.resolve_field_offsets(resolve_field_offset);
@@ -1008,7 +909,7 @@ pub fn resume_in_blackhole(
             // pyre: single-portal architecture — all callees share the same
             // portal_runner address. The blackhole's inline_call reads fnaddr
             // from BhDescr::JitCode and calls bh_call_*(fnaddr, ...).
-            bh_portal_runner as usize as i64
+            bh_portal_runner as *const () as usize as i64
         });
 
         if majit_metainterp::majit_log_enabled() {
@@ -1309,10 +1210,7 @@ pub extern "C" fn jit_force_recursive_call_1(
     callable: i64,
     boxed_arg: i64,
 ) -> i64 {
-    let callable_ref = callable as PyObjectRef;
     let boxed_arg_ref = boxed_arg as PyObjectRef;
-    let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
-    let green_key = crate::eval::make_green_key(w_code, 0);
     // result_type=REF: no RawInt unbox needed — arg is already boxed Ref
     if majit_metainterp::majit_log_enabled() {
         let caller = unsafe { &*(caller_frame as *const PyFrame) };
@@ -1368,9 +1266,6 @@ pub extern "C" fn jit_force_recursive_call_argraw_boxed_1(
     callable: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let callable_ref = callable as PyObjectRef;
-    let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
-    let green_key = crate::eval::make_green_key(w_code, 0);
     // result_type=REF: box the int arg, dispatch as boxed Ref
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     jit_force_recursive_call_1(caller_frame, callable, boxed as i64)
@@ -1389,8 +1284,6 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     if caller_frame == 0 {
         return boxed_arg;
     }
-    let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let green_key = crate::eval::make_green_key(caller.pycode, 0);
     // result_type=REF: arg is already boxed Ref
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
     // blackhole.py:1101-1132 bhimpl_recursive_call_r: calls
@@ -1414,8 +1307,6 @@ pub extern "C" fn jit_force_self_recursive_call_argraw_boxed_1(
     caller_frame: i64,
     raw_int_arg: i64,
 ) -> i64 {
-    let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    let green_key = crate::eval::make_green_key(caller.pycode, 0);
     // result_type=REF: box the int arg, dispatch as boxed Ref
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     jit_force_self_recursive_call_1(caller_frame, boxed as i64)
@@ -1500,18 +1391,6 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
         );
     }
     result
-}
-
-/// Unbox a Ref (PyObjectRef to boxed int) to a raw i64 value.
-/// Used by call_assembler_guard_failure's FALLBACK path when the first
-/// local is a Ref type (boxed int) instead of raw Int.
-fn unbox_int_for_force(raw: i64) -> i64 {
-    let obj = raw as pyre_object::PyObjectRef;
-    if !obj.is_null() && unsafe { is_int(obj) } {
-        unsafe { w_int_get_value(obj) }
-    } else {
-        raw
-    }
 }
 
 pub fn install_jit_call_bridge() {

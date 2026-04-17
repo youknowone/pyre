@@ -571,12 +571,11 @@ fn new_typeobject_with_base_and_layout(
         } else {
             false
         };
+        let has_dict = (*ns_ptr).get("__dict__").is_some();
+        let has_weakref = (*ns_ptr).get("__weakref__").is_some();
         let layout = if reuse {
             parent_layout
         } else {
-            // typedef.py:34,37,43 — set flags from typedef dict contents.
-            let has_dict = (*ns_ptr).get("__dict__").is_some();
-            let has_weakref = (*ns_ptr).get("__weakref__").is_some();
             let has_new = (*ns_ptr).get("__new__").is_some();
             pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
                 typedef: layout_pytype,
@@ -588,8 +587,6 @@ fn new_typeobject_with_base_and_layout(
         };
         pyre_object::w_type_set_layout(type_obj, layout);
         // typedef.py:39-41: inherit from bases
-        let has_dict = (*ns_ptr).get("__dict__").is_some();
-        let has_weakref = (*ns_ptr).get("__weakref__").is_some();
         let base_hasdict = pyre_object::w_type_get_hasdict(base);
         let base_weakrefable = pyre_object::w_type_get_weakrefable(base);
         pyre_object::w_type_set_hasdict(type_obj, has_dict || base_hasdict);
@@ -2278,8 +2275,7 @@ fn init_function_type(ns: &mut PyNamespace) {
             // as a plain function rather than a bound method.
             let cls_is_none = unsafe { w_cls.is_null() || pyre_object::is_none(w_cls) };
             let obj_is_none = unsafe { w_obj.is_null() || pyre_object::is_none(w_obj) };
-            let cls_is_none_type =
-                unsafe { std::ptr::eq(w_cls, gettypeobject(&pyre_object::NONE_TYPE)) };
+            let cls_is_none_type = std::ptr::eq(w_cls, gettypeobject(&pyre_object::NONE_TYPE));
             let asking_for_function = cls_is_none || (obj_is_none && !cls_is_none_type);
             if asking_for_function {
                 Ok(w_function)

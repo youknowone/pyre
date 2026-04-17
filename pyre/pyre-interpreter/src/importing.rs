@@ -316,7 +316,7 @@ fn init_unicodedata(ns: &mut PyNamespace) {
 fn init_struct(ns: &mut PyNamespace) {
     fn parse_format(fmt: &str) -> (char, Vec<char>) {
         // Returns (byte_order, codes).
-        let mut chars = fmt.chars();
+        let chars = fmt.chars();
         let first = chars.clone().next().unwrap_or('@');
         let (endian, rest) = if matches!(first, '<' | '>' | '!' | '=' | '@') {
             (first, chars.skip(1).collect::<String>())
@@ -884,11 +884,13 @@ fn init_pwd(ns: &mut PyNamespace) {
     }
     #[cfg(unix)]
     unsafe fn c_str(ptr: *const std::os::raw::c_char) -> String {
-        if ptr.is_null() {
-            return String::new();
+        unsafe {
+            if ptr.is_null() {
+                return String::new();
+            }
+            let cstr = std::ffi::CStr::from_ptr(ptr);
+            cstr.to_string_lossy().into_owned()
         }
-        let cstr = std::ffi::CStr::from_ptr(ptr);
-        cstr.to_string_lossy().into_owned()
     }
     #[cfg(unix)]
     unsafe fn make_struct_passwd(pw: *mut Passwd) -> pyre_object::PyObjectRef {

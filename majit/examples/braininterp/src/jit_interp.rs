@@ -134,7 +134,7 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
 fn mainloop_resume(
     program: &Bytecode,
     state: &mut BfState,
-    driver: &mut majit_metainterp::JitDriver<BfState>,
+    _driver: &mut majit_metainterp::JitDriver<BfState>,
     mut pc: usize,
     _threshold: u32,
 ) -> String {

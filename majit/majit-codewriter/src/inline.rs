@@ -784,7 +784,7 @@ fn remap_value_in_terminator(term: &Terminator, old: ValueId, new: ValueId) -> T
 mod tests {
     use super::*;
     use crate::call::CallControl;
-    use crate::model::{CallTarget, FieldDescriptor, FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
     use crate::parse::CallPath;
 
     fn make_simple_callee() -> FunctionGraph {

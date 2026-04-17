@@ -44,33 +44,39 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
 
 #[inline]
 pub unsafe fn is_generator(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &GENERATOR_TYPE)
+    unsafe { py_type_check(obj, &GENERATOR_TYPE) }
 }
 
 pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> *mut u8 {
-    (*(obj as *const W_GeneratorObject)).frame_ptr
+    unsafe { (*(obj as *const W_GeneratorObject)).frame_ptr }
 }
 
 pub unsafe fn w_generator_is_exhausted(obj: PyObjectRef) -> bool {
-    (*(obj as *const W_GeneratorObject)).exhausted
+    unsafe { (*(obj as *const W_GeneratorObject)).exhausted }
 }
 
 pub unsafe fn w_generator_set_exhausted(obj: PyObjectRef) {
-    (*(obj as *mut W_GeneratorObject)).exhausted = true;
+    unsafe {
+        (*(obj as *mut W_GeneratorObject)).exhausted = true;
+    }
 }
 
 pub unsafe fn w_generator_is_started(obj: PyObjectRef) -> bool {
-    (*(obj as *const W_GeneratorObject)).started
+    unsafe { (*(obj as *const W_GeneratorObject)).started }
 }
 
 pub unsafe fn w_generator_set_started(obj: PyObjectRef) {
-    (*(obj as *mut W_GeneratorObject)).started = true;
+    unsafe {
+        (*(obj as *mut W_GeneratorObject)).started = true;
+    }
 }
 
 pub unsafe fn w_generator_is_running(obj: PyObjectRef) -> bool {
-    (*(obj as *const W_GeneratorObject)).running
+    unsafe { (*(obj as *const W_GeneratorObject)).running }
 }
 
 pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
-    (*(obj as *mut W_GeneratorObject)).running = val;
+    unsafe {
+        (*(obj as *mut W_GeneratorObject)).running = val;
+    }
 }

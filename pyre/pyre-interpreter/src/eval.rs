@@ -819,7 +819,7 @@ impl OpcodeStepExecutor for PyFrame {
             self.push(pyre_object::w_bool_from(false));
             return Ok(());
         }
-        let exc_type = unsafe { crate::typedef::r#type(val) }.unwrap_or(pyre_object::w_none());
+        let exc_type = crate::typedef::r#type(val).unwrap_or(pyre_object::w_none());
         let exc_tb =
             crate::baseobjspace::getattr(val, "__traceback__").unwrap_or(pyre_object::w_none());
         let res = crate::call_function(exit_func, &[exc_type, val, exc_tb]);
@@ -1515,43 +1515,7 @@ impl OpcodeStepExecutor for PyFrame {
         // the generator object was already created at call time.
         // Push dummy value for the following POP_TOP to consume.
         self.push(pyre_object::w_none());
-        return Ok(());
-
-        // Legacy path for CPython-style RETURN_GENERATOR (not used with RustPython compiler):
-        // Copy the current frame into a heap-allocated frame for the generator.
-        // PyPy: GeneratorIterator stores the PyFrame and resumes it on __next__.
-        let w_code = self.pycode;
-        let code_ref = unsafe { &*crate::pyframe_get_pycode(self) };
-        let n_total = code_ref.varnames.len() + code_ref.cellvars.len() + code_ref.freevars.len();
-
-        let mut gen_frame = crate::pyframe::PyFrame::new_with_namespace(
-            w_code,
-            self.execution_context,
-            self.get_w_globals(),
-        );
-        let w_locals = self.get_w_locals();
-        if !w_locals.is_null() {
-            gen_frame.setdictscope(w_locals);
-        }
-        gen_frame.last_instr = self.last_instr;
-        // Copy locals + cells + stack
-        for i in 0..self.valuestackdepth {
-            gen_frame.locals_w_mut()[i] = self.locals_w()[i];
-        }
-        gen_frame.valuestackdepth = self.valuestackdepth;
-        let blocklist = self.get_blocklist();
-        gen_frame.set_blocklist(&blocklist);
-
-        let frame_ptr = Box::into_raw(Box::new(gen_frame)) as *mut u8;
-        let generator = pyre_object::generatorobject::w_generator_new(frame_ptr);
-        // Signal the eval loop to return this generator object.
-        // Encode the generator pointer in the error message for retrieval.
-        return Err(crate::PyError {
-            kind: crate::PyErrorKind::GeneratorReturn,
-            message: format!("{}", generator as usize),
-            exc_object: std::ptr::null_mut(),
-        }
-        .into());
+        Ok(())
     }
 
     // ── load_super_attr ──
@@ -2216,8 +2180,8 @@ impl OpcodeStepExecutor for PyFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PyExecutionContext;
     use crate::*;
-    use crate::{PyExecutionContext, function_new};
     use std::rc::Rc;
 
     fn run_eval(source: &str) -> PyResult {

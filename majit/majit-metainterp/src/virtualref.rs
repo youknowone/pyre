@@ -144,18 +144,20 @@ impl VirtualRefInfo {
         vref_ptr: *mut u8,
         force_fn: impl FnOnce(i64) -> *mut u8,
     ) -> *mut u8 {
-        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-        if vref.virtual_token == TOKEN_NONE {
-            return vref.forced;
-        }
-        if vref.virtual_token == TOKEN_TRACING_RESCALL {
+        unsafe {
+            let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+            if vref.virtual_token == TOKEN_NONE {
+                return vref.forced;
+            }
+            if vref.virtual_token == TOKEN_TRACING_RESCALL {
+                vref.virtual_token = TOKEN_NONE;
+                return vref.forced;
+            }
+            let materialized = force_fn(vref.virtual_token);
+            vref.forced = materialized;
             vref.virtual_token = TOKEN_NONE;
-            return vref.forced;
+            materialized
         }
-        let materialized = force_fn(vref.virtual_token);
-        vref.forced = materialized;
-        vref.virtual_token = TOKEN_NONE;
-        materialized
     }
 
     /// Create a virtual reference during tracing.
@@ -176,8 +178,10 @@ impl VirtualRefInfo {
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
     pub unsafe fn tracing_before_residual_call(&self, vref_ptr: *mut u8) {
-        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-        vref.virtual_token = TOKEN_TRACING_RESCALL;
+        unsafe {
+            let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+            vref.virtual_token = TOKEN_TRACING_RESCALL;
+        }
     }
 
     /// virtualref.py:107-119 tracing_after_residual_call(vref)
@@ -188,14 +192,16 @@ impl VirtualRefInfo {
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
     pub unsafe fn tracing_after_residual_call(&self, vref_ptr: *mut u8) -> bool {
-        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-        if vref.virtual_token != TOKEN_TRACING_RESCALL {
-            // Token was modified during the call — vref was forced
-            return true;
+        unsafe {
+            let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+            if vref.virtual_token != TOKEN_TRACING_RESCALL {
+                // Token was modified during the call — vref was forced
+                return true;
+            }
+            // Not forced: clear to TOKEN_NONE (virtualref.py:118)
+            vref.virtual_token = TOKEN_NONE;
+            false
         }
-        // Not forced: clear to TOKEN_NONE (virtualref.py:118)
-        vref.virtual_token = TOKEN_NONE;
-        false
     }
 
     /// virtualref.py: continue_tracing(vref, real_object)
@@ -205,9 +211,11 @@ impl VirtualRefInfo {
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
     pub unsafe fn continue_tracing(&self, vref_ptr: *mut u8, real_object: *mut u8) {
-        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-        vref.forced = real_object;
-        vref.virtual_token = TOKEN_NONE;
+        unsafe {
+            let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+            vref.forced = real_object;
+            vref.virtual_token = TOKEN_NONE;
+        }
     }
 
     /// Check if a virtual reference is currently active (has a JIT frame token).
@@ -236,11 +244,13 @@ impl VirtualRefInfo {
     /// # Safety
     /// `ptr` must point to a valid object or be null.
     pub unsafe fn is_virtual_ref(&self, ptr: *const u8) -> bool {
-        if ptr.is_null() {
-            return false;
+        unsafe {
+            if ptr.is_null() {
+                return false;
+            }
+            let tag = *(ptr as *const u64);
+            tag == VREF_TYPE_TAG
         }
-        let tag = *(ptr as *const u64);
-        tag == VREF_TYPE_TAG
     }
 
     /// virtualref.py: force_virtual(inst)
@@ -255,18 +265,20 @@ impl VirtualRefInfo {
         vref_ptr: *mut u8,
         force_fn: impl FnOnce(i64) -> *mut u8,
     ) -> *mut u8 {
-        let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-        if vref.virtual_token == TOKEN_NONE {
-            return vref.forced;
-        }
-        if vref.virtual_token == TOKEN_TRACING_RESCALL {
+        unsafe {
+            let vref = &mut *(vref_ptr as *mut JitVirtualRef);
+            if vref.virtual_token == TOKEN_NONE {
+                return vref.forced;
+            }
+            if vref.virtual_token == TOKEN_TRACING_RESCALL {
+                vref.virtual_token = TOKEN_NONE;
+                return vref.forced;
+            }
+            let materialized = force_fn(vref.virtual_token);
+            vref.forced = materialized;
             vref.virtual_token = TOKEN_NONE;
-            return vref.forced;
+            materialized
         }
-        let materialized = force_fn(vref.virtual_token);
-        vref.forced = materialized;
-        vref.virtual_token = TOKEN_NONE;
-        materialized
     }
 }
 

@@ -20,7 +20,7 @@ use crate::state::PyreSym;
 pub fn trace_bytecode(
     ctx: &mut TraceCtx,
     sym: &mut PyreSym,
-    code: &CodeObject,
+    _code: &CodeObject,
     start_pc: usize,
     mut concrete_frame: Box<pyre_interpreter::pyframe::PyFrame>,
 ) -> (TraceAction, Box<pyre_interpreter::pyframe::PyFrame>) {

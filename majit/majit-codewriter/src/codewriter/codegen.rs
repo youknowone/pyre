@@ -19,16 +19,6 @@ use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use syn::{GenericArgument, PathArguments, Type};
 
-/// A mapping from an interpreter helper/binary-op method name to its JIT opcode.
-///
-/// This is codewriter-owned build-time metadata, analogous to the helper/opcode
-/// tables consumed by RPython's translation/codewriter layer.
-#[derive(Debug, Clone)]
-pub struct BinopMapping {
-    pub method: Ident,
-    pub opcode: Ident,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum CodegenValueKind {
     Int,
@@ -150,9 +140,6 @@ pub struct JitDriverConfig {
     /// Green key fields for `#[jit_interp(greens = [...])]`.
     pub greens: Vec<TokenStream>,
 
-    /// Binary operation mappings for `#[jit_interp(binops = { ... })]`.
-    pub binops: Vec<BinopMapping>,
-
     /// I/O shim pairs: `(original_fn_path, shim_fn_name)`.
     pub io_shims: Vec<IoShim>,
 
@@ -229,16 +216,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
     let env_type = config.env_type.clone();
 
     let greens = config.greens.clone();
-
-    let binop_entries: Vec<TokenStream> = config
-        .binops
-        .iter()
-        .map(|b| {
-            let method = b.method.clone();
-            let opcode = b.opcode.clone();
-            quote! { #method => #opcode }
-        })
-        .collect();
 
     let virtualizable_attr = config.virtualizable.as_ref().map(|v| {
         let var = v.var.clone();
@@ -319,7 +296,6 @@ pub fn generate_jitcode(config: &JitDriverConfig) -> TokenStream {
             greens = [#(#greens),*],
             #state_fields_attr
             #virtualizable_attr
-            binops = { #(#binop_entries),* },
             io_shims = { #(#io_shim_attr_entries),* },
         )]
         pub fn mainloop #fn_sig {
@@ -344,7 +320,6 @@ mod tests {
             state_name: format_ident!("State"),
             state_fields: vec![],
             greens: vec![],
-            binops: vec![],
             io_shims: vec![],
             virtualizable: None,
             mainloop_body: quote!({}),

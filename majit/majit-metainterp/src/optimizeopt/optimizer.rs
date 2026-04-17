@@ -1627,7 +1627,6 @@ impl Optimizer {
         constants: &mut std::collections::HashMap<u32, i64>,
         num_inputs: usize,
     ) -> Vec<Op> {
-        use majit_ir::OpRef;
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -2627,7 +2626,7 @@ impl Optimizer {
     /// Returns `(optimized_ops, retrace_requested)`. When retrace_requested
     /// is true, the caller should increment retraced_count and may use the
     /// optimizer's exported_loop_state for the new target token.
-    pub fn optimize_bridge(
+    pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[Op],
         constants: &mut std::collections::HashMap<u32, i64>,
@@ -2637,7 +2636,7 @@ impl Optimizer {
         retraced_count: u32,
         retrace_limit: u32,
         pending_bridge_rd: Option<PendingBridgeRd>,
-        loop_num_inputs: Option<usize>,
+        _loop_num_inputs: Option<usize>,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
@@ -3578,7 +3577,7 @@ mod tests {
     }
 
     impl Optimization for AddVirtualInputsOnce {
-        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        fn propagate_forward(&mut self, _op: &Op, ctx: &mut OptContext) -> OptimizationResult {
             if !self.added {
                 ctx.num_inputs += 2;
                 self.added = true;
