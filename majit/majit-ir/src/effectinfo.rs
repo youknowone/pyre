@@ -257,9 +257,20 @@ impl EffectInfo {
         self.extraeffect >= ExtraEffect::ForcesVirtualOrVirtualizable
     }
 
-    /// Whether this call has random effects (worst case).
+    /// `effectinfo.py:252-253` `has_random_effects(self)`:
+    ///
+    /// ```python
+    /// def has_random_effects(self):
+    ///     return self.extraeffect >= self.EF_RANDOM_EFFECTS
+    /// ```
+    ///
+    /// Uses `>=` (not `==`).  `EF_RANDOM_EFFECTS = 7` is the highest
+    /// ExtraEffect numeric value today, so the two operators pick the
+    /// same set; the structural parity matters because future upstream
+    /// additions that slot a value after `EF_RANDOM_EFFECTS` would need
+    /// this predicate to remain inclusive.
     pub fn has_random_effects(&self) -> bool {
-        self.extraeffect == ExtraEffect::RandomEffects
+        self.extraeffect >= ExtraEffect::RandomEffects
     }
 
     /// Whether the oopspec identifies a special-cased operation.
