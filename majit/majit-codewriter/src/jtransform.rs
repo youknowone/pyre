@@ -1170,6 +1170,36 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
+    /// RPython: `Transformer.rewrite_op_jit_conditional_call(op)`
+    /// (jtransform.py:1685-1686). Dispatch wrapper kept for structural
+    /// parity; pyre's `rewrite_operation` match does not reach it.
+    #[allow(dead_code)]
+    fn rewrite_op_jit_conditional_call(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        self._rewrite_op_cond_call(op, target, args, result_ty, graph_name, false)
+    }
+
+    /// RPython: `Transformer.rewrite_op_jit_conditional_call_value(op)`
+    /// (jtransform.py:1687-1688). Dispatch wrapper kept for structural
+    /// parity; pyre's `rewrite_operation` match does not reach it.
+    #[allow(dead_code)]
+    fn rewrite_op_jit_conditional_call_value(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        self._rewrite_op_cond_call(op, target, args, result_ty, graph_name, true)
+    }
+
     /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
     /// (jtransform.py:292-313).
     fn rewrite_op_jit_record_known_result(
