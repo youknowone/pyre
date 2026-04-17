@@ -55,12 +55,11 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
                                 back_edge_key, target, bridge_origin
                             );
                         }
-                        return Ok(Some(
-                            live_args
-                                .into_iter()
-                                .map(crate::state::FrontendOp::opref_only)
-                                .collect(),
-                        ));
+                        // pyjitpl.py:3191 raise_if_successful() — successful
+                        // compile_trace stops tracing immediately instead of
+                        // falling through to the loop-closing path.
+                        driver.note_compile_trace_success();
+                        return Ok(None);
                     }
                 }
             }
