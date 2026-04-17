@@ -115,29 +115,16 @@ impl LiveVars {
                     }
                     // Super-instructions LOAD_FAST; LOAD_FAST and
                     // LOAD_FAST_BORROW; LOAD_FAST_BORROW read two locals.
-                    // Enabling GEN here triggers `OptIntBounds::propagate_forward`
-                    // → `OptContext::getintbound` "expected 'i'-typed OpRef, got
-                    // Some(Ref)" during `optimize_bridge`. Confirmed via repro
-                    // that the offending OpRef is CONST_BIT|N (a constant-pool
-                    // index), not an inputarg — the bridge IR contains
-                    // `IntLt(raw_index, OpRef(const|N))` where const|N holds
-                    // value 0 (null pointer) marked Ref.
-                    // Two independent paths must be reconciled before GEN can
-                    // land:
-                    //   1. `ConstantPool::get_or_insert(0)` dedups on the raw
-                    //      i64 but only checks `constant_types`, not
-                    //      `numbering_type_overrides` — so tracer-side
-                    //      `const_int(0)` can alias an idx previously marked
-                    //      Ref by `inject_bridge_constants`.
-                    //   2. `OptContext::const_pool` receives `Value::Ref(0)`
-                    //      directly via a `seed_constant` path during bridge
-                    //      import (short-preamble / setinfo_from_preamble).
-                    //      `OptContext::opref_type` reads `Value::get_type()`,
-                    //      so even if path 1 is fixed, path 2 keeps the Ref
-                    //      visible to the optimizer.
-                    // See memory/phase3_aliasing_diagnostic_2026_04_16.md for
-                    // the repro and diagnostic log. Leave disabled until both
-                    // layers are closed.
+                    // The original concern about `ConstantPool::get_or_insert`
+                    // vs `numbering_type_overrides` aliasing is no longer
+                    // reproducible — `OptContext::seed_constant` now asserts
+                    // Ref(0)/Int(0) cross-seeding, and the full dynasm
+                    // benchmark suite runs without firing it.  However,
+                    // enabling GEN here regresses spectral_norm output
+                    // (1.2742199912349301 vs expected 1.2742199912349306);
+                    // the root cause is a separate liveness-vs-regalloc /
+                    // numbering issue that needs its own diagnosis.  Leave
+                    // disabled until that regression is traced.
                     // Instruction::LoadFastLoadFast { var_nums }
                     // | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);

@@ -2235,13 +2235,44 @@ impl OptContext {
 
     /// Store a constant value WITHOUT setting Forwarded::Const.
     /// Used for pre-populating backend constants and call_pure_results.
+    ///
+    /// RPython parity: `ConstInt`, `ConstPtr`, `ConstFloat` are distinct
+    /// Box subclasses (history.py:220/261/307); two Boxes at the same
+    /// OpRef position MUST NOT disagree on type.  Seeding a typed
+    /// constant over a slot that already holds a different-typed value
+    /// is a bug (typical source: `Value::Ref(0)` reseeded where
+    /// `Value::Int(0)` lives, causing `opref_type` to flip Int→Ref and
+    /// downstream `getintbound` to panic during bridge optimization).
+    /// Assert the invariant instead of silently overwriting.
     pub fn seed_constant(&mut self, opref: OpRef, value: Value) {
         if opref.is_constant() {
+            if let Some(existing) = self.const_pool.get(&opref.const_index()) {
+                assert_eq!(
+                    existing.get_type(),
+                    value.get_type(),
+                    "seed_constant: type mismatch at {:?} (existing={:?}, new={:?}) — \
+                     ConstInt/ConstPtr/ConstFloat must never alias",
+                    opref,
+                    existing,
+                    value,
+                );
+            }
             self.const_pool.insert(opref.const_index(), value);
         } else {
             let idx = opref.0 as usize;
             if idx >= self.constants.len() {
                 self.constants.resize(idx + 1, None);
+            }
+            if let Some(Some(existing)) = self.constants.get(idx) {
+                assert_eq!(
+                    existing.get_type(),
+                    value.get_type(),
+                    "seed_constant: type mismatch at {:?} (existing={:?}, new={:?}) — \
+                     ConstInt/ConstPtr/ConstFloat must never alias",
+                    opref,
+                    existing,
+                    value,
+                );
             }
             self.constants[idx] = Some(value);
         }
