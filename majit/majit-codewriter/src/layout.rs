@@ -129,10 +129,10 @@ mod tests {
         assert_eq!(layout.fields.len(), 2);
         assert_eq!(layout.fields[0].name, "x");
         assert_eq!(layout.fields[0].offset, 0);
-        assert!(!layout.fields[0].is_immutable);
+        assert!(!layout.fields[0].is_immutable());
         assert_eq!(layout.fields[1].name, "y");
         assert_eq!(layout.fields[1].offset, 8);
-        assert!(!layout.fields[1].is_immutable);
+        assert!(!layout.fields[1].is_immutable());
     }
 
     #[test]
@@ -164,9 +164,9 @@ mod tests {
             HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &immutable);
         let layout = provider.get_struct_layout("Storage").unwrap();
         assert_eq!(layout.fields[0].name, "pools");
-        assert!(layout.fields[0].is_immutable);
+        assert!(layout.fields[0].is_immutable());
         assert_eq!(layout.fields[1].name, "scratch");
-        assert!(!layout.fields[1].is_immutable);
+        assert!(!layout.fields[1].is_immutable());
     }
 
     #[test]
@@ -189,10 +189,13 @@ mod tests {
             HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &immutable);
         let layout = provider.get_struct_layout("Cell").unwrap();
         assert_eq!(layout.fields[0].name, "value");
-        assert_eq!(layout.fields[0].rank, ImmutableRank::QuasiImmutable);
-        assert!(layout.fields[0].is_immutable);
+        assert_eq!(layout.fields[0].rank, Some(ImmutableRank::QuasiImmutable));
+        assert!(layout.fields[0].is_immutable());
+        assert!(layout.fields[0].is_quasi_immutable());
         assert_eq!(layout.fields[1].name, "flag");
-        assert_eq!(layout.fields[1].rank, ImmutableRank::Immutable);
-        assert!(!layout.fields[1].is_immutable);
+        // RPython `STRUCT._immutable_field` returns False (not a default
+        // rank) for fields outside `_immutable_fields_`.
+        assert_eq!(layout.fields[1].rank, None);
+        assert!(!layout.fields[1].is_immutable());
     }
 }

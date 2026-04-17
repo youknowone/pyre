@@ -214,6 +214,7 @@ mod tests {
                     base,
                     field: crate::model::FieldDescriptor::new("obj", None),
                     ty: ValueType::Ref,
+                    pure: false,
                 },
                 true,
             )

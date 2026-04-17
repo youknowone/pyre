@@ -218,6 +218,13 @@ pub enum OpKind {
         base: ValueId,
         field: FieldDescriptor,
         ty: ValueType,
+        /// RPython `jtransform.py:867-903` may rewrite immutable /
+        /// quasi-immutable reads to `getfield_*_pure`.  Carries the
+        /// chosen opcode flavour through flatten/assembly so the
+        /// runtime sees the `_pure` bytecode variant instead of having
+        /// to rediscover purity from the descriptor later.
+        #[serde(default)]
+        pure: bool,
     },
     FieldWrite {
         base: ValueId,

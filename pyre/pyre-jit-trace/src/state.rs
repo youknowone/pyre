@@ -5102,6 +5102,13 @@ mod tests {
 // so the tracer can compute the same offsets without depending on
 // `pyre-interpreter`. Driver registration still happens in `pyre-jit/src/eval.rs`.
 
+/// PRE-EXISTING-ADAPTATION: deferred `MetaInterp.perform_call`
+/// (`rpython/jit/metainterp/pyjitpl.py`) for pyre.  RPython constructs
+/// and pushes the callee `MIFrame` directly inside `perform_call`; pyre
+/// returns this struct from the trace step so the framestack mutation
+/// happens in `MetaInterpreter::push_inline_frame` after the trace
+/// handler releases its borrow on `MetaInterpFrame`.  No upstream
+/// counterpart.
 pub struct PendingInlineFrame {
     pub sym: PyreSym,
     pub concrete_frame: pyre_interpreter::pyframe::PyFrame,

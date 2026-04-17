@@ -1073,8 +1073,15 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
     match kind {
         OpKind::Input { ty, .. } => format!("input_{}", value_type_to_kind(ty)),
         OpKind::ConstInt(_) => "const_int".into(),
-        // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f
-        OpKind::FieldRead { ty, .. } => format!("getfield_gc_{}", value_type_to_kind(ty)),
+        // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f and `_pure`
+        // variants from jtransform.py rewrite_op_getfield().
+        OpKind::FieldRead { ty, pure, .. } => {
+            let mut opname = format!("getfield_gc_{}", value_type_to_kind(ty));
+            if *pure {
+                opname.push_str("_pure");
+            }
+            opname
+        }
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {
@@ -1356,6 +1363,7 @@ mod tests {
                     base,
                     field: FieldDescriptor::new("value", Some("Cell".to_string())),
                     ty: ValueType::Int,
+                    pure: false,
                 },
                 true,
             )
@@ -1390,6 +1398,11 @@ mod tests {
             "expected key record_quasiimmut_field/rdd, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
+        assert!(
+            asm.insns.contains_key("getfield_gc_i_pure/rd>i"),
+            "expected pure getfield opcode, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
         // Two BhDescr::Field entries — for `value` and `mutate_value`.
         let field_descr_names: Vec<&str> = asm
             .descrs
@@ -1416,7 +1429,6 @@ mod tests {
     /// `rpython/jit/codewriter/jtransform.py:546`.
     #[test]
     fn assembles_funcptr_from_vtable_with_vtable_method_descr() {
-        use crate::flatten::flatten as flatten_graph;
         use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
 
         let mut graph = FunctionGraph::new("vtable_lookup");

@@ -340,7 +340,13 @@ impl PyreMetaInterp {
 
     // ── Frame management ─────────────────────────────────────────
 
-    /// RPython perform_call: push PendingInlineFrame onto framestack.
+    /// PRE-EXISTING-ADAPTATION: equivalent to RPython
+    /// `MetaInterp.perform_call` (`rpython/jit/metainterp/pyjitpl.py`)
+    /// which constructs and pushes the callee `MIFrame` directly.  Pyre
+    /// splits trace-step output (returns `PendingInlineFrame`) from the
+    /// frame-stack mutation (this method) so the trace handler stays
+    /// borrow-isolated from the metainterp framestack.  The
+    /// `PendingInlineFrame` struct itself has no upstream counterpart.
     fn push_inline_frame(
         &mut self,
         ctx: &mut TraceCtx,

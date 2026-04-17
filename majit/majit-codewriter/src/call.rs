@@ -408,14 +408,26 @@ pub struct StructFieldLayout {
     /// IR type classification.
     pub field_type: majit_ir::value::Type,
     /// RPython: `STRUCT._immutable_field(fieldname)` —
-    /// True iff fieldname appears in the owning class's
-    /// `_immutable_fields_` declaration. Drives
-    /// `FieldDescr.is_pure` / `is_always_pure()`.
-    pub is_immutable: bool,
-    /// RPython: `rpython/rtyper/rclass.py:644-678 _parse_field_list` rank.
-    /// Carries the `?` / `[*]` / `?[*]` suffix classification so descriptor
-    /// construction can flip `is_quasi_immutable` / `ArrayDescr.is_pure`.
-    pub rank: crate::model::ImmutableRank,
+    /// `rpython/rtyper/rclass.py:33-37` returns `False` for mutable
+    /// fields and the matching `ImmutableRanking` (truthy) for fields
+    /// listed in `_immutable_fields_`.  `None` here = mutable; `Some(rank)`
+    /// = declared with that rank (`?`, `[*]`, `?[*]`, or plain).  Drives
+    /// `FieldDescr.is_pure` + `is_quasi_immutable` and (future)
+    /// `ArrayDescr.is_pure` for `[*]` arrays.
+    pub rank: Option<crate::model::ImmutableRank>,
+}
+
+impl StructFieldLayout {
+    /// RPython `STRUCT._immutable_field(fieldname)` truthiness — true iff
+    /// the field appears in `_immutable_fields_` (any rank).
+    pub fn is_immutable(&self) -> bool {
+        self.rank.is_some()
+    }
+
+    /// True iff the rank is `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY`.
+    pub fn is_quasi_immutable(&self) -> bool {
+        self.rank.map(|r| r.is_quasi_immutable()).unwrap_or(false)
+    }
 }
 
 impl StructLayout {
@@ -485,15 +497,13 @@ impl StructLayout {
             // RPython: alignment is typically min(field_size, WORD).
             let align = field_size.min(std::mem::size_of::<usize>());
             offset = (offset + align - 1) & !(align - 1);
-            let rank = immutable_field_ranks.get(name).copied().unwrap_or_default();
-            let is_immutable = immutable_field_ranks.contains_key(name);
+            let rank = immutable_field_ranks.get(name).copied();
             layout_fields.push(StructFieldLayout {
                 name: name.clone(),
                 offset,
                 size: field_size,
                 flag,
                 field_type,
-                is_immutable,
                 rank,
             });
             offset += field_size;
@@ -2933,8 +2943,8 @@ fn all_interiorfielddescrs(
                 offset: fl.offset,
                 field_size: fl.size,
                 field_type: fl.field_type,
-                is_immutable: fl.is_immutable,
-                is_quasi_immutable: fl.rank.is_quasi_immutable(),
+                is_immutable: fl.is_immutable(),
+                is_quasi_immutable: fl.is_quasi_immutable(),
                 flag: fl.flag,
                 virtualizable: false,
                 index_in_parent,
@@ -3906,6 +3916,7 @@ mod tests {
                 base,
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );
@@ -4017,6 +4028,7 @@ mod tests {
                 base,
                 field: field.clone(),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );

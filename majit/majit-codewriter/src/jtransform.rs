@@ -483,9 +483,8 @@ impl<'a> Transformer<'a> {
     /// tracking + immediate return).  Otherwise the field's immutability rank
     /// drives the emit shape:
     ///
-    /// * `IR_IMMUTABLE`           → keep as-is; the FieldDescr's
-    ///   `is_always_pure()` flag already communicates purity downstream
-    ///   (`jtransform.py:875-877 pure = '_pure'`).
+    /// * `IR_IMMUTABLE`           → rewrite the read to
+    ///   `getfield_*_pure` (`jtransform.py:875-877`).
     /// * `IR_QUASIIMMUTABLE[_ARRAY]` → emit `[-live-, record_quasiimmut_field,
     ///   getfield_*_pure]` — `jtransform.py:895-903`.
     /// * mutable                  → keep as-is.
@@ -525,30 +524,29 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        // `jtransform.py:895-903` — quasi-immutable field read:
+        // `jtransform.py:867-903` — immutable and quasi-immutable
+        // field reads both become `getfield_*_pure`; the quasi variant
+        // additionally prepends `-live-` + `record_quasiimmut_field`.
         //    return [SpaceOperation('-live-', [], None),
         //            SpaceOperation('record_quasiimmut_field',
         //                           [v_inst, descr, descr1], None),
         //            op1]       # op1 = getfield_*_pure
-        // For non-quasi immutable/mutable fields no rewrite is needed;
-        // the descriptor already carries `is_always_pure` when immutable
-        // (`SimpleFieldDescr::is_always_pure` excludes the quasi variant).
+        // Mutable fields stay as plain `getfield_gc_*`.
         let rank = self
             .callcontrol
             .as_deref()
             .and_then(|cc| cc.field_immutability(field.owner_root.as_deref(), &field.name));
         if let Some(rank) = rank {
+            let OpKind::FieldRead {
+                base,
+                field: _,
+                ty: _,
+                pure: _,
+            } = &op.kind
+            else {
+                return RewriteResult::Keep;
+            };
             if rank.is_quasi_immutable() {
-                // Recover the `base` ValueId from the original FieldRead op
-                // — the dispatcher only handed us the field + ty parameters.
-                let OpKind::FieldRead {
-                    base,
-                    field: _,
-                    ty: _,
-                } = &op.kind
-                else {
-                    return RewriteResult::Keep;
-                };
                 // PRE-EXISTING-ADAPTATION: RPython
                 // `quasiimmut.get_mutate_field_name(fieldname)` —
                 // `rpython/jit/metainterp/quasiimmut.py:11-15` — strips the
@@ -586,9 +584,29 @@ impl<'a> Transformer<'a> {
                             base: *base,
                             field: field.clone(),
                             ty: ty.clone(),
+                            pure: true,
                         },
                     },
                 ]);
+            }
+            if rank.is_immutable() {
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!(
+                        "rewrite: getfield({owner}.{name}) → pure read",
+                        owner = field.owner_root.as_deref().unwrap_or("<?>"),
+                        name = field.name,
+                    ),
+                });
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::FieldRead {
+                        base: *base,
+                        field: field.clone(),
+                        ty: ty.clone(),
+                        pure: true,
+                    },
+                }]);
             }
         }
         RewriteResult::Keep
@@ -1901,10 +1919,16 @@ fn remap_op(
             field: field.clone(),
             mutate_field: mutate_field.clone(),
         },
-        OpKind::FieldRead { base, field, ty } => OpKind::FieldRead {
+        OpKind::FieldRead {
+            base,
+            field,
+            ty,
+            pure,
+        } => OpKind::FieldRead {
             base: remap_value(*base, aliases),
             field: field.clone(),
             ty: ty.clone(),
+            pure: *pure,
         },
         OpKind::FieldWrite {
             base,
@@ -2373,6 +2397,7 @@ mod tests {
                 base,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );
@@ -2410,6 +2435,7 @@ mod tests {
                 base,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("OtherFrame".into())),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );
@@ -2548,6 +2574,7 @@ mod tests {
                 base: hinted,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );
@@ -2599,6 +2626,7 @@ mod tests {
                 base: forced,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );
@@ -2794,6 +2822,7 @@ mod tests {
                 base,
                 field: FieldDescriptor::new("value", Some("Cell".to_string())),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );
@@ -2826,13 +2855,15 @@ mod tests {
         ));
         assert!(matches!(
             ops[live_idx + 2],
-            OpKind::FieldRead { field, .. } if field.name == "value"
+            OpKind::FieldRead {
+                field, pure: true, ..
+            } if field.name == "value"
         ));
     }
 
-    /// A plain-immutable field read needs no rewrite — the descriptor's
-    /// `is_always_pure()` already communicates purity.  Mirrors the `pure`
-    /// / non-`pure` fork at `jtransform.py:867-878`.
+    /// A plain-immutable field read lowers directly to a pure read, without
+    /// the quasi-immutable bookkeeping pair.  Mirrors the `pure` /
+    /// non-`pure` fork at `jtransform.py:867-878`.
     #[test]
     fn getfield_rewrite_preserves_plain_immutable_read() {
         use crate::call::CallControl;
@@ -2861,6 +2892,7 @@ mod tests {
                 base,
                 field: FieldDescriptor::new("x", Some("Point".to_string())),
                 ty: ValueType::Int,
+                pure: false,
             },
             true,
         );
@@ -2879,9 +2911,11 @@ mod tests {
         assert!(
             ops.iter().any(|o| matches!(
                 &o.kind,
-                OpKind::FieldRead { field, .. } if field.name == "x"
+                OpKind::FieldRead {
+                    field, pure: true, ..
+                } if field.name == "x"
             )),
-            "FieldRead for x should remain"
+            "FieldRead for x should become a pure read"
         );
     }
 }

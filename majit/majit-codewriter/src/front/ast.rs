@@ -68,6 +68,9 @@ pub struct SemanticProgram {
     pub functions: Vec<SemanticFunction>,
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
     pub known_struct_names: std::collections::HashSet<String>,
+    /// Known trait names used to canonicalize local `dyn Trait` family keys.
+    #[serde(default)]
+    pub known_trait_names: std::collections::HashSet<String>,
     /// RPython: struct field types for resolving `op.args[0].concretetype`
     /// on FieldRead-produced array bases.
     pub struct_fields: StructFieldRegistry,
@@ -117,6 +120,7 @@ fn collect_types_from_items(
     items: &[Item],
     prefix: &str,
     known_struct_names: &mut std::collections::HashSet<String>,
+    known_trait_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
     fn_return_types: &mut HashMap<String, String>,
     immutable_fields: &mut HashMap<String, Vec<(String, ImmutableRank)>>,
@@ -126,10 +130,12 @@ fn collect_types_from_items(
     // This ensures qualified_full_type_string can identify known structs
     // regardless of source order (RPython's lltype T.TO identity).
     collect_struct_names(items, prefix, known_struct_names);
+    collect_trait_names(items, prefix, known_trait_names);
     collect_fields_and_returns(
         items,
         prefix,
         known_struct_names,
+        known_trait_names,
         struct_fields,
         fn_return_types,
         immutable_fields,
@@ -213,11 +219,41 @@ fn collect_struct_names(
     }
 }
 
+fn collect_trait_names(
+    items: &[Item],
+    prefix: &str,
+    known_trait_names: &mut std::collections::HashSet<String>,
+) {
+    for item in items {
+        match item {
+            Item::Trait(trait_def) => {
+                let bare_name = trait_def.ident.to_string();
+                known_trait_names.insert(bare_name.clone());
+                if !prefix.is_empty() {
+                    known_trait_names.insert(format!("{}::{}", prefix, bare_name));
+                }
+            }
+            Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_trait_names(sub_items, &mod_prefix, known_trait_names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Pass 1b: collect field types + fn return types using known_struct_names.
 fn collect_fields_and_returns(
     items: &[Item],
     prefix: &str,
     known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
     fn_return_types: &mut HashMap<String, String>,
     immutable_fields: &mut HashMap<String, Vec<(String, ImmutableRank)>>,
@@ -234,8 +270,12 @@ fn collect_fields_and_returns(
                     .iter()
                     .filter_map(|f| {
                         let field_name = f.ident.as_ref()?.to_string();
-                        let field_type =
-                            qualified_full_type_string(&f.ty, prefix, known_struct_names)?;
+                        let field_type = qualified_full_type_string(
+                            &f.ty,
+                            prefix,
+                            known_struct_names,
+                            known_trait_names,
+                        )?;
                         Some((field_name, field_type))
                     })
                     .collect();
@@ -274,9 +314,12 @@ fn collect_fields_and_returns(
             Item::Fn(func) => {
                 // RPython: op.result.concretetype — module-qualified return type.
                 let ret_ty = match &func.sig.output {
-                    syn::ReturnType::Type(_, ty) => {
-                        qualified_full_type_string(ty, prefix, known_struct_names)
-                    }
+                    syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                        ty,
+                        prefix,
+                        known_struct_names,
+                        known_trait_names,
+                    ),
                     syn::ReturnType::Default => None,
                 };
                 if let Some(ret_ty) = ret_ty {
@@ -293,9 +336,12 @@ fn collect_fields_and_returns(
                 for sub in &impl_block.items {
                     if let syn::ImplItem::Fn(method) = sub {
                         let ret_ty = match &method.sig.output {
-                            syn::ReturnType::Type(_, ty) => {
-                                qualified_full_type_string(ty, prefix, known_struct_names)
-                            }
+                            syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                                ty,
+                                prefix,
+                                known_struct_names,
+                                known_trait_names,
+                            ),
                             syn::ReturnType::Default => None,
                         };
                         if let Some(ret_ty) = ret_ty {
@@ -321,6 +367,7 @@ fn collect_fields_and_returns(
                         sub_items,
                         &mod_prefix,
                         known_struct_names,
+                        known_trait_names,
                         struct_fields,
                         fn_return_types,
                         immutable_fields,
@@ -342,6 +389,7 @@ fn build_graphs_from_items(
     struct_fields: &StructFieldRegistry,
     fn_return_types: &HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
     functions: &mut Vec<SemanticFunction>,
 ) {
     for item in items {
@@ -355,6 +403,7 @@ fn build_graphs_from_items(
                     fn_return_types,
                     prefix,
                     known_struct_names,
+                    known_trait_names,
                 );
                 // RPython: exact graph identity — module-qualified name.
                 if !prefix.is_empty() {
@@ -382,6 +431,7 @@ fn build_graphs_from_items(
                             fn_return_types,
                             prefix,
                             known_struct_names,
+                            known_trait_names,
                         ));
                     }
                 }
@@ -400,6 +450,7 @@ fn build_graphs_from_items(
                         struct_fields,
                         fn_return_types,
                         known_struct_names,
+                        known_trait_names,
                         functions,
                     );
                 }
@@ -415,6 +466,7 @@ pub fn build_semantic_program_with_options(
 ) -> SemanticProgram {
     let mut functions = Vec::new();
     let mut known_struct_names = std::collections::HashSet::new();
+    let mut known_trait_names = std::collections::HashSet::new();
     let mut struct_fields = StructFieldRegistry::default();
 
     // Pass 1: collect all struct definitions and function return types.
@@ -427,6 +479,7 @@ pub fn build_semantic_program_with_options(
         &parsed.file.items,
         "",
         &mut known_struct_names,
+        &mut known_trait_names,
         &mut struct_fields,
         &mut fn_return_types,
         &mut immutable_fields,
@@ -442,12 +495,14 @@ pub fn build_semantic_program_with_options(
         &struct_fields,
         &fn_return_types,
         &known_struct_names,
+        &known_trait_names,
         &mut functions,
     );
 
     SemanticProgram {
         functions,
         known_struct_names,
+        known_trait_names,
         struct_fields,
         fn_return_types,
         immutable_fields,
@@ -464,6 +519,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     // Uses collect_types_from_items to handle Item::Mod recursively with
     // qualified paths matching canonical_call_target identity.
     let mut known_struct_names = std::collections::HashSet::new();
+    let mut known_trait_names = std::collections::HashSet::new();
     let mut struct_fields = StructFieldRegistry::default();
     let mut fn_return_types: HashMap<String, String> = HashMap::new();
     let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
@@ -471,12 +527,14 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     // Collect struct names from ALL files first, then fields+returns.
     for parsed in parsed_files {
         collect_struct_names(&parsed.file.items, "", &mut known_struct_names);
+        collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
     }
     for parsed in parsed_files {
         collect_fields_and_returns(
             &parsed.file.items,
             "",
             &known_struct_names,
+            &known_trait_names,
             &mut struct_fields,
             &mut fn_return_types,
             &mut immutable_fields,
@@ -493,12 +551,14 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             &struct_fields,
             &fn_return_types,
             &known_struct_names,
+            &known_trait_names,
             &mut functions,
         );
     }
     SemanticProgram {
         functions,
         known_struct_names,
+        known_trait_names,
         struct_fields,
         fn_return_types,
         immutable_fields,
@@ -513,7 +573,14 @@ pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
     let empty_names = std::collections::HashSet::new();
-    let mut ctx = GraphBuildContext::new(&empty_registry, &empty_fn_ret, "", &empty_names);
+    let empty_trait_names = std::collections::HashSet::new();
+    let mut ctx = GraphBuildContext::new(
+        &empty_registry,
+        &empty_fn_ret,
+        "",
+        &empty_names,
+        &empty_trait_names,
+    );
     let result = lower_expr(
         graph,
         &mut block,
@@ -532,6 +599,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
     let empty_names = std::collections::HashSet::new();
+    let empty_trait_names = std::collections::HashSet::new();
     build_function_graph(
         func,
         &AstGraphOptions::default(),
@@ -540,6 +608,7 @@ pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
         &empty_fn_ret,
         "",
         &empty_names,
+        &empty_trait_names,
     )
 }
 
@@ -550,6 +619,7 @@ pub fn build_function_graph_with_self_ty_pub(
     fn_return_types: &HashMap<String, String>,
     module_prefix: &str,
     known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
 ) -> SemanticFunction {
     build_function_graph(
         func,
@@ -559,6 +629,7 @@ pub fn build_function_graph_with_self_ty_pub(
         fn_return_types,
         module_prefix,
         known_struct_names,
+        known_trait_names,
     )
 }
 
@@ -588,6 +659,7 @@ struct GraphBuildContext<'a> {
     /// must resolve to "a::Foo" in struct_fields lookups.
     module_prefix: String,
     known_struct_names: &'a std::collections::HashSet<String>,
+    known_trait_names: &'a std::collections::HashSet<String>,
 }
 
 impl<'a> GraphBuildContext<'a> {
@@ -596,6 +668,7 @@ impl<'a> GraphBuildContext<'a> {
         fn_return_types: &'a HashMap<String, String>,
         module_prefix: &str,
         known_struct_names: &'a std::collections::HashSet<String>,
+        known_trait_names: &'a std::collections::HashSet<String>,
     ) -> Self {
         Self {
             local_type_roots: HashMap::new(),
@@ -605,6 +678,7 @@ impl<'a> GraphBuildContext<'a> {
             fn_return_types,
             module_prefix: module_prefix.to_string(),
             known_struct_names,
+            known_trait_names,
         }
     }
 }
@@ -617,6 +691,7 @@ fn build_function_graph(
     fn_return_types: &HashMap<String, String>,
     module_prefix: &str,
     known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
 ) -> SemanticFunction {
     let mut graph = FunctionGraph::new(func.sig.ident.to_string());
     let mut entry = graph.startblock;
@@ -625,6 +700,7 @@ fn build_function_graph(
         fn_return_types,
         module_prefix,
         known_struct_names,
+        known_trait_names,
     );
 
     // Register function parameters as Input ops (RPython: Block.inputargs)
@@ -657,10 +733,15 @@ fn build_function_graph(
                     &pat_type.ty,
                     &ctx.module_prefix,
                     ctx.known_struct_names,
+                    ctx.known_trait_names,
                 ) {
                     ctx.local_array_types.insert(name.clone(), full_type);
                 }
-                if let Some(trait_root) = extract_dyn_trait_root(&pat_type.ty) {
+                if let Some(trait_root) = extract_dyn_trait_root_with_context(
+                    &pat_type.ty,
+                    &ctx.module_prefix,
+                    ctx.known_trait_names,
+                ) {
                     ctx.local_dyn_trait_roots.insert(name.clone(), trait_root);
                 }
                 if let Some(vid) = graph.push_op(
@@ -690,7 +771,7 @@ fn build_function_graph(
     // RPython: op.result.concretetype — module-qualified for exact type identity.
     let return_type = match &func.sig.output {
         syn::ReturnType::Type(_, ty) => {
-            qualified_full_type_string(ty, module_prefix, known_struct_names)
+            qualified_full_type_string(ty, module_prefix, known_struct_names, known_trait_names)
         }
         syn::ReturnType::Default => None,
     };
@@ -759,7 +840,14 @@ pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stm
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
     let empty_names = std::collections::HashSet::new();
-    let mut ctx = GraphBuildContext::new(&empty_registry, &empty_fn_ret, "", &empty_names);
+    let empty_trait_names = std::collections::HashSet::new();
+    let mut ctx = GraphBuildContext::new(
+        &empty_registry,
+        &empty_fn_ret,
+        "",
+        &empty_names,
+        &empty_trait_names,
+    );
     lower_stmt(
         graph,
         &mut block,
@@ -793,10 +881,15 @@ fn lower_stmt(
                     &pat_type.ty,
                     &ctx.module_prefix,
                     ctx.known_struct_names,
+                    ctx.known_trait_names,
                 ) {
                     ctx.local_array_types.insert(name.clone(), full_type);
                 }
-                if let Some(trait_root) = extract_dyn_trait_root(&pat_type.ty) {
+                if let Some(trait_root) = extract_dyn_trait_root_with_context(
+                    &pat_type.ty,
+                    &ctx.module_prefix,
+                    ctx.known_trait_names,
+                ) {
                     ctx.local_dyn_trait_roots.insert(name.clone(), trait_root);
                 }
             }
@@ -887,6 +980,7 @@ fn lower_expr(
                             receiver_type_root(&field.base, ctx),
                         ),
                         ty: ValueType::Unknown,
+                        pure: false,
                     },
                     true,
                 )
@@ -1656,7 +1750,7 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
         syn::Type::Paren(paren) => type_root_ident(&paren.elem),
         syn::Type::Group(group) => type_root_ident(&group.elem),
         // `dyn Trait + 'a` / `&mut dyn Trait` (after deref) — return the
-        // first trait bound's last segment, rendered as `dyn <Trait>` so
+        // first trait bound's canonical path, rendered as `dyn <Trait>` so
         // callers can tell this is a trait object.
         syn::Type::TraitObject(obj) => {
             trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
@@ -1669,16 +1763,53 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
 }
 
 /// Extract the declaring trait name from a `dyn T + 'a` bound list:
-/// returns the first `T::Trait`-style bound's last segment.
+/// returns the first `T::Trait`-style bound's canonical path.
 /// Used by `type_root_ident` / `full_type_string` / `extract_dyn_trait_root`
 /// to identify the indirect-call family key.
 fn trait_object_root_name(
     bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
 ) -> Option<String> {
     bounds.iter().find_map(|b| match b {
-        syn::TypeParamBound::Trait(t) => t.path.segments.last().map(|seg| seg.ident.to_string()),
+        syn::TypeParamBound::Trait(t) => Some(
+            t.path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
+        ),
         _ => None,
     })
+}
+
+fn qualify_known_trait_name(
+    bare: &str,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> String {
+    let qualified = if prefix.is_empty() || bare.contains("::") {
+        None
+    } else {
+        Some(format!("{}::{}", prefix, bare))
+    };
+    if let Some(qualified) = qualified {
+        if known_trait_names.contains(&qualified) {
+            qualified
+        } else {
+            bare.to_string()
+        }
+    } else {
+        bare.to_string()
+    }
+}
+
+fn trait_object_root_name_qualified(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    trait_object_root_name(bounds)
+        .map(|name| qualify_known_trait_name(&name, prefix, known_trait_names))
 }
 
 /// Returns the bare trait root (no `dyn ` prefix) when `ty` denotes a
@@ -1687,12 +1818,30 @@ fn trait_object_root_name(
 /// should be modeled as an RPython `indirect_call`
 /// (`rewrite_op_indirect_call` entrypoint).
 pub fn extract_dyn_trait_root(ty: &syn::Type) -> Option<String> {
+    extract_dyn_trait_root_with_context(ty, "", &std::collections::HashSet::new())
+}
+
+fn extract_dyn_trait_root_with_context(
+    ty: &syn::Type,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> Option<String> {
     match ty {
-        syn::Type::TraitObject(obj) => trait_object_root_name(&obj.bounds),
-        syn::Type::ImplTrait(obj) => trait_object_root_name(&obj.bounds),
-        syn::Type::Reference(r) => extract_dyn_trait_root(&r.elem),
-        syn::Type::Paren(p) => extract_dyn_trait_root(&p.elem),
-        syn::Type::Group(g) => extract_dyn_trait_root(&g.elem),
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
+        }
+        syn::Type::ImplTrait(obj) => {
+            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
+        }
+        syn::Type::Reference(r) => {
+            extract_dyn_trait_root_with_context(&r.elem, prefix, known_trait_names)
+        }
+        syn::Type::Paren(p) => {
+            extract_dyn_trait_root_with_context(&p.elem, prefix, known_trait_names)
+        }
+        syn::Type::Group(g) => {
+            extract_dyn_trait_root_with_context(&g.elem, prefix, known_trait_names)
+        }
         syn::Type::Path(path) => {
             // `Box<dyn Trait>` / `Rc<dyn Trait>` / `Arc<dyn Trait>`.
             let last = path.path.segments.last()?;
@@ -1702,7 +1851,9 @@ pub fn extract_dyn_trait_root(ty: &syn::Type) -> Option<String> {
             if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
                 for arg in &args.args {
                     if let syn::GenericArgument::Type(inner) = arg {
-                        if let Some(r) = extract_dyn_trait_root(inner) {
+                        if let Some(r) =
+                            extract_dyn_trait_root_with_context(inner, prefix, known_trait_names)
+                        {
                             return Some(r);
                         }
                     }
@@ -1788,6 +1939,7 @@ pub(crate) fn qualified_full_type_string(
     ty: &syn::Type,
     prefix: &str,
     known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
 ) -> Option<String> {
     if prefix.is_empty() {
         return full_type_string(ty);
@@ -1816,9 +1968,12 @@ pub(crate) fn qualified_full_type_string(
                                 .args
                                 .iter()
                                 .filter_map(|arg| match arg {
-                                    syn::GenericArgument::Type(t) => {
-                                        qualified_full_type_string(t, prefix, known_struct_names)
-                                    }
+                                    syn::GenericArgument::Type(t) => qualified_full_type_string(
+                                        t,
+                                        prefix,
+                                        known_struct_names,
+                                        known_trait_names,
+                                    ),
                                     _ => None,
                                 })
                                 .collect();
@@ -1834,13 +1989,22 @@ pub(crate) fn qualified_full_type_string(
                 .collect();
             Some(segments.join("::"))
         }
-        syn::Type::Reference(r) => qualified_full_type_string(&r.elem, prefix, known_struct_names),
-        syn::Type::Paren(p) => qualified_full_type_string(&p.elem, prefix, known_struct_names),
-        syn::Type::Group(g) => qualified_full_type_string(&g.elem, prefix, known_struct_names),
-        syn::Type::Slice(s) => qualified_full_type_string(&s.elem, prefix, known_struct_names)
-            .map(|t| format!("[{}]", t)),
+        syn::Type::Reference(r) => {
+            qualified_full_type_string(&r.elem, prefix, known_struct_names, known_trait_names)
+        }
+        syn::Type::Paren(p) => {
+            qualified_full_type_string(&p.elem, prefix, known_struct_names, known_trait_names)
+        }
+        syn::Type::Group(g) => {
+            qualified_full_type_string(&g.elem, prefix, known_struct_names, known_trait_names)
+        }
+        syn::Type::Slice(s) => {
+            qualified_full_type_string(&s.elem, prefix, known_struct_names, known_trait_names)
+                .map(|t| format!("[{}]", t))
+        }
         syn::Type::Array(a) => {
-            let elem = qualified_full_type_string(&a.elem, prefix, known_struct_names)?;
+            let elem =
+                qualified_full_type_string(&a.elem, prefix, known_struct_names, known_trait_names)?;
             let len_str = match &a.len {
                 syn::Expr::Lit(lit) => match &lit.lit {
                     syn::Lit::Int(int_lit) => int_lit.base10_digits().to_string(),
@@ -1851,10 +2015,12 @@ pub(crate) fn qualified_full_type_string(
             Some(format!("[{};{}]", elem, len_str))
         }
         syn::Type::TraitObject(obj) => {
-            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
+                .map(|r| format!("dyn {r}"))
         }
         syn::Type::ImplTrait(obj) => {
-            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
+                .map(|r| format!("dyn {r}"))
         }
         _ => None,
     }
@@ -2302,6 +2468,44 @@ mod tests {
                 graph.block(graph.startblock).operations
             );
         }
+    }
+
+    #[test]
+    fn dyn_trait_receiver_uses_module_qualified_trait_family_key() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            mod a {
+                pub trait Handler { fn run(&mut self); }
+                pub fn call_a(h: &mut dyn Handler) { h.run(); }
+            }
+            mod b {
+                pub trait Handler { fn run(&mut self); }
+                pub fn call_b(h: &mut dyn Handler) { h.run(); }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let mut seen = std::collections::HashMap::<String, String>::new();
+        for func in &program.functions {
+            let Some(trait_root) = func
+                .graph
+                .block(func.graph.startblock)
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::Indirect { trait_root, .. },
+                        ..
+                    } => Some(trait_root.clone()),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            seen.insert(func.name.clone(), trait_root);
+        }
+        assert_eq!(seen.get("a::call_a"), Some(&"a::Handler".to_string()));
+        assert_eq!(seen.get("b::call_b"), Some(&"b::Handler".to_string()));
     }
 
     /// RPython `rpython/rtyper/rclass.py:644-678 _parse_field_list` — the

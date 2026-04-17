@@ -240,6 +240,7 @@ mod tests {
                     base,
                     field: crate::model::FieldDescriptor::new("x", None),
                     ty: ValueType::Int,
+                    pure: false,
                 },
                 true,
             )

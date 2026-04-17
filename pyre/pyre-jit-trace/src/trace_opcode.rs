@@ -4276,6 +4276,76 @@ impl MIFrame {
 /// between the int and float fast paths in generated_compare_value_direct,
 /// but reads the ConcreteValue variant directly so the check does not
 /// have to allocate an intermediate w_int/w_float box.
+/// Trace-side mirror of `pyre_interpreter::eval::check_exc_match_against`
+/// (`pyre/pyre-interpreter/src/eval.rs:81-130`).  Kept structurally
+/// identical so the recorded boolean matches the interpreter's
+/// concrete computation — including tuple-of-types, builtin-function
+/// alias, str-named exception kinds, and `is_type` + MRO fallback.
+///
+/// SAFETY: `exc_value` and `exc_type` must be non-null PyObjectRefs
+/// owned by the running interpreter for the duration of this call.
+unsafe fn trace_check_exc_match_against(
+    exc_value: pyre_object::PyObjectRef,
+    exc_type: pyre_object::PyObjectRef,
+) -> bool {
+    if !pyre_object::is_exception(exc_value) {
+        return true;
+    }
+    if pyre_object::is_tuple(exc_type) {
+        let n = pyre_object::w_tuple_len(exc_type) as i64;
+        for i in 0..n {
+            if let Some(elem) = pyre_object::w_tuple_getitem(exc_type, i) {
+                if trace_check_exc_match_against(exc_value, elem) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    let kind = pyre_object::w_exception_get_kind(exc_value);
+    if pyre_object::is_str(exc_type) {
+        let type_name = pyre_object::w_str_get_value(exc_type);
+        return pyre_object::exc_kind_matches(kind, type_name);
+    }
+    if pyre_interpreter::is_function(exc_type)
+        && pyre_interpreter::is_builtin_code(
+            pyre_interpreter::getcode(exc_type) as pyre_object::PyObjectRef
+        )
+    {
+        let type_name = pyre_interpreter::function_get_name(exc_type);
+        return pyre_object::exc_kind_matches(kind, type_name);
+    }
+    if pyre_object::is_type(exc_type) {
+        let type_name = pyre_object::w_type_get_name(exc_type);
+        if pyre_object::exc_kind_matches(kind, type_name) {
+            return true;
+        }
+        // ExcKind may not reflect the actual Python class hierarchy
+        // (e.g. FileNotFoundError created with ExcKind::Exception).
+        // Fall back to checking the exception's w_class MRO.
+        let w_class = (*exc_value).w_class;
+        if !w_class.is_null() && pyre_object::is_type(w_class) {
+            if std::ptr::eq(w_class, exc_type) {
+                return true;
+            }
+            let mro = pyre_object::w_type_get_mro(w_class);
+            if !mro.is_null() {
+                for &t in &*mro {
+                    if std::ptr::eq(t, exc_type) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    // Unrecognised type-spec format — eval.rs:130+ falls through to the
+    // legacy isinstance helper.  At trace time we don't have that path
+    // ported yet; report a structural mismatch loudly so the caller
+    // surfaces a tracer regression rather than silently emitting True.
+    false
+}
+
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
     match cv {
         ConcreteValue::Int(_) => (true, false),
@@ -4662,12 +4732,20 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
-    /// RPython pyjitpl.py:1677 opimpl_goto_if_exception_mismatch.
+    /// RPython pyjitpl.py:1677 opimpl_goto_if_exception_mismatch +
+    /// CPython `CHECK_EXC_MATCH` semantics.  Pops the expected exception
+    /// type, checks against last_exc_value, and pushes the concrete
+    /// match result.  GUARD_EXCEPTION already verified the class so this
+    /// usually produces True, but multi-except blocks may produce False
+    /// for non-matching clauses.
     ///
-    /// Pops the expected exception type, checks against last_exc_value,
-    /// and pushes the concrete match result. GUARD_EXCEPTION already
-    /// verified the class so this usually produces True, but multi-except
-    /// blocks may produce False for non-matching clauses.
+    /// Logic mirrors `pyre_interpreter::eval::check_exc_match_against`
+    /// (`pyre/pyre-interpreter/src/eval.rs:81-130`) — including tuple-of-
+    /// types and `is_type` + MRO walk — so the recorded boolean matches
+    /// what the interpreter would compute.  RPython
+    /// `pyjitpl.py:1680-1681` asserts last_exc_value + class_of_last_exc
+    /// are both set; pyre aborts tracing instead of silently emitting a
+    /// constant True if either operand is null at trace time.
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         let exc_type_val = <Self as SharedOpcodeHandler>::pop_value(self).ok();
         let exc_type_obj = exc_type_val
@@ -4675,34 +4753,20 @@ impl OpcodeStepExecutor for MIFrame {
             .map(|v| v.concrete.to_pyobj())
             .unwrap_or(std::ptr::null_mut());
 
-        // pyjitpl.py:1682 rclass.ll_isinstance: isinstance check against
-        // last_exc_value. Must match eval.rs check_exc_match exactly so
-        // the concrete trace path is correct (multi-except blocks).
         let last_exc = self.sym().last_exc_value;
-        let matched = if !last_exc.is_null() && !exc_type_obj.is_null() {
-            unsafe {
-                if !pyre_object::is_exception(last_exc) {
-                    true
-                } else {
-                    let kind = pyre_object::w_exception_get_kind(last_exc);
-                    if pyre_object::is_str(exc_type_obj) {
-                        let type_name = pyre_object::w_str_get_value(exc_type_obj);
-                        pyre_object::exc_kind_matches(kind, type_name)
-                    } else if pyre_interpreter::is_function(exc_type_obj)
-                        && pyre_interpreter::is_builtin_code(
-                            pyre_interpreter::getcode(exc_type_obj) as pyre_object::PyObjectRef,
-                        )
-                    {
-                        let type_name = pyre_interpreter::function_get_name(exc_type_obj);
-                        pyre_object::exc_kind_matches(kind, type_name)
-                    } else {
-                        true // unrecognized type format → match
-                    }
-                }
-            }
-        } else {
-            true // fallback: assume match if no concrete info
-        };
+        if last_exc.is_null() || exc_type_obj.is_null() {
+            // RPython `pyjitpl.py:1680-1681` `assert last_exc_value;
+            // assert class_of_last_exc_is_const`.  A null operand here
+            // means a tracer invariant was broken upstream (typically
+            // CHECK_EXC_MATCH ran without prior PUSH_EXC_INFO /
+            // GUARD_EXCEPTION).  Bail out loudly rather than fold a
+            // wrong constant into the trace.
+            return Err(PyError::runtime_error(
+                "CHECK_EXC_MATCH with null last_exc or exc_type during tracing",
+            ));
+        }
+
+        let matched = unsafe { trace_check_exc_match_against(last_exc, exc_type_obj) };
 
         let result_obj = pyre_object::w_bool_from(matched);
         let result_opref = self.with_ctx(|_this, ctx| ctx.const_ref(result_obj as i64));

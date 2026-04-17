@@ -159,12 +159,15 @@ pub fn extract_trait_impls(
     known_struct_names: &std::collections::HashSet<String>,
 ) -> Vec<TraitImplInfo> {
     let mut impls = Vec::new();
+    let mut known_trait_names = std::collections::HashSet::new();
+    collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
     collect_trait_impls_from_items(
         &parsed.file.items,
         "",
         struct_fields,
         fn_return_types,
         known_struct_names,
+        &known_trait_names,
         &mut impls,
     );
     impls
@@ -176,6 +179,7 @@ fn collect_trait_impls_from_items(
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
+    known_trait_names: &std::collections::HashSet<String>,
     impls: &mut Vec<TraitImplInfo>,
 ) {
     for item in items {
@@ -183,7 +187,8 @@ fn collect_trait_impls_from_items(
             // Concrete trait impls (impl Trait for Type)
             Item::Impl(impl_block) => {
                 if let Some((_, trait_path, _)) = &impl_block.trait_ {
-                    let trait_name = canonical_path_name(trait_path);
+                    let trait_name =
+                        canonical_trait_path_name(trait_path, prefix, known_trait_names);
                     let self_ty = &impl_block.self_ty;
                     let for_type = canonical_type_name(self_ty);
                     // Qualify bare type name with module prefix (RPython: unique type identity).
@@ -209,6 +214,7 @@ fn collect_trait_impls_from_items(
                                             fn_return_types,
                                             prefix,
                                             known_struct_names,
+                                            known_trait_names,
                                         );
                                     (Some(sf.graph), sf.hints)
                                 };
@@ -218,6 +224,7 @@ fn collect_trait_impls_from_items(
                                             ty,
                                             prefix,
                                             known_struct_names,
+                                            known_trait_names,
                                         )
                                     }
                                     syn::ReturnType::Default => None,
@@ -243,7 +250,11 @@ fn collect_trait_impls_from_items(
             }
             // Trait definitions with default methods
             Item::Trait(trait_def) => {
-                let trait_name = trait_def.ident.to_string();
+                let trait_name = qualify_known_trait_name(
+                    &trait_def.ident.to_string(),
+                    prefix,
+                    known_trait_names,
+                );
                 let methods: Vec<MethodInfo> = trait_def
                     .items
                     .iter()
@@ -263,6 +274,7 @@ fn collect_trait_impls_from_items(
                                     fn_return_types,
                                     prefix,
                                     known_struct_names,
+                                    known_trait_names,
                                 );
                                 let return_type = match &method.sig.output {
                                     syn::ReturnType::Type(_, ty) => {
@@ -270,6 +282,7 @@ fn collect_trait_impls_from_items(
                                             ty,
                                             prefix,
                                             known_struct_names,
+                                            known_trait_names,
                                         )
                                     }
                                     syn::ReturnType::Default => None,
@@ -309,8 +322,38 @@ fn collect_trait_impls_from_items(
                         struct_fields,
                         fn_return_types,
                         known_struct_names,
+                        known_trait_names,
                         impls,
                     );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_trait_names(
+    items: &[Item],
+    prefix: &str,
+    known_trait_names: &mut std::collections::HashSet<String>,
+) {
+    for item in items {
+        match item {
+            Item::Trait(trait_def) => {
+                let bare_name = trait_def.ident.to_string();
+                known_trait_names.insert(bare_name.clone());
+                if !prefix.is_empty() {
+                    known_trait_names.insert(format!("{}::{}", prefix, bare_name));
+                }
+            }
+            Item::Mod(m) => {
+                if let Some((_, ref sub_items)) = m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    collect_trait_names(sub_items, &mod_prefix, known_trait_names);
                 }
             }
             _ => {}
@@ -371,6 +414,7 @@ fn collect_inherent_methods_from_items(
                             fn_return_types,
                             prefix,
                             known_struct_names,
+                            &std::collections::HashSet::new(),
                         );
                         let return_type = match &method.sig.output {
                             syn::ReturnType::Type(_, ty) => {
@@ -378,6 +422,7 @@ fn collect_inherent_methods_from_items(
                                     ty,
                                     prefix,
                                     known_struct_names,
+                                    &std::collections::HashSet::new(),
                                 )
                             }
                             syn::ReturnType::Default => None,
@@ -616,14 +661,9 @@ fn extract_receiver_trait_bindings(func: &ItemFn) -> ReceiverTraitBindings {
                 .bounds
                 .iter()
                 .filter_map(|bound| match bound {
-                    syn::TypeParamBound::Trait(trait_bound) => Some(
-                        trait_bound
-                            .path
-                            .segments
-                            .last()
-                            .map(|seg| seg.ident.to_string())
-                            .unwrap_or_default(),
-                    ),
+                    syn::TypeParamBound::Trait(trait_bound) => {
+                        Some(canonical_path_name(&trait_bound.path))
+                    }
                     _ => None,
                 })
                 .filter(|name| !name.is_empty())
@@ -689,6 +729,40 @@ fn canonical_path_name(path: &syn::Path) -> String {
         .join("::")
 }
 
+fn qualify_known_trait_name(
+    bare: &str,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> String {
+    let qualified = if prefix.is_empty() || bare.contains("::") {
+        None
+    } else {
+        Some(format!("{}::{}", prefix, bare))
+    };
+    if let Some(qualified) = qualified {
+        if known_trait_names.contains(&qualified) {
+            qualified
+        } else {
+            bare.to_string()
+        }
+    } else {
+        bare.to_string()
+    }
+}
+
+fn canonical_trait_path_name(
+    path: &syn::Path,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> String {
+    let canonical = canonical_path_name(path);
+    if path.segments.len() == 1 {
+        qualify_known_trait_name(&canonical, prefix, known_trait_names)
+    } else {
+        canonical
+    }
+}
+
 fn canonical_type_name(ty: &syn::Type) -> String {
     match ty {
         syn::Type::Path(path) => canonical_path_name(&path.path),
@@ -741,6 +815,38 @@ mod tests {
             bindings.traits_by_receiver.get("executor"),
             Some(&vec!["OpcodeStepExecutor".to_string()])
         );
+    }
+
+    #[test]
+    fn extract_trait_impls_qualify_nested_trait_names() {
+        let parsed = parse_source(
+            r#"
+            mod a {
+                pub trait Handler {
+                    fn run(&mut self) {}
+                }
+                pub struct A;
+                impl Handler for A {}
+            }
+            mod b {
+                pub trait Handler {
+                    fn run(&mut self) {}
+                }
+                pub struct B;
+                impl Handler for B {}
+            }
+        "#,
+        );
+        let impls = extract_trait_impls(
+            &parsed,
+            &crate::front::StructFieldRegistry::default(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        let trait_names: std::collections::HashSet<&str> =
+            impls.iter().map(|imp| imp.trait_name.as_str()).collect();
+        assert!(trait_names.contains("a::Handler"));
+        assert!(trait_names.contains("b::Handler"));
     }
 
     #[test]

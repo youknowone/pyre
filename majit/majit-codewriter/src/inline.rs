@@ -281,10 +281,16 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             ty: ty.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
-        OpKind::FieldRead { base, field, ty } => OpKind::FieldRead {
+        OpKind::FieldRead {
+            base,
+            field,
+            ty,
+            pure,
+        } => OpKind::FieldRead {
             base: remap(base),
             field: field.clone(),
             ty: ty.clone(),
+            pure: *pure,
         },
         OpKind::FieldWrite {
             base,
