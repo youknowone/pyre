@@ -429,25 +429,18 @@ struct RegisteredLoopTarget {
     /// virtualizable.py:86 read_boxes: number of scalar inputargs
     /// (frame + static fields). First local is at this index.
     num_scalar_inputargs: usize,
-    /// regalloc.py:871 — byte offsets of each inputarg within jf_frame,
-    /// relative to BASEITEMOFS. _ll_initial_locs[i] = i * 8 (contiguous).
-    _ll_initial_locs: Vec<i32>,
-    /// rewrite.py:669 — compiled_loop_token.frame_info.
-    /// Leaked Box<[isize; 2]> with stable address (never freed).
-    /// Layout matches jitframe.py JitFrameInfo: two Signed (isize) fields.
-    /// RPython: frame_info = lltype.malloc(JITFRAMEINFO) — allocated once,
-    /// updated in place, pointer survives across registry clones/updates.
-    frame_info: *mut [isize; 2],
     /// pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable.
     /// Read from JitCellToken at registration time; -1 when the driver
     /// has no virtualizable.
     index_of_virtualizable: i32,
     /// `rpython/jit/backend/model.py:292-338` `CompiledLoopToken` — the
     /// per-loop metadata RPython `handle_call_assembler` (rewrite.py:665-
-    /// 695) reads as `loop_token.compiled_loop_token`. Dual-written during
-    /// P2.1: `_ll_initial_locs` / `frame_info` above still serve as the
-    /// consumer (`call_assembler_callee_locs` callback, P2.3 will switch
-    /// to read from this Arc and drop the duplicates).
+    /// 695) reads as `loop_token.compiled_loop_token`. Sources
+    /// `_ll_initial_locs` (`regalloc.py:861-871`) and `frame_info`
+    /// (`jitframe.py:30-40`) for `call_assembler_callee_locs`. Arc
+    /// continuity across pending → real registration is preserved by
+    /// adopting the pending Arc onto `token.compiled_loop_token` in
+    /// `register_call_assembler_target`.
     compiled_loop_token: Arc<CompiledLoopToken>,
 }
 
@@ -1996,14 +1989,8 @@ fn register_call_assembler_target(
     compiled: &CompiledLoop,
 ) -> Result<(), BackendError> {
     invalidate_ca_thread_cache(token.number);
-    let depth = (compiled.max_output_slots + compiled.num_ref_roots) as isize;
-    let base_ofs = JF_FRAME_ITEM0_OFS as isize;
-    let size = GcHeader::SIZE as isize + base_ofs + depth * 8;
-    // `rpython/jit/backend/regalloc.py:861-871` `_set_initial_bindings`
-    // assigns `looptoken.compiled_loop_token._ll_initial_locs` to the
-    // inputarg byte offsets. Pyre lays inputargs contiguously so
-    // `locs[i] = i * SIZEOFSIGNED`.
-    let ll_initial_locs: Vec<i32> = (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect();
+    let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
+    let base_ofs = JF_FRAME_ITEM0_OFS as i64;
     let num_scalar_inputargs = if token.num_scalar_inputargs > 0 {
         token.num_scalar_inputargs
     } else {
@@ -2030,10 +2017,16 @@ fn register_call_assembler_target(
         .as_ref()
         .expect("JitCellToken missing compiled_loop_token")
         .clone();
-    *clt._ll_initial_locs.lock() = ll_initial_locs.clone();
+    // `regalloc.py:861-871` `_set_initial_bindings`: contiguous layout
+    // → `locs[i] = i * SIZEOFSIGNED`.
+    *clt._ll_initial_locs.lock() = (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect();
+    // `jitframe.py:18-22` `jitframeinfo_update_depth`. The base_ofs is
+    // shifted by `GcHeader::SIZE` because pyre's nursery allocator
+    // returns the JITFRAME pointer past an 8-byte GcHeader; the depth
+    // field counts payload slots after the header.
     clt.frame_info
         .lock()
-        .update_frame_depth(base_ofs as i64, depth as i64);
+        .update_frame_depth(base_ofs + GcHeader::SIZE as i64, depth);
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
@@ -2050,31 +2043,6 @@ fn register_call_assembler_target(
         inputarg_types: token.inputarg_types.clone(),
         // virtualizable.py:86 read_boxes: header = frame + static fields.
         num_scalar_inputargs,
-        _ll_initial_locs: ll_initial_locs,
-        // rewrite.py:669 — compiled_loop_token.frame_info. Size includes
-        // the 8-byte GcHeader overhead that pyre prepends to every
-        // nursery allocation (malloc_nursery_varsize_frame(size) bumps
-        // `size` bytes and returns pointer 8 bytes in past the header).
-        //
-        // RPython: frame_info is allocated once, updated in place. Reuse
-        // the pending target's allocation if it exists so the raw
-        // pointer baked into already-rewritten caller traces stays
-        // valid.
-        frame_info: {
-            let registry = call_assembler_registry().lock().unwrap();
-            let fi = if let Some(existing) = registry.get(&token.number) {
-                let fi = existing.frame_info;
-                unsafe {
-                    (*fi)[0] = depth;
-                    (*fi)[1] = size;
-                }
-                fi
-            } else {
-                Box::into_raw(Box::new([depth, size]))
-            };
-            drop(registry);
-            fi
-        },
         index_of_virtualizable: token
             .virtualizable_arg_index
             .map(|i| i as i32)
@@ -2130,11 +2098,10 @@ pub fn register_pending_call_assembler_target(
     ca_dispatch_slot(token_number, std::ptr::null());
     ca_dispatch_set_finish_descr_ptr(token_number, CA_FINISH_INDEX_UNKNOWN as i64);
     // `rpython/jit/backend/model.py:292` — fresh placeholder
-    // `CompiledLoopToken`. When the real `JitCellToken` is created later,
-    // its own `Arc<CompiledLoopToken>` replaces this one; the duplicate
-    // `frame_info: *mut [isize;2]` block above keeps pointer stability
-    // for already-rewritten caller traces until P2.2 unifies the Arc
-    // across pending → real registration.
+    // `CompiledLoopToken`. `register_call_assembler_target` adopts this
+    // same Arc onto `token.compiled_loop_token` so the allocation (and
+    // therefore the `frame_info` address baked into already-rewritten
+    // caller traces) stays valid across the pending → real transition.
     let pending_clt = Arc::new(CompiledLoopToken::new(token_number));
     *pending_clt._ll_initial_locs.lock() = (0..num_inputs).map(|i| (i as i32) * 8).collect();
     let target = RegisteredLoopTarget {
@@ -2152,8 +2119,6 @@ pub fn register_pending_call_assembler_target(
         frame_depth: 1,
         inputarg_types,
         num_scalar_inputargs,
-        _ll_initial_locs: (0..num_inputs).map(|i| (i as i32) * 8).collect(),
-        frame_info: Box::into_raw(Box::new([0isize, 0isize])),
         index_of_virtualizable,
         compiled_loop_token: pending_clt,
     };
@@ -5450,15 +5415,29 @@ impl CraneliftBackend {
                 .get()
                 .and_then(|info| info.jitframe_descrs.clone()),
             constant_types: ct,
-            // rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
+            // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
+            // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
+            // both sourced directly from the CLT Arc on the target
+            // (model.py:292-338).
             call_assembler_callee_locs: Some(Box::new(|token_number| {
                 lookup_call_assembler_target(token_number).map(|t| {
-                    // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info)
-                    let fi_ptr = t.frame_info;
+                    let clt = &t.compiled_loop_token;
+                    // JitFrameInfo is #[repr(C)] so `&JitFrameInfo as *const _`
+                    // points at [jfi_frame_depth: i64, jfi_frame_size: i64];
+                    // the generated CALL_ASSEMBLER code loads those words
+                    // without taking the Mutex. Keeping the Arc alive via
+                    // `RegisteredLoopTarget.compiled_loop_token` pins the
+                    // allocation, matching RPython where the lltype-malloced
+                    // JITFRAMEINFO outlives the loop.
+                    let frame_info_ptr = {
+                        let guard = clt.frame_info.lock();
+                        &*guard as *const majit_backend::JitFrameInfo as usize
+                    };
+                    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
                     majit_gc::rewrite::CallAssemblerCalleeLocs {
-                        _ll_initial_locs: t._ll_initial_locs.clone(),
+                        _ll_initial_locs: ll_initial_locs,
                         frame_depth: t.frame_depth,
-                        frame_info_ptr: fi_ptr as usize,
+                        frame_info_ptr,
                         // pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable,
                         // propagated from JitCellToken at registration time.
                         index_of_virtualizable: t.index_of_virtualizable,
