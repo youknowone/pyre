@@ -908,16 +908,17 @@ impl AssemblerARM64 {
     /// calling into Rust.
     fn gen_shadowstack_header(&mut self) {
         let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
-        // RPython uses x8 as scratch here (r.ip1 for rst_addr, r.x8 for
-        // the loaded top). We mirror that: x16 = rst_addr, x8 = top.
-        self.emit_mov_imm64(16, rst);
+        // Register assignment mirrors assembler.py:1426-1436 literally:
+        // r.ip1 = x17 holds the rst address; r.ip0 = x16 holds the
+        // `1` is_minor marker; r.x8 = x8 holds the loaded top.
+        self.emit_mov_imm64(17, rst);
         dynasm!(self.mc ; .arch aarch64
-            ; ldr x8, [x16]             // x8 = *rst = root_stack_top
-            ; mov x17, 1                 // is_minor marker
-            ; str x17, [x8]             // [x8] = 1
+            ; ldr x8, [x17]             // x8 = *rst = root_stack_top
+            ; mov x16, 1                 // is_minor marker
+            ; str x16, [x8]             // [x8] = 1
             ; str x29, [x8, 8]          // [x8 + WORD] = fp (jf_ptr)
             ; add x8, x8, 16            // x8 += 2*WORD
-            ; str x8, [x16]             // *rst = x8
+            ; str x8, [x17]             // *rst = x8
         );
     }
 
