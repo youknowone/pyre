@@ -2662,9 +2662,18 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
                 };
                 let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
                 let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                // Replace items[s..e] with the iterable value.
-                let new_items = crate::builtins::collect_iterable(value)?;
-                pyre_object::listobject::w_list_setslice(obj, s, e, new_items);
+                // listobject.py:1746-1758 setslice — strategy-preserving
+                // when replacement list uses the same strategy.
+                // listobject.py:709-714: wrap non-list iterables into a
+                // temporary W_ListObject so setslice is strategy-aware.
+                let w_other = if pyre_object::is_list(value) {
+                    value
+                } else {
+                    let items = crate::builtins::collect_iterable(value)?;
+                    pyre_object::listobject::w_list_new(items)
+                };
+                pyre_object::listobject::w_list_setslice(obj, s, e, w_other)
+                    .expect("w_other is always a valid list");
                 return Ok(w_none());
             }
             if !is_int(index) {

@@ -162,6 +162,30 @@ pub enum RdVirtualInfo {
         offset: usize,
         fieldnums: Vec<i16>,
     },
+    /// resume.py:763 VStrPlainInfo
+    VStrPlainInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:781 VStrConcatInfo
+    VStrConcatInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:801 VStrSliceInfo
+    VStrSliceInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:817 VUniPlainInfo
+    VUniPlainInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:836 VUniConcatInfo
+    VUniConcatInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:856 VUniSliceInfo
+    VUniSliceInfo {
+        fieldnums: Vec<i16>,
+    },
     Empty,
 }
 
@@ -299,6 +323,16 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: b2,
                 },
             ) => a1 == b1 && a2 == b2,
+            (Self::VStrPlainInfo { fieldnums: a }, Self::VStrPlainInfo { fieldnums: b }) => a == b,
+            (Self::VStrConcatInfo { fieldnums: a }, Self::VStrConcatInfo { fieldnums: b }) => {
+                a == b
+            }
+            (Self::VStrSliceInfo { fieldnums: a }, Self::VStrSliceInfo { fieldnums: b }) => a == b,
+            (Self::VUniPlainInfo { fieldnums: a }, Self::VUniPlainInfo { fieldnums: b }) => a == b,
+            (Self::VUniConcatInfo { fieldnums: a }, Self::VUniConcatInfo { fieldnums: b }) => {
+                a == b
+            }
+            (Self::VUniSliceInfo { fieldnums: a }, Self::VUniSliceInfo { fieldnums: b }) => a == b,
             (Self::Empty, Self::Empty) => true,
             _ => false,
         }

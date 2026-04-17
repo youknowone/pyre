@@ -551,6 +551,18 @@ pub(crate) fn build_guard_metadata(
                                 majit_ir::RdVirtualInfo::Empty => {
                                     panic!("[jit] rd_virtuals[{vidx}] is Empty");
                                 }
+                                // resume.py:763-870 VStr/VUni info types —
+                                // no pyre producer yet; vstring.py porting
+                                // of virtual string materialization is a
+                                // future step.
+                                majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
+                                | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
+                                | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
+                                | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
+                                | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
+                                | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
+                                    panic!("[jit] virtual string info unexpected in pyre");
+                                }
                             }
                         })
                         .collect()

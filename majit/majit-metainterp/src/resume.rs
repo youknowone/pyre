@@ -1727,6 +1727,50 @@ pub fn rd_virtual_to_virtual_info(
                 parent,
             }
         }
+        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
+            let chars = fieldnums
+                .iter()
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .collect();
+            VirtualInfo::VStrPlain { chars }
+        }
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
+            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            VirtualInfo::VStrConcat { left, right }
+        }
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
+            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
+            VirtualInfo::VStrSlice {
+                source,
+                start,
+                length,
+            }
+        }
+        majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
+            let chars = fieldnums
+                .iter()
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .collect();
+            VirtualInfo::VUniPlain { chars }
+        }
+        majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            VirtualInfo::VUniConcat { left, right }
+        }
+        majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
+            VirtualInfo::VUniSlice {
+                source,
+                start,
+                length,
+            }
+        }
         majit_ir::RdVirtualInfo::Empty => VirtualInfo::VirtualObj {
             descr: None,
             type_id: 0,

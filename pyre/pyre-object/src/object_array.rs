@@ -12,9 +12,16 @@ pub const PYOBJECT_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(PyObjectArray,
 pub const PYOBJECT_ARRAY_CAP_OFFSET: usize = std::mem::offset_of!(PyObjectArray, cap);
 
 /// pypy/interpreter/pyframe.py:110 — RPython allocates locals_cells_stack_w
-/// as a plain list (GC array). This is the Rust equivalent: always heap-
-/// allocated so the JIT `ptr` field stays valid across frame moves and the
-/// GC can trace elements via the pointer.
+/// as a fixed-size GC array (`[None] * size` + `make_sure_not_resized`).
+/// Always heap-allocated so the JIT `ptr` field stays valid across frame
+/// moves and the GC can trace elements via the pointer.
+///
+/// Two usage modes:
+/// - **Fixed (frame)**: created via `filled()`, never resized.
+///   Corresponds to RPython's `make_sure_not_resized` GcArray.
+///   virtualizable.py:50 requires this for JIT virtualizable fields.
+/// - **Resizable (list)**: created via `from_vec()`, supports
+///   push/insert/remove/drain/clear for list mutation.
 ///
 /// The `ptr` field (offset 0) is used by the JIT for direct memory access.
 #[repr(C)]
@@ -109,56 +116,42 @@ impl PyObjectArray {
         self.as_mut_slice().swap(a, b);
     }
 
-    /// Insert `value` at `index`, shifting later elements right.
-    /// Mirrors RPython `AbstractUnwrappedStrategy.insert` (listobject.py:1714):
-    ///   `l.insert(index, self.unwrap(w_item))`
     pub fn insert(&mut self, index: usize, value: PyObjectRef) {
-        debug_assert!(index <= self.len);
-        if self.len == self.capacity() {
+        assert!(index <= self.len);
+        if self.len == self.cap {
             self.grow(self.len + 1);
         }
-        let len_orig = self.len;
         unsafe {
-            let ptr = self.ptr;
-            std::ptr::copy(ptr.add(index), ptr.add(index + 1), len_orig - index);
-            *ptr.add(index) = value;
+            let p = self.ptr.add(index);
+            std::ptr::copy(p, p.add(1), self.len - index);
+            *p = value;
         }
         self.len += 1;
     }
 
-    /// Remove and return the element at `index`, shifting later elements left.
-    /// Mirrors RPython `AbstractUnwrappedStrategy.pop` (listobject.py:1855):
-    ///   `item = l.pop(index)`
     pub fn remove(&mut self, index: usize) -> PyObjectRef {
-        debug_assert!(index < self.len);
-        let len = self.len;
-        let slice = self.as_mut_slice();
-        let value = slice[index];
-        slice.copy_within(index + 1..len, index);
+        assert!(index < self.len);
+        let value = unsafe { *self.ptr.add(index) };
+        unsafe {
+            let p = self.ptr.add(index);
+            std::ptr::copy(p.add(1), p, self.len - index - 1);
+        }
         self.len -= 1;
         value
     }
 
-    /// Remove and return the last element.
-    /// Mirrors RPython `AbstractUnwrappedStrategy.pop_end` (listobject.py:1848):
-    ///   `return self.wrap(l.pop())`
     pub fn pop(&mut self) -> PyObjectRef {
-        debug_assert!(self.len > 0);
+        assert!(self.len > 0);
         let value = self.as_slice()[self.len - 1];
         self.len -= 1;
         value
     }
 
-    /// Reverse storage in-place.
-    /// Mirrors RPython `AbstractUnwrappedStrategy.reverse` (listobject.py:1880):
-    ///   `self.unerase(w_list.lstorage).reverse()`
     pub fn reverse(&mut self) {
         self.as_mut_slice().reverse();
     }
 
     /// Replace `[start .. start+remove_count]` with `new_values` in one pass.
-    /// Mirrors RPython `AbstractUnwrappedStrategy.setslice` (listobject.py:1773-1808)
-    /// step==1 path: `del items[start:start+delta]` + overwrite, O(n).
     ///
     /// # Safety
     /// All pointers in `new_values` and in the existing storage must be valid.
@@ -191,6 +184,25 @@ impl PyObjectArray {
                 self.as_mut_slice()[s..s + len2].copy_from_slice(new_values);
             }
         }
+    }
+
+    pub fn drain(&mut self, range: std::ops::Range<usize>) {
+        let start = range.start;
+        let end = range.end;
+        assert!(start <= end && end <= self.len);
+        let count = end - start;
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let p = self.ptr.add(start);
+            std::ptr::copy(p.add(count), p, self.len - end);
+        }
+        self.len -= count;
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
     }
 }
 

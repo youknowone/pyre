@@ -8,12 +8,30 @@ use std::collections::HashMap;
 /// Generation-based loop aging. Loops not accessed for `max_age`
 /// generations are candidates for eviction.
 ///
-/// Reference: rpython/jit/metainterp/memmgr.py MemoryManager.
+/// Reference: rpython/jit/metainterp/memmgr.py MemoryManager. In RPython
+/// the retrace/unroll parameters are Python attributes set lazily by
+/// warmstate.py:299-320 (`set_param_retrace_limit`,
+/// `set_param_max_retrace_guards`, `set_param_max_unroll_loops`,
+/// `set_param_max_unroll_recursion`) and read back by unroll.py:215 and
+/// pyjitpl.py:1404/2946. In Rust we declare them as typed fields on the
+/// manager and initialize to the rlib/jit.py:588 PARAMETERS defaults.
 pub struct LoopAging {
     generation: u64,
     max_age: u64,
     /// loop_key → last access generation.
     loop_generations: HashMap<u64, u64>,
+    /// warmstate.py:299-302 — `set_param_retrace_limit` writes here.
+    /// unroll.py:215 `warmrunnerdescr.memory_manager.retrace_limit`.
+    pub retrace_limit: u32,
+    /// warmstate.py:307-310 — `set_param_max_retrace_guards`.
+    /// unroll.py:265 `memory_manager.max_retrace_guards`.
+    pub max_retrace_guards: u32,
+    /// warmstate.py:312-315 — `set_param_max_unroll_loops`.
+    /// pyjitpl.py:2946 `memmgr.max_unroll_loops`.
+    pub max_unroll_loops: u32,
+    /// warmstate.py:317-320 — `set_param_max_unroll_recursion`.
+    /// pyjitpl.py:1404 `memmgr.max_unroll_recursion`.
+    pub max_unroll_recursion: u32,
 }
 
 impl LoopAging {
@@ -24,6 +42,11 @@ impl LoopAging {
             generation: 0,
             max_age,
             loop_generations: HashMap::new(),
+            // rlib/jit.py:588 PARAMETERS defaults.
+            retrace_limit: 0,
+            max_retrace_guards: 15,
+            max_unroll_loops: 0,
+            max_unroll_recursion: 7,
         }
     }
 

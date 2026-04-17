@@ -5865,4 +5865,48 @@ mod tests {
             .count();
         assert_eq!(len_count, 1, "duplicate ARRAYLEN_GC should be cached");
     }
+
+    /// heap.py:278-298 ArrayCachedItem._cannot_alias_via_content — two
+    /// arrays with the same descr + length but differing constant items
+    /// must be reported as unable to alias.
+    #[test]
+    fn test_cannot_alias_via_content_different_constants() {
+        use crate::optimizeopt::OptContext;
+        use crate::optimizeopt::info::{ArrayPtrInfo, FieldEntry};
+        use crate::optimizeopt::intutils::IntBound;
+
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(64, 4, 0, 4);
+
+        let arr_descr = descr(50);
+        let op1 = OpRef(0);
+        let op2 = OpRef(1);
+
+        let const_10 = ctx.emit_constant_int(10);
+        let const_20 = ctx.emit_constant_int(20);
+        let const_30 = ctx.emit_constant_int(30);
+
+        ctx.set_ptr_info(
+            op1,
+            PtrInfo::Array(ArrayPtrInfo {
+                descr: arr_descr.clone(),
+                lenbound: IntBound::from_constant(2),
+                items: vec![FieldEntry::Value(const_10), FieldEntry::Value(const_20)],
+                last_guard_pos: -1,
+            }),
+        );
+        ctx.set_ptr_info(
+            op2,
+            PtrInfo::Array(ArrayPtrInfo {
+                descr: arr_descr,
+                lenbound: IntBound::from_constant(2),
+                items: vec![FieldEntry::Value(const_10), FieldEntry::Value(const_30)],
+                last_guard_pos: -1,
+            }),
+        );
+
+        assert!(
+            super::ArrayCachedItem::_cannot_alias_via_content(op1, op2, &mut ctx),
+            "arrays with different constant at index 1 cannot alias"
+        );
+    }
 }

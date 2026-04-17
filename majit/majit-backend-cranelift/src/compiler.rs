@@ -10662,6 +10662,15 @@ fn collect_guards(
                                     .unwrap_or(ExitValueSourceLayout::Constant(0)),
                             }
                         }
+                        // resume.py:763-870 VStr/VUni info types — no pyre
+                        // producer yet; backing virtual-string materialization
+                        // lives on a future port of vstring.py. Skip safely.
+                        majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
+                        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
+                        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
+                        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
+                        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
+                        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => continue,
                         majit_ir::RdVirtualInfo::Empty => continue,
                     };
                     recovery_layout.virtual_layouts.push(layout);

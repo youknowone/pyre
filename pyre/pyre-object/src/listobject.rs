@@ -9,9 +9,10 @@
 
 use crate::pyobject::*;
 use crate::{
-    FloatArray, IntArray, PyObjectArray, floatobject::w_float_get_value, floatobject::w_float_new,
-    intobject::w_int_get_value, intobject::w_int_new, intobject::w_int_small_cached,
-    longobject::w_long_fits_int, longobject::w_long_get_value,
+    FloatArray, IntArray, PyObjectArray, boolobject::w_bool_get_value,
+    floatobject::w_float_get_value, floatobject::w_float_new, intobject::w_int_get_value,
+    intobject::w_int_new, intobject::w_int_small_cached, longobject::w_long_fits_int,
+    longobject::w_long_get_value,
 };
 
 #[repr(u8)]
@@ -35,31 +36,46 @@ pub struct W_ListObject {
     pub float_items: FloatArray,
 }
 
-/// `is_plain_int1(w_obj)` — RPython listobject.py:2390.
-/// True if `item` is a plain `int` (exact type W_IntObject, not a bool subclass)
-/// or a W_LongObject whose value fits in a machine-word int.
-///   `type(w_obj) is W_IntObject  OR  (type(w_obj) is W_LongObject AND w_obj._fits_int())`
+/// listobject.py:2390-2392 is_plain_int1(w_obj)
+///
+/// Accepts exact W_IntObject (not bool, not int subclass) or W_LongObject
+/// whose value fits in a machine-word integer.
 #[inline]
 unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if item.is_null() {
         return false;
     }
-    if is_int(item) {
-        // W_IntObject: verify not a bool subclass by checking small-int cache identity.
-        let v = w_int_get_value(item);
-        if w_int_small_cached(v) {
-            std::ptr::eq(item, w_int_new(v))
-        } else {
-            true
+    if is_int(item) && !is_bool(item) {
+        // type(w_obj) is W_IntObject — reject int subclasses.
+        // Subclass instances share ob_type == &INT_TYPE but have w_class
+        // overwritten to the subclass type object (typedef.rs:673).
+        let int_typeobj = get_instantiate(&INT_TYPE);
+        if !int_typeobj.is_null() {
+            let w_class = (*item).w_class;
+            if !w_class.is_null() && !std::ptr::eq(w_class, int_typeobj) {
+                return false;
+            }
         }
-    } else if is_long(item) {
-        // W_LongObject: accept if value fits in a machine-word integer.
-        w_long_fits_int(item)
+        return true;
+    }
+    if is_long(item) {
+        return w_long_fits_int(item);
+    }
+    false
+}
+
+/// Unwrap a plain int value from W_IntObject or W_LongObject.
+/// Caller must ensure `is_plain_int1(item)` is true.
+#[inline]
+unsafe fn unwrap_plain_int(item: PyObjectRef) -> i64 {
+    if is_int(item) {
+        w_int_get_value(item)
     } else {
-        false
+        i64::try_from(w_long_get_value(item)).unwrap_or(0)
     }
 }
 
+/// Check if all items are plain ints for IntegerListStrategy.
 fn all_ints(items: &[PyObjectRef]) -> bool {
     items.iter().all(|&item| unsafe { is_plain_int1(item) })
 }
@@ -115,7 +131,7 @@ pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         ListStrategy::Integer => {
             let values = items
                 .into_iter()
-                .map(|item| unsafe { w_int_get_value(item) })
+                .map(|item| unsafe { unwrap_plain_int(item) })
                 .collect();
             (
                 PyObjectArray::from_vec(Vec::new()),
@@ -217,12 +233,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             }
             // AbstractUnwrappedStrategy.setitem (listobject.py:1737): plain_int_w (unwrap)
             if is_plain_int1(value) {
-                let v = if is_int(value) {
-                    w_int_get_value(value)
-                } else {
-                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
-                };
-                list.int_items[idx as usize] = v;
+                list.int_items[idx as usize] = unwrap_plain_int(value);
                 true
             } else {
                 switch_to_object_strategy(list);
@@ -259,12 +270,7 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
         ListStrategy::Object => list.items.push(value),
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                let v = if is_int(value) {
-                    w_int_get_value(value)
-                } else {
-                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
-                };
-                list.int_items.push(v);
+                list.int_items.push(unwrap_plain_int(value));
             } else {
                 switch_to_object_strategy(list);
                 list.items.push(value);
@@ -336,112 +342,113 @@ pub unsafe fn w_list_uses_float_storage(obj: PyObjectRef) -> bool {
 }
 
 /// Rebuild the list's object storage from a Vec.
-/// Used by mutation operations that need insert/remove.
-pub unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectRef>) {
+unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectRef>) {
     list.items = PyObjectArray::from_vec(items);
     list.items.fix_ptr();
 }
 
-/// Set a slice of the list: `list[start:end] = new_items` (step=1).
-/// Switches to ObjectStrategy when new_items don't match the current strategy type.
-pub unsafe fn w_list_setslice(
-    obj: PyObjectRef,
-    start: usize,
-    end: usize,
-    new_items: Vec<PyObjectRef>,
-) {
-    let list = &mut *(obj as *mut W_ListObject);
-    // AbstractUnwrappedStrategy.setslice (listobject.py:1749-1808) step==1.
+/// listobject.py:363-371 _temporarily_as_objects()
+///
+/// Returns wrapped object items without mutating the source list's strategy.
+/// PyPy creates a temporary W_ListObject with ObjectListStrategy; Rust
+/// returns a Vec<PyObjectRef> copy instead.
+unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
     match list.strategy {
-        ListStrategy::Integer => {
-            let all_int = new_items.iter().all(|&v| is_plain_int1(v));
-            if all_int {
-                let new_ints: Vec<i64> = new_items
-                    .iter()
-                    .map(|&v| {
-                        if is_int(v) {
-                            w_int_get_value(v)
-                        } else {
-                            i64::try_from(w_long_get_value(v)).unwrap_or(0)
-                        }
-                    })
-                    .collect();
-                let remove_count = end.saturating_sub(start);
-                list.int_items.splice(start, remove_count, &new_ints);
-                return;
-            }
-            switch_to_object_strategy(list);
-        }
-        ListStrategy::Float => {
-            let all_float = new_items.iter().all(|&v| !v.is_null() && is_float(v));
-            if all_float {
-                let new_floats: Vec<f64> =
-                    new_items.iter().map(|&v| w_float_get_value(v)).collect();
-                let remove_count = end.saturating_sub(start);
-                list.float_items.splice(start, remove_count, &new_floats);
-                return;
-            }
-            switch_to_object_strategy(list);
-        }
-        ListStrategy::Object => {}
+        ListStrategy::Object => list.items.to_vec(),
+        ListStrategy::Integer => list
+            .int_items
+            .as_slice()
+            .iter()
+            .map(|&v| w_int_new(v))
+            .collect(),
+        ListStrategy::Float => list
+            .float_items
+            .as_slice()
+            .iter()
+            .map(|&v| w_float_new(v))
+            .collect(),
     }
-    // Object strategy: splice in-place, O(n)
-    let remove_count = end.saturating_sub(start);
-    list.items.splice(start, remove_count, &new_items);
 }
 
-/// Insert item at index.
+fn normalize_insert_index(index: i64, len: usize) -> usize {
+    if index < 0 {
+        (index + len as i64).max(0) as usize
+    } else {
+        (index as usize).min(len)
+    }
+}
+
+/// listobject.py:1712-1720 IntegerListStrategy.insert
+/// Strategy-preserving: inserts on typed storage when type matches,
+/// switches to Object only when incompatible.
 pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
-    let len = w_list_len(obj) as i64;
-    let idx = if index < 0 {
-        (index + len).max(0) as usize
-    } else {
-        (index as usize).min(len as usize)
-    };
     match list.strategy {
-        ListStrategy::Object => list.items.insert(idx, value),
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                let v = if is_int(value) {
-                    w_int_get_value(value)
-                } else {
-                    // W_LongObject that fits in i64 (plain_int_w / _int_w)
-                    i64::try_from(w_long_get_value(value)).unwrap_or(0)
-                };
-                list.int_items.insert(idx, v);
-            } else {
-                switch_to_object_strategy(list);
-                list.items.insert(idx, value);
+                let idx = normalize_insert_index(index, list.int_items.len());
+                list.int_items.insert(idx, unwrap_plain_int(value));
+                return;
             }
+            switch_to_object_strategy(list);
+            w_list_insert(obj, index, value);
         }
         ListStrategy::Float => {
             if !value.is_null() && is_float(value) {
+                let idx = normalize_insert_index(index, list.float_items.len());
                 list.float_items.insert(idx, w_float_get_value(value));
-            } else {
-                switch_to_object_strategy(list);
-                list.items.insert(idx, value);
+                return;
             }
+            switch_to_object_strategy(list);
+            w_list_insert(obj, index, value);
+        }
+        ListStrategy::Object => {
+            let idx = normalize_insert_index(index, list.items.len());
+            list.items.insert(idx, value);
         }
     }
 }
 
-/// Remove and return item at `index`. Returns `None` if out of bounds.
+/// listobject.py:1850-1862 IntegerListStrategy.pop
+/// Strategy-preserving: pops from typed storage, wraps result.
 pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let list = &mut *(obj as *mut W_ListObject);
-    let len = w_list_len(obj) as i64;
-    if len == 0 {
-        return None;
-    }
-    let idx = if index < 0 { index + len } else { index };
-    if idx < 0 || idx >= len {
-        return None;
-    }
-    let idx = idx as usize;
     match list.strategy {
-        ListStrategy::Object => Some(list.items.remove(idx)),
-        ListStrategy::Integer => Some(w_int_new(list.int_items.remove(idx))),
-        ListStrategy::Float => Some(w_float_new(list.float_items.remove(idx))),
+        ListStrategy::Integer => {
+            let len = list.int_items.len() as i64;
+            if len == 0 {
+                return None;
+            }
+            let idx = if index < 0 { index + len } else { index };
+            if idx < 0 || idx >= len {
+                return None;
+            }
+            let item = list.int_items.remove(idx as usize);
+            Some(w_int_new(item))
+        }
+        ListStrategy::Float => {
+            let len = list.float_items.len() as i64;
+            if len == 0 {
+                return None;
+            }
+            let idx = if index < 0 { index + len } else { index };
+            if idx < 0 || idx >= len {
+                return None;
+            }
+            let item = list.float_items.remove(idx as usize);
+            Some(w_float_new(item))
+        }
+        ListStrategy::Object => {
+            let len = list.items.len() as i64;
+            if len == 0 {
+                return None;
+            }
+            let idx = if index < 0 { index + len } else { index };
+            if idx < 0 || idx >= len {
+                return None;
+            }
+            Some(list.items.remove(idx as usize))
+        }
     }
 }
 
@@ -449,12 +456,6 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
 pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        ListStrategy::Object => {
-            if list.items.len() == 0 {
-                return None;
-            }
-            Some(list.items.pop())
-        }
         ListStrategy::Integer => {
             if list.int_items.len() == 0 {
                 return None;
@@ -467,72 +468,48 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
             }
             Some(w_float_new(list.float_items.pop()))
         }
+        ListStrategy::Object => {
+            if list.items.len() == 0 {
+                return None;
+            }
+            Some(list.items.pop())
+        }
     }
 }
 
-/// Clear all items.
-/// RPython `W_ListObject.clear` (listobject.py:391) switches to EmptyListStrategy.
-/// Pyre has no EmptyListStrategy, so we keep the **current** strategy and empty its
-/// storage — semantically equivalent for all subsequent operations (append re-fills
-/// the same typed storage; mixed items will switch to ObjectStrategy as needed).
+/// listobject.py:391 W_ListObject.clear
+/// Strategy-preserving: clears typed storage in place.
 pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        ListStrategy::Object => {
-            list.items = PyObjectArray::from_vec(Vec::new());
-            list.items.fix_ptr();
-        }
-        ListStrategy::Integer => {
-            list.int_items = IntArray::from_vec(Vec::new());
-            list.int_items.fix_ptr();
-        }
-        ListStrategy::Float => {
-            list.float_items = FloatArray::from_vec(Vec::new());
-            list.float_items.fix_ptr();
-        }
+        ListStrategy::Integer => list.int_items.clear(),
+        ListStrategy::Float => list.float_items.clear(),
+        ListStrategy::Object => list.items.clear(),
     }
 }
 
-/// Reverse in place.
+/// listobject.py:1873-1874 IntegerListStrategy.reverse
+/// Strategy-preserving: reverses typed storage in place.
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        ListStrategy::Object => list.items.reverse(),
-        ListStrategy::Integer => list.int_items.reverse(),
-        ListStrategy::Float => list.float_items.reverse(),
+        ListStrategy::Integer => list.int_items.as_mut_slice().reverse(),
+        ListStrategy::Float => list.float_items.as_mut_slice().reverse(),
+        ListStrategy::Object => list.items.as_mut_slice().reverse(),
     }
 }
 
-/// Delete a range of items `[start..end)` in place.
+/// listobject.py:1814-1844 deleteslice (step=1 simple case)
+/// Strategy-preserving: drains from typed storage.
 pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        ListStrategy::Object => {
-            let len = list.items.len();
-            let s = start.min(len);
-            let e = end.min(len);
-            if s < e {
-                // shift elements left: items[s..len-count] = items[e..len]
-                let count = e - s;
-                let slice = list.items.as_mut_slice();
-                slice.copy_within(e..len, s);
-                // truncate: reduce len by count
-                for _ in 0..count {
-                    list.items.pop();
-                }
-            }
-        }
         ListStrategy::Integer => {
             let len = list.int_items.len();
             let s = start.min(len);
             let e = end.min(len);
             if s < e {
-                let count = e - s;
-                let slice = list.int_items.as_mut_slice();
-                slice.copy_within(e..len, s);
-                for _ in 0..count {
-                    list.int_items.pop();
-                }
+                list.int_items.drain(s..e);
             }
         }
         ListStrategy::Float => {
@@ -540,18 +517,157 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
             let s = start.min(len);
             let e = end.min(len);
             if s < e {
-                let count = e - s;
-                let slice = list.float_items.as_mut_slice();
-                slice.copy_within(e..len, s);
-                for _ in 0..count {
-                    list.float_items.pop();
-                }
+                list.float_items.drain(s..e);
+            }
+        }
+        ListStrategy::Object => {
+            let len = list.items.len();
+            let s = start.min(len);
+            let e = end.min(len);
+            if s < e {
+                list.items.drain(s..e);
             }
         }
     }
 }
 
-/// Result of the typed fast-path `find_or_count`. Mirrors the
+/// listobject.py:1613-1631 IntegerListStrategy._safe_find_or_count
+/// Fast path for integer lists: unwrapped comparison.
+unsafe fn int_find(items: &[i64], value: i64) -> Option<usize> {
+    items.iter().position(|&v| v == value)
+}
+
+/// Python int/float cross-type equality: avoids false positives from
+/// f64 precision loss (e.g. 2**53+1 != float(2**53)).
+#[inline]
+fn int_eq_float(ival: i64, fval: f64) -> bool {
+    if !fval.is_finite() {
+        return false;
+    }
+    let ival_f = ival as f64;
+    if ival_f != fval {
+        return false;
+    }
+    const I64_UPPER_F: f64 = (1u64 << 63) as f64;
+    if fval >= I64_UPPER_F || fval < -I64_UPPER_F {
+        return false;
+    }
+    fval as i64 == ival
+}
+
+/// listobject.py:2103-2125 FloatListStrategy._safe_find_or_count
+/// Fast path for float lists: handles NaN via bit-pattern comparison.
+unsafe fn float_find(items: &[f64], value: f64) -> Option<usize> {
+    if !value.is_nan() {
+        items.iter().position(|&v| v == value)
+    } else {
+        let bits = value.to_bits();
+        items.iter().position(|&v| v.to_bits() == bits)
+    }
+}
+
+/// listobject.py:782-792 descr_remove → find_or_count + pop
+/// Strategy-preserving: searches on typed storage with fast path,
+/// falls back to generic eq_w for Object strategy.
+pub unsafe fn w_list_remove(obj: PyObjectRef, value: PyObjectRef) -> bool {
+    let list = &mut *(obj as *mut W_ListObject);
+    match list.strategy {
+        ListStrategy::Integer => {
+            if is_plain_int1(value) {
+                let target = unwrap_plain_int(value);
+                if let Some(idx) = int_find(list.int_items.as_slice(), target) {
+                    list.int_items.remove(idx);
+                    return true;
+                }
+                return false;
+            }
+            // listobject.py:1613-1618 → ListStrategy.find_or_count (line 941):
+            // generic eq_w comparison without switching strategy.
+            if !value.is_null() {
+                if is_bool(value) {
+                    let target = if w_bool_get_value(value) { 1i64 } else { 0i64 };
+                    if let Some(idx) = int_find(list.int_items.as_slice(), target) {
+                        list.int_items.remove(idx);
+                        return true;
+                    }
+                } else if is_int(value) {
+                    let target = w_int_get_value(value);
+                    if let Some(idx) = int_find(list.int_items.as_slice(), target) {
+                        list.int_items.remove(idx);
+                        return true;
+                    }
+                } else if is_float(value) {
+                    let fval = w_float_get_value(value);
+                    for i in 0..list.int_items.len() {
+                        if int_eq_float(list.int_items[i], fval) {
+                            list.int_items.remove(i);
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        ListStrategy::Float => {
+            if !value.is_null() && is_float(value) {
+                let target = w_float_get_value(value);
+                if let Some(idx) = float_find(list.float_items.as_slice(), target) {
+                    list.float_items.remove(idx);
+                    return true;
+                }
+                return false;
+            }
+            // listobject.py:1613-1618 → ListStrategy.find_or_count (line 941):
+            // generic eq_w comparison without switching strategy.
+            if !value.is_null() {
+                let ival = if is_bool(value) {
+                    Some(if w_bool_get_value(value) { 1i64 } else { 0 })
+                } else if is_int(value) {
+                    Some(w_int_get_value(value))
+                } else if is_long(value) && w_long_fits_int(value) {
+                    Some(unwrap_plain_int(value))
+                } else {
+                    None
+                };
+                if let Some(ival) = ival {
+                    for i in 0..list.float_items.len() {
+                        if int_eq_float(ival, list.float_items[i]) {
+                            list.float_items.remove(i);
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        ListStrategy::Object => {
+            let items = list.items.as_slice();
+            for i in 0..items.len() {
+                if std::ptr::eq(items[i], value) {
+                    list.items.remove(i);
+                    return true;
+                }
+                if is_int(items[i])
+                    && is_int(value)
+                    && w_int_get_value(items[i]) == w_int_get_value(value)
+                {
+                    list.items.remove(i);
+                    return true;
+                }
+                if is_float(items[i])
+                    && is_float(value)
+                    && w_float_get_value(items[i]) == w_float_get_value(value)
+                {
+                    list.items.remove(i);
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Outcome of `W_ListObject.find_or_count` fast path. Mirrors the
 /// short-circuit return in `IntegerListStrategy.find_or_count`
 /// (listobject.py:1613) and `FloatListStrategy.find_or_count` — when the
 /// strategy + needle type match, the typed pool is scanned in place.
@@ -635,6 +751,75 @@ pub unsafe fn w_list_find_or_count_fast(
         }
         _ => ListFindFast::NeedsGeneric,
     }
+}
+
+/// listobject.py:1746-1758 setslice — strategy-preserving.
+///
+/// When replacement is a list with the same strategy, operates on typed
+/// storage directly. Otherwise falls back to Object strategy.
+/// `start` and `end` are already normalized (non-negative, clamped).
+pub unsafe fn w_list_setslice(
+    obj: PyObjectRef,
+    start: usize,
+    end: usize,
+    w_other: PyObjectRef,
+) -> Result<(), &'static str> {
+    let list = &mut *(obj as *mut W_ListObject);
+    if is_list(w_other) {
+        let other = &*(w_other as *const W_ListObject);
+        // listobject.py:1752: not self.list_is_correct_type(w_other) and w_other.length() != 0
+        // Only switch strategy when donor is non-empty AND has different type.
+        // Empty donor → pure deletion, strategy preserved.
+        let other_len = w_list_len(w_other);
+        if list.strategy == other.strategy || other_len == 0 {
+            match list.strategy {
+                ListStrategy::Integer => {
+                    let new_items = if list.strategy == other.strategy {
+                        other.int_items.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let mut v = list.int_items.to_vec();
+                    let s = start.min(v.len());
+                    let e = end.min(v.len());
+                    v.splice(s..e, new_items.iter().copied());
+                    list.int_items = IntArray::from_vec(v);
+                    list.int_items.fix_ptr();
+                    return Ok(());
+                }
+                ListStrategy::Float => {
+                    let new_items = if list.strategy == other.strategy {
+                        other.float_items.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let mut v = list.float_items.to_vec();
+                    let s = start.min(v.len());
+                    let e = end.min(v.len());
+                    v.splice(s..e, new_items.iter().copied());
+                    list.float_items = FloatArray::from_vec(v);
+                    list.float_items.fix_ptr();
+                    return Ok(());
+                }
+                ListStrategy::Object => {}
+            }
+        }
+    }
+    // listobject.py:1751-1753: strategies differ and donor is non-empty →
+    // switch to object strategy, then splice as objects.
+    let new_items: Vec<PyObjectRef> = if is_list(w_other) {
+        let other = &*(w_other as *const W_ListObject);
+        temporarily_as_objects(other)
+    } else {
+        return Err("non-list iterable");
+    };
+    switch_to_object_strategy(list);
+    let mut v = list.items.to_vec();
+    let s = start.min(v.len());
+    let e = end.min(v.len());
+    v.splice(s..e, new_items);
+    rebuild_object_items(list, v);
+    Ok(())
 }
 
 #[majit_macros::dont_look_inside]
@@ -1011,19 +1196,25 @@ mod tests {
     }
 
     #[test]
-    fn test_int_list_find_or_count_fast_integer_strategy() {
-        // listobject.py:1613 IntegerListStrategy.find_or_count fast path.
+    fn test_int_list_remove_stays_integer_strategy() {
+        // W_ListObject.descr_remove (listobject.py:790): find_or_count then pop
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
-            match w_list_find_or_count_fast(list, w_int_new(2), 0, i64::MAX, false) {
-                ListFindFast::Found(i) => assert_eq!(i, 1),
-                _ => panic!("expected Found(1)"),
-            }
-            match w_list_find_or_count_fast(list, w_int_new(99), 0, i64::MAX, false) {
-                ListFindFast::NotFound => {}
-                _ => panic!("expected NotFound"),
-            }
+            assert!(w_list_remove(list, w_int_new(2)));
+            assert!(
+                w_list_uses_int_storage(list),
+                "remove must not switch strategy"
+            );
+            assert_eq!(w_list_len(list), 2);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 1).unwrap()),
+                3
+            );
         }
     }
 }

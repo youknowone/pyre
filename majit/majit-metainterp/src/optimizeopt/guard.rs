@@ -400,7 +400,7 @@ impl Guard {
 /// RPython name: `GuardStrengthenOpt`. Collects guard information from
 /// a complete loop, determines implication/strengthening, re-emits with
 /// proper descr/fail_args, and optionally eliminates array bound checks.
-pub struct GuardEliminator {
+pub struct GuardStrengthenOpt {
     /// guard.py:168
     pub index_vars: HashMap<OpRef, IndexVar>,
     /// guard.py:169
@@ -420,10 +420,10 @@ pub struct GuardEliminator {
     pub const_values: HashMap<OpRef, i64>,
 }
 
-impl GuardEliminator {
+impl GuardStrengthenOpt {
     /// guard.py:167
     pub fn new(index_vars: HashMap<OpRef, IndexVar>) -> Self {
-        GuardEliminator {
+        GuardStrengthenOpt {
             index_vars,
             _newoperations: Vec::new(),
             strength_reduced: 0,
@@ -636,7 +636,7 @@ fn info_track_guard(
     info.track(fail_index, version);
 }
 
-impl GuardEliminator {
+impl GuardStrengthenOpt {
     /// guard.py:279-303: eliminate_array_bound_checks(info, loop)
     ///
     /// `version_info`: LoopVersionInfo for tracking.
@@ -709,13 +709,13 @@ impl GuardEliminator {
     }
 }
 
-impl Default for GuardEliminator {
+impl Default for GuardStrengthenOpt {
     fn default() -> Self {
         Self::new(HashMap::new())
     }
 }
 
-pub struct GuardStrengthenOpt {
+pub struct OptGuard {
     /// Set of guard conditions already verified in the trace.
     seen: HashSet<GuardKey>,
 
@@ -734,9 +734,9 @@ pub struct GuardStrengthenOpt {
     last_guard_descr: Option<DescrRef>,
 }
 
-impl GuardStrengthenOpt {
+impl OptGuard {
     pub fn new() -> Self {
-        GuardStrengthenOpt {
+        OptGuard {
             seen: HashSet::new(),
             truthy_values: HashSet::new(),
             known_classes: std::collections::HashMap::new(),
@@ -894,13 +894,13 @@ impl GuardStrengthenOpt {
     }
 }
 
-impl Default for GuardStrengthenOpt {
+impl Default for OptGuard {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Optimization for GuardStrengthenOpt {
+impl Optimization for OptGuard {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         if !op.opcode.is_guard() {
             // Non-guard operations invalidate the last-guard descriptor
@@ -980,7 +980,7 @@ mod tests {
 
     fn run_guard_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(GuardStrengthenOpt::new()));
+        opt.add_pass(Box::new(OptGuard::new()));
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
@@ -1245,9 +1245,9 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
-    // ── Integration: GuardStrengthenOpt as standalone pass ─────────────────────
+    // ── Integration: OptGuard as standalone pass ─────────────────────
     // RPython: guard.py is NOT in the default pipeline (only used by vectorization).
-    // These tests exercise GuardStrengthenOpt independently.
+    // These tests exercise OptGuard independently.
 
     #[test]
     fn test_guard_strengthen_pass_removes_duplicate() {
@@ -1267,7 +1267,7 @@ mod tests {
             .count();
         assert_eq!(
             guard_count, 1,
-            "duplicate guard should be removed by GuardStrengthenOpt"
+            "duplicate guard should be removed by OptGuard"
         );
     }
 

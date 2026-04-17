@@ -276,22 +276,10 @@ pub struct WarmEnterState {
     /// calls.
     function_entry_counts: HashMap<u64, u32>,
 
-    // ── RPython warmstate.py additional parameters ──
-    /// Maximum number of retrace attempts for a single green key.
-    /// RPython: `set_param_retrace_limit`
-    retrace_limit: u32,
-    /// Maximum number of extra guards allowed in a retrace before giving up.
-    /// RPython: `set_param_max_retrace_guards`
-    max_retrace_guards: u32,
-    /// Maximum number of loop unrolling iterations.
-    /// RPython: `set_param_max_unroll_loops`
-    max_unroll_loops: u32,
-    /// Maximum recursive unrolling depth.
-    /// RPython: `set_param_max_unroll_recursion`
-    max_unroll_recursion: u32,
-    /// Loop longevity factor (how long compiled loops survive without being hot).
-    /// RPython: `set_param_loop_longevity`
-    loop_longevity: u32,
+    // warmstate.py:299-320 — retrace_limit / max_retrace_guards /
+    // max_unroll_loops / max_unroll_recursion live on
+    // warmrunnerdesc.memory_manager, not on WarmEnterState itself. See
+    // `LoopAging` in memmgr.rs.
     /// jit.py:581,602: vec — enable vectorization optimization.
     vectorize: bool,
     /// jit.py:585,603: vec_all — vectorize loops outside numpypy library.
@@ -308,8 +296,6 @@ pub struct WarmEnterState {
     /// warmstate.py: set_param_pureop_historylength — size of the
     /// pure operation history cache.
     pureop_historylength: u32,
-    /// warmstate.py: set_param_decay — counter decay factor.
-    decay: u32,
     /// warmspot.py:110: memory_manager — generation-based loop aging.
     /// pyjitpl.py:2348: try_to_free_some_loops calls next_generation().
     pub memory_manager: crate::memmgr::LoopAging,
@@ -378,13 +364,6 @@ impl WarmEnterState {
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
             function_entry_counts: HashMap::new(),
-            retrace_limit: DEFAULT_RETRACE_LIMIT,
-            max_retrace_guards: 15,
-            // RPython parity: default 4 (PyPy sets via set_param_max_unroll_loops).
-            // 0 causes cancelled_too_many_times on first InvalidLoop.
-            max_unroll_loops: 4,
-            max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
-            loop_longevity: 1000,
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
@@ -392,8 +371,18 @@ impl WarmEnterState {
             inlining: true,
             disable_unrolling_threshold: 0,
             pureop_historylength: 16,
-            decay: 40,
-            memory_manager: crate::memmgr::LoopAging::new(0),
+            memory_manager: {
+                let mut m = crate::memmgr::LoopAging::new(0);
+                // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
+                // PARAMETERS is 0, applied in production via set_user_param).
+                m.retrace_limit = DEFAULT_RETRACE_LIMIT;
+                // pyre quirk: rlib/jit.py:588 PARAMETERS default is 0 but
+                // pyre's cancel_count path aborts immediately on the first
+                // InvalidLoop when max_unroll_loops is 0. 4 matches prior
+                // pyre-side constructor behavior.
+                m.max_unroll_loops = 4;
+                m
+            },
         }
     }
 
@@ -415,13 +404,6 @@ impl WarmEnterState {
             quasiimmut_deps: HashMap::new(),
             function_call_counts: HashMap::new(),
             function_entry_counts: HashMap::new(),
-            retrace_limit: DEFAULT_RETRACE_LIMIT,
-            max_retrace_guards: 15,
-            // RPython parity: default 4 (PyPy sets via set_param_max_unroll_loops).
-            // 0 causes cancelled_too_many_times on first InvalidLoop.
-            max_unroll_loops: 4,
-            max_unroll_recursion: DEFAULT_MAX_INLINE_DEPTH,
-            loop_longevity: 1000,
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
@@ -429,8 +411,18 @@ impl WarmEnterState {
             inlining: true,
             disable_unrolling_threshold: 0,
             pureop_historylength: 16,
-            decay: 40,
-            memory_manager: crate::memmgr::LoopAging::new(0),
+            memory_manager: {
+                let mut m = crate::memmgr::LoopAging::new(0);
+                // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
+                // PARAMETERS is 0, applied in production via set_user_param).
+                m.retrace_limit = DEFAULT_RETRACE_LIMIT;
+                // pyre quirk: rlib/jit.py:588 PARAMETERS default is 0 but
+                // pyre's cancel_count path aborts immediately on the first
+                // InvalidLoop when max_unroll_loops is 0. 4 matches prior
+                // pyre-side constructor behavior.
+                m.max_unroll_loops = 4;
+                m
+            },
         }
     }
 
@@ -833,9 +825,10 @@ impl WarmEnterState {
         self.vec_cost = value;
     }
 
-    /// RPython-compatible wrapper: set `max_unroll_recursion`.
+    /// warmstate.py:317-320 set_param_max_unroll_recursion — delegates
+    /// to memory_manager.max_unroll_recursion.
     pub fn set_param_max_unroll_recursion(&mut self, value: u32) {
-        self.max_unroll_recursion = value;
+        self.memory_manager.max_unroll_recursion = value;
     }
 
     /// RPython-compatible wrapper: set_param_max_inline_depth.
@@ -843,24 +836,28 @@ impl WarmEnterState {
         self.set_max_inline_depth(value);
     }
 
-    /// RPython-compatible wrapper: set_param_retrace_limit.
+    /// warmstate.py:299-302 set_param_retrace_limit — delegates to
+    /// memory_manager.retrace_limit.
     pub fn set_param_retrace_limit(&mut self, value: u32) {
-        self.retrace_limit = value;
+        self.memory_manager.retrace_limit = value;
     }
 
-    /// RPython-compatible wrapper: set_param_max_retrace_guards.
+    /// warmstate.py:307-310 set_param_max_retrace_guards — delegates to
+    /// memory_manager.max_retrace_guards.
     pub fn set_param_max_retrace_guards(&mut self, value: u32) {
-        self.max_retrace_guards = value;
+        self.memory_manager.max_retrace_guards = value;
     }
 
-    /// RPython-compatible wrapper: set_param_max_unroll_loops.
+    /// warmstate.py:312-315 set_param_max_unroll_loops — delegates to
+    /// memory_manager.max_unroll_loops.
     pub fn set_param_max_unroll_loops(&mut self, value: u32) {
-        self.max_unroll_loops = value;
+        self.memory_manager.max_unroll_loops = value;
     }
 
-    /// RPython-compatible wrapper: set_param_loop_longevity.
+    /// warmstate.py:293-297 set_param_loop_longevity — delegates to the
+    /// memory manager's max_age.
     pub fn set_param_loop_longevity(&mut self, value: u32) {
-        self.loop_longevity = value;
+        self.memory_manager.set_max_age(value as u64);
     }
 
     /// RPython-compatible wrapper: set_param_pureop_historylength.
@@ -868,9 +865,9 @@ impl WarmEnterState {
         self.pureop_historylength = value;
     }
 
-    /// RPython-compatible wrapper: set_param_decay.
+    /// warmstate.py:269-270 set_param_decay — delegates to the jit counter.
     pub fn set_param_decay(&mut self, value: u32) {
-        self.decay = value;
+        self.counter.set_decay(value as i32);
     }
 
     /// Set the maximum inline depth.
@@ -949,12 +946,12 @@ impl WarmEnterState {
         self.inlining = true; // inlining = 1
         self.disable_unrolling_threshold = DEFAULT_DISABLE_UNROLLING; // 200
         self.pureop_historylength = 16;
-        self.decay = 40;
-        self.max_retrace_guards = 15;
-        self.max_unroll_loops = 0;
-        self.retrace_limit = DEFAULT_RETRACE_LIMIT; // 0
-        self.max_unroll_recursion = DEFAULT_MAX_UNROLL_RECURSION; // 7
-        self.loop_longevity = 1000;
+        self.counter.set_decay(40);
+        self.memory_manager.max_retrace_guards = 15;
+        self.memory_manager.max_unroll_loops = 0;
+        self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT;
+        self.memory_manager.max_unroll_recursion = DEFAULT_MAX_UNROLL_RECURSION;
+        self.memory_manager.set_max_age(1000);
         self.vec_cost = 0;
         self.vectorize = false;
         self.set_param_enable_opts("all");
@@ -1216,11 +1213,11 @@ impl WarmEnterState {
             "trace_eagerness" | "bridge_threshold" => self.set_param_trace_eagerness(as_u32),
             "function_threshold" => self.function_threshold = as_u32,
             "max_inline_depth" => self.max_inline_depth = as_u32,
-            "retrace_limit" => self.retrace_limit = as_u32,
-            "max_retrace_guards" => self.max_retrace_guards = as_u32,
-            "max_unroll_loops" => self.max_unroll_loops = as_u32,
-            "max_unroll_recursion" => self.max_unroll_recursion = as_u32,
-            "loop_longevity" => self.loop_longevity = as_u32,
+            "retrace_limit" => self.memory_manager.retrace_limit = as_u32,
+            "max_retrace_guards" => self.memory_manager.max_retrace_guards = as_u32,
+            "max_unroll_loops" => self.memory_manager.max_unroll_loops = as_u32,
+            "max_unroll_recursion" => self.memory_manager.max_unroll_recursion = as_u32,
+            "loop_longevity" => self.memory_manager.set_max_age(as_u32 as u64),
             // warmstate.py:322-329 — vec, vec_all, vec_cost are separate fields
             "vec" | "vectorize" => self.vectorize = value != 0,
             "vec_all" => self.vec_all = value != 0,
@@ -1228,7 +1225,7 @@ impl WarmEnterState {
             "inlining" => self.inlining = value != 0,
             "disable_unrolling" => self.disable_unrolling_threshold = as_u32,
             "pureop_historylength" => self.pureop_historylength = as_u32,
-            "decay" => self.decay = as_u32,
+            "decay" => self.counter.set_decay(value as i32),
             "enable_opts" => {} // string param, handled by set_param_enable_opts
             _ => {}
         }
@@ -1294,17 +1291,20 @@ impl WarmEnterState {
             "trace_eagerness" | "bridge_threshold" => Some(self.trace_eagerness as i64),
             "function_threshold" => Some(self.function_threshold as i64),
             "max_inline_depth" => Some(self.max_inline_depth as i64),
-            "retrace_limit" => Some(self.retrace_limit as i64),
-            "max_retrace_guards" => Some(self.max_retrace_guards as i64),
-            "max_unroll_loops" => Some(self.max_unroll_loops as i64),
-            "max_unroll_recursion" => Some(self.max_unroll_recursion as i64),
-            "loop_longevity" => Some(self.loop_longevity as i64),
+            "retrace_limit" => Some(self.memory_manager.retrace_limit as i64),
+            "max_retrace_guards" => Some(self.memory_manager.max_retrace_guards as i64),
+            "max_unroll_loops" => Some(self.memory_manager.max_unroll_loops as i64),
+            "max_unroll_recursion" => Some(self.memory_manager.max_unroll_recursion as i64),
+            "loop_longevity" => Some(self.memory_manager.max_age() as i64),
             "vectorize" => Some(if self.vectorize { 1 } else { 0 }),
             "vec_cost" => Some(self.vec_cost as i64),
             "inlining" => Some(if self.inlining { 1 } else { 0 }),
             "disable_unrolling" => Some(self.disable_unrolling_threshold as i64),
             "pureop_historylength" => Some(self.pureop_historylength as i64),
-            "decay" => Some(self.decay as i64),
+            // warmstate.py has no getter for "decay": set_param_decay delegates
+            // into jitcounter.set_decay which stores decay_by_mult (the derived
+            // multiplier), not the raw int. Read-back is not supported.
+            "decay" => None,
             _ => None,
         }
     }
@@ -1320,15 +1320,17 @@ impl WarmEnterState {
             }
             "function_threshold" => self.function_threshold = DEFAULT_FUNCTION_THRESHOLD,
             "max_inline_depth" => self.max_inline_depth = 10,
-            "retrace_limit" => self.retrace_limit = DEFAULT_RETRACE_LIMIT,
-            "max_retrace_guards" => self.max_retrace_guards = 15,
-            "max_unroll_loops" => self.max_unroll_loops = 0,
+            "retrace_limit" => self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT,
+            "max_retrace_guards" => self.memory_manager.max_retrace_guards = 15,
+            "max_unroll_loops" => self.memory_manager.max_unroll_loops = 0,
             "max_unroll_recursion" => {
-                self.max_unroll_recursion = DEFAULT_MAX_INLINE_DEPTH;
+                self.memory_manager.max_unroll_recursion = DEFAULT_MAX_INLINE_DEPTH;
             }
-            "loop_longevity" => self.loop_longevity = 1000,
+            "loop_longevity" => self.memory_manager.set_max_age(1000),
             "vectorize" => self.vectorize = false,
             "vec_cost" => self.vec_cost = 0,
+            // rlib/jit.py:588 PARAMETERS default decay=40.
+            "decay" => self.counter.set_decay(40),
             _ => {}
         }
     }
@@ -1359,19 +1361,16 @@ impl WarmEnterState {
     // ── RPython warmstate.py getter methods ──
 
     pub fn retrace_limit(&self) -> u32 {
-        self.retrace_limit
+        self.memory_manager.retrace_limit
     }
     pub fn max_retrace_guards(&self) -> u32 {
-        self.max_retrace_guards
+        self.memory_manager.max_retrace_guards
     }
     pub fn max_unroll_loops(&self) -> u32 {
-        self.max_unroll_loops
+        self.memory_manager.max_unroll_loops
     }
     pub fn max_unroll_recursion(&self) -> u32 {
-        self.max_unroll_recursion
-    }
-    pub fn loop_longevity(&self) -> u32 {
-        self.loop_longevity
+        self.memory_manager.max_unroll_recursion
     }
     pub fn vectorize(&self) -> bool {
         self.vectorize
@@ -1390,10 +1389,6 @@ impl WarmEnterState {
     /// warmstate.py: pureop_historylength
     pub fn pureop_historylength(&self) -> u32 {
         self.pureop_historylength
-    }
-    /// warmstate.py: decay
-    pub fn decay(&self) -> u32 {
-        self.decay
     }
 
     /// Get a snapshot of current JIT statistics.
@@ -2737,7 +2732,11 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         for name in WarmEnterState::param_names() {
             let original = ws.get_param(name);
-            assert!(original.is_some(), "param {name} should be gettable");
+            // "decay" is write-only (warmstate.py:269-270 delegates to
+            // jitcounter.set_decay which stores decay_by_mult, not the raw int).
+            if *name != "decay" {
+                assert!(original.is_some(), "param {name} should be gettable");
+            }
             ws.set_param(name, 999);
             ws.set_param_to_default(name);
             // After default, should be same as a fresh instance
