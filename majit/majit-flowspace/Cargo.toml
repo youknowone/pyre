@@ -6,4 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Rust port of rpython/flowspace/ — CPython bytecode to SSA FunctionGraph"
 
+[features]
+# Forwarded to pyre-interpreter so downstream builds (`pyre/check.sh`) pick the
+# right majit backend. pyre-interpreter requires exactly one backend feature to
+# compile, so majit-flowspace inherits the same constraint from its consumers.
+cranelift = ["pyre-interpreter/cranelift"]
+dynasm = ["pyre-interpreter/dynasm"]
+
 [dependencies]
+pyre-interpreter.workspace = true

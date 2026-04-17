@@ -15,15 +15,17 @@
 //! | majit                        | rpython/flowspace/              |
 //! |------------------------------|---------------------------------|
 //! | `model`                      | `model.py`                      |
-//! | `bytecode`        (Phase 2)  | `bytecode.py`                   |
+//! | `bytecode`                   | `bytecode.py`                   |
 //! | `framestate`      (Phase 3)  | `framestate.py`                 |
 //! | `operation`       (Phase 3)  | `operation.py`                  |
 //! | `flowcontext`     (Phase 3)  | `flowcontext.py`                |
 //! | `flowcontext_py314` (Phase 3)| PYRE-ONLY, no RPython basis     |
 //! | `pygraph`         (Phase 3)  | `pygraph.py`                    |
 //! | `generator`       (Phase 3)  | `generator.py`                  |
-//! | `argument`        (Phase 3)  | `argument.py`                   |
+//! | `argument`                   | `argument.py` (partial: Signature only — CallSpec lands Phase 3 F3.2) |
 //! | `objspace`        (Phase 3)  | `objspace.py`                   |
 //! | `specialcase`     (Phase 3)  | `specialcase.py`                |
 
+pub mod argument;
+pub mod bytecode;
 pub mod model;
