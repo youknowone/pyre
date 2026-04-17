@@ -169,14 +169,6 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     })
 }
 
-/// Create a FailDescr with explicit types and an explicit fail_index.
-pub fn make_fail_descr_typed_with_index(fail_index: u32, types: Vec<Type>) -> DescrRef {
-    Arc::new(MetaFailDescr {
-        fail_index,
-        types,
-        vector_info: UnsafeCell::new(Vec::new()),
-    })
-}
 
 /// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
 /// with no additional fields or method overrides. Type tag only.

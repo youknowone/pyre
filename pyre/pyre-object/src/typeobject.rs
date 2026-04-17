@@ -269,34 +269,6 @@ pub unsafe fn is_type(obj: PyObjectRef) -> bool {
     py_type_check(obj, &TYPE_TYPE)
 }
 
-/// descroperation.py:551 _type_issubtype parity: accept metaclasses.
-/// True if obj's type is `type` OR a subtype of `type` (i.e., obj
-/// was created by a metaclass). PyPy uses this for isinstance/issubtype
-/// instead of exact `is_type()`.
-#[inline]
-pub unsafe fn is_type_or_subtype(obj: PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    let obj_type = (*(obj as *const super::pyobject::PyObject)).ob_type;
-    if obj_type.is_null() {
-        return false;
-    }
-    // Exact match: ob_type == &TYPE_TYPE
-    if std::ptr::eq(obj_type, &TYPE_TYPE) {
-        return true;
-    }
-    // Subtype: check ob_type's MRO for TYPE_TYPE
-    let mro = (*(obj_type as *const W_TypeObject)).mro_w;
-    if !mro.is_null() {
-        let type_ptr = &TYPE_TYPE as *const _ as *const ();
-        return (*mro)
-            .iter()
-            .any(|&t| std::ptr::eq(t as *const (), type_ptr));
-    }
-    false
-}
-
 /// typeobject.py:543-544 `is_heaptype(self)`.
 #[inline]
 pub unsafe fn w_type_is_heaptype(obj: PyObjectRef) -> bool {

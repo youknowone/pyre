@@ -303,9 +303,6 @@ pub unsafe fn py_type_check(obj: PyObjectRef, tp: &PyType) -> bool {
 }
 
 #[inline]
-/// boolobject.py:42 parity: bool is a subtype of int.
-/// PyPy's W_BoolObject inherits W_IntObject, so isinstance(True, int)
-/// is True. This function matches both int and bool objects.
 pub unsafe fn is_int(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &INT_TYPE) || py_type_check(obj, &BOOL_TYPE) }
 }

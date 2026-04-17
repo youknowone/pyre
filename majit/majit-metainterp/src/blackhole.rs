@@ -5474,13 +5474,6 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
         .collect();
     (values, pos + 1 + count)
 }
-fn flatten_args(a: &[i64], b: &[i64], c: &[i64]) -> Vec<i64> {
-    let mut all = Vec::with_capacity(a.len() + b.len() + c.len());
-    all.extend_from_slice(a);
-    all.extend_from_slice(b);
-    all.extend_from_slice(c);
-    all
-}
 
 // residual_call_irf_*
 fn handler_residual_call_irf_i(

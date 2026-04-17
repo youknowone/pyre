@@ -209,28 +209,6 @@ impl ConstantPool {
         &mut self.constants
     }
 
-    /// Ensure `next_const_idx` is beyond the given const-namespace key.
-    /// Used by bridge injection: constants with pre-assigned indices must
-    /// not be overwritten by subsequent `get_or_insert` allocations.
-    pub fn reserve_index_past(&mut self, opref_key: u32) {
-        let raw_idx = opref_key & !(1 << 31);
-        self.next_const_idx = self.next_const_idx.max(raw_idx + 1);
-    }
-
-    /// Insert (or overwrite) a bridge-injected constant with explicit type.
-    /// resume.py:1042 parity: rd_consts entries carry their type. Used for
-    /// bridge tracing where the constant pool is seeded from the parent
-    /// guard's rd_consts before trace recording starts.
-    pub fn insert_with_type(&mut self, opref: OpRef, value: i64, tp: Type) {
-        self.constants.insert(opref.0, value);
-        self.constant_types.insert(opref.0, tp);
-        if tp == Type::Ref && value != 0 {
-            let ss_idx = shadow_stack::push(GcRef(value as usize));
-            self.rooted_refs.push((opref.0, ss_idx));
-        }
-        self.reserve_index_past(opref.0);
-    }
-
     /// Get a shared reference to the inner constants map.
     pub fn as_ref(&self) -> &HashMap<u32, i64> {
         &self.constants

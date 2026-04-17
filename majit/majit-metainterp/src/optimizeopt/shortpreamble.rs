@@ -1071,7 +1071,6 @@ pub struct ProducedShortOp {
 struct AbstractShortPreambleBuilderState {
     short: Vec<Op>,
     short_results: HashSet<OpRef>,
-    label_args: Vec<OpRef>,
     used_boxes: Vec<OpRef>,
     short_preamble_jump: Vec<Op>,
     extra_same_as: Vec<Op>,
@@ -1350,7 +1349,6 @@ impl ShortPreambleBuilder {
         let produced_short_boxes = short_boxes.iter().cloned().collect();
         ShortPreambleBuilder {
             state: AbstractShortPreambleBuilderState {
-                label_args: label_args.to_vec(),
                 short_inputargs: if short_inputargs.is_empty() {
                     label_args.to_vec()
                 } else {

@@ -135,14 +135,6 @@ impl ValueStore for TraceValues {
     }
 }
 
-pub(crate) fn resolve(values: &HashMap<u32, i64>, opref: OpRef) -> i64 {
-    values.resolve(opref)
-}
-
-pub(crate) fn resolve_fast(values: &TraceValues, opref: OpRef) -> i64 {
-    values.resolve(opref)
-}
-
 pub(crate) enum OpResult {
     Value(i64),
     Void,

@@ -412,11 +412,6 @@ impl OptPure {
         None
     }
 
-    /// Handle CALL_PURE: demote to plain CALL since we can't constant-fold.
-    fn handle_call_pure(&self, op: &Op) -> OptimizationResult {
-        OptimizationResult::Emit(self.demote_call_pure(op))
-    }
-
     /// Record a pure operation in the CSE cache.
     /// pure.py: pure(opnum, op)
     pub fn pure(&mut self, op: &Op) {

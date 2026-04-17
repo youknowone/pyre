@@ -901,30 +901,6 @@ impl OptVirtualize {
         OptimizationResult::PassOn
     }
 
-    /// Resolve a guard fail_arg, keeping virtual-struct-shaped infos intact
-    /// so `store_final_boxes_in_guard` can encode them as TAGVIRTUAL at
-    /// emit time. Other virtual-ish infos (raw buffers, array slices) that
-    /// the guard encoder does not handle are forced to concrete here.
-    ///
-    /// Called from the generic guard path in `propagate_forward`. RPython's
-    /// virtualize.py does not run a dedicated fail_args pre-pass; the
-    /// equivalent work happens inside `Optimizer.store_final_boxes_in_guard`
-    /// + `force_box` in `emit_operation` (optimizer.py:677-683).
-    fn prepare_guard_fail_arg(&mut self, resolved: OpRef, ctx: &mut OptContext) -> OpRef {
-        let Some(info) = ctx.get_ptr_info(resolved).cloned() else {
-            return resolved;
-        };
-        match info {
-            PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_) => resolved,
-            PtrInfo::Virtualizable(_) => resolved,
-            other if other.is_virtual() => {
-                let forced = self.force_virtual(resolved, ctx);
-                ctx.get_box_replacement(forced)
-            }
-            _ => resolved,
-        }
-    }
-
     /// Handle VirtualRefR / VirtualRefI.
     ///
     /// Replace the VIRTUAL_REF operation with a virtual struct of type
@@ -1563,15 +1539,6 @@ fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<D
         .iter()
         .find(|(idx, _)| *idx == field_idx)
         .map(|(_, descr)| descr.clone())
-}
-
-fn get_struct_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
-    field_descrs.get(field_idx as usize).cloned().or_else(|| {
-        field_descrs
-            .iter()
-            .find(|descr| descr.index() == field_idx)
-            .cloned()
-    })
 }
 
 fn get_field(fields: &[(u32, OpRef)], field_idx: u32) -> Option<OpRef> {

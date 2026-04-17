@@ -1753,18 +1753,6 @@ pub fn export_state(
     VirtualState::new_with_slot_schedule(state, slot_schedule, numnotvirtuals)
 }
 
-pub(crate) fn export_value_state(
-    opref: OpRef,
-    ctx: &OptContext,
-    _forwarded: &[crate::optimizeopt::info::Forwarded],
-) -> VirtualStateInfo {
-    // virtualstate.py:713 `box = get_box_replacement(box)` is inside
-    // `export_single_value`.
-    let mut cache = ExportCache::new();
-    let rc = export_single_value(opref, ctx, &mut cache);
-    (*rc).clone()
-}
-
 /// Bookkeeping shared across `export_single_value` recursion: the DAG cache
 /// (fully constructed nodes only) plus an `in_progress` set used to detect
 /// back-edges. Splitting the two prevents the previous "insert Unknown stub
