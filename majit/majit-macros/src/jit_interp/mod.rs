@@ -155,16 +155,44 @@ pub struct StateFieldDecl {
     pub kind: StateFieldKind,
 }
 
-/// Whether a state field is a scalar, array, or virtualizable array.
+/// Whether a state field is a scalar, array, virtualizable array, or
+/// an opaque pass-through (RPython parity: a field that lives on the state
+/// struct but is invisible to the JIT — accessed only through explicit
+/// interpreter code or via raw-pointer handles. Used for `Storage`-like
+/// pools with polymorphic dispatch that can not be flattened as ints).
 pub enum StateFieldKind {
-    /// Scalar value (e.g., `a: int`).
-    Scalar(Ident),
+    /// Scalar value.
+    ///
+    /// Syntax: `a: int` (default i64 storage) or `a: int(usize)` /
+    /// `a: int(i32)` to declare a different Rust storage type. RPython
+    /// parity: `lltype.Signed` is i64 word-sized, `lltype.Unsigned` is
+    /// usize word-sized — both render to a single Int register in IR
+    /// but the user-visible struct field carries the declared type. The
+    /// macro emits `as i64` / `as <type>` casts at the JIT boundary so
+    /// IR sees a uniform i64 while the interpreter keeps natural Rust
+    /// types (e.g. aheui's `selected: usize`, `stacksize: i32`).
+    Scalar {
+        ir_type: Ident,
+        /// `None` ⇒ Rust storage type matches `ir_type` (default i64
+        /// for `int`). `Some(path)` ⇒ explicit override from
+        /// `int(<path>)` syntax.
+        rust_type: Option<syn::Path>,
+    },
     /// Array value (e.g., `regs: [int]`) — flattened into inputargs.
     Array(Ident),
     /// Virtualizable array (e.g., `tape: [int; virt]`) — NOT flattened.
     /// Only the data pointer and length are tracked as inputargs.
     /// Element access emits GETARRAYITEM_RAW_I / SETARRAYITEM_RAW IR ops.
     VirtArray(Ident),
+    /// Opaque pass-through (e.g., `storage: opaque(Storage)`) — the field
+    /// keeps its declared type on the state struct but is NOT enumerated
+    /// as a JIT inputarg, fail_arg, or sym slot. The codegen skips it
+    /// entirely; the interpreter is responsible for accessing it directly.
+    /// Used to carry pools/handles whose internal layout is not flat ints
+    /// (e.g. polymorphic `Storage`). Pair with `opaque(Type)` raw-pointer
+    /// handles passed via additional `int` scalars when the JIT needs to
+    /// touch the underlying memory through `jit_promote!` + raw-load IR.
+    Opaque(syn::Path),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,7 +352,7 @@ fn parse_expr_list(input: ParseStream) -> syn::Result<Vec<Expr>> {
 /// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
 ///
 /// Parse `state_fields = { name: type, ... }` where type is `int`, `[int]`,
-/// or `[int; virt]`.
+/// `[int; virt]`, or `opaque(TypePath)`.
 fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
     let content;
     braced!(content in input);
@@ -363,18 +391,36 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
                 StateFieldKind::Array(item_type)
             }
         } else {
-            // Scalar: int
-            let field_type: Ident = content.parse()?;
-            if field_type != "int" {
+            // Scalar forms: `int`, `int(<TypePath>)`, or `opaque(TypePath)`.
+            let head: Ident = content.parse()?;
+            if head == "opaque" {
+                let inner;
+                syn::parenthesized!(inner in content);
+                let type_path: syn::Path = inner.parse()?;
+                StateFieldKind::Opaque(type_path)
+            } else if head == "int" {
+                // RPython parity: optional `int(<TypePath>)` declares the
+                // Rust storage type when it differs from i64.
+                let rust_type = if content.peek(syn::token::Paren) {
+                    let inner;
+                    syn::parenthesized!(inner in content);
+                    Some(inner.parse::<syn::Path>()?)
+                } else {
+                    None
+                };
+                StateFieldKind::Scalar {
+                    ir_type: head,
+                    rust_type,
+                }
+            } else {
                 return Err(syn::Error::new(
-                    field_type.span(),
+                    head.span(),
                     format!(
-                        "state_fields scalar `{name}` uses unsupported type `{field_type}`; \
-                         only `int` is currently supported"
+                        "state_fields scalar `{name}` uses unsupported type `{head}`; \
+                         supported: `int`, `int(<TypePath>)`, `opaque(TypePath)`"
                     ),
                 ));
             }
-            StateFieldKind::Scalar(field_type)
         };
 
         fields.push(StateFieldDecl { name, kind });
@@ -954,6 +1000,57 @@ mod tests {
         fn parse(input: ParseStream) -> syn::Result<Self> {
             Ok(Self(parse_virtualizable_decl(input)?))
         }
+    }
+
+    struct StateFieldsWrapper(StateFieldsConfig);
+    impl Parse for StateFieldsWrapper {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            Ok(Self(parse_state_fields(input)?))
+        }
+    }
+
+    #[test]
+    fn parse_state_fields_accepts_opaque_pass_through() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            {
+                storage: opaque(aheui_runtime::storage::Storage),
+                selected: int,
+                tape: [int; virt],
+            }
+        };
+        let parsed = syn::parse2::<StateFieldsWrapper>(tokens).unwrap().0;
+        assert_eq!(parsed.fields.len(), 3);
+        assert_eq!(parsed.fields[0].name.to_string(), "storage");
+        match &parsed.fields[0].kind {
+            StateFieldKind::Opaque(p) => {
+                assert_eq!(p.segments.last().unwrap().ident.to_string(), "Storage");
+            }
+            _ => panic!("expected Opaque variant"),
+        }
+        assert!(matches!(
+            parsed.fields[1].kind,
+            StateFieldKind::Scalar { .. }
+        ));
+        assert!(matches!(
+            parsed.fields[2].kind,
+            StateFieldKind::VirtArray(_)
+        ));
+    }
+
+    #[test]
+    fn parse_state_fields_rejects_unknown_scalar_type() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            { val: float }
+        };
+        let err = match syn::parse2::<StateFieldsWrapper>(tokens) {
+            Ok(_) => panic!("expected parse error for unknown scalar type"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("supported: `int`, `int(<TypePath>)`, `opaque(TypePath)`"),
+            "msg: {msg}"
+        );
     }
 
     #[test]

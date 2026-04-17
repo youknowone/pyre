@@ -24,21 +24,31 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
     let unsupported_fields: Vec<String> = sf
         .fields
         .iter()
-        .filter_map(|f| {
-            let ty = match &f.kind {
-                StateFieldKind::Scalar(tp)
-                | StateFieldKind::Array(tp)
-                | StateFieldKind::VirtArray(tp) => tp.to_string(),
-            };
-            match ty.as_str() {
-                "int" => None,
-                _ => Some(format!("{}: {}", f.name, ty)),
+        .filter_map(|f| match &f.kind {
+            StateFieldKind::Scalar { ir_type, .. } => {
+                let ty = ir_type.to_string();
+                if ty == "int" {
+                    None
+                } else {
+                    Some(format!("{}: {}", f.name, ty))
+                }
             }
+            StateFieldKind::Array(tp) | StateFieldKind::VirtArray(tp) => {
+                let ty = tp.to_string();
+                if ty == "int" {
+                    None
+                } else {
+                    Some(format!("{}: {}", f.name, ty))
+                }
+            }
+            // RPython parity: opaque(T) fields are pass-through; the JIT
+            // does not enumerate them as inputargs, so any T is allowed.
+            StateFieldKind::Opaque(_) => None,
         })
         .collect();
     if !unsupported_fields.is_empty() {
         let message = format!(
-            "state_fields supports int, [int], and [int; virt]; unsupported: {}",
+            "state_fields supports int, [int], [int; virt], and opaque(T); unsupported: {}",
             unsupported_fields.join(", ")
         );
         return quote! {
@@ -51,8 +61,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .fields
         .iter()
         .enumerate()
-        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Scalar(_)))
+        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Scalar { .. }))
         .collect();
+    // Helper: per-scalar Rust storage type token (`i64` by default, or
+    // the explicit `int(<TypePath>)` override). Used to emit `as <type>`
+    // casts at the JIT boundary so user struct fields can stay in their
+    // natural Rust types (e.g. `selected: usize`, `stacksize: i32`).
+    let scalar_rust_type = |kind: &StateFieldKind| -> TokenStream {
+        match kind {
+            StateFieldKind::Scalar {
+                rust_type: Some(p), ..
+            } => quote! { #p },
+            _ => quote! { i64 },
+        }
+    };
     let arrays: Vec<_> = sf
         .fields
         .iter()
@@ -140,6 +162,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .map(|(idx, (_, f))| {
             let fname = &f.name;
             let idx_lit = idx;
+            // OpRef field (Sym side) — return as-is.
             quote! { #idx_lit => Some(self.#fname), }
         })
         .collect();
@@ -149,6 +172,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .map(|(idx, (_, f))| {
             let fname = &f.name;
             let idx_lit = idx;
+            // OpRef field on Sym — direct assignment, no cast.
             quote! { #idx_lit => { self.#fname = value; } }
         })
         .collect();
@@ -413,8 +437,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
+            let rust_ty = scalar_rust_type(&f.kind);
             quote! {
-                self.#fname = values[__offset];
+                self.#fname = values[__offset] as #rust_ty;
                 __offset += 1;
             }
         })
@@ -447,8 +472,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .map(|(_, f)| {
             let fname = &f.name;
             let value_name = quote::format_ident!("{}_value", f.name);
+            // Cast user's typed field to i64 for the JIT Sym slot.
             quote! {
-                sym.#value_name = self.#fname;
+                sym.#value_name = self.#fname as i64;
             }
         })
         .collect();

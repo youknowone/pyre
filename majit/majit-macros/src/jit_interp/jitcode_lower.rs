@@ -172,7 +172,7 @@ impl LowererConfig {
             let mut virt_array_idx = 0usize;
             for f in &sf.fields {
                 match &f.kind {
-                    StateFieldKind::Scalar(_) => {
+                    StateFieldKind::Scalar { .. } => {
                         scalars.insert(f.name.to_string(), scalar_idx);
                         scalar_idx += 1;
                     }
@@ -184,6 +184,9 @@ impl LowererConfig {
                         virt_arrays.insert(f.name.to_string(), virt_array_idx);
                         virt_array_idx += 1;
                     }
+                    // Opaque fields are not registered in any index map —
+                    // the lowering layer must not see them as state slots.
+                    StateFieldKind::Opaque(_) => {}
                 }
             }
             (scalars, arrays, virt_arrays)
@@ -1114,7 +1117,90 @@ impl<'c> Lowerer<'c> {
 
     /// Check if an expression touches the storage pool or state fields.
     fn expr_touches_storage(&self, expr: &Expr) -> bool {
-        self.expr_has_jit_state_reference(expr)
+        self.expr_has_jit_state_reference(expr) || self.expr_references_unknown_local(expr)
+    }
+
+    /// Walks the expression looking for `Path` references to locals that
+    /// are not visible in the generated trace function. The trace
+    /// function's scope only carries `program`, `pc`, `__op`, plus the
+    /// macro-managed `__builder` / `__ctx` / `__sym` handles. Any other
+    /// bare identifier (e.g. user mainloop locals `op`, `stackok`,
+    /// `is_queue`) cannot survive verbatim emission inside the trace
+    /// function and must abort lowering instead.
+    ///
+    /// Type identifiers (uppercase first letter) and qualified paths are
+    /// allowed — they resolve at module scope.
+    fn expr_references_unknown_local(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(p) => {
+                if let Some(ident) = p.path.get_ident() {
+                    let s = ident.to_string();
+                    // Whitelist trace-function scope.
+                    if matches!(
+                        s.as_str(),
+                        "program" | "pc" | "__op" | "__sym" | "__ctx" | "__builder"
+                    ) {
+                        return false;
+                    }
+                    // Type / module / constant idents start uppercase or
+                    // underscore-uppercase (e.g. `OP_MOV`, `VAL_PORT`).
+                    let first = s.chars().next();
+                    if first.map_or(false, |c| c.is_uppercase() || c == '_') {
+                        return false;
+                    }
+                    // Bare lowercase identifier — assume it is a user
+                    // local that the trace function will not have.
+                    true
+                } else {
+                    // Qualified path (`a::b::c`) resolves at module scope.
+                    false
+                }
+            }
+            Expr::MethodCall(ExprMethodCall { receiver, args, .. }) => {
+                self.expr_references_unknown_local(receiver)
+                    || args.iter().any(|a| self.expr_references_unknown_local(a))
+            }
+            Expr::Call(ExprCall { func, args, .. }) => {
+                self.expr_references_unknown_local(func)
+                    || args.iter().any(|a| self.expr_references_unknown_local(a))
+            }
+            Expr::Binary(ExprBinary { left, right, .. })
+            | Expr::Assign(ExprAssign { left, right, .. }) => {
+                self.expr_references_unknown_local(left)
+                    || self.expr_references_unknown_local(right)
+            }
+            Expr::Cast(ExprCast { expr, .. })
+            | Expr::Paren(ExprParen { expr, .. })
+            | Expr::Reference(ExprReference { expr, .. })
+            | Expr::Unary(ExprUnary { expr, .. })
+            | Expr::Try(syn::ExprTry { expr, .. }) => self.expr_references_unknown_local(expr),
+            Expr::Field(syn::ExprField { base, .. }) => self.expr_references_unknown_local(base),
+            Expr::Index(syn::ExprIndex { expr, index, .. }) => {
+                self.expr_references_unknown_local(expr)
+                    || self.expr_references_unknown_local(index)
+            }
+            Expr::Match(m) => self.expr_references_unknown_local(&m.expr),
+            Expr::If(ExprIf {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            }) => {
+                self.expr_references_unknown_local(cond)
+                    || then_branch.stmts.iter().any(|s| {
+                        if let Stmt::Expr(e, _) = s {
+                            self.expr_references_unknown_local(e)
+                        } else {
+                            false
+                        }
+                    })
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|(_, e)| self.expr_references_unknown_local(e))
+            }
+            // Literals, returns without expression, etc. are safe.
+            _ => false,
+        }
     }
 
     fn expr_modifies_jit_state(&self, expr: &Expr) -> bool {
@@ -1178,6 +1264,17 @@ impl<'c> Lowerer<'c> {
 
     fn expr_has_jit_state_reference(&self, expr: &Expr) -> bool {
         if self.expr_is_jit_state_place(expr) {
+            return true;
+        }
+        // RPython parity: any reference to the state root (e.g.
+        // `state.selected_dispatch_mut()`) touches the JIT-managed state.
+        // The trace function does not have `state` in scope; without
+        // this guard, lower_local's runtime-constant fallback would
+        // emit the verbatim expression and fail to compile. Catching
+        // the bare `state` path forces the macro to either lower the
+        // expression to IR (Step 4b MethodCall lowering) or skip the
+        // arm (treat as residual / not traced).
+        if self.expr_is_state_root(expr) {
             return true;
         }
         match expr {
