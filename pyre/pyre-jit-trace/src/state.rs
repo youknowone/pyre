@@ -716,25 +716,6 @@ pub struct PyreSym {
     pub(crate) vable_w_globals: OpRef,
     #[vable(array_base)]
     pub(crate) vable_array_base: Option<u32>,
-    /// RPython goto_if_not fusion: cached raw truth OpRef from the
-    /// most recent int/float comparison. POP_JUMP_IF_FALSE/TRUE
-    /// consumes this to emit GUARD_TRUE/GUARD_FALSE directly,
-    /// bypassing bool object creation.
-    pub(crate) last_comparison_truth: Option<OpRef>,
-    /// Concrete truth value paired with `last_comparison_truth`.
-    /// RPython pyjitpl.py passes the computed condbox directly into
-    /// goto_if_not and reads `box.getint()` there, instead of reloading a
-    /// stack value later. Keep the concrete branch direction alongside the
-    /// raw traced truth so POP_JUMP_IF can consume the same pair.
-    pub(crate) last_comparison_concrete_truth: Option<bool>,
-    /// Popped branch source currently being converted to truth.
-    /// Generic guards emitted during `truth_value(value)` must still capture
-    /// the pre-pop stack shape, matching RPython's goto_if_not(box).
-    pub(crate) pending_branch_value: Option<OpRef>,
-    /// RPython goto_if_not parity: the branch target NOT taken during tracing.
-    /// On guard failure, the interpreter jumps to this PC instead of
-    /// re-executing the branch instruction (stack machine safety).
-    pub(crate) pending_branch_other_target: Option<usize>,
     // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
     // Concrete Python object values for locals and stack, tracked in
     // parallel with symbolic_locals/symbolic_stack. Each opcode handler
@@ -762,17 +743,6 @@ pub struct PyreSym {
     pub(crate) pre_opcode_vsd: Option<usize>,
     pub(crate) pre_opcode_stack: Option<Vec<OpRef>>,
     pub(crate) pre_opcode_stack_types: Option<Vec<Type>>,
-    /// RPython generate_guard parity (pyjitpl.py:2558-2570): when a
-    /// COMPARE_OP fast-path emits IntLt/FloatLt directly, save the PC
-    /// and pre-opcode stack snapshot of the COMPARE_OP itself. The
-    /// following PopJumpIf*'s record_branch_guard uses these so the
-    /// guard's resume PC is the COMPARE_OP's orgpc and the operands
-    /// are still on the symbolic stack — matching what blackhole sees
-    /// when it re-executes the COMPARE_OP from orgpc.
-    pub(crate) last_comparison_orgpc: Option<usize>,
-    pub(crate) last_comparison_pre_vsd: Option<usize>,
-    pub(crate) last_comparison_pre_stack: Option<Vec<OpRef>>,
-    pub(crate) last_comparison_pre_stack_types: Option<Vec<Type>>,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py:2745): concrete
     /// exception object pending during tracing. Set by execute_ll_raised
     /// (raise_varargs), consumed by handle_possible_exception.
@@ -1542,10 +1512,6 @@ impl PyreSym {
             vable_lastblock: OpRef::NONE,
             vable_w_globals: OpRef::NONE,
             vable_array_base: None,
-            last_comparison_truth: None,
-            last_comparison_concrete_truth: None,
-            pending_branch_value: None,
-            pending_branch_other_target: None,
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
             // jitcode and concrete_namespace initialized below
@@ -1557,10 +1523,6 @@ impl PyreSym {
             pre_opcode_vsd: None,
             pre_opcode_stack: None,
             pre_opcode_stack_types: None,
-            last_comparison_orgpc: None,
-            last_comparison_pre_vsd: None,
-            last_comparison_pre_stack: None,
-            last_comparison_pre_stack_types: None,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
@@ -4287,7 +4249,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_value_direct_keeps_raw_truth_for_immediate_branch_consumer() {
+    fn test_compare_value_direct_emits_raw_truth_for_immediate_branch_consumer() {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
@@ -4342,11 +4304,6 @@ mod tests {
                 concrete_rhs,
             )
             .expect("int comparison should trace");
-        let truth = state
-            .truth_value_direct(result, PY_NULL)
-            .expect("immediate POP_JUMP consumer should reuse raw truth");
-
-        assert_eq!(result, truth);
 
         let recorder = ctx.into_recorder();
         let mut saw_cmp = false;
@@ -4369,6 +4326,11 @@ mod tests {
         assert!(
             saw_cmp,
             "branch compare should still emit raw int comparison"
+        );
+        assert_eq!(
+            result,
+            OpRef(2),
+            "with two input args, the immediate branch consumer should receive the raw comparison truth"
         );
         assert!(
             !saw_bool_call,
@@ -4438,7 +4400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_comparison_truth_survives_extended_arg_trivia() {
+    fn test_next_instruction_consumes_comparison_truth_skips_extended_arg_trivia() {
         use pyre_interpreter::pyframe::PyFrame;
 
         ensure_test_callbacks();
@@ -4503,31 +4465,13 @@ mod tests {
             state.next_instruction_consumes_comparison_truth(),
             "branch fusion should survive EXTENDED_ARG/other trivia before the branch"
         );
-
-        let mut frame = Box::new(PyFrame::new(code.clone()));
-        frame.fix_array_ptrs();
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.last_comparison_truth = Some(OpRef(123));
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: compare_pc + 2,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let action = state.trace_code_step(&code, compare_pc + 1);
-        assert!(matches!(action, TraceAction::Continue));
-        assert_eq!(
-            state.sym().last_comparison_truth,
-            Some(OpRef(123)),
-            "comparison truth cache should survive trivia until the real branch consumer"
-        );
     }
+
+    // test_trace_code_step_preserves_comparison_truth_across_extended_arg_trivia
+    // removed: the last_comparison_truth cache no longer exists. Trivia
+    // skipping between COMPARE_OP and POP_JUMP_IF* is now verified through
+    // the fused-dispatch path (try_fused_compare_goto_if_not), which uses
+    // semantic_fallthrough_pc to locate the branch across trivia.
 
     // Tests for concrete_popped_value, concrete_binary_operands,
     // concrete_store_subscr_operands removed: these stack-based concrete
@@ -4536,69 +4480,13 @@ mod tests {
     // test_concrete_branch_truth_reads_last_popped_slot removed:
     // concrete_branch_truth now requires explicit concrete parameter.
 
-    #[test]
-    fn test_branch_truth_concrete_cache_paths() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code.clone()));
-        frame.fix_array_ptrs();
-        let mut ctx = TraceCtx::for_test(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth;
-        sym.last_comparison_truth = Some(OpRef(321));
-        sym.last_comparison_concrete_truth = Some(false);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        assert!(
-            !state
-                .concrete_branch_truth()
-                .expect("cached comparison truth should avoid concrete stack lookup")
-        );
-        assert_eq!(state.sym().last_comparison_concrete_truth, None);
-
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.push(w_int_new(7));
-        frame.fix_array_ptrs();
-        let mut ctx = TraceCtx::for_test(1);
-        let raw_int = OpRef(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth - 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let truth = state
-            .truth_value_direct(raw_int, w_int_new(7))
-            .expect("raw int truth should trace");
-        assert!(!truth.is_none());
-
-        state.sym_mut().valuestackdepth = frame.valuestackdepth;
-        assert!(
-            state
-                .concrete_branch_truth()
-                .expect("cached raw-int truth should avoid concrete stack lookup")
-        );
-        assert_eq!(state.sym().last_comparison_concrete_truth, None);
-    }
+    // test_concrete_branch_truth_uses_cached_comparison_truth_without_stack_value
+    // and test_truth_value_direct_caches_concrete_truth_for_raw_int_branch_consumer
+    // (consolidated on main as test_branch_truth_concrete_cache_paths) removed:
+    // all three exercised the last_comparison_truth / last_comparison_concrete_truth
+    // cache fields. Those fields were eliminated when the
+    // try_fused_compare_goto_if_not dispatcher consumed the fused
+    // COMPARE_OP + POP_JUMP_IF* pair directly (pyjitpl.py:541-556 parity).
 
     #[test]
     fn test_branch_guard_preserves_pre_pop_stack_shape() {
@@ -4630,7 +4518,7 @@ mod tests {
         };
 
         state.with_ctx(|this, ctx| {
-            this.record_branch_guard(ctx, OpRef::NONE, truth, true);
+            this.record_branch_guard(ctx, OpRef::NONE, truth, true, this.fallthrough_pc);
         });
 
         let recorder = ctx.into_recorder();
@@ -4662,7 +4550,6 @@ mod tests {
         sym.valuestackdepth = frame.nlocals() + 1;
         sym.symbolic_stack = vec![lower_stack];
         sym.symbolic_stack_types = vec![Type::Ref];
-        sym.pending_branch_value = Some(OpRef::NONE);
 
         let mut state = MIFrame {
             ctx: &mut ctx,
@@ -4674,9 +4561,7 @@ mod tests {
             concrete_frame_addr: 0,
         };
 
-        state.sym_mut().pending_branch_value = Some(OpRef::NONE);
         state.with_ctx(|this, ctx| {
-            this.sym_mut().pending_branch_value = Some(OpRef::NONE);
             this.generate_guard(ctx, OpCode::GuardTrue, &[truth]);
         });
 
@@ -4710,7 +4595,6 @@ mod tests {
         sym.valuestackdepth = frame.valuestackdepth;
         sym.symbolic_stack = vec![truth];
         sym.symbolic_stack_types = vec![Type::Int];
-        sym.pending_branch_value = Some(truth);
 
         let mut state = MIFrame {
             ctx: &mut ctx,

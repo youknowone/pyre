@@ -1071,21 +1071,12 @@ pub fn generated_compare_value_direct(
                 crate::state::trace_unbox_int_with_resume(frame, ctx, b, int_type_addr)
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-            // RPython goto_if_not fusion: cache truth for
-            // the next POP_JUMP_IF to consume directly.
-            let cmp_orgpc = frame.orgpc;
-            let sym = frame.sym_mut();
-            sym.last_comparison_truth = Some(truth);
-            sym.last_comparison_concrete_truth =
-                Some(crate::state::objspace_compare_ints(concrete_lhs, concrete_rhs, op));
-            // RPython generate_guard parity (pyjitpl.py:2558-2570):
-            // record COMPARE_OP's pre-opcode state so the following
-            // PopJumpIf*'s branch_guard resumes at COMPARE_OP's orgpc
-            // with operands still on the symbolic stack.
-            sym.last_comparison_orgpc = Some(cmp_orgpc);
-            sym.last_comparison_pre_vsd = sym.pre_opcode_vsd;
-            sym.last_comparison_pre_stack = sym.pre_opcode_stack.clone();
-            sym.last_comparison_pre_stack_types = sym.pre_opcode_stack_types.clone();
+            // pyjitpl.py:541-556 goto_if_not_int_<op> parity: when the
+            // next non-trivia instruction is POP_JUMP_IF_*, the fused
+            // dispatch (try_fused_compare_goto_if_not) consumes this raw
+            // truth directly and emits GUARD_TRUE/GUARD_FALSE on it. For
+            // any other successor, emit the bool-box so stack discipline
+            // matches the generic compare_value path.
             return if frame.next_instruction_consumes_comparison_truth() {
                 Some(truth)
             } else {
@@ -1139,15 +1130,6 @@ pub fn generated_compare_value_direct(
                 crate::state::trace_unbox_float_with_resume(frame, ctx, b, float_type_addr)
             };
             let truth = ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
-            let cmp_orgpc = frame.orgpc;
-            let sym = frame.sym_mut();
-            sym.last_comparison_truth = Some(truth);
-            sym.last_comparison_concrete_truth =
-                Some(crate::state::objspace_compare_floats(concrete_lhs, concrete_rhs, op));
-            sym.last_comparison_orgpc = Some(cmp_orgpc);
-            sym.last_comparison_pre_vsd = sym.pre_opcode_vsd;
-            sym.last_comparison_pre_stack = sym.pre_opcode_stack.clone();
-            sym.last_comparison_pre_stack_types = sym.pre_opcode_stack_types.clone();
             return if frame.next_instruction_consumes_comparison_truth() {
                 Some(truth)
             } else {
@@ -1279,17 +1261,6 @@ pub fn generated_truth_value_direct(
     concrete_val: pyre_object::PyObjectRef,
 ) -> Option<majit_ir::OpRef> {
     use majit_ir::OpCode;
-
-    // RPython goto_if_not fusion: if the previous op was a comparison,
-    // use the cached raw truth (0/1) directly.
-    if let Some(truth) = frame.sym_mut().last_comparison_truth.take() {
-        return Some(truth);
-    }
-
-    if !concrete_val.is_null() {
-        let cached_concrete_truth = pyre_interpreter::truth_value(concrete_val);
-        frame.sym_mut().last_comparison_concrete_truth = Some(cached_concrete_truth);
-    }
 
     // Already-unboxed values (Type::Int or Type::Float from earlier operations).
     if frame.value_type(value) == majit_ir::Type::Int {

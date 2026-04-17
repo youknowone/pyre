@@ -228,13 +228,6 @@ pub trait BranchOpcodeHandler: TruthOpcodeHandler + ControlFlowOpcodeHandler {
         Ok(())
     }
 
-    /// RPython goto_if_not parity: store the branch target NOT taken
-    /// during tracing, so guard failure can resume at the correct path.
-    fn set_branch_other_target(&mut self, _target: usize) {}
-    fn branch_other_target(&self) -> Option<usize> {
-        None
-    }
-
     fn concrete_truth_as_bool(
         &mut self,
         value: Self::Value,
@@ -250,8 +243,9 @@ pub trait BranchOpcodeHandler: TruthOpcodeHandler + ControlFlowOpcodeHandler {
         value: Self::Value,
         truth: Self::Truth,
         concrete_truth: bool,
+        other_target: usize,
     ) -> Result<(), PyError> {
-        let _ = value;
+        let _ = (value, other_target);
         self.guard_truth_value(truth, concrete_truth)
     }
 }
@@ -576,8 +570,7 @@ fn opcode_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(
     // The "other target" is the branch NOT taken during tracing.
     // On guard failure, the interpreter should jump to this target.
     let other_target = if should_jump { fallthrough } else { target };
-    handler.set_branch_other_target(other_target);
-    handler.record_branch_guard(value, truth, concrete_truth)?;
+    handler.record_branch_guard(value, truth, concrete_truth, other_target)?;
     handler.leave_branch_truth()?;
     let next_target = if should_jump { target } else { fallthrough };
     handler.set_next_instr(next_target)
@@ -1944,7 +1937,7 @@ where
     }
 }
 
-fn jump_target_forward(instructions: &[CodeUnit], next_instr: usize, delta: usize) -> usize {
+pub fn jump_target_forward(instructions: &[CodeUnit], next_instr: usize, delta: usize) -> usize {
     skip_caches(instructions, next_instr) + delta
 }
 
@@ -1952,7 +1945,7 @@ fn jump_target_backward(instructions: &[CodeUnit], next_instr: usize, delta: usi
     skip_caches(instructions, next_instr) - delta
 }
 
-fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
+pub fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
     while pos < instructions.len() {
         let mut state = OpArgState::default();
         let (instruction, _) = state.get(instructions[pos]);

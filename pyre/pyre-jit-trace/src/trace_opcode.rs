@@ -1353,18 +1353,11 @@ impl MIFrame {
         if let Some(saved_orgpc) = ctx.pending_guard_not_invalidated_pc() {
             ctx.set_pending_guard_not_invalidated(None);
             // pyjitpl.py:1087 parity: use the field read's orgpc so the
-            // snapshot captures the correct liveness state. Also clear
-            // pending_branch_value to prevent record_guard from diverting
-            // to record_branch_guard (which would emit GuardTrue/False
-            // instead of GuardNotInvalidated).
+            // snapshot captures the correct liveness state.
             let current_orgpc = self.orgpc;
-            let saved_branch = self.sym_mut().pending_branch_value.take();
-            let saved_other = self.sym_mut().pending_branch_other_target.take();
             self.orgpc = saved_orgpc;
             self.generate_guard(ctx, OpCode::GuardNotInvalidated, &[]);
             self.orgpc = current_orgpc;
-            self.sym_mut().pending_branch_value = saved_branch;
-            self.sym_mut().pending_branch_other_target = saved_other;
         }
     }
 
@@ -1411,27 +1404,6 @@ impl MIFrame {
                 | OpCode::GuardNotForced
                 | OpCode::GuardAlwaysFails
         );
-        // pyjitpl.py:2558-2602 generate_guard + capture_resumedata parity:
-        // RPython sets `frame.pc = resumepc` on the TOP frame regardless of
-        // whether the framestack has parent frames. The branch-guard path
-        // (`record_branch_guard`, see goto_if_not at pyjitpl.py:510-520)
-        // passes a non-orgpc resumepc — the runtime branch destination —
-        // and that adaptation must apply uniformly to inline-callee branch
-        // guards. Earlier majit revisions checked `parent_frames` first
-        // and routed inline-frame guards through the generic record_guard
-        // body, silently skipping the `pending_branch_other_target`
-        // adaptation. Recheck the branch-guard pending state up front so
-        // both standalone and inline-frame branch guards take the same
-        // resume_pc adaptation path — `record_branch_guard` itself handles
-        // the multi-frame snapshot assembly for parent_frames.
-        if let Some(branch_value) = self.sym().pending_branch_value
-            && matches!(opcode, OpCode::GuardTrue | OpCode::GuardFalse)
-        {
-            let truth = args.first().copied().unwrap_or(OpRef::NONE);
-            let concrete_truth = opcode == OpCode::GuardTrue;
-            self.record_branch_guard(ctx, branch_value, truth, concrete_truth);
-            return;
-        }
         // opencoder.py:819 capture_resumedata(framestack) parity:
         // Encode the full framestack [callee (top), caller (parent)] into
         // a multi-frame snapshot. The callee's pc is set to resumepc
@@ -1970,6 +1942,7 @@ impl MIFrame {
         _branch_value: OpRef,
         truth: OpRef,
         concrete_truth: bool,
+        other_target: usize,
     ) {
         let opcode = if concrete_truth {
             OpCode::GuardTrue
@@ -1988,35 +1961,18 @@ impl MIFrame {
         // operands directly and branches. The trace's "register" for the
         // truth and the jitcode's "register" agree on type (int).
         //
-        // Pyre has separate Python bytecodes for COMPARE_OP and
-        // POP_JUMP_IF_FALSE. The trace records them via
-        // last_comparison_truth/last_comparison_concrete_truth which is a
-        // trace-time emulation of the fused op, but the codewriter still
-        // generates two separate JitCode opcodes for the blackhole, and the
-        // POP_JUMP_IF_FALSE jitcode reads a Ref (boxed PyBool) from the
-        // PyFrame stack via move_r + call_int_typed(truth_fn). If we used
-        // orgpc as the resume_pc, the snapshot at orgpc would carry the
-        // symbolic stack top — which is a Type::Int raw truth from
-        // trace_compare_value's fast path, not a Ref — and the blackhole
-        // would call truth_fn on a raw int (NULL pointer dereference).
-        //
-        // ADAPTATION (pending fused jitcode opcode infrastructure):
-        // Resume at other_target (the runtime branch destination) so the
-        // blackhole skips POP_JUMP_IF_FALSE entirely and re-enters the
-        // interpreter at the not-taken branch. The truth never has to be
-        // restored — its only role was to pick the resume_pc at trace time.
-        // This adaptation applies to inline-frame branch guards too: the
-        // callee frame's resume pc is other_target, and parent frames keep
-        // their original return_point pc. True line-by-line parity
-        // requires implementing jtransform.optimize_goto_if_not at pyre's
-        // codewriter level: a fused goto_if_not_int_lt jitcode opcode
-        // taking int operands + target label, and the matching
-        // bhimpl_goto_if_not_int_lt. See task #30.
-        let other_target = self.sym().pending_branch_other_target;
-        let resume_pc = {
-            let s = self.sym();
-            other_target.unwrap_or(s.pending_next_instr.unwrap_or(self.fallthrough_pc))
-        };
+        // Pyre emits the same fused op at tracer-dispatch level via
+        // try_fused_compare_goto_if_not (pyjitpl.py:541-556 parity): the
+        // fused dispatch pops COMPARE's operands, emits IntLt/FloatLt,
+        // and calls into this function with the raw Int truth — the
+        // symbolic stack carries no comparison value at the guard site.
+        // Resuming at other_target (the runtime branch destination)
+        // matches the fused jitcode's semantics: the blackhole skips the
+        // separate POP_JUMP_IF_FALSE entirely and re-enters the
+        // interpreter at the not-taken branch. Inline-frame branch
+        // guards use the same resume_pc; parent frames keep their own
+        // return_point pc.
+        let resume_pc = other_target;
 
         // pyjitpl.py:2593-2602: saved_pc = frame.pc; frame.pc = resumepc;
         // capture_resumedata(); frame.pc = saved_pc
@@ -2131,6 +2087,133 @@ impl MIFrame {
         s.pre_opcode_vsd = saved_pre_opcode_vsd;
         s.pre_opcode_stack = saved_pre_opcode_stack;
         s.pre_opcode_stack_types = saved_pre_opcode_stack_types;
+    }
+
+    /// pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity.
+    ///
+    /// Fused COMPARE_OP + POP_JUMP_IF_FALSE/TRUE dispatch. Mirrors the
+    /// RPython jitcode-level `goto_if_not_int_<op>` fused opcode: emits a
+    /// single IntLt/FloatLt followed by GUARD_TRUE/GUARD_FALSE without ever
+    /// pushing the comparison truth as a stack value.
+    ///
+    /// Returns Ok(Some(action)) when the fused path consumed both the
+    /// COMPARE_OP and the following PopJumpIf*. Returns Ok(None) when
+    /// fuseability fails (next instruction is not PopJumpIf*, or the
+    /// operands are not a compatible int/float pair) — caller falls back
+    /// to non-fused per-opcode dispatch.
+    pub(crate) fn try_fused_compare_goto_if_not(
+        &mut self,
+        code: &CodeObject,
+        compare_pc: usize,
+        op: ComparisonOperator,
+    ) -> Result<Option<TraceAction>, PyError> {
+        // Peek next non-trivia instruction for PopJumpIf*.
+        let branch_pc = crate::metainterp::semantic_fallthrough_pc(code, compare_pc);
+        let Some((branch_instr, branch_op_arg)) = decode_instruction_at(code, branch_pc) else {
+            return Ok(None);
+        };
+        let (jump_if_true, delta) = match branch_instr {
+            Instruction::PopJumpIfFalse { delta } => (false, delta.get(branch_op_arg).as_usize()),
+            Instruction::PopJumpIfTrue { delta } => (true, delta.get(branch_op_arg).as_usize()),
+            _ => return Ok(None),
+        };
+
+        // Fuseability gate: peek concrete values without popping. Only
+        // commit to fusion when the codegen int/float fast path will
+        // succeed (matches codegen.rs:1056 is_int×is_int and
+        // codegen.rs:1103-1109 float-pair conditions). Inspect the
+        // ConcreteValue variants directly so the gate does not allocate
+        // a throwaway w_int box just to read its type.
+        let (a_concrete, b_concrete) = {
+            let s = self.sym();
+            let top_idx = s
+                .valuestackdepth
+                .checked_sub(s.nlocals + 1)
+                .ok_or_else(|| PyError::type_error("stack underflow in fused compare"))?;
+            let a_idx = top_idx
+                .checked_sub(1)
+                .ok_or_else(|| PyError::type_error("stack underflow in fused compare"))?;
+            (
+                s.concrete_stack
+                    .get(a_idx)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Null),
+                s.concrete_stack
+                    .get(top_idx)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Null),
+            )
+        };
+        let (lhs_is_int, lhs_is_float) = classify_concrete(a_concrete);
+        let (rhs_is_int, rhs_is_float) = classify_concrete(b_concrete);
+        let ints_ok = lhs_is_int && rhs_is_int;
+        let floats_ok = (lhs_is_float || lhs_is_int)
+            && (rhs_is_float || rhs_is_int)
+            && (lhs_is_float || rhs_is_float);
+        if !ints_ok && !floats_ok {
+            return Ok(None);
+        }
+
+        // Materialize the full concrete values only after the gate
+        // succeeds; compare_value_direct + objspace_compare_{ints,floats}
+        // both need them in PyObjectRef form to call into baseobjspace.
+        let lhs_obj = a_concrete.to_pyobj();
+        let rhs_obj = b_concrete.to_pyobj();
+        if lhs_obj.is_null() || rhs_obj.is_null() {
+            return Ok(None);
+        }
+
+        // Compute branch destinations (matches opcode_pop_jump_if at
+        // pyopcode.rs:556). `fallthrough` is MIFrame's semantic_fallthrough_pc
+        // past trivia; `target` is jump_target_forward (skip_caches + delta).
+        let branch_fallthrough = crate::metainterp::semantic_fallthrough_pc(code, branch_pc);
+        let branch_target =
+            pyre_interpreter::jump_target_forward(&code.instructions, branch_pc + 1, delta);
+
+        // Compute concrete branch direction locally. Matches baseobjspace
+        // ::compare int/float pair semantics so the fused path does not
+        // depend on any tracer-side cache written during trace emission.
+        let concrete_truth = if ints_ok {
+            unsafe { crate::state::objspace_compare_ints(lhs_obj, rhs_obj, op) }
+        } else {
+            unsafe { crate::state::objspace_compare_floats(lhs_obj, rhs_obj, op) }
+        };
+
+        // Commit: pop b, pop a (matches opcode_compare_op at pyopcode.rs:530).
+        let b_ref = self.with_ctx(|this, ctx| this.pop_value(ctx))?;
+        let a_ref = self.with_ctx(|this, ctx| this.pop_value(ctx))?;
+
+        // Emit IntLt/FloatLt via compare_value_direct (generated int/float
+        // fast path). `next_instruction_consumes_comparison_truth()` is
+        // true here (the fuseability gate already saw PopJumpIf* as the
+        // next non-trivia instruction), so the returned OpRef is the raw
+        // Int truth, NOT a boxed bool.
+        let truth = self.compare_value_direct(a_ref, b_ref, op, lhs_obj, rhs_obj)?;
+
+        // Decide branch direction (opcode_pop_jump_if at pyopcode.rs:565-572).
+        let should_jump = concrete_truth == jump_if_true;
+        let other_target = if should_jump {
+            branch_fallthrough
+        } else {
+            branch_target
+        };
+        let next_target = if should_jump {
+            branch_target
+        } else {
+            branch_fallthrough
+        };
+
+        // Emit GUARD_TRUE/GUARD_FALSE. record_branch_guard swaps orgpc to
+        // resume_pc (other_target), suppresses pre_opcode_*, and builds
+        // the framestack snapshot before restoring state.
+        self.with_ctx(|this, ctx| {
+            MIFrame::record_branch_guard(this, ctx, truth, truth, concrete_truth, other_target);
+            Ok::<(), PyError>(())
+        })?;
+
+        // Advance past the branch; the outer dispatch loop picks this up.
+        self.sym_mut().pending_next_instr = Some(next_target);
+        Ok(Some(TraceAction::Continue))
     }
 
     /// RPython registers[idx] parity: read concrete value from Box arrays.
@@ -3693,9 +3776,6 @@ impl MIFrame {
         _value: OpRef,
         concrete_val: PyObjectRef,
     ) -> Result<bool, PyError> {
-        if let Some(truth) = self.sym_mut().last_comparison_concrete_truth.take() {
-            return Ok(truth);
-        }
         if concrete_val.is_null() {
             return Err(PyError::type_error(
                 "missing concrete branch value during trace",
@@ -3785,23 +3865,6 @@ impl MIFrame {
             return TraceAction::Abort;
         };
 
-        // RPython goto_if_not fusion: invalidate comparison truth cache
-        // unless this instruction is POP_JUMP_IF_FALSE/TRUE (the consumer).
-        // RPython's codewriter fuses COMPARE+BRANCH into one op, so there's
-        // no intermediate instruction. In pyre they're separate bytecodes,
-        // so we keep the cache alive only for the immediately following jump.
-        if !instruction_consumes_comparison_truth(instruction)
-            && !instruction_is_trivia_between_compare_and_branch(instruction)
-        {
-            let s = self.sym_mut();
-            s.last_comparison_truth = None;
-            s.last_comparison_concrete_truth = None;
-            s.last_comparison_orgpc = None;
-            s.last_comparison_pre_vsd = None;
-            s.last_comparison_pre_stack = None;
-            s.last_comparison_pre_stack_types = None;
-        }
-
         self.set_orgpc(pc);
         self.prepare_fallthrough();
         // RPython capture_resumedata(resumepc=orgpc): save pre-opcode
@@ -3818,7 +3881,35 @@ impl MIFrame {
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
             );
         }
-        let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+        // pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity: when
+        // the CompareOp is followed by PopJumpIf* and operands form a
+        // compatible int/float pair, run the fused dispatch path and
+        // skip the separate PopJumpIf* dispatch entirely.
+        let fused_result = if let Instruction::CompareOp { opname } = instruction {
+            let comp_op = opname.get(op_arg);
+            match self.try_fused_compare_goto_if_not(code, pc, comp_op) {
+                Ok(Some(action)) => Some(Ok(action)),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        } else {
+            None
+        };
+        let step_result = match fused_result {
+            Some(Ok(action)) => {
+                // Fused path consumed COMPARE + BRANCH. Clear snapshot
+                // and return the action immediately (matches the
+                // post-dispatch clear that normally follows
+                // execute_opcode_step below).
+                let s = self.sym_mut();
+                s.pre_opcode_vsd = None;
+                s.pre_opcode_stack = None;
+                s.pre_opcode_stack_types = None;
+                return action;
+            }
+            Some(Err(e)) => Err(e),
+            None => execute_opcode_step(self, code, instruction, op_arg, pc + 1),
+        };
         // Clear pre-opcode snapshot immediately after opcode execution.
         // RPython: capture_resumedata is called at each guard; there is
         // no per-opcode snapshot lifecycle. Clearing here ensures the
@@ -4108,21 +4199,35 @@ impl MIFrame {
             return InlineTraceStepAction::Trace(TraceAction::Abort);
         };
 
-        // RPython goto_if_not: invalidate truth cache for non-jump instructions.
-        if !instruction_consumes_comparison_truth(instruction)
-            && !instruction_is_trivia_between_compare_and_branch(instruction)
-        {
-            let s = self.sym_mut();
-            s.last_comparison_truth = None;
-            s.last_comparison_concrete_truth = None;
-            s.last_comparison_orgpc = None;
-            s.last_comparison_pre_vsd = None;
-            s.last_comparison_pre_stack = None;
-            s.last_comparison_pre_stack_types = None;
-        }
-
         self.prepare_fallthrough();
-        let step_result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+        // pyjitpl.py:541-556 fused COMPARE_OP + PopJumpIf* parity (see
+        // trace_code_step's counterpart for the full rationale).
+        let fused_result = if let Instruction::CompareOp { opname } = instruction {
+            let comp_op = opname.get(op_arg);
+            match self.try_fused_compare_goto_if_not(code, pc, comp_op) {
+                Ok(Some(action)) => Some(Ok(action)),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        } else {
+            None
+        };
+        let step_result = match fused_result {
+            Some(Ok(action)) => {
+                // Symmetry with trace_code_step: if pre_opcode_* were ever
+                // captured for the inline frame (none do today, but future
+                // work may add it), clear them on the fused-return path the
+                // same way the non-inline path does at the post-dispatch
+                // clear below.
+                let s = self.sym_mut();
+                s.pre_opcode_vsd = None;
+                s.pre_opcode_stack = None;
+                s.pre_opcode_stack_types = None;
+                return InlineTraceStepAction::Trace(action);
+            }
+            Some(Err(e)) => Err(e),
+            None => execute_opcode_step(self, code, instruction, op_arg, pc + 1),
+        };
         // RPython execute_ll_raised parity: store exception in last_exc_value.
         if let Err(ref err) = step_result {
             let exc_obj = err.to_exc_object();
@@ -4172,6 +4277,20 @@ impl MIFrame {
             }
             other => InlineTraceStepAction::Trace(other),
         }
+    }
+}
+
+/// Returns (is_int, is_float) for the fused-dispatch fuseability gate.
+/// Mirrors the concrete-type classification codegen.rs uses to pick
+/// between the int and float fast paths in generated_compare_value_direct,
+/// but reads the ConcreteValue variant directly so the check does not
+/// have to allocate an intermediate w_int/w_float box.
+fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
+    match cv {
+        ConcreteValue::Int(_) => (true, false),
+        ConcreteValue::Float(_) => (false, true),
+        ConcreteValue::Ref(obj) if !obj.is_null() => unsafe { (is_int(obj), is_float(obj)) },
+        _ => (false, false),
     }
 }
 

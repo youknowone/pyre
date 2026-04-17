@@ -196,19 +196,10 @@ fn emit_truth_impl(out: &mut String) {
     out.push_str("        negate: bool,\n");
     out.push_str("    ) -> Result<Self::Value, pyre_interpreter::PyError> {\n");
     out.push_str("        use crate::helpers::TraceHelperAccess;\n");
-    out.push_str("        let mut result_concrete = crate::state::ConcreteValue::Null;\n");
-    out.push_str(
-        "        if let Some(concrete_truth) = self.sym().last_comparison_concrete_truth {\n",
-    );
-    out.push_str(
-        "            let result = if negate { !concrete_truth } else { concrete_truth };\n",
-    );
-    out.push_str(
-        "            result_concrete = crate::state::ConcreteValue::Int(result as i64);\n",
-    );
-    out.push_str("        }\n");
     out.push_str("        let opref = self.trace_bool_value_from_truth(truth, negate)?;\n");
-    out.push_str("        Ok(crate::state::FrontendOp::new(opref, result_concrete))\n");
+    out.push_str(
+        "        Ok(crate::state::FrontendOp::new(opref, crate::state::ConcreteValue::Null))\n",
+    );
     out.push_str("    }\n");
     out.push_str("}\n");
 }

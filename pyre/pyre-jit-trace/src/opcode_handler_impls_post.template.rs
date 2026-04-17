@@ -87,29 +87,6 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
 }
 
 impl pyre_interpreter::BranchOpcodeHandler for crate::state::MIFrame {
-    fn enter_branch_truth(
-        &mut self,
-        value: Self::Value,
-    ) -> Result<(), pyre_interpreter::PyError> {
-        self.sym_mut().pending_branch_value = Some(value.opref);
-        Ok(())
-    }
-
-    fn leave_branch_truth(&mut self) -> Result<(), pyre_interpreter::PyError> {
-        let sym = self.sym_mut();
-        sym.pending_branch_value = None;
-        sym.pending_branch_other_target = None;
-        Ok(())
-    }
-
-    fn set_branch_other_target(&mut self, target: usize) {
-        self.sym_mut().pending_branch_other_target = Some(target);
-    }
-
-    fn branch_other_target(&self) -> Option<usize> {
-        self.sym().pending_branch_other_target
-    }
-
     fn concrete_truth_as_bool(
         &mut self,
         value: Self::Value,
@@ -143,6 +120,7 @@ impl pyre_interpreter::BranchOpcodeHandler for crate::state::MIFrame {
         value: Self::Value,
         truth: Self::Truth,
         concrete_truth: bool,
+        other_target: usize,
     ) -> Result<(), pyre_interpreter::PyError> {
         self.with_ctx(|this, ctx| {
             crate::state::MIFrame::record_branch_guard(
@@ -151,6 +129,7 @@ impl pyre_interpreter::BranchOpcodeHandler for crate::state::MIFrame {
                 value.opref,
                 truth,
                 concrete_truth,
+                other_target,
             );
             Ok(())
         })
