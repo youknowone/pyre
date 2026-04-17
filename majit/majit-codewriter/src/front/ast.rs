@@ -1631,12 +1631,38 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
     }
 }
 
+/// Extract the trait root from a type-string when the type is a trait
+/// object — direct (`"dyn Foo"`) or wrapped (`"Box<dyn Foo>"`,
+/// `"Rc<dyn Foo>"`, `"Arc<dyn Foo>"`).  The trailing `+ 'a` lifetime
+/// bound is stripped.  Returns `None` for non-dyn types.
+fn dyn_trait_root_from_type_str(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix("dyn ") {
+        // `dyn Trait + 'a` — drop everything after the first `+`.
+        let head = rest.split('+').next()?.trim();
+        if head.is_empty() {
+            return None;
+        }
+        return Some(head.to_string());
+    }
+    for wrapper in ["Box", "Rc", "Arc"] {
+        let prefix = format!("{wrapper}<");
+        if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
+            && let Some(inner) = rest.strip_suffix('>')
+        {
+            return dyn_trait_root_from_type_str(inner);
+        }
+    }
+    None
+}
+
 /// Return the trait root when the receiver's static type is a
 /// `dyn Trait` (including `&dyn T` / `&mut dyn T` / `Box<dyn T>`),
 /// otherwise `None`.  Looks up local/parameter bindings via
-/// `ctx.local_dyn_trait_roots`, and for chained method-call receivers
-/// consults `fn_return_types` to see whether the inner call returns
-/// a trait object.
+/// `ctx.local_dyn_trait_roots`, struct field types via
+/// `ctx.struct_fields`, array element types via
+/// `ctx.local_array_types`, and chained method-call / free-call
+/// return types via `ctx.fn_return_types`.
 fn dyn_trait_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
     match expr {
         // Local/parameter bound to `dyn Trait` — directly mapped in
@@ -1649,16 +1675,43 @@ fn dyn_trait_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Opt
         syn::Expr::Reference(reference) => dyn_trait_root_for_receiver(&reference.expr, ctx),
         syn::Expr::Paren(paren) => dyn_trait_root_for_receiver(&paren.expr, ctx),
         syn::Expr::Group(group) => dyn_trait_root_for_receiver(&group.expr, ctx),
+        // `self.handler.run()` — resolve `self.handler`'s declared field
+        // type via `struct_fields[owner_type][handler]`, then check for
+        // `dyn` / `Box<dyn>` / wrapper.
+        syn::Expr::Field(field) => {
+            let owner = receiver_type_root(&field.base, ctx)?;
+            let field_name = match &field.member {
+                syn::Member::Named(ident) => ident.to_string(),
+                syn::Member::Unnamed(_) => return None,
+            };
+            let field_type = ctx.struct_fields.field_type(&owner, &field_name)?;
+            dyn_trait_root_from_type_str(field_type)
+        }
+        // `handlers[i].run()` — `handlers`'s declared full type is
+        // tracked in `local_array_types` (e.g. `"Vec<Box<dyn T>>"`);
+        // strip the container wrapper to get the element type, then
+        // check whether that element is a trait object.
+        syn::Expr::Index(index) => {
+            let container = match &*index.expr {
+                syn::Expr::Path(path) => path
+                    .path
+                    .get_ident()
+                    .and_then(|ident| ctx.local_array_types.get(&ident.to_string()).cloned()),
+                _ => None,
+            }?;
+            let elem = extract_element_type_from_str(&container)?;
+            dyn_trait_root_from_type_str(&elem)
+        }
         // Chained `x.foo().bar()` — look up `x.foo`'s declared return
-        // type and check for a leading `dyn ` qualifier.
+        // type, accepting plain `dyn T` AND wrapped (`Box<dyn T>`).
         syn::Expr::MethodCall(mc) => {
             let owner = receiver_type_root(&mc.receiver, ctx)?;
             let key = format!("{}::{}", owner, mc.method);
             let ret = ctx.fn_return_types.get(&key)?;
-            let trimmed = ret.trim();
-            trimmed.strip_prefix("dyn ").map(|s| s.trim().to_string())
+            dyn_trait_root_from_type_str(ret)
         }
-        // Chained `foo().bar()` — free function return type.
+        // Chained `foo().bar()` — free function return type, same wrapper
+        // recognition as the method-call branch.
         syn::Expr::Call(call) => {
             if let syn::Expr::Path(p) = &*call.func {
                 let key = p
@@ -1669,8 +1722,7 @@ fn dyn_trait_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Opt
                     .collect::<Vec<_>>()
                     .join("::");
                 let ret = ctx.fn_return_types.get(&key)?;
-                let trimmed = ret.trim();
-                return trimmed.strip_prefix("dyn ").map(|s| s.trim().to_string());
+                return dyn_trait_root_from_type_str(ret);
             }
             None
         }
@@ -1755,9 +1807,14 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
         syn::Type::TraitObject(obj) => {
             trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
         }
-        syn::Type::ImplTrait(obj) => {
-            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
-        }
+        // `impl Trait` is a static opaque type (compiler monomorphizes
+        // each call site to a single concrete impl), not runtime
+        // family-dispatch.  RPython `indirect_call` is reserved for
+        // truly polymorphic callees (`rpython/jit/codewriter/call.py:103
+        // graphs_from`); treat impl Trait the same way concrete-type
+        // method calls are treated and bail out so downstream emits
+        // CallTarget::Method, not CallTarget::Indirect.
+        syn::Type::ImplTrait(_) => None,
         _ => None,
     }
 }
@@ -1830,9 +1887,9 @@ fn extract_dyn_trait_root_with_context(
         syn::Type::TraitObject(obj) => {
             trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
         }
-        syn::Type::ImplTrait(obj) => {
-            trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
-        }
+        // `impl Trait` is a static opaque type — no runtime family-dispatch.
+        // See `type_root_ident`'s ImplTrait arm for the rationale + RPython cite.
+        syn::Type::ImplTrait(_) => None,
         syn::Type::Reference(r) => {
             extract_dyn_trait_root_with_context(&r.elem, prefix, known_trait_names)
         }
@@ -1908,9 +1965,10 @@ pub fn full_type_string(ty: &syn::Type) -> Option<String> {
         syn::Type::TraitObject(obj) => {
             trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
         }
-        syn::Type::ImplTrait(obj) => {
-            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
-        }
+        // `impl Trait` is a static opaque type — render as the underlying
+        // bound name without the `dyn ` prefix so downstream consumers
+        // do not mistake it for a trait object (see `type_root_ident`).
+        syn::Type::ImplTrait(obj) => trait_object_root_name(&obj.bounds),
         // RPython: ARRAY identity preserves full type including length.
         // [Point; 4] and [Point; 8] are different ARRAY types.
         syn::Type::Array(a) => {
@@ -2018,9 +2076,10 @@ pub(crate) fn qualified_full_type_string(
             trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
                 .map(|r| format!("dyn {r}"))
         }
+        // `impl Trait` is a static opaque — render the bound name without
+        // the `dyn ` marker.  See `type_root_ident` for the full rationale.
         syn::Type::ImplTrait(obj) => {
             trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
-                .map(|r| format!("dyn {r}"))
         }
         _ => None,
     }
@@ -2590,5 +2649,97 @@ mod tests {
             entries.iter().map(|(n, r)| (n.as_str(), *r)).collect();
         assert_eq!(by_name.get("a"), Some(&ImmutableRank::QuasiImmutable));
         assert_eq!(by_name.get("b"), Some(&ImmutableRank::ImmutableArray));
+    }
+
+    /// Rust `impl Trait` is a static opaque type — the compiler
+    /// monomorphizes each call site to a single concrete impl.  RPython
+    /// `indirect_call` is reserved for truly polymorphic callees
+    /// (`rpython/jit/codewriter/call.py:103 graphs_from`).  An `impl
+    /// Trait` parameter must therefore lower to `CallTarget::Method`,
+    /// not `CallTarget::Indirect`.
+    #[test]
+    fn impl_trait_param_does_not_lower_to_indirect_call() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            pub trait Handler { fn run(&mut self); }
+            pub fn call_via_impl(mut h: impl Handler) {
+                h.run();
+            }
+            "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let func = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "call_via_impl")
+            .expect("call_via_impl present");
+        let saw_indirect = func
+            .graph
+            .block(func.graph.startblock)
+            .operations
+            .iter()
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Indirect { .. },
+                        ..
+                    }
+                )
+            });
+        assert!(
+            !saw_indirect,
+            "impl Trait must not lower to CallTarget::Indirect, got {:?}",
+            func.graph.block(func.graph.startblock).operations
+        );
+    }
+
+    /// Issue #5 — receiver detection beyond simple bindings.  Field
+    /// access (`self.handler.run()`), index (`handlers[i].run()`), and
+    /// `Box<dyn T>`-returning calls (`make_boxed().run()`) must all
+    /// reach `CallTarget::Indirect`.
+    #[test]
+    fn dyn_receiver_via_field_index_and_box_return() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            pub trait Handler { fn run(&mut self); }
+            struct Owner { handler: Box<dyn Handler> }
+            impl Owner {
+                fn dispatch(&mut self) { self.handler.run(); }
+            }
+            fn list_dispatch(handlers: Vec<Box<dyn Handler>>, idx: usize) {
+                handlers[idx].run();
+            }
+            fn make_boxed() -> Box<dyn Handler> { panic!() }
+            fn ret_dispatch() { make_boxed().run(); }
+            "#,
+        );
+        let program = build_semantic_program(&parsed);
+        for fname in &["dispatch", "list_dispatch", "ret_dispatch"] {
+            let func = program
+                .functions
+                .iter()
+                .find(|f| f.graph.name == *fname)
+                .unwrap_or_else(|| panic!("function {fname} present"));
+            let saw_indirect = func
+                .graph
+                .block(func.graph.startblock)
+                .operations
+                .iter()
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Indirect { method_name, .. },
+                            ..
+                        } if method_name == "run"
+                    )
+                });
+            assert!(
+                saw_indirect,
+                "expected CallTarget::Indirect{{method=run}} in {fname}, got {:?}",
+                func.graph.block(func.graph.startblock).operations
+            );
+        }
     }
 }
