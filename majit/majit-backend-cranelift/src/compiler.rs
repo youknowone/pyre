@@ -1495,12 +1495,25 @@ fn resolve_virtual_field_value_with_materialized(
     }
 }
 
-static CALL_ASSEMBLER_TARGETS: OnceLock<Mutex<HashMap<u64, RegisteredLoopTarget>>> =
-    OnceLock::new();
-static CALL_ASSEMBLER_EXPECTATIONS: OnceLock<
-    Mutex<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>>,
-> = OnceLock::new();
 thread_local! {
+    /// Per-thread CALL_ASSEMBLER target registry.
+    ///
+    /// RPython `CallAssemblerDescr.loop_token` carries a direct
+    /// `JitCellToken` reference, so `handle_call_assembler`
+    /// (rewrite.py:665-695) reads metadata via
+    /// `loop_token.compiled_loop_token` with no indirection. pyre's
+    /// backends emit u64-keyed trampolines, so a `token_number ->
+    /// RegisteredLoopTarget` map is a PRE-EXISTING-ADAPTATION required
+    /// for the u64 dispatch. Storing the map thread-locally (matching
+    /// `CALL_ASSEMBLER_DEADFRAMES` below) keeps cranelift's per-thread
+    /// CA state separated and avoids a process-global registry
+    /// (`plan:staged-sauteeing-koala.md` Phase 2 goal).
+    static CALL_ASSEMBLER_TARGETS: RefCell<HashMap<u64, RegisteredLoopTarget>> =
+        RefCell::new(HashMap::new());
+    /// Per-thread caller->callee result-kind expectations. Same
+    /// PRE-EXISTING-ADAPTATION rationale as `CALL_ASSEMBLER_TARGETS`.
+    static CALL_ASSEMBLER_EXPECTATIONS: RefCell<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>> =
+        RefCell::new(HashMap::new());
     /// Thread-local deadframe storage for call_assembler results.
     /// Each test thread gets its own isolated registry, preventing
     /// non-deterministic failures from shared global state.
@@ -1713,12 +1726,8 @@ unsafe fn fast_lookup_ca_target(token_number: u64) -> *const RegisteredLoopTarge
         let _ = CA_FAST_PTR.try_with(|c| c.set((token_number, ptr)));
         return ptr as *const RegisteredLoopTarget;
     }
-    // Cold path: global registry (mutex lock), then cache
-    let target = call_assembler_registry()
-        .lock()
-        .unwrap()
-        .get(&token_number)
-        .cloned()
+    // Cold path: thread-local registry, then cache
+    let target = with_call_assembler_registry(|m| m.get(&token_number).cloned())
         .map(Arc::new)
         .unwrap_or_else(|| panic!("missing call_assembler target token {token_number}"));
     let ptr = Arc::as_ptr(&target) as usize;
@@ -1792,13 +1801,38 @@ enum CallAssemblerCallerId {
     BridgeTrace(u64),
 }
 
-fn call_assembler_registry() -> &'static Mutex<HashMap<u64, RegisteredLoopTarget>> {
-    CALL_ASSEMBLER_TARGETS.get_or_init(|| Mutex::new(HashMap::new()))
+fn with_call_assembler_registry<R>(
+    f: impl FnOnce(&mut HashMap<u64, RegisteredLoopTarget>) -> R,
+) -> R {
+    // `try_with` + `expect`: normal call paths run long before the thread's
+    // TLS destructor fires. The `Drop for CraneliftBackend` path uses
+    // `try_call_assembler_registry_drop` below, which silently no-ops when
+    // TLS has already been torn down.
+    CALL_ASSEMBLER_TARGETS
+        .try_with(|r| f(&mut r.borrow_mut()))
+        .expect("CALL_ASSEMBLER_TARGETS TLS not available")
 }
 
-fn call_assembler_expectation_registry()
--> &'static Mutex<HashMap<u64, HashMap<CallAssemblerCallerId, u64>>> {
-    CALL_ASSEMBLER_EXPECTATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+fn with_call_assembler_expectations<R>(
+    f: impl FnOnce(&mut HashMap<u64, HashMap<CallAssemblerCallerId, u64>>) -> R,
+) -> R {
+    CALL_ASSEMBLER_EXPECTATIONS
+        .try_with(|r| f(&mut r.borrow_mut()))
+        .expect("CALL_ASSEMBLER_EXPECTATIONS TLS not available")
+}
+
+/// Drop-path variant: `CraneliftBackend::drop` runs during thread shutdown
+/// and may reach these helpers after Rust has destroyed the `RefCell`
+/// thread_local (see `std::thread::LocalKey::try_with`). Since the drop
+/// path is discarding state anyway, silently no-op when TLS is gone.
+fn try_call_assembler_registry_drop(f: impl FnOnce(&mut HashMap<u64, RegisteredLoopTarget>)) {
+    let _ = CALL_ASSEMBLER_TARGETS.try_with(|r| f(&mut r.borrow_mut()));
+}
+
+fn try_call_assembler_expectations_drop(
+    f: impl FnOnce(&mut HashMap<u64, HashMap<CallAssemblerCallerId, u64>>),
+) {
+    let _ = CALL_ASSEMBLER_EXPECTATIONS.try_with(|r| f(&mut r.borrow_mut()));
 }
 
 fn call_assembler_result_kind_name(kind: u64) -> &'static str {
@@ -1847,12 +1881,14 @@ fn validate_registered_target_against_call_assembler_expectations(
     target_token: u64,
     target: &RegisteredLoopTarget,
 ) -> Result<(), BackendError> {
-    let expectations = call_assembler_expectation_registry().lock().unwrap();
-    let Some(target_expectations) = expectations.get(&target_token) else {
+    let expected_result_kinds: Vec<u64> = with_call_assembler_expectations(|m| {
+        m.get(&target_token)
+            .map(|target_expectations| target_expectations.values().copied().collect())
+            .unwrap_or_default()
+    });
+    if expected_result_kinds.is_empty() {
         return Ok(());
-    };
-    let expected_result_kinds: Vec<u64> = target_expectations.values().copied().collect();
-    drop(expectations);
+    }
 
     let actual_result_kind = actual_call_assembler_target_result_kind(&target.fail_descrs)?;
     for expected_result_kind in expected_result_kinds {
@@ -1877,8 +1913,12 @@ fn remove_call_assembler_expectations_locked(
 }
 
 fn unregister_call_assembler_expectations(caller_id: CallAssemblerCallerId) {
-    let mut expectations = call_assembler_expectation_registry().lock().unwrap();
-    remove_call_assembler_expectations_locked(&mut expectations, caller_id);
+    // `try_*_drop`: this helper is called from `CraneliftBackend::drop`,
+    // which may run during thread TLS teardown. See the drop-path comment
+    // on `try_call_assembler_expectations_drop`.
+    try_call_assembler_expectations_drop(|m| {
+        remove_call_assembler_expectations_locked(m, caller_id)
+    });
 }
 
 fn unregister_bridge_call_assembler_expectations(bridge: &BridgeData) {
@@ -1958,30 +1998,31 @@ fn install_call_assembler_expectations(
         }
     }
 
-    let mut registry = call_assembler_expectation_registry().lock().unwrap();
-    for (&target_token, &expected_result_kind) in &expectations {
-        if let Some(callers) = registry.get(&target_token) {
-            for (&other_caller, &other_expected_kind) in callers {
-                if other_caller != caller_id {
-                    validate_call_assembler_target_result_kind(
-                        target_token,
-                        expected_result_kind,
-                        other_expected_kind,
-                        "caller result expectation",
-                    )?;
+    with_call_assembler_expectations(|registry| -> Result<(), BackendError> {
+        for (&target_token, &expected_result_kind) in &expectations {
+            if let Some(callers) = registry.get(&target_token) {
+                for (&other_caller, &other_expected_kind) in callers {
+                    if other_caller != caller_id {
+                        validate_call_assembler_target_result_kind(
+                            target_token,
+                            expected_result_kind,
+                            other_expected_kind,
+                            "caller result expectation",
+                        )?;
+                    }
                 }
             }
         }
-    }
 
-    remove_call_assembler_expectations_locked(&mut registry, caller_id);
-    for (&target_token, &expected_result_kind) in &expectations {
-        registry
-            .entry(target_token)
-            .or_default()
-            .insert(caller_id, expected_result_kind);
-    }
-    Ok(())
+        remove_call_assembler_expectations_locked(registry, caller_id);
+        for (&target_token, &expected_result_kind) in &expectations {
+            registry
+                .entry(target_token)
+                .or_default()
+                .insert(caller_id, expected_result_kind);
+        }
+        Ok(())
+    })
 }
 
 fn register_call_assembler_target(
@@ -2009,8 +2050,10 @@ fn register_call_assembler_target(
     // same allocation survives registration. `CompiledLoopToken::new`
     // zero-initialises the fields we're about to populate, so swapping
     // the fresh CLT the token already owns is safe (no state lost).
-    if let Some(existing) = call_assembler_registry().lock().unwrap().get(&token.number) {
-        token.compiled_loop_token = Some(existing.compiled_loop_token.clone());
+    if let Some(existing_clt) = with_call_assembler_registry(|m| {
+        m.get(&token.number).map(|t| t.compiled_loop_token.clone())
+    }) {
+        token.compiled_loop_token = Some(existing_clt);
     }
     let clt = token
         .compiled_loop_token
@@ -2061,10 +2104,7 @@ fn register_call_assembler_target(
         let ptr = Arc::as_ptr(done_with_this_frame_descr(&finish_descr.fail_arg_types)) as i64;
         ca_dispatch_set_finish_descr_ptr(token.number, ptr);
     }
-    call_assembler_registry()
-        .lock()
-        .unwrap()
-        .insert(token.number, target);
+    with_call_assembler_registry(|m| m.insert(token.number, target));
     Ok(())
 }
 
@@ -2072,10 +2112,10 @@ fn unregister_call_assembler_target(token_number: u64) {
     invalidate_ca_thread_cache(token_number);
     unregister_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token_number));
     ca_dispatch_remove(token_number);
-    let removed = call_assembler_registry()
-        .lock()
-        .unwrap()
-        .remove(&token_number);
+    // `try_*_drop`: called from `CraneliftBackend::drop` during thread
+    // shutdown — use TLS teardown-safe variant.
+    let mut removed = None;
+    try_call_assembler_registry_drop(|m| removed = m.remove(&token_number));
     if let Some(target) = removed {
         unregister_call_assembler_bridge_tree(&target.fail_descrs);
     }
@@ -2122,18 +2162,11 @@ pub fn register_pending_call_assembler_target(
         index_of_virtualizable,
         compiled_loop_token: pending_clt,
     };
-    call_assembler_registry()
-        .lock()
-        .unwrap()
-        .insert(token_number, target);
+    with_call_assembler_registry(|m| m.insert(token_number, target));
 }
 
 fn lookup_call_assembler_target(token_number: u64) -> Option<RegisteredLoopTarget> {
-    call_assembler_registry()
-        .lock()
-        .unwrap()
-        .get(&token_number)
-        .cloned()
+    with_call_assembler_registry(|m| m.get(&token_number).cloned())
 }
 
 fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<(), BackendError> {
@@ -2159,10 +2192,7 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
         .map(|d| Arc::as_ptr(d) as i64)
         .unwrap_or(CA_FINISH_INDEX_UNKNOWN as i64);
     ca_dispatch_redirect(old_number, new_target.code_ptr, new_finish_descr_ptr);
-    call_assembler_registry()
-        .lock()
-        .unwrap()
-        .insert(old_number, new_target);
+    with_call_assembler_registry(|m| m.insert(old_number, new_target));
     Ok(())
 }
 
