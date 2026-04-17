@@ -5742,8 +5742,11 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         handler_hint_force_virtualizable,
     );
     builder.wire_handler("guard_class/ri", handler_guard_class);
+    // RPython `rpython/jit/metainterp/blackhole.py:1537-1539`:
+    //   @arguments("r", "d", "d")
+    //   def bhimpl_record_quasiimmut_field(struct, fielddescr, mutatefielddescr):
     builder.wire_handler(
-        "record_quasiimmut_field/rd",
+        "record_quasiimmut_field/rdd",
         handler_record_quasiimmut_field,
     );
     builder.wire_handler(
@@ -6036,11 +6039,18 @@ fn handler_guard_class(
     Ok(p + 2)
 }
 fn handler_record_quasiimmut_field(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(p + 3)
+    // RPython `bhimpl_record_quasiimmut_field` is a no-op during blackhole
+    // execution (`blackhole.py:1539 pass`); the metainterp consumes the two
+    // descriptors during tracing instead.  Skip past `r` (1 byte) +
+    // `d` (2 bytes) + `d` (2 bytes) to reach the next opcode.
+    let p = p + 1; // r
+    let (_, p) = read_descr(bh, code, p);
+    let (_, p) = read_descr(bh, code, p);
+    Ok(p)
 }
 fn handler_jit_force_quasi_immutable(
     _bh: &mut BlackholeInterpreter,

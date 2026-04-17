@@ -536,6 +536,36 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // RPython `rpython/jit/codewriter/jtransform.py:901-903` emits
+            // `record_quasiimmut_field(v_inst, fielddescr, mutatefielddescr)`
+            // — a register followed by two descrs.  The blackhole counterpart
+            // `bhimpl_record_quasiimmut_field(struct, fielddescr,
+            // mutatefielddescr)` (`rpython/jit/metainterp/blackhole.py:1537-1539`)
+            // expects argcodes `rdd`.
+            OpKind::RecordQuasiImmutField {
+                base,
+                field,
+                mutate_field,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                for fd in [field, mutate_field] {
+                    let descr_idx = self.descrs.len();
+                    self.descrs.push(crate::jitcode::BhDescr::Field {
+                        offset: 0,
+                        name: fd.name.clone(),
+                        owner: fd.owner_root.clone().unwrap_or_default(),
+                    });
+                    state.code.push((descr_idx & 0xFF) as u8);
+                    state.code.push((descr_idx >> 8) as u8);
+                    argcodes.push('d');
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::FieldWrite {
                 base, value, field, ..
             } => {
@@ -1250,5 +1280,95 @@ mod tests {
         assert_eq!(jitcode.num_regs_i(), 1);
         assert_eq!(jitcode.num_regs_r(), 1);
         assert_eq!(jitcode.num_regs_f(), 0);
+    }
+
+    /// `OpKind::RecordQuasiImmutField` must lower to a single opcode
+    /// keyed `record_quasiimmut_field/rdd`, with the field+mutate
+    /// FieldDescriptor pair pushed as two `BhDescr::Field` entries — see
+    /// `rpython/jit/codewriter/jtransform.py:901-903` and
+    /// `rpython/jit/metainterp/blackhole.py:1537-1539`.
+    #[test]
+    fn assembles_record_quasiimmut_field_with_two_descrs() {
+        use crate::call::CallControl;
+        use crate::flatten::flatten as flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{
+            FieldDescriptor, FunctionGraph, ImmutableRank, OpKind, Terminator, ValueType,
+        };
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Cell".to_string(),
+            vec![("value".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+
+        let mut graph = FunctionGraph::new("read_cell");
+        let base = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "cell".to_string(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("value", Some("Cell".to_string())),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_terminator(graph.startblock, Terminator::Return(Some(result)));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let rewritten = transformer.transform(&graph).graph;
+
+        let mut value_kinds = HashMap::new();
+        value_kinds.insert(base, RegKind::Ref);
+        value_kinds.insert(result, RegKind::Int);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
+        let mut flat = flatten_graph(&rewritten);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        let key_count = asm
+            .insns
+            .keys()
+            .filter(|k| k.starts_with("record_quasiimmut_field/"))
+            .count();
+        assert_eq!(
+            key_count,
+            1,
+            "expected exactly one record_quasiimmut_field/* key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("record_quasiimmut_field/rdd"),
+            "expected key record_quasiimmut_field/rdd, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        // Two BhDescr::Field entries — for `value` and `mutate_value`.
+        let field_descr_names: Vec<&str> = asm
+            .descrs
+            .iter()
+            .filter_map(|d| match d {
+                crate::jitcode::BhDescr::Field { name, owner, .. } if owner == "Cell" => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            field_descr_names.contains(&"value") && field_descr_names.contains(&"mutate_value"),
+            "expected Field descrs for `value` + `mutate_value`, got {:?}",
+            field_descr_names
+        );
     }
 }
