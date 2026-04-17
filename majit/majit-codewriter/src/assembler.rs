@@ -1071,6 +1071,8 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // RPython: no dedicated opname — the vtable entry becomes the `funcptr`
         // Variable that `int_guard_value` + `residual_call_*` consume.
         OpKind::FuncptrFromVtable { .. } => "funcptr_from_vtable".into(),
+        // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
+        OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Unknown { .. } => "unknown".into(),
     }
 }

@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::call::StructLayout;
+use crate::model::ImmutableRank;
 
 /// RPython: `symbolic.get_field_token` + `symbolic.get_size` provider.
 ///
@@ -35,9 +36,11 @@ pub struct HeuristicLayoutProvider {
     known_struct_names: HashSet<String>,
     known_struct_sizes: HashMap<String, usize>,
     fields_by_struct: HashMap<String, Vec<(String, String)>>,
-    /// RPython: per-class `_immutable_fields_` declarations. Empty when
-    /// the source did not declare any immutable fields for that struct.
-    immutable_fields_by_struct: HashMap<String, HashSet<String>>,
+    /// RPython: per-class `_immutable_fields_` declarations paired with
+    /// `ImmutableRank` (see `rpython/rtyper/rclass.py:644-678`).  Empty
+    /// when the source did not declare any immutable fields for that
+    /// struct.
+    immutable_fields_by_struct: HashMap<String, HashMap<String, ImmutableRank>>,
 }
 
 impl HeuristicLayoutProvider {
@@ -49,26 +52,26 @@ impl HeuristicLayoutProvider {
     ///
     /// `immutable_fields_by_struct`: parsed `#[jit_immutable_fields(...)]`
     /// per struct (RPython `_immutable_fields_`). Used to set
-    /// `StructFieldLayout.is_immutable`.
+    /// `StructFieldLayout.is_immutable` and `StructFieldLayout.rank`.
     pub fn from_struct_fields(
         fields_by_struct: &HashMap<String, Vec<(String, String)>>,
         known_struct_names: &HashSet<String>,
-        immutable_fields_by_struct: &HashMap<String, Vec<String>>,
+        immutable_fields_by_struct: &HashMap<String, Vec<(String, ImmutableRank)>>,
     ) -> Self {
-        let immutable: HashMap<String, HashSet<String>> = immutable_fields_by_struct
+        let immutable: HashMap<String, HashMap<String, ImmutableRank>> = immutable_fields_by_struct
             .iter()
-            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+            .map(|(k, v)| (k.clone(), v.iter().map(|(n, r)| (n.clone(), *r)).collect()))
             .collect();
         let mut known_sizes: HashMap<String, usize> = HashMap::new();
         loop {
             let mut changed = false;
             for (struct_name, fields) in fields_by_struct {
-                let imm_set = immutable.get(struct_name).cloned().unwrap_or_default();
+                let imm_ranks = immutable.get(struct_name).cloned().unwrap_or_default();
                 let layout = StructLayout::from_type_strings(
                     fields,
                     &HashSet::new(),
                     &known_sizes,
-                    &imm_set,
+                    &imm_ranks,
                 );
                 if known_sizes.get(struct_name) != Some(&layout.size) {
                     known_sizes.insert(struct_name.clone(), layout.size);
@@ -91,7 +94,7 @@ impl HeuristicLayoutProvider {
 impl LayoutProvider for HeuristicLayoutProvider {
     fn get_struct_layout(&self, struct_name: &str) -> Option<StructLayout> {
         let fields = self.fields_by_struct.get(struct_name)?;
-        let imm_set = self
+        let imm_ranks = self
             .immutable_fields_by_struct
             .get(struct_name)
             .cloned()
@@ -100,7 +103,7 @@ impl LayoutProvider for HeuristicLayoutProvider {
             fields,
             &self.known_struct_names,
             &self.known_struct_sizes,
-            &imm_set,
+            &imm_ranks,
         ))
     }
 }
@@ -153,13 +156,43 @@ mod tests {
             ],
         );
         let mut immutable = HashMap::new();
-        immutable.insert("Storage".to_string(), vec!["pools".to_string()]);
+        immutable.insert(
+            "Storage".to_string(),
+            vec![("pools".to_string(), ImmutableRank::Immutable)],
+        );
         let provider =
             HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &immutable);
         let layout = provider.get_struct_layout("Storage").unwrap();
         assert_eq!(layout.fields[0].name, "pools");
         assert!(layout.fields[0].is_immutable);
         assert_eq!(layout.fields[1].name, "scratch");
+        assert!(!layout.fields[1].is_immutable);
+    }
+
+    #[test]
+    fn test_heuristic_provider_quasi_immutable_field_rank() {
+        // RPython parity: `?` suffix → `IR_QUASIIMMUTABLE` rank.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "Cell".to_string(),
+            vec![
+                ("value".to_string(), "i64".to_string()),
+                ("flag".to_string(), "i64".to_string()),
+            ],
+        );
+        let mut immutable = HashMap::new();
+        immutable.insert(
+            "Cell".to_string(),
+            vec![("value".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+        let provider =
+            HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &immutable);
+        let layout = provider.get_struct_layout("Cell").unwrap();
+        assert_eq!(layout.fields[0].name, "value");
+        assert_eq!(layout.fields[0].rank, ImmutableRank::QuasiImmutable);
+        assert!(layout.fields[0].is_immutable);
+        assert_eq!(layout.fields[1].name, "flag");
+        assert_eq!(layout.fields[1].rank, ImmutableRank::Immutable);
         assert!(!layout.fields[1].is_immutable);
     }
 }

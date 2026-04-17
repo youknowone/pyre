@@ -9,7 +9,8 @@ use syn::{Item, ItemFn};
 
 use crate::ParsedInterpreter;
 use crate::model::{
-    BlockId, CallTarget, FunctionGraph, OpKind, Terminator, UnknownKind, ValueId, ValueType,
+    BlockId, CallTarget, FunctionGraph, ImmutableRank, OpKind, Terminator, UnknownKind, ValueId,
+    ValueType,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -77,12 +78,13 @@ pub struct SemanticProgram {
     #[serde(default)]
     pub fn_return_types: HashMap<String, String>,
     /// RPython: `_immutable_fields_ = [...]` declared on a class body.
-    /// Maps struct name → list of field names whose value never mutates
-    /// after construction. Both bare and qualified struct keys are
-    /// inserted (mirroring `struct_fields`) so the same lookup logic
-    /// works across module-prefix variants.
+    /// Maps struct name → `(field_name, rank)` pairs whose value never
+    /// mutates after construction (or is quasi-immutable).  Both bare and
+    /// qualified struct keys are inserted (mirroring `struct_fields`) so
+    /// the same lookup logic works across module-prefix variants.  Rank
+    /// encoding follows `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
     #[serde(default)]
-    pub immutable_fields: HashMap<String, Vec<String>>,
+    pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
 }
 
 pub fn build_semantic_program(parsed: &ParsedInterpreter) -> SemanticProgram {
@@ -117,7 +119,7 @@ fn collect_types_from_items(
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
     fn_return_types: &mut HashMap<String, String>,
-    immutable_fields: &mut HashMap<String, Vec<String>>,
+    immutable_fields: &mut HashMap<String, Vec<(String, ImmutableRank)>>,
 ) {
     // RPython: annotator/rtyper resolves all types in a whole-program pass.
     // Two-pass: first collect ALL struct names, then field types + return types.
@@ -134,12 +136,19 @@ fn collect_types_from_items(
     );
 }
 
-/// Read `#[jit_immutable_fields(a, b, c)]` attributes off a struct
-/// declaration and return the union of declared field names. Multiple
-/// attributes accumulate; non-ident tokens inside the parens are
-/// silently skipped (matching `syn::Meta::parse` looseness).
-fn collect_immutable_field_attrs(attrs: &[syn::Attribute]) -> Vec<String> {
-    let mut names = Vec::new();
+/// Read `#[jit_immutable_fields("a", "b?", "c[*]", "d?[*]")]` attributes
+/// off a struct declaration and return the declared field names paired
+/// with their `ImmutableRank`.  Bare idents (`#[jit_immutable_fields(a, b)]`)
+/// remain accepted as `ImmutableRank::Immutable` for backward compatibility.
+///
+/// Multiple attributes accumulate; non-recognised tokens are silently
+/// skipped (matching `syn::Meta::parse` looseness).  Rank suffix encoding
+/// follows RPython `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
+fn collect_immutable_field_attrs(attrs: &[syn::Attribute]) -> Vec<(String, ImmutableRank)> {
+    use syn::punctuated::Punctuated;
+    use syn::{Expr, ExprLit, ExprPath, Lit, Token};
+
+    let mut specs = Vec::new();
     for attr in attrs {
         let Some(ident) = attr.path().get_ident() else {
             continue;
@@ -147,16 +156,31 @@ fn collect_immutable_field_attrs(attrs: &[syn::Attribute]) -> Vec<String> {
         if ident != "jit_immutable_fields" {
             continue;
         }
-        // Accept both `path::Type::ident` and bare `ident` style attribute
-        // paths (the front-end may see either depending on `use` glob).
-        let _ = attr.parse_nested_meta(|meta| {
-            if let Some(field_ident) = meta.path.get_ident() {
-                names.push(field_ident.to_string());
+        // Accept a comma-separated list of string literals and/or bare
+        // idents:  `#[jit_immutable_fields("foo?", bar)]`.  String form
+        // carries the RPython suffix; bare ident form is
+        // `ImmutableRank::Immutable`.
+        let parsed = attr.parse_args_with(Punctuated::<Expr, Token![,]>::parse_terminated);
+        let Ok(items) = parsed else {
+            continue;
+        };
+        for item in items {
+            match item {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(s), ..
+                }) => {
+                    specs.push(ImmutableRank::parse(&s.value()));
+                }
+                Expr::Path(ExprPath { path, .. }) => {
+                    if let Some(id) = path.get_ident() {
+                        specs.push((id.to_string(), ImmutableRank::Immutable));
+                    }
+                }
+                _ => {}
             }
-            Ok(())
-        });
+        }
     }
-    names
+    specs
 }
 
 /// Pass 1a: collect all struct names (bare + qualified) recursively.
@@ -196,7 +220,7 @@ fn collect_fields_and_returns(
     known_struct_names: &std::collections::HashSet<String>,
     struct_fields: &mut StructFieldRegistry,
     fn_return_types: &mut HashMap<String, String>,
-    immutable_fields: &mut HashMap<String, Vec<String>>,
+    immutable_fields: &mut HashMap<String, Vec<(String, ImmutableRank)>>,
 ) {
     for item in items {
         match item {
@@ -398,7 +422,7 @@ pub fn build_semantic_program_with_options(
     // We recursively traverse Item::Mod to register module-qualified paths
     // matching the exact callee identity that canonical_call_target produces.
     let mut fn_return_types: HashMap<String, String> = HashMap::new();
-    let mut immutable_fields: HashMap<String, Vec<String>> = HashMap::new();
+    let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
     collect_types_from_items(
         &parsed.file.items,
         "",
@@ -442,7 +466,7 @@ pub fn build_semantic_program_from_parsed_files_with_options(
     let mut known_struct_names = std::collections::HashSet::new();
     let mut struct_fields = StructFieldRegistry::default();
     let mut fn_return_types: HashMap<String, String> = HashMap::new();
-    let mut immutable_fields: HashMap<String, Vec<String>> = HashMap::new();
+    let mut immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>> = HashMap::new();
     // RPython: whole-program — ALL types visible everywhere.
     // Collect struct names from ALL files first, then fields+returns.
     for parsed in parsed_files {
@@ -2278,5 +2302,89 @@ mod tests {
                 graph.block(graph.startblock).operations
             );
         }
+    }
+
+    /// RPython `rpython/rtyper/rclass.py:644-678 _parse_field_list` — the
+    /// `?`, `[*]`, and `?[*]` suffixes must resolve to `IR_QUASIIMMUTABLE`,
+    /// `IR_IMMUTABLE_ARRAY`, and `IR_QUASIIMMUTABLE_ARRAY` respectively.
+    /// Covers Issue 5 (partial port).
+    #[test]
+    fn parse_immutable_fields_accepts_string_literal_suffixes() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[jit_immutable_fields("plain", "quasi?", "arr[*]", "qarr?[*]")]
+            struct S { plain: i64, quasi: i64, arr: i64, qarr: i64 }
+            fn noop() {}
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let entries = program
+            .immutable_fields
+            .get("S")
+            .expect("S should have immutable_fields entries");
+        let by_name: std::collections::HashMap<&str, ImmutableRank> =
+            entries.iter().map(|(n, r)| (n.as_str(), *r)).collect();
+        assert_eq!(by_name.get("plain"), Some(&ImmutableRank::Immutable));
+        assert_eq!(by_name.get("quasi"), Some(&ImmutableRank::QuasiImmutable));
+        assert_eq!(by_name.get("arr"), Some(&ImmutableRank::ImmutableArray));
+        assert_eq!(
+            by_name.get("qarr"),
+            Some(&ImmutableRank::QuasiImmutableArray)
+        );
+    }
+
+    /// Bare ident entries in `#[jit_immutable_fields(foo, bar)]` continue
+    /// to resolve to `IR_IMMUTABLE` — backward compatibility with pre-rank
+    /// usage sites.
+    #[test]
+    fn parse_immutable_fields_preserves_bare_ident_backward_compat() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[jit_immutable_fields(foo, bar)]
+            struct S { foo: i64, bar: i64 }
+            fn noop() {}
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let entries = program
+            .immutable_fields
+            .get("S")
+            .expect("S should have immutable_fields entries");
+        for (name, rank) in entries {
+            assert!(
+                matches!(rank, ImmutableRank::Immutable),
+                "bare ident `{}` expected Immutable rank, got {:?}",
+                name,
+                rank,
+            );
+        }
+        let names: std::collections::HashSet<&str> =
+            entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains("foo"));
+        assert!(names.contains("bar"));
+    }
+
+    /// Multiple `#[jit_immutable_fields(...)]` attributes on the same
+    /// struct should accumulate — `rpython/rtyper/rclass.py:638-641` rbase
+    /// walk iterates ancestor `_immutable_fields_` unions similarly.
+    #[test]
+    fn parse_immutable_fields_merge_across_multiple_attributes() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            #[jit_immutable_fields("a?")]
+            #[jit_immutable_fields("b[*]")]
+            struct S { a: i64, b: i64 }
+            fn noop() {}
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let entries = program
+            .immutable_fields
+            .get("S")
+            .expect("S should have immutable_fields entries");
+        let by_name: std::collections::HashMap<&str, ImmutableRank> =
+            entries.iter().map(|(n, r)| (n.as_str(), *r)).collect();
+        assert_eq!(by_name.get("a"), Some(&ImmutableRank::QuasiImmutable));
+        assert_eq!(by_name.get("b"), Some(&ImmutableRank::ImmutableArray));
     }
 }

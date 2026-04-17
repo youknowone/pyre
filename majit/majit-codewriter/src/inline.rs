@@ -373,6 +373,15 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             trait_root: trait_root.clone(),
             method_name: method_name.clone(),
         },
+        OpKind::RecordQuasiImmutField {
+            base,
+            field,
+            mutate_field,
+        } => OpKind::RecordQuasiImmutField {
+            base: remap(base),
+            field: field.clone(),
+            mutate_field: mutate_field.clone(),
+        },
         OpKind::VableFieldRead { field_index, ty } => OpKind::VableFieldRead {
             field_index: *field_index,
             ty: ty.clone(),
@@ -646,6 +655,7 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![*value],
         OpKind::FuncptrFromVtable { receiver, .. } => vec![*receiver],
+        OpKind::RecordQuasiImmutField { base, .. } => vec![*base],
         OpKind::JitDebug { args, .. } => args.clone(),
         OpKind::VableFieldRead { .. } => vec![],
         OpKind::VableFieldWrite { value, .. } => vec![*value],

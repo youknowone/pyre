@@ -369,11 +369,13 @@ pub struct CallControl {
     /// codewriter/jtransform reads this to route calls through OopSpecIndex.
     pub oopspec_targets: HashMap<CallPath, String>,
 
-    /// RPython: `_immutable_fields_` per class. Maps struct_name → field names
-    /// declared immutable. Consulted by the heuristic fallback in
-    /// `all_interiorfielddescrs` when a struct has no registered StructLayout
-    /// (Path 1 already carries `is_immutable` on `StructFieldLayout`).
-    pub immutable_fields_by_struct: HashMap<String, Vec<String>>,
+    /// RPython: `_immutable_fields_` per class. Maps struct_name →
+    /// `(field_name, rank)` pairs declared immutable / quasi-immutable.
+    /// Consulted by the heuristic fallback in `all_interiorfielddescrs`
+    /// when a struct has no registered StructLayout (Path 1 already carries
+    /// `rank` on `StructFieldLayout`).  Rank encoding follows
+    /// `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
+    pub immutable_fields_by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -410,6 +412,10 @@ pub struct StructFieldLayout {
     /// `_immutable_fields_` declaration. Drives
     /// `FieldDescr.is_pure` / `is_always_pure()`.
     pub is_immutable: bool,
+    /// RPython: `rpython/rtyper/rclass.py:644-678 _parse_field_list` rank.
+    /// Carries the `?` / `[*]` / `?[*]` suffix classification so descriptor
+    /// construction can flip `is_quasi_immutable` / `ArrayDescr.is_pure`.
+    pub rank: crate::model::ImmutableRank,
 }
 
 impl StructLayout {
@@ -417,14 +423,15 @@ impl StructLayout {
     /// Used at pipeline init to populate struct_layouts from struct_fields.
     /// The runtime can later override with actual layout via set_struct_layout().
     ///
-    /// `immutable_field_names`: subset of field names declared as
-    /// `_immutable_fields_` on the owning class — RPython
-    /// `STRUCT._immutable_field(fieldname)` returns True for these.
+    /// `immutable_field_ranks`: map from field name → `ImmutableRank` for
+    /// every entry in the owning class's `_immutable_fields_` declaration.
+    /// RPython `STRUCT._immutable_field(fieldname)` returns the matching
+    /// `ImmutableRanking` for these; fields not in the map are mutable.
     pub fn from_type_strings(
         fields: &[(String, String)],
         known_structs: &std::collections::HashSet<String>,
         known_struct_sizes: &std::collections::HashMap<String, usize>,
-        immutable_field_names: &std::collections::HashSet<String>,
+        immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
     ) -> Self {
         // RPython: symbolic.get_array_token() computes itemsize for ANY struct,
         // even those with nested structs. UnsupportedFieldExc only affects
@@ -478,7 +485,8 @@ impl StructLayout {
             // RPython: alignment is typically min(field_size, WORD).
             let align = field_size.min(std::mem::size_of::<usize>());
             offset = (offset + align - 1) & !(align - 1);
-            let is_immutable = immutable_field_names.contains(name);
+            let rank = immutable_field_ranks.get(name).copied().unwrap_or_default();
+            let is_immutable = immutable_field_ranks.contains_key(name);
             layout_fields.push(StructFieldLayout {
                 name: name.clone(),
                 offset,
@@ -486,6 +494,7 @@ impl StructLayout {
                 flag,
                 field_type,
                 is_immutable,
+                rank,
             });
             offset += field_size;
         }
@@ -636,6 +645,28 @@ impl CallControl {
             oopspec_targets: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
         }
+    }
+
+    /// RPython `rpython/rtyper/rclass.py:644-678` —
+    /// `STRUCT._immutable_field(fieldname)` returns the `ImmutableRanking`
+    /// when the field is listed in `_immutable_fields_`, or `None` for
+    /// plain mutable fields.  Called by `jtransform.rewrite_op_getfield`
+    /// (`rpython/jit/codewriter/jtransform.py:866-906`) to decide between
+    /// mutable read, pure read, and the quasi-immut guard/record pair.
+    pub fn field_immutability(
+        &self,
+        owner_root: Option<&str>,
+        field_name: &str,
+    ) -> Option<crate::model::ImmutableRank> {
+        let owner = owner_root?;
+        self.immutable_fields_by_struct
+            .get(owner)
+            .and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|(n, _)| n == field_name)
+                    .map(|(_, rank)| *rank)
+            })
     }
 
     /// RPython: register struct type names for get_type_flag(ARRAY.OF).
@@ -2903,6 +2934,7 @@ fn all_interiorfielddescrs(
                 field_size: fl.size,
                 field_type: fl.field_type,
                 is_immutable: fl.is_immutable,
+                is_quasi_immutable: fl.rank.is_quasi_immutable(),
                 flag: fl.flag,
                 virtualizable: false,
                 index_in_parent,
@@ -2934,10 +2966,10 @@ fn all_interiorfielddescrs(
     }
     // RPython: STRUCT._immutable_field(fieldname) — class-level
     // `_immutable_fields_` declaration. Honored by all_fielddescrs.
-    let immutable_set: std::collections::HashSet<&str> = cc
+    let immutable_ranks: std::collections::HashMap<&str, crate::model::ImmutableRank> = cc
         .immutable_fields_by_struct
         .get(struct_name)
-        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .map(|v| v.iter().map(|(n, r)| (n.as_str(), *r)).collect())
         .unwrap_or_default();
     let mut offset: usize = 0;
     let mut field_specs = Vec::new();
@@ -2957,13 +2989,15 @@ fn all_interiorfielddescrs(
             offset = (offset + align - 1) & !(align - 1);
         }
         let index_in_parent = field_specs.len();
+        let rank = immutable_ranks.get(field_name.as_str()).copied();
         field_specs.push(majit_ir::descr::SimpleFieldDescrSpec {
             index: index_in_parent as u32,
             name: format!("{}.{}", struct_name, field_name),
             offset,
             field_size,
             field_type,
-            is_immutable: immutable_set.contains(field_name.as_str()),
+            is_immutable: rank.is_some(),
+            is_quasi_immutable: rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
             flag,
             virtualizable: false,
             index_in_parent,
@@ -3147,6 +3181,9 @@ fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
         | OpKind::IsConstant { .. }
         | OpKind::IsVirtual { .. }
         | OpKind::RecordKnownResult { .. }
+        // jtransform.py:901-903 — `record_quasiimmut_field` is pure bookkeeping
+        // that the metainterp converts into a guard; cannot raise.
+        | OpKind::RecordQuasiImmutField { .. }
         | OpKind::Live => false,
         // Virtualizable field/array access (from boxes, no heap) → cannot raise
         OpKind::VableFieldRead { .. }
@@ -4096,7 +4133,7 @@ mod tests {
                     fields,
                     &known_structs,
                     &known_sizes,
-                    &HashSet::new(),
+                    &HashMap::new(),
                 );
                 if known_sizes.get(*name) != Some(&layout.size) {
                     known_sizes.insert(name.to_string(), layout.size);

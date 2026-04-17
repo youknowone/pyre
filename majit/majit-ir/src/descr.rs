@@ -1273,6 +1273,11 @@ pub struct SimpleFieldDescr {
     field_size: usize,
     field_type: Type,
     is_immutable: bool,
+    /// RPython `rpython/rtyper/rclass.py` `IR_QUASIIMMUTABLE[_ARRAY]` rank.
+    /// Consumed by `FieldDescr::is_quasi_immutable()` (trait default overridden
+    /// below) so `rewrite_op_getfield` can emit the `record_quasiimmut_field`
+    /// guard pair from `rpython/jit/codewriter/jtransform.py:895-903`.
+    is_quasi_immutable: bool,
     /// descr.py:151: FieldDescr.flag — type classification from get_type_flag().
     /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
     flag: ArrayFlag,
@@ -1299,6 +1304,7 @@ impl Clone for SimpleFieldDescr {
             field_size: self.field_size,
             field_type: self.field_type,
             is_immutable: self.is_immutable,
+            is_quasi_immutable: self.is_quasi_immutable,
             flag: self.flag,
             virtualizable: self.virtualizable,
             index_in_parent: self.index_in_parent,
@@ -1326,6 +1332,7 @@ impl SimpleFieldDescr {
             field_size,
             field_type,
             is_immutable,
+            is_quasi_immutable: false,
             flag,
             virtualizable: false,
             index_in_parent: 0,
@@ -1353,11 +1360,21 @@ impl SimpleFieldDescr {
             field_size,
             field_type,
             is_immutable,
+            is_quasi_immutable: false,
             flag,
             virtualizable: false,
             index_in_parent: 0,
             parent_descr: None,
         }
+    }
+
+    /// RPython `rpython/rtyper/rclass.py:644-678` — `IR_QUASIIMMUTABLE[_ARRAY]`.
+    /// Flipped by the descriptor builder when the field participated in a
+    /// quasi-immutable declaration.  Drives
+    /// `FieldDescr::is_quasi_immutable()` below.
+    pub fn with_quasi_immutable(mut self, is_quasi_immutable: bool) -> Self {
+        self.is_quasi_immutable = is_quasi_immutable;
+        self
     }
 
     /// descr.py:151: set flag directly.
@@ -1403,7 +1420,14 @@ impl Descr for SimpleFieldDescr {
         self.descr_index.store(index, Ordering::Relaxed);
     }
     fn is_always_pure(&self) -> bool {
-        self.is_immutable
+        // RPython `jtransform.py:895-896`: a quasi-immutable field is *not*
+        // always-pure at the descriptor level — the pure-read is protected by
+        // `record_quasiimmut_field` + guard.  Only true immutable fields are
+        // unconditionally pure.
+        self.is_immutable && !self.is_quasi_immutable
+    }
+    fn is_quasi_immutable(&self) -> bool {
+        self.is_quasi_immutable
     }
     fn is_virtualizable(&self) -> bool {
         self.virtualizable
@@ -1558,6 +1582,12 @@ pub struct SimpleFieldDescrSpec {
     pub field_size: usize,
     pub field_type: Type,
     pub is_immutable: bool,
+    /// RPython `rpython/rtyper/rclass.py:644-678` — rank
+    /// `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY`.  Flipped by
+    /// `rewrite_op_getfield` consumers to emit
+    /// `record_quasiimmut_field` before the pure read
+    /// (`rpython/jit/codewriter/jtransform.py:895-903`).
+    pub is_quasi_immutable: bool,
     /// descr.py:151: FieldDescr.flag — get_type_flag(FIELDTYPE).
     pub flag: ArrayFlag,
     pub virtualizable: bool,
@@ -1592,6 +1622,7 @@ pub fn make_simple_descr_group(
                     field_size: spec.field_size,
                     field_type: spec.field_type,
                     is_immutable: spec.is_immutable,
+                    is_quasi_immutable: spec.is_quasi_immutable,
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
                     index_in_parent: spec.index_in_parent,

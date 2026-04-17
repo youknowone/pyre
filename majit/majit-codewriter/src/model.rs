@@ -29,6 +29,64 @@ pub enum UnknownKind {
     UnsupportedExpr,
 }
 
+/// RPython `rpython/rtyper/rclass.py:57-60` — `IR_IMMUTABLE` / `IR_IMMUTABLE_ARRAY`
+/// / `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY`.  Parsed from
+/// `_immutable_fields_` string literals (`rclass.py:644-678 _parse_field_list`):
+///
+/// * `"field"`       → `Immutable`
+/// * `"field?"`      → `QuasiImmutable`
+/// * `"field[*]"`    → `ImmutableArray`
+/// * `"field?[*]"`   → `QuasiImmutableArray`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ImmutableRank {
+    Immutable,
+    QuasiImmutable,
+    ImmutableArray,
+    QuasiImmutableArray,
+}
+
+impl ImmutableRank {
+    /// Parse a single RPython-style `_immutable_fields_` entry.  Returns the
+    /// bare field name and its rank.  Suffix precedence matches
+    /// `rclass.py:649-661`: `?[*]` → `[*]` → `?` → plain.
+    pub fn parse(entry: &str) -> (String, Self) {
+        if let Some(stripped) = entry.strip_suffix("?[*]") {
+            (stripped.to_string(), Self::QuasiImmutableArray)
+        } else if let Some(stripped) = entry.strip_suffix("[*]") {
+            (stripped.to_string(), Self::ImmutableArray)
+        } else if let Some(stripped) = entry.strip_suffix('?') {
+            (stripped.to_string(), Self::QuasiImmutable)
+        } else {
+            (entry.to_string(), Self::Immutable)
+        }
+    }
+
+    /// RPython `ImmutableRanking.pure` flag — `rclass.py:33-37`.  True for
+    /// `IR_IMMUTABLE` / `IR_IMMUTABLE_ARRAY`; false for the quasi variants
+    /// (they pin via guard, not via pure flag).
+    pub fn is_immutable(self) -> bool {
+        matches!(self, Self::Immutable | Self::ImmutableArray)
+    }
+
+    /// True for `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY` —
+    /// `jtransform.py:895 immut in (IR_QUASIIMMUTABLE, IR_QUASIIMMUTABLE_ARRAY)`.
+    pub fn is_quasi_immutable(self) -> bool {
+        matches!(self, Self::QuasiImmutable | Self::QuasiImmutableArray)
+    }
+
+    /// True for `IR_IMMUTABLE_ARRAY` / `IR_QUASIIMMUTABLE_ARRAY` —
+    /// `rclass.py:670 rank in (IR_QUASIIMMUTABLE_ARRAY, IR_IMMUTABLE_ARRAY)`.
+    pub fn is_array(self) -> bool {
+        matches!(self, Self::ImmutableArray | Self::QuasiImmutableArray)
+    }
+}
+
+impl Default for ImmutableRank {
+    fn default() -> Self {
+        Self::Immutable
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CallTarget {
     Method {
@@ -461,6 +519,24 @@ pub enum OpKind {
         args_f: Vec<ValueId>,
         /// 'i' or 'r' — kind of the known result (no float support).
         result_kind: char,
+    },
+
+    /// RPython `record_quasiimmut_field(v_inst, fielddescr, mutatefielddescr)`
+    /// — `jtransform.py:901-903`.  Emitted by `rewrite_op_getfield` when the
+    /// field is quasi-immutable; paired with a subsequent pure-read.  The
+    /// metainterp/blackhole counterpart (`blackhole.py:1537-1539
+    /// bhimpl_record_quasiimmut_field`) is a no-op during blackhole execution
+    /// but the descriptors drive guard/invalidation accounting in the
+    /// optimizer (`quasiimmut.py`).
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython derives `mutate_field` via
+    /// `quasiimmut.get_mutate_field_name(name)` which expects the lltype
+    /// `inst_` prefix (`quasiimmut.py:11-15`).  Rust structs have no such
+    /// prefix, so we use the literal `mutate_<fieldname>` convention.
+    RecordQuasiImmutField {
+        base: ValueId,
+        field: FieldDescriptor,
+        mutate_field: FieldDescriptor,
     },
 
     /// Liveness marker — RPython `-live-` operation.

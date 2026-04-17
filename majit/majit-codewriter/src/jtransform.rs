@@ -328,7 +328,15 @@ impl<'a> Transformer<'a> {
                 self.rewrite_op_hint(op, target, args, graph_name)
             }
             // ── rewrite_op_getfield ──
-            OpKind::FieldRead { field, ty, .. } if self.config.lower_virtualizable => {
+            //
+            // Unlike the setfield/getarrayitem dispatch this runs whether or
+            // not `lower_virtualizable` is enabled: the quasi-immutable
+            // `-live-` + `record_quasiimmut_field` pair from
+            // `rpython/jit/codewriter/jtransform.py:895-903` is independent
+            // of virtualizable lowering.  `rewrite_op_getfield` internally
+            // falls through to `RewriteResult::Keep` for mutable fields and
+            // plain immutables (their purity is carried on the descriptor).
+            OpKind::FieldRead { field, ty, .. } => {
                 self.rewrite_op_getfield(op, field, ty, graph_name)
             }
             // ── rewrite_op_setfield ──
@@ -469,7 +477,18 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    /// RPython: rewrite_op_getfield
+    /// RPython `rpython/jit/codewriter/jtransform.py:830-906 rewrite_op_getfield`.
+    ///
+    /// Virtualizable lowering takes precedence (RPython `self.vable_array_vars`
+    /// tracking + immediate return).  Otherwise the field's immutability rank
+    /// drives the emit shape:
+    ///
+    /// * `IR_IMMUTABLE`           → keep as-is; the FieldDescr's
+    ///   `is_always_pure()` flag already communicates purity downstream
+    ///   (`jtransform.py:875-877 pure = '_pure'`).
+    /// * `IR_QUASIIMMUTABLE[_ARRAY]` → emit `[-live-, record_quasiimmut_field,
+    ///   getfield_*_pure]` — `jtransform.py:895-903`.
+    /// * mutable                  → keep as-is.
     fn rewrite_op_getfield(
         &mut self,
         op: &SpaceOperation,
@@ -505,6 +524,72 @@ impl<'a> Transformer<'a> {
                     ty: ty.clone(),
                 },
             }]);
+        }
+        // `jtransform.py:895-903` — quasi-immutable field read:
+        //    return [SpaceOperation('-live-', [], None),
+        //            SpaceOperation('record_quasiimmut_field',
+        //                           [v_inst, descr, descr1], None),
+        //            op1]       # op1 = getfield_*_pure
+        // For non-quasi immutable/mutable fields no rewrite is needed;
+        // the descriptor already carries `is_always_pure` when immutable
+        // (`SimpleFieldDescr::is_always_pure` excludes the quasi variant).
+        let rank = self
+            .callcontrol
+            .as_deref()
+            .and_then(|cc| cc.field_immutability(field.owner_root.as_deref(), &field.name));
+        if let Some(rank) = rank {
+            if rank.is_quasi_immutable() {
+                // Recover the `base` ValueId from the original FieldRead op
+                // — the dispatcher only handed us the field + ty parameters.
+                let OpKind::FieldRead {
+                    base,
+                    field: _,
+                    ty: _,
+                } = &op.kind
+                else {
+                    return RewriteResult::Keep;
+                };
+                // PRE-EXISTING-ADAPTATION: RPython
+                // `quasiimmut.get_mutate_field_name(fieldname)` —
+                // `rpython/jit/metainterp/quasiimmut.py:11-15` — strips the
+                // lltype `inst_` prefix before prepending `mutate_`.  Rust
+                // structs carry no such prefix, so we prepend `mutate_`
+                // directly.
+                let mutate_field = FieldDescriptor::new(
+                    format!("mutate_{}", field.name),
+                    field.owner_root.clone(),
+                );
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!(
+                        "rewrite: getfield({owner}.{name}) → -live- + record_quasiimmut_field + pure read",
+                        owner = field.owner_root.as_deref().unwrap_or("<?>"),
+                        name = field.name,
+                    ),
+                });
+                return RewriteResult::Replace(vec![
+                    SpaceOperation {
+                        result: None,
+                        kind: OpKind::Live,
+                    },
+                    SpaceOperation {
+                        result: None,
+                        kind: OpKind::RecordQuasiImmutField {
+                            base: *base,
+                            field: field.clone(),
+                            mutate_field,
+                        },
+                    },
+                    SpaceOperation {
+                        result: op.result,
+                        kind: OpKind::FieldRead {
+                            base: *base,
+                            field: field.clone(),
+                            ty: ty.clone(),
+                        },
+                    },
+                ]);
+            }
         }
         RewriteResult::Keep
     }
@@ -1807,6 +1892,15 @@ fn remap_op(
         | OpKind::GuardValue { .. }
         | OpKind::FuncptrFromVtable { .. }
         | OpKind::Unknown { .. } => op.kind.clone(),
+        OpKind::RecordQuasiImmutField {
+            base,
+            field,
+            mutate_field,
+        } => OpKind::RecordQuasiImmutField {
+            base: remap_value(*base, aliases),
+            field: field.clone(),
+            mutate_field: mutate_field.clone(),
+        },
         OpKind::FieldRead { base, field, ty } => OpKind::FieldRead {
             base: remap_value(*base, aliases),
             field: field.clone(),
@@ -2666,5 +2760,128 @@ mod tests {
         let mut sorted = residual.candidates.clone();
         sorted.sort();
         assert_eq!(sorted, vec![0, 1]);
+    }
+
+    /// RPython `rpython/jit/codewriter/jtransform.py:895-903` — a
+    /// quasi-immutable field read lowers to
+    /// `[-live-, record_quasiimmut_field(v, descr, descr1), getfield_*_pure]`.
+    /// Covers Issue 5.
+    #[test]
+    fn getfield_rewrite_emits_record_quasiimmut_for_quasi_immut() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Cell".to_string(),
+            vec![("value".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+
+        let mut graph = FunctionGraph::new("read_cell");
+        let base = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "cell".to_string(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("value", Some("Cell".to_string())),
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+
+        // Expect the triple [Live, RecordQuasiImmutField, FieldRead] in
+        // order, preceded by the Input op.
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live))
+            .expect("Live marker present");
+        assert!(matches!(
+            ops[live_idx + 1],
+            OpKind::RecordQuasiImmutField {
+                field, mutate_field, ..
+            } if field.name == "value"
+                && mutate_field.name == "mutate_value"
+                && mutate_field.owner_root.as_deref() == Some("Cell")
+        ));
+        assert!(matches!(
+            ops[live_idx + 2],
+            OpKind::FieldRead { field, .. } if field.name == "value"
+        ));
+    }
+
+    /// A plain-immutable field read needs no rewrite — the descriptor's
+    /// `is_always_pure()` already communicates purity.  Mirrors the `pure`
+    /// / non-`pure` fork at `jtransform.py:867-878`.
+    #[test]
+    fn getfield_rewrite_preserves_plain_immutable_read() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Point".to_string(),
+            vec![("x".to_string(), ImmutableRank::Immutable)],
+        );
+
+        let mut graph = FunctionGraph::new("read_x");
+        let base = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p".to_string(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("x", Some("Point".to_string())),
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        let ops = &result.graph.block(graph.startblock).operations;
+
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o.kind, OpKind::RecordQuasiImmutField { .. })),
+            "plain immutable must not emit record_quasiimmut_field"
+        );
+        assert!(
+            ops.iter().any(|o| matches!(
+                &o.kind,
+                OpKind::FieldRead { field, .. } if field.name == "x"
+            )),
+            "FieldRead for x should remain"
+        );
     }
 }

@@ -154,7 +154,9 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         | OpKind::GuardValue { .. }
         | OpKind::JitDebug { .. }
         | OpKind::AssertGreen { .. }
-        | OpKind::RecordKnownResult { .. } => ValueType::Void,
+        | OpKind::RecordKnownResult { .. }
+        // jtransform.py:901-903 — `record_quasiimmut_field` has no result.
+        | OpKind::RecordQuasiImmutField { .. } => ValueType::Void,
         OpKind::CurrentTraceLength => ValueType::Int,
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Int,
         // RPython: vtable entry is a `Ptr(FuncType)` address.
