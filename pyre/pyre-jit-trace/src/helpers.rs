@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_build_helper_dispatches_items() {
+    fn test_container_helpers_dispatch_expected_runtime_shapes() {
         let result = jit_build_tuple_2(w_int_new(3) as i64, w_int_new(5) as i64);
         let tuple = result as PyObjectRef;
         unsafe {
@@ -550,10 +550,7 @@ mod tests {
             assert_eq!(w_int_get_value(w_tuple_getitem(tuple, 0).unwrap()), 3);
             assert_eq!(w_int_get_value(w_tuple_getitem(tuple, 1).unwrap()), 5);
         }
-    }
 
-    #[test]
-    fn test_sequence_getitem_helper_dispatches_list_and_tuple() {
         let list = w_list_new(vec![w_int_new(2), w_int_new(4)]);
         let tuple = w_tuple_new(vec![w_int_new(7), w_int_new(9)]);
         unsafe {
@@ -566,10 +563,7 @@ mod tests {
                 7
             );
         }
-    }
 
-    #[test]
-    fn test_map_build_helper_dispatches_int_keys() {
         let result = jit_build_map_2(
             w_int_new(1) as i64,
             w_int_new(10) as i64,
@@ -585,23 +579,17 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_helper_reuses_objspace_semantics() {
+    fn test_numeric_helpers_reuse_objspace_semantics() {
         let result = jit_binary_value_from_tag(w_int_new(9) as i64, w_int_new(4) as i64, 1);
         unsafe {
             assert_eq!(w_int_get_value(result as PyObjectRef), 5);
         }
-    }
 
-    #[test]
-    fn test_compare_helper_reuses_objspace_semantics() {
         let result = jit_compare_value_from_tag(w_int_new(2) as i64, w_int_new(7) as i64, 0);
         unsafe {
             assert!(w_bool_get_value(result as PyObjectRef));
         }
-    }
 
-    #[test]
-    fn test_invert_helper_reuses_objspace_semantics() {
         let result = jit_unary_invert_value(w_int_new(5) as i64);
         unsafe {
             assert_eq!(w_int_get_value(result as PyObjectRef), !5);

@@ -3374,6 +3374,15 @@ impl Optimization for OptHeap {
 
 #[cfg(test)]
 mod tests {
+    //! Upstream parity anchor:
+    //! `rpython/jit/metainterp/test/test_heapcache.py` and
+    //! `rpython/jit/metainterp/test/test_tracingopts.py`
+    //! (`test_heapcache_interiorfields`, `test_heapcache_from_constant`, ...).
+    //!
+    //! Imported-short-field, arraycopy-range, and byte-array cases below are
+    //! original Rust regressions for optimizer-state seams that upstream
+    //! mostly covers only indirectly through larger integration tests.
+
     use std::sync::Arc;
 
     use majit_ir::{

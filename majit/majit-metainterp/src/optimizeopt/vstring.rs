@@ -1272,6 +1272,14 @@ impl Optimization for OptString {
 
 #[cfg(test)]
 mod tests {
+    //! Upstream parity anchor: `rpython/jit/metainterp/test/test_string.py`
+    //! for string-builder and copy-content behavior, plus
+    //! `rpython/jit/metainterp/optimizeopt/vstring.py`.
+    //!
+    //! Tests that focus on `IntBound`-only constants, `lgtop` caching identity,
+    //! or partial-pass behavior are original Rust regressions for helper paths
+    //! that upstream usually exercises only through larger optimizer tests.
+
     use super::*;
     use crate::optimizeopt::info::{
         PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
@@ -1870,6 +1878,9 @@ mod tests {
 
     #[test]
     fn test_strlen_caching_non_virtual() {
+        // Original Rust smoke test: `OptString` alone does not eliminate the
+        // second non-virtual `STRLEN`, but this still guards the local
+        // `known_lengths` cache wiring from panicking or regressing.
         // STRLEN on a non-virtual string should be cached for the second call.
         let mut ops = vec![
             Op::new(OpCode::Strlen, &[OpRef(100)]),

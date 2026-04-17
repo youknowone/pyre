@@ -1607,6 +1607,15 @@ impl Optimization for OptIntBounds {
 
 #[cfg(test)]
 mod tests {
+    //! Upstream parity anchor:
+    //! `rpython/jit/metainterp/optimizeopt/test/test_optimizeopt.py`
+    //! (`test_bound_*`, `test_strgetitem_bounds`, `test_arraylen_bound`, ...)
+    //! and `rpython/jit/metainterp/optimizeopt/intbounds.py`.
+    //!
+    //! These Rust tests are mostly unit-level decompositions of those optimizer
+    //! behaviors so the port can be checked below full trace-optimizer
+    //! integration.
+
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::{Descr, DescrRef};

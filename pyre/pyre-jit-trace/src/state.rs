@@ -3638,6 +3638,14 @@ fn extract_pyre_field_offset(descr_idx: u32) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    //! Most tests in this module are original Rust regressions.
+    //!
+    //! PyPy/Pyre upstream tests usually assert behavior at the meta-interpreter
+    //! level, not at the typed-raw tracer seam exercised here. These tests keep
+    //! local descriptor choices, virtualizable restoration, and raw-int/raw-f64
+    //! fast paths from drifting silently. Where a test is tied directly to an
+    //! upstream parity point, that reference is called out inline.
+
     use super::*;
     use crate::descr::{list_float_items_len_descr, list_int_items_len_descr};
     use crate::helpers::TraceHelperAccess;
@@ -3849,7 +3857,6 @@ mod tests {
 
     #[test]
     fn test_init_symbolic_skips_heap_array_read_for_standard_virtualizable() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -4007,7 +4014,6 @@ mod tests {
 
     #[test]
     fn test_virtualizable_array_lengths_uses_full_array() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -4101,66 +4107,40 @@ mod tests {
     }
 
     #[test]
-    fn test_load_local_checked_value_skips_nonnull_guard_for_typed_int_local() {
-        let mut ctx = TraceCtx::for_test(1);
-        let local = OpRef(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![local];
-        sym.symbolic_local_types = vec![Type::Int];
-        sym.nlocals = 1;
+    fn test_load_local_checked_value_respects_symbolic_local_type() {
+        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
+            let mut ctx = TraceCtx::for_test(1);
+            let local = OpRef(0);
+            let mut sym = PyreSym::new_uninit(OpRef::NONE);
+            sym.symbolic_locals = vec![local];
+            sym.symbolic_local_types = vec![symbolic_type];
+            sym.nlocals = 1;
 
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
+            let mut state = MIFrame {
+                ctx: &mut ctx,
+                sym: &mut sym,
+                fallthrough_pc: 0,
+                parent_frames: Vec::new(),
+                pending_inline_frame: None,
+                orgpc: 0,
+                concrete_frame_addr: 0,
+            };
+
+            let loaded =
+                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
+                    .expect("local should load");
+            assert_eq!(loaded.opref, local);
+
+            let recorder = ctx.into_recorder();
+            assert_eq!(recorder.last_op().map(|op| op.opcode), expected_guard);
         };
 
-        let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "j")
-            .expect("typed int local should load without guard");
-        assert_eq!(loaded.opref, local);
-
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 0);
-    }
-
-    #[test]
-    fn test_load_local_checked_value_keeps_nonnull_guard_for_ref_local() {
-        let mut ctx = TraceCtx::for_test(1);
-        let local = OpRef(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![local];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.nlocals = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "b")
-            .expect("ref local should load with guard");
-        assert_eq!(loaded.opref, local);
-
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 1);
-        assert_eq!(
-            recorder.last_op().map(|op| op.opcode),
-            Some(OpCode::GuardNonnull)
-        );
+        run_case(Type::Int, "j", None);
+        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
     }
 
     #[test]
     fn test_store_local_value_preserves_traced_raw_int_type_for_ref_slot() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -4299,7 +4279,6 @@ mod tests {
 
     #[test]
     fn test_compare_value_direct_keeps_raw_truth_for_immediate_branch_consumer() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("if 1 < 2:\n    x = 3\n").expect("test code should compile");
@@ -4394,7 +4373,6 @@ mod tests {
 
     #[test]
     fn test_compare_value_direct_boxes_bool_when_not_immediately_consumed_by_branch() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -4451,77 +4429,7 @@ mod tests {
     }
 
     #[test]
-    fn test_next_instruction_consumes_comparison_truth_skips_extended_arg_trivia() {
-        use pyre_interpreter::compile_exec;
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let mut source = String::from("def f(x, y):\n    if x < y:\n");
-        for i in 0..400 {
-            source.push_str(&format!("        z{i} = {i}\n"));
-        }
-        source.push_str("    return 0\n");
-        source.push_str("f(1, 2)\n");
-
-        let module = compile_exec(&source).expect("test code should compile");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                    Some((**code).clone())
-                }
-                _ => None,
-            })
-            .expect("test source should contain function code");
-
-        let compare_pc = (0..code.instructions.len())
-            .find(|&pc| {
-                matches!(
-                    decode_instruction_at(&code, pc),
-                    Some((Instruction::CompareOp { .. }, _))
-                )
-            })
-            .expect("test bytecode should contain COMPARE_OP");
-
-        let first_after_compare = decode_instruction_at(&code, compare_pc + 1)
-            .map(|(instruction, _)| instruction)
-            .expect("bytecode should continue after COMPARE_OP");
-        assert!(
-            instruction_is_trivia_between_compare_and_branch(first_after_compare),
-            "test source should force trivia between COMPARE_OP and POP_JUMP_IF"
-        );
-
-        let code_ref =
-            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
-                as *const ();
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.fix_array_ptrs();
-        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(2);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.valuestackdepth = 0;
-        sym.jitcode = jitcode_for(code_ref);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: compare_pc + 1,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        assert!(
-            state.next_instruction_consumes_comparison_truth(),
-            "branch fusion should survive EXTENDED_ARG/other trivia before the branch"
-        );
-    }
-
-    #[test]
-    fn test_trace_code_step_preserves_comparison_truth_across_extended_arg_trivia() {
-        use pyre_interpreter::compile_exec;
+    fn test_comparison_truth_survives_extended_arg_trivia() {
         use pyre_interpreter::pyframe::PyFrame;
 
         ensure_test_callbacks();
@@ -4561,6 +4469,32 @@ mod tests {
             "test source should force trivia between COMPARE_OP and POP_JUMP_IF"
         );
 
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.fix_array_ptrs();
+
+        let mut ctx = TraceCtx::for_test(2);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.valuestackdepth = 0;
+        sym.jitcode = jitcode_for(code_ref);
+
+        let state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: compare_pc + 1,
+            parent_frames: Vec::new(),
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+        };
+
+        assert!(
+            state.next_instruction_consumes_comparison_truth(),
+            "branch fusion should survive EXTENDED_ARG/other trivia before the branch"
+        );
+
         let mut frame = Box::new(PyFrame::new(code.clone()));
         frame.fix_array_ptrs();
         let mut ctx = TraceCtx::for_test(0);
@@ -4594,12 +4528,11 @@ mod tests {
     // concrete_branch_truth now requires explicit concrete parameter.
 
     #[test]
-    fn test_concrete_branch_truth_uses_cached_comparison_truth_without_stack_value() {
-        use pyre_interpreter::compile_exec;
+    fn test_branch_truth_concrete_cache_paths() {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = Box::new(PyFrame::new(code.clone()));
         frame.fix_array_ptrs();
         let mut ctx = TraceCtx::for_test(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
@@ -4624,14 +4557,7 @@ mod tests {
                 .expect("cached comparison truth should avoid concrete stack lookup")
         );
         assert_eq!(state.sym().last_comparison_concrete_truth, None);
-    }
 
-    #[test]
-    fn test_truth_value_direct_caches_concrete_truth_for_raw_int_branch_consumer() {
-        use pyre_interpreter::compile_exec;
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.push(w_int_new(7));
         frame.fix_array_ptrs();
@@ -4666,12 +4592,11 @@ mod tests {
     }
 
     #[test]
-    fn test_record_branch_guard_uses_branch_pc_and_pre_pop_stack_shape() {
-        use pyre_interpreter::compile_exec;
+    fn test_branch_guard_preserves_pre_pop_stack_shape() {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = Box::new(PyFrame::new(code.clone()));
         frame.set_last_instr_from_next_instr(456);
         frame.fix_array_ptrs();
         let mut ctx = TraceCtx::for_test(3);
@@ -4714,14 +4639,7 @@ mod tests {
         assert!(fail_args.len() >= n + 1);
         assert_eq!(fail_args[0], frame_ref);
         assert_eq!(fail_args[n], lower_stack);
-    }
 
-    #[test]
-    fn test_generic_guard_during_branch_truth_uses_pre_pop_stack_shape() {
-        use pyre_interpreter::compile_exec;
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = Box::new(PyFrame::new(code));
         frame.set_last_instr_from_next_instr(456);
         frame.fix_array_ptrs();
@@ -4768,7 +4686,6 @@ mod tests {
 
     #[test]
     fn test_branch_truth_uses_concrete_parameter() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
@@ -4857,7 +4774,6 @@ mod tests {
 
     #[test]
     fn test_current_fail_args_materializes_symbolic_holes_from_concrete_frame() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("len(x)").expect("test code should compile");
@@ -4972,7 +4888,6 @@ mod tests {
 
     #[test]
     fn test_direct_len_value_returns_typed_raw_len_for_integer_list() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("len(x)").expect("test code should compile");
@@ -5094,174 +5009,130 @@ mod tests {
     }
 
     #[test]
-    fn test_list_append_value_uses_raw_int_storage_fast_path() {
-        use pyre_interpreter::compile_exec;
+    fn test_list_append_value_uses_raw_storage_fast_paths() {
         use pyre_interpreter::pyframe::PyFrame;
 
-        let mut ctx = TraceCtx::for_test(2);
-        let list = OpRef(0);
-        let value = OpRef(1);
-        let concrete_list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.fix_array_ptrs();
-        unsafe {
-            assert!(w_list_uses_int_storage(concrete_list));
-            assert!(w_list_can_append_without_realloc(concrete_list));
-        }
+        let run_case = |concrete_list: pyre_object::PyObjectRef,
+                        symbolic_value_type: Type,
+                        concrete_value: pyre_object::PyObjectRef,
+                        expected_array_descr_idx: u32,
+                        expected_len_descr_idx: u32,
+                        case_name: &str,
+                        expect_box_alloc: bool| {
+            let mut ctx = TraceCtx::for_test(2);
+            let list = OpRef(0);
+            let value = OpRef(1);
+            let mut frame = Box::new(PyFrame::new(code.clone()));
+            frame.fix_array_ptrs();
 
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![list, value];
-        sym.symbolic_local_types = vec![Type::Ref, Type::Int];
-        sym.nlocals = 2;
+            let mut sym = PyreSym::new_uninit(OpRef::NONE);
+            sym.symbolic_locals = vec![list, value];
+            sym.symbolic_local_types = vec![Type::Ref, symbolic_value_type];
+            sym.nlocals = 2;
 
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
+            let mut state = MIFrame {
+                ctx: &mut ctx,
+                sym: &mut sym,
+                fallthrough_pc: 0,
+                parent_frames: Vec::new(),
+                pending_inline_frame: None,
+                orgpc: 0,
+                concrete_frame_addr: 0,
+            };
+
+            state
+                .list_append_value(list, value, concrete_list, concrete_value)
+                .expect("raw-storage append fast path should trace");
+
+            let recorder = ctx.into_recorder();
+            let mut saw_raw_setitem = false;
+            let mut saw_len_update = false;
+            let mut saw_call = false;
+            let mut saw_new = false;
+            for pos in 2..(2 + recorder.num_ops() as u32) {
+                let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                    continue;
+                };
+                if matches!(
+                    op.opcode,
+                    OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
+                ) {
+                    saw_call = true;
+                }
+                if op.opcode == OpCode::New {
+                    saw_new = true;
+                }
+                if op.opcode == OpCode::SetarrayitemRaw
+                    && op.descr.as_ref().map(|d| d.index()) == Some(expected_array_descr_idx)
+                {
+                    saw_raw_setitem = true;
+                }
+                if op.opcode == OpCode::SetfieldGc
+                    && op.descr.as_ref().map(|d| d.index()) == Some(expected_len_descr_idx)
+                {
+                    saw_len_update = true;
+                }
+            }
+
+            assert!(
+                saw_raw_setitem,
+                "{} append should write through the raw payload array",
+                case_name
+            );
+            assert!(
+                saw_len_update,
+                "{} append should update the strategy length field",
+                case_name
+            );
+            assert!(
+                !saw_call,
+                "{} append should not fall back to jit_list_append",
+                case_name
+            );
+            assert_eq!(
+                saw_new, expect_box_alloc,
+                "{} append unexpected boxing allocation behavior",
+                case_name
+            );
         };
 
-        let concrete_value = w_int_new(42);
-        state
-            .list_append_value(list, value, concrete_list, concrete_value)
-            .expect("integer-list append fast path should trace");
-
-        let recorder = ctx.into_recorder();
-        let mut saw_raw_setitem = false;
-        let mut saw_len_update = false;
-        let mut saw_call = false;
-        let mut saw_new = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
-            if matches!(
-                op.opcode,
-                OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
-            ) {
-                saw_call = true;
-            }
-            if op.opcode == OpCode::New {
-                saw_new = true;
-            }
-            if op.opcode == OpCode::SetarrayitemRaw
-                && op.descr.as_ref().map(|d| d.index()) == Some(int_array_descr().index())
-            {
-                saw_raw_setitem = true;
-            }
-            if op.opcode == OpCode::SetfieldGc
-                && op.descr.as_ref().map(|d| d.index()) == Some(list_int_items_len_descr().index())
-            {
-                saw_len_update = true;
-            }
+        let int_list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(int_list));
+            assert!(w_list_can_append_without_realloc(int_list));
         }
+        run_case(
+            int_list,
+            Type::Int,
+            w_int_new(42),
+            int_array_descr().index(),
+            list_int_items_len_descr().index(),
+            "integer-list",
+            false,
+        );
 
-        assert!(
-            saw_raw_setitem,
-            "integer-list append should write through the raw int array"
-        );
-        assert!(
-            saw_len_update,
-            "integer-list append should update the integer-list length field"
-        );
-        assert!(
-            !saw_call,
-            "integer-list append should not fall back to jit_list_append"
-        );
-        assert!(
-            !saw_new,
-            "integer-list append should not allocate a W_Int box in the trace"
-        );
-    }
-
-    #[test]
-    fn test_list_append_value_uses_raw_float_storage_fast_path() {
-        use pyre_interpreter::compile_exec;
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let mut ctx = TraceCtx::for_test(2);
-        let list = OpRef(0);
-        let value = OpRef(1);
-        let concrete_list = w_list_new(vec![
+        let float_list = w_list_new(vec![
             pyre_object::floatobject::w_float_new(1.5),
             pyre_object::floatobject::w_float_new(2.5),
         ]);
-        let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.fix_array_ptrs();
         unsafe {
-            assert!(w_list_uses_float_storage(concrete_list));
-            assert!(w_list_can_append_without_realloc(concrete_list));
+            assert!(w_list_uses_float_storage(float_list));
+            assert!(w_list_can_append_without_realloc(float_list));
         }
-
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![list, value];
-        sym.symbolic_local_types = vec![Type::Ref, Type::Float];
-        sym.nlocals = 2;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let concrete_value = pyre_object::w_float_new(3.14);
-        state
-            .list_append_value(list, value, concrete_list, concrete_value)
-            .expect("float-list append fast path should trace");
-
-        let recorder = ctx.into_recorder();
-        let mut saw_raw_setitem = false;
-        let mut saw_len_update = false;
-        let mut saw_call = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
-            if matches!(
-                op.opcode,
-                OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
-            ) {
-                saw_call = true;
-            }
-            if op.opcode == OpCode::SetarrayitemRaw
-                && op.descr.as_ref().map(|d| d.index()) == Some(float_array_descr().index())
-            {
-                saw_raw_setitem = true;
-            }
-            if op.opcode == OpCode::SetfieldGc
-                && op.descr.as_ref().map(|d| d.index())
-                    == Some(list_float_items_len_descr().index())
-            {
-                saw_len_update = true;
-            }
-        }
-
-        assert!(
-            saw_raw_setitem,
-            "float-list append should write through the raw float array"
-        );
-        assert!(
-            saw_len_update,
-            "float-list append should update the float-list length field"
-        );
-        assert!(
-            !saw_call,
-            "float-list append should not fall back to jit_list_append"
+        run_case(
+            float_list,
+            Type::Float,
+            pyre_object::w_float_new(3.14),
+            float_array_descr().index(),
+            list_float_items_len_descr().index(),
+            "float-list",
+            false,
         );
     }
 
     #[test]
     fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int() {
-        use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_object::w_range_iter_new;
 

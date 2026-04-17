@@ -3051,6 +3051,15 @@ pub fn resume_in_blackhole(
 
 #[cfg(test)]
 mod tests {
+    //! Upstream parity anchor: `rpython/jit/metainterp/test/test_blackhole.py`
+    //! for interpreter pooling, exception-state handling, and blackhole control
+    //! flow.
+    //!
+    //! The opcode-by-opcode `execute_one` coverage below is mostly original
+    //! Rust unit coverage. PyPy does not keep a dedicated `test_executor.py` in
+    //! this tree, so these tests exist to pin down the local Rust dispatcher
+    //! and arithmetic edge cases directly.
+
     use super::*;
     use majit_ir::OpRef;
 
@@ -3268,9 +3277,10 @@ mod tests {
         }
     }
 
-    // ── Executor parity tests (ported from test_executor.py) ──
+    // ── Executor opcode tests (Rust-original dispatcher coverage) ──
     //
-    // Systematic correctness tests for each opcode category.
+    // Systematic correctness tests for each opcode category handled by the
+    // local Rust blackhole dispatcher.
 
     /// Helper: build and execute a single binop, returning the i64 result.
     fn exec_binop(opcode: OpCode, a: i64, b: i64) -> i64 {
@@ -3366,15 +3376,6 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_int_bitwise() {
-        assert_eq!(exec_binop(OpCode::IntAnd, 0xFF, 0x0F), 0x0F);
-        assert_eq!(exec_binop(OpCode::IntOr, 0xF0, 0x0F), 0xFF);
-        assert_eq!(exec_binop(OpCode::IntXor, 0xFF, 0x0F), 0xF0);
-        assert_eq!(exec_binop(OpCode::IntLshift, 1, 4), 16);
-        assert_eq!(exec_binop(OpCode::IntRshift, 16, 4), 1);
-    }
-
-    #[test]
     fn test_executor_int_unary() {
         assert_eq!(exec_unop(OpCode::IntNeg, 42), -42);
         assert_eq!(exec_unop(OpCode::IntNeg, -1), 1);
@@ -3402,9 +3403,13 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_cast_int_float() {
+    fn test_executor_int_float_casts() {
         let fr = |r: i64| f64::from_bits(r as u64);
         assert_eq!(fr(exec_unop(OpCode::CastIntToFloat, 42)), 42.0);
+        assert_eq!(
+            fr(exec_unop(OpCode::CastIntToFloat, i64::MAX)),
+            i64::MAX as f64
+        );
         assert_eq!(
             exec_unop(OpCode::CastFloatToInt, f64::to_bits(3.7) as i64),
             3
@@ -3413,67 +3418,49 @@ mod tests {
             exec_unop(OpCode::CastFloatToInt, f64::to_bits(-2.9) as i64),
             -2
         );
+        assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(2.9)), 2);
+        assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(-2.9)), -2);
+        assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(0.999)), 0);
     }
 
     // ── Overflow arithmetic ──
 
     #[test]
-    fn test_executor_int_add_ovf_no_overflow() {
+    fn test_executor_overflow_arithmetic_uses_blackhole_wrapping_semantics() {
         assert_eq!(exec_binop(OpCode::IntAddOvf, 10, 20), 30);
-    }
+        assert_eq!(exec_binop(OpCode::IntSubOvf, 10, 3), 7);
+        assert_eq!(exec_binop(OpCode::IntMulOvf, 6, 7), 42);
 
-    #[test]
-    fn test_executor_int_add_ovf_wraps() {
         // In blackhole mode, overflow ops use wrapping arithmetic.
         // GuardNoOverflow/GuardOverflow are separate ops.
         let result = exec_binop(OpCode::IntAddOvf, i64::MAX, 1);
         assert_eq!(result, i64::MIN);
-    }
-
-    #[test]
-    fn test_executor_int_sub_ovf() {
-        assert_eq!(exec_binop(OpCode::IntSubOvf, 10, 3), 7);
-    }
-
-    #[test]
-    fn test_executor_int_mul_ovf() {
-        assert_eq!(exec_binop(OpCode::IntMulOvf, 6, 7), 42);
+        assert_eq!(exec_binop(OpCode::IntSubOvf, i64::MIN, 1), i64::MAX);
+        assert_eq!(exec_binop(OpCode::IntMulOvf, i64::MAX, 2), -2);
     }
 
     // ── Bitwise ops ──
 
     #[test]
-    fn test_executor_int_and() {
+    fn test_executor_bitwise_and_shift_ops() {
         assert_eq!(exec_binop(OpCode::IntAnd, 0xFF, 0x0F), 0x0F);
         assert_eq!(exec_binop(OpCode::IntAnd, 0xAB, 0x00), 0x00);
-    }
-
-    #[test]
-    fn test_executor_int_or() {
+        assert_eq!(exec_binop(OpCode::IntAnd, -1, -1), -1);
+        assert_eq!(exec_binop(OpCode::IntAnd, -1, 0), 0);
         assert_eq!(exec_binop(OpCode::IntOr, 0xF0, 0x0F), 0xFF);
         assert_eq!(exec_binop(OpCode::IntOr, 0, 0), 0);
-    }
-
-    #[test]
-    fn test_executor_int_xor() {
+        assert_eq!(exec_binop(OpCode::IntOr, -1, 0), -1);
+        assert_eq!(exec_binop(OpCode::IntOr, i64::MAX, i64::MIN), -1);
         assert_eq!(exec_binop(OpCode::IntXor, 0xFF, 0x0F), 0xF0);
         assert_eq!(exec_binop(OpCode::IntXor, 42, 42), 0);
-    }
-
-    #[test]
-    fn test_executor_int_lshift() {
+        assert_eq!(exec_binop(OpCode::IntXor, i64::MAX, i64::MAX), 0);
+        assert_eq!(exec_binop(OpCode::IntXor, i64::MIN, i64::MIN), 0);
+        assert_eq!(exec_unop(OpCode::IntInvert, i64::MAX), i64::MIN);
+        assert_eq!(exec_unop(OpCode::IntInvert, i64::MIN), i64::MAX);
         assert_eq!(exec_binop(OpCode::IntLshift, 1, 4), 16);
         assert_eq!(exec_binop(OpCode::IntLshift, 0xFF, 8), 0xFF00);
-    }
-
-    #[test]
-    fn test_executor_int_rshift() {
         assert_eq!(exec_binop(OpCode::IntRshift, 16, 4), 1);
         assert_eq!(exec_binop(OpCode::IntRshift, -1, 1), -1); // arithmetic shift
-    }
-
-    #[test]
-    fn test_executor_uint_rshift() {
         // Logical (unsigned) right shift.
         let result = exec_binop(OpCode::UintRshift, -1, 1);
         assert_eq!(result, i64::MAX);
@@ -3482,24 +3469,21 @@ mod tests {
     // ── Boolean predicates ──
 
     #[test]
-    fn test_executor_int_is_zero() {
+    fn test_executor_int_predicates_and_force_ge_zero() {
         assert_eq!(exec_unop(OpCode::IntIsZero, 0), 1);
         assert_eq!(exec_unop(OpCode::IntIsZero, 1), 0);
         assert_eq!(exec_unop(OpCode::IntIsZero, -1), 0);
-    }
-
-    #[test]
-    fn test_executor_int_is_true() {
+        assert_eq!(exec_unop(OpCode::IntIsZero, i64::MAX), 0);
+        assert_eq!(exec_binop(OpCode::IntAdd, i64::MAX, 0), i64::MAX); // sanity
         assert_eq!(exec_unop(OpCode::IntIsTrue, 0), 0);
         assert_eq!(exec_unop(OpCode::IntIsTrue, 1), 1);
         assert_eq!(exec_unop(OpCode::IntIsTrue, -42), 1);
-    }
-
-    #[test]
-    fn test_executor_int_force_ge_zero() {
         assert_eq!(exec_unop(OpCode::IntForceGeZero, 5), 5);
         assert_eq!(exec_unop(OpCode::IntForceGeZero, 0), 0);
         assert_eq!(exec_unop(OpCode::IntForceGeZero, -10), 0);
+        assert_eq!(exec_unop(OpCode::IntForceGeZero, i64::MIN), 0);
+        assert_eq!(exec_unop(OpCode::IntForceGeZero, i64::MAX), i64::MAX);
+        assert_eq!(exec_unop(OpCode::IntForceGeZero, 1), 1);
     }
 
     // ── Float comparisons ──
@@ -3520,19 +3504,21 @@ mod tests {
     // ── FloatFloorDiv / FloatMod ──
 
     #[test]
-    fn test_executor_float_floordiv() {
+    fn test_executor_float_floordiv_and_mod() {
         let a = f64::to_bits(7.0) as i64;
         let b = f64::to_bits(2.0) as i64;
         let result = exec_binop(OpCode::FloatFloorDiv, a, b);
         assert_eq!(f64::from_bits(result as u64), 3.0);
-    }
-
-    #[test]
-    fn test_executor_float_mod() {
         let a = f64::to_bits(7.0) as i64;
         let b = f64::to_bits(3.0) as i64;
         let result = exec_binop(OpCode::FloatMod, a, b);
         assert_eq!(f64::from_bits(result as u64), 1.0);
+        // -7.0 // 2.0 = -4.0
+        let result = exec_binop(OpCode::FloatFloorDiv, f64_bits(-7.0), f64_bits(2.0));
+        assert_eq!(bits_f64(result), -4.0);
+        let result = exec_binop(OpCode::FloatMod, f64_bits(-7.0), f64_bits(3.0));
+        let r = bits_f64(result);
+        assert!(r.is_finite());
     }
 
     // ── Pointer comparisons ──
@@ -3581,6 +3567,13 @@ mod tests {
         // -1i64 = 0xFFFF_FFFF_FFFF_FFFF as u64, * 2 → high = 1
         let result = exec_binop(OpCode::UintMulHigh, -1, 2);
         assert_eq!(result, 1);
+        // u64::MAX * u64::MAX = (2^64-1)^2 = 2^128 - 2^65 + 1
+        // High 64 bits = 0xFFFFFFFFFFFFFFFE
+        let result = exec_binop(OpCode::UintMulHigh, -1, -1);
+        assert_eq!(result, -2); // 0xFFFFFFFFFFFFFFFE as i64 = -2
+        // Any value * 1 has high 64 bits = 0
+        assert_eq!(exec_binop(OpCode::UintMulHigh, i64::MAX, 1), 0);
+        assert_eq!(exec_binop(OpCode::UintMulHigh, -1, 1), 0);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -3591,15 +3584,11 @@ mod tests {
     // ── Division by zero ──
 
     #[test]
-    fn test_executor_int_floordiv_by_zero() {
+    fn test_executor_int_divmod_by_zero_returns_blackhole_default() {
         // Division by zero returns 0 (blackhole convention: no panic).
         assert_eq!(exec_binop(OpCode::IntFloorDiv, 42, 0), 0);
         assert_eq!(exec_binop(OpCode::IntFloorDiv, -1, 0), 0);
         assert_eq!(exec_binop(OpCode::IntFloorDiv, 0, 0), 0);
-    }
-
-    #[test]
-    fn test_executor_int_mod_by_zero() {
         assert_eq!(exec_binop(OpCode::IntMod, 42, 0), 0);
         assert_eq!(exec_binop(OpCode::IntMod, -1, 0), 0);
         assert_eq!(exec_binop(OpCode::IntMod, 0, 0), 0);
@@ -3608,33 +3597,17 @@ mod tests {
     // ── Integer overflow boundaries ──
 
     #[test]
-    fn test_executor_int_add_overflow_boundary() {
+    fn test_executor_integer_overflow_boundaries() {
         // Wrapping: i64::MAX + 1 = i64::MIN
         assert_eq!(exec_binop(OpCode::IntAdd, i64::MAX, 1), i64::MIN);
         // i64::MIN - 1 wraps to i64::MAX
         assert_eq!(exec_binop(OpCode::IntSub, i64::MIN, 1), i64::MAX);
-    }
-
-    #[test]
-    fn test_executor_int_mul_overflow_boundary() {
         assert_eq!(exec_binop(OpCode::IntMul, i64::MAX, 2), -2);
         assert_eq!(exec_binop(OpCode::IntMul, i64::MIN, -1), i64::MIN); // wrapping
-    }
-
-    #[test]
-    fn test_executor_int_neg_min() {
         // -i64::MIN wraps to i64::MIN (two's complement)
         assert_eq!(exec_unop(OpCode::IntNeg, i64::MIN), i64::MIN);
-    }
-
-    #[test]
-    fn test_executor_int_floordiv_min_by_neg1() {
         // i64::MIN / -1 would overflow; wrapping_div wraps to i64::MIN
         assert_eq!(exec_binop(OpCode::IntFloorDiv, i64::MIN, -1), i64::MIN);
-    }
-
-    #[test]
-    fn test_executor_int_mod_min_by_neg1() {
         // i64::MIN % -1 would overflow; wrapping_rem wraps to 0
         assert_eq!(exec_binop(OpCode::IntMod, i64::MIN, -1), 0);
     }
@@ -3650,38 +3623,21 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_float_add_nan() {
+    fn test_executor_float_special_values() {
         let result = exec_binop(OpCode::FloatAdd, f64_bits(f64::NAN), f64_bits(1.0));
         assert!(bits_f64(result).is_nan());
-    }
-
-    #[test]
-    fn test_executor_float_mul_inf_zero() {
         // Inf * 0 = NaN
         let result = exec_binop(OpCode::FloatMul, f64_bits(f64::INFINITY), f64_bits(0.0));
         assert!(bits_f64(result).is_nan());
-    }
-
-    #[test]
-    fn test_executor_float_truediv_by_zero() {
         // 1.0 / 0.0 = Inf
         let result = exec_binop(OpCode::FloatTrueDiv, f64_bits(1.0), f64_bits(0.0));
         assert_eq!(bits_f64(result), f64::INFINITY);
-
         // -1.0 / 0.0 = -Inf
         let result = exec_binop(OpCode::FloatTrueDiv, f64_bits(-1.0), f64_bits(0.0));
         assert_eq!(bits_f64(result), f64::NEG_INFINITY);
-    }
-
-    #[test]
-    fn test_executor_float_truediv_zero_by_zero() {
         // 0.0 / 0.0 = NaN
         let result = exec_binop(OpCode::FloatTrueDiv, f64_bits(0.0), f64_bits(0.0));
         assert!(bits_f64(result).is_nan());
-    }
-
-    #[test]
-    fn test_executor_float_sub_inf() {
         // Inf - Inf = NaN
         let result = exec_binop(
             OpCode::FloatSub,
@@ -3689,23 +3645,11 @@ mod tests {
             f64_bits(f64::INFINITY),
         );
         assert!(bits_f64(result).is_nan());
-    }
-
-    #[test]
-    fn test_executor_float_neg_nan() {
         // -NaN is still NaN
         let result = exec_unop(OpCode::FloatNeg, f64_bits(f64::NAN));
         assert!(bits_f64(result).is_nan());
-    }
-
-    #[test]
-    fn test_executor_float_abs_neg_inf() {
         let result = exec_unop(OpCode::FloatAbs, f64_bits(f64::NEG_INFINITY));
         assert_eq!(bits_f64(result), f64::INFINITY);
-    }
-
-    #[test]
-    fn test_executor_float_comparisons_nan() {
         // All comparisons with NaN return false (0).
         let nan = f64_bits(f64::NAN);
         let one = f64_bits(1.0);
@@ -3720,14 +3664,10 @@ mod tests {
     // ── Unsigned comparisons with negative values ──
 
     #[test]
-    fn test_executor_uint_lt_negative_as_large() {
+    fn test_executor_uint_comparisons() {
         // -1i64 as u64 is u64::MAX, which is larger than 1
         assert_eq!(exec_binop(OpCode::UintLt, -1, 1), 0);
         assert_eq!(exec_binop(OpCode::UintGt, -1, 1), 1);
-    }
-
-    #[test]
-    fn test_executor_uint_comparisons_systematic() {
         // -1 as u64 = 0xFFFFFFFFFFFFFFFF (max unsigned)
         assert_eq!(exec_binop(OpCode::UintLt, -1, 0), 0);
         assert_eq!(exec_binop(OpCode::UintGe, -1, 0), 1);
@@ -3748,32 +3688,16 @@ mod tests {
     // ── Shift edge cases ──
 
     #[test]
-    fn test_executor_int_lshift_63() {
+    fn test_executor_shift_edge_cases() {
         // 1 << 63 = i64::MIN (sign bit)
         assert_eq!(exec_binop(OpCode::IntLshift, 1, 63), i64::MIN);
-    }
-
-    #[test]
-    fn test_executor_int_rshift_neg1() {
         // Arithmetic shift: -1 >> 63 = -1 (sign bit fills)
         assert_eq!(exec_binop(OpCode::IntRshift, -1, 63), -1);
-    }
-
-    #[test]
-    fn test_executor_uint_rshift_neg1() {
         // Logical shift: -1u >> 63 = 1 (top bit only)
         assert_eq!(exec_binop(OpCode::UintRshift, -1, 63), 1);
-    }
-
-    #[test]
-    fn test_executor_shift_by_zero() {
         assert_eq!(exec_binop(OpCode::IntLshift, 42, 0), 42);
         assert_eq!(exec_binop(OpCode::IntRshift, 42, 0), 42);
         assert_eq!(exec_binop(OpCode::UintRshift, 42, 0), 42);
-    }
-
-    #[test]
-    fn test_executor_lshift_negative_value() {
         // -5 << 2 = -20
         assert_eq!(exec_binop(OpCode::IntLshift, -5, 2), -20);
     }
@@ -3781,27 +3705,19 @@ mod tests {
     // ── IntSignext ──
 
     #[test]
-    fn test_executor_int_signext_1byte() {
+    fn test_executor_int_signext() {
         // 0xFF sign-extended from 1 byte = -1
         assert_eq!(exec_binop(OpCode::IntSignext, 0xFF, 1), -1);
         // 0x7F sign-extended from 1 byte = 127
         assert_eq!(exec_binop(OpCode::IntSignext, 0x7F, 1), 127);
         // 0x80 sign-extended from 1 byte = -128
         assert_eq!(exec_binop(OpCode::IntSignext, 0x80, 1), -128);
-    }
-
-    #[test]
-    fn test_executor_int_signext_2bytes() {
         // 0xFFFF sign-extended from 2 bytes = -1
         assert_eq!(exec_binop(OpCode::IntSignext, 0xFFFF, 2), -1);
         // 0x7FFF = 32767
         assert_eq!(exec_binop(OpCode::IntSignext, 0x7FFF, 2), 32767);
         // 0x8000 = -32768
         assert_eq!(exec_binop(OpCode::IntSignext, 0x8000, 2), -32768);
-    }
-
-    #[test]
-    fn test_executor_int_signext_4bytes() {
         // 0xFFFFFFFF sign-extended from 4 bytes = -1
         assert_eq!(exec_binop(OpCode::IntSignext, 0xFFFFFFFF_i64, 4), -1);
         // 0x7FFFFFFF = 2147483647
@@ -3835,114 +3751,6 @@ mod tests {
             let back = exec_unop(OpCode::ConvertLonglongBytesToFloat, ll);
             assert_eq!(back, bits);
         }
-    }
-
-    // ── UintMulHigh edge cases ──
-
-    #[test]
-    fn test_executor_uint_mul_high_max() {
-        // u64::MAX * u64::MAX = (2^64-1)^2 = 2^128 - 2^65 + 1
-        // High 64 bits = 0xFFFFFFFFFFFFFFFE
-        let result = exec_binop(OpCode::UintMulHigh, -1, -1);
-        assert_eq!(result, -2); // 0xFFFFFFFFFFFFFFFE as i64 = -2
-    }
-
-    #[test]
-    fn test_executor_uint_mul_high_one() {
-        // Any value * 1 has high 64 bits = 0
-        assert_eq!(exec_binop(OpCode::UintMulHigh, i64::MAX, 1), 0);
-        assert_eq!(exec_binop(OpCode::UintMulHigh, -1, 1), 0);
-    }
-
-    // ── Cast edge cases ──
-
-    #[test]
-    fn test_executor_cast_int_to_float_large() {
-        let result = exec_unop(OpCode::CastIntToFloat, i64::MAX);
-        assert_eq!(bits_f64(result), i64::MAX as f64);
-    }
-
-    #[test]
-    fn test_executor_cast_float_to_int_truncates() {
-        // Truncation toward zero
-        assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(2.9)), 2);
-        assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(-2.9)), -2);
-        assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(0.999)), 0);
-    }
-
-    // ── Overflow ops with exact overflow detection ──
-
-    #[test]
-    fn test_executor_int_sub_ovf_underflow() {
-        // i64::MIN - 1 wraps
-        let result = exec_binop(OpCode::IntSubOvf, i64::MIN, 1);
-        assert_eq!(result, i64::MAX);
-    }
-
-    #[test]
-    fn test_executor_int_mul_ovf_large() {
-        let result = exec_binop(OpCode::IntMulOvf, i64::MAX, 2);
-        assert_eq!(result, -2);
-    }
-
-    // ── IntIsZero / IntIsTrue / IntForceGeZero boundary ──
-
-    #[test]
-    fn test_executor_int_is_zero_minmax() {
-        assert_eq!(exec_unop(OpCode::IntIsZero, i64::MAX), 0);
-        assert_eq!(exec_binop(OpCode::IntAdd, i64::MAX, 0), i64::MAX); // sanity
-    }
-
-    #[test]
-    fn test_executor_int_force_ge_zero_boundary() {
-        assert_eq!(exec_unop(OpCode::IntForceGeZero, i64::MIN), 0);
-        assert_eq!(exec_unop(OpCode::IntForceGeZero, i64::MAX), i64::MAX);
-        assert_eq!(exec_unop(OpCode::IntForceGeZero, 1), 1);
-    }
-
-    // ── Float floordiv / mod edge cases ──
-
-    #[test]
-    fn test_executor_float_floordiv_negative() {
-        // -7.0 // 2.0 = -4.0
-        let result = exec_binop(OpCode::FloatFloorDiv, f64_bits(-7.0), f64_bits(2.0));
-        assert_eq!(bits_f64(result), -4.0);
-    }
-
-    #[test]
-    fn test_executor_float_mod_negative() {
-        // Python-style float mod: result has sign of divisor
-        let result = exec_binop(OpCode::FloatMod, f64_bits(-7.0), f64_bits(3.0));
-        // -7.0 % 3.0 = 2.0 (Python) or -1.0 (C)
-        // Depends on implementation; verify it at least produces a valid result
-        let r = bits_f64(result);
-        assert!(r.is_finite());
-    }
-
-    // ── Bitwise ops with boundary values ──
-
-    #[test]
-    fn test_executor_int_and_all_ones() {
-        assert_eq!(exec_binop(OpCode::IntAnd, -1, -1), -1);
-        assert_eq!(exec_binop(OpCode::IntAnd, -1, 0), 0);
-    }
-
-    #[test]
-    fn test_executor_int_or_all_ones() {
-        assert_eq!(exec_binop(OpCode::IntOr, -1, 0), -1);
-        assert_eq!(exec_binop(OpCode::IntOr, i64::MAX, i64::MIN), -1);
-    }
-
-    #[test]
-    fn test_executor_int_xor_self() {
-        assert_eq!(exec_binop(OpCode::IntXor, i64::MAX, i64::MAX), 0);
-        assert_eq!(exec_binop(OpCode::IntXor, i64::MIN, i64::MIN), 0);
-    }
-
-    #[test]
-    fn test_executor_int_invert_boundaries() {
-        assert_eq!(exec_unop(OpCode::IntInvert, i64::MAX), i64::MIN);
-        assert_eq!(exec_unop(OpCode::IntInvert, i64::MIN), i64::MAX);
     }
 
     /// Verify every OpCode variant has an explicit handler in execute_one
@@ -3993,7 +3801,9 @@ mod tests {
     }
 
     // ================================================================
-    // Tests for jitcode-based BlackholeInterpreter (RPython parity)
+    // Tests for jitcode-based BlackholeInterpreter.
+    // Upstream parity anchor: `rpython/jit/metainterp/test/test_blackhole.py`
+    // plus the dispatch-loop setup in `rpython/jit/metainterp/blackhole.py`.
     // ================================================================
 
     mod bh_interp_tests {
