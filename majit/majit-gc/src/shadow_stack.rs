@@ -175,11 +175,17 @@ pub fn push(gcref: GcRef) -> usize {
 }
 
 /// Pop entries from the shadow stack back to the given depth.
+///
+/// Returns an empty Vec when called after SHADOW_STACK's TLS destructor
+/// has fired (thread teardown); the thread is exiting, so no roots need
+/// to be reclaimed.
 pub fn pop_to(depth: usize) -> Vec<GcRef> {
-    SHADOW_STACK.with(|ss| {
-        let mut ss = ss.borrow_mut();
-        ss.entries.split_off(depth)
-    })
+    SHADOW_STACK
+        .try_with(|ss| {
+            let mut ss = ss.borrow_mut();
+            ss.entries.split_off(depth)
+        })
+        .unwrap_or_default()
 }
 
 /// Get a GcRef at the given index.
@@ -203,8 +209,14 @@ pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
 }
 
 /// Current depth of the GcRef shadow stack.
+///
+/// Returns 0 when called after SHADOW_STACK's TLS destructor has fired
+/// (thread teardown); callers running under Drop (ConstantPool) see an
+/// empty stack instead of panicking on the destroyed key.
 pub fn depth() -> usize {
-    SHADOW_STACK.with(|ss| ss.borrow().entries.len())
+    SHADOW_STACK
+        .try_with(|ss| ss.borrow().entries.len())
+        .unwrap_or(0)
 }
 
 /// Clear both shadow stacks.

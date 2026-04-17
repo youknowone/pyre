@@ -259,6 +259,14 @@ impl LiveVars {
                             }
                         }
                     }
+                    // LOAD_FAST_LOAD_FAST / LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+                    // intentionally not GEN'd — see the commented-out block
+                    // above and memory/phase3_aliasing_diagnostic_2026_04_17.md.
+                    // Enabling GEN here regresses dynasm (stale null-ref
+                    // live-args in bridges). Explicit no-op arms prevent
+                    // warn_unhandled_opcode false positives.
+                    Instruction::LoadFastLoadFast { .. }
+                    | Instruction::LoadFastBorrowLoadFastBorrow { .. } => {}
                     other => warn_unhandled_opcode("gen_kill", &other),
                 }
                 // Exception handlers: union with handler target's live set.
