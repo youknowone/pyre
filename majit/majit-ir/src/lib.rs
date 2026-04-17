@@ -24,5 +24,6 @@ pub use resoperation::{
     OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
-    Const, FAILARGS_LIMIT, GcRef, GreenKey, InputArg, JitDriverVar, Type, Value, VarKind,
+    Const, FAILARGS_LIMIT, GcRef, GreenKey, GreenType, InputArg, JitDriverVar, StrEqFn, StrHashFn,
+    Type, Value, VarKind, set_str_resolver, set_unicode_resolver,
 };

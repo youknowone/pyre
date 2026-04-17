@@ -55,7 +55,7 @@ use crate::virtualizable::VirtualizableInfo;
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
-use majit_ir::{GreenKey, JitDriverVar, Type, Value, VarKind};
+use majit_ir::{GreenKey, GreenType, JitDriverVar, Type, Value, VarKind};
 
 /// Descriptor for a JitDriver's variable layout.
 ///
@@ -199,8 +199,10 @@ pub trait DeclarativeJitDriver {
 pub struct EntryPoint {
     /// Human-readable name of this entry point (e.g., function name).
     pub name: String,
-    /// Green key type schema for this entry point.
-    pub schema: Vec<Type>,
+    /// warmstate.py:564 `_green_args_spec` — per-entry TYPE used by
+    /// `JitCell.comparekey` / `get_uhash`. `GreenType` retains the
+    /// STR / UNICODE distinction that IR `Type` collapses into `Ref`.
+    pub schema: Vec<GreenType>,
 }
 
 /// High-level JIT driver that automates the tracing lifecycle.
@@ -369,7 +371,12 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
         let mut driver = Self::new(threshold);
-        let greens: Vec<Type> = descriptor.greens().iter().map(|v| v.tp).collect();
+        // warmstate.py:564 `_green_args_spec` carries lltype TYPE per
+        // green arg. `JitDriverVar.tp` is the IR `Type`; convert through
+        // `From<Type>` which maps `Ref` to `GreenType::Ref`. Callers that
+        // need the stricter `STR` / `UNICODE` distinction use
+        // `register_entry_point` with an explicit schema.
+        let greens: Vec<GreenType> = descriptor.greens().iter().map(|v| v.tp.into()).collect();
         driver.descriptor = Some(descriptor);
         driver.entry_points.push(EntryPoint {
             name: "primary".to_string(),
@@ -1720,6 +1727,20 @@ impl<S: JitState> JitDriver<S> {
     /// Each entry point has a name and a green key schema describing the
     /// types of its green (loop-invariant) variables.
     pub fn register_entry_point(&mut self, name: &str, green_key_schema: &[Type]) {
+        // Accept IR `Type` for source compatibility. Callers that need to
+        // declare STR/UNICODE greens can call `register_entry_point_typed`.
+        let schema: Vec<GreenType> = green_key_schema.iter().copied().map(Into::into).collect();
+        self.entry_points.push(EntryPoint {
+            name: name.to_string(),
+            schema,
+        });
+    }
+
+    /// warmstate.py:564-565 — register an entry point with an explicit
+    /// `GreenType` schema. Frontends that declare STR / UNICODE green
+    /// args call this path so `comparekey` / `get_uhash` dispatch through
+    /// `equal_whatever` / `hash_whatever` correctly.
+    pub fn register_entry_point_typed(&mut self, name: &str, green_key_schema: &[GreenType]) {
         self.entry_points.push(EntryPoint {
             name: name.to_string(),
             schema: green_key_schema.to_vec(),
@@ -3753,14 +3774,14 @@ mod tests {
             .find_entry_point("loop_main")
             .expect("should find loop_main");
         assert_eq!(ep0.name, "loop_main");
-        assert_eq!(ep0.schema, vec![Type::Int]);
+        assert_eq!(ep0.schema, vec![GreenType::Int]);
 
         // Verify second entry point.
         let ep1 = driver
             .find_entry_point("loop_helper")
             .expect("should find loop_helper");
         assert_eq!(ep1.name, "loop_helper");
-        assert_eq!(ep1.schema, vec![Type::Int, Type::Ref]);
+        assert_eq!(ep1.schema, vec![GreenType::Int, GreenType::Ref]);
 
         // Non-existent entry point returns None.
         assert!(driver.find_entry_point("nonexistent").is_none());

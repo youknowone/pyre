@@ -251,38 +251,209 @@ impl JitDriverVar {
     }
 }
 
-/// Structured green key — represents the exact values of all green variables
-/// at a particular program point.
+/// warmstate.py:108-112 equal_whatever / :115-128 hash_whatever take a
+/// TYPE parameter that can be primitive, generic Ptr, or specifically a
+/// Ptr to rstr.STR / rstr.UNICODE. The IR-level [`Type`] only carries the
+/// kind (i/r/f/v); this enum extends it with the STR/UNICODE subtypes so
+/// green key comparisons match RPython 1:1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GreenType {
+    /// lltype.Signed / Unsigned / Bool / Char / primitive.
+    Int,
+    /// lltype.Float.
+    Float,
+    /// lltype.Void.
+    Void,
+    /// Generic GC Ptr — identityhash / pointer equality.
+    Ref,
+    /// Ptr to rstr.STR — ll_streq / ll_strhash.
+    Str,
+    /// Ptr to rstr.UNICODE — ll_streq / ll_strhash.
+    Unicode,
+}
+
+impl From<Type> for GreenType {
+    fn from(t: Type) -> Self {
+        match t {
+            Type::Int => GreenType::Int,
+            Type::Ref => GreenType::Ref,
+            Type::Float => GreenType::Float,
+            Type::Void => GreenType::Void,
+        }
+    }
+}
+
+/// Resolver types for ll_streq / ll_strhash — pluggable because each
+/// frontend (pyre, RPython) has its own rstr.STR / UNICODE layout. The
+/// helper remains pure at the majit-ir layer; frontends register their
+/// resolvers at startup via [`set_str_resolver`] / [`set_unicode_resolver`].
+pub type StrEqFn = fn(i64, i64) -> bool;
+pub type StrHashFn = fn(i64) -> u64;
+
+static STR_EQ: std::sync::OnceLock<StrEqFn> = std::sync::OnceLock::new();
+static STR_HASH: std::sync::OnceLock<StrHashFn> = std::sync::OnceLock::new();
+static UNICODE_EQ: std::sync::OnceLock<StrEqFn> = std::sync::OnceLock::new();
+static UNICODE_HASH: std::sync::OnceLock<StrHashFn> = std::sync::OnceLock::new();
+
+pub fn set_str_resolver(eq: StrEqFn, hash: StrHashFn) {
+    let _ = STR_EQ.set(eq);
+    let _ = STR_HASH.set(hash);
+}
+
+pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
+    let _ = UNICODE_EQ.set(eq);
+    let _ = UNICODE_HASH.set(hash);
+}
+
+/// warmstate.py:108-112 equal_whatever(TYPE, x, y)
 ///
-/// Mirrors RPython's green key which is a tuple of green variable values.
-/// In RPython, `make_jitcell_subclass()` creates a cell class keyed on
-/// all green variable values (not just a hash).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Port of RPython's lltype dispatch:
+/// - Ptr to STR / UNICODE → rstr.LLHelpers.ll_streq
+/// - everything else → `x == y` (with Float using bitwise f64 equality)
+pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
+    match tp {
+        GreenType::Str => STR_EQ.get().map(|f| f(x, y)).unwrap_or_else(|| x == y),
+        GreenType::Unicode => UNICODE_EQ.get().map(|f| f(x, y)).unwrap_or_else(|| x == y),
+        GreenType::Float => {
+            let a = f64::from_bits(x as u64);
+            let b = f64::from_bits(y as u64);
+            a == b
+        }
+        // Int, Ref, Void: x == y (integer / pointer equality)
+        GreenType::Int | GreenType::Ref | GreenType::Void => x == y,
+    }
+}
+
+/// warmstate.py:115-128 hash_whatever(TYPE, x)
+///
+/// - Ptr to STR / UNICODE → rstr.LLHelpers.ll_strhash
+/// - generic GC Ptr → identityhash (or 0 for null)
+/// - primitive → rffi.cast(Signed, x)
+pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
+    match tp {
+        GreenType::Str => STR_HASH
+            .get()
+            .map(|f| f(value))
+            .unwrap_or_else(|| value as u64),
+        GreenType::Unicode => UNICODE_HASH
+            .get()
+            .map(|f| f(value))
+            .unwrap_or_else(|| value as u64),
+        GreenType::Ref => {
+            // identityhash(x) or 0
+            if value != 0 { value as u64 } else { 0 }
+        }
+        GreenType::Float => {
+            // rffi.cast(Signed, x) — truncate float to integer
+            let float_val = f64::from_bits(value as u64);
+            (float_val as i64) as u64
+        }
+        // Int, Void: rffi.cast(Signed, x) — the value itself
+        GreenType::Int | GreenType::Void => value as u64,
+    }
+}
+
+/// Structured green key — represents the exact values and types of all
+/// green variables at a particular program point.
+///
+/// warmstate.py:564-565 green_args_name_spec — pairs each green arg with
+/// its TYPE. comparekey uses equal_whatever(TYPE, ...) and get_uhash uses
+/// hash_whatever(TYPE, ...) per RPython.
+#[derive(Clone, Debug, Default)]
 pub struct GreenKey {
     /// Values of all green variables, in declaration order.
     pub values: Vec<i64>,
+    /// warmstate.py:564 — per-entry TYPE. Drives hash_whatever/equal_whatever.
+    /// `GreenType` (not IR `Type`) so `Ptr to rstr.STR/UNICODE` stays distinct
+    /// from generic Ref and is dispatched through ll_streq / ll_strhash.
+    pub types: Vec<GreenType>,
+}
+
+impl PartialEq for GreenKey {
+    /// warmstate.py:575-582 JitCell.comparekey(*greenargs2)
+    ///
+    /// RPython's comparekey iterates green_args_name_spec (fixed per JitCell
+    /// class), comparing each stored attr with the incoming greenarg using
+    /// equal_whatever(TYPE, stored, incoming). Both the type spec and the
+    /// values must match for equality.
+    fn eq(&self, other: &Self) -> bool {
+        if self.values.len() != other.values.len() {
+            return false;
+        }
+        if self.types != other.types {
+            return false;
+        }
+        for i in 0..self.values.len() {
+            if !equal_whatever(self.types[i], self.values[i], other.values[i]) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Eq for GreenKey {}
+
+impl std::fmt::Display for GreenKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GreenKey({:?})", self.values)
+    }
+}
+
+impl std::hash::Hash for GreenKey {
+    /// warmstate.py:584-593 JitCell.get_uhash(*greenargs)
+    ///
+    /// Delegates to get_uhash() so that HashMap<GreenKey, _> uses the same
+    /// hash as jitcounter bucket lookup.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.get_uhash());
+    }
 }
 
 impl GreenKey {
+    /// Create an all-Int green key (most common case: PC-based keys).
     pub fn new(values: Vec<i64>) -> Self {
-        GreenKey { values }
+        let types = vec![GreenType::Int; values.len()];
+        GreenKey { values, types }
     }
 
+    /// warmstate.py:564-565 — typed green key. Accepts either IR-level
+    /// [`Type`] (via `From<Type>`) or the richer [`GreenType`].
+    pub fn with_types<T: Into<GreenType> + Copy>(values: Vec<i64>, types: Vec<T>) -> Self {
+        debug_assert_eq!(values.len(), types.len());
+        let types = types.into_iter().map(Into::into).collect();
+        GreenKey { values, types }
+    }
+
+    /// Single Int green key.
     pub fn single(value: i64) -> Self {
         GreenKey {
             values: vec![value],
+            types: vec![GreenType::Int],
         }
     }
 
-    /// Compute a hash suitable for use as HashMap key.
+    /// warmstate.py:584-593 JitCell.get_uhash(*greenargs)
     ///
-    /// This is equivalent to the `green_key_hash: u64` currently used
-    /// in WarmEnterState, but computed from the structured values.
+    /// Exact port of RPython's hash algorithm:
+    ///     x = r_uint(-1888132534)
+    ///     for _, TYPE in green_args_name_spec:
+    ///         y = r_uint(hash_whatever(TYPE, item))
+    ///         x = (x ^ y) * r_uint(1405695061)
+    ///     return x
+    pub fn get_uhash(&self) -> u64 {
+        let mut x: u64 = (-1888132534_i64) as u64;
+        for i in 0..self.values.len() {
+            let tp = self.types.get(i).copied().unwrap_or(GreenType::Int);
+            let y = hash_whatever(tp, self.values[i]);
+            x = (x ^ y).wrapping_mul(1405695061);
+        }
+        x
+    }
+
+    /// Alias for get_uhash.
     pub fn hash_u64(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.values.hash(&mut hasher);
-        hasher.finish()
+        self.get_uhash()
     }
 }
 
@@ -341,5 +512,24 @@ mod tests {
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
         assert_eq!(k1.hash_u64(), k2.hash_u64());
+    }
+
+    /// warmstate.py:108-112 — STR/UNICODE greens use ll_streq, not
+    /// identity. With a resolver wired, equal_whatever should treat two
+    /// distinct pointers with identical content as equal.
+    #[test]
+    fn test_green_type_str_dispatch_without_resolver() {
+        // Without a resolver the helpers fall back to pointer identity.
+        assert!(equal_whatever(GreenType::Str, 0x1000, 0x1000));
+        assert!(!equal_whatever(GreenType::Str, 0x1000, 0x1001));
+        assert_eq!(hash_whatever(GreenType::Str, 0x1000), 0x1000u64);
+    }
+
+    #[test]
+    fn test_green_type_from_type() {
+        assert_eq!(GreenType::from(Type::Int), GreenType::Int);
+        assert_eq!(GreenType::from(Type::Ref), GreenType::Ref);
+        assert_eq!(GreenType::from(Type::Float), GreenType::Float);
+        assert_eq!(GreenType::from(Type::Void), GreenType::Void);
     }
 }

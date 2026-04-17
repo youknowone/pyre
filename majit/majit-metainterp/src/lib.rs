@@ -203,12 +203,10 @@ macro_rules! conditional_call_elidable {
 ///
 /// Uses the same algorithm as [`GreenKey::hash_u64`](majit_ir::GreenKey::hash_u64),
 /// so callers can compute a key hash without constructing a full `GreenKey`.
+/// warmstate.py:584-593 `JitCell.get_uhash` — all-Int path.
 #[inline]
 pub fn green_key_hash(values: &[i64]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    values.hash(&mut hasher);
-    hasher.finish()
+    majit_ir::GreenKey::new(values.to_vec()).hash_u64()
 }
 
 // ── we_are_jitted / JIT mode flag ──
