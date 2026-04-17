@@ -115,16 +115,40 @@ impl LiveVars {
                     }
                     // Super-instructions LOAD_FAST; LOAD_FAST and
                     // LOAD_FAST_BORROW; LOAD_FAST_BORROW read two locals.
-                    // The original concern about `ConstantPool::get_or_insert`
-                    // vs `numbering_type_overrides` aliasing is no longer
-                    // reproducible — `OptContext::seed_constant` now asserts
-                    // Ref(0)/Int(0) cross-seeding, and the full dynasm
-                    // benchmark suite runs without firing it.  However,
-                    // enabling GEN here regresses spectral_norm output
-                    // (1.2742199912349301 vs expected 1.2742199912349306);
-                    // the root cause is a separate liveness-vs-regalloc /
-                    // numbering issue that needs its own diagnosis.  Leave
-                    // disabled until that regression is traced.
+                    //
+                    // Diagnosis 2026-04-17 (task #47): enabling GEN for
+                    // `LoadFastBorrowLoadFastBorrow` causes two separate
+                    // failures on spectral_norm (cranelift keeps passing,
+                    // so the bug is dynasm-side):
+                    //   (a) n=10/11/../15/28../45/55.. SIGSEGV in
+                    //       `baseobjspace::getitem` after a bridge entry
+                    //       hands the interpreter slots 4/5 = Ref(0).  The
+                    //       backward-liveness walk marks those two locals
+                    //       live at the guard's resume_pc because the
+                    //       downstream super-inst reads them; at the PC
+                    //       where the guard fires they are not yet
+                    //       initialised in Python (slot is Py_NULL), so
+                    //       the bridge re-enters with null refs.
+                    //   (b) n=100 produces 1.2742199912349301 vs expected
+                    //       1.2742199912349306 — a single-ULP deviation
+                    //       caused by the same guard carrying extra live
+                    //       slots into compilation, which shifts some
+                    //       float-op ordering in the assembled trace.
+                    // LoadFastLoadFast GEN alone does NOT regress output
+                    // (tested), and LoadFastBorrowLoadFastBorrow alone
+                    // reproduces both (a) and (b) end-to-end.
+                    //
+                    // Proper fix requires either (i) a forward-definedness
+                    // pass combined with backward liveness so that slots
+                    // are only live after their first STORE_FAST, or
+                    // (ii) dynasm guard/bridge material that tolerates
+                    // null-ref live-args (skip using them if null).
+                    // Upstream RPython avoids (a) because `-live-` markers
+                    // are emitted by the codewriter with post-store
+                    // definedness; pyre's pyre-jit-trace liveness is pure
+                    // backward.  Leave disabled; see
+                    // memory/phase3_aliasing_diagnostic_2026_04_17.md
+                    // (updated) for follow-up options.
                     // Instruction::LoadFastLoadFast { var_nums }
                     // | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
                     //     let pair = var_nums.get(op_arg);
