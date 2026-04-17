@@ -257,9 +257,15 @@ pub struct CallControl {
     /// Used for resolving `handler.method_name()` calls.
     trait_method_graphs: HashMap<(String, String), FunctionGraph>,
 
-    /// Trait bindings: method_name → Vec<impl_type>.
-    /// Tracks which types implement a given method.
-    trait_method_impls: HashMap<String, Vec<String>>,
+    /// Trait bindings: `(trait_root, method_name)` → `Vec<impl_type>`.
+    ///
+    /// Keyed by the *declaring trait* (impl's `trait_name` from
+    /// `parse.rs:237`), so two traits exposing the same method name do
+    /// not collide (RPython `call.py:94-114` indirect branch reads
+    /// `op.args[-1].value` = exact candidate graph list, not a
+    /// method-name global).  Inherent impls do not populate this map;
+    /// they use `function_graphs` directly via `[impl_type, method_name]`.
+    trait_method_impls: HashMap<(String, String), Vec<String>>,
 
     /// Candidate targets — graphs we will inline.
     /// RPython: `CallControl.candidate_graphs`.
@@ -350,6 +356,13 @@ pub struct CallControl {
     /// External functions whose calls may have random effects on GC objects.
     /// analyze_can_collect returns True immediately for these.
     pub external_gc_effects: HashSet<CallPath>,
+
+    /// RPython: `getattr(func, '_call_aroundstate_target_', None)` (call.py:252,271).
+    /// Functions wrapping aroundstate GIL release/restore logic that must
+    /// never be mixed into an indirect_call family.  Placeholder until
+    /// `#[jit_call_aroundstate_target]` attribute is ported; read by
+    /// `check_indirect_call_family`.
+    pub aroundstate_targets: HashSet<CallPath>,
 
     /// RPython: rlib/jit.py:250 `@oopspec(spec)` — `getattr(func, 'oopspec', None)`.
     /// Maps call target → oopspec string (e.g. "jit.isconstant(value)").
@@ -619,6 +632,7 @@ impl CallControl {
             cannot_collect_targets: HashSet::new(),
             close_stack_targets: HashSet::new(),
             external_gc_effects: HashSet::new(),
+            aroundstate_targets: HashSet::new(),
             oopspec_targets: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
         }
@@ -739,9 +753,15 @@ impl CallControl {
     /// CallPath so that BFS in find_all_graphs can discover it.
     /// RPython: method graphs are reachable through funcptr._obj.graph
     /// linkage — we emulate this by dual registration.
+    ///
+    /// `trait_root` identifies the declaring trait for polymorphic
+    /// resolution (inherent impls pass `None`).  Populating
+    /// `trait_method_impls` under `(trait_root, method_name)` keeps two
+    /// traits with the same method name distinct per `call.py:94-114`.
     pub fn register_trait_method(
         &mut self,
         method_name: &str,
+        trait_root: Option<&str>,
         impl_type: &str,
         graph: FunctionGraph,
     ) {
@@ -749,10 +769,12 @@ impl CallControl {
             (method_name.to_string(), impl_type.to_string()),
             graph.clone(),
         );
-        self.trait_method_impls
-            .entry(method_name.to_string())
-            .or_default()
-            .push(impl_type.to_string());
+        if let Some(trait_root) = trait_root {
+            self.trait_method_impls
+                .entry((trait_root.to_string(), method_name.to_string()))
+                .or_default()
+                .push(impl_type.to_string());
+        }
         // Register in function_graphs for BFS reachability.
         // RPython: each graph has its own identity via funcptr._obj.graph.
         // We emulate this with CallPath([impl_type, method_name]) —
@@ -1386,6 +1408,22 @@ impl CallControl {
     /// 4. `graphs_from(target) is None` → 'residual'
     /// 5. Otherwise → 'regular'
     pub fn guess_call_kind(&self, target: &CallTarget) -> CallKind {
+        // RPython `call.py:116-139` direct_call branch resolves op.args[0]'s
+        // funcobj.graph to a single CallPath; the indirect_call branch
+        // uses `graphs_from(op)` to test if any candidate is inlinable.
+        // We route `CallTarget::Indirect` here, since it has no single
+        // path and close_stack/builtin flags don't apply family-wide.
+        if let CallTarget::Indirect {
+            trait_root,
+            method_name,
+        } = target
+        {
+            return match self.graphs_from_indirect(trait_root, method_name) {
+                Some(_) => CallKind::Regular,
+                None => CallKind::Residual,
+            };
+        }
+
         // Step 1: recursive (RPython call.py:119-120)
         let path = self.target_to_path(target);
         if let Some(ref p) = path {
@@ -1434,13 +1472,19 @@ impl CallControl {
         }
         // RPython call.py:94-101: returns the actual target graph.
         // For FunctionPath: direct lookup in function_graphs.
-        // For Method: resolve_method returns the specific impl graph,
-        // NOT whatever was first registered under the synthetic path.
+        // For Method: if target_to_path resolved to a qualified
+        // `[impl_type, method_name]` that already exists in
+        // function_graphs (inherent impl, or direct graph linkage for a
+        // trait impl), return that.  Only fall through to
+        // resolve_method when the qualified path isn't registered.
         match target {
             CallTarget::Method {
                 name,
                 receiver_root,
-            } => self.resolve_method(name, receiver_root.as_deref()),
+            } => self
+                .function_graphs
+                .get(&path)
+                .or_else(|| self.resolve_method(name, receiver_root.as_deref())),
             _ => self.function_graphs.get(&path),
         }
     }
@@ -1474,6 +1518,11 @@ impl CallControl {
                 let impl_type = self.resolve_method_impl_type(name, receiver_root.as_deref())?;
                 Some(CallPath::from_segments([impl_type, name.as_str()]))
             }
+            // RPython: an `indirect_call` is a *family* of graphs — there is no
+            // single CallPath to resolve to.  `graphs_from_indirect` returns
+            // the Vec of candidates; target_to_path returns None so callers
+            // fall back to the family path.  `call.py:94-114` indirect branch.
+            CallTarget::Indirect { .. } => None,
             CallTarget::UnsupportedExpr => None,
         }
     }
@@ -1482,20 +1531,22 @@ impl CallControl {
     ///
     /// RPython: method resolution happens at the type system level.
     /// Here we resolve through the trait impl registry. If there's
-    /// exactly one impl for the method, return it. If the receiver
-    /// is a generic parameter (lowercase or single uppercase letter),
-    /// we try all known impls and return the unique one.
+    /// exactly one impl for the method (across all declaring traits),
+    /// return it.  If the receiver is a generic parameter
+    /// (lowercase or single uppercase letter), we try all known impls
+    /// and return the unique one.
     pub fn resolve_method(
         &self,
         name: &str,
         receiver_root: Option<&str>,
     ) -> Option<&FunctionGraph> {
-        let impls = self.trait_method_impls.get(name)?;
-
-        // Filter out default trait method entries (e.g. "<default methods of LocalOpcodeHandler>")
-        // — we prefer concrete impls when available.
+        let impls = self.impls_for_method_name(name);
+        if impls.is_empty() {
+            return None;
+        }
         let concrete_impls: Vec<&String> = impls
             .iter()
+            .copied()
             .filter(|t| !t.starts_with("<default methods of"))
             .collect();
 
@@ -1520,7 +1571,7 @@ impl CallControl {
         // Generic receiver with multiple concrete impls — can't resolve uniquely.
         // Fall back to default method if available.
         if concrete_impls.is_empty() && impls.len() == 1 {
-            let impl_type = &impls[0];
+            let impl_type = impls[0];
             return self
                 .trait_method_graphs
                 .get(&(name.to_string(), impl_type.clone()));
@@ -1538,27 +1589,115 @@ impl CallControl {
         name: &str,
         receiver_root: Option<&str>,
     ) -> Option<&'b str> {
-        let impls = self.trait_method_impls.get(name)?;
+        let impls = self.impls_for_method_name(name);
+        if impls.is_empty() {
+            return None;
+        }
         let concrete_impls: Vec<&String> = impls
             .iter()
+            .copied()
             .filter(|t| !t.starts_with("<default methods of"))
             .collect();
 
         if concrete_impls.len() == 1 {
-            return Some(concrete_impls[0]);
+            return Some(concrete_impls[0].as_str());
         }
         if let Some(receiver) = receiver_root {
             if !is_generic_receiver(receiver) {
                 // Find the matching impl owned by self
-                if let Some(impl_name) = impls.iter().find(|t| t.as_str() == receiver) {
-                    return Some(impl_name);
+                if let Some(impl_name) = impls.iter().copied().find(|t| t.as_str() == receiver) {
+                    return Some(impl_name.as_str());
                 }
             }
         }
         if concrete_impls.is_empty() && impls.len() == 1 {
-            return Some(&impls[0]);
+            return Some(impls[0].as_str());
         }
         None
+    }
+
+    /// Collect every registered impl type name for `method_name`, across
+    /// all declaring traits.  Used by `resolve_method` /
+    /// `resolve_method_impl_type` for concrete-receiver method calls
+    /// (RPython's `funcobj.graph` resolution).  `graphs_from_indirect`
+    /// uses the exact `(trait_root, method_name)` key instead.
+    fn impls_for_method_name<'b>(&'b self, method_name: &str) -> Vec<&'b String> {
+        self.trait_method_impls
+            .iter()
+            .filter(|((_, m), _)| m == method_name)
+            .flat_map(|(_, impls)| impls.iter())
+            .collect()
+    }
+
+    /// RPython `call.py:94-114` indirect branch: given a
+    /// `(trait_root, method_name)` key, return every `CallPath` that is
+    /// (a) registered as an impl of that trait method and (b) present
+    /// in `candidate_graphs` (`is_candidate(graph)`).  `None` if no
+    /// candidate is a regular-candidate graph — meaning the caller
+    /// should fall through to the residual path.
+    pub fn graphs_from_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<Vec<CallPath>> {
+        let impls = self
+            .trait_method_impls
+            .get(&(trait_root.to_string(), method_name.to_string()))?;
+        let mut result = Vec::new();
+        for impl_type in impls {
+            let path = CallPath::from_segments([impl_type.as_str(), method_name]);
+            if self.candidate_graphs.contains(&path) {
+                result.push(path);
+            }
+        }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    /// Collect every registered impl `CallPath` for a
+    /// `(trait_root, method_name)` family, regardless of whether each
+    /// one is a regular candidate.  Used by family-wide validation
+    /// where the goal is to reject mixed `_elidable_function_` etc.
+    /// even among residual members (`call.py:259-280`).
+    pub fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
+        self.trait_method_impls
+            .get(&(trait_root.to_string(), method_name.to_string()))
+            .into_iter()
+            .flatten()
+            .map(|impl_type| CallPath::from_segments([impl_type.as_str(), method_name]))
+            .collect()
+    }
+
+    /// RPython `call.py:259-280` — family-wide validation for indirect_call.
+    ///
+    /// Rejects a family if any member is marked `_elidable_function_` /
+    /// `_jit_loop_invariant_` / `_call_aroundstate_target_`: indirect
+    /// dispatch cannot preserve the semantics those flags require, so
+    /// upstream raises an Exception at getcalldescr time.  Returns a
+    /// formatted error message on the first mismatch.
+    pub fn check_indirect_call_family(&self, candidates: &[CallPath]) -> Result<(), String> {
+        for graph in candidates {
+            let err = if self.elidable_targets.contains(graph) {
+                Some("@jit.elidable")
+            } else if self.loopinvariant_targets.contains(graph) {
+                Some("@jit.loop_invariant")
+            } else if self.aroundstate_targets.contains(graph) {
+                Some("_call_aroundstate_target_")
+            } else {
+                None
+            };
+            if let Some(flag) = err {
+                return Err(format!(
+                    "indirect_call family includes {graph:?} marked {flag}; \
+                     every candidate in an indirect family must share the \
+                     same jit attribute"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Access the function graphs map (for inline pass).
@@ -1607,6 +1746,15 @@ impl CallControl {
     /// Mark an external target as having random GC effects.
     pub fn mark_external_gc_effects(&mut self, path: CallPath) {
         self.external_gc_effects.insert(path);
+    }
+
+    /// RPython: `getattr(func, '_call_aroundstate_target_', None)` (call.py:252).
+    /// Mark a target as `_call_aroundstate_target_` so
+    /// `check_indirect_call_family` rejects mixing it into an
+    /// indirect_call family.  Placeholder until
+    /// `#[jit_call_aroundstate_target]` attribute is ported.
+    pub fn mark_aroundstate(&mut self, path: CallPath) {
+        self.aroundstate_targets.insert(path);
     }
 
     /// RPython: collectanalyze.py:15 — `_gctransformer_hint_cannot_collect_`.
@@ -2039,6 +2187,26 @@ impl CallControl {
         extraeffect: Option<ExtraEffect>,
         cache: &mut AnalysisCache,
     ) -> CallDescriptor {
+        // RPython `call.py:259-280` — indirect_call family-wide validation.
+        //
+        //   elif op.opname == 'indirect_call':
+        //       graphs = op.args[-1].value
+        //       for graph in (graphs or ()):
+        //           if hasattr(graph.func, '_elidable_function_'): error
+        //           if hasattr(graph.func, '_jit_loop_invariant_'): error
+        //           if hasattr(graph.func, '_call_aroundstate_target_'): error
+        //           ... raise Exception("indirect call to family ...")
+        if let CallTarget::Indirect {
+            trait_root,
+            method_name,
+        } = target
+        {
+            let candidates = self.all_impls_for_indirect(trait_root, method_name);
+            if let Err(err) = self.check_indirect_call_family(&candidates) {
+                panic!("getcalldescr: {err}");
+            }
+        }
+
         // RPython call.py:239-240: extract flags
         let elidable = self.is_elidable(target);
         let loopinvariant = self.is_loopinvariant(target);
@@ -3011,6 +3179,11 @@ fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
         // be conservative.
         OpKind::Call { .. } => true,
 
+        // ── vtable entry extraction: pure memory load, no raise ──
+        // RPython: op.args[0] in indirect_call is a plain Variable,
+        // the address extraction itself has no raising analogue.
+        OpKind::FuncptrFromVtable { .. } => false,
+
         // ── Unknown ops: canraise.py:18 → True (conservative) ─────
         // RPython: log.WARNING("Unknown operation: %s" % op.opname)
         //          return True
@@ -3381,7 +3554,12 @@ mod tests {
     fn resolve_method_unique_impl() {
         let mut cc = CallControl::new();
         let graph = FunctionGraph::new("PyFrame::load_local_value");
-        cc.register_trait_method("load_local_value", "PyFrame", graph);
+        cc.register_trait_method(
+            "load_local_value",
+            Some("LocalOpcodeHandler"),
+            "PyFrame",
+            graph,
+        );
 
         // Unique impl — resolves for any receiver
         assert!(
@@ -3397,11 +3575,13 @@ mod tests {
         let mut cc = CallControl::new();
         cc.register_trait_method(
             "push_value",
+            Some("LocalOpcodeHandler"),
             "PyFrame",
             FunctionGraph::new("PyFrame::push_value"),
         );
         cc.register_trait_method(
             "push_value",
+            Some("LocalOpcodeHandler"),
             "MIFrame",
             FunctionGraph::new("MIFrame::push_value"),
         );
@@ -4194,5 +4374,118 @@ mod tests {
         cc.make_virtualizable_infos(|_, _| None);
         assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());
         assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
+    }
+
+    // ── RPython indirect_call family tests — plan §Tests ────────────
+
+    /// `guess_call_kind` for `CallTarget::Indirect`:
+    ///   ≥1 candidate impl is a regular candidate → `Regular`
+    ///   no candidate registered                 → `Residual`
+    /// RPython `call.py:116-139`.
+    #[test]
+    fn guess_call_kind_indirect() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method("run", Some("Handler"), "A", FunctionGraph::new("A::run"));
+        cc.register_trait_method("run", Some("Handler"), "B", FunctionGraph::new("B::run"));
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::indirect("Handler", "run");
+        assert_eq!(cc.guess_call_kind(&target), CallKind::Regular);
+
+        let bogus = CallTarget::indirect("Unknown", "run");
+        assert_eq!(cc.guess_call_kind(&bogus), CallKind::Residual);
+    }
+
+    /// `graphs_from_indirect` must not mix impls across traits that
+    /// share a method name.  Regression test for Issue 2.
+    /// RPython `call.py:94-114` indirect branch.
+    #[test]
+    fn graphs_from_indirect_filters_by_trait() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "bar",
+            Some("Foo"),
+            "FooImpl",
+            FunctionGraph::new("FooImpl::bar"),
+        );
+        cc.register_trait_method(
+            "bar",
+            Some("Baz"),
+            "BazImpl",
+            FunctionGraph::new("BazImpl::bar"),
+        );
+        cc.find_all_graphs_for_tests();
+
+        let foo_candidates = cc
+            .graphs_from_indirect("Foo", "bar")
+            .expect("Foo::bar family is non-empty");
+        let baz_candidates = cc
+            .graphs_from_indirect("Baz", "bar")
+            .expect("Baz::bar family is non-empty");
+
+        assert_eq!(foo_candidates.len(), 1);
+        assert_eq!(
+            foo_candidates[0].segments[0], "FooImpl",
+            "Foo::bar must not surface BazImpl: {foo_candidates:?}"
+        );
+        assert_eq!(baz_candidates.len(), 1);
+        assert_eq!(
+            baz_candidates[0].segments[0], "BazImpl",
+            "Baz::bar must not surface FooImpl: {baz_candidates:?}"
+        );
+    }
+
+    /// `getcalldescr` with mixed `@jit.elidable` vs non-elidable impls
+    /// panics to match RPython `call.py:259-280`.
+    #[test]
+    #[should_panic(expected = "indirect_call family")]
+    fn getcalldescr_rejects_mixed_elidable_family() {
+        use majit_ir::value::Type;
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "bar",
+            Some("Foo"),
+            "PureImpl",
+            FunctionGraph::new("PureImpl::bar"),
+        );
+        cc.register_trait_method(
+            "bar",
+            Some("Foo"),
+            "ImpureImpl",
+            FunctionGraph::new("ImpureImpl::bar"),
+        );
+        cc.mark_elidable(CallPath::from_segments(["PureImpl", "bar"]));
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::indirect("Foo", "bar");
+        let mut cache = AnalysisCache::default();
+        let _ = cc.getcalldescr(
+            &target,
+            vec![Type::Ref],
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+        );
+    }
+
+    /// Inherent impl (no `impl Trait for Type`) continues to resolve
+    /// via `function_graphs` and classify as `Regular`, without
+    /// populating `trait_method_impls`.
+    #[test]
+    fn inherent_method_still_direct_regression() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["Foo", "bar"]);
+        cc.register_function_graph(path.clone(), FunctionGraph::new("Foo::bar"));
+        cc.find_all_graphs_for_tests();
+
+        // Inherent impl: front-end emits `CallTarget::Method` with a
+        // concrete receiver_root.  No `trait_method_impls` entry.
+        let target = CallTarget::method("bar", Some("Foo".to_string()));
+        assert_eq!(cc.guess_call_kind(&target), CallKind::Regular);
+        assert!(
+            cc.graphs_from_indirect("Foo", "bar").is_none(),
+            "inherent impls must not appear as indirect candidates"
+        );
     }
 }

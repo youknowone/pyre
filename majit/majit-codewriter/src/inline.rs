@@ -364,6 +364,15 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             value: remap(value),
             kind_char: *kind_char,
         },
+        OpKind::FuncptrFromVtable {
+            receiver,
+            trait_root,
+            method_name,
+        } => OpKind::FuncptrFromVtable {
+            receiver: remap(receiver),
+            trait_root: trait_root.clone(),
+            method_name: method_name.clone(),
+        },
         OpKind::VableFieldRead { field_index, ty } => OpKind::VableFieldRead {
             field_index: *field_index,
             ty: ty.clone(),
@@ -482,6 +491,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             args_r,
             args_f,
             result_kind,
+            indirect_targets,
         } => OpKind::CallResidual {
             funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
@@ -489,6 +499,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             args_r: args_r.iter().map(remap).collect(),
             args_f: args_f.iter().map(remap).collect(),
             result_kind: *result_kind,
+            indirect_targets: indirect_targets.clone(),
         },
         OpKind::CallMayForce {
             funcptr,
@@ -634,6 +645,7 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         | OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![*value],
+        OpKind::FuncptrFromVtable { receiver, .. } => vec![*receiver],
         OpKind::JitDebug { args, .. } => args.clone(),
         OpKind::VableFieldRead { .. } => vec![],
         OpKind::VableFieldWrite { value, .. } => vec![*value],

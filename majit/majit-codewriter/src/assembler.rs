@@ -4,10 +4,11 @@
 //! `Assembler`. The `JitCode` struct itself lives in `crate::jitcode`
 //! (RPython parity: `rpython/jit/codewriter/jitcode.py`).
 //!
-//! **Status: partial port.** `write_insn`, `fix_labels`, and the
-//! `all_liveness` shared table are implemented in pyre-relevant subset.
-//! Full RPython parity for descriptors, `IndirectCallTargets`, and
-//! `SwitchDictDescr` is pending.
+//! **Status: partial port.** `write_insn`, `fix_labels`, the
+//! `all_liveness` shared table, and the `IndirectCallTargets` sidecar
+//! merge for `residual_call` are implemented in the pyre-relevant
+//! subset.  `SwitchDictDescr` and full RPython parity for the
+//! remaining descriptor kinds are still pending.
 
 use std::collections::HashMap;
 
@@ -28,8 +29,11 @@ pub struct Assembler {
     /// RPython: Assembler.descrs — list of descriptors.
     /// RPython stores AbstractDescr objects; pyre uses BhDescr enum.
     descrs: Vec<crate::jitcode::BhDescr>,
-    /// RPython: Assembler.indirectcalltargets — set of JitCode indices.
-    /// RPython: set of JitCode objects. In majit: set of jitcode indices.
+    /// RPython: `Assembler.indirectcalltargets` — merged `IndirectCallTargets`
+    /// sidecars from every `residual_call` emitted during assembly
+    /// (`assembler.py:208-209`).  RPython stores `JitCode` objects; we
+    /// store their jitcode indices because codewriter owns the
+    /// jitcode-index allocator.
     pub indirectcalltargets: std::collections::HashSet<usize>,
     /// RPython: Assembler.list_of_addr2name — (addr, name) pairs for debugging.
     /// In majit: (target_path, name) string pairs since we don't have raw addresses.
@@ -429,6 +433,20 @@ impl Assembler {
                 result_kind,
                 ..
             } => {
+                // RPython `assembler.py:208-209`: the sidecar
+                // `IndirectCallTargets(lst)` on a `residual_call`
+                // merges into the global `Assembler.indirectcalltargets`
+                // set so the metainterp can later look up jitcodes by
+                // funcptr address during runtime dispatch.  Only
+                // `OpKind::CallResidual` carries the sidecar today.
+                if let OpKind::CallResidual {
+                    indirect_targets: Some(t),
+                    ..
+                } = &op.kind
+                {
+                    self.indirectcalltargets
+                        .extend(t.candidates.iter().copied());
+                }
                 let base = match &op.kind {
                     OpKind::CallMayForce { .. } => "call_may_force",
                     OpKind::CallElidable { .. } => "call_elidable",
@@ -1050,6 +1068,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::CallMayForce { .. } => "call_may_force".into(),
         OpKind::InlineCall { .. } => "inline_call".into(),
         OpKind::RecursiveCall { .. } => "recursive_call".into(),
+        // RPython: no dedicated opname — the vtable entry becomes the `funcptr`
+        // Variable that `int_guard_value` + `residual_call_*` consume.
+        OpKind::FuncptrFromVtable { .. } => "funcptr_from_vtable".into(),
         OpKind::Unknown { .. } => "unknown".into(),
     }
 }

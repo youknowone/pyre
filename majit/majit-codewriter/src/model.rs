@@ -38,6 +38,14 @@ pub enum CallTarget {
     FunctionPath {
         segments: Vec<String>,
     },
+    /// RPython: `indirect_call` opname. Receiver's static type is a
+    /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
+    /// is resolved via vtable.  `trait_root` + `method_name` together
+    /// key the candidate family in `CallControl.trait_method_impls`.
+    Indirect {
+        trait_root: String,
+        method_name: String,
+    },
     UnsupportedExpr,
 }
 
@@ -59,6 +67,13 @@ impl CallTarget {
         }
     }
 
+    pub fn indirect(trait_root: impl Into<String>, method_name: impl Into<String>) -> Self {
+        Self::Indirect {
+            trait_root: trait_root.into(),
+            method_name: method_name.into(),
+        }
+    }
+
     pub fn receiver_root(&self) -> Option<&str> {
         match self {
             CallTarget::Method { receiver_root, .. } => receiver_root.as_deref(),
@@ -72,6 +87,7 @@ impl CallTarget {
             CallTarget::FunctionPath { segments } => {
                 Some(segments.iter().map(String::as_str).collect())
             }
+            CallTarget::Indirect { method_name, .. } => Some(vec![method_name.as_str()]),
             CallTarget::UnsupportedExpr => None,
         }
     }
@@ -89,9 +105,33 @@ impl fmt::Display for CallTarget {
                 receiver_root: None,
             } => f.write_str(name),
             CallTarget::FunctionPath { segments } => f.write_str(&segments.join("::")),
+            CallTarget::Indirect {
+                trait_root,
+                method_name,
+            } => write!(f, "<dyn {trait_root}>::{method_name}"),
             CallTarget::UnsupportedExpr => f.write_str("<unsupported-call-expr>"),
         }
     }
+}
+
+/// RPython `flatten.py:53-57`:
+///
+/// ```python
+/// class IndirectCallTargets(object):
+///     def __init__(self, lst):
+///         self.lst = lst       # list of JitCodes
+/// ```
+///
+/// Sidecar attached to `OpKind::CallResidual` when the residual call is the
+/// tail of a regular-indirect lowering (`jtransform.py:547`).  The assembler
+/// merges `candidates` into `Assembler.indirectcalltargets` so the metainterp
+/// can later look up jitcodes by function-pointer address during runtime
+/// dispatch (`pyjitpl.py:2325-2343`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IndirectCallTargets {
+    /// JitCode indices of every candidate impl in the `(trait, method)`
+    /// family.
+    pub candidates: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -186,6 +226,21 @@ pub enum OpKind {
         /// 'i', 'r', or 'f' — the kind of the guarded value.
         kind_char: char,
     },
+    /// Extract the function-pointer address from a `dyn Trait` receiver's
+    /// vtable for a given method slot.  The produced value is integer-typed
+    /// and is the input to `int_guard_value` in `handle_regular_indirect_call`,
+    /// matching RPython's `op.args[0]` which is a plain `Ptr(FuncType)`
+    /// (`jtransform.py:546`).
+    ///
+    /// Rust lowering detail: `dyn Trait` is a fat pointer `(data, vtable)`.
+    /// This op reads the method entry from the `vtable` half; `int_guard_value`
+    /// then pins the function address, which is a stable 1:1 function-of-type
+    /// identity (unlike the data half, which is object identity).
+    FuncptrFromVtable {
+        receiver: ValueId,
+        trait_root: String,
+        method_name: String,
+    },
     /// Virtualizable field read → reads from boxes, no heap op.
     /// RPython: `getfield_vable_i/r/f`
     VableFieldRead {
@@ -265,6 +320,9 @@ pub enum OpKind {
     /// RPython: `residual_call_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
     /// `funcptr` mirrors `op.args[0]` (the function-pointer Variable);
     /// `descriptor` carries the calldescr-equivalent EffectInfo.
+    /// `indirect_targets` mirrors the `IndirectCallTargets(lst)` sidecar
+    /// that RPython appends to the extraargs for an indirect_call family
+    /// (`jtransform.py:547`).  `None` for direct-call lowering.
     CallResidual {
         funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
@@ -272,6 +330,7 @@ pub enum OpKind {
         args_r: Vec<ValueId>,
         args_f: Vec<ValueId>,
         result_kind: char,
+        indirect_targets: Option<IndirectCallTargets>,
     },
     /// May-force call — can trigger GC or force virtualizables.
     /// RPython: `call_may_force_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
@@ -524,6 +583,26 @@ impl FunctionGraph {
         let id = ValueId(self.next_value);
         self.next_value += 1;
         id
+    }
+
+    /// Read-only view of the ValueId allocator cursor.  Used by passes
+    /// that need to mint fresh ValueIds outside the graph (e.g.
+    /// `Transformer::allocate_synthetic_value` in `jtransform.rs`).
+    pub fn next_value(&self) -> usize {
+        self.next_value
+    }
+
+    /// Re-seat the ValueId allocator cursor.  Must be called after a
+    /// pass that synthesized values outside the graph so subsequent
+    /// `alloc_value()` calls do not collide.
+    pub fn set_next_value(&mut self, next: usize) {
+        debug_assert!(
+            next >= self.next_value,
+            "set_next_value must not walk the cursor backward: {} -> {}",
+            self.next_value,
+            next,
+        );
+        self.next_value = next;
     }
 
     pub fn push_op(&mut self, block: BlockId, kind: OpKind, has_result: bool) -> Option<ValueId> {

@@ -546,6 +546,12 @@ struct GraphBuildContext<'a> {
     /// This is the Rust equivalent of RPython's `GcArray(T)` where T is the
     /// element type that determines the ARRAY identity for `cpu.arraydescrof()`.
     local_array_types: HashMap<String, String>,
+    /// Receiver-trait lookup for locals/parameters bound to `&mut dyn T`
+    /// / `&dyn T` / `Box<dyn T>` / `dyn T`.  Populated at let-statement
+    /// and fn-parameter binding time; consumed by `dyn_trait_for_receiver`
+    /// so method-call lowering can emit `CallTarget::Indirect`
+    /// (`jtransform.py:410-412`).
+    local_dyn_trait_roots: HashMap<String, String>,
     /// RPython: program-level struct field types, available for resolving
     /// field access array identity (e.g. `self.array[i]` → owner.field_type).
     struct_fields: &'a StructFieldRegistry,
@@ -570,6 +576,7 @@ impl<'a> GraphBuildContext<'a> {
         Self {
             local_type_roots: HashMap::new(),
             local_array_types: HashMap::new(),
+            local_dyn_trait_roots: HashMap::new(),
             struct_fields,
             fn_return_types,
             module_prefix: module_prefix.to_string(),
@@ -628,6 +635,9 @@ fn build_function_graph(
                     ctx.known_struct_names,
                 ) {
                     ctx.local_array_types.insert(name.clone(), full_type);
+                }
+                if let Some(trait_root) = extract_dyn_trait_root(&pat_type.ty) {
+                    ctx.local_dyn_trait_roots.insert(name.clone(), trait_root);
                 }
                 if let Some(vid) = graph.push_op(
                     entry,
@@ -761,6 +771,9 @@ fn lower_stmt(
                     ctx.known_struct_names,
                 ) {
                     ctx.local_array_types.insert(name.clone(), full_type);
+                }
+                if let Some(trait_root) = extract_dyn_trait_root(&pat_type.ty) {
+                    ctx.local_dyn_trait_roots.insert(name.clone(), trait_root);
                 }
             }
             if let Some(init) = &local.init {
@@ -986,13 +999,20 @@ fn lower_expr(
                     args.push(v);
                 }
             }
+            // RPython `jtransform.py:410-412`: a polymorphic receiver
+            // (dyn Trait) lowers to `indirect_call`, not `direct_call`.
+            // Detect via the collected local_dyn_trait_roots map so
+            // locals / params / Box<dyn> receivers all participate
+            // (Issue 3 coverage).
+            let target = if let Some(trait_root) = dyn_trait_root_for_receiver(&mc.receiver, ctx) {
+                CallTarget::indirect(trait_root, mc.method.to_string())
+            } else {
+                CallTarget::method(mc.method.to_string(), receiver_type_root(&mc.receiver, ctx))
+            };
             graph.push_op(
                 *block,
                 OpKind::Call {
-                    target: CallTarget::method(
-                        mc.method.to_string(),
-                        receiver_type_root(&mc.receiver, ctx),
-                    ),
+                    target,
                     args,
                     result_ty: ValueType::Unknown,
                 },
@@ -1493,6 +1513,53 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
     }
 }
 
+/// Return the trait root when the receiver's static type is a
+/// `dyn Trait` (including `&dyn T` / `&mut dyn T` / `Box<dyn T>`),
+/// otherwise `None`.  Looks up local/parameter bindings via
+/// `ctx.local_dyn_trait_roots`, and for chained method-call receivers
+/// consults `fn_return_types` to see whether the inner call returns
+/// a trait object.
+fn dyn_trait_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
+    match expr {
+        // Local/parameter bound to `dyn Trait` — directly mapped in
+        // `local_dyn_trait_roots`.
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .and_then(|ident| ctx.local_dyn_trait_roots.get(&ident.to_string()).cloned()),
+        // Strip wrappers that don't change the static type's trait-ness.
+        syn::Expr::Reference(reference) => dyn_trait_root_for_receiver(&reference.expr, ctx),
+        syn::Expr::Paren(paren) => dyn_trait_root_for_receiver(&paren.expr, ctx),
+        syn::Expr::Group(group) => dyn_trait_root_for_receiver(&group.expr, ctx),
+        // Chained `x.foo().bar()` — look up `x.foo`'s declared return
+        // type and check for a leading `dyn ` qualifier.
+        syn::Expr::MethodCall(mc) => {
+            let owner = receiver_type_root(&mc.receiver, ctx)?;
+            let key = format!("{}::{}", owner, mc.method);
+            let ret = ctx.fn_return_types.get(&key)?;
+            let trimmed = ret.trim();
+            trimmed.strip_prefix("dyn ").map(|s| s.trim().to_string())
+        }
+        // Chained `foo().bar()` — free function return type.
+        syn::Expr::Call(call) => {
+            if let syn::Expr::Path(p) = &*call.func {
+                let key = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let ret = ctx.fn_return_types.get(&key)?;
+                let trimmed = ret.trim();
+                return trimmed.strip_prefix("dyn ").map(|s| s.trim().to_string());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn canonical_pat_name(pat: &syn::Pat) -> String {
     match pat {
         syn::Pat::Ident(ident) => ident.ident.to_string(),
@@ -1532,6 +1599,23 @@ fn canonical_pat_name(pat: &syn::Pat) -> String {
 fn type_root_ident(ty: &syn::Type) -> Option<String> {
     match ty {
         syn::Type::Path(path) => {
+            // `Box<dyn Trait>` / `Rc<dyn Trait>` / `Arc<dyn Trait>` —
+            // unwrap the first generic arg and try again; the resulting
+            // root identifies the trait, not the container.
+            if let Some(last) = path.path.segments.last() {
+                let wrapper = last.ident.to_string();
+                if matches!(wrapper.as_str(), "Box" | "Rc" | "Arc") {
+                    if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                        for arg in &args.args {
+                            if let syn::GenericArgument::Type(inner) = arg {
+                                if let Some(root) = type_root_ident(inner) {
+                                    return Some(root);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let segments: Vec<_> = path
                 .path
                 .segments
@@ -1547,6 +1631,61 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
         syn::Type::Reference(reference) => type_root_ident(&reference.elem),
         syn::Type::Paren(paren) => type_root_ident(&paren.elem),
         syn::Type::Group(group) => type_root_ident(&group.elem),
+        // `dyn Trait + 'a` / `&mut dyn Trait` (after deref) — return the
+        // first trait bound's last segment, rendered as `dyn <Trait>` so
+        // callers can tell this is a trait object.
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+        }
+        syn::Type::ImplTrait(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+        }
+        _ => None,
+    }
+}
+
+/// Extract the declaring trait name from a `dyn T + 'a` bound list:
+/// returns the first `T::Trait`-style bound's last segment.
+/// Used by `type_root_ident` / `full_type_string` / `extract_dyn_trait_root`
+/// to identify the indirect-call family key.
+fn trait_object_root_name(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+) -> Option<String> {
+    bounds.iter().find_map(|b| match b {
+        syn::TypeParamBound::Trait(t) => t.path.segments.last().map(|seg| seg.ident.to_string()),
+        _ => None,
+    })
+}
+
+/// Returns the bare trait root (no `dyn ` prefix) when `ty` denotes a
+/// `dyn Trait` / `&dyn Trait` / `Box<dyn Trait>` receiver; `None`
+/// otherwise.  Used by method-call lowering to decide whether the call
+/// should be modeled as an RPython `indirect_call`
+/// (`rewrite_op_indirect_call` entrypoint).
+pub fn extract_dyn_trait_root(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::TraitObject(obj) => trait_object_root_name(&obj.bounds),
+        syn::Type::ImplTrait(obj) => trait_object_root_name(&obj.bounds),
+        syn::Type::Reference(r) => extract_dyn_trait_root(&r.elem),
+        syn::Type::Paren(p) => extract_dyn_trait_root(&p.elem),
+        syn::Type::Group(g) => extract_dyn_trait_root(&g.elem),
+        syn::Type::Path(path) => {
+            // `Box<dyn Trait>` / `Rc<dyn Trait>` / `Arc<dyn Trait>`.
+            let last = path.path.segments.last()?;
+            if !matches!(last.ident.to_string().as_str(), "Box" | "Rc" | "Arc") {
+                return None;
+            }
+            if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                for arg in &args.args {
+                    if let syn::GenericArgument::Type(inner) = arg {
+                        if let Some(r) = extract_dyn_trait_root(inner) {
+                            return Some(r);
+                        }
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1591,6 +1730,12 @@ pub fn full_type_string(ty: &syn::Type) -> Option<String> {
         syn::Type::Paren(p) => full_type_string(&p.elem),
         syn::Type::Group(g) => full_type_string(&g.elem),
         syn::Type::Slice(s) => full_type_string(&s.elem).map(|t| format!("[{}]", t)),
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+        }
+        syn::Type::ImplTrait(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+        }
         // RPython: ARRAY identity preserves full type including length.
         // [Point; 4] and [Point; 8] are different ARRAY types.
         syn::Type::Array(a) => {
@@ -1680,6 +1825,12 @@ pub(crate) fn qualified_full_type_string(
                 _ => "N".to_string(),
             };
             Some(format!("[{};{}]", elem, len_str))
+        }
+        syn::Type::TraitObject(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
+        }
+        syn::Type::ImplTrait(obj) => {
+            trait_object_root_name(&obj.bounds).map(|r| format!("dyn {r}"))
         }
         _ => None,
     }
@@ -2082,5 +2233,50 @@ mod tests {
             })
             .expect("unary op");
         assert_eq!(op, "neg");
+    }
+
+    /// RPython `jtransform.py:410-412`: `dyn Trait` receivers from
+    /// parameter bindings and `Box<dyn Trait>` locals must lower to
+    /// `CallTarget::Indirect`, not to `CallTarget::Method`.
+    /// Covers Issue 3 (detection too narrow).
+    #[test]
+    fn dyn_trait_receiver_detection_local_binding() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn call_via_param(h: &mut dyn Handler) {
+                h.run();
+            }
+            fn call_via_box_local() {
+                let h: Box<dyn Handler> = make_handler();
+                h.run();
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+
+        for func in &program.functions {
+            let graph = &func.graph;
+            let saw_indirect = graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|op| match &op.kind {
+                    OpKind::Call {
+                        target:
+                            CallTarget::Indirect {
+                                trait_root,
+                                method_name,
+                            },
+                        ..
+                    } => trait_root == "Handler" && method_name == "run",
+                    _ => false,
+                });
+            assert!(
+                saw_indirect,
+                "expected CallTarget::Indirect in {}, got {:?}",
+                func.graph.name,
+                graph.block(graph.startblock).operations
+            );
+        }
     }
 }

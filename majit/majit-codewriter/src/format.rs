@@ -237,6 +237,10 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
         CallTarget::FunctionPath { segments } => {
             format!("$<* function '{}'>", segments.join("."))
         }
+        CallTarget::Indirect {
+            trait_root,
+            method_name,
+        } => format!("$<* indirect 'dyn {trait_root}::{method_name}'>"),
         CallTarget::UnsupportedExpr => "$<unsupported call target>".to_string(),
     }
 }
@@ -561,6 +565,7 @@ mod tests {
                 args_r: vec![ValueId(2)],
                 args_f: vec![],
                 result_kind: 'i',
+                indirect_targets: None,
             },
             result: Some(ValueId(3)),
         }));

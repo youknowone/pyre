@@ -314,9 +314,23 @@ fn analyze_pipeline_from_parsed(
             .self_ty_root
             .as_deref()
             .unwrap_or(&impl_info.for_type);
+        // RPython parity: `trait_root=Some(trait_name)` for real trait impls,
+        // `None` for inherent impls (impl SomeType { ... } without `for Trait`).
+        // `parse.rs:237` always writes `trait_name`; a sentinel empty string
+        // from the inherent branch (see parse.rs:357-389) needs special-casing.
+        let trait_root = if impl_info.trait_name.is_empty() {
+            None
+        } else {
+            Some(impl_info.trait_name.as_str())
+        };
         for method in &impl_info.methods {
             if let Some(graph) = &method.graph {
-                call_control.register_trait_method(&method.name, impl_type, graph.clone());
+                call_control.register_trait_method(
+                    &method.name,
+                    trait_root,
+                    impl_type,
+                    graph.clone(),
+                );
             }
             // RPython: op.result.concretetype for trait/default method calls.
             let path = crate::parse::CallPath::from_segments([impl_type, method.name.as_str()]);
@@ -1788,9 +1802,19 @@ mod tests {
                 .self_ty_root
                 .as_deref()
                 .unwrap_or(&impl_info.for_type);
+            let trait_root = if impl_info.trait_name.is_empty() {
+                None
+            } else {
+                Some(impl_info.trait_name.as_str())
+            };
             for method in &impl_info.methods {
                 if let Some(graph) = &method.graph {
-                    call_control.register_trait_method(&method.name, impl_type, graph.clone());
+                    call_control.register_trait_method(
+                        &method.name,
+                        trait_root,
+                        impl_type,
+                        graph.clone(),
+                    );
                 }
             }
         }
