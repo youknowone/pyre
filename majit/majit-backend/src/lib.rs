@@ -639,7 +639,14 @@ impl std::fmt::Debug for LoopVersionInfo {
 ///
 /// Runtime frame depth/size carried on each `CompiledLoopToken`. Mutated
 /// in-place via `update_frame_depth` when bridges extend the frame layout.
+///
+/// `#[repr(C)]` pins the `[jfi_frame_depth, jfi_frame_size]` field order so
+/// the rewriter's `CallAssemblerCalleeLocs.frame_info_ptr` can pass the
+/// struct's raw address to generated code that loads `jfi_frame_depth` /
+/// `jfi_frame_size` at fixed offsets — matching RPython `jitframe.py:30-40`
+/// (lltype-allocated, stable-layout struct).
 #[derive(Debug, Default)]
+#[repr(C)]
 pub struct JitFrameInfo {
     /// `jitframe.py:33` `('jfi_frame_depth', lltype.Signed)`.
     pub jfi_frame_depth: i64,
