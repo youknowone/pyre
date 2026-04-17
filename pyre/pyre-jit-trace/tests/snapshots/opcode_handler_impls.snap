@@ -1,3 +1,7 @@
+---
+source: pyre/pyre-jit-trace/tests/trait_impls_snapshot.rs
+expression: assembled
+---
 // `OpcodeHandler` trait impls for `MIFrame` — variant section, part 1.
 //
 // `pyre/pyre-jit-trace/build.rs` assembles `OUT_DIR/jit_trace_trait_impls.rs`
