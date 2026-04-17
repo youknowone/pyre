@@ -1148,10 +1148,18 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
-    // jitcode.py:18: jitdriver_sd is not None for portals.
-    // Inline check matches JitCode.is_portal set by codewriter.
-    // Cannot call codewriter::is_portal() here as it triggers
-    // lazy jitcode compilation which interferes with JIT state.
+    // jitcode.py:18: `jitcode.jitdriver_sd is not None` for portals.
+    //
+    // PRE-EXISTING-ADAPTATION: the obvious port is
+    // `codewriter::is_portal(code)` which tests whether the CodeObject
+    // has any `JUMP_BACKWARD` targets — the exact condition that
+    // `transform_graph_to_jitcode` uses to set `jitdriver_sd`. Routing
+    // through that helper here, however, makes module-level code
+    // (`<module>`) with a hot top-level loop qualify as a portal, which
+    // regresses `fib_recursive`/`nbody`/`list_*` benchmarks through
+    // jit_merge_point_keyed paths that expect function-scope frames.
+    // Until the portal/interpreter split is ported to pyre's dispatch,
+    // the module-level code is excluded by name.
     let is_portal: bool = &*code.obj_name != "<module>";
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.

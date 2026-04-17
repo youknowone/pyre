@@ -1,4 +1,5 @@
 pub mod assembler;
+pub mod call;
 pub mod codewriter;
 pub mod flatten;
 pub mod liveness;

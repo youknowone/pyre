@@ -51,11 +51,11 @@ fn local_to_vable_slot(var_num: usize) -> usize {
 /// JitCode PCs. Pyre translates CPython bytecode to JitCode lazily, so the
 /// translation maps live here instead of polluting the canonical JitCode.
 pub struct PyJitCodeMetadata {
-    /// py_pc → jitcode byte offset.
+    /// py_pc → jitcode byte offset. Named for RPython's `frame.pc →
+    /// jitcode position` flow; `set_majit_jitcode` clones this into
+    /// `state::JitCode.py_to_jit_pc` so the `pyjitpl` side can look up
+    /// without touching the pyre-jit codewriter crate.
     pub pc_map: Vec<usize>,
-    /// py_pc → jitcode byte offset, named for consumers that mirror RPython's
-    /// frame.pc → jitcode position flow.
-    pub py_to_jit_pc: Vec<usize>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
     /// Register allocated for the portal's frame red argument.
@@ -134,23 +134,26 @@ impl PyJitCode {
 
 /// Compiles Python CodeObjects into JitCode for blackhole execution.
 ///
-/// RPython: CodeWriter class in codewriter/codewriter.py.
-/// `codewriter.py:20-23` stores `self.assembler = Assembler()` once on
-/// the CodeWriter and reuses it across every `transform_graph_to_jitcode`
-/// call so `all_liveness` / `num_liveness_ops` accumulate over the
-/// whole translator session. pyre mirrors that ownership via the
-/// `RefCell<Assembler>` field below: the thread-local
-/// `with_codewriter(...)` accessor hands out a single long-lived
-/// instance, so every compiled jitcode in a thread's lifetime shares
-/// the same `Assembler` and its per-kind counters actually accumulate.
+/// RPython: `rpython/jit/codewriter/codewriter.py::CodeWriter`.
+/// `codewriter.py:20-23` stores `self.assembler = Assembler()` and
+/// `self.callcontrol = CallControl(cpu, jitdrivers_sd)` once on the
+/// CodeWriter and reuses them across every `transform_graph_to_jitcode`
+/// call so `all_liveness` / `num_liveness_ops` and the `jitcodes` dict
+/// accumulate over the whole translator session.
+///
+/// pyre mirrors that ownership via a per-thread singleton: the process
+/// holds a single `CodeWriter` instance (one per thread) reachable via
+/// [`CodeWriter::instance`], matching `warmspot.py:245`
+/// `codewriter = CodeWriter(cpu, [jd])`. The owned `Assembler` lives on
+/// a `RefCell<Assembler>` field so `transform_graph_to_jitcode` can
+/// still mutate it under the immutable-by-default singleton borrow.
 pub struct CodeWriter {
-    /// Blackhole helper function pointers, registered once.
+    /// Blackhole helper function pointers.
     ///
-    /// RPython: CallControl manages these via callinfocollection.
-    /// In pyre, we store the concrete function pointers that the
-    /// BlackholeInterpreter calls through JitCode.fn_ptrs.
+    /// RPython: `CallControl.cpu` supplies these via `callinfocollection`.
+    /// pyre embeds them directly on the CodeWriter since pyre has no
+    /// `cpu` struct yet.
     /// bhimpl_residual_call: per-arity call helpers.
-    /// Parent frame via BH_VABLE_PTR thread-local.
     /// call_fn_0(callable) ... call_fn_8(callable, a0..a7).
     pub call_fn: extern "C" fn(i64, i64) -> i64,
     pub call_fn_0: extern "C" fn(i64) -> i64,
@@ -181,22 +184,22 @@ pub struct CodeWriter {
     /// call on this CodeWriter. `all_liveness` / `all_liveness_positions` /
     /// `num_liveness_ops` accumulate here just like the upstream object.
     assembler: RefCell<Assembler>,
+    /// RPython: `self.callcontrol = CallControl(cpu, jitdrivers_sd)`
+    /// (codewriter.py:23). Owned in a `UnsafeCell` so `&CodeWriter` can
+    /// mint `&mut CallControl` through [`Self::callcontrol`] — matches
+    /// the legacy `JITCODE_CACHE` interior-mutability contract.
+    callcontrol: UnsafeCell<super::call::CallControl>,
 }
 
 impl CodeWriter {
-    pub fn new(
-        call_fn: extern "C" fn(i64, i64) -> i64,
-        load_global_fn: extern "C" fn(i64, i64, i64) -> i64,
-        compare_fn: extern "C" fn(i64, i64, i64) -> i64,
-        binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
-        box_int_fn: extern "C" fn(i64) -> i64,
-        truth_fn: extern "C" fn(i64) -> i64,
-        load_const_fn: extern "C" fn(i64, i64) -> i64,
-        store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
-        build_list_fn: extern "C" fn(i64, i64, i64) -> i64,
-    ) -> Self {
+    /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py:20-23).
+    ///
+    /// Phase A: the cpu helpers are fixed module-level functions in
+    /// `crate::call_jit`; Phase D.2 wired `callcontrol` as a field so
+    /// `writer.callcontrol()` matches `self.callcontrol` in upstream.
+    pub fn new() -> Self {
         Self {
-            call_fn,
+            call_fn: crate::call_jit::bh_call_fn,
             call_fn_0: crate::call_jit::bh_call_fn_0,
             call_fn_2: crate::call_jit::bh_call_fn_2,
             call_fn_3: crate::call_jit::bh_call_fn_3,
@@ -205,16 +208,46 @@ impl CodeWriter {
             call_fn_6: crate::call_jit::bh_call_fn_6,
             call_fn_7: crate::call_jit::bh_call_fn_7,
             call_fn_8: crate::call_jit::bh_call_fn_8,
-            load_global_fn,
-            compare_fn,
-            binary_op_fn,
-            box_int_fn,
-            truth_fn,
-            load_const_fn,
-            store_subscr_fn,
-            build_list_fn,
+            load_global_fn: crate::call_jit::bh_load_global_fn,
+            compare_fn: crate::call_jit::bh_compare_fn,
+            binary_op_fn: crate::call_jit::bh_binary_op_fn,
+            box_int_fn: crate::call_jit::bh_box_int_fn,
+            truth_fn: crate::call_jit::bh_truth_fn,
+            load_const_fn: crate::call_jit::bh_load_const_fn,
+            store_subscr_fn: crate::call_jit::bh_store_subscr_fn,
+            build_list_fn: crate::call_jit::bh_build_list_fn,
             assembler: RefCell::new(Assembler::new()),
+            callcontrol: UnsafeCell::new(super::call::CallControl::new()),
         }
+    }
+
+    /// RPython: `self.callcontrol` (codewriter.py:23).
+    ///
+    /// Returns a mutable reference to the owned `CallControl`. Safe under
+    /// the same invariant as the legacy `JITCODE_CACHE` thread_local: the
+    /// caller must not re-enter `callcontrol()` while the returned borrow
+    /// is live.
+    #[allow(clippy::mut_from_ref)]
+    pub fn callcontrol(&self) -> &mut super::call::CallControl {
+        // SAFETY: `CodeWriter` is only accessed via `instance()` which
+        // returns a thread-local reference; all callers execute on the
+        // owning thread.
+        unsafe { &mut *self.callcontrol.get() }
+    }
+
+    /// Access the process-wide single `CodeWriter` — analog of the
+    /// single `codewriter` owned by `warmspot.py:245-281` for the
+    /// lifetime of the JIT.
+    ///
+    /// Implemented as a per-thread singleton: pyre's JIT currently runs
+    /// one interpreter per thread and function pointers in `Self` are
+    /// `Sync`, so a thread-local provides the RPython "one CodeWriter
+    /// per warmspot" invariant without a global lock.
+    pub fn instance() -> &'static CodeWriter {
+        thread_local! {
+            static INSTANCE: CodeWriter = CodeWriter::new();
+        }
+        INSTANCE.with(|cw| unsafe { &*(cw as *const CodeWriter) })
     }
 
     /// Transform a Python CodeObject into a JitCode.
@@ -349,19 +382,8 @@ impl CodeWriter {
         // `jump_absolute` Python wrapper — the equivalent is to pre-scan
         // `JumpBackward` opcodes and record their targets; each target PC
         // becomes a `loop_header` site.
-        let mut loop_header_pcs: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        {
-            let mut scan_state = OpArgState::default();
-            for scan_pc in 0..num_instrs {
-                let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
-                if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
-                    if target < num_instrs {
-                        loop_header_pcs.insert(target);
-                    }
-                }
-            }
-        }
+        let loop_header_pcs = find_loop_header_pcs(code);
+
         // Exception table: handler target PC → handler stack depth.
         // Python sets the stack depth to handler.depth (+1 if push_lasti)
         // at exception handler entry. Used to correct current_depth at
@@ -437,23 +459,18 @@ impl CodeWriter {
             };
         }
 
-        // B6 Phase 3b dual emission for `abort_permanent`.
-        // PRE-EXISTING-ADAPTATION: the opname does not appear in
-        // `rpython/jit/codewriter/` or `rpython/jit/metainterp/`. RPython
-        // simply refuses to build jitcode for bytecodes it cannot
-        // translate (the translator surfaces the failure at build time),
-        // whereas pyre must always produce runnable jitcode because
-        // bytecode translation is lazy at runtime. The pyre-only
-        // `abort_permanent` opcode emits a `BC_ABORT_PERMANENT` entry
-        // that falls the blackhole interpreter back to CPython evaluation
-        // for any bytecode the jit cannot trace. The assembler dispatch
-        // (`assembler.rs:388`) already accepts the opname.
-        macro_rules! emit_abort_permanent {
-            ($ssarepr:expr, $asm:expr) => {{
-                $ssarepr.insns.push(Insn::op("abort_permanent", Vec::new()));
-                $asm.abort_permanent();
-            }};
-        }
+        // PRE-EXISTING-ADAPTATION: the `BC_ABORT_PERMANENT` runtime
+        // bytecode does not appear in `rpython/jit/codewriter/` or
+        // `rpython/jit/metainterp/`. RPython refuses to build jitcode for
+        // bytecodes it cannot translate (the translator surfaces the
+        // failure at build time); pyre must always produce runnable
+        // jitcode because bytecode translation is lazy at runtime. We
+        // therefore keep the runtime-side adaptation (assembler emits
+        // `BC_ABORT_PERMANENT` so the blackhole interpreter falls back to
+        // CPython evaluation) but never surface the pyre-only opname into
+        // the RPython-parity SSARepr layer — `flatten.py:106` uses plain
+        // `Label` for loop headers and `assembler.py:159` does not encode
+        // unsupported bytecodes as named opnames.
 
         // B6 Phase 3b dual emission for `last_exc_value`. RPython parity:
         // `flatten.py:347` `self.emitline("last_exc_value", "->",
@@ -473,23 +490,17 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `jump_target`.
-        // PRE-EXISTING-ADAPTATION: the opname does not appear in
-        // `rpython/jit/codewriter/`. RPython marks loop-header block
-        // entries with a plain `Insn::Label` and lets the blackhole's
-        // dispatch loop recognise them via the label position; pyre
-        // emits a dedicated `BC_JUMP_TARGET` opcode so the runtime
-        // inner-loop can cheaply identify back-edge targets without
-        // consulting a label table. The SSARepr carries the pyre-only
-        // `jump_target` opname so the Phase 3c switchover can reproduce
-        // the same bytecode; the assembler dispatch arm
-        // (`assembler.rs:367-372`) already accepts it.
-        macro_rules! emit_jump_target {
-            ($ssarepr:expr, $asm:expr) => {{
-                $ssarepr.insns.push(Insn::op("jump_target", Vec::new()));
-                $asm.jump_target();
-            }};
-        }
+        // PRE-EXISTING-ADAPTATION: the `BC_JUMP_TARGET` runtime opcode
+        // does not appear in `rpython/jit/codewriter/`. RPython marks
+        // loop-header block entries with a plain `Insn::Label` and lets
+        // the blackhole's dispatch loop recognise them via the label
+        // position; pyre emits a dedicated `BC_JUMP_TARGET` opcode so the
+        // runtime inner-loop can cheaply identify back-edge targets
+        // without consulting a label table. The runtime-side adaptation
+        // stays (assembler dispatch at `assembler.rs:367-372`) but the
+        // pyre-only opname is not surfaced into the RPython-parity
+        // SSARepr layer — `flatten.py:106` uses plain `Label` for loop
+        // headers.
 
         // B6 Phase 3b dual emission for `int_copy` / `ref_copy` /
         // `float_copy` with a Constant source. RPython parity:
@@ -1257,7 +1268,7 @@ impl CodeWriter {
                     // extern "C" fn with that many i64 parameters.
                     // nargs > 8 → abort_permanent (no matching helper).
                     if nargs > 8 {
-                        emit_abort_permanent!(ssarepr, assembler);
+                        assembler.abort_permanent();
                     } else {
                         let fn_idx = match nargs {
                             0 => call_fn_0_idx,
@@ -1430,7 +1441,7 @@ impl CodeWriter {
 
                 Instruction::Reraise { .. } => {
                     // Exception path: abort_permanent.
-                    emit_abort_permanent!(ssarepr, assembler);
+                    assembler.abort_permanent();
                 }
 
                 Instruction::Copy { i } => {
@@ -1444,7 +1455,7 @@ impl CodeWriter {
                         // COPY(d>1): exception handler pattern only.
                         // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
                         // doesn't trigger the has_abort(BC_ABORT=13) check.
-                        emit_abort_permanent!(ssarepr, assembler);
+                        assembler.abort_permanent();
                     }
                 }
 
@@ -1452,7 +1463,7 @@ impl CodeWriter {
                 | Instruction::StoreName { .. }
                 | Instruction::MakeFunction { .. } => {
                     // Module-level only: abort_permanent (won't block blackhole).
-                    emit_abort_permanent!(ssarepr, assembler);
+                    assembler.abort_permanent();
                 }
 
                 // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
@@ -1492,7 +1503,7 @@ impl CodeWriter {
                 // underflow.
                 Instruction::UnpackSequence { count } => {
                     let n = count.get(op_arg) as u16;
-                    emit_abort_permanent!(ssarepr, assembler);
+                    assembler.abort_permanent();
                     // Stack effect: pop 1 + push n = net (n - 1)
                     if current_depth > 0 {
                         current_depth -= 1;
@@ -1506,19 +1517,19 @@ impl CodeWriter {
                 // don't underflow.
                 Instruction::GetIter => {
                     // pop iterable, push iterator: net 0
-                    emit_abort_permanent!(ssarepr, assembler);
+                    assembler.abort_permanent();
                 }
 
                 Instruction::ForIter { .. } => {
                     // push next item: net +1
-                    emit_abort_permanent!(ssarepr, assembler);
+                    assembler.abort_permanent();
                     current_depth += 1;
                     emit_vsd!(assembler, current_depth);
                 }
 
                 Instruction::EndFor => {
                     // pop iterator + last value: net -2
-                    emit_abort_permanent!(ssarepr, assembler);
+                    assembler.abort_permanent();
                     current_depth = current_depth.saturating_sub(2);
                     // No emit_vsd: after abort_permanent, depth is
                     // simulation-only for subsequent compile-time tracking.
@@ -1532,7 +1543,7 @@ impl CodeWriter {
 
                 // Unsupported instruction: abort_permanent.
                 _other => {
-                    emit_abort_permanent!(ssarepr, assembler);
+                    assembler.abort_permanent();
                 }
             }
             if let Some(catch_label) = catch_for_pc[py_pc] {
@@ -1699,8 +1710,7 @@ impl CodeWriter {
         jitcode.fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
 
         let metadata = PyJitCodeMetadata {
-            pc_map: pc_map.clone(),
-            py_to_jit_pc: pc_map.clone(),
+            pc_map,
             depth_at_py_pc: depth_at_pc,
             portal_frame_reg,
             portal_ec_reg,
@@ -1716,17 +1726,61 @@ impl CodeWriter {
         }
     }
 
-    /// RPython: CodeWriter.make_jitcodes() — compile all reachable graphs.
+    /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
     ///
-    /// For pyre, JitCodes are compiled lazily per-CodeObject (not AOT).
-    /// This method compiles a single CodeObject and caches the result.
-    pub fn make_jitcode(
-        &self,
-        code: &CodeObject,
-        w_code: *const (),
-        merge_point_pc: Option<usize>,
-    ) -> PyJitCode {
-        self.transform_graph_to_jitcode(code, w_code, merge_point_pc)
+    /// ```python
+    /// def make_jitcodes(self, verbose=False):
+    ///     self.callcontrol.grab_initial_jitcodes()
+    ///     count = 0
+    ///     all_jitcodes = []
+    ///     for graph, jitcode in self.callcontrol.enum_pending_graphs():
+    ///         self.transform_graph_to_jitcode(graph, jitcode, verbose, len(all_jitcodes))
+    ///         all_jitcodes.append(jitcode)
+    ///         count += 1
+    ///     self.assembler.finished(self.callcontrol.callinfocollection)
+    ///     return all_jitcodes
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's `get_jitcode` is currently eager
+    /// (compiles during the call that pushes to `unfinished_graphs`),
+    /// so the `enum_pending_graphs` drain loop finds already-compiled
+    /// entries and does no additional work. A later phase will split
+    /// `get_jitcode` into skeleton-allocation + later fill so the drain
+    /// loop becomes the actual compile trigger, matching
+    /// `codewriter.py:80 transform_graph_to_jitcode(graph, jitcode, ...)`.
+    ///
+    /// The third tuple field — `merge_point_pc` — is a pyre-only
+    /// refinement hook; see
+    /// [`super::call::CallControl::grab_initial_jitcodes`].
+    pub fn make_jitcodes(&self, initial: &[(&CodeObject, *const (), Option<usize>)]) {
+        // codewriter.py:76 `self.callcontrol.grab_initial_jitcodes()`.
+        self.callcontrol().grab_initial_jitcodes(self, initial);
+        // codewriter.py:79 `for graph, jitcode in
+        // self.callcontrol.enum_pending_graphs():`.
+        //
+        // PRE-EXISTING-ADAPTATION: the `transform_graph_to_jitcode`
+        // step at codewriter.py:80 already ran eagerly inside
+        // `get_jitcode` (pyre's Python-bytecode-direct lowering has no
+        // separate skeleton-then-fill flow). The drain loop is used to
+        // pipe each compiled jitcode into `MetaInterpStaticData` — the
+        // pyre analog of `self.assembler.finished(callinfocollection)`
+        // at codewriter.py:85 — centralising the
+        // `set_majit_jitcode` pipe that previously lived inside
+        // `CallControl::get_jitcode`.
+        loop {
+            let popped = self.callcontrol().enum_pending_graphs();
+            let Some((_graph, w_code, jitcode)) = popped else {
+                break;
+            };
+            if !jitcode.has_abort {
+                pyre_jit_trace::set_majit_jitcode(
+                    w_code,
+                    jitcode.jitcode.clone(),
+                    jitcode.metadata.pc_map.clone(),
+                    jitcode.metadata.liveness.clone(),
+                );
+            }
+        }
     }
 }
 
@@ -1786,119 +1840,69 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// JitCode cache — lazy compilation per CodeObject
-// RPython: CallControl.get_jitcode(graph, called_from) with dedup
+// JitCode cache — RPython: `CallControl.get_jitcode` (call.py:155-172).
+// The cache + `unfinished_graphs` queue live on `super::call::CallControl`;
+// `CallControl::get_jitcode` is the canonical entry point.
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static JITCODE_CACHE: UnsafeCell<HashMap<usize, PyJitCode>> =
-        UnsafeCell::new(HashMap::new());
-
-    /// `codewriter.py:20-23` single long-lived `CodeWriter` per thread.
-    ///
-    /// Matches RPython's "CodeWriter holds the Assembler" ownership model.
-    /// All four `pyre/pyre-jit` call sites now route through
-    /// `with_codewriter(...)` so every jitcode compiled on a thread's
-    /// lifetime shares the same `Assembler` instance, letting its
-    /// `all_liveness` / `num_liveness_ops` accumulate across calls just
-    /// like upstream.
-    static CODEWRITER: OnceCell<CodeWriter> = const { OnceCell::new() };
-}
-
-/// `codewriter.py:20-23` accessor. Initialises the thread-local
-/// `CodeWriter` on first use with the standard `bh_*` helper pointers
-/// (every current caller uses the same bundle). Additional call sites
-/// should route through here rather than calling `CodeWriter::new(...)`
-/// inline — a fresh CodeWriter-per-call splits the Assembler's
-/// accumulator and diverges from RPython parity.
-pub fn with_codewriter<R>(f: impl FnOnce(&CodeWriter) -> R) -> R {
-    CODEWRITER.with(|cell| {
-        let writer = cell.get_or_init(|| {
-            CodeWriter::new(
-                crate::call_jit::bh_call_fn,
-                crate::call_jit::bh_load_global_fn,
-                crate::call_jit::bh_compare_fn,
-                crate::call_jit::bh_binary_op_fn,
-                crate::call_jit::bh_box_int_fn,
-                crate::call_jit::bh_truth_fn,
-                crate::call_jit::bh_load_const_fn,
-                crate::call_jit::bh_store_subscr_fn,
-                crate::call_jit::bh_build_list_fn,
-            )
-        });
-        f(writer)
-    })
-}
-
-/// Get or compile JitCode for a CodeObject.
+/// RPython parity: `codewriter.make_jitcodes()` (codewriter.py:74-89)
+/// is the single entry point that populates `MetaInterpStaticData`'s
+/// JitCode set before any tracing happens.
 ///
-/// jitcode.py:18: jitdriver_sd is not None for portal jitcodes.
-/// call.py:148 grab_initial_jitcodes: sets jitdriver_sd on the portal.
-/// Cached per CodeObject pointer — jitdriver_sd is fixed per jitcode.
-pub fn get_jitcode(
-    code: &CodeObject,
-    w_code: *const (),
-    writer: &CodeWriter,
-    merge_point_pc: Option<usize>,
-) -> &'static PyJitCode {
-    let key = code as *const CodeObject as usize;
-    JITCODE_CACHE.with(|cell| {
-        let cache = unsafe { &mut *cell.get() };
-        let needs_rebuild = if let Some(existing) = cache.get(&key) {
-            // Rebuild if merge_point_pc changed (first trace provides the
-            // correct PC that was only an estimate at initial creation).
-            merge_point_pc.is_some() && existing.merge_point_pc != merge_point_pc
-        } else {
-            true
-        };
-        if needs_rebuild {
-            let pyjitcode = writer.make_jitcode(code, w_code, merge_point_pc);
-            cache.insert(key, pyjitcode);
-            // RPython parity: clone JitCode into state::JitCode (which is
-            // Box'd in MetaInterpStaticData.jitcodes — stable address).
-            // Skip when has_abort (liveness overflow cleared the data);
-            // get_list_of_active_boxes falls back to LiveVars analysis.
-            let entry = cache.get(&key).unwrap();
-            if !entry.has_abort {
-                pyre_jit_trace::set_majit_jitcode(
-                    w_code,
-                    entry.jitcode.clone(),
-                    entry.metadata.py_to_jit_pc.clone(),
-                    entry.metadata.liveness.clone(),
-                );
-            }
-        }
-        let entry = cache.get(&key).unwrap();
-        // SAFETY: thread-local cache lives for thread lifetime
-        unsafe { &*(entry as *const PyJitCode) }
-    })
-}
-
-/// RPython parity: codewriter.make_jitcodes() runs before tracing.
-/// In pyre, JitCode compilation is lazy. This function ensures the
-/// JitCode (with liveness info) exists for a CodeObject so that
-/// get_list_of_active_boxes can use it during tracing.
+/// pyre-adaptation: Python's dynamic dispatch prevents static callee
+/// discovery, so pyre calls `make_jitcodes(&[portal_code])` at each JIT
+/// entry rather than once at warmspot init. The `merge_point_pc` tuple
+/// field threads through `CallControl::grab_initial_jitcodes` so that
+/// the first trace's MERGE_POINT PC refines the cached JitCode (see
+/// `super::call::CallControl::grab_initial_jitcodes`).
 pub fn ensure_jitcode_for(
     code: &pyre_interpreter::CodeObject,
     w_code: *const (),
     merge_point_pc: Option<usize>,
 ) {
-    with_codewriter(|writer| {
-        let _ = get_jitcode(code, w_code, writer, merge_point_pc);
-    });
+    CodeWriter::instance().make_jitcodes(&[(code, w_code, merge_point_pc)]);
+}
+
+/// Scan `code` for JUMP_BACKWARD targets — the PCs where
+/// `transform_graph_to_jitcode` would emit `BC_JUMP_TARGET` and where
+/// `jit_merge_point` is evaluated.
+///
+/// RPython parity: corresponds to `jtransform.py:1714-1718`
+/// `handle_jit_marker__loop_header`, which walks the flow graph looking
+/// for `jit_marker('loop_header', ...)` operations. pyre's "graph" is
+/// raw Python bytecode, so the equivalent scan looks for
+/// `JUMP_BACKWARD` instructions and resolves their target PCs.
+///
+/// Shared between `transform_graph_to_jitcode` (which uses the set to
+/// decide emit locations) and `is_portal` (which tests emptiness to
+/// classify the CodeObject without triggering a compile).
+pub fn find_loop_header_pcs(
+    code: &pyre_interpreter::CodeObject,
+) -> std::collections::HashSet<usize> {
+    let num_instrs = code.instructions.len();
+    let mut loop_header_pcs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut scan_state = OpArgState::default();
+    for scan_pc in 0..num_instrs {
+        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+        if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
+            if target < num_instrs {
+                loop_header_pcs.insert(target);
+            }
+        }
+    }
+    loop_header_pcs
 }
 
 /// jitcode.py:18: `jitcode.jitdriver_sd is not None`.
-pub fn is_portal(code: &pyre_interpreter::CodeObject, w_code: *const ()) -> bool {
-    ensure_jitcode_for(code, w_code, None);
-    let key = code as *const pyre_interpreter::CodeObject as usize;
-    JITCODE_CACHE.with(|cell| {
-        let cache = unsafe { &*cell.get() };
-        cache
-            .get(&key)
-            .map(|pjc| pjc.jitcode.jitdriver_sd.is_some())
-            .unwrap_or(false)
-    })
+///
+/// pyre checks the pre-compile signal — "does `code` contain any
+/// `JUMP_BACKWARD` instructions" — which is the exact condition that
+/// `transform_graph_to_jitcode` uses to set `JitCode.jitdriver_sd`
+/// (codewriter.rs). The check is pure (no cache mutation, no compile)
+/// so callers on the hot JIT-entry path can use it to classify a
+/// CodeObject before deciding whether to trace.
+pub fn is_portal(code: &pyre_interpreter::CodeObject) -> bool {
+    !find_loop_header_pcs(code).is_empty()
 }
 
 #[cfg(test)]

@@ -490,13 +490,22 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let py_pc = frame.next_instr();
 
-    // RPython: blackhole_from_resumedata() → setposition + consume_one_section
-    // For pyre, we compile Python bytecodes to JitCode and load frame state.
-    // codewriter.py:20-23 parity: reuse the thread-local CodeWriter so the
-    // single shared Assembler keeps accumulating across jitcodes.
-    let pyjitcode = crate::jit::codewriter::with_codewriter(|writer| {
-        crate::jit::codewriter::get_jitcode(code, frame.pycode, writer, None)
-    });
+    // RPython: blackhole_from_resumedata() → setposition + consume_one_section.
+    // The JitCode was populated earlier via make_jitcodes()/get_jitcode()
+    // during trace setup; here we only look up the compiled entry.
+    let writer = crate::jit::codewriter::CodeWriter::instance();
+    let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
+        Some(pjc) => pjc,
+        None => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bh-fail] blackhole_from_jit_frame: no JitCode for code {:p}",
+                    code as *const _,
+                );
+            }
+            return None;
+        }
+    };
 
     // Map Python PC → JitCode PC.
     // resume.py:928/1338 parity: rd_numb pc is consumed as-is. RPython does
@@ -781,9 +790,9 @@ pub fn resume_in_blackhole(
 
     // codewriter.py:20-23 parity: the CodeWriter-owned Assembler lives
     // on the thread-local singleton so each `get_jitcode` call below
-    // shares the same accumulator. The `with_codewriter` closure wraps
-    // the per-section get_jitcode call at ~line 1074 on a best-effort
-    // basis since the rest of this function does not need the writer.
+    // shares the same accumulator.
+    let writer = crate::jit::codewriter::CodeWriter::instance();
+
     thread_local! {
         static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
@@ -857,12 +866,18 @@ pub fn resume_in_blackhole(
         // RPython parity: vsd from vable_values (snapshot), stored in
         // ResumedFrame.vsd by build_resumed_frames.
         let vsd = section.vsd;
-        // call.py:148: jitcode via get_jitcode (jitdriver_sd set on portal).
-        // virtualizable.py:126-137: code from resume data, not heap.
+        // call.py:148: jitcode via jitcodes dict lookup (jitdriver_sd
+        // set on portal). virtualizable.py:126-137: code from resume
+        // data, not heap. Lookup-only: trace setup already compiled.
         let w_code = section.code;
-        let pyjitcode = crate::jit::codewriter::with_codewriter(|writer| {
-            crate::jit::codewriter::get_jitcode(code, w_code, writer, None)
-        });
+        let _ = w_code;
+        let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
+            Some(pjc) => pjc,
+            None => {
+                builder.release_chain(prev_bh);
+                return BlackholeResult::Failed;
+            }
+        };
         let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
             pyjitcode.metadata.pc_map[py_pc]
         } else {
@@ -1517,9 +1532,10 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
     // to a pyre JitCode via CodeWriter.
-    // codewriter.py:20-23 parity: each resolve_jitcode invocation routes
-    // through `with_codewriter(...)` so the thread-local CodeWriter's
-    // single Assembler keeps accumulating.
+    // codewriter.py:20-23 parity: each resolve_jitcode invocation uses
+    // the thread-local CodeWriter singleton so the Assembler keeps
+    // accumulating.
+    let writer = crate::jit::codewriter::CodeWriter::instance();
     let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
             return None;
@@ -1536,9 +1552,8 @@ pub fn blackhole_resume_via_rd_numb(
             return None;
         }
         let code = unsafe { &*raw_code };
-        let pyjitcode = crate::jit::codewriter::with_codewriter(|writer| {
-            crate::jit::codewriter::get_jitcode(code, code_ptr, writer, None)
-        });
+        let _ = code_ptr;
+        let pyjitcode = writer.callcontrol().find_jitcode(code as *const _)?;
         if pyjitcode.has_abort_opcode() {
             return None;
         }
