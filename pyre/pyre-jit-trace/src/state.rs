@@ -701,19 +701,14 @@ pub struct PyreSym {
     /// registers for the resumed frame.
     pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
-    /// resume.py:1245 decode_box parity: each slot's `.type` is fixed by
-    /// which `_callback_i/_callback_r/_callback_f` the encoder dispatched
-    /// through `enumerate_vars(info, liveness_info, ...)`. RPython's
-    /// `IntFrontendOp/RefFrontendOp/FloatFrontendOp` carries this kind on
-    /// `box.type`. pyre's `setup_bridge_sym` walks `live_i_regs +
-    /// live_r_regs + live_f_regs` and records `Type::Int/Ref/Float` per
-    /// slot here. Without this, init_symbolic falls into the
-    /// `concrete_slot_types` path which always returns `Type::Ref` for
-    /// W_IntObject locals, and `RETURN_VALUE` then takes the
-    /// `trace_guarded_int_payload` unbox path that the optimizer
-    /// constant-folds — producing `Finish(constant 0)` bridges.
+    /// virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
+    /// is a W_Root array → all items are Type::Ref. setup_bridge_sym
+    /// populates this with all-Ref; downstream unboxing happens in
+    /// opcode handlers via guard_class + getfield_gc_pure_i/_f, not at
+    /// the virtualizable slot level.
     pub(crate) bridge_local_types: Option<Vec<Type>>,
-    /// Bridge-specific override for symbolic_stack_types.
+    /// Bridge-specific override for symbolic_stack_types. Same
+    /// all-Ref contract as bridge_local_types.
     pub(crate) bridge_stack_types: Option<Vec<Type>>,
     // virtualizable.py:86-93: ALL static fields in declared order.
     // RPython's unroll_static_fields includes every field from
@@ -1350,26 +1345,12 @@ pub(crate) fn record_current_state_guard(
     ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
 }
 
-pub(crate) fn concrete_value_type(value: PyObjectRef) -> Type {
-    if value.is_null() {
-        return Type::Ref;
-    }
-    if !looks_like_heap_ref(value) {
-        // Non-heap value (e.g. PY_NULL sentinel or leaked raw int)
-        return Type::Int;
-    }
-    if unsafe { is_int(value) } {
-        return Type::Int;
-    }
-    if unsafe { is_float(value) } {
-        return Type::Float;
-    }
-    Type::Ref
-}
-
-/// pyre slots are always GCREF (Ref) at the concrete frame level.
-/// Even W_IntObject values are stored as Ref pointers — the trace
-/// unboxes via GetfieldGcPureI.
+/// virtualizable.py:44 + interp_jit.py:25-31 —
+/// `locals_cells_stack_w[*]` is declared as a W_Root array, so every
+/// item's JIT type is GCREF (Type::Ref). W_IntObject/W_FloatObject are
+/// stored as Ref pointers; unboxing happens inside trace opcode handlers
+/// via `guard_class + getfield_gc_pure_i` / `_f`, never at the
+/// virtualizable slot level.
 pub(crate) fn concrete_virtualizable_slot_type(_value: PyObjectRef) -> Type {
     Type::Ref
 }
@@ -1409,26 +1390,19 @@ pub(crate) fn concrete_slot_types(
     num_locals: usize,
     valuestackdepth: usize,
 ) -> Vec<Type> {
-    // virtualizable.py:44: declared type of locals_cells_stack_w is
-    // always Ref (W_Root pointer array). However, pyre's trace opcode
-    // handlers currently produce Int/Float OpRefs for LOAD_FAST when the
-    // concrete value is W_IntObject/W_FloatObject — they don't emit the
-    // RPython guard_class + getfield_gc_i unboxing sequence yet.
-    // Until vable-locals lowering (Phase 4/5) lands, trace-time slot
-    // types must match what the handlers actually produce.
     let stack_only = valuestackdepth.saturating_sub(num_locals);
     let mut types = Vec::with_capacity(num_locals + stack_only);
     for idx in 0..num_locals {
         types.push(
             concrete_stack_value(frame, idx)
-                .map(concrete_value_type)
+                .map(concrete_virtualizable_slot_type)
                 .unwrap_or(Type::Ref),
         );
     }
     for stack_idx in 0..stack_only {
         types.push(
             concrete_stack_value(frame, num_locals + stack_idx)
-                .map(concrete_value_type)
+                .map(concrete_virtualizable_slot_type)
                 .unwrap_or(Type::Ref),
         );
     }
@@ -1651,21 +1625,17 @@ impl PyreSym {
             // are GC pointers → Ref. No pre-unboxing at function entry.
             self.symbolic_local_types = vec![Type::Ref; nlocals];
         } else if let Some(ref overrides) = self.bridge_local_types {
-            // resume.py:1245 decode_box parity: bridge inputarg types are
-            // determined by which jitcode liveness list (live_i_regs /
-            // live_r_regs / live_f_regs) the slot belongs to at the resume
-            // PC. setup_bridge_sym walks these lists in encoder order and
-            // populates `bridge_local_types[reg_idx] = Type::Int/Ref/Float`.
-            // Use that override here so RETURN_VALUE sees the correct
-            // type and skips the trace_guarded_int_payload unbox path.
+            // virtualizable.py:44: bridge locals keep the Ref contract of
+            // the virtualizable array. `bridge_local_types` is always
+            // all-Ref (populated by setup_bridge_sym); the override is
+            // retained only for length parity with bridge_local_oprefs.
             let mut types = overrides.clone();
             types.resize(nlocals, Type::Ref);
             self.symbolic_local_types = types;
         } else if let Some((ref local_types, _)) = inputarg_slot_types {
-            // Bridge/root traces resume from the JIT inputarg contract.
-            // Re-deriving slot kinds from the concrete frame would turn boxed
-            // W_Int/W_Float locals back into raw Int/Float and break raw-array
-            // stores that expect an explicit unbox step.
+            // warmstate.py:73 wrap(): inputargs resolved from the JIT
+            // contract retain whatever declared type the input signature
+            // records. For virtualizable array inputargs this is Ref.
             self.symbolic_local_types = local_types.clone();
         } else if self.symbolic_local_types.len() != nlocals {
             self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
@@ -2695,16 +2665,12 @@ impl JitState for PyreJitState {
         sym.init_vable_indices();
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
-        // RPython parity: slot types from meta reflect actual value types
-        // (Int for W_IntObject, Float for W_FloatObject, Ref otherwise).
-        let n = _meta.num_locals.min(_meta.slot_types.len());
-        sym.symbolic_local_types = _meta.slot_types[..n].to_vec();
-        let stack_n = _meta.slot_types.len().saturating_sub(_meta.num_locals);
-        sym.symbolic_stack_types = if _meta.slot_types.len() > _meta.num_locals {
-            _meta.slot_types[_meta.num_locals..].to_vec()
-        } else {
-            vec![Type::Ref; stack_n]
-        };
+        // virtualizable.py:44 + interp_jit.py:25-31: all locals_cells_stack_w
+        // items are W_Root → Type::Ref. Unboxing happens inside trace opcode
+        // handlers (guard_class + getfield_gc_pure_i/_f), not at slot setup.
+        sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
+        sym.symbolic_stack_types =
+            vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
         let stack_only = _meta.vable_stack_only_depth();
         sym.symbolic_stack = vec![OpRef::NONE; stack_only];
         sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
@@ -2794,17 +2760,11 @@ impl JitState for PyreJitState {
 
         let nlocals = sym.nlocals;
         let mut bridge_locals = vec![OpRef::NONE; nlocals];
-        // resume.py:1245 decode_box parity: each slot's `.type` is fixed
-        // by which _callback_i/_callback_r/_callback_f the encoder dispatched.
-        let mut bridge_local_types = vec![Type::Ref; nlocals];
-        let type_for_value = |v: &RebuiltValue| -> Type {
-            match v {
-                RebuiltValue::Box(_n, tp) => *tp,
-                RebuiltValue::Int(_) => Type::Int,
-                RebuiltValue::Const(_, tp) => *tp,
-                _ => Type::Ref,
-            }
-        };
+        // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
+        // items are declared Ref (W_Root array). Bridge resume slots stay
+        // Ref at the virtualizable contract; any Int/Float unboxing must
+        // happen inside trace opcode handlers, not at the inputarg level.
+        let bridge_local_types = vec![Type::Ref; nlocals];
 
         // pyre adaptation (NOT a line-by-line port of
         // rebuild_state_after_failure).
@@ -2847,7 +2807,6 @@ impl JitState for PyreJitState {
                     let off = i - num_scalars;
                     if off < nlocals {
                         bridge_locals[off] = resolved;
-                        bridge_local_types[off] = type_for_value(v);
                     }
                     // Stack values beyond nlocals are intentionally dropped:
                     // the target loop header has stack_only=0.
@@ -2860,11 +2819,9 @@ impl JitState for PyreJitState {
                 bridge_locals, bridge_local_types,
             );
         }
-        // Override sym.symbolic_locals AND sym.symbolic_local_types so
-        // subsequent LOAD_FAST / RETURN_VALUE see the bridge inputarg
-        // OpRefs and their resume-data-derived types, not the parent's
-        // vable_array_base+i OpRefs / concrete_slot_types fallback that
-        // init_symbolic seeded before setup_bridge_sym ran.
+        // Override sym.symbolic_locals so subsequent LOAD_FAST sees the
+        // bridge inputarg OpRefs, not the parent's vable_array_base+i
+        // OpRefs that init_symbolic seeded before setup_bridge_sym ran.
         //
         // pyre's start_bridge_tracing calls initialize_sym() (which runs
         // init_symbolic) BEFORE setup_bridge_sym, so init_symbolic sees
@@ -2875,12 +2832,11 @@ impl JitState for PyreJitState {
         // stale parent OpRefs in symbolic_locals after we set
         // bridge_local_oprefs here.
         //
-        // The TYPES override is critical: without it, the bridge's
-        // RETURN_VALUE handler sees `value_type(OpRef(1)) == Type::Ref`,
-        // calls `trace_guarded_int_payload`, and emits a guard_class +
-        // getfield_gc_pure_i sequence whose result the optimizer
-        // constant-folds — producing a bridge that always returns
-        // Finish(constant 0) instead of Finish(n).
+        // virtualizable.py:44 + interp_jit.py:25-31: array item types are
+        // all Ref; RETURN_VALUE / arithmetic paths unbox via
+        // `trace_guarded_int_payload` (guard_class + getfield_gc_pure_i),
+        // matching the RPython unbox-at-consumer model. The slot-level
+        // type override is NOT how RPython avoids the guarded path.
         sym.symbolic_locals = {
             let mut locals = bridge_locals.clone();
             locals.resize(sym.nlocals, OpRef::NONE);

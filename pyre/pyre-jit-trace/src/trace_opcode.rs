@@ -1044,16 +1044,13 @@ impl MIFrame {
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
             let stack_only = s.stack_only_depth();
-            // pyjitpl.py:2955-2965: loop-carried types come from
-            // the actual tracked symbolic types (INT/REF/FLOAT). Only
-            // reset to Ref when the type vector drifted in length
-            // (e.g. inline tracing changed nlocals).
-            if s.symbolic_local_types.len() != concrete_nlocals {
-                s.symbolic_local_types.resize(concrete_nlocals, Type::Ref);
-            }
-            if s.symbolic_stack_types.len() != stack_only {
-                s.symbolic_stack_types.resize(stack_only, Type::Ref);
-            }
+            // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
+            // is a W_Root array → every item is declared Ref. The loop-carried
+            // types passed to the JUMP / merge point therefore MUST be Ref for
+            // every array slot; tracker-observed Int/Float types are internal
+            // to unboxing lowering and must not leak into the inputarg contract.
+            s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
+            s.symbolic_stack_types = vec![Type::Ref; stack_only];
             if s.symbolic_stack.len() < stack_only {
                 s.symbolic_stack.resize(stack_only, OpRef::NONE);
             }
