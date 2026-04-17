@@ -64,6 +64,21 @@ pub enum ConstValue {
     /// Boolean constant — used as `Link.exitcase` for if/else
     /// switches (`True` / `False`).
     Bool(bool),
+    /// `None` — CPython's None singleton, used by
+    /// `FrameState._exc_args()` as the sentinel for
+    /// "no pending exception".
+    None,
+    /// RPython `rpython/rlib/unroll.py:SpecTag` — an identity-bearing
+    /// marker instance that prevents two different tags from being
+    /// merged by `framestate.union()`. Each `SpecTag(id)` carries a
+    /// process-unique `u64` so two separately constructed tags never
+    /// compare equal even if wrapped in `Constant`.
+    ///
+    /// Deviation from upstream (parity rule #1): RPython uses a Python
+    /// class (`SpecTag`) whose identity is the instance's `id()`. Rust
+    /// has no cross-session `id()`, so we materialise identity as an
+    /// atomic counter.
+    SpecTag(u64),
 }
 
 /// RPython `flowspace/model.py:463-467` — typed marker like
@@ -345,6 +360,41 @@ impl Constant {
     /// RPython `Constant.replace(mapping)` — Constants never rename.
     pub fn replace<'a>(&'a self, _mapping: &'a HashMap<Variable, Variable>) -> &'a Constant {
         self
+    }
+}
+
+/// Application-level exception captured inside the flow space.
+///
+/// RPython basis: `rpython/flowspace/model.py:385-392` — `class
+/// FSException(object)`. `w_type` and `w_value` carry the exception
+/// class and instance as flow-space `Hlvalue`s.
+///
+/// RPython's `ConstException(Constant, FSException)` multiple
+/// inheritance has no direct Rust equivalent; the upstream only uses
+/// it as a fast-path marker for `foldable()` on constant exceptions.
+/// Phase 3 (`flowspace/operation.py`) handles the same flow via a
+/// `Constant`-carrying FSException without the extra class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FSException {
+    /// RPython `FSException.w_type` — the exception class (as an
+    /// `Hlvalue`, usually a `Constant` wrapping the Python class).
+    pub w_type: Hlvalue,
+    /// RPython `FSException.w_value` — the exception instance (as an
+    /// `Hlvalue`).
+    pub w_value: Hlvalue,
+}
+
+impl FSException {
+    /// RPython `FSException.__init__(w_type, w_value)`.
+    pub fn new(w_type: Hlvalue, w_value: Hlvalue) -> Self {
+        FSException { w_type, w_value }
+    }
+}
+
+impl std::fmt::Display for FSException {
+    // RPython `FSException.__str__` — `[w_type: w_value]`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}: {}]", self.w_type, self.w_value)
     }
 }
 

@@ -16,9 +16,9 @@
 //! |------------------------------|---------------------------------|
 //! | `model`                      | `model.py`                      |
 //! | `bytecode`                   | `bytecode.py`                   |
-//! | `framestate`      (Phase 3)  | `framestate.py`                 |
+//! | `framestate`                 | `framestate.py`                 |
 //! | `operation`       (Phase 3)  | `operation.py`                  |
-//! | `flowcontext`     (Phase 3)  | `flowcontext.py`                |
+//! | `flowcontext`                | `flowcontext.py` (skeleton: FlowSignal + FrameBlock only; F3.4 adds SpamBlock/EggBlock/Recorder + opcode handlers) |
 //! | `flowcontext_py314` (Phase 3)| PYRE-ONLY, no RPython basis     |
 //! | `pygraph`         (Phase 3)  | `pygraph.py`                    |
 //! | `generator`       (Phase 3)  | `generator.py`                  |
@@ -28,4 +28,6 @@
 
 pub mod argument;
 pub mod bytecode;
+pub mod flowcontext;
+pub mod framestate;
 pub mod model;
