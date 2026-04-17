@@ -67,9 +67,20 @@ impl ConstantPool {
     pub fn get_or_insert(&mut self, value: i64) -> OpRef {
         for (&idx, &v) in &self.constants {
             if v == value {
-                // Skip Ref-typed entries — Int/Ref must not alias.
-                match self.constant_types.get(&idx) {
-                    Some(&Type::Ref) | Some(&Type::Float) => continue,
+                // RPython parity: ConstInt / ConstPtr / ConstFloat are
+                // separate classes (history.py:220, 261, 307), so Int
+                // and Ref constants with the same raw value MUST NOT
+                // alias. Skip Ref/Float entries. Both `constant_types`
+                // (pool-internal type) and `numbering_type_overrides`
+                // (bridge-injected resume-data type) mark a slot as
+                // non-Int.
+                let tp = self
+                    .constant_types
+                    .get(&idx)
+                    .or_else(|| self.numbering_type_overrides.get(&idx))
+                    .copied();
+                match tp {
+                    Some(Type::Ref) | Some(Type::Float) => continue,
                     _ => return OpRef(idx),
                 }
             }
