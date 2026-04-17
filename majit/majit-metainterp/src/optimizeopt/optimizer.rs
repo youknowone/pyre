@@ -1301,6 +1301,62 @@ impl Optimizer {
         resolved
     }
 
+    /// `optimizer.py:306-319` `force_box_for_end_of_preamble(box)`.
+    ///
+    /// ```python
+    /// def force_box_for_end_of_preamble(self, box):
+    ///     if box.type == 'r':
+    ///         info = getptrinfo(box)
+    ///         if info is not None and info.is_virtual():
+    ///             rec = {}
+    ///             return info.force_at_the_end_of_preamble(box, self.optearlyforce, rec)
+    ///         return box
+    ///     if box.type == 'i':
+    ///         info = getrawptrinfo(box)
+    ///         if info is not None:
+    ///             return info.force_at_the_end_of_preamble(box, self.optearlyforce, None)
+    ///     return box
+    /// ```
+    ///
+    /// Wraps `force_at_the_end_of_preamble` with the per-type gating
+    /// RPython inlines at the call site.  Ref boxes only recurse when
+    /// a virtual `PtrInfo` is present; Int boxes only recurse when a
+    /// raw-ptr info is present (pyre stores that under
+    /// `PtrInfo::VirtualRawBuffer` in the same info table); Float
+    /// boxes are returned unchanged.  Callers that previously invoked
+    /// `force_at_the_end_of_preamble` directly should route through
+    /// this wrapper for RPython structural parity (unroll.py:126-127).
+    pub fn force_box_for_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+        let resolved = ctx.get_box_replacement(opref);
+        match ctx.opref_type(resolved) {
+            // optimizer.py:307-313 — `box.type == 'r'` path.
+            Some(majit_ir::Type::Ref) => {
+                let is_virtual = ctx
+                    .get_ptr_info(resolved)
+                    .is_some_and(|info| info.is_virtual());
+                if is_virtual {
+                    return self.force_at_the_end_of_preamble(resolved, ctx);
+                }
+                resolved
+            }
+            // optimizer.py:314-318 — `box.type == 'i'` path.
+            //
+            // pyre tracks raw-ptr info on Int boxes via
+            // `PtrInfo::VirtualRawBuffer` in the same `ptr_info` table
+            // that Ref boxes use; there is no separate `getrawptrinfo`
+            // registry, so the presence check fires on any PtrInfo
+            // attached to an Int-typed OpRef.
+            Some(majit_ir::Type::Int) => {
+                if ctx.get_ptr_info(resolved).is_some() {
+                    return self.force_at_the_end_of_preamble(resolved, ctx);
+                }
+                resolved
+            }
+            // optimizer.py:319 — fall-through `return box`.
+            _ => resolved,
+        }
+    }
+
     /// optimizer.py: force_at_the_end_of_preamble(box)
     ///
     /// The exported loop state should record the boxes that survive the end of
@@ -1320,6 +1376,25 @@ impl Optimizer {
         let Some(mut info) = ctx.get_ptr_info(resolved).cloned() else {
             return resolved;
         };
+
+        // `info.py:53-56` `PtrInfo.force_at_the_end_of_preamble` base:
+        //
+        // ```python
+        // def force_at_the_end_of_preamble(self, op, optforce, rec):
+        //     if not self.is_virtual():
+        //         return get_box_replacement(op)
+        //     return self._force_at_the_end_of_preamble(op, optforce, rec)
+        // ```
+        //
+        // RPython gates every dispatch on `self.is_virtual()`.  pyre's
+        // variant-tag match below would otherwise re-force a non-virtual
+        // `VirtualRawSlice` (post-`_force_elements`, `parent = OpRef::NONE`)
+        // every time this method is re-entered — matching info.py:464-465
+        // `return self.parent is not None` requires the same is_virtual
+        // gate here as in the RPython base.
+        if !info.is_virtual() {
+            return resolved;
+        }
 
         // RPython info.py: InstancePtrInfo, StructPtrInfo, ArrayPtrInfo all
         // override _force_at_the_end_of_preamble to keep the virtual alive
@@ -1342,10 +1417,18 @@ impl Optimizer {
             return resolved;
         }
 
-        // RawBuffer: AbstractRawPtrInfo inherits base force_box() default.
-        // info.py:159-160: _force_at_the_end_of_preamble → force_box()
-        // optimizer.py:311-312: optforce = self.optearlyforce
-        if matches!(info, crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)) {
+        // RawBuffer / RawSlice: `AbstractRawPtrInfo` (info.py:374-384)
+        // inherits `AbstractVirtualPtrInfo._force_at_the_end_of_preamble`
+        // (info.py:159-160) without override, so both take the base
+        // `force_box()` materialization path.  pyre mirrors this by
+        // matching both `VirtualRawBuffer` and `VirtualRawSlice`
+        // (info.py:386 `RawBufferPtrInfo` / info.py:459 `RawSlicePtrInfo`).
+        // optimizer.py:311-312 routes through `optforce = self.optearlyforce`.
+        if matches!(
+            info,
+            crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
+                | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_)
+        ) {
             let saved = ctx.current_pass_idx;
             ctx.current_pass_idx = ctx.optearlyforce_idx;
             let result = self.force_box(resolved, ctx);

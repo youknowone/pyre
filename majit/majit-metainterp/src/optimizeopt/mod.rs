@@ -593,6 +593,32 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .map(|vref| self.ctx.get_box_replacement(*vref))
                     .collect(),
             }),
+            // `info.py:478-482` `RawSlicePtrInfo._visitor_walk_recursive`:
+            //
+            // ```python
+            // def _visitor_walk_recursive(self, op, visitor):
+            //     source_op = get_box_replacement(op.getarg(0))
+            //     visitor.register_virtual_fields(op, [source_op])
+            //     if self.parent.is_virtual():
+            //         self.parent.visitor_walk_recursive(source_op, visitor)
+            // ```
+            //
+            // pyre's consumer (`resume.rs::encode_*` worklist at
+            // `resume.rs:3517`) drives the recursion off `get_virtual_fields`
+            // — registering the parent OpRef here lets the worklist enqueue
+            // the parent and re-enter `get_virtual_fields` on it, which
+            // matches RPython's `parent.visitor_walk_recursive(source_op,
+            // visitor)` follow-up.  Only fires while the slice is still
+            // virtual (`slice.parent` non-NONE); after `force_box_impl`
+            // materializes the slice the gate in `is_virtual` flips False
+            // and the caller drops the entry.
+            PtrInfo::VirtualRawSlice(vi) if !vi.parent.is_none() => {
+                Some(majit_ir::VirtualFieldsInfo {
+                    descr: None,
+                    known_class: None,
+                    field_oprefs: vec![self.ctx.get_box_replacement(vi.parent)],
+                })
+            }
             _ => None,
         }
     }

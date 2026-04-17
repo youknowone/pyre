@@ -774,12 +774,19 @@ impl UnrollOptimizer {
         let (imported_short_preamble_builder, rebuilt_imported_short_preamble) =
             if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
                 if !body_jump_args.is_empty() {
+                    // unroll.py:126-127 parity:
+                    //   for a in end_jump.getarglist():
+                    //       self.force_box_for_end_of_preamble(get_box_replacement(a))
+                    //
+                    // Route through `force_box_for_end_of_preamble` (the
+                    // per-box type-gating wrapper) rather than the inner
+                    // dispatcher, matching optimizer.py:306-319.
                     let resolved_jump_args: Vec<OpRef> = body_jump_args
                         .iter()
                         .map(|&arg| final_ctx.get_box_replacement(arg))
                         .collect();
                     for &arg in &resolved_jump_args {
-                        let _ = opt_p2.force_at_the_end_of_preamble(arg, &mut final_ctx);
+                        let _ = opt_p2.force_box_for_end_of_preamble(arg, &mut final_ctx);
                     }
                     let forced_jump_args: Vec<OpRef> = body_jump_args
                         .iter()

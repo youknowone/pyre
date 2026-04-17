@@ -768,16 +768,32 @@ impl PtrInfo {
 
     /// Whether this pointer is a virtual (allocation removed).
     /// info.py: is_virtual()
+    ///
+    /// Variant-specific gates match RPython:
+    ///
+    /// - `VirtualRawSlice`: `info.py:464-465`
+    ///   `def is_virtual(self): return self.parent is not None`.
+    ///   pyre encodes "no parent" as `OpRef::NONE` (set by
+    ///   `force_box_impl` when the slice is materialized; see
+    ///   `info.py:473-476 RawSlicePtrInfo._force_elements`).
+    /// - The other `Virtual*` variants carry no per-instance sentinel
+    ///   in pyre; their enum tag alone marks them virtual, which
+    ///   matches the RPython subclasses whose `is_virtual()` defaults
+    ///   stay True until the info itself is replaced (e.g.
+    ///   `RawBufferPtrInfo.is_virtual()` at `info.py:417-418` flips via
+    ///   `self.size != -1` — tracked as a separate future fix so the
+    ///   enum-tag gate remains structurally accurate for those types).
     pub fn is_virtual(&self) -> bool {
-        matches!(
-            self,
+        match self {
             PtrInfo::Virtual(_)
-                | PtrInfo::VirtualArray(_)
-                | PtrInfo::VirtualStruct(_)
-                | PtrInfo::VirtualArrayStruct(_)
-                | PtrInfo::VirtualRawBuffer(_)
-                | PtrInfo::VirtualRawSlice(_)
-        ) || matches!(self, PtrInfo::Str(sinfo) if sinfo.is_virtual())
+            | PtrInfo::VirtualArray(_)
+            | PtrInfo::VirtualStruct(_)
+            | PtrInfo::VirtualArrayStruct(_)
+            | PtrInfo::VirtualRawBuffer(_) => true,
+            PtrInfo::VirtualRawSlice(slice) => !slice.parent.is_none(),
+            PtrInfo::Str(sinfo) => sinfo.is_virtual(),
+            _ => false,
+        }
     }
 
     /// Whether this is a constant pointer.
@@ -938,6 +954,28 @@ impl PtrInfo {
                     info.lenbound.make_guards(lenop_pos, short, alloc_const);
                 }
             }
+            // info.py:379-384 `AbstractRawPtrInfo.make_guards`:
+            //
+            // ```python
+            // def make_guards(self, op, short, optimizer):
+            //     from rpython.jit.metainterp.optimizeopt.optimizer import CONST_0
+            //     op = ResOperation(rop.INT_EQ, [op, CONST_0])
+            //     short.append(op)
+            //     op = ResOperation(rop.GUARD_FALSE, [op])
+            //     short.append(op)
+            // ```
+            //
+            // Emits "must not be 0" check (null-pointer equivalent for
+            // Int-typed raw pointers) at the short-preamble entry.
+            // Both `RawBufferPtrInfo` (info.py:386) and
+            // `RawSlicePtrInfo` (info.py:459) inherit this override.
+            PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
+                let zero = alloc_const(Value::Int(0));
+                let eq_op = Op::new(OpCode::IntEq, &[op, zero]);
+                let eq_pos = eq_op.pos;
+                short.push(eq_op);
+                short.push(Op::new(OpCode::GuardFalse, &[eq_pos]));
+            }
             PtrInfo::Str(sinfo) => {
                 // vstring.py:116-126: StrPtrInfo.make_guards
                 short.push(Op::new(OpCode::GuardNonnull, &[op]));
@@ -960,37 +998,6 @@ impl PtrInfo {
             }
             // Virtuals/Virtualizable: no guards needed in short preamble
             _ => {}
-        }
-    }
-
-    /// info.py:74-75 (PtrInfo base) and info.py:804-808 (ConstPtrInfo)
-    ///
-    /// ```text
-    /// # base
-    /// def getstrlen(self, op, string_optimizer, mode):
-    ///     return None
-    ///
-    /// # ConstPtrInfo
-    /// def getstrlen(self, op, string_optimizer, mode):
-    ///     length = self.getstrlen1(mode)
-    ///     if length < 0:
-    ///         return None
-    ///     return ConstInt(length)
-    /// ```
-    ///
-    /// `mode` is `0` for byte strings and `1` for unicode (matches majit's
-    /// vstring `mode_string` / `mode_unicode` discriminator). The actual
-    /// length lookup needs a runtime hook because majit's `GcRef` is an
-    /// opaque pointer; that hook is supplied at the `OptContext` level via
-    /// `string_resolver`. When no resolver is plugged in, return `None`
-    /// (matches RPython's "unknown length" path).
-    pub fn getstrlen<F>(&self, mode: u8, mut resolver: F) -> Option<i64>
-    where
-        F: FnMut(majit_ir::GcRef, u8) -> Option<i64>,
-    {
-        match self {
-            PtrInfo::Constant(gcref) if !gcref.is_null() => resolver(*gcref, mode),
-            _ => None,
         }
     }
 
@@ -1114,6 +1121,24 @@ impl PtrInfo {
                 .flat_map(|fields| fields.iter().map(|(_, r)| *r))
                 .collect(),
             PtrInfo::VirtualRawBuffer(v) => v.values.clone(),
+            // info.py:478-482 `RawSlicePtrInfo._visitor_walk_recursive`:
+            //
+            // ```python
+            // def _visitor_walk_recursive(self, op, visitor):
+            //     source_op = get_box_replacement(op.getarg(0))
+            //     visitor.register_virtual_fields(op, [source_op])
+            //     if self.parent.is_virtual():
+            //         self.parent.visitor_walk_recursive(source_op, visitor)
+            // ```
+            //
+            // RPython registers the parent OpRef as the sole "field" of the
+            // slice; the subsequent recursive walk into `self.parent` is
+            // driven by the visitor itself once it sees the parent OpRef.
+            // pyre's walker returns the flat list of OpRefs a visitor
+            // should enqueue, so surfacing the parent here is sufficient —
+            // the visitor's outer loop re-enters `visitor_walk_recursive`
+            // on the parent once it drains the queue.
+            PtrInfo::VirtualRawSlice(v) => vec![v.parent],
             PtrInfo::Virtualizable(v) => {
                 let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| *r).collect();
                 for (_, items) in &v.arrays {
@@ -1166,13 +1191,14 @@ impl PtrInfo {
                     }
                 }
             }
-            PtrInfo::VirtualRawBuffer(v) => {
-                for field in &mut v.values {
-                    if !field.is_none() {
-                        *field = recurse(*field);
-                    }
-                }
-            }
+            // info.py:374-384 `AbstractRawPtrInfo` inherits
+            // `AbstractVirtualPtrInfo._force_at_the_end_of_preamble`
+            // (info.py:159-160) unchanged — the base calls `force_box()`
+            // to materialize instead of recursing into fields.  pyre's
+            // dispatcher at `optimizer.rs::force_at_the_end_of_preamble_rec`
+            // routes `VirtualRawBuffer` / `VirtualRawSlice` to `force_box`
+            // directly, so neither variant reaches this recurse path.  No
+            // explicit arm is needed; the `_` below falls through.
             _ => {}
         }
     }
@@ -1469,14 +1495,42 @@ impl PtrInfo {
                 alloc_ref
             }
             PtrInfo::VirtualRawSlice(slice) => {
-                // info.py:473-476 RawSlicePtrInfo._force_elements
-                // Force the parent first.
+                // `info.py:473-476` `RawSlicePtrInfo._force_elements`:
+                //
+                // ```python
+                // def _force_elements(self, op, optforce, descr):
+                //     if self.parent.is_virtual():
+                //         self.parent._force_elements(op, optforce, descr)
+                //     self.parent = None
+                // ```
+                //
+                // RPython keeps the `RawSlicePtrInfo` attached to the op and
+                // flips it to non-virtual by setting `self.parent = None`
+                // (`is_virtual` at info.py:464-465 is `self.parent is not None`).
+                // The info class stays RawSlicePtrInfo so subsequent
+                // `getrawptrinfo` lookups still identify it as a raw slice.
+                //
+                // pyre's `VirtualRawSliceInfo` stores `parent: OpRef`; the
+                // `OpRef::NONE` sentinel plays the role of `None`, and
+                // `PtrInfo::is_virtual` gates on `slice.parent.is_none()`.
+                // Overwriting with `PtrInfo::nonnull()` would lose the
+                // raw-slice identity and mis-route any later
+                // `get_virtual_fields` / raw-guard path.
                 let parent_forced = force_child(slice.parent, ctx);
                 let parent_forced = ctx.get_box_replacement(parent_forced);
                 let offset_ref = ctx.emit_constant_int(slice.offset as i64);
                 let add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
                 let new_ref = emit_op(ctx, add_op);
-                ctx.set_ptr_info(new_ref, PtrInfo::nonnull());
+                // Preserve raw-slice identity; mark non-virtual via
+                // `parent = OpRef::NONE` (RPython `self.parent = None`).
+                ctx.set_ptr_info(
+                    new_ref,
+                    PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+                        offset: slice.offset,
+                        parent: OpRef::NONE,
+                        last_guard_pos: slice.last_guard_pos,
+                    }),
+                );
                 if opref != new_ref {
                     ctx.replace_op(opref, new_ref);
                 }
@@ -1662,24 +1716,45 @@ impl PtrInfo {
         }
     }
 
-    /// info.py: is_about_object() — whether this info describes an object
-    /// (has fields/vtable, as opposed to an array or raw buffer).
+    /// `info.py:44-45` `PtrInfo.is_about_object(): return False` (base
+    /// default) / `info.py:327-328`
+    /// `InstancePtrInfo.is_about_object(): return True` (override).
+    ///
+    /// RPython only overrides `is_about_object` on `InstancePtrInfo`;
+    /// `StructPtrInfo`, `ArrayPtrInfo`, the raw variants, and the
+    /// other abstract subclasses inherit the `False` default.  pyre's
+    /// `Virtual` variant maps 1:1 to `InstancePtrInfo` in its virtual
+    /// state (has `known_class` / vtable), so it mirrors True; all
+    /// other variants must return False to keep `optimize_GUARD_IS_OBJECT`
+    /// (rewrite.py:210-211) and `optimize_GUARD_SUBCLASS` (rewrite.py:241-243)
+    /// from eliding guards on non-instance pointers.
     pub fn is_about_object(&self) -> bool {
-        matches!(
-            self,
-            PtrInfo::Instance(_)
-                | PtrInfo::Struct(_)
-                | PtrInfo::Virtual(_)
-                | PtrInfo::VirtualStruct(_)
-        )
+        matches!(self, PtrInfo::Instance(_) | PtrInfo::Virtual(_))
     }
 
-    /// info.py: is_precise() — whether the type info is exact (not just a bound).
+    /// `info.py:28-29` `PtrInfo.is_precise(): return False` (base default)
+    /// / `info.py:134-135` `AbstractVirtualPtrInfo.is_precise(): return True`
+    /// (overrides for every virtual-descriptor-carrying subclass).
+    ///
+    /// RPython's class hierarchy:
+    ///   - `PtrInfo`, `NonNullPtrInfo`, `ConstPtrInfo` → inherit the False
+    ///     default.
+    ///   - `AbstractVirtualPtrInfo` and its subclasses (`InstancePtrInfo`,
+    ///     `StructPtrInfo`, `ArrayPtrInfo`, `VArrayStructInfo`,
+    ///     `RawBufferPtrInfo`, `RawSlicePtrInfo`, + virtual variants of
+    ///     the above) → return True.
+    ///
+    /// pyre's enum flattens the class hierarchy, so the `True` list matches
+    /// AbstractVirtualPtrInfo's subclasses directly.  `PtrInfo::Constant`
+    /// was previously (incorrectly) in the True list — RPython's
+    /// `ConstPtrInfo` inherits from `PtrInfo` (not AbstractVirtualPtrInfo)
+    /// so it gets the False default.  The `Str` variant maps to
+    /// `StrPtrInfo` (vstring.py:50) which likewise inherits from
+    /// `PtrInfo` without override and should stay False.
     pub fn is_precise(&self) -> bool {
         matches!(
             self,
-            PtrInfo::Constant(_)
-                | PtrInfo::Instance(_)
+            PtrInfo::Instance(_)
                 | PtrInfo::Struct(_)
                 | PtrInfo::Array(_)
                 | PtrInfo::Virtual(_)
@@ -1741,6 +1816,28 @@ impl PtrInfo {
                     "ArrayPtrInfo.getlenbound: mode must be None"
                 );
                 Some(v.lenbound.clone())
+            }
+            // info.py:ArrayPtrInfo (virtual branch) + info.py:641-647
+            // `ArrayStructInfo(ArrayPtrInfo).__init__` which stores
+            // `self.lenbound = IntBound.from_constant(size)`.  pyre's
+            // `VirtualArrayInfo` keeps the array size implicit as
+            // `items.len()` and `VirtualArrayStructInfo` keeps it as
+            // `element_fields.len()`; synthesize the constant bound so
+            // `ARRAYLEN_GC` / `INT_GE` / `INT_LT` postprocessing sees
+            // the same information the ArrayPtrInfo branch does.
+            PtrInfo::VirtualArray(v) => {
+                debug_assert!(
+                    mode.is_none(),
+                    "VirtualArrayInfo.getlenbound: mode must be None"
+                );
+                Some(IntBound::from_constant(v.items.len() as i64))
+            }
+            PtrInfo::VirtualArrayStruct(v) => {
+                debug_assert!(
+                    mode.is_none(),
+                    "VirtualArrayStructInfo.getlenbound: mode must be None"
+                );
+                Some(IntBound::from_constant(v.element_fields.len() as i64))
             }
             // vstring.py:62-70 StrPtrInfo.getlenbound: lazy lenbound
             PtrInfo::Str(sinfo) => {
