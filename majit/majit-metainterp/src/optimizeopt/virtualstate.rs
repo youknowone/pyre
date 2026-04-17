@@ -2385,6 +2385,7 @@ mod tests {
                 fields: vec![],
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
@@ -2420,6 +2421,7 @@ mod tests {
                 fields: vec![],
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
@@ -2475,6 +2477,7 @@ mod tests {
                 fields: vec![(0, inner_field_value)],
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
         ctx.set_ptr_info(
@@ -2484,6 +2487,7 @@ mod tests {
                 fields: vec![(0, inner_field_value)],
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
 
@@ -2541,6 +2545,7 @@ mod tests {
                 fields: vec![(0, OpRef::NONE), (8, field_value)],
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
 
@@ -2596,6 +2601,7 @@ mod tests {
                 fields: vec![],
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();

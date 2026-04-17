@@ -630,7 +630,23 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     ) -> Option<majit_ir::RdVirtualInfo> {
         let resolved = self.ctx.get_box_replacement(opref);
         let info = self.ctx.get_ptr_info(resolved)?;
-        match info {
+        // resume.py:307-315 make_virtual_info cache check.
+        //
+        //     vinfo = info._cached_vinfo
+        //     if vinfo is not None and vinfo.equals(fieldnums):
+        //         return vinfo
+        //
+        // If a prior finish() already built the RdVirtualInfo for this
+        // PtrInfo instance and its fieldnums haven't changed, return the
+        // cached result directly instead of rebuilding.
+        if let Some(cache) = info.cached_vinfo() {
+            if let Some(vinfo) = cache.borrow().as_ref() {
+                if vinfo.equals(&fieldnums) {
+                    return Some(vinfo.clone());
+                }
+            }
+        }
+        let result = match info {
             PtrInfo::Virtual(vi) => {
                 let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
                     .fields
@@ -829,7 +845,16 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 })
             }
             _ => None,
+        };
+        // resume.py:314: info._cached_vinfo = vinfo
+        //
+        // On cache miss the freshly-built vinfo becomes the new cached
+        // entry. Future calls with matching fieldnums can short-circuit
+        // via the equals() check above.
+        if let (Some(cache), Some(vinfo)) = (info.cached_vinfo(), result.as_ref()) {
+            *cache.borrow_mut() = Some(vinfo.clone());
         }
+        result
     }
 }
 
@@ -4650,6 +4675,7 @@ mod constant_ptr_info_tests {
                 values: Vec::new(),
                 last_guard_pos: -1,
                 calldescr: None,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
         ctx.set_ptr_info(
@@ -4658,6 +4684,7 @@ mod constant_ptr_info_tests {
                 offset: 8,
                 parent,
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
 

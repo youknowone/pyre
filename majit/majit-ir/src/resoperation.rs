@@ -306,6 +306,37 @@ impl PartialEq for RdVirtualInfo {
 }
 impl Eq for RdVirtualInfo {}
 
+impl RdVirtualInfo {
+    /// resume.py:584-585 `AbstractVirtualInfo.set_content` stores `fieldnums`
+    /// onto every concrete vinfo. This accessor exposes that per-variant
+    /// field for `equals` / caching.
+    pub fn fieldnums(&self) -> Option<&[i16]> {
+        match self {
+            Self::VirtualInfo { fieldnums, .. }
+            | Self::VStructInfo { fieldnums, .. }
+            | Self::VArrayInfoClear { fieldnums, .. }
+            | Self::VArrayInfoNotClear { fieldnums, .. }
+            | Self::VArrayStructInfo { fieldnums, .. }
+            | Self::VRawBufferInfo { fieldnums, .. }
+            | Self::VRawSliceInfo { fieldnums, .. } => Some(fieldnums),
+            Self::Empty => None,
+        }
+    }
+
+    /// resume.py:581-582 `AbstractVirtualInfo.equals(fieldnums)`:
+    ///
+    /// ```python
+    /// def equals(self, fieldnums):
+    ///     return tagged_list_eq(self.fieldnums, fieldnums)
+    /// ```
+    ///
+    /// Used by `ResumeDataVirtualAdder.make_virtual_info` (resume.py:310)
+    /// to decide whether a cached `_cached_vinfo` can be reused verbatim.
+    pub fn equals(&self, other_fieldnums: &[i16]) -> bool {
+        self.fieldnums().is_some_and(|fns| fns == other_fieldnums)
+    }
+}
+
 /// resume.py: _add_pending_fields — a deferred SETFIELD_GC/SETARRAYITEM_GC
 /// where the stored value is virtual. Encoded into the guard's resume data
 /// and replayed on guard failure after virtual materialization.

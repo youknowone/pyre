@@ -332,6 +332,7 @@ impl OptVirtualize {
             offset,
             parent,
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         };
         ctx.set_ptr_info(source_op.pos, PtrInfo::VirtualRawSlice(opinfo));
     }
@@ -357,6 +358,7 @@ impl OptVirtualize {
             values: Vec::new(),
             last_guard_pos: -1,
             calldescr: source_op.descr.clone(),
+            cached_vinfo: std::cell::RefCell::new(None),
         };
         ctx.set_ptr_info(source_op.pos, PtrInfo::VirtualRawBuffer(opinfo));
     }
@@ -395,6 +397,7 @@ impl OptVirtualize {
             fields: Vec::new(),
             field_descrs: Vec::new(),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         };
         ctx.set_ptr_info(op.pos, PtrInfo::Virtual(vinfo));
         OptimizationResult::Remove
@@ -407,6 +410,7 @@ impl OptVirtualize {
             fields: Vec::new(),
             field_descrs: Vec::new(),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
         OptimizationResult::Remove
@@ -440,6 +444,7 @@ impl OptVirtualize {
                         fielddescrs,
                         element_fields,
                         last_guard_pos: -1,
+                        cached_vinfo: std::cell::RefCell::new(None),
                     };
                     ctx.set_ptr_info(op.pos, PtrInfo::VirtualArrayStruct(vinfo));
                 } else {
@@ -449,6 +454,7 @@ impl OptVirtualize {
                         clear: matches!(op.opcode, OpCode::NewArrayClear),
                         items,
                         last_guard_pos: -1,
+                        cached_vinfo: std::cell::RefCell::new(None),
                     };
                     ctx.set_ptr_info(op.pos, PtrInfo::VirtualArray(vinfo));
                 }
@@ -938,6 +944,7 @@ impl OptVirtualize {
             fields,
             field_descrs,
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         };
         ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
 
@@ -2953,6 +2960,7 @@ mod tests {
                     values: Vec::new(),
                     last_guard_pos: -1,
                     calldescr: None,
+                    cached_vinfo: std::cell::RefCell::new(None),
                 }),
             );
         }

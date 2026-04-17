@@ -348,6 +348,7 @@ impl Optimizer {
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -365,6 +366,7 @@ impl Optimizer {
                             clear: false,
                             items: imported_items,
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -387,6 +389,7 @@ impl Optimizer {
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -418,6 +421,7 @@ impl Optimizer {
                             fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -449,6 +453,7 @@ impl Optimizer {
                             last_guard_pos: -1,
                             // resume.py:1452: calldescr from callinfo_for_oopspec
                             calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -676,6 +681,7 @@ impl Optimizer {
                                 fields: entry.fields,
                                 field_descrs: entry.field_descrs,
                                 last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
                             },
                         ),
                     );
@@ -689,6 +695,7 @@ impl Optimizer {
                                 fields: entry.fields,
                                 field_descrs: entry.field_descrs,
                                 last_guard_pos: -1,
+                                cached_vinfo: std::cell::RefCell::new(None),
                             },
                         ),
                     );
@@ -787,6 +794,7 @@ impl Optimizer {
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -814,6 +822,7 @@ impl Optimizer {
                             clear: false,
                             items: imported_items,
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -848,6 +857,7 @@ impl Optimizer {
                             fields: imported_fields,
                             field_descrs: field_descrs.clone(),
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -887,6 +897,7 @@ impl Optimizer {
                             fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
                             last_guard_pos: -1,
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -926,6 +937,7 @@ impl Optimizer {
                             last_guard_pos: -1,
                             // resume.py:1452: calldescr from callinfo_for_oopspec
                             calldescr: Some(majit_ir::make_raw_malloc_calldescr()),
+                            cached_vinfo: std::cell::RefCell::new(None),
                         },
                     ),
                 );
@@ -4554,6 +4566,7 @@ mod tests {
                 fields: vec![(1, OpRef(11))],
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
         ctx.replace_op(OpRef(11), OpRef(20));
@@ -4564,6 +4577,7 @@ mod tests {
                 fields: Vec::new(),
                 field_descrs: Vec::new(),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
 
@@ -4603,6 +4617,7 @@ mod tests {
                 fields: vec![(0, OpRef(11))],
                 field_descrs: vec![field_descr.clone()],
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
 
