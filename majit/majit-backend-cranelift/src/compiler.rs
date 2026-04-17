@@ -1992,7 +1992,7 @@ fn install_call_assembler_expectations(
 }
 
 fn register_call_assembler_target(
-    token: &JitCellToken,
+    token: &mut JitCellToken,
     compiled: &CompiledLoop,
 ) -> Result<(), BackendError> {
     invalidate_ca_thread_cache(token.number);
@@ -2010,10 +2010,21 @@ fn register_call_assembler_target(
         // Derive from types: first N header entries.
         token.inputarg_types.len().min(compiled.num_inputs)
     };
-    // `rpython/jit/backend/model.py:292` — mirror `_ll_initial_locs` and
-    // `frame_info` onto the token's `CompiledLoopToken` so P2.3 can drop
-    // the duplicate fields below. `update_frame_depth` matches
-    // `jitframe.py:18-22` `jitframeinfo_update_depth`.
+    // P2.2 — CLT Arc continuity across pending → real registration.
+    //
+    // `compile_tmp_callback` (RPython `compile.py`) creates a placeholder
+    // target before the real `JitCellToken` exists; caller traces
+    // rewritten during the pending window bake in the pending CLT's
+    // `frame_info` address. If we let `JitCellToken::new` replace that
+    // Arc with a fresh one, the baked pointer dangles.
+    //
+    // Fix: adopt the pending Arc onto `token.compiled_loop_token` so the
+    // same allocation survives registration. `CompiledLoopToken::new`
+    // zero-initialises the fields we're about to populate, so swapping
+    // the fresh CLT the token already owns is safe (no state lost).
+    if let Some(existing) = call_assembler_registry().lock().unwrap().get(&token.number) {
+        token.compiled_loop_token = Some(existing.compiled_loop_token.clone());
+    }
     let clt = token
         .compiled_loop_token
         .as_ref()
