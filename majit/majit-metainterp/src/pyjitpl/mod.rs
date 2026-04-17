@@ -5631,13 +5631,12 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_box_types = snapshot_box_types;
         optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
 
+        // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
+        // constant pool merge. Const objects flow via rd_consts + fresh
+        // decode (resume.py:1245-1282). Typed seeding comes from
+        // inject_bridge_constants + decoded_box_to_opref.
         let (retraced_count, loop_num_inputs) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
-            if let Some(source_trace) = compiled.traces.get(&compiled.root_trace_id) {
-                for (&idx, &tp) in &source_trace.constant_types {
-                    optimizer.constant_types.entry(idx).or_insert(tp);
-                }
-            }
             (compiled.retraced_count, compiled.num_inputs)
         };
         let retrace_limit = self.warm_state.retrace_limit();
@@ -5675,49 +5674,8 @@ impl<M: Clone> MetaInterp<M> {
                 std::panic::resume_unwind(payload);
             }
         };
-        for (&idx, &(val, tp)) in &optimizer.bridge_preamble_constants {
-            constants.entry(idx).or_insert(val);
-            constant_types.entry(idx).or_insert(tp);
-        }
-        {
-            let compiled = self.compiled_loops.get(&green_key).unwrap();
-            if let Some(source_trace) = compiled.traces.get(&compiled.root_trace_id) {
-                let mut defined: std::collections::HashSet<u32> = std::collections::HashSet::new();
-                for i in 0..bridge_inputargs.len() {
-                    defined.insert(i as u32);
-                }
-                for op in &optimized_ops {
-                    if !op.pos.is_none() {
-                        defined.insert(op.pos.0);
-                    }
-                }
-                let mut missing: Vec<u32> = Vec::new();
-                for op in &optimized_ops {
-                    for &arg in &op.args {
-                        let idx = arg.0;
-                        if !defined.contains(&idx) && !constants.contains_key(&idx) {
-                            missing.push(idx);
-                        }
-                    }
-                    if let Some(ref fa) = op.fail_args {
-                        for &arg in fa {
-                            let idx = arg.0;
-                            if !defined.contains(&idx) && !constants.contains_key(&idx) {
-                                missing.push(idx);
-                            }
-                        }
-                    }
-                }
-                for idx in missing {
-                    if let Some(&val) = source_trace.constants.get(&idx) {
-                        constants.insert(idx, val);
-                        if let Some(&tp) = source_trace.constant_types.get(&idx) {
-                            constant_types.insert(idx, tp);
-                        }
-                    }
-                }
-            }
-        }
+        // RPython-orthodox: unroll.py replay uses Const args directly;
+        // no cross-trace constant pool merge step.
         if retrace_requested {
             if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                 compiled.retraced_count += 1;
@@ -6001,26 +5959,10 @@ impl<M: Clone> MetaInterp<M> {
         // to ExportedState.renamed_inputarg_types (RPython Box type parity).
         optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
 
-        // Merge source trace's constant_types into the bridge optimizer
-        // BEFORE optimization runs. The bridge trace's constant pool may
-        // reference OpRefs from the source trace (e.g. ob_type constants
-        // for virtual objects). Without this, fail_arg_type inference
-        // panics on unknown OpRef types during bridge optimization.
-        {
-            let source_trace_id = {
-                let tid = fail_descr.trace_id();
-                if tid == 0 {
-                    compiled.root_trace_id
-                } else {
-                    tid
-                }
-            };
-            if let Some(source_trace) = compiled.traces.get(&source_trace_id) {
-                for (&idx, &tp) in &source_trace.constant_types {
-                    optimizer.constant_types.entry(idx).or_insert(tp);
-                }
-            }
-        }
+        // RPython-orthodox: no source→bridge constant_types merge.
+        // bridgeopt.py / unroll.py do not copy the source loop's constant
+        // pool; typed seeding flows through inject_bridge_constants +
+        // decoded_box_to_opref per TAGCONST decode.
 
         // RPython bridgeopt.py:133-146 deserialize_optimizer_knowledge:
         // known_classes are restored from the per-guard bitfield that was
@@ -6072,65 +6014,10 @@ impl<M: Clone> MetaInterp<M> {
                 std::panic::resume_unwind(payload);
             }
         };
-        // RPython parity: merge short preamble constants into bridge pool.
-        // inline_short_preamble registered them in optimizer.bridge_preamble_constants.
-        for (&idx, &(val, tp)) in &optimizer.bridge_preamble_constants {
-            constants.entry(idx).or_insert(val);
-            constant_types.entry(idx).or_insert(tp);
-        }
-        // Also merge any remaining missing constants from the source trace's
-        // constant pool (for non-short-preamble references).
-        {
-            let source_trace_id = {
-                let tid = fail_descr.trace_id();
-                if tid == 0 {
-                    compiled.root_trace_id
-                } else {
-                    tid
-                }
-            };
-            // Collect all defined OpRefs (inputargs + op results)
-            let mut defined: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for i in 0..bridge_inputargs.len() {
-                defined.insert(i as u32);
-            }
-            for op in &optimized_ops {
-                if !op.pos.is_none() {
-                    defined.insert(op.pos.0);
-                }
-            }
-            // For any referenced OpRef that's not defined and not already a
-            // constant, check the source trace's constant pool.
-            if let Some(source_trace) = compiled.traces.get(&source_trace_id) {
-                let mut missing: Vec<u32> = Vec::new();
-                for op in &optimized_ops {
-                    for &arg in &op.args {
-                        let idx = arg.0;
-                        if !defined.contains(&idx) && !constants.contains_key(&idx) {
-                            missing.push(idx);
-                        }
-                    }
-                    if let Some(ref fa) = op.fail_args {
-                        for &arg in fa {
-                            let idx = arg.0;
-                            if !defined.contains(&idx) && !constants.contains_key(&idx) {
-                                missing.push(idx);
-                            }
-                        }
-                    }
-                }
-                for idx in missing {
-                    if let Some(&val) = source_trace.constants.get(&idx) {
-                        constants.insert(idx, val);
-                        // Also merge the type so Cranelift uses the correct
-                        // register class (Int vs Ref vs Float).
-                        if let Some(&tp) = source_trace.constant_types.get(&idx) {
-                            constant_types.insert(idx, tp);
-                        }
-                    }
-                }
-            }
-        }
+        // RPython-orthodox: no post-optimize cross-trace constant merge.
+        // Short preamble replay (unroll.py) emits ops with Const args
+        // directly; missing-constant recovery from source_trace is
+        // pyre-only and violates bridge pool isolation.
         if retrace_requested {
             // compile.py:1079: metainterp.retrace_needed(new_trace, info)
             // Save partial trace + exported state so the next loop-header's

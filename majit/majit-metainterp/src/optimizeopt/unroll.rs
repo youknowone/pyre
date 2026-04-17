@@ -2477,11 +2477,6 @@ impl OptUnroll {
             };
             ctx.make_constant(majit_ir::OpRef(idx), value);
             optimizer.constant_types.entry(idx).or_insert(tp);
-            // Store for compile_bridge to merge into Cranelift's constants map.
-            optimizer
-                .bridge_preamble_constants
-                .entry(idx)
-                .or_insert((val, tp));
         }
 
         let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();

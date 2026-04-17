@@ -69,11 +69,6 @@ pub struct Optimizer {
     /// Types of constant OpRefs from ConstantPool.constant_types.
     /// Used to distinguish Ref constants from Int in guard fail_args.
     pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
-    /// Short preamble constants imported during inline_short_preamble.
-    /// RPython parity: these are Const objects embedded in short preamble ops
-    /// that survive across compilations. In pyre, they must be merged into
-    /// the bridge's constant pool after optimize_bridge returns.
-    pub bridge_preamble_constants: std::collections::HashMap<u32, (i64, majit_ir::Type)>,
     /// RPython parity: GcRef constants (ob_type etc.) recorded as const_int
     /// need Ref type for resume data but must NOT trigger Cranelift GC root.
     pub numbering_type_overrides: std::collections::HashMap<u32, majit_ir::Type>,
@@ -994,7 +989,6 @@ impl Optimizer {
             quasi_immutable_deps: std::collections::HashSet::new(),
             resumedata_memo_consts: std::collections::HashMap::new(),
             constant_types: std::collections::HashMap::new(),
-            bridge_preamble_constants: std::collections::HashMap::new(),
             numbering_type_overrides: std::collections::HashMap::new(),
             imported_virtuals: Vec::new(),
             trace_inputarg_types: Vec::new(),
