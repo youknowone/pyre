@@ -84,13 +84,18 @@ pub enum CallEffectKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallEffectOverride {
+    /// `op.args[0]`-equivalent funcptr identity used to match the
+    /// override against a call site.
+    pub target: CallTarget,
+    /// `calldescr`-equivalent EffectInfo wrapper attached to the call.
     pub descriptor: CallDescriptor,
 }
 
 impl CallEffectOverride {
     pub fn new(target: CallTarget, effect: CallEffectKind) -> Self {
         Self {
-            descriptor: CallDescriptor::override_effect(target, effect_info_for_kind(effect)),
+            target,
+            descriptor: CallDescriptor::override_effect(effect_info_for_kind(effect)),
         }
     }
 }
@@ -586,7 +591,7 @@ impl<'a> Transformer<'a> {
                                 &mut self.analysis_cache,
                             )
                         };
-                    self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
+                    self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Builtin => {
                     self.handle_builtin_call(op, target, args, result_ty, graph_name)
@@ -600,7 +605,7 @@ impl<'a> Transformer<'a> {
         // Fallback when no CallControl: effect-only classification (legacy path).
         // RPython: always residual_call_*, effect only in calldescr.
         if let Some((descriptor, _effect)) = classify_call(target, &self.config.call_effects) {
-            self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
+            self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
         } else {
             RewriteResult::Keep
         }
@@ -727,7 +732,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:2003-2007: __handle_oopspec_call always
         // produces residual_call_*, appends -live- if calldescr_canraise.
         // Effect is only in the calldescr, never in the opcode name.
-        self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
+        self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
     }
 
     /// RPython: `Transformer.handle_regular_call(op)`.
@@ -1053,7 +1058,7 @@ impl<'a> Transformer<'a> {
             }
         }
         // jtransform.py:2003-2008: residual_call + optional -live-
-        self.handle_residual_call(op, descriptor, args, result_ty, graph_name)
+        self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
     }
 
     // NOTE: rewrite_op_jit_conditional_call, _rewrite_op_cond_call, and
@@ -1141,6 +1146,7 @@ impl<'a> Transformer<'a> {
         let call_kind = if is_value {
             OpKind::ConditionalCallValue {
                 value: condition_or_value,
+                funcptr: target.clone(),
                 descriptor: descriptor.clone(),
                 args_i,
                 args_r,
@@ -1150,6 +1156,7 @@ impl<'a> Transformer<'a> {
         } else {
             OpKind::ConditionalCall {
                 condition: condition_or_value,
+                funcptr: target.clone(),
                 descriptor: descriptor.clone(),
                 args_i,
                 args_r,
@@ -1264,6 +1271,7 @@ impl<'a> Transformer<'a> {
             result: None, // record_known_result produces void
             kind: OpKind::RecordKnownResult {
                 result_value,
+                funcptr: target.clone(),
                 descriptor: descriptor.clone(),
                 args_i,
                 args_r,
@@ -1283,9 +1291,12 @@ impl<'a> Transformer<'a> {
     /// RPython: `Transformer.handle_residual_call(op)` (jtransform.py:456-471).
     /// Call that the JIT should NOT look inside — emit residual_call_*.
     /// Args are split by kind via `rewrite_call()` → `make_three_lists()`.
+    /// `target` is the funcptr identity (mirrors `op.args[0]` upstream),
+    /// kept separate from `descriptor` per jtransform.py:457.
     fn handle_residual_call(
         &mut self,
         op: &SpaceOperation,
+        target: &CallTarget,
         descriptor: CallDescriptor,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -1293,7 +1304,7 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("call {} → residual", descriptor.target),
+            detail: format!("call {target} → residual"),
         });
         self.calls_classified += 1;
         // RPython jtransform.py:467: rewrite_call(op, 'residual_call', ...)
@@ -1305,6 +1316,7 @@ impl<'a> Transformer<'a> {
         let mut ops = vec![SpaceOperation {
             result: op.result,
             kind: OpKind::CallResidual {
+                funcptr: target.clone(),
                 descriptor,
                 args_i,
                 args_r,
@@ -1323,10 +1335,13 @@ impl<'a> Transformer<'a> {
 
     /// RPython: elidable call — pure function, result depends only on args.
     /// RPython jtransform.py:546-562.
+    ///
+    /// `target` is the funcptr identity per jtransform.py:457.
     #[allow(dead_code)]
     fn handle_elidable_call(
         &mut self,
         op: &SpaceOperation,
+        target: &CallTarget,
         descriptor: CallDescriptor,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -1334,7 +1349,7 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("call {} → elidable", descriptor.target),
+            detail: format!("call {target} → elidable"),
         });
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
@@ -1342,6 +1357,7 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(vec![SpaceOperation {
             result: op.result,
             kind: OpKind::CallElidable {
+                funcptr: target.clone(),
                 descriptor,
                 args_i,
                 args_r,
@@ -1353,10 +1369,13 @@ impl<'a> Transformer<'a> {
 
     /// RPython: may-force call — can trigger GC or force virtualizables.
     /// RPython jtransform.py:609-625.
+    ///
+    /// `target` is the funcptr identity per jtransform.py:457.
     #[allow(dead_code)]
     fn handle_may_force_call(
         &mut self,
         op: &SpaceOperation,
+        target: &CallTarget,
         descriptor: CallDescriptor,
         args: &[ValueId],
         result_ty: &ValueType,
@@ -1364,7 +1383,7 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("call {} → may_force", descriptor.target),
+            detail: format!("call {target} → may_force"),
         });
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
@@ -1374,6 +1393,7 @@ impl<'a> Transformer<'a> {
             SpaceOperation {
                 result: op.result,
                 kind: OpKind::CallMayForce {
+                    funcptr: target.clone(),
                     descriptor,
                     args_i,
                     args_r,
@@ -1647,6 +1667,7 @@ fn remap_op(
         },
         OpKind::RecordKnownResult {
             result_value,
+            funcptr,
             descriptor,
             args_i,
             args_r,
@@ -1654,6 +1675,7 @@ fn remap_op(
             result_kind,
         } => OpKind::RecordKnownResult {
             result_value: remap_value(*result_value, aliases),
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -1673,12 +1695,14 @@ fn remap_op(
             kind_char: *kind_char,
         },
         OpKind::CallElidable {
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::CallElidable {
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -1686,12 +1710,14 @@ fn remap_op(
             result_kind: *result_kind,
         },
         OpKind::CallResidual {
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::CallResidual {
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -1699,12 +1725,14 @@ fn remap_op(
             result_kind: *result_kind,
         },
         OpKind::CallMayForce {
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::CallMayForce {
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -1781,12 +1809,14 @@ fn remap_op(
         },
         OpKind::ConditionalCall {
             condition,
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
         } => OpKind::ConditionalCall {
             condition: remap_value(*condition, aliases),
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -1794,6 +1824,7 @@ fn remap_op(
         },
         OpKind::ConditionalCallValue {
             value,
+            funcptr,
             descriptor,
             args_i,
             args_r,
@@ -1801,6 +1832,7 @@ fn remap_op(
             result_kind,
         } => OpKind::ConditionalCallValue {
             value: remap_value(*value, aliases),
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -1929,7 +1961,7 @@ fn classify_call(
 
     if let Some(descriptor) = overrides
         .iter()
-        .find(|override_| call_target_matches_loose(&override_.descriptor.target, target))
+        .find(|override_| call_target_matches_loose(&override_.target, target))
         .map(|override_| override_.descriptor.clone())
     {
         let effect = classify_effect_info(&descriptor.get_extra_info());

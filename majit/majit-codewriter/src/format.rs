@@ -7,23 +7,16 @@
 //! directly.
 //!
 //! - Registers print as `%i<n>`, `%r<n>`, `%f<n>`.
-//! - Constants print as `$<value>`.
+//! - Constants print as `$<value>` (matching `format.py:23`).
 //! - Labels print as `L<index>` (assigned in textual order, matching
 //!   `format.py`'s `getlabelname`).
-//!
-//! **Partial port — known gaps versus `format.py:12-81`:**
-//!
-//! - Argument printing only handles `OpKind::Call`; every other
-//!   `OpKind` variant currently emits its name with an empty argument
-//!   list.  Callers who need precise per-variant fidelity should
-//!   extend [`op_args_repr`] before relying on the output.
-//! - Constants are not yet special-cased; upstream prints `$<repr>`
-//!   for `Constant` values, but pyre routes constants through the
-//!   `ValueId` / `RegKind` pair so the helper would need a
-//!   constant-pool lookup that does not exist yet.
-//! - Descrs and `ListOfKind` argument groups are not formatted.
-//! - The `_insns_pos` map (`format.py:62-66`) and the trailing
-//!   "missing label sentinel" branch are not reproduced.
+//! - `ListOfKind` argument groups print as `I[…]`, `R[…]`, `F[…]`
+//!   (matching `format.py:27`).
+//! - Call descriptors print via their `Debug` repr (matching
+//!   `format.py:32-33` `repr(AbstractDescr)`).
+//! - When `ssarepr.insns_pos` is set the formatter prefixes each line
+//!   with `'%4d  '` (matching `format.py:57-60`).
+//! - The trailing `('---',)` sentinel (`format.py:54-55`) is trimmed.
 //!
 //! The reverse direction (`unformat_assembler`) is intentionally not
 //! ported — the parity tests we run end-to-end build SSARepr through
@@ -60,38 +53,55 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
         }
     }
 
+    // format.py:53-55:
+    //   insns = ssarepr.insns
+    //   if insns and insns[-1] == ('---',):
+    //       insns = insns[:-1]
+    let insns: &[FlatOp] = match ssarepr.insns.last() {
+        Some(FlatOp::Unreachable) => &ssarepr.insns[..ssarepr.insns.len() - 1],
+        _ => &ssarepr.insns[..],
+    };
+
     let mut out = String::new();
-    for op in &ssarepr.insns {
+    for (i, op) in insns.iter().enumerate() {
+        // format.py:57-60: prefix = '%4d  ' % ssarepr._insns_pos[i] when set.
+        let prefix = match &ssarepr.insns_pos {
+            Some(positions) => positions
+                .get(i)
+                .map(|p| format!("{p:>4}  "))
+                .unwrap_or_default(),
+            None => String::new(),
+        };
         match op {
             FlatOp::Label(label) => {
                 if let Some(num) = seenlabels.get(label) {
-                    let _ = writeln!(out, "L{num}:");
+                    let _ = writeln!(out, "{prefix}L{num}:");
                 }
             }
             FlatOp::Op(space_op) => {
-                let _ = writeln!(
-                    out,
-                    "{} {}",
-                    op_name(space_op),
-                    op_args_repr(space_op, &ssarepr.value_kinds)
-                );
+                let args = op_args_repr(space_op, &ssarepr.value_kinds);
+                if args.is_empty() {
+                    let _ = writeln!(out, "{prefix}{}", op_name(space_op));
+                } else {
+                    let _ = writeln!(out, "{prefix}{} {args}", op_name(space_op));
+                }
             }
             FlatOp::Jump(label) => {
                 let num = name_label(*label, &mut seenlabels, &mut next_label);
-                let _ = writeln!(out, "goto L{num}");
+                let _ = writeln!(out, "{prefix}goto L{num}");
             }
             FlatOp::GotoIfNot { cond, target } => {
                 let num = name_label(*target, &mut seenlabels, &mut next_label);
                 let _ = writeln!(
                     out,
-                    "goto_if_not {}, L{num}",
+                    "{prefix}goto_if_not {}, L{num}",
                     register_repr(*cond, &ssarepr.value_kinds)
                 );
             }
             FlatOp::Move { dst, src } => {
                 let _ = writeln!(
                     out,
-                    "move {} -> {}",
+                    "{prefix}move {} -> {}",
                     register_repr(*src, &ssarepr.value_kinds),
                     register_repr(*dst, &ssarepr.value_kinds)
                 );
@@ -103,10 +113,10 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     .collect();
                 // format.py:76: `if asm[0] == '-live-': lst.sort()`.
                 names.sort();
-                let _ = writeln!(out, "-live- {}", names.join(", "));
+                let _ = writeln!(out, "{prefix}-live- {}", names.join(", "));
             }
             FlatOp::Unreachable => {
-                let _ = writeln!(out, "---");
+                let _ = writeln!(out, "{prefix}---");
             }
         }
     }
@@ -193,10 +203,100 @@ fn register_repr(v: ValueId, kinds: &HashMap<ValueId, RegKind>) -> String {
     format!("%{prefix}{}", v.0)
 }
 
+/// format.py:26-27 `ListOfKind` formatter.
+///
+/// Upstream emits `'%s[%s]' % (x.kind[0].upper(), ', '.join(map(repr, x)))`.
+/// Pyre's call-family `OpKind` variants split args into typed
+/// `args_i`/`args_r`/`args_f` Vecs, so the kind char is fixed per slot.
+fn list_of_kind_repr(
+    kind_char: char,
+    args: &[ValueId],
+    kinds: &HashMap<ValueId, RegKind>,
+) -> String {
+    let parts: Vec<String> = args.iter().map(|v| register_repr(*v, kinds)).collect();
+    format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
+}
+
+/// format.py:20-23 — render a `funcptr` Constant slot.
+///
+/// Upstream emits `$<* struct <name>>` for `Constant(lltype.Ptr(Struct))`
+/// and `$<value>` otherwise.  Pyre's codewrite-time funcptr surrogate is
+/// the [`crate::model::CallTarget`] stored on `CallDescriptor.target`,
+/// which we render in the `$<* function '<path>'>` shape that mirrors
+/// the upstream Ptr-to-Struct repr.
+fn call_target_repr(target: &crate::model::CallTarget) -> String {
+    use crate::model::CallTarget;
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+        } => match receiver_root {
+            Some(root) => format!("$<* function '{root}.{name}'>"),
+            None => format!("$<* function '{name}'>"),
+        },
+        CallTarget::FunctionPath { segments } => {
+            format!("$<* function '{}'>", segments.join("."))
+        }
+        CallTarget::UnsupportedExpr => "$<unsupported call target>".to_string(),
+    }
+}
+
 fn op_name(op: &crate::model::SpaceOperation) -> String {
     use crate::model::OpKind;
     match &op.kind {
         OpKind::Call { .. } => "call".to_string(),
+        OpKind::ConstInt(_) => "const_int".to_string(),
+        OpKind::CallElidable {
+            result_kind,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            format!(
+                "call_elidable_{}_{result_kind}",
+                kind_signature(args_i, args_r, args_f)
+            )
+        }
+        OpKind::CallResidual {
+            result_kind,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            format!(
+                "residual_call_{}_{result_kind}",
+                kind_signature(args_i, args_r, args_f)
+            )
+        }
+        OpKind::CallMayForce {
+            result_kind,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            format!(
+                "call_may_force_{}_{result_kind}",
+                kind_signature(args_i, args_r, args_f)
+            )
+        }
+        OpKind::InlineCall {
+            result_kind,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            format!(
+                "inline_call_{}_{result_kind}",
+                kind_signature(args_i, args_r, args_f)
+            )
+        }
+        OpKind::RecursiveCall { result_kind, .. } => {
+            format!("recursive_call_{result_kind}")
+        }
         // For the rest, fall back on a stable Debug-derived discriminant.
         other => format!("{:?}", other)
             .split('{')
@@ -210,6 +310,25 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
     }
 }
 
+/// jtransform.py:414-435 — call-family opcode kind suffix.
+///
+/// Encodes the (int, ref, float) arg tuple as a single-character
+/// signature ("i", "r", "f", "ir", "irf", …).  Empty bins drop out so
+/// `(args_i=[a], args_r=[], args_f=[])` produces `"i"`.
+fn kind_signature(args_i: &[ValueId], args_r: &[ValueId], args_f: &[ValueId]) -> String {
+    let mut out = String::new();
+    if !args_i.is_empty() {
+        out.push('i');
+    }
+    if !args_r.is_empty() {
+        out.push('r');
+    }
+    if !args_f.is_empty() {
+        out.push('f');
+    }
+    out
+}
+
 fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegKind>) -> String {
     use crate::model::OpKind;
     let mut out = String::new();
@@ -218,15 +337,111 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
             let parts: Vec<String> = args.iter().map(|v| register_repr(*v, kinds)).collect();
             out.push_str(&parts.join(", "));
         }
+        // format.py:23 `'$%r' % (x.value,)` — constants print as $<value>.
+        OpKind::ConstInt(value) => {
+            let _ = write!(out, "${value}");
+        }
+        // jtransform.py:414-435 `rewrite_call`:
+        //   sublists = [lst_i?, lst_r?, lst_f?, calldescr?]   # only kinds present
+        //   args = initialargs + sublists
+        // → for residual_call/call_may_force/call_elidable upstream emits
+        //   `$<funcptr>, I[…]?, R[…]?, F[…]?, <descr>` where the I/R/F
+        //   slots are gated on the opname kind signature.  Pyre carries
+        //   the funcptr identity on the dedicated `funcptr` field per
+        //   jtransform.py:457 `[op.args[0]] + extraargs`.
+        OpKind::CallElidable {
+            funcptr,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::CallResidual {
+            funcptr,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        }
+        | OpKind::CallMayForce {
+            funcptr,
+            descriptor,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut parts = vec![call_target_repr(funcptr)];
+            // jtransform.py:430-433 — emit each ListOfKind only when the
+            // matching kind char is in the signature.
+            if !args_i.is_empty() {
+                parts.push(list_of_kind_repr('i', args_i, kinds));
+            }
+            if !args_r.is_empty() {
+                parts.push(list_of_kind_repr('r', args_r, kinds));
+            }
+            if !args_f.is_empty() {
+                parts.push(list_of_kind_repr('f', args_f, kinds));
+            }
+            // jtransform.py:434 — descr is the last sublist when set.
+            parts.push(format!("{:?}", descriptor.extra_info));
+            out.push_str(&parts.join(", "));
+        }
+        // jtransform.py:473-482 `handle_regular_call`:
+        //   args = [jitcode] + [I?, R?, F? sublists]   # only kinds present
+        // → format.py:34-35 renders the JitCode object via JitCode.__repr__;
+        //   pyre stores `jitcode_index` so we surface the same
+        //   `<JitCode #N>` shape (mirroring JitCode.__repr__'s identity slot).
+        OpKind::InlineCall {
+            jitcode_index,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let mut parts = vec![format!("<JitCode #{jitcode_index}>")];
+            if !args_i.is_empty() {
+                parts.push(list_of_kind_repr('i', args_i, kinds));
+            }
+            if !args_r.is_empty() {
+                parts.push(list_of_kind_repr('r', args_r, kinds));
+            }
+            if !args_f.is_empty() {
+                parts.push(list_of_kind_repr('f', args_f, kinds));
+            }
+            out.push_str(&parts.join(", "));
+        }
+        // jtransform.py:522-534 `handle_recursive_call`:
+        //   args = [Constant(jdindex, lltype.Signed)] + green sublists + red sublists
+        // → format.py:23 renders `Constant(jdindex)` as `$<jdindex>`.
+        OpKind::RecursiveCall {
+            jd_index,
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+            ..
+        } => {
+            let mut parts = vec![format!("${jd_index}")];
+            parts.push(list_of_kind_repr('i', greens_i, kinds));
+            parts.push(list_of_kind_repr('r', greens_r, kinds));
+            parts.push(list_of_kind_repr('f', greens_f, kinds));
+            parts.push(list_of_kind_repr('i', reds_i, kinds));
+            parts.push(list_of_kind_repr('r', reds_r, kinds));
+            parts.push(list_of_kind_repr('f', reds_f, kinds));
+            out.push_str(&parts.join(", "));
+        }
         _ => {
             // **Stub branch.**  Pyre's `OpKind` carries typed payloads
             // rather than positional argument tuples, so an upstream-
-            // shaped formatter would need a per-variant projection
-            // (constants → `$<repr>`, descrs, `ListOfKind` groups,
-            // `Variable` regs).  Emitting an empty arg list keeps the
-            // op name + result direction printable without lying about
-            // the args; extend this branch when a parity test demands
-            // it.
+            // shaped formatter would need a per-variant projection.
+            // Variants not covered here (FieldRead/FieldWrite, etc.)
+            // print just the op name; extend this match when a parity
+            // test demands it.
         }
     }
     if let Some(result) = op.result {
@@ -251,6 +466,7 @@ mod tests {
             num_values: 0,
             num_blocks: 0,
             value_kinds: HashMap::new(),
+            insns_pos: None,
         }
     }
 
@@ -278,7 +494,19 @@ mod tests {
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Unreachable);
         let text = format_assembler(&ssa);
-        assert_eq!(text.trim(), "---");
+        // format.py:54-55 trims a trailing ('---',) sentinel.
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn format_unreachable_in_middle_is_kept() {
+        // Trim only when `---` is the last instruction (format.py:54-55).
+        let mut ssa = empty_ssa();
+        ssa.insns.push(FlatOp::Unreachable);
+        ssa.insns.push(FlatOp::Jump(Label(0)));
+        let text = format_assembler(&ssa);
+        assert!(text.contains("---"));
+        assert!(text.contains("goto L1"));
     }
 
     #[test]
@@ -292,8 +520,147 @@ mod tests {
             "
             goto L1
             L1:
-            ---
             ",
+        );
+    }
+
+    #[test]
+    fn format_constint_emits_dollar_value() {
+        // format.py:23 `'$%r' % (x.value,)`.
+        use crate::model::{OpKind, SpaceOperation};
+        let mut ssa = empty_ssa();
+        ssa.value_kinds.insert(ValueId(0), RegKind::Int);
+        ssa.insns.push(FlatOp::Op(SpaceOperation {
+            kind: OpKind::ConstInt(42),
+            result: Some(ValueId(0)),
+        }));
+        let text = format_assembler(&ssa);
+        assert!(text.contains("$42"), "expected `$42` in: {text}");
+        assert!(text.contains("-> %i0"), "expected `-> %i0` in: {text}");
+    }
+
+    #[test]
+    fn format_residual_call_emits_descr_and_listofkind() {
+        // jtransform.py:414-435 + format.py:27,32-33.
+        use crate::call::CallDescriptor;
+        use crate::model::{CallTarget, OpKind, SpaceOperation};
+        use majit_ir::descr::EffectInfo;
+
+        let mut ssa = empty_ssa();
+        ssa.value_kinds.insert(ValueId(1), RegKind::Int);
+        ssa.value_kinds.insert(ValueId(2), RegKind::Ref);
+        ssa.value_kinds.insert(ValueId(3), RegKind::Int);
+
+        let funcptr = CallTarget::function_path(["foo"]);
+        let descriptor = CallDescriptor::known(EffectInfo::default());
+        ssa.insns.push(FlatOp::Op(SpaceOperation {
+            kind: OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i: vec![ValueId(1)],
+                args_r: vec![ValueId(2)],
+                args_f: vec![],
+                result_kind: 'i',
+            },
+            result: Some(ValueId(3)),
+        }));
+        let text = format_assembler(&ssa);
+        assert!(
+            text.contains("residual_call_ir_i "),
+            "expected residual_call_ir_i in: {text}"
+        );
+        // jtransform.py:456-462 emits funcptr as args[0], calldescr via
+        // SpaceOperation.descr.  Pyre carries the funcptr identity on
+        // descriptor.target and renders it as `$<* function 'name'>`
+        // mirroring format.py:21-23 Ptr-to-Struct repr.
+        assert!(
+            text.contains("$<* function 'foo'>"),
+            "expected funcptr slot in: {text}"
+        );
+        assert!(text.contains("I[%i1]"), "expected I[%i1] in: {text}");
+        assert!(text.contains("R[%r2]"), "expected R[%r2] in: {text}");
+        // jtransform.py:430-433 — empty kind slots are dropped, matching
+        // upstream where `kinds = "ir"` excludes the F sublist entirely.
+        assert!(
+            !text.contains("F["),
+            "F[] must not appear when 'f' kind absent: {text}"
+        );
+        assert!(text.contains("-> %i3"));
+    }
+
+    #[test]
+    fn format_inline_call_emits_jitcode_and_listofkind() {
+        use crate::model::{OpKind, SpaceOperation};
+        let mut ssa = empty_ssa();
+        ssa.value_kinds.insert(ValueId(1), RegKind::Ref);
+        ssa.insns.push(FlatOp::Op(SpaceOperation {
+            kind: OpKind::InlineCall {
+                jitcode_index: 7,
+                args_i: vec![],
+                args_r: vec![ValueId(1)],
+                args_f: vec![],
+                result_kind: 'v',
+            },
+            result: None,
+        }));
+        let text = format_assembler(&ssa);
+        assert!(
+            text.contains("inline_call_r_v "),
+            "expected inline_call_r_v in: {text}"
+        );
+        // jtransform.py:478 stores the JitCode object as args[0]; format.py
+        // renders it via JitCode.__repr__ which carries the index-keyed
+        // identity.  Pyre prints it as `<JitCode #N>` so the parity test
+        // sees the same shape.
+        assert!(text.contains("<JitCode #7>"), "got: {text}");
+        assert!(text.contains("R[%r1]"));
+    }
+
+    #[test]
+    fn format_recursive_call_emits_jd_and_six_listofkinds() {
+        use crate::model::{OpKind, SpaceOperation};
+        let mut ssa = empty_ssa();
+        ssa.value_kinds.insert(ValueId(1), RegKind::Int);
+        ssa.value_kinds.insert(ValueId(2), RegKind::Ref);
+        ssa.insns.push(FlatOp::Op(SpaceOperation {
+            kind: OpKind::RecursiveCall {
+                jd_index: 0,
+                greens_i: vec![ValueId(1)],
+                greens_r: vec![],
+                greens_f: vec![],
+                reds_i: vec![],
+                reds_r: vec![ValueId(2)],
+                reds_f: vec![],
+                result_kind: 'v',
+            },
+            result: None,
+        }));
+        let text = format_assembler(&ssa);
+        assert!(text.contains("recursive_call_v "), "got: {text}");
+        // jtransform.py:530 stores `Constant(jdindex, lltype.Signed)` as
+        // args[0]; format.py:23 renders it as `$<value>`.  Pyre mirrors
+        // the shape exactly: `$0` for jd_index=0.
+        assert!(text.contains(" $0,"), "got: {text}");
+        // Six ListOfKind groups: greens (i,r,f) + reds (i,r,f).
+        let groups: Vec<&str> = text.matches('[').collect();
+        assert_eq!(groups.len(), 6, "expected 6 ListOfKind groups, got: {text}");
+    }
+
+    #[test]
+    fn format_with_insns_pos_prepends_position_prefix() {
+        // format.py:57-60 `prefix = '%4d  ' % ssarepr._insns_pos[i]`.
+        let mut ssa = empty_ssa();
+        ssa.insns.push(FlatOp::Jump(Label(0)));
+        ssa.insns.push(FlatOp::Label(Label(0)));
+        ssa.insns_pos = Some(vec![0, 12]);
+        let text = format_assembler(&ssa);
+        assert!(
+            text.contains("   0  goto L1"),
+            "expected '   0  goto L1' in: {text}"
+        );
+        assert!(
+            text.contains("  12  L1:"),
+            "expected '  12  L1:' in: {text}"
         );
     }
 }

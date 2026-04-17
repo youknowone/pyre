@@ -7396,30 +7396,24 @@ impl<M: Clone> MetaInterp<M> {
     // ────────────────────────────────────────────────────────────────
     // Frame-management surface mirroring pyjitpl.py:2421-2477.
     //
-    // **Skeleton stubs.**  Each method here exists so that future call
-    // sites compile against the upstream signature, but the bodies
-    // currently forward through pyre's `enter_inline_frame` /
-    // `leave_inline_frame` (which only maintain the trace-side
-    // `inline_depth` counter) and therefore do NOT yet implement the
-    // upstream call/return protocol.  The pieces still missing are:
+    // perform_call → newframe → MIFrame::setup_call (pyjitpl.py:2421-
+    // 2425), popframe → cleanup_registers (pyjitpl.py:2462-2477),
+    // finishframe → caller make_result_of_lastop + ChangeFrame
+    // (pyjitpl.py:2479-2503) are all wired against
+    // MetaInterp::framestack.  Two upstream limbs are explicitly
+    // staged:
     //
-    // - `MetaInterp<M>` does not own a real `MIFrameStack`, so
-    //   `perform_call` cannot construct an `MIFrame` and call
-    //   `f.setup_call(boxes)` (frame.rs already exposes the method).
-    // - `popframe` does not invoke `frame.cleanup_registers()` or
-    //   restore caller registers — the cleanup helper exists on
-    //   MIFrame but has no live frame to act on.
-    // - `finishframe` does not write the result back into the caller
-    //   frame via `make_result_of_lastop`, nor does it raise
-    //   `DoneWithThisFrame*` when the framestack is empty.
-    // - `is_main_jitcode` cannot consult `jitcode.jitdriver_sd.is_recursive`
-    //   because pyre has no JitCode-by-index registry on MetaInterp.
-    //
-    // Wiring all of this requires adding `framestack: MIFrameStack<'a>`
-    // (and the lifetime parameter) to `MetaInterp<M>`; that landing is
-    // tracked separately.  Until then, treat the methods below as the
-    // upstream API surface only — their bodies match RPython names but
-    // not behaviour.
+    // - finishframe's empty-framestack branch returns `Ok(())`
+    //   instead of raising `DoneWithThisFrame{Void,Int,Ref,Float}`;
+    //   the upstream raise path lands once the portal-runner shim is
+    //   migrated onto MetaInterp (see DoneWithThisFrame variant
+    //   below).
+    // - the upstream method on MIFrame, `do_residual_or_indirect_call`,
+    //   uses `self.metainterp` as a back-pointer; pyre's borrow
+    //   checker forbids that (MIFrame already lives inside
+    //   MetaInterp::framestack), so the canonical body lives on
+    //   MetaInterp<M> and acts on the current top-of-framestack
+    //   frame implicitly.
     // ────────────────────────────────────────────────────────────────
 
     /// pyjitpl.py:2421-2425 `MetaInterp.perform_call(jitcode, boxes, greenkey)`.
@@ -7813,7 +7807,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         allboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         descr: &dyn majit_ir::descr::CallDescr,
-    ) -> Result<Option<OpRef>, AbortEscape> {
+    ) -> Result<Option<OpRef>, SwitchToBlackhole> {
         // pyjitpl.py:3684: self.clear_exception()
         self.clear_exception();
         // pyjitpl.py:3685-3686: executor.execute_varargs(cpu, self, CALL_N, allboxes, descr)
@@ -7831,7 +7825,7 @@ impl<M: Clone> MetaInterp<M> {
         crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
         // pyjitpl.py:3687-3692: if self.last_exc_value: raise SwitchToBlackhole(ABORT_ESCAPE)
         if self.last_exc_value != 0 {
-            return Err(AbortEscape);
+            return Err(SwitchToBlackhole::abort_escape());
         }
         // pyjitpl.py:3693: return None
         Ok(None)
@@ -8211,17 +8205,33 @@ impl<M: Clone> MetaInterp<M> {
     /// instead of reading `bytecode[pc-1]` after dispatch, so the
     /// caller threads it through here.
     ///
-    /// `compile_done_with_this_frame` and the `DoneWithThisFrame*`
-    /// raise live behind pyre's portal-runner shim — the
-    /// frame-stack-exhausted branch returns `Ok(())` so callers can
-    /// take their existing exit path.
+    /// `compile_done_with_this_frame` is invoked here line-by-line
+    /// per pyjitpl.py:2487-2491; its body is the structural port at
+    /// `MetaInterp::compile_done_with_this_frame` (pyjitpl.py:3198).
+    /// PRE-EXISTING-ADAPTATION: in pyre the `recorder.finish()` +
+    /// `compile.compile_trace` work also happens at the
+    /// `TraceAction::Finish` dispatch point (jitdriver.rs:956 →
+    /// `MetaInterp::finish_and_compile`) because production function-
+    /// return paths route through the trace-recorder pipeline rather
+    /// than this method.  When `compile_done_with_this_frame` raises
+    /// `SwitchToBlackhole`, the catch translates it into
+    /// `aborted_tracing(reason)` per pyjitpl.py:2491.
     pub fn finishframe(
         &mut self,
         result: Option<(crate::jitcode::JitArgKind, usize, OpRef, i64)>,
         leave_portal_frame: bool,
-    ) -> Result<(), ChangeFrame> {
+    ) -> Result<(), FinishFrameSignal> {
         // pyjitpl.py:2481: self.last_exc_value = lltype.nullptr(...)
         self.last_exc_value = 0;
+        // Capture the popping frame's jitdriver_sd index BEFORE
+        // popframe takes the frame: pyjitpl.py:2493 reads
+        // `self.jitdriver_sd.result_type` from the active jitdriver,
+        // which in pyre is identified by the popped frame's jitcode.
+        let popping_jdindex = self
+            .framestack
+            .frames
+            .last()
+            .and_then(|f| f.jitcode.jitdriver_sd);
         // pyjitpl.py:2482: self.popframe(leave_portal_frame=...)
         self.popframe(leave_portal_frame);
         // pyjitpl.py:2483: if self.framestack:
@@ -8236,9 +8246,155 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             // pyjitpl.py:2486: raise ChangeFrame
-            return Err(ChangeFrame);
+            return Err(FinishFrameSignal::ChangeFrame);
         }
-        // pyjitpl.py:2487-2503: compile_done_with_this_frame branch.
+        // pyjitpl.py:2493-2503: result_type = self.jitdriver_sd.result_type
+        // → raise DoneWithThisFrame{Void,Int,Ref,Float} per result_type.
+        // The variant is determined by the active jitdriver's
+        // declared return type, NOT by the resultbox kind tuple — the
+        // resultbox supplies the value, the driver supplies the type.
+        // Pre-resolved here so compile_done_with_this_frame and the
+        // matching DoneWithThisFrame constructor share the same value.
+        let result_type = popping_jdindex
+            .and_then(|idx| self.staticdata.jitdrivers_sd.get(idx))
+            .map(|jd| jd.result_type)
+            // No active jitdriver_sd (e.g. helper jitcodes that never
+            // entered through a portal); fall back to the resultbox
+            // kind so the helper's caller still gets a typed signal.
+            .unwrap_or_else(|| match &result {
+                None => majit_ir::Type::Void,
+                Some((crate::jitcode::JitArgKind::Int, _, _, _)) => majit_ir::Type::Int,
+                Some((crate::jitcode::JitArgKind::Ref, _, _, _)) => majit_ir::Type::Ref,
+                Some((crate::jitcode::JitArgKind::Float, _, _, _)) => majit_ir::Type::Float,
+            });
+        // pyjitpl.py:2487-2491:
+        //     try:
+        //         self.compile_done_with_this_frame(resultbox)
+        //     except SwitchToBlackhole as stb:
+        //         self.aborted_tracing(stb.reason)
+        let exitbox = result.map(|(_, _, opref, _)| opref);
+        if let Err(stb) = self.compile_done_with_this_frame(exitbox, result_type) {
+            self.aborted_tracing(stb.reason);
+        }
+        let signal = match result_type {
+            // pyjitpl.py:2494-2496: VOID → assert resultbox is None;
+            //                              raise DoneWithThisFrameVoid()
+            majit_ir::Type::Void => {
+                debug_assert!(
+                    result.is_none(),
+                    "finishframe: VOID result_type with non-None resultbox",
+                );
+                DoneWithThisFrame::Void
+            }
+            // pyjitpl.py:2497-2498: INT → DoneWithThisFrameInt(resultbox.getint())
+            majit_ir::Type::Int => {
+                let value = result.map(|(_, _, _, v)| v).unwrap_or(0);
+                DoneWithThisFrame::Int(value)
+            }
+            // pyjitpl.py:2499-2500: REF → DoneWithThisFrameRef(resultbox.getref_base())
+            // jitexc.py:29 carries `GcRef`; pyre stores the raw GC
+            // pointer as `i64` in the make_result_of_lastop tuple, so
+            // wrap it back into the typed jitexc payload here.
+            majit_ir::Type::Ref => {
+                let value = result.map(|(_, _, _, v)| v).unwrap_or(0);
+                DoneWithThisFrame::Ref(majit_ir::GcRef(value as usize))
+            }
+            // pyjitpl.py:2501-2502: FLOAT → DoneWithThisFrameFloat(resultbox.getfloatstorage())
+            // jitexc.py:37 carries `f64`; pyre threads the IEEE-754 bit
+            // pattern through the i64 result tuple, so decode it back
+            // to f64 for the typed payload.
+            majit_ir::Type::Float => {
+                let value = result.map(|(_, _, _, v)| v).unwrap_or(0);
+                DoneWithThisFrame::Float(f64::from_bits(value as u64))
+            }
+        };
+        Err(FinishFrameSignal::Done(signal))
+    }
+
+    /// pyjitpl.py:3198-3220 `MetaInterp.compile_done_with_this_frame(exitbox)`.
+    ///
+    /// ```python
+    /// def compile_done_with_this_frame(self, exitbox):
+    ///     self.store_token_in_vable()
+    ///     sd = self.staticdata
+    ///     result_type = self.jitdriver_sd.result_type
+    ///     if result_type == history.VOID:
+    ///         assert exitbox is None
+    ///         exits = []
+    ///         token = sd.done_with_this_frame_descr_void
+    ///     elif result_type == history.INT:
+    ///         exits = [exitbox]
+    ///         token = sd.done_with_this_frame_descr_int
+    ///     elif result_type == history.REF:
+    ///         exits = [exitbox]
+    ///         token = sd.done_with_this_frame_descr_ref
+    ///     elif result_type == history.FLOAT:
+    ///         exits = [exitbox]
+    ///         token = sd.done_with_this_frame_descr_float
+    ///     else:
+    ///         assert False
+    ///     self.history.record(rop.FINISH, exits, None, descr=token)
+    ///     target_token = compile.compile_trace(self, self.resumekey, exits)
+    ///     if target_token is not token:
+    ///         compile.giveup()
+    /// ```
+    ///
+    /// `popping_jdindex` is the index of the jitdriver_sd whose result_type
+    /// drives the dispatch (pyre's analog of `self.jitdriver_sd`, which
+    /// upstream resolves implicitly off `self`).  See `finishframe`'s
+    /// `popping_jdindex` snapshot for why the index has to be threaded
+    /// through here in pyre.
+    ///
+    /// PRE-EXISTING-ADAPTATION: `self.history.record(rop.FINISH, ...)`
+    /// + `compile.compile_trace` are also driven from the
+    /// `TraceAction::Finish` dispatch (jitdriver.rs:956 →
+    /// `MetaInterp::finish_and_compile`) — pyre's recorder owns the
+    /// finish/compile sequence and emits FINISH from there with the
+    /// matching `make_fail_descr_typed(result_types)` descr (the
+    /// `done_with_this_frame_descr_*` analog).  This method runs the
+    /// upstream skeleton — `store_token_in_vable` (idempotent because
+    /// the frontend already records it before TraceAction::Finish at
+    /// mod.rs:3267), result_type/exits/token bookkeeping, and surfacing
+    /// `SwitchToBlackhole` to the caller — without re-emitting the
+    /// FINISH op.
+    pub fn compile_done_with_this_frame(
+        &mut self,
+        exitbox: Option<OpRef>,
+        result_type: majit_ir::Type,
+    ) -> Result<(), SwitchToBlackhole> {
+        // pyjitpl.py:3199 self.store_token_in_vable()
+        // store_token_in_vable_setfield is a no-op when no virtualizable
+        // is registered or when the frontend already wrote the token.
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.store_token_in_vable_setfield();
+        }
+        // pyjitpl.py:3200-3216: select exits / token from result_type.
+        // (Upstream reads `self.jitdriver_sd.result_type` directly; pyre
+        // resolves it in `finishframe` and passes it through here.)
+        let exits: Vec<OpRef> = match result_type {
+            // pyjitpl.py:3204-3206: VOID → exits = [], assert exitbox is None.
+            majit_ir::Type::Void => {
+                debug_assert!(
+                    exitbox.is_none(),
+                    "compile_done_with_this_frame: VOID with non-None exitbox",
+                );
+                Vec::new()
+            }
+            // pyjitpl.py:3207-3215: INT/REF/FLOAT → exits = [exitbox].
+            _ => exitbox.into_iter().collect(),
+        };
+        // pyjitpl.py:3216 token = sd.done_with_this_frame_descr_<kind>
+        // PRE-EXISTING-ADAPTATION: pyre's analog is the typed FINISH
+        // descr produced by `make_fail_descr_typed([result_type])`.
+        let _token = match result_type {
+            majit_ir::Type::Void => crate::make_fail_descr_typed(vec![]),
+            tp => crate::make_fail_descr_typed(vec![tp]),
+        };
+        // pyjitpl.py:3217 self.history.record(rop.FINISH, exits, None, descr=token)
+        // pyjitpl.py:3218 target_token = compile.compile_trace(self, self.resumekey, exits)
+        // PRE-EXISTING-ADAPTATION: emitted at the TraceAction::Finish
+        // dispatch (jitdriver.rs:956); see method docstring.
+        let _ = exits;
         Ok(())
     }
 
@@ -8649,7 +8805,7 @@ impl<M: Clone> MetaInterp<M> {
     /// **Stub** — RPython's libffi-call optimization is highly
     /// specialized to RPython's libffi binding (`OS_LIBFFI_CALL`).
     /// Pyre does not currently expose libffi at the JIT layer; the
-    /// named entry returns `None` so `do_residual_call_full` falls
+    /// named entry returns `None` so `do_residual_call` falls
     /// through to `direct_call_release_gil` / `direct_call_may_force`,
     /// matching the upstream "may return None to mean 'can't handle
     /// it myself'" contract (pyjitpl.py:2061).
@@ -8664,50 +8820,349 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:3589-3609 `MetaInterp.direct_assembler_call(arglist, valueconst, calldescr, targetjitdriver_sd)`.
     ///
-    /// **Stub** — pyre's CALL_ASSEMBLER lowering currently lives in
-    /// the existing tracer (`call_callable_value` / `pyre-jit`), not
-    /// inside MetaInterp.  Returns `(None, None)` so the
-    /// `do_residual_call_full` force_virtual path falls back to
-    /// pyre's existing residual emission.
+    /// ```python
+    /// def direct_assembler_call(self, arglist, valueconst, calldescr, targetjitdriver_sd):
+    ///     num_green_args = targetjitdriver_sd.num_green_args
+    ///     greenargs = arglist[1:num_green_args+1]
+    ///     args = arglist[num_green_args+1:]
+    ///     warmrunnerstate = targetjitdriver_sd.warmstate
+    ///     token = warmrunnerstate.get_assembler_token(greenargs)
+    ///     opnum = OpHelpers.call_assembler_for_descr(calldescr)
+    ///     op = self.history.record_nospec(opnum, args, valueconst, descr=token)
+    ///     jd = token.outermost_jitdriver_sd
+    ///     if jd.index_of_virtualizable >= 0:
+    ///         return args[jd.index_of_virtualizable], op
+    ///     else:
+    ///         return None, op
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream's
+    /// `warmrunnerstate.get_assembler_token(greenargs)` uses the
+    /// concrete green-arg values to look up the matching JitCellToken;
+    /// pyre's MetaInterp doesn't get the concrete greens at this site
+    /// (the args list passed in carries OpRefs only).  We therefore
+    /// record the CALL_ASSEMBLER_* op via the typed-descr path that
+    /// reuses the target jitdriver_sd's mainjitcode calldescr — the
+    /// JitCellToken plumbing folds into pyre's existing
+    /// `TraceCtx::call_assembler_typed` recorder hook
+    /// (trace_ctx.rs:2376) and stays correct because the descr already
+    /// encodes the target identity.
     pub fn direct_assembler_call(
         &mut self,
-        _arglist: &[OpRef],
-        _descr_ref: majit_ir::DescrRef,
-        _descr_view: &dyn majit_ir::descr::CallDescr,
-        _targetjitdriver_sd: usize,
+        arglist: &[OpRef],
+        descr_ref: majit_ir::DescrRef,
+        descr_view: &dyn majit_ir::descr::CallDescr,
+        targetjitdriver_sd: usize,
     ) -> (Option<OpRef>, Option<OpRef>) {
-        (None, None)
+        // pyjitpl.py:3593 num_green_args = targetjitdriver_sd.num_green_args
+        let target_sd = match self.staticdata.jitdrivers_sd.get(targetjitdriver_sd) {
+            Some(sd) => sd,
+            None => return (None, None),
+        };
+        let num_green_args = target_sd.num_greens();
+        // pyjitpl.py:3594-3595 greenargs = arglist[1:num+1]; args = arglist[num+1:]
+        // PRE-EXISTING-ADAPTATION: arglist here is the OpRef-only
+        // version (pyre's `_build_allboxes` already split funcbox to
+        // index 0 and the typed args follow).  Greenargs are sliced
+        // for parity but only their length matters at this site
+        // because the warmstate token lookup happens via the
+        // TraceCtx::call_assembler_typed descr path.
+        if arglist.len() < num_green_args + 1 {
+            return (None, None);
+        }
+        let _greenargs = &arglist[1..num_green_args + 1];
+        let args: &[OpRef] = &arglist[num_green_args + 1..];
+        // pyjitpl.py:3596 assert len(args) == targetjitdriver_sd.num_red_args
+        debug_assert_eq!(
+            args.len(),
+            target_sd.num_reds(),
+            "pyjitpl.py:3596 — direct_assembler_call args.len() must match num_red_args",
+        );
+        // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
+        let opnum = match descr_view.result_type() {
+            majit_ir::Type::Int => OpCode::CallAssemblerI,
+            majit_ir::Type::Ref => OpCode::CallAssemblerR,
+            majit_ir::Type::Float => OpCode::CallAssemblerF,
+            majit_ir::Type::Void => OpCode::CallAssemblerN,
+        };
+        // pyjitpl.py:3602 op = self.history.record_nospec(opnum, args, valueconst, descr=token)
+        let op_ref = {
+            let ctx = match self.tracing.as_mut() {
+                Some(ctx) => ctx,
+                None => return (None, None),
+            };
+            ctx.recorder.record_op_with_descr(opnum, args, descr_ref)
+        };
+        // pyjitpl.py:3604-3608 return vablebox per jd.index_of_virtualizable.
+        let vablebox = target_sd
+            .virtualizable_arg_index()
+            .and_then(|idx| args.get(idx).copied());
+        (vablebox, Some(op_ref))
     }
 
     /// pyjitpl.py:3317-3335 `MetaInterp.vable_and_vrefs_before_residual_call`.
     ///
-    /// **Stub** — pyre's virtualizable + virtualref handling lives in
-    /// the existing tracer state machine (`virtualref_boxes`,
-    /// `vable_array_lengths`).  The named entry stays so
-    /// `do_residual_call_full` calls the upstream sequence; the body
-    /// will land when pyre's virtualizable infrastructure migrates
-    /// to MetaInterp methods.
-    pub fn vable_and_vrefs_before_residual_call(&mut self) {}
+    /// ```python
+    /// def vable_and_vrefs_before_residual_call(self):
+    ///     vrefinfo = self.staticdata.virtualref_info
+    ///     for i in range(1, len(self.virtualref_boxes), 2):
+    ///         vrefbox = self.virtualref_boxes[i]
+    ///         vref = vrefbox.getref_base()
+    ///         vrefinfo.tracing_before_residual_call(vref)
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is not None:
+    ///         virtualizable_box = self.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         vinfo.tracing_before_residual_call(virtualizable)
+    ///         force_token = self.history.record0(rop.FORCE_TOKEN, ...)
+    ///         self.history.record2(rop.SETFIELD_GC, virtualizable_box,
+    ///                              force_token, None,
+    ///                              descr=vinfo.vable_token_descr)
+    /// ```
+    pub fn vable_and_vrefs_before_residual_call(&mut self) {
+        // pyjitpl.py:3318-3324 — vrefinfo loop over odd indices.
+        let vref_ptrs: Vec<usize> = self
+            .virtualref_boxes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, ptr))| (i % 2 == 1).then_some(*ptr))
+            .collect();
+        for vref_ptr in vref_ptrs {
+            // SAFETY: vref_ptr was registered by `opimpl_virtual_ref` with a
+            // valid JitVirtualRef pointer; we only flip its token field.
+            unsafe {
+                self.virtualref_info
+                    .tracing_before_residual_call(vref_ptr as *mut u8);
+            }
+        }
+        // pyjitpl.py:3326-3334 — vinfo path (FORCE_TOKEN + SETFIELD_GC).
+        let vinfo = match self.virtualizable_info.clone() {
+            Some(info) => info,
+            None => return,
+        };
+        let vable_ptr = self.vable_ptr;
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let vbox = match ctx.standard_virtualizable_box() {
+            Some(b) => b,
+            None => return,
+        };
+        if !vable_ptr.is_null() {
+            // SAFETY: the host stamps `vable_ptr` to the live virtualizable
+            // pointer for the duration of the trace; flipping the token
+            // field is the only side effect.
+            unsafe {
+                vinfo.tracing_before_residual_call(vable_ptr as *mut u8);
+            }
+        }
+        let force_token = ctx.force_token();
+        ctx.vable_setfield_descr(vbox, force_token, vinfo.token_field_descr());
+    }
 
     /// pyjitpl.py:3337-3347 `MetaInterp.vrefs_after_residual_call`.
-    pub fn vrefs_after_residual_call(&mut self) {}
+    ///
+    /// ```python
+    /// def vrefs_after_residual_call(self):
+    ///     vrefinfo = self.staticdata.virtualref_info
+    ///     for i in range(0, len(self.virtualref_boxes), 2):
+    ///         vrefbox = self.virtualref_boxes[i+1]
+    ///         vref = vrefbox.getref_base()
+    ///         if vrefinfo.tracing_after_residual_call(vref):
+    ///             self.stop_tracking_virtualref(i)
+    /// ```
+    pub fn vrefs_after_residual_call(&mut self) {
+        let mut forced_pairs: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i + 1 < self.virtualref_boxes.len() {
+            let vref_ptr = self.virtualref_boxes[i + 1].1;
+            // SAFETY: vref_ptr was registered by `opimpl_virtual_ref`.
+            let forced = unsafe {
+                self.virtualref_info
+                    .tracing_after_residual_call(vref_ptr as *mut u8)
+            };
+            if forced {
+                forced_pairs.push(i);
+            }
+            i += 2;
+        }
+        for pair_index in forced_pairs {
+            self.stop_tracking_virtualref(pair_index);
+        }
+    }
 
     /// pyjitpl.py:3349-3378 `MetaInterp.vable_after_residual_call(funcbox)`.
-    pub fn vable_after_residual_call(&mut self, _funcbox: i64) {}
+    ///
+    /// ```python
+    /// def vable_after_residual_call(self, funcbox):
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is not None:
+    ///         virtualizable_box = self.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         if vinfo.tracing_after_residual_call(virtualizable):
+    ///             self.load_fields_from_virtualizable()
+    ///             ...debug_print...
+    ///             raise SwitchToBlackhole(Counters.ABORT_ESCAPE,
+    ///                                     raising_exception=True)
+    /// ```
+    ///
+    /// Returns `Err(SwitchToBlackhole)` (with `raising_exception=true`)
+    /// when the virtualizable escaped during the residual call so the
+    /// caller can route to the matching `aborted_tracing` /
+    /// blackhole-resume path.
+    pub fn vable_after_residual_call(&mut self, _funcbox: i64) -> Result<(), SwitchToBlackhole> {
+        let vinfo = match self.virtualizable_info.clone() {
+            Some(info) => info,
+            None => return Ok(()),
+        };
+        let vable_ptr = self.vable_ptr;
+        if vable_ptr.is_null() {
+            return Ok(());
+        }
+        // SAFETY: the host keeps `vable_ptr` live for the duration of the
+        // trace; we read/write its token field only.
+        let escaped = unsafe { vinfo.tracing_after_residual_call(vable_ptr as *mut u8) };
+        if !escaped {
+            return Ok(());
+        }
+        // pyjitpl.py:3367 self.load_fields_from_virtualizable() — pyre's
+        // existing tracer state-machine mirror is invoked from the
+        // trace-context dispatch loop on the matching guard fail path,
+        // so this method only signals the escape event upward.
+        // pyjitpl.py:3373-3375 raise SwitchToBlackhole(ABORT_ESCAPE,
+        //                              raising_exception=True)
+        Err(SwitchToBlackhole {
+            reason: counters::ABORT_ESCAPE,
+            raising_exception: true,
+        })
+    }
+
+    /// pyjitpl.py:3381-3387 `MetaInterp.stop_tracking_virtualref(i)`.
+    ///
+    /// ```python
+    /// def stop_tracking_virtualref(self, i):
+    ///     virtualbox = self.virtualref_boxes[i]
+    ///     vrefbox = self.virtualref_boxes[i+1]
+    ///     self.history.record2(rop.VIRTUAL_REF_FINISH, vrefbox, virtualbox, None)
+    ///     self.virtualref_boxes[i+1] = CONST_NULL
+    /// ```
+    pub fn stop_tracking_virtualref(&mut self, i: usize) {
+        if i + 1 >= self.virtualref_boxes.len() {
+            return;
+        }
+        let virtualbox = self.virtualref_boxes[i].0;
+        let vrefbox = self.virtualref_boxes[i + 1].0;
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, virtualbox]);
+        }
+        // pyjitpl.py:3387 `self.virtualref_boxes[i+1] = CONST_NULL`
+        let null_const = self
+            .tracing
+            .as_mut()
+            .map(|ctx| ctx.const_int(0))
+            .unwrap_or(OpRef(0));
+        self.virtualref_boxes[i + 1] = (null_const, 0);
+    }
 
     /// pyjitpl.py:2153-2172 `MIFrame._do_jit_force_virtual(allboxes, descr, pc)`.
     ///
-    /// **Stub** — pyre's `OS_JIT_FORCE_VIRTUAL` short-circuit lives
-    /// in `optimizeopt::virtualize` today; the named entry returns
-    /// None so `do_residual_call_full` falls through to the regular
-    /// CALL_MAY_FORCE_* lowering.
+    /// ```python
+    /// def _do_jit_force_virtual(self, allboxes, descr, pc):
+    ///     assert len(allboxes) == 2
+    ///     if (self.metainterp.jitdriver_sd.virtualizable_info is None and
+    ///         self.metainterp.jitdriver_sd.greenfield_info is None):
+    ///         return None
+    ///     vref_box = allboxes[1]
+    ///     standard_box = self.metainterp.virtualizable_boxes[-1]
+    ///     if standard_box is vref_box:
+    ///         return vref_box
+    ///     if self.metainterp.heapcache.is_known_nonstandard_virtualizable(vref_box):
+    ///         return None
+    ///     eqbox = self.metainterp.execute_and_record(rop.PTR_EQ, None, vref_box, standard_box)
+    ///     eqbox = self.implement_guard_value(eqbox, pc)
+    ///     isstandard = eqbox.getint()
+    ///     if isstandard:
+    ///         return standard_box
+    ///     else:
+    ///         return None
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream's `greenfield_info` lives on
+    /// the per-jitdriver static data; pyre keeps a single
+    /// `virtualizable_info` slot on MetaInterp because the
+    /// jitdrivers_sd table on metainterp doesn't yet carry per-driver
+    /// greenfield_info (codewriter side does).  The bail condition
+    /// therefore checks `virtualizable_info` only — when greenfield-
+    /// only drivers ship, the metainterp jitdrivers_sd port will
+    /// supply the missing slot.
     pub fn _do_jit_force_virtual(
         &mut self,
-        _allboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+        allboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         _descr_view: &dyn majit_ir::descr::CallDescr,
-        _pc: usize,
+        pc: usize,
     ) -> Option<OpRef> {
-        None
+        debug_assert_eq!(
+            allboxes.len(),
+            2,
+            "pyjitpl.py:2154 — _do_jit_force_virtual expects exactly 2 args",
+        );
+        // pyjitpl.py:2155-2158: bail when neither virtualizable nor greenfield_info exists.
+        if self.virtualizable_info.is_none() {
+            return None;
+        }
+        // pyjitpl.py:2159-2161: vref_box vs standard_box identity short-circuit.
+        let vref_box = allboxes[1].1;
+        let vref_concrete = allboxes[1].2;
+        let standard_box = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.standard_virtualizable_box())?;
+        if vref_box == standard_box {
+            return Some(vref_box);
+        }
+        // pyjitpl.py:2162-2163: heapcache short-circuit when the box is
+        // known to NOT be the standard virtualizable.
+        let is_known_nonstandard = self
+            .tracing
+            .as_ref()
+            .map(|ctx| {
+                ctx.heap_cache()
+                    .is_known_nonstandard_virtualizable(vref_box)
+            })
+            .unwrap_or(false);
+        if is_known_nonstandard {
+            return None;
+        }
+        // pyjitpl.py:2165: eqbox = self.metainterp.execute_and_record(rop.PTR_EQ,
+        //                                                              None,
+        //                                                              vref_box,
+        //                                                              standard_box)
+        let standard_concrete = self.vable_ptr as usize as i64;
+        let isstandard_int = if vref_concrete == standard_concrete {
+            1
+        } else {
+            0
+        };
+        let eqbox_opref = {
+            let ctx = self.tracing.as_mut()?;
+            ctx.recorder
+                .record_op(OpCode::PtrEq, &[vref_box, standard_box])
+        };
+        // pyjitpl.py:2166: eqbox = self.implement_guard_value(eqbox, pc)
+        // — pyre's `promote_int` records GUARD_VALUE on the result and
+        // returns the const ref the optimizer can constant-fold against.
+        let _ = pc;
+        let _eqbox_const = {
+            let ctx = self.tracing.as_mut()?;
+            ctx.promote_int(eqbox_opref, isstandard_int, 0)
+        };
+        // pyjitpl.py:2167-2171: isstandard branch.
+        if isstandard_int != 0 {
+            Some(standard_box)
+        } else {
+            None
+        }
     }
 
     /// pyjitpl.py:1995-2126 `MIFrame.do_residual_call(funcbox, argboxes, descr, pc, assembler_call=False, assembler_call_jd=None)`.
@@ -8834,7 +9289,13 @@ impl<M: Clone> MetaInterp<M> {
                 _ => None,
             };
             // pyjitpl.py:2078: vable_after_residual_call(funcbox)
-            self.vable_after_residual_call(funcbox.2);
+            // SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)
+            // surfaces here when the virtualizable escaped during the
+            // residual call (pyjitpl.py:3373-3375).  Route into the
+            // existing DoResidualCallAbort variant so the caller's
+            // abort path fires.
+            self.vable_after_residual_call(funcbox.2)
+                .map_err(DoResidualCallAbort::from)?;
             // pyjitpl.py:2079: generate_guard(rop.GUARD_NOT_FORCED)
             if let Some(ctx) = self.tracing.as_mut() {
                 ctx.record_guard(OpCode::GuardNotForced, &[], 0);
@@ -8865,11 +9326,11 @@ impl<M: Clone> MetaInterp<M> {
                         .heap_cache()
                         .call_loopinvariant_known_result(descr_index as u32, arg0_int)
                     {
-                        // PRE-EXISTING-ADAPTATION: pyre's heap cache
-                        // stores the cached OpRef but not the cached
-                        // resvalue; return 0 for the concrete value
-                        // until the cache grows that field.
-                        return Ok(Some((cached, 0)));
+                        // pyjitpl.py:2089-2090: `if res is not None: return res`
+                        // — the cached entry already pairs the symbolic
+                        // OpRef with its concrete value (heapcache.rs
+                        // `loopinvariant_resvalue`).
+                        return Ok(Some(cached));
                     }
                 }
             }
@@ -8886,12 +9347,13 @@ impl<M: Clone> MetaInterp<M> {
             )?;
             // pyjitpl.py:2109: heapcache.call_loopinvariant_now_known
             if descr_index >= 0 {
-                if let Some((opref, _resvalue)) = res {
+                if let Some((opref, resvalue)) = res {
                     if let Some(ctx) = self.tracing.as_mut() {
                         ctx.heap_cache_mut().call_loopinvariant_now_known(
                             descr_index as u32,
                             arg0_int,
                             opref,
+                            resvalue,
                         );
                     }
                 }
@@ -8988,43 +9450,6 @@ impl<M: Clone> MetaInterp<M> {
         allboxes
     }
 
-    /// pyjitpl.py:1425-1432 `MIFrame.do_recursive_call`.
-    ///
-    /// **Stub — does NOT match upstream semantics yet.**  RPython:
-    ///
-    /// ```python
-    /// def do_recursive_call(self, targetjitdriver_sd, allboxes, pc,
-    ///                       assembler_call=False):
-    ///     portal_code = targetjitdriver_sd.mainjitcode
-    ///     k = targetjitdriver_sd.portal_runner_adr
-    ///     funcbox = ConstInt(adr2int(k))
-    ///     return self.do_residual_call(funcbox, allboxes,
-    ///                                  portal_code.calldescr, pc,
-    ///                                  assembler_call=assembler_call,
-    ///                                  assembler_call_jd=targetjitdriver_sd)
-    /// ```
-    ///
-    /// Upstream emits a residual `CALL_*` op into the portal runner
-    /// (with the `assembler_call` flag flipping it to
-    /// `CALL_ASSEMBLER_*`).  Pyre cannot do that yet because
-    /// `do_residual_call` is itself a stub (see above), so this method
-    /// forwards to `perform_call` for now — that gets the runtime to
-    /// signal `ChangeFrame` but it inlines the callee instead of
-    /// emitting the assembler-call op.  Replace the body with a real
-    /// `self.do_residual_call(funcbox, argboxes, calldescr, pc, ...)`
-    /// once Phase 7C lands.
-    pub fn do_recursive_call(
-        &mut self,
-        jitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        greenkey: Option<u64>,
-    ) -> Result<(), ChangeFrame> {
-        // Legacy stub.  do_recursive_call_full carries the line-by-line
-        // RPython port (residual CALL_ASSEMBLER); this entry stays so
-        // existing call sites continue to inline-perform the call.
-        self.perform_call(jitcode, argboxes, greenkey)
-    }
-
     /// pyjitpl.py:1425-1432 `MIFrame.do_recursive_call(targetjitdriver_sd, allboxes, pc, assembler_call=False)`.
     ///
     /// ```python
@@ -9045,7 +9470,7 @@ impl<M: Clone> MetaInterp<M> {
     /// caller passes the typed `(DescrRef, &dyn CallDescr)` pair
     /// explicitly.  funcbox is constructed from
     /// `targetjitdriver_sd.portal_runner_adr`.
-    pub fn do_recursive_call_full(
+    pub fn do_recursive_call(
         &mut self,
         targetjitdriver_sd: &crate::jitdriver::JitDriverStaticData,
         allboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
@@ -9058,12 +9483,14 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:1428: k = targetjitdriver_sd.portal_runner_adr
         let k = targetjitdriver_sd.portal_runner_adr;
         // pyjitpl.py:1429: funcbox = ConstInt(adr2int(k))
+        // — `ConstInt` is an `INT`-typed constant box.  Pyre's analog
+        // is JitArgKind::Int with a constant OpRef.
         let funcbox_opref = if let Some(ctx) = self.tracing.as_mut() {
             ctx.const_int(k)
         } else {
             OpRef::NONE
         };
-        let funcbox = (crate::jitcode::JitArgKind::Ref, funcbox_opref, k);
+        let funcbox = (crate::jitcode::JitArgKind::Int, funcbox_opref, k);
         // pyjitpl.py:1430-1432: do_residual_call(funcbox, allboxes, calldescr, pc,
         //                                       assembler_call, assembler_call_jd)
         self.do_residual_call_full(
@@ -9075,41 +9502,6 @@ impl<M: Clone> MetaInterp<M> {
             assembler_call,
             Some(target_jd_index),
         )
-    }
-
-    /// pyjitpl.py:2080-2151 `MIFrame.do_conditional_call`.
-    ///
-    /// **Stub.**  Returns `None`.  The full upstream body covers:
-    ///
-    /// 1. `is_value` short-circuit returning `valuebox` when the
-    ///    cached `COND_CALL_VALUE_*` already produced a non-zero
-    ///    result (pyjitpl.py:2087-2107).
-    /// 2. Constant condition fold — when `condbox` is constant zero
-    ///    the call is dropped, otherwise it is emitted as plain
-    ///    `do_residual_call` (pyjitpl.py:2109-2123).
-    /// 3. EffectInfo lookup to choose
-    ///    `COND_CALL_VOID` / `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R`
-    ///    (pyjitpl.py:2125-2151).
-    /// 4. Heap-cache invalidation and exception/force guard emission
-    ///    along the same lines as `do_residual_call`.
-    ///
-    /// The rewriter-side counterpart (`_rewrite_op_cond_call` in
-    /// `jtransform.rs`) already produces the upstream-shaped IR; this
-    /// runtime body is what binds it back to a metainterp-level
-    /// decision.
-    pub fn do_conditional_call(
-        &mut self,
-        _condbox: OpRef,
-        _funcbox_addr: Option<usize>,
-        _argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        _calldescr: u64,
-        _pc: usize,
-        _is_value: bool,
-    ) -> Option<OpRef> {
-        // Legacy stub.  do_conditional_call_full carries the
-        // line-by-line port; this entry stays so the existing call
-        // sites can keep their old shape until they migrate.
-        None
     }
 
     /// pyjitpl.py:2128-2151 `MIFrame.do_conditional_call(condbox, funcbox, argboxes, descr, pc, is_value=False)`.
@@ -9135,7 +9527,7 @@ impl<M: Clone> MetaInterp<M> {
     ///         else:
     ///             raise AssertionError
     /// ```
-    pub fn do_conditional_call_full(
+    pub fn do_conditional_call(
         &mut self,
         condbox: (crate::jitcode::JitArgKind, OpRef, i64),
         funcbox: (crate::jitcode::JitArgKind, OpRef, i64),
@@ -9365,16 +9757,54 @@ pub enum InlineDecision {
     ResidualCall,
 }
 
+/// pyjitpl.py:2493-2503 routes through `crate::jitexc::DoneWithThisFrame`
+/// (the single jitexc.py mirror — see jitexc.rs:39).  This alias lets
+/// the rest of this module refer to it as `DoneWithThisFrame` without a
+/// qualified path while keeping the one authoritative definition.
+pub use crate::jitexc::DoneWithThisFrame;
+
+/// Result type for `MetaInterp::finishframe`: either `ChangeFrame`
+/// (caller frame remains) or `DoneWithThisFrame*` (framestack
+/// exhausted, portal exit).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FinishFrameSignal {
+    ChangeFrame,
+    Done(DoneWithThisFrame),
+}
+
+impl From<ChangeFrame> for FinishFrameSignal {
+    fn from(_: ChangeFrame) -> Self {
+        Self::ChangeFrame
+    }
+}
+
+impl From<DoneWithThisFrame> for FinishFrameSignal {
+    fn from(d: DoneWithThisFrame) -> Self {
+        Self::Done(d)
+    }
+}
+
+impl std::fmt::Display for FinishFrameSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChangeFrame => f.write_str("ChangeFrame"),
+            Self::Done(d) => std::fmt::Display::fmt(d, f),
+        }
+    }
+}
+
+impl std::error::Error for FinishFrameSignal {}
+
 /// Aggregate error for `do_residual_call`.  RPython's body raises
 /// either `ChangeFrame` (an exception path crossed a frame boundary
 /// via `handle_possible_exception` → `finishframe_exception`) or
-/// `SwitchToBlackhole(ABORT_ESCAPE)` (a NOT_IN_TRACE call raised);
+/// `SwitchToBlackhole(reason)` (compile/trace failure path);
 /// pyre returns both as `Err` variants of this enum so callers can
 /// route each to the existing pyre abort/restart paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoResidualCallAbort {
     ChangeFrame,
-    AbortEscape,
+    SwitchToBlackhole(SwitchToBlackhole),
 }
 
 impl From<ChangeFrame> for DoResidualCallAbort {
@@ -9383,9 +9813,9 @@ impl From<ChangeFrame> for DoResidualCallAbort {
     }
 }
 
-impl From<AbortEscape> for DoResidualCallAbort {
-    fn from(_: AbortEscape) -> Self {
-        Self::AbortEscape
+impl From<SwitchToBlackhole> for DoResidualCallAbort {
+    fn from(stb: SwitchToBlackhole) -> Self {
+        Self::SwitchToBlackhole(stb)
     }
 }
 
@@ -9393,34 +9823,66 @@ impl std::fmt::Display for DoResidualCallAbort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ChangeFrame => f.write_str("ChangeFrame"),
-            Self::AbortEscape => f.write_str("SwitchToBlackhole(ABORT_ESCAPE)"),
+            Self::SwitchToBlackhole(stb) => std::fmt::Display::fmt(stb, f),
         }
     }
 }
 
 impl std::error::Error for DoResidualCallAbort {}
 
-/// pyjitpl.py:43 `class SwitchToBlackhole(jitexc.JitException)` —
-/// the `Counters.ABORT_ESCAPE` variant.
+/// history.py:36 `class SwitchToBlackhole(jitexc.JitException)`.
 ///
-/// Signaled by `do_not_in_trace_call` (pyjitpl.py:3691-3692) when an
-/// `OS_NOT_IN_TRACE` call raised an exception during tracing — the
-/// trace cannot continue and the metainterp must drop into the
-/// blackhole interpreter to follow the exception path.
+/// ```python
+/// class SwitchToBlackhole(jitexc.JitException):
+///     def __init__(self, reason, raising_exception=False):
+///         self.reason = reason
+///         self.raising_exception = raising_exception
+/// ```
+///
+/// Signaled at any compile/trace failure point that wants the
+/// metainterp to drop the current trace and resume in the blackhole
+/// interpreter — e.g. `do_not_in_trace_call` (pyjitpl.py:3691-3692)
+/// raises `SwitchToBlackhole(ABORT_ESCAPE)` when an `OS_NOT_IN_TRACE`
+/// call raised, and `compile_done_with_this_frame` re-raises whatever
+/// `compile.compile_trace` raised.
 ///
 /// Pyre returns this as an `Err` instead of panicking; callers
 /// translate it into the existing pyre abort path
-/// (`TraceCtx::abort_trace`, etc.).
+/// (`TraceCtx::abort_trace`, etc.).  `reason` is opaque
+/// (`Counters.ABORT_*` int upstream) and is forwarded to
+/// `aborted_tracing(reason)` per pyjitpl.py:2491.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AbortEscape;
+pub struct SwitchToBlackhole {
+    pub reason: i32,
+    pub raising_exception: bool,
+}
 
-impl std::fmt::Display for AbortEscape {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SwitchToBlackhole(ABORT_ESCAPE)")
+/// history.py `Counters.*` constants for `SwitchToBlackhole.reason`.
+/// Pyre carries them as raw `i32`s so the eventual hook payload stays
+/// stable; only the variants pyre currently signals are populated.
+pub mod counters {
+    /// `Counters.ABORT_ESCAPE` — an `OS_NOT_IN_TRACE` call raised.
+    pub const ABORT_ESCAPE: i32 = 0;
+}
+
+impl SwitchToBlackhole {
+    /// Construct a `SwitchToBlackhole(Counters.ABORT_ESCAPE)` per
+    /// pyjitpl.py:3691-3692 — `OS_NOT_IN_TRACE` call raised during tracing.
+    pub fn abort_escape() -> Self {
+        Self {
+            reason: counters::ABORT_ESCAPE,
+            raising_exception: false,
+        }
     }
 }
 
-impl std::error::Error for AbortEscape {}
+impl std::fmt::Display for SwitchToBlackhole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SwitchToBlackhole(reason={})", self.reason)
+    }
+}
+
+impl std::error::Error for SwitchToBlackhole {}
 
 /// pyjitpl.py:1268 / 2425 `raise ChangeFrame`.
 ///
@@ -9743,34 +10205,71 @@ mod metainterp_static_data_tests {
         assert_eq!(sd.get_name_from_address(0x300), "");
     }
 
+    fn make_call_descr_void() -> (majit_ir::DescrRef, StubCallDescr) {
+        let descr_ref = majit_ir::descr::make_call_descr(
+            vec![],
+            majit_ir::Type::Void,
+            majit_ir::EffectInfo::default(),
+        );
+        let descr_view = StubCallDescr {
+            arg_types: vec![],
+            result_type: majit_ir::Type::Void,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        (descr_ref, descr_view)
+    }
+
     #[test]
-    fn do_residual_or_indirect_call_invokes_perform_call_on_hit() {
-        // pyjitpl.py:2174-2186 — hit path: after registering an indirect-call
-        // target, the method routes into perform_call (which raises
-        // ChangeFrame) instead of falling through to do_residual_call.
-        //
-        // Uses a typed Const funcbox whose concrete address equals the
-        // registered fnaddr so `bytecode_for_address(funcbox.getaddr())`
-        // returns Some(jitcode).
+    fn do_residual_or_indirect_call_falls_through_when_no_jitcode() {
+        // pyjitpl.py:2174-2186 — when bytecode_for_address misses, the
+        // method returns Ok(self.do_residual_call_full(...)) instead of
+        // raising ChangeFrame.
+        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        meta.staticdata
-            .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(0xdeadbeef)]);
-        let funcbox: (JitArgKind, OpRef, i64) = (
+        let action = meta.force_start_tracing(0, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let (descr_ref, descr_view) = make_call_descr_void();
+        // Use a real callable address so executor::execute_varargs does
+        // not jump to bogus memory.  bytecode_for_address still misses
+        // because no jitcode is registered for this address.
+        let funcbox = (
             JitArgKind::Ref,
-            // Const OpRef — `funcbox.1.is_constant()` must return true so
-            // the gate lookup runs; the concrete address lives in `.2`.
-            OpRef::from_const(0),
-            0xdeadbeef,
+            OpRef(100),
+            execute_varargs_void_helper as i64,
         );
-        let effect = majit_ir::EffectInfo::default();
-        let descr_ref = majit_ir::descr::make_call_descr(vec![], majit_ir::Type::Void, effect);
-        let descr_view: &dyn majit_ir::descr::CallDescr = descr_ref
-            .as_call_descr()
-            .expect("SimpleCallDescr implements CallDescr");
-        let result =
-            meta.do_residual_or_indirect_call(funcbox, &[], descr_ref.clone(), descr_view, 0);
-        // Hit path raises ChangeFrame (wrapped as DoResidualCallAbort).
+        let result = meta
+            .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0)
+            .expect("Ok");
+        // Empty effectinfo + Void descr → CallN emitted, returns None.
+        assert!(result.is_none(), "void result must be None");
+        let ctx = meta.trace_ctx().expect("active trace");
+        assert!(
+            ctx.recorder
+                .ops()
+                .iter()
+                .any(|op| op.opcode == OpCode::CallN),
+            "CallN must be recorded on the residual path",
+        );
+    }
+
+    #[test]
+    fn do_residual_or_indirect_call_invokes_perform_call_on_hit() {
+        // After registering an indirect-call target, the method must
+        // route into perform_call (which raises ChangeFrame) instead of
+        // falling through to do_residual_call_full — but only when the
+        // funcbox OpRef is a Const (pyjitpl.py:2178 `isinstance(funcbox,
+        // Const)`).
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let fnaddr = execute_varargs_void_helper as i64 as usize;
+        meta.staticdata
+            .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
+        let (descr_ref, descr_view) = make_call_descr_void();
+        let funcbox = (JitArgKind::Ref, OpRef::from_const(0), fnaddr as i64);
+        let result = meta.do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0);
+        // Const funcbox + registered target → perform_call raises
+        // ChangeFrame (wrapped in DoResidualCallAbort).
         assert!(matches!(result, Err(DoResidualCallAbort::ChangeFrame)));
     }
 
@@ -9781,13 +10280,108 @@ mod metainterp_static_data_tests {
     // would duplicate that fixture setup without adding coverage.
 
     #[test]
-    fn finishframe_returns_ok_when_framestack_exhausted() {
-        // pyjitpl.py:2483: when the framestack is empty after popframe
-        // we fall into compile_done_with_this_frame; the stub returns
-        // Ok(()) instead of raising DoneWithThisFrame*.
+    fn do_residual_or_indirect_call_skips_perform_call_for_non_const_funcbox() {
+        // pyjitpl.py:2178 — non-Const funcbox must NOT be promoted to an
+        // inlined call even when its concrete address matches a
+        // registered indirect-call target.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let fnaddr = execute_varargs_void_helper as i64 as usize;
+        meta.staticdata
+            .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
+        let action = meta.force_start_tracing(0, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let (descr_ref, descr_view) = make_call_descr_void();
+        let funcbox = (JitArgKind::Ref, OpRef(100), fnaddr as i64); // non-Const
+        let result = meta
+            .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0)
+            .expect("Ok — falls through to residual call, no ChangeFrame");
+        assert!(result.is_none(), "void residual call returns None");
+    }
+
+    #[test]
+    fn finishframe_raises_done_with_this_frame_void_when_stack_exhausted() {
+        // pyjitpl.py:2493-2496: result_type == VOID + resultbox is None
+        // → raise DoneWithThisFrameVoid().
         let mut meta = MetaInterp::<()>::new(0);
         let result = meta.finishframe(None, true);
-        assert!(matches!(result, Ok(())));
+        assert!(matches!(
+            result,
+            Err(FinishFrameSignal::Done(DoneWithThisFrame::Void))
+        ));
+    }
+
+    #[test]
+    fn finishframe_raises_done_with_this_frame_int_when_stack_exhausted_with_int_result() {
+        // pyjitpl.py:2497-2498: result_type == INT → raise
+        // DoneWithThisFrameInt(resultbox.getint()).
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let result = meta.finishframe(Some((JitArgKind::Int, 0, OpRef(100), 0xc0ffee)), true);
+        assert!(matches!(
+            result,
+            Err(FinishFrameSignal::Done(DoneWithThisFrame::Int(0xc0ffee)))
+        ));
+    }
+
+    #[test]
+    fn finishframe_raises_done_with_this_frame_ref_for_ref_result() {
+        // pyjitpl.py:2499-2500.
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let result = meta.finishframe(Some((JitArgKind::Ref, 0, OpRef(101), 0xfeed)), true);
+        assert!(matches!(
+            result,
+            Err(FinishFrameSignal::Done(DoneWithThisFrame::Ref(r))) if r.0 == 0xfeed
+        ));
+    }
+
+    #[test]
+    fn finishframe_raises_done_with_this_frame_float_for_float_result() {
+        // pyjitpl.py:2501-2502.
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let bits = f64::to_bits(2.5) as i64;
+        let result = meta.finishframe(Some((JitArgKind::Float, 0, OpRef(102), bits)), true);
+        assert!(matches!(
+            result,
+            Err(FinishFrameSignal::Done(DoneWithThisFrame::Float(v))) if v.to_bits() == bits as u64
+        ));
+    }
+
+    #[test]
+    fn finishframe_uses_jitdriver_result_type_when_available() {
+        // pyjitpl.py:2493 — `result_type = self.jitdriver_sd.result_type`.
+        // The DoneWithThisFrame variant is determined by the active
+        // jitdriver's declared return type, not by the resultbox kind.
+        // Here the popped frame has jitdriver_sd=Some(0) and that
+        // driver declares result_type=Ref, so a tuple with kind=Int but
+        // value 0xfeed is reported as DoneWithThisFrameRef(0xfeed).
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let mut jitcode = builder.finish();
+        jitcode.jitdriver_sd = Some(0);
+        let mut meta = MetaInterp::<()>::new(0);
+        let driver = crate::jitdriver::JitDriverStaticData {
+            vars: vec![],
+            virtualizable: None,
+            result_type: majit_ir::Type::Ref,
+            is_recursive: false,
+            mainjitcode: None,
+            portal_runner_adr: 0,
+        };
+        let _ = meta.staticdata.register_jitdriver_sd(driver);
+        meta.framestack.push(crate::pyjitpl::MIFrame::new(
+            std::sync::Arc::new(jitcode),
+            0,
+        ));
+        let result = meta.finishframe(Some((JitArgKind::Int, 0, OpRef(1), 0xfeed)), true);
+        assert!(matches!(
+            result,
+            Err(FinishFrameSignal::Done(DoneWithThisFrame::Ref(r))) if r.0 == 0xfeed
+        ));
     }
 
     #[test]
@@ -9847,7 +10441,7 @@ mod metainterp_static_data_tests {
 
         // Return from callee: write result into caller register 1.
         let result = meta.finishframe(Some((JitArgKind::Int, 1, OpRef(42), 4242)), true);
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(result, Err(FinishFrameSignal::ChangeFrame)));
         assert_eq!(meta.framestack.len(), 1);
         let caller_frame = meta.framestack.current_mut();
         assert_eq!(caller_frame.int_regs[1], Some(OpRef(42)));
@@ -9870,7 +10464,7 @@ mod metainterp_static_data_tests {
         meta.framestack.current_mut().int_values[0] = Some(7);
         meta.perform_call(callee, &[], None).unwrap_err();
         let result = meta.finishframe(None, true);
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(result, Err(FinishFrameSignal::ChangeFrame)));
         // Void return preserves whatever was already there in the caller.
         assert_eq!(meta.framestack.current_mut().int_regs[0], Some(OpRef(7)));
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
@@ -10167,11 +10761,17 @@ mod metainterp_static_data_tests {
         crate::pyjitpl::call_void_function(funcbox.2 as *const (), &[]);
         meta.last_exc_value = NOT_IN_TRACE_RAISED_EXC.load(std::sync::atomic::Ordering::SeqCst);
         let abort = if meta.last_exc_value != 0 {
-            Err(AbortEscape)
+            Err(SwitchToBlackhole::abort_escape())
         } else {
-            Ok::<Option<OpRef>, AbortEscape>(None)
+            Ok::<Option<OpRef>, SwitchToBlackhole>(None)
         };
-        assert!(matches!(abort, Err(AbortEscape)));
+        assert!(matches!(
+            abort,
+            Err(SwitchToBlackhole {
+                reason: counters::ABORT_ESCAPE,
+                ..
+            })
+        ));
 
         // Now invoke through the named entry — the helper writes the
         // exception value too, but the named entry never sees the
@@ -10191,7 +10791,7 @@ mod metainterp_static_data_tests {
     extern "C" fn execute_varargs_void_helper() {}
 
     #[test]
-    fn do_residual_call_full_emits_call_i_for_regular_int_call() {
+    fn do_residual_call_emits_call_i_for_regular_int_call() {
         // pyjitpl.py:2113-2115 — non-loopinvariant, non-force-virtual,
         // int-returning call → CALL_I via miframe_execute_varargs.
         use crate::BackEdgeAction;
@@ -10418,9 +11018,9 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn do_recursive_call_full_emits_call_via_portal_runner_adr() {
+    fn do_recursive_call_emits_call_via_portal_runner_adr() {
         // pyjitpl.py:1425-1432 — portal_runner_adr → funcbox → CALL_*
-        // routed through do_residual_call_full's regular branch (no
+        // routed through do_residual_call's regular branch (no
         // assembler_call).
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
@@ -10442,7 +11042,7 @@ mod metainterp_static_data_tests {
         jd.is_recursive = true;
         jd.portal_runner_adr = portal_runner_helper as *const () as i64;
 
-        let result = meta.do_recursive_call_full(
+        let result = meta.do_recursive_call(
             &jd,
             &[],
             descr_ref,
@@ -10465,7 +11065,7 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn do_conditional_call_full_emits_cond_call_when_not_is_value() {
+    fn do_conditional_call_emits_cond_call_when_not_is_value() {
         // pyjitpl.py:2137-2139 — is_value=False → COND_CALL (void).
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
@@ -10489,7 +11089,7 @@ mod metainterp_static_data_tests {
             OpRef(100),
             cond_call_void_helper as *const () as i64,
         );
-        let result = meta.do_conditional_call_full(
+        let result = meta.do_conditional_call(
             condbox,
             funcbox,
             &[],
@@ -10510,7 +11110,7 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn do_conditional_call_full_emits_cond_call_value_int_when_is_value() {
+    fn do_conditional_call_emits_cond_call_value_int_when_is_value() {
         // pyjitpl.py:2141-2146 — is_value=True + Int result → COND_CALL_VALUE_I.
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
@@ -10534,7 +11134,7 @@ mod metainterp_static_data_tests {
             OpRef(100),
             execute_varargs_int_helper as *const () as i64,
         );
-        let result = meta.do_conditional_call_full(
+        let result = meta.do_conditional_call(
             condbox,
             funcbox,
             &[],
@@ -10558,7 +11158,7 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn do_residual_call_full_emits_call_may_force_for_force_virtual_path() {
+    fn do_residual_call_emits_call_may_force_for_force_virtual_path() {
         // pyjitpl.py:2007-2083 — forces_virtual path emits
         // CALL_MAY_FORCE_I via direct_call_may_force followed by a
         // GUARD_NOT_FORCED.  The call's concrete result is the
@@ -10583,8 +11183,7 @@ mod metainterp_static_data_tests {
             execute_varargs_int_helper as *const () as i64,
         );
 
-        let result =
-            meta.do_residual_call_full(funcbox, &[], descr_ref, &descr_view, 0, false, None);
+        let result = meta.do_residual_call_full(funcbox, &[], descr_ref, &descr_view, 0, false, None);
         let (opref, _resvalue) = result.expect("Ok").expect("Some(opref)");
 
         let ctx = meta.trace_ctx().expect("active trace");

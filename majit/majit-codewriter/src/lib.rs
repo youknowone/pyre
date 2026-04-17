@@ -396,7 +396,7 @@ fn analyze_pipeline_from_parsed(
 
     // RPython: setup_jitdriver(jitdriver_sd) — register portal + green/red layout.
     // PyPy interp_jit.py: greens = ['next_instr', 'is_being_profiled', 'pycode'],
-    //                      reds = ['frame', 'ec']
+    //                      reds = ['frame', 'ec'], virtualizables = ['frame']
     let portal = parse::CallPath::from_segments(["execute_opcode_step"]);
     if call_control.function_graphs().contains_key(&portal) {
         call_control.setup_jitdriver(
@@ -407,7 +407,27 @@ fn analyze_pipeline_from_parsed(
                 "pycode".to_string(),
             ],
             vec!["frame".to_string(), "ec".to_string()],
+            // PyPy interp_jit.py: virtualizables = ['frame'] —
+            // jitdriver.virtualizables drives warmspot.py:527-545
+            // make_virtualizable_infos selection.
+            vec!["frame".to_string()],
+            // jit.py / interp_jit.py: red types parallel to reds.
+            // 'frame' is the virtualizable PyFrame; 'ec' is the
+            // ExecutionContext (the wrapping struct in pyre).
+            vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
         );
+        // warmspot.py:515-545 WarmRunnerDesc.make_virtualizable_infos —
+        // assigns jd.index_of_virtualizable, builds GreenFieldInfo
+        // when any green name contains '.', and (via the factory)
+        // would build VirtualizableInfo here too.  Pyre supplies a
+        // `|_, _| None` factory at codewrite time because the
+        // runtime VirtualizableInfo constructor lives in
+        // metainterp (`__build_virtualizable_info` →
+        // `MetaInterp::set_virtualizable_info` at jitdriver.rs:285);
+        // the codewriter slot is then overridden via
+        // `CallControl::set_jitdriver_virtualizable_info` if the host
+        // wants the codewriter side to consult the same handle.
+        call_control.make_virtualizable_infos(|_jd_idx, _vtypeptr_token| None);
     }
     // Mark known builtins (elidable helpers).
     // RPython: detected via funcobj.graph.func.oopspec attribute.

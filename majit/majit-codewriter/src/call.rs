@@ -75,23 +75,26 @@ pub struct WriteAnalysis {
     pub is_top: bool,
 }
 
-/// Call descriptor — associates a call target with its effect info.
+/// Call descriptor — `AbstractDescr`-equivalent metadata for a call op.
 ///
-/// RPython equivalent: the combination of `CallDescr` + `EffectInfo`
-/// stored on call operations by `CallControl.getcalldescr()`.
+/// RPython equivalent: the `CallDescr` returned by
+/// `CallControl.getcalldescr()` (call.py:236-241), wrapping
+/// `EffectInfo` and the cpu-level descr identity.  Upstream stores
+/// the funcptr separately as `op.args[0]`; pyre carries the funcptr
+/// identity on each `OpKind` variant's dedicated `funcptr` field
+/// (model.rs:247) so this struct holds only the calldescr-side data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallDescriptor {
-    pub target: CallTarget,
     pub extra_info: EffectInfo,
 }
 
 impl CallDescriptor {
-    pub fn known(target: CallTarget, extra_info: EffectInfo) -> Self {
-        Self { target, extra_info }
+    pub fn known(extra_info: EffectInfo) -> Self {
+        Self { extra_info }
     }
 
-    pub fn override_effect(target: CallTarget, extra_info: EffectInfo) -> Self {
-        Self { target, extra_info }
+    pub fn override_effect(extra_info: EffectInfo) -> Self {
+        Self { extra_info }
     }
 
     pub fn get_extra_info(&self) -> EffectInfo {
@@ -119,6 +122,62 @@ pub enum CallKind {
     Recursive,
 }
 
+/// virtualizable.py:306-307 `VirtualizableInfo.is_vtypeptr(TYPE)` —
+/// identity check for the VTYPEPTR (struct-pointer type) the
+/// virtualizable describes.
+///
+/// PRE-EXISTING-ADAPTATION: pyre has no `lltype` so VTYPEPTR identity is
+/// expressed via a `usize` token (typically the SizeDescr identity from
+/// `majit_ir::descr::descr_identity`).  Hosts attach their rich
+/// `VirtualizableInfo` (defined in `majit-metainterp::virtualizable`) by
+/// implementing this trait so codewriter, which sits below metainterp in
+/// the crate graph, can still consult `jd.virtualizable_info` per
+/// `call.py:375-385 CallControl.get_vinfo`.
+pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
+    /// virtualizable.py:306-307 `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
+    fn is_vtypeptr(&self, vtypeptr_id: usize) -> bool;
+}
+
+/// greenfield.py `GreenFieldInfo.green_fields` membership test.
+///
+/// PRE-EXISTING-ADAPTATION: same crate-boundary reasoning as
+/// `VirtualizableInfoHandle`.  Hosts implement this on their rich
+/// `GreenFieldInfo` so `CallControl.could_be_green_field`
+/// (call.py:387-393) can walk `jd.greenfield_info` without depending on
+/// metainterp.
+pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
+    /// `(GTYPE, fieldname) in self.green_fields`.
+    fn contains_green_field(&self, gtype: &str, fieldname: &str) -> bool;
+}
+
+/// Codewriter-internal `GreenFieldInfoHandle` built directly from a
+/// jitdriver's `greens` list during `make_virtualizable_infos`.
+///
+/// `contains_green_field` is a pure structural query (`(gtype,
+/// fieldname) in self.green_fields`), so no runtime identity is
+/// required — unlike `is_vtypeptr` which has no codewrite-time
+/// equivalent.  Hosts that want their richer
+/// `GreenFieldInfoHandle` impl (e.g. `majit_metainterp::greenfield::
+/// GreenFieldInfo` with descriptor indices) override this placeholder
+/// via [`CallControl::set_jitdriver_greenfield_info`].
+#[derive(Debug, Clone)]
+pub struct StaticGreenFieldInfoHandle {
+    /// greenfield.py:14 `self.red_index = jd.jitdriver.reds.index(objname)`
+    /// — index of the unique green-field owning red.
+    pub red_index: usize,
+    /// greenfield.py:18 `self.green_fields = jd.jitdriver.ll_greenfields.values()`
+    /// — `(GTYPE, fieldname)` pairs.
+    pub green_fields: Vec<(String, String)>,
+}
+
+impl GreenFieldInfoHandle for StaticGreenFieldInfoHandle {
+    fn contains_green_field(&self, gtype: &str, fieldname: &str) -> bool {
+        self.green_fields
+            .iter()
+            .any(|(g, f)| g == gtype && f == fieldname)
+    }
+}
+
 /// RPython: `JitDriverStaticData` — per-jitdriver metadata.
 ///
 /// RPython `metainterp/jitdriver.py`: stores green/red variable names,
@@ -131,11 +190,44 @@ pub struct JitDriverStaticData {
     pub greens: Vec<String>,
     /// RPython: `jitdriver.reds` — loop-variant variable names.
     pub reds: Vec<String>,
+    /// RPython: `jitdriver.virtualizables` — names of red variables
+    /// declared as virtualizable.  Drives warmspot.py:527-545
+    /// `make_virtualizable_infos` selection.
+    pub virtualizables: Vec<String>,
+    /// Type names (GTYPEs) for each red variable, parallel to `reds`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream looks up GTYPE via
+    /// `jd._JIT_ENTER_FUNCTYPE.ARGS[index]` at warmspot time; pyre
+    /// propagates the matching struct names from `setup_jitdriver` so
+    /// `make_virtualizable_infos` can build `(GTYPE, fieldname)`
+    /// `green_fields` per greenfield.py:14 / warmspot.py:540-543.
+    /// May be empty when the host has not yet supplied red types
+    /// (legacy callers); in that case green-field construction
+    /// substitutes the variable name as a fallback.
+    pub red_types: Vec<String>,
     /// Portal graph path.
     pub portal_graph: CallPath,
     /// RPython: `jd.mainjitcode` (call.py:147) — JitCode index for the portal.
     /// Set by `grab_initial_jitcodes()`.
     pub mainjitcode: Option<usize>,
+    /// warmspot.py:533 `jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
+    ///
+    /// `-1` for drivers without a virtualizable, otherwise the slot
+    /// in `reds` that holds the virtualizable.
+    pub index_of_virtualizable: i32,
+    /// warmspot.py:545 `jd.virtualizable_info = vinfos[VTYPEPTR]`.
+    ///
+    /// `None` for drivers that do not declare a virtualizable.  Set
+    /// from the host runtime once the metainterp-side
+    /// `VirtualizableInfo` is built — codewriter only sees the trait
+    /// surface required by `CallControl::get_vinfo`.
+    pub virtualizable_info: Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
+    /// warmspot.py:519-525 `jd.greenfield_info = GreenFieldInfo(self.cpu, jd)`.
+    ///
+    /// Same plumbing as `virtualizable_info` — hosts attach their rich
+    /// `GreenFieldInfo` via the trait so `CallControl.could_be_green_field`
+    /// can walk it.
+    pub greenfield_info: Option<std::sync::Arc<dyn GreenFieldInfoHandle>>,
 }
 
 /// Call control — decides inline vs residual for each call target.
@@ -658,25 +750,280 @@ impl CallControl {
         self.portal_targets.insert(path);
     }
 
-    /// Register a JitDriver with its green/red variable layout.
+    /// Register a JitDriver with its green/red/virtualizable layout.
     ///
-    /// RPython: `CodeWriter.setup_jitdriver(jitdriver_sd)` (codewriter.py:96-99).
+    /// RPython: `CodeWriter.setup_jitdriver(jitdriver_sd)` (codewriter.py:96-99)
+    /// + `jitdriver.virtualizables` (rlib/jit.py:601-603).
     /// Each jitdriver gets a sequential index.
+    ///
+    /// `red_types` mirrors `_JIT_ENTER_FUNCTYPE.ARGS` for the red slot
+    /// portion (warmspot.py:540-543).  Pass an empty vector if the
+    /// host hasn't propagated the runtime types yet — the
+    /// green-field constructor in `make_virtualizable_infos` falls
+    /// back to the variable name in that case.
     pub fn setup_jitdriver(
         &mut self,
         portal_graph: CallPath,
         greens: Vec<String>,
         reds: Vec<String>,
+        virtualizables: Vec<String>,
+        red_types: Vec<String>,
     ) {
         let index = self.jitdrivers_sd.len();
+        debug_assert!(
+            red_types.is_empty() || red_types.len() == reds.len(),
+            "setup_jitdriver: red_types length must match reds when supplied",
+        );
         self.jitdrivers_sd.push(JitDriverStaticData {
             index,
             greens,
             reds,
+            virtualizables,
+            red_types,
             portal_graph: portal_graph.clone(),
             mainjitcode: None,
+            index_of_virtualizable: -1,
+            virtualizable_info: None,
+            greenfield_info: None,
         });
         self.portal_targets.insert(portal_graph);
+    }
+
+    /// warmspot.py:528-545 `jd.virtualizable_info = vinfos[VTYPEPTR]`.
+    ///
+    /// Attach the host-built [`VirtualizableInfoHandle`] to the
+    /// pre-registered driver at `index`.  Mirrors the upstream
+    /// post-construction assignment that warmspot performs once the
+    /// per-driver `VirtualizableInfo` map has been built.  Pyre's host
+    /// runtime calls this between [`Self::setup_jitdriver`] and
+    /// [`Self::find_all_graphs`] so that
+    /// [`Self::get_vinfo`] returns the matching handle.
+    pub fn set_jitdriver_virtualizable_info(
+        &mut self,
+        index: usize,
+        info: std::sync::Arc<dyn VirtualizableInfoHandle>,
+    ) {
+        self.jitdrivers_sd[index].virtualizable_info = Some(info);
+    }
+
+    /// warmspot.py:519-525 `jd.greenfield_info = GreenFieldInfo(cpu, jd)`.
+    ///
+    /// Same staging pattern as
+    /// [`Self::set_jitdriver_virtualizable_info`].  Hosts compute the
+    /// green-field metadata once during driver setup and attach the
+    /// handle here so [`Self::could_be_green_field`] can walk it.
+    pub fn set_jitdriver_greenfield_info(
+        &mut self,
+        index: usize,
+        info: std::sync::Arc<dyn GreenFieldInfoHandle>,
+    ) {
+        self.jitdrivers_sd[index].greenfield_info = Some(info);
+    }
+
+    /// warmspot.py:515-545 `WarmRunnerDesc.make_virtualizable_infos`.
+    ///
+    /// ```python
+    /// def make_virtualizable_infos(self):
+    ///     vinfos = {}
+    ///     for jd in self.jitdrivers_sd:
+    ///         jd.greenfield_info = None
+    ///         for name in jd.jitdriver.greens:
+    ///             if '.' in name:
+    ///                 jd.greenfield_info = GreenFieldInfo(self.cpu, jd)
+    ///                 break
+    ///         if not jd.jitdriver.virtualizables:
+    ///             jd.virtualizable_info = None
+    ///             jd.index_of_virtualizable = -1
+    ///             continue
+    ///         else:
+    ///             assert jd.greenfield_info is None, "XXX not supported yet"
+    ///         jitdriver = jd.jitdriver
+    ///         assert len(jitdriver.virtualizables) == 1    # for now
+    ///         [vname] = jitdriver.virtualizables
+    ///         jd.index_of_virtualizable = jitdriver.reds.index(vname)
+    ///         index = jd.num_green_args + jd.index_of_virtualizable
+    ///         VTYPEPTR = jd._JIT_ENTER_FUNCTYPE.ARGS[index]
+    ///         if VTYPEPTR not in vinfos:
+    ///             vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)
+    ///         jd.virtualizable_info = vinfos[VTYPEPTR]
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream owns this method on
+    /// `WarmRunnerDesc` (warmspot.py:451) so it can mutate the single
+    /// shared `jitdrivers_sd` list (the same Python list object is
+    /// referenced by both `WarmRunnerDesc.jitdrivers_sd` and
+    /// `MetaInterpStaticData.jitdrivers_sd`).  Pyre splits that list
+    /// into two: codewriter `CallControl::jitdrivers_sd` (build.rs
+    /// time) and metainterp `MetaInterpStaticData::jitdrivers_sd`
+    /// (runtime), so the warmspot logic is invoked once per side at
+    /// the matching lifecycle phase.  This call covers the codewriter
+    /// side; the metainterp side is wired through
+    /// `MetaInterp::set_virtualizable_info` at `JitDriver::new`
+    /// (jitdriver.rs:285).
+    ///
+    /// `greenfield_info` is constructed in-place as a
+    /// [`StaticGreenFieldInfoHandle`] (the codewriter-internal default;
+    /// hosts can override via
+    /// [`Self::set_jitdriver_greenfield_info`] with a richer impl such
+    /// as `majit_metainterp::greenfield::GreenFieldInfo`).
+    ///
+    /// `vinfo_factory` mirrors the upstream `VirtualizableInfo(self,
+    /// VTYPEPTR)` constructor (warmspot.py:543).  Pyre's codewriter
+    /// crate sits below metainterp and therefore cannot reach the
+    /// rich runtime constructor; the factory closure delegates to the
+    /// host (e.g. pyre `build.rs` or runtime warm-up), which can
+    /// either return a real
+    /// `Arc<dyn VirtualizableInfoHandle>` or `None`.  When the
+    /// factory returns `None`, the slot stays empty until the host
+    /// later overrides it with [`Self::set_jitdriver_virtualizable_info`]
+    /// at runtime — matching pyre's
+    /// `MetaInterp::set_virtualizable_info` (jitdriver.rs:285) wiring.
+    /// The factory receives `(jd_idx, vtypeptr_token)` where
+    /// `vtypeptr_token` is the `red_types[index_of_virtualizable]`
+    /// string the codewriter resolved.
+    pub fn make_virtualizable_infos<VF>(&mut self, mut vinfo_factory: VF)
+    where
+        VF: FnMut(usize, &str) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
+    {
+        // warmspot.py:516 `vinfos = {}` — per-VTYPEPTR cache so multiple
+        // jitdrivers sharing the same virtualizable type reuse one handle.
+        let mut vinfos: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn VirtualizableInfoHandle>,
+        > = std::collections::HashMap::new();
+        self.make_virtualizable_infos_inner(&mut vinfo_factory, &mut vinfos);
+    }
+
+    fn make_virtualizable_infos_inner<VF>(
+        &mut self,
+        vinfo_factory: &mut VF,
+        vinfos: &mut std::collections::HashMap<String, std::sync::Arc<dyn VirtualizableInfoHandle>>,
+    ) where
+        VF: FnMut(usize, &str) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
+    {
+        for jd_idx in 0..self.jitdrivers_sd.len() {
+            // warmspot.py:519 `jd.greenfield_info = None`
+            self.jitdrivers_sd[jd_idx].greenfield_info = None;
+            // warmspot.py:520-524 — scan greens for '.' and split each
+            // dotted name into `(objname, fieldname)`.  Upstream
+            // collects the unique `objname` set, then resolves each
+            // `(objname, fieldname)` to `(GTYPE, fieldname)` via
+            // `jd.jitdriver.ll_greenfields` for the
+            // `green_fields` list and via `_JIT_ENTER_FUNCTYPE.ARGS`
+            // for the index→GTYPE mapping (greenfield.py:14-19,
+            // warmspot.py:540-543).
+            let mut seen: Vec<String> = Vec::new();
+            let mut parsed_pairs: Vec<(String, String)> = Vec::new();
+            for name in &self.jitdrivers_sd[jd_idx].greens {
+                if let Some((objname, fieldname)) = name.split_once('.') {
+                    if !seen.iter().any(|s| s == objname) {
+                        seen.push(objname.to_string());
+                    }
+                    parsed_pairs.push((objname.to_string(), fieldname.to_string()));
+                }
+            }
+            // warmspot.py:520-524 (cont.): if any dotted green was seen,
+            // construct GreenFieldInfo(cpu, jd) — pyre's codewriter has
+            // no `cpu` so we build the structural placeholder
+            // `StaticGreenFieldInfoHandle` here; hosts override with the
+            // descriptor-aware metainterp variant via
+            // `set_jitdriver_greenfield_info`.
+            if !seen.is_empty() {
+                // greenfield.py:11-13 `assert len(seen) == 1`.
+                assert_eq!(
+                    seen.len(),
+                    1,
+                    "greenfield.py:11 — only one instance with green fields supported, found {seen:?}",
+                );
+                let objname = &seen[0];
+                // greenfield.py:14 `red_index = jd.jitdriver.reds.index(objname)`.
+                let red_index = self.jitdrivers_sd[jd_idx]
+                    .reds
+                    .iter()
+                    .position(|r| r == objname)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "greenfield.py:14 — green-field owner {objname:?} not in reds {:?}",
+                            self.jitdrivers_sd[jd_idx].reds
+                        )
+                    });
+                // greenfield.py:18 `self.green_fields = jd.jitdriver.ll_greenfields.values()`
+                // — values are `(GTYPE, fieldname)` pairs.  Resolve `GTYPE`
+                // by looking up the red slot's type from `red_types`
+                // (parallel to `reds`); legacy callers without
+                // `red_types` fall back to the variable name so the
+                // structural shape is preserved.
+                let gtype = self.jitdrivers_sd[jd_idx]
+                    .red_types
+                    .get(red_index)
+                    .cloned()
+                    .unwrap_or_else(|| objname.to_string());
+                let green_fields: Vec<(String, String)> = parsed_pairs
+                    .into_iter()
+                    .map(|(_objname, fieldname)| (gtype.clone(), fieldname))
+                    .collect();
+                self.jitdrivers_sd[jd_idx].greenfield_info =
+                    Some(std::sync::Arc::new(StaticGreenFieldInfoHandle {
+                        red_index,
+                        green_fields,
+                    }));
+            }
+            // warmspot.py:527-530: no virtualizable → keep None and continue.
+            if self.jitdrivers_sd[jd_idx].virtualizables.is_empty() {
+                self.jitdrivers_sd[jd_idx].virtualizable_info = None;
+                self.jitdrivers_sd[jd_idx].index_of_virtualizable = -1;
+                continue;
+            }
+            // warmspot.py:531-532: greenfield + virtualizable not supported.
+            assert!(
+                self.jitdrivers_sd[jd_idx].greenfield_info.is_none(),
+                "warmspot.py:532 — greenfield + virtualizable on the same driver: XXX not supported yet",
+            );
+            // warmspot.py:534-538 `[vname] = jitdriver.virtualizables`
+            //                    `jd.index_of_virtualizable = jitdriver.reds.index(vname)`
+            assert_eq!(
+                self.jitdrivers_sd[jd_idx].virtualizables.len(),
+                1,
+                "warmspot.py:535 — only one virtualizable per jitdriver supported",
+            );
+            let vname = self.jitdrivers_sd[jd_idx].virtualizables[0].clone();
+            let idx = self.jitdrivers_sd[jd_idx]
+                .reds
+                .iter()
+                .position(|r| r == &vname)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "warmspot.py:538 — virtualizable {vname:?} not in reds {:?}",
+                        self.jitdrivers_sd[jd_idx].reds
+                    )
+                });
+            self.jitdrivers_sd[jd_idx].index_of_virtualizable = idx as i32;
+            // warmspot.py:540-545:
+            //   index = jd.num_green_args + jd.index_of_virtualizable
+            //   VTYPEPTR = jd._JIT_ENTER_FUNCTYPE.ARGS[index]
+            //   if VTYPEPTR not in vinfos:
+            //       vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)
+            //   jd.virtualizable_info = vinfos[VTYPEPTR]
+            //
+            // Pyre resolves VTYPEPTR via `red_types[index_of_virtualizable]`
+            // (the `_JIT_ENTER_FUNCTYPE.ARGS` analog supplied at
+            // `setup_jitdriver` time) and delegates the constructor
+            // call to `vinfo_factory`.
+            let vtypeptr_token = self.jitdrivers_sd[jd_idx]
+                .red_types
+                .get(idx)
+                .cloned()
+                .unwrap_or_default();
+            let info = if let Some(cached) = vinfos.get(&vtypeptr_token) {
+                Some(cached.clone())
+            } else if let Some(fresh) = vinfo_factory(jd_idx, &vtypeptr_token) {
+                vinfos.insert(vtypeptr_token, fresh.clone());
+                Some(fresh)
+            } else {
+                None
+            };
+            self.jitdrivers_sd[jd_idx].virtualizable_info = info;
+        }
     }
 
     /// call.py:357-361 `jitdriver_sd_from_portal_graph(graph)`.
@@ -709,31 +1056,81 @@ impl CallControl {
 
     /// call.py:375-385 `get_vinfo(VTYPEPTR)`.
     ///
-    /// **Stub — always returns `None`.**  Upstream walks
-    /// `self.jitdrivers_sd` and returns the unique
-    /// `virtualizable_info` whose `VTYPEPTR` matches.  Pyre's
-    /// [`JitDriverStaticData`] does not yet carry per-driver
-    /// `virtualizable_info`, so callers that rely on the lookup
-    /// (jtransform's vable-field rewrites, optimizer's force-virtual
-    /// path) currently see "no virtualizable info" and fall back to
-    /// the non-vable code path.  The named entry point exists so
-    /// future call sites compile straight from the Python; once
-    /// per-driver virtualizable metadata is plumbed in, replace the
-    /// stub body with the upstream walk.
-    pub fn get_vinfo(&self, _vtypeptr: &str) -> Option<()> {
-        None
+    /// ```python
+    /// def get_vinfo(self, VTYPEPTR):
+    ///     seen = set()
+    ///     for jd in self.jitdrivers_sd:
+    ///         if jd.virtualizable_info is not None:
+    ///             if jd.virtualizable_info.is_vtypeptr(VTYPEPTR):
+    ///                 seen.add(jd.virtualizable_info)
+    ///     if seen:
+    ///         assert len(seen) == 1
+    ///         return seen.pop()
+    ///     else:
+    ///         return None
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: `VTYPEPTR` is an RPython lltype pointer;
+    /// pyre represents VTYPEPTR identity as a `usize` token supplied by
+    /// the host (typically `descr_identity(&size_descr)` from
+    /// `majit_ir::descr`).  Hosts install per-driver
+    /// [`VirtualizableInfoHandle`] via `JitDriverStaticData.virtualizable_info`.
+    pub fn get_vinfo(
+        &self,
+        vtypeptr_id: usize,
+    ) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
+        let mut seen: Vec<std::sync::Arc<dyn VirtualizableInfoHandle>> = Vec::new();
+        for jd in &self.jitdrivers_sd {
+            if let Some(vinfo) = &jd.virtualizable_info {
+                if vinfo.is_vtypeptr(vtypeptr_id) {
+                    // Dedupe by Arc identity so the upstream
+                    // `assert len(seen) == 1` translates to "at most one
+                    // distinct VirtualizableInfo per VTYPEPTR".
+                    let seen_already = seen
+                        .iter()
+                        .any(|existing| std::sync::Arc::ptr_eq(existing, vinfo));
+                    if !seen_already {
+                        seen.push(std::sync::Arc::clone(vinfo));
+                    }
+                }
+            }
+        }
+        if seen.is_empty() {
+            None
+        } else {
+            assert_eq!(
+                seen.len(),
+                1,
+                "get_vinfo: multiple distinct VirtualizableInfo for VTYPEPTR"
+            );
+            Some(seen.into_iter().next().unwrap())
+        }
     }
 
-    /// call.py:387-395 `could_be_green_field(SELFTYPE, fieldname)`.
+    /// call.py:387-393 `could_be_green_field(GTYPE, fieldname)`.
     ///
-    /// **Stub — always returns `false`.**  Upstream walks every
-    /// jitdriver's `green_fields_info` to decide whether a `(struct,
-    /// field)` pair was observed as a green field.  Pyre does not
-    /// yet perform green-field inference, so the rewriter never
-    /// promotes a getfield to its constant equivalent.  The named
-    /// entry stays so jtransform-side call sites compile against
-    /// the upstream signature.
-    pub fn could_be_green_field(&self, _selftype: &str, _fieldname: &str) -> bool {
+    /// ```python
+    /// def could_be_green_field(self, GTYPE, fieldname):
+    ///     GTYPE_fieldname = (GTYPE, fieldname)
+    ///     for jd in self.jitdrivers_sd:
+    ///         if jd.greenfield_info is not None:
+    ///             if GTYPE_fieldname in jd.greenfield_info.green_fields:
+    ///                 return True
+    ///     return False
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: `GTYPE` is an RPython lltype; pyre
+    /// represents it by name (`&str`).  The host attaches a
+    /// [`GreenFieldInfoHandle`] whose `contains_green_field` implements
+    /// the `(GTYPE, fieldname) in green_fields` membership test.
+    pub fn could_be_green_field(&self, gtype: &str, fieldname: &str) -> bool {
+        for jd in &self.jitdrivers_sd {
+            if let Some(gfinfo) = &jd.greenfield_info {
+                if gfinfo.contains_green_field(gtype, fieldname) {
+                    return true;
+                }
+            }
+        }
         false
     }
 
@@ -791,6 +1188,35 @@ impl CallControl {
         let mut todo: Vec<CallPath> = self.portal_targets.iter().cloned().collect();
         for path in &todo {
             self.candidate_graphs.insert(path.clone());
+        }
+        // call.py:59-64 — seed the BFS with builtin oopspec helpers so
+        // `int_abs` / `int_floordiv` / `int_mod` / `ll_math.ll_math_sqrt`
+        // are reachable even when the portal does not call them
+        // directly.
+        //
+        // ```python
+        // if hasattr(self, 'rtyper'):
+        //     for oopspec_name, ll_args, ll_res in support.inline_calls_to:
+        //         c_func, _ = support.builtin_func_for_spec(self.rtyper,
+        //                                                   oopspec_name,
+        //                                                   ll_args, ll_res)
+        //         todo.append(c_func.value._obj.graph)
+        // ```
+        //
+        // PRE-EXISTING-ADAPTATION: pyre has no `MixLevelHelperAnnotator`
+        // so `builtin_func_for_spec` returns a descriptor only, not a
+        // function-pointer-with-graph.  Where the oopspec name matches a
+        // graph registered via `register_function_graph`, seed that
+        // graph; otherwise the entry is structural-only and contributes
+        // nothing, matching upstream behavior when the helper is later
+        // inlined as a Rust intrinsic.
+        for (oopspec_name, ll_args, ll_res) in crate::support::INLINE_CALLS_TO {
+            let _spec = crate::support::builtin_func_for_spec(oopspec_name, ll_args, *ll_res);
+            let path = CallPath::from_segments([*oopspec_name]);
+            if self.function_graphs.contains_key(&path) && !self.candidate_graphs.contains(&path) {
+                self.candidate_graphs.insert(path.clone());
+                todo.push(path);
+            }
         }
 
         while let Some(path) = todo.pop() {
@@ -1727,8 +2153,11 @@ impl CallControl {
         }
 
         // RPython call.py:334-335: cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)
+        // Pyre's CallDescriptor mirrors the calldescr return only — the
+        // matching funcptr is plumbed separately by callers (typically
+        // from the same `target` they passed in here).
+        let _ = target;
         CallDescriptor {
-            target: target.clone(),
             extra_info: effectinfo,
         }
     }
@@ -2879,7 +3308,7 @@ pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
     CALL_DESCRIPTOR_TABLE
         .iter()
         .find(|entry| matches_any(target, entry.targets))
-        .map(|entry| CallDescriptor::known(target.clone(), entry.get_extra_info()))
+        .map(|entry| CallDescriptor::known(entry.get_extra_info()))
 }
 
 #[cfg(test)]
@@ -3470,5 +3899,269 @@ mod tests {
         assert_eq!(known_sizes["C"], 8, "C: single i64");
         assert_eq!(known_sizes["B"], 16, "B: C(8) + i64(8)");
         assert_eq!(known_sizes["A"], 24, "A: B(16) + i64(8)");
+    }
+
+    #[derive(Debug)]
+    struct StubVInfo {
+        vtypeptr_id: usize,
+    }
+    impl VirtualizableInfoHandle for StubVInfo {
+        fn is_vtypeptr(&self, vtypeptr_id: usize) -> bool {
+            self.vtypeptr_id == vtypeptr_id
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubGFInfo {
+        green_fields: HashSet<(String, String)>,
+    }
+    impl GreenFieldInfoHandle for StubGFInfo {
+        fn contains_green_field(&self, gtype: &str, fieldname: &str) -> bool {
+            self.green_fields
+                .contains(&(gtype.to_string(), fieldname.to_string()))
+        }
+    }
+
+    fn cc_with_one_driver() -> CallControl {
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal_runner"]),
+            vec!["pc".into()],
+            vec!["frame".into()],
+            vec![],
+            vec![],
+        );
+        cc
+    }
+
+    #[test]
+    fn get_vinfo_returns_none_when_no_driver_has_virtualizable_info() {
+        let cc = cc_with_one_driver();
+        assert!(cc.get_vinfo(0xfeed).is_none());
+    }
+
+    #[test]
+    fn get_vinfo_returns_matching_handle_from_driver() {
+        let mut cc = cc_with_one_driver();
+        let vinfo: std::sync::Arc<dyn VirtualizableInfoHandle> = std::sync::Arc::new(StubVInfo {
+            vtypeptr_id: 0xabcd,
+        });
+        cc.jitdrivers_sd[0].virtualizable_info = Some(std::sync::Arc::clone(&vinfo));
+        let got = cc.get_vinfo(0xabcd).expect("must match");
+        assert!(std::sync::Arc::ptr_eq(&got, &vinfo));
+        // Non-matching id → None.
+        assert!(cc.get_vinfo(0x1234).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple distinct VirtualizableInfo")]
+    fn get_vinfo_panics_when_multiple_distinct_infos_match_same_vtypeptr() {
+        let mut cc = cc_with_one_driver();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal_runner_b"]),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        cc.jitdrivers_sd[0].virtualizable_info = Some(std::sync::Arc::new(StubVInfo {
+            vtypeptr_id: 0xabcd,
+        }));
+        cc.jitdrivers_sd[1].virtualizable_info = Some(std::sync::Arc::new(StubVInfo {
+            vtypeptr_id: 0xabcd,
+        }));
+        let _ = cc.get_vinfo(0xabcd);
+    }
+
+    #[test]
+    fn could_be_green_field_returns_false_when_no_driver_has_greenfield_info() {
+        let cc = cc_with_one_driver();
+        assert!(!cc.could_be_green_field("Frame", "code"));
+    }
+
+    #[test]
+    fn could_be_green_field_returns_true_for_registered_pair() {
+        let mut cc = cc_with_one_driver();
+        let mut greens = HashSet::new();
+        greens.insert(("Frame".to_string(), "code".to_string()));
+        cc.jitdrivers_sd[0].greenfield_info = Some(std::sync::Arc::new(StubGFInfo {
+            green_fields: greens,
+        }));
+        assert!(cc.could_be_green_field("Frame", "code"));
+        assert!(!cc.could_be_green_field("Frame", "pc"));
+        assert!(!cc.could_be_green_field("OtherFrame", "code"));
+    }
+
+    #[test]
+    fn set_jitdriver_virtualizable_info_is_visible_to_get_vinfo() {
+        // warmspot.py:528-545 assignment hook reachability test —
+        // exercises the production wiring path (not direct field write).
+        let mut cc = cc_with_one_driver();
+        let info: std::sync::Arc<dyn VirtualizableInfoHandle> =
+            std::sync::Arc::new(StubVInfo { vtypeptr_id: 0xab });
+        cc.set_jitdriver_virtualizable_info(0, std::sync::Arc::clone(&info));
+        let got = cc.get_vinfo(0xab).expect("must match after set");
+        assert!(std::sync::Arc::ptr_eq(&got, &info));
+    }
+
+    #[test]
+    fn set_jitdriver_greenfield_info_is_visible_to_could_be_green_field() {
+        let mut cc = cc_with_one_driver();
+        let mut greens = HashSet::new();
+        greens.insert(("Frame".to_string(), "pc".to_string()));
+        let info: std::sync::Arc<dyn GreenFieldInfoHandle> = std::sync::Arc::new(StubGFInfo {
+            green_fields: greens,
+        });
+        cc.set_jitdriver_greenfield_info(0, info);
+        assert!(cc.could_be_green_field("Frame", "pc"));
+        assert!(!cc.could_be_green_field("Frame", "code"));
+    }
+
+    #[test]
+    fn make_virtualizable_infos_assigns_index_and_handle_per_warmspot_py_534() {
+        // warmspot.py:534-545 — single jitdriver with virtualizables=['frame'],
+        // reds=['frame', 'ec'].  index_of_virtualizable must land on slot 0
+        // (matching reds.index('frame')) and virtualizable_info must
+        // become a populated handle whose VTYPEPTR matches the
+        // owner_root token shared across all jitdrivers.
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["execute_opcode_step"]),
+            vec!["pc".into()],
+            vec!["frame".into(), "ec".into()],
+            vec!["frame".into()],
+            vec!["PyFrame".into(), "ExecutionContext".into()],
+        );
+        cc.make_virtualizable_infos(|_, _| None);
+        // warmspot.py:534-538 — `index_of_virtualizable = reds.index('frame')`
+        assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
+        // warmspot.py:540-545 — codewriter side leaves vinfo None;
+        // runtime metainterp populates via set_jitdriver_virtualizable_info.
+        assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());
+        // warmspot.py:531-532 — virtualizables present + no dotted greens
+        // → greenfield_info stays None.
+        assert!(cc.jitdrivers_sd[0].greenfield_info.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "greenfield + virtualizable on the same driver")]
+    fn make_virtualizable_infos_panics_on_dotted_green_with_virtualizable() {
+        // warmspot.py:531-532 `assert jd.greenfield_info is None,
+        // "XXX not supported yet"` — pyre keeps the assertion.
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal"]),
+            vec!["frame.code".into()],
+            vec!["frame".into()],
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+        );
+        cc.make_virtualizable_infos(|_, _| None);
+    }
+
+    #[test]
+    fn make_virtualizable_infos_clears_when_no_virtualizable() {
+        // warmspot.py:527-530 — `if not jd.jitdriver.virtualizables: ... continue`.
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal"]),
+            vec!["pc".into()],
+            vec!["frame".into()],
+            vec![],
+            vec![],
+        );
+        cc.jitdrivers_sd[0].virtualizable_info = Some(std::sync::Arc::new(StubVInfo {
+            vtypeptr_id: 0xfeed,
+        }));
+        cc.jitdrivers_sd[0].index_of_virtualizable = 7;
+        cc.make_virtualizable_infos(|_, _| None);
+        assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());
+        assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, -1);
+    }
+
+    #[test]
+    fn make_virtualizable_infos_resolves_gtype_from_red_types() {
+        // greenfield.py:14,18 — green_fields holds (GTYPE, fieldname) where
+        // GTYPE is the type of the red slot identified by objname.
+        // Pyre threads this through `red_types` parallel to `reds`.
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal_with_greenfield"]),
+            vec!["frame.code".into(), "pc".into()],
+            vec!["frame".into()],
+            vec![],
+            vec!["PyFrame".into()],
+        );
+        cc.make_virtualizable_infos(|_, _| None);
+        let gfinfo = cc.jitdrivers_sd[0]
+            .greenfield_info
+            .as_ref()
+            .expect("greenfield_info populated for dotted green");
+        // contains_green_field expects (GTYPE, fieldname) — resolved
+        // from `red_types` not the raw `objname`.
+        assert!(gfinfo.contains_green_field("PyFrame", "code"));
+        assert!(!gfinfo.contains_green_field("frame", "code"));
+    }
+
+    #[test]
+    fn make_virtualizable_infos_invokes_factory_and_caches_per_vtypeptr() {
+        // warmspot.py:540-545 — `vinfos[VTYPEPTR]` cache: two jitdrivers
+        // sharing the same VTYPEPTR token must reuse the same handle
+        // (same Arc identity), and the factory must be called once
+        // per unique VTYPEPTR.
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal_a"]),
+            vec!["pc".into()],
+            vec!["frame".into()],
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+        );
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal_b"]),
+            vec!["pc".into()],
+            vec!["frame".into()],
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+        );
+        let mut factory_calls: Vec<String> = Vec::new();
+        cc.make_virtualizable_infos(|_jd_idx, vtypeptr_token| {
+            factory_calls.push(vtypeptr_token.to_string());
+            Some(std::sync::Arc::new(StubVInfo {
+                vtypeptr_id: 0xfeed,
+            }))
+        });
+        assert_eq!(
+            factory_calls,
+            vec!["PyFrame".to_string()],
+            "warmspot.py:540-545 vinfos cache must dedupe by VTYPEPTR token",
+        );
+        let h0 = cc.jitdrivers_sd[0]
+            .virtualizable_info
+            .clone()
+            .expect("vinfo populated");
+        let h1 = cc.jitdrivers_sd[1]
+            .virtualizable_info
+            .clone()
+            .expect("vinfo populated");
+        assert!(std::sync::Arc::ptr_eq(&h0, &h1));
+    }
+
+    #[test]
+    fn make_virtualizable_infos_factory_none_keeps_slot_empty() {
+        // warmspot.py:540-545 with factory→None: the codewriter slot
+        // stays empty so the runtime metainterp setter populates it
+        // later (jitdriver.rs:285).
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal"]),
+            vec!["pc".into()],
+            vec!["frame".into()],
+            vec!["frame".into()],
+            vec!["PyFrame".into()],
+        );
+        cc.make_virtualizable_infos(|_, _| None);
+        assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());
+        assert_eq!(cc.jitdrivers_sd[0].index_of_virtualizable, 0);
     }
 }

@@ -107,10 +107,21 @@ impl Assembler {
             resulttypes: HashMap::new(),
         };
 
-        // RPython assembler.py:42-44: for insn in ssarepr.insns: write_insn(insn)
-        for op in &ssarepr.insns {
+        // RPython assembler.py:41-44:
+        //     ssarepr._insns_pos = []
+        //     for insn in ssarepr.insns:
+        //         ssarepr._insns_pos.append(len(self.code))
+        //         self.write_insn(insn)
+        let mut insns_pos = Vec::with_capacity(ssarepr.insns.len());
+        // Borrow split: clone the insn vec so we can mutate ssarepr
+        // (insns_pos write) without aliasing the borrow used by the
+        // write_insn loop.
+        let ops = ssarepr.insns.clone();
+        for op in &ops {
+            insns_pos.push(state.code.len());
             self.write_insn(op, regallocs, &mut state);
         }
+        ssarepr.insns_pos = Some(insns_pos);
 
         // RPython assembler.py:45,250-258: self.fix_labels()
         for (label, fixup_pos) in &state.tlabel_fixups {
@@ -400,6 +411,7 @@ impl Assembler {
                 args_r,
                 args_f,
                 result_kind,
+                ..
             }
             | OpKind::CallMayForce {
                 descriptor: _,
@@ -407,6 +419,7 @@ impl Assembler {
                 args_r,
                 args_f,
                 result_kind,
+                ..
             }
             | OpKind::CallElidable {
                 descriptor: _,
@@ -414,6 +427,7 @@ impl Assembler {
                 args_r,
                 args_f,
                 result_kind,
+                ..
             } => {
                 let base = match &op.kind {
                     OpKind::CallMayForce { .. } => "call_may_force",
@@ -1052,6 +1066,7 @@ mod tests {
             num_values: 0,
             num_blocks: 1,
             value_kinds: HashMap::new(),
+            insns_pos: None,
         };
 
         // Empty regalloc results
@@ -1139,6 +1154,7 @@ mod tests {
             num_values: 3,
             num_blocks: 1,
             value_kinds,
+            insns_pos: None,
         };
         let mut asm = Assembler::new();
         let jitcode = asm.assemble(&mut flat, &regallocs);

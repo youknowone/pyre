@@ -191,6 +191,20 @@ impl Clone for VirtualizableInfo {
     }
 }
 
+impl majit_codewriter::call::VirtualizableInfoHandle for VirtualizableInfo {
+    /// virtualizable.py:306-307 `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
+    ///
+    /// Pyre identifies VTYPEPTR by the SizeDescr identity stored in
+    /// `parent_descr`; `vtypeptr_id` is the `descr_identity` of the
+    /// SizeDescr the caller wants to match.
+    fn is_vtypeptr(&self, vtypeptr_id: usize) -> bool {
+        match &self.parent_descr {
+            Some(descr) => descr_identity(descr) == vtypeptr_id,
+            None => false,
+        }
+    }
+}
+
 impl VirtualizableInfo {
     /// Create a new VirtualizableInfo.
     pub fn new(token_offset: usize) -> Self {

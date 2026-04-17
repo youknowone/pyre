@@ -2356,10 +2356,13 @@ impl TraceCtx {
         let descr_index = func_ref.0;
         let arg0_int = args.first().map(|a| a.0 as i64).unwrap_or(0);
         // heapcache: check loop-invariant cache
-        if let Some(cached) = self
+        if let Some((cached, _resvalue)) = self
             .heap_cache
             .call_loopinvariant_lookup(descr_index, arg0_int)
         {
+            // Legacy trace_ctx helper does not yet thread the concrete
+            // resvalue from this call site; the cached symbolic OpRef
+            // is enough for the consumers of this method.
             return cached;
         }
         let opcode = OpCode::call_loopinvariant_for_type(ret_type);
@@ -2370,8 +2373,9 @@ impl TraceCtx {
             .recorder
             .record_op_with_descr(opcode, &call_args, descr);
         // Loop-invariant calls don't invalidate caches (like pure calls).
+        // Concrete resvalue is unknown to this legacy helper; pass 0.
         self.heap_cache
-            .call_loopinvariant_cache(descr_index, arg0_int, result);
+            .call_loopinvariant_cache(descr_index, arg0_int, result, 0);
         result
     }
 

@@ -35,11 +35,15 @@ pub enum JitException {
 /// Result of a completed trace execution.
 ///
 /// Mirrors DoneWithThisFrame{Void,Int,Ref,Float} in jitexc.py.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DoneWithThisFrame {
+    /// jitexc.py:17 DoneWithThisFrameVoid
     Void,
+    /// jitexc.py:21 DoneWithThisFrameInt
     Int(i64),
+    /// jitexc.py:29 DoneWithThisFrameRef
     Ref(GcRef),
+    /// jitexc.py:37 DoneWithThisFrameFloat
     Float(f64),
 }
 
@@ -54,6 +58,19 @@ impl DoneWithThisFrame {
         }
     }
 }
+
+impl std::fmt::Display for DoneWithThisFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Void => f.write_str("DoneWithThisFrameVoid"),
+            Self::Int(v) => write!(f, "DoneWithThisFrameInt({v})"),
+            Self::Ref(r) => write!(f, "DoneWithThisFrameRef({:#x})", r.0),
+            Self::Float(v) => write!(f, "DoneWithThisFrameFloat({:#x})", v.to_bits()),
+        }
+    }
+}
+
+impl std::error::Error for DoneWithThisFrame {}
 
 /// The trace exited with an exception.
 ///

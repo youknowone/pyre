@@ -243,7 +243,10 @@ pub enum OpKind {
     //
     /// Elidable (pure) call — no side effects, result depends only on args.
     /// RPython: `call_elidable_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
+    /// `funcptr` mirrors `op.args[0]` (the function-pointer Variable);
+    /// `descriptor` carries the calldescr-equivalent EffectInfo.
     CallElidable {
+        funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,
@@ -252,7 +255,10 @@ pub enum OpKind {
     },
     /// Residual call — has side effects, must be preserved.
     /// RPython: `residual_call_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
+    /// `funcptr` mirrors `op.args[0]` (the function-pointer Variable);
+    /// `descriptor` carries the calldescr-equivalent EffectInfo.
     CallResidual {
+        funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,
@@ -261,7 +267,10 @@ pub enum OpKind {
     },
     /// May-force call — can trigger GC or force virtualizables.
     /// RPython: `call_may_force_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
+    /// `funcptr` mirrors `op.args[0]` (the function-pointer Variable);
+    /// `descriptor` carries the calldescr-equivalent EffectInfo.
     CallMayForce {
+        funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,
@@ -352,6 +361,7 @@ pub enum OpKind {
     /// RPython: `COND_CALL(condition, funcptr, calldescr, args...)`
     ConditionalCall {
         condition: ValueId,
+        funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,
@@ -362,6 +372,7 @@ pub enum OpKind {
     /// RPython: `COND_CALL_VALUE(value, funcptr, calldescr, args...)`
     ConditionalCallValue {
         value: ValueId,
+        funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,
@@ -376,6 +387,7 @@ pub enum OpKind {
     RecordKnownResult {
         /// The known result value (arg 0 of the jit_record_known_result llop).
         result_value: ValueId,
+        funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,

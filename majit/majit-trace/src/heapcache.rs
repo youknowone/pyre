@@ -282,9 +282,17 @@ pub struct HeapCache {
     /// heapcache.py: loop-invariant call result cache.
     /// RPython stores exactly ONE result: (descr, arg0_int) → result.
     /// Subsequent calls overwrite the single entry.
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream's `result` is a Box that
+    /// carries both the symbolic identity and the concrete value
+    /// together; pyre splits these into the symbolic `OpRef` plus a
+    /// concrete `i64` so `do_residual_call` can return the same
+    /// `(opref, value)` tuple shape on cache hits as it does on
+    /// freshly-executed calls.
     loopinvariant_descr: Option<u32>,
     loopinvariant_arg0: Option<i64>,
     loopinvariant_result: Option<OpRef>,
+    loopinvariant_resvalue: Option<i64>,
 
     /// heapcache.py: per-box `_heapc_deps`.
     ///
@@ -327,6 +335,7 @@ impl HeapCache {
             loopinvariant_descr: None,
             loopinvariant_arg0: None,
             loopinvariant_result: None,
+            loopinvariant_resvalue: None,
             heapc_deps: Vec::new(),
             replaced_with_const: Vec::new(),
             need_guard_not_invalidated: true,
@@ -1598,14 +1607,21 @@ impl HeapCache {
         &self,
         descr_index: u32,
         arg0_int: i64,
-    ) -> Option<OpRef> {
+    ) -> Option<(OpRef, i64)> {
         if self.loopinvariant_descr != Some(descr_index) {
             return None;
         }
         if self.loopinvariant_arg0 != Some(arg0_int) {
             return None;
         }
-        self.loopinvariant_result
+        // Pair the cached symbolic OpRef with its cached concrete value
+        // so the caller can return the same `(opref, value)` shape it
+        // would emit for a fresh call.  See `loopinvariant_resvalue` for
+        // the rationale.
+        Some((
+            self.loopinvariant_result?,
+            self.loopinvariant_resvalue.unwrap_or(0),
+        ))
     }
 
     /// heapcache.py:636-639 call_loopinvariant_now_known
@@ -1616,19 +1632,36 @@ impl HeapCache {
     ///      self.loop_invariant_arg0int = allboxes[0].getint()
     ///      self.loop_invariant_result = res
     /// ```
-    pub fn call_loopinvariant_now_known(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
+    pub fn call_loopinvariant_now_known(
+        &mut self,
+        descr_index: u32,
+        arg0_int: i64,
+        result: OpRef,
+        resvalue: i64,
+    ) {
         self.loopinvariant_descr = Some(descr_index);
         self.loopinvariant_arg0 = Some(arg0_int);
         self.loopinvariant_result = Some(result);
+        self.loopinvariant_resvalue = Some(resvalue);
     }
 
     /// Internal alias retained for older callsites.
-    pub fn call_loopinvariant_cache(&mut self, descr_index: u32, arg0_int: i64, result: OpRef) {
-        self.call_loopinvariant_now_known(descr_index, arg0_int, result);
+    pub fn call_loopinvariant_cache(
+        &mut self,
+        descr_index: u32,
+        arg0_int: i64,
+        result: OpRef,
+        resvalue: i64,
+    ) {
+        self.call_loopinvariant_now_known(descr_index, arg0_int, result, resvalue);
     }
 
     /// Internal alias retained for older callsites.
-    pub fn call_loopinvariant_lookup(&self, descr_index: u32, arg0_int: i64) -> Option<OpRef> {
+    pub fn call_loopinvariant_lookup(
+        &self,
+        descr_index: u32,
+        arg0_int: i64,
+    ) -> Option<(OpRef, i64)> {
         self.call_loopinvariant_known_result(descr_index, arg0_int)
     }
 

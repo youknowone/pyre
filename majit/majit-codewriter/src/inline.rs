@@ -423,6 +423,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
         },
         OpKind::RecordKnownResult {
             result_value,
+            funcptr,
             descriptor,
             args_i,
             args_r,
@@ -430,6 +431,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_kind,
         } => OpKind::RecordKnownResult {
             result_value: remap(result_value),
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -451,12 +453,14 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
         },
         OpKind::Live => OpKind::Live,
         OpKind::CallElidable {
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::CallElidable {
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -464,12 +468,14 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_kind: *result_kind,
         },
         OpKind::CallResidual {
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::CallResidual {
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -477,12 +483,14 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_kind: *result_kind,
         },
         OpKind::CallMayForce {
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::CallMayForce {
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -523,12 +531,14 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
         },
         OpKind::ConditionalCall {
             condition,
+            funcptr,
             descriptor,
             args_i,
             args_r,
             args_f,
         } => OpKind::ConditionalCall {
             condition: remap(condition),
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -536,6 +546,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
         },
         OpKind::ConditionalCallValue {
             value,
+            funcptr,
             descriptor,
             args_i,
             args_r,
@@ -543,6 +554,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_kind,
         } => OpKind::ConditionalCallValue {
             value: remap(value),
+            funcptr: funcptr.clone(),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),

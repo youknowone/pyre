@@ -314,6 +314,7 @@ mod tests {
             num_values: 3,
             num_blocks: 1,
             value_kinds: std::collections::HashMap::new(),
+            insns_pos: None,
         };
 
         // Should not panic

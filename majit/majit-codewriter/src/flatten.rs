@@ -70,6 +70,13 @@ pub struct SSARepr {
     /// Value kinds inferred from the type resolution pass.
     #[serde(default)]
     pub value_kinds: std::collections::HashMap<ValueId, RegKind>,
+    /// flatten.py / assembler.py `ssarepr._insns_pos` — byte position
+    /// of each instruction in the final bytecode, populated by the
+    /// assembler.  `format.py:57-60` uses it to prefix every line with
+    /// the position when set.  `None` when the SSARepr has not yet been
+    /// assembled, matching upstream's `if ssarepr._insns_pos:` guard.
+    #[serde(default)]
+    pub insns_pos: Option<Vec<usize>>,
 }
 
 /// Flatten a FunctionGraph into a linear instruction sequence.
@@ -221,6 +228,7 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
         num_values: max_value,
         num_blocks: graph.blocks.len(),
         value_kinds: std::collections::HashMap::new(),
+        insns_pos: None,
     }
 }
 

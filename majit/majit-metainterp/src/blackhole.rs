@@ -852,6 +852,37 @@ pub enum BhReturnType {
 /// RPython `history.py:AbstractDescr` parity.
 pub use majit_codewriter::jitcode::{BhCallDescr, BhDescr};
 
+/// Per-jitdriver static data visible to the blackhole interpreter.
+///
+/// Mirrors the subset of `metainterp_sd.jitdrivers_sd[jdindex]` that
+/// `bhimpl_recursive_call_*` and the BC_RECURSIVE_CALL dispatch consult
+/// (blackhole.py:1080-1099):
+/// - `result_type` selects which `bhimpl_recursive_call_{v,i,r,f}`
+///   method handles the call (blackhole.py:1080-1093).
+/// - `portal_runner_ptr` / `mainjitcode_calldescr` feed
+///   `get_portal_runner` (blackhole.py:1095-1099).
+#[derive(Clone, Debug, Default)]
+pub struct BhJitDriverSd {
+    /// warmspot.py:449 `jd.result_type` projected to the blackhole
+    /// dispatch char ('v','i','r','f') via `BhReturnType`.
+    pub result_type: BhReturnType,
+    /// warmspot.py:1010-1013 `jd.portal_runner_ptr` — full portal arg
+    /// ABI: `fn(all_i, all_r, all_f) -> i64`.
+    pub portal_runner_ptr: Option<fn(&[i64], &[i64], &[i64]) -> i64>,
+    /// `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
+    /// function returned by `get_portal_runner` for `bh_call_*`.
+    pub mainjitcode_calldescr: BhCallDescr,
+}
+
+impl Default for BhReturnType {
+    fn default() -> Self {
+        // Matches BlackholeInterpreter::new() default and avoids a
+        // separate impl Default block; entry-creation defaults to Void
+        // so empty drivers stay inert until populated.
+        BhReturnType::Void
+    }
+}
+
 /// Signal from dispatch_one to run().
 ///
 /// RPython: `LeaveFrame` exception + `except Exception` in blackhole.py run()
@@ -950,18 +981,17 @@ pub struct BlackholeInterpreter {
     /// Pointer to the VirtualizableInfo describing field offsets.
     /// Used by vable bytecodes to compute memory offsets.
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
-    /// blackhole.py:1095 get_portal_runner(jdindex):
-    ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
-    ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
-    ///   calldescr = jitdriver_sd.mainjitcode.calldescr
-    /// warmspot.py:1010-1013: jd.portal_runner_ptr.
-    /// Portal runner with full portal arg ABI:
-    ///   fn(all_i: &[i64], all_r: &[i64], all_f: &[i64]) -> i64
-    /// where all_i = greens_i + reds_i, all_r = greens_r + reds_r, etc.
-    pub portal_runner_ptr: Option<fn(&[i64], &[i64], &[i64]) -> i64>,
-    /// RPython: `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
-    /// function. Returned by `get_portal_runner()` for `bhimpl_recursive_call_*`.
-    pub mainjitcode_calldescr: BhCallDescr,
+    /// blackhole.py:1095-1099 / warmspot.py:1010-1013 — per-jitdriver
+    /// static data indexed by `jdindex`.  Each entry carries the
+    /// portal_runner_ptr, mainjitcode.calldescr and result_type that
+    /// `get_portal_runner` and the BC_RECURSIVE_CALL dispatch consult
+    /// (blackhole.py:1080-1093 selects `bhimpl_recursive_call_{v,i,r,f}`
+    /// from `sd.jitdrivers_sd[jdindex].result_type`).
+    ///
+    /// Replaces the prior single-driver flat fields
+    /// (`portal_runner_ptr`/`mainjitcode_calldescr`) so multi-driver
+    /// dispatch matches upstream line-by-line.
+    pub jitdrivers_sd: Vec<BhJitDriverSd>,
     /// Packed all_liveness bytes. RPython stores this on metainterp_sd;
     /// majit's blackhole receives it from the pyre resolver until the
     /// surrounding MetaInterpStaticData object is fully ported.
@@ -1026,8 +1056,7 @@ impl BlackholeInterpreter {
             exception_last_value: 0,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
-            portal_runner_ptr: None,
-            mainjitcode_calldescr: BhCallDescr::default(),
+            jitdrivers_sd: Vec::new(),
             liveness_info: Vec::new(),
             virtualizable_stack_base: 0,
         }
@@ -1110,18 +1139,28 @@ impl BlackholeInterpreter {
         }
     }
 
-    /// blackhole.py:1095-1099 get_portal_runner(jdindex):
-    ///   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
-    ///   fnptr = adr2int(jitdriver_sd.portal_runner_adr)
-    ///   calldescr = jitdriver_sd.mainjitcode.calldescr
-    ///   return fnptr, calldescr
-    /// pyre: single jitdriver. mainjitcode_calldescr set during blackhole setup.
-    pub fn get_portal_runner(&self, _jdindex: usize) -> (i64, BhCallDescr) {
-        let fnptr = self
-            .portal_runner_ptr
-            .map(|f| f as usize as i64)
-            .unwrap_or(0);
-        (fnptr, self.mainjitcode_calldescr.clone())
+    /// blackhole.py:1095-1099 `get_portal_runner(jdindex)`.
+    ///
+    /// ```python
+    /// def get_portal_runner(self, jdindex):
+    ///     jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
+    ///     fnptr = adr2int(jitdriver_sd.portal_runner_adr)
+    ///     calldescr = jitdriver_sd.mainjitcode.calldescr
+    ///     return fnptr, calldescr
+    /// ```
+    pub fn get_portal_runner(&self, jdindex: usize) -> (i64, BhCallDescr) {
+        let jd = &self.jitdrivers_sd[jdindex];
+        let fnptr = jd.portal_runner_ptr.map(|f| f as usize as i64).unwrap_or(0);
+        (fnptr, jd.mainjitcode_calldescr.clone())
+    }
+
+    /// Lookup helper for the jdindex-keyed runner pointer used by the
+    /// no-cpu fallback in `bhimpl_recursive_call_r` (pyre-only path
+    /// kept until the cpu surface fully covers blackhole's bh_call_*).
+    fn jitdrivers_sd_runner(&self, jdindex: usize) -> Option<fn(&[i64], &[i64], &[i64]) -> i64> {
+        self.jitdrivers_sd
+            .get(jdindex)
+            .and_then(|jd| jd.portal_runner_ptr)
     }
 
     /// Resolve field descriptor offsets in this interpreter's descrs table.
@@ -1170,7 +1209,7 @@ impl BlackholeInterpreter {
         reds_i: Vec<i64>,
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
-    ) -> i64 {
+    ) -> majit_ir::GcRef {
         let (fnptr, calldescr) = self.get_portal_runner(jdindex);
         // blackhole.py:1113-1116: greens + reds merged per kind.
         let mut all_i = greens_i;
@@ -1182,12 +1221,11 @@ impl BlackholeInterpreter {
         if let Some(cpu) = self.cpu {
             // RPython path: cpu.bh_call_r(fnptr, all_i, all_r, all_f, calldescr)
             cpu.bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
-                .0 as i64
-        } else if let Some(runner) = self.portal_runner_ptr {
+        } else if let Some(runner) = self.jitdrivers_sd_runner(jdindex) {
             // blackhole.py:1113-1116: portal_runner(all_i, all_r, all_f)
-            runner(&all_i, &all_r, &all_f)
+            majit_ir::GcRef(runner(&all_i, &all_r, &all_f) as usize)
         } else {
-            0
+            majit_ir::GcRef::NULL
         }
     }
 
@@ -1747,15 +1785,39 @@ impl BlackholeInterpreter {
                     }));
                 }
                 // blackhole.py:1074-1093: recursive portal level.
-                // sd = self.builder.metainterp_sd
-                // result_type = sd.jitdrivers_sd[jdindex].result_type
-                // pyre: single jitdriver, result_type always Ref.
-                // RPython dispatches on result_type {v,i,r,f}; pyre
-                // always takes the 'r' path.
-                let x = self.bhimpl_recursive_call_r(jdindex, gi, gr, gf, ri, rr, rf);
-                // blackhole.py:1088-1089: bhimpl_ref_return(x)
-                self.tmpreg_r = x;
-                self.return_type = BhReturnType::Ref;
+                //   sd = self.builder.metainterp_sd
+                //   result_type = sd.jitdrivers_sd[jdindex].result_type
+                //   if result_type == 'v': bhimpl_recursive_call_v + void_return
+                //   elif result_type == 'i': bhimpl_recursive_call_i + int_return
+                //   elif result_type == 'r': bhimpl_recursive_call_r + ref_return
+                //   elif result_type == 'f': bhimpl_recursive_call_f + float_return
+                //   assert False
+                let result_type = self.jitdrivers_sd[jdindex].result_type;
+                match result_type {
+                    BhReturnType::Void => {
+                        // blackhole.py:1081-1083
+                        self.bhimpl_recursive_call_v(jdindex, gi, gr, gf, ri, rr, rf);
+                        self.return_type = BhReturnType::Void;
+                    }
+                    BhReturnType::Int => {
+                        // blackhole.py:1084-1086
+                        let x = self.bhimpl_recursive_call_i(jdindex, gi, gr, gf, ri, rr, rf);
+                        self.tmpreg_i = x;
+                        self.return_type = BhReturnType::Int;
+                    }
+                    BhReturnType::Ref => {
+                        // blackhole.py:1087-1089
+                        let x = self.bhimpl_recursive_call_r(jdindex, gi, gr, gf, ri, rr, rf);
+                        self.tmpreg_r = x.0 as i64;
+                        self.return_type = BhReturnType::Ref;
+                    }
+                    BhReturnType::Float => {
+                        // blackhole.py:1090-1092
+                        let x = self.bhimpl_recursive_call_f(jdindex, gi, gr, gf, ri, rr, rf);
+                        self.tmpreg_f = x.to_bits() as i64;
+                        self.return_type = BhReturnType::Float;
+                    }
+                }
                 return Err(DispatchError::LeaveFrame);
             }
             BC_JUMP_TARGET => {
@@ -2192,17 +2254,19 @@ impl BlackholeInterpreter {
 // and returns the typed result.  The `recursive_call` family adds a
 // jitdriver-index lookup via `get_portal_runner`.
 //
-// **Not on the dispatch table yet.**  Pyre's blackhole is IR-driven
-// (BC_RESIDUAL_CALL_* / BC_CALL_MAY_FORCE_* / etc. live in
-// `pyjitpl/dispatch.rs::JitCodeMachine::dispatch_one`) rather than
-// driven by an opname lookup like RPython's
-// `BlackholeInterpBuilder.setup_insns`.  The methods below are
-// implemented but currently unreachable from the runtime — they
-// exist so that, once the codewriter's bhimpl-binding pass lands, the
-// dispatcher emitted by `BlackholeInterpBuilder::setup_insns` can
-// route opcodes directly to them with no body changes.  Treat them as
-// API surface only, **not** as proof that pyre's blackhole already
-// handles residual / inline / recursive calls in the upstream way.
+// **Wired into the codewriter-orthodox dispatch table.**  The
+// `handler_residual_call_*` / `handler_inline_call_*` /
+// `handler_recursive_call_*` functions registered by
+// `wire_bhimpl_handlers` (`BlackholeInterpBuilder::wire_handler` →
+// `dispatch_table`) decode the bytecode (func/jitcode + ListOfKind
+// args + descr) and then call the corresponding `bhimpl_*_call_*`
+// method on the BlackholeInterpreter, which in turn routes through
+// `cpu().bh_call_{i,r,f,v}` exactly like RPython.  The legacy inline
+// `BC_RESIDUAL_CALL_*` / `BC_CALL_MAY_FORCE_*` branches in
+// `JitCodeMachine::dispatch_one` are pyre's IR-side fast path for
+// JIT-compiled traces and operate on a different bytecode encoding
+// (raw fn pointers, no calldescr); the codewriter-orthodox path runs
+// through these handlers + bhimpl methods.
 
 impl BlackholeInterpreter {
     fn cpu(&self) -> &'static dyn majit_backend::Backend {
@@ -5282,10 +5346,9 @@ fn handler_residual_call_irf_i(
     let (af, p) = read_list_f(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    // blackhole.py:1244-1246 → bhimpl_residual_call_irf_i.
     bh.registers_i[code[p] as usize] =
-        bh.cpu
-            .expect("cpu")
-            .bh_call_i(func, Some(&ai), Some(&ar), Some(&af), &calldescr);
+        bh.bhimpl_residual_call_irf_i(func, &ai, &ar, &af, &calldescr);
     Ok(p + 1)
 }
 fn handler_residual_call_irf_r(
@@ -5299,10 +5362,9 @@ fn handler_residual_call_irf_r(
     let (af, p) = read_list_f(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    // blackhole.py:1247-1249 → bhimpl_residual_call_irf_r.
     bh.registers_r[code[p] as usize] = bh
-        .cpu
-        .expect("cpu")
-        .bh_call_r(func, Some(&ai), Some(&ar), Some(&af), &calldescr)
+        .bhimpl_residual_call_irf_r(func, &ai, &ar, &af, &calldescr)
         .0 as i64;
     Ok(p + 1)
 }
@@ -5317,10 +5379,9 @@ fn handler_residual_call_irf_f(
     let (af, p) = read_list_f(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    // blackhole.py:1250-1252 → bhimpl_residual_call_irf_f.
     bh.registers_f[code[p] as usize] = bh
-        .cpu
-        .expect("cpu")
-        .bh_call_f(func, Some(&ai), Some(&ar), Some(&af), &calldescr)
+        .bhimpl_residual_call_irf_f(func, &ai, &ar, &af, &calldescr)
         .to_bits() as i64;
     Ok(p + 1)
 }
@@ -5335,9 +5396,9 @@ fn handler_residual_call_irf_v(
     let (af, p) = read_list_f(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
-    bh.cpu
-        .expect("cpu")
-        .bh_call_v(func, Some(&ai), Some(&ar), Some(&af), &calldescr);
+    // blackhole.py:1253-1255 routes through bhimpl_residual_call_irf_v
+    // which forwards to cpu.bh_call_v.
+    bh.bhimpl_residual_call_irf_v(func, &ai, &ar, &af, &calldescr);
     Ok(p)
 }
 // residual_call_ir_*
@@ -5351,10 +5412,8 @@ fn handler_residual_call_ir_i(
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
-    bh.registers_i[code[p] as usize] =
-        bh.cpu
-            .expect("cpu")
-            .bh_call_i(func, Some(&ai), Some(&ar), None, &calldescr);
+    // blackhole.py:1234-1236 → bhimpl_residual_call_ir_i.
+    bh.registers_i[code[p] as usize] = bh.bhimpl_residual_call_ir_i(func, &ai, &ar, &calldescr);
     Ok(p + 1)
 }
 fn handler_residual_call_ir_r(
@@ -5367,11 +5426,9 @@ fn handler_residual_call_ir_r(
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
-    bh.registers_r[code[p] as usize] = bh
-        .cpu
-        .expect("cpu")
-        .bh_call_r(func, Some(&ai), Some(&ar), None, &calldescr)
-        .0 as i64;
+    // blackhole.py:1237-1239 → bhimpl_residual_call_ir_r.
+    bh.registers_r[code[p] as usize] =
+        bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr).0 as i64;
     Ok(p + 1)
 }
 fn handler_residual_call_ir_v(
@@ -5384,9 +5441,8 @@ fn handler_residual_call_ir_v(
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
-    bh.cpu
-        .expect("cpu")
-        .bh_call_v(func, Some(&ai), Some(&ar), None, &calldescr);
+    // blackhole.py:1240-1242 → bhimpl_residual_call_ir_v.
+    bh.bhimpl_residual_call_ir_v(func, &ai, &ar, &calldescr);
     Ok(p)
 }
 // residual_call_r_*
@@ -5399,10 +5455,8 @@ fn handler_residual_call_r_i(
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
-    bh.registers_i[code[p] as usize] =
-        bh.cpu
-            .expect("cpu")
-            .bh_call_i(func, None, Some(&ar), None, &calldescr);
+    // blackhole.py:1225-1226 → bhimpl_residual_call_r_i.
+    bh.registers_i[code[p] as usize] = bh.bhimpl_residual_call_r_i(func, &ar, &calldescr);
     Ok(p + 1)
 }
 fn handler_residual_call_r_r(
@@ -5414,11 +5468,8 @@ fn handler_residual_call_r_r(
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
-    bh.registers_r[code[p] as usize] = bh
-        .cpu
-        .expect("cpu")
-        .bh_call_r(func, None, Some(&ar), None, &calldescr)
-        .0 as i64;
+    // blackhole.py:1227-1229 → bhimpl_residual_call_r_r.
+    bh.registers_r[code[p] as usize] = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr).0 as i64;
     Ok(p + 1)
 }
 fn handler_residual_call_r_v(
@@ -5430,9 +5481,8 @@ fn handler_residual_call_r_v(
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
-    bh.cpu
-        .expect("cpu")
-        .bh_call_v(func, None, Some(&ar), None, &calldescr);
+    // blackhole.py:1230-1232 → bhimpl_residual_call_r_v.
+    bh.bhimpl_residual_call_r_v(func, &ar, &calldescr);
     Ok(p)
 }
 
@@ -7032,9 +7082,9 @@ fn handler_inline_call_irf_i(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    // blackhole.py:1304-1307 → bhimpl_inline_call_irf_i.
     bh.registers_i[code[p] as usize] =
-        cpu.bh_call_i(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr);
+        bh.bhimpl_inline_call_irf_i(fnaddr, &ai, &ar, &af, &calldescr);
     Ok(p + 1)
 }
 fn handler_inline_call_irf_r(
@@ -7046,9 +7096,9 @@ fn handler_inline_call_irf_r(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu
-        .bh_call_r(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr)
+    // blackhole.py:1308-1311 → bhimpl_inline_call_irf_r.
+    bh.registers_r[code[p] as usize] = bh
+        .bhimpl_inline_call_irf_r(fnaddr, &ai, &ar, &af, &calldescr)
         .0 as i64;
     Ok(p + 1)
 }
@@ -7061,9 +7111,9 @@ fn handler_inline_call_irf_f(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[p] as usize] = cpu
-        .bh_call_f(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr)
+    // blackhole.py:1312-1315 → bhimpl_inline_call_irf_f.
+    bh.registers_f[code[p] as usize] = bh
+        .bhimpl_inline_call_irf_f(fnaddr, &ai, &ar, &af, &calldescr)
         .to_bits() as i64;
     Ok(p + 1)
 }
@@ -7076,8 +7126,8 @@ fn handler_inline_call_irf_v(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnaddr, Some(&ai), Some(&ar), Some(&af), &calldescr);
+    // blackhole.py:1316-1319 → bhimpl_inline_call_irf_v.
+    bh.bhimpl_inline_call_irf_v(fnaddr, &ai, &ar, &af, &calldescr);
     Ok(p)
 }
 fn handler_inline_call_ir_i(
@@ -7088,9 +7138,8 @@ fn handler_inline_call_ir_i(
     let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] =
-        cpu.bh_call_i(fnaddr, Some(&ai), Some(&ar), None, &calldescr);
+    // blackhole.py:1291-1294 → bhimpl_inline_call_ir_i.
+    bh.registers_i[code[p] as usize] = bh.bhimpl_inline_call_ir_i(fnaddr, &ai, &ar, &calldescr);
     Ok(p + 1)
 }
 fn handler_inline_call_ir_r(
@@ -7101,10 +7150,9 @@ fn handler_inline_call_ir_r(
     let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu
-        .bh_call_r(fnaddr, Some(&ai), Some(&ar), None, &calldescr)
-        .0 as i64;
+    // blackhole.py:1295-1298 → bhimpl_inline_call_ir_r.
+    bh.registers_r[code[p] as usize] =
+        bh.bhimpl_inline_call_ir_r(fnaddr, &ai, &ar, &calldescr).0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_ir_v(
@@ -7115,8 +7163,8 @@ fn handler_inline_call_ir_v(
     let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnaddr, Some(&ai), Some(&ar), None, &calldescr);
+    // blackhole.py:1299-1302 → bhimpl_inline_call_ir_v.
+    bh.bhimpl_inline_call_ir_v(fnaddr, &ai, &ar, &calldescr);
     Ok(p)
 }
 fn handler_inline_call_r_i(
@@ -7126,8 +7174,8 @@ fn handler_inline_call_r_i(
 ) -> Result<usize, DispatchError> {
     let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] = cpu.bh_call_i(fnaddr, None, Some(&ar), None, &calldescr);
+    // blackhole.py:1279-1281 → bhimpl_inline_call_r_i.
+    bh.registers_i[code[p] as usize] = bh.bhimpl_inline_call_r_i(fnaddr, &ar, &calldescr);
     Ok(p + 1)
 }
 fn handler_inline_call_r_r(
@@ -7137,9 +7185,8 @@ fn handler_inline_call_r_r(
 ) -> Result<usize, DispatchError> {
     let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] =
-        cpu.bh_call_r(fnaddr, None, Some(&ar), None, &calldescr).0 as i64;
+    // blackhole.py:1282-1285 → bhimpl_inline_call_r_r.
+    bh.registers_r[code[p] as usize] = bh.bhimpl_inline_call_r_r(fnaddr, &ar, &calldescr).0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_r_v(
@@ -7149,8 +7196,8 @@ fn handler_inline_call_r_v(
 ) -> Result<usize, DispatchError> {
     let (_jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnaddr, None, Some(&ar), None, &calldescr);
+    // blackhole.py:1286-1289 → bhimpl_inline_call_r_v.
+    bh.bhimpl_inline_call_r_v(fnaddr, &ar, &calldescr);
     Ok(p)
 }
 // recursive_call — stub (needs portal runner)
@@ -7172,7 +7219,16 @@ fn read_recursive_call_args(
     bh: &BlackholeInterpreter,
     code: &[u8],
     p: usize,
-) -> (usize, Vec<i64>, Vec<i64>, Vec<i64>, usize) {
+) -> (
+    usize,
+    Vec<i64>,
+    Vec<i64>,
+    Vec<i64>,
+    Vec<i64>,
+    Vec<i64>,
+    Vec<i64>,
+    usize,
+) {
     let jdindex = code[p] as usize; // 'c' short constant
     let p = p + 1;
     let (greens_i, p) = read_list_i(bh, code, p);
@@ -7181,14 +7237,13 @@ fn read_recursive_call_args(
     let (reds_i, p) = read_list_i(bh, code, p);
     let (reds_r, p) = read_list_r(bh, code, p);
     let (reds_f, p) = read_list_f(bh, code, p);
-    // RPython blackhole.py:1105-1108: greens + reds merged per kind.
-    let mut all_i = greens_i;
-    all_i.extend(&reds_i);
-    let mut all_r = greens_r;
-    all_r.extend(&reds_r);
-    let mut all_f = greens_f;
-    all_f.extend(&reds_f);
-    (jdindex, all_i, all_r, all_f, p)
+    // The greens+reds concatenation per kind happens inside
+    // bhimpl_recursive_call_* (mirroring blackhole.py:1105-1108) — the
+    // handlers hand over the raw greens / reds tuples so the bhimpl
+    // method owns the merge.
+    (
+        jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p,
+    )
 }
 // blackhole.py:1101-1108 bhimpl_recursive_call_i
 fn handler_recursive_call_i(
@@ -7196,11 +7251,11 @@ fn handler_recursive_call_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[p] as usize] =
-        cpu.bh_call_i(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
+    let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
+        read_recursive_call_args(bh, code, p);
+    bh.registers_i[code[p] as usize] = bh.bhimpl_recursive_call_i(
+        jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+    );
     Ok(p + 1)
 }
 // blackhole.py:1109-1116 bhimpl_recursive_call_r
@@ -7209,11 +7264,12 @@ fn handler_recursive_call_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_r[code[p] as usize] = cpu
-        .bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+    let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
+        read_recursive_call_args(bh, code, p);
+    bh.registers_r[code[p] as usize] = bh
+        .bhimpl_recursive_call_r(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        )
         .0 as i64;
     Ok(p + 1)
 }
@@ -7223,11 +7279,12 @@ fn handler_recursive_call_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_f[code[p] as usize] = cpu
-        .bh_call_f(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
+    let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
+        read_recursive_call_args(bh, code, p);
+    bh.registers_f[code[p] as usize] = bh
+        .bhimpl_recursive_call_f(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        )
         .to_bits() as i64;
     Ok(p + 1)
 }
@@ -7237,9 +7294,10 @@ fn handler_recursive_call_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let (jdindex, all_i, all_r, all_f, p) = read_recursive_call_args(bh, code, p);
-    let (fnptr, calldescr) = bh.get_portal_runner(jdindex);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_call_v(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
+    let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
+        read_recursive_call_args(bh, code, p);
+    bh.bhimpl_recursive_call_v(
+        jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+    );
     Ok(p)
 }

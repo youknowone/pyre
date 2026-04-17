@@ -1029,40 +1029,49 @@ pub fn execute_varargs(
 ) -> i64 {
     debug_assert!(opnum.is_call(), "execute_varargs requires a call opcode");
     // COND_CALL / COND_CALL_VALUE_* layout (pyjitpl.py:2128-2151):
-    //   argboxes[0] = condbox
+    //   argboxes[0] = condbox / valuebox
     //   argboxes[1] = funcbox
     //   argboxes[2..] = call args
     // RPython's executor handles cond-call dispatch via a per-opcode
     // execute function (`do_cond_call_*`); pyre inlines the same
     // semantics here.
-    if matches!(
-        opnum,
-        OpCode::CondCallN | OpCode::CondCallValueI | OpCode::CondCallValueR
-    ) {
+    //
+    // Two distinct shapes (blackhole.py:1257-1276):
+    //   bhimpl_conditional_call_ir_v(condition, func, ...):
+    //       if condition: cpu.bh_call_v(func, ...)        # void
+    //   bhimpl_conditional_call_value_ir_{i,r}(value, func, ...):
+    //       if value == 0: value = cpu.bh_call_*(func, ...)
+    //       return value
+    if matches!(opnum, OpCode::CondCallN) {
         debug_assert!(
             argboxes.len() >= 2,
-            "COND_CALL requires [condbox, funcbox, *args]",
+            "COND_CALL_N requires [condbox, funcbox, *args]",
         );
         let cond = argboxes[0].2;
         if cond == 0 {
-            // pyjitpl.py: COND_CALL with cond=0 leaves the call alone
-            // and the result default-initializes — for COND_CALL_VALUE_*
-            // the upstream `valuebox` short-circuit lives in the
-            // codewriter; here we return the existing value (0).
+            // condition false → skip the call.
             return 0;
         }
         let func_ptr = argboxes[1].2 as *const ();
         let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
-        return match descr.result_type() {
-            majit_ir::Type::Int | majit_ir::Type::Ref => {
-                crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
-            }
-            majit_ir::Type::Void => {
-                crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
-                0
-            }
-            majit_ir::Type::Float => 0,
-        };
+        crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
+        return 0;
+    }
+    if matches!(opnum, OpCode::CondCallValueI | OpCode::CondCallValueR) {
+        debug_assert!(
+            argboxes.len() >= 2,
+            "COND_CALL_VALUE_* requires [valuebox, funcbox, *args]",
+        );
+        let value = argboxes[0].2;
+        if value != 0 {
+            // blackhole.py:1267 / 1274: nonzero `value` short-circuits
+            // and returns the existing value without calling.
+            return value;
+        }
+        // value == 0 → call and return the call's result.
+        let func_ptr = argboxes[1].2 as *const ();
+        let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
+        return crate::pyjitpl::call_int_function(func_ptr, &concrete_args);
     }
     debug_assert!(
         !argboxes.is_empty(),

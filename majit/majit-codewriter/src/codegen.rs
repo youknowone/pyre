@@ -2181,6 +2181,7 @@ mod tests {
                     num_values: 0,
                     num_blocks: 0,
                     value_kinds: std::collections::HashMap::new(),
+                    insns_pos: None,
                 },
             });
         let code = generate_from_pipeline(&pipeline);

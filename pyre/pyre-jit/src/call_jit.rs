@@ -886,12 +886,17 @@ pub fn resume_in_blackhole(
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
         // pyjitpl.py:2264: metainterp_sd.liveness_info — global pool.
         bh.liveness_info = pyre_jit_trace::state::liveness_info_snapshot();
-        // blackhole.py:1095 get_portal_runner parity:
-        // Set portal_runner_ptr for bhimpl_recursive_call.
-        bh.portal_runner_ptr = Some(bh_portal_runner);
-        // RPython: calldescr = jitdriver_sd.mainjitcode.calldescr
-        // blackhole.py:1098: calldescr from the portal's mainjitcode.
-        bh.mainjitcode_calldescr = pyjitcode.jitcode.calldescr.clone();
+        // blackhole.py:1095-1099 get_portal_runner parity:
+        //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
+        //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
+        //   calldescr    = jitdriver_sd.mainjitcode.calldescr
+        // pyre publishes the single Pyre jitdriver at jdindex 0 with
+        // result_type Ref (the portal returns a PyObject Ref).
+        bh.jitdrivers_sd = vec![majit_metainterp::blackhole::BhJitDriverSd {
+            result_type: majit_metainterp::blackhole::BhReturnType::Ref,
+            portal_runner_ptr: Some(bh_portal_runner),
+            mainjitcode_calldescr: pyjitcode.jitcode.calldescr.clone(),
+        }];
 
         // RPython warmspot.py: jitcode.fnaddr = getfunctionptr(graph).
         // pyre: all Python functions go through the single portal runner.
@@ -1613,11 +1618,15 @@ pub fn blackhole_resume_via_rd_numb(
         bh.virtualizable_ptr = deadframe[0];
     }
     bh.virtualizable_info = crate::eval::get_virtualizable_info();
-    // blackhole.py:1095 get_portal_runner parity
-    bh.portal_runner_ptr = Some(bh_portal_runner);
-    // RPython: calldescr = jitdriver_sd.mainjitcode.calldescr
-    // blackhole.py:1098: calldescr from the portal's mainjitcode.
-    bh.mainjitcode_calldescr = bh.jitcode.calldescr.clone();
+    // blackhole.py:1095-1099 get_portal_runner parity:
+    //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
+    //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
+    //   calldescr    = jitdriver_sd.mainjitcode.calldescr
+    bh.jitdrivers_sd = vec![majit_metainterp::blackhole::BhJitDriverSd {
+        result_type: majit_metainterp::blackhole::BhReturnType::Ref,
+        portal_runner_ptr: Some(bh_portal_runner),
+        mainjitcode_calldescr: bh.jitcode.calldescr.clone(),
+    }];
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
