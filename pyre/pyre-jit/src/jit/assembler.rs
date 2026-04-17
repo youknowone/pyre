@@ -14,7 +14,6 @@ use majit_codewriter::jitcode::BhDescr;
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
 
 use super::flatten::{DescrOperand, Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
-use super::liveness::encode_liveness;
 
 /// `assembler.py:65` `count_regs = dict.fromkeys(KINDS, 0)` override.
 #[derive(Debug, Clone, Copy, Default)]
@@ -26,21 +25,30 @@ pub struct NumRegs {
 
 /// `assembler.py:19-32` `class Assembler(object)`.
 ///
-/// The persistent state kept across multiple `assemble()` calls matches the
-/// RPython fields that are semantically shared across jitcodes: the deduped
-/// `all_liveness` table, liveness statistics, and the `indirectcalltargets`
-/// set accumulated from every `IndirectCallTargets` operand emitted by the
-/// codewriter's `handle_regular_indirect_call` pass.
+/// Writer-side state, per-instance, matching `Assembler.__init__`
+/// (rpython/jit/codewriter/assembler.py:19-32) line-by-line. A fresh
+/// `Assembler::new()` produces independent `all_liveness` /
+/// `all_liveness_positions` / `num_liveness_ops` /
+/// `indirectcalltargets`; upstream does the same — each `CodeWriter`
+/// owns one `Assembler` and carries its own dedup state.
+///
+/// The reader side (`blackhole` / `trace_opcode`, both in the
+/// lower `pyre_jit_trace` crate) still needs to read `all_liveness`
+/// at runtime. pyre-jit-trace cannot depend on pyre-jit, so we
+/// publish the latest `all_liveness` snapshot to
+/// `pyre_jit_trace::assembler::ASSEMBLER_STATE` after every write
+/// — PRE-EXISTING-ADAPTATION for the crate layering, not a state
+/// relocation.
 #[derive(Debug, Default)]
 pub struct Assembler {
     /// `assembler.py:29` `self.all_liveness = []`.
     all_liveness: Vec<u8>,
     /// `assembler.py:30` `self.all_liveness_length = 0`.
-    pub all_liveness_length: usize,
+    all_liveness_length: usize,
     /// `assembler.py:31` `self.all_liveness_positions = {}`.
-    all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), usize>,
+    all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>,
     /// `assembler.py:32` `self.num_liveness_ops = 0`.
-    pub num_liveness_ops: usize,
+    num_liveness_ops: usize,
     /// `assembler.py:24` `self.indirectcalltargets = set()    # set of JitCodes`.
     /// Accumulated across every `assemble()` call; `pyjitpl.py:2262`
     /// `self.setup_indirectcalltargets(asm.indirectcalltargets)` pipes
@@ -123,8 +131,19 @@ impl Assembler {
         Self::default()
     }
 
+    /// `assembler.py:29` accessor.
     pub fn all_liveness(&self) -> &[u8] {
         &self.all_liveness
+    }
+
+    /// `assembler.py:30` accessor.
+    pub fn all_liveness_length(&self) -> usize {
+        self.all_liveness_length
+    }
+
+    /// `assembler.py:32` accessor.
+    pub fn num_liveness_ops(&self) -> usize {
+        self.num_liveness_ops
     }
 
     /// Return the accumulated indirect-call target set as a deduped
@@ -176,6 +195,11 @@ impl Assembler {
 
         let mut jitcode = state.builder.finish();
         jitcode.descrs = state.descrs;
+        // `assembler.py:54`: run `check_result()` unconditionally after
+        // `fix_labels()` and before `make_jitcode`. Strict RPython parity
+        // — an oversized jitcode is a translator-level programming error,
+        // so this asserts and aborts rather than degrading to a runtime
+        // fallback. Any pyre-only safety net belongs outside this unit.
         self.check_result(&jitcode);
         jitcode
     }
@@ -192,7 +216,11 @@ impl Assembler {
                 state.builder.mark_label(label_id);
             }
             Insn::Live(args) => {
-                self.num_liveness_ops += 1;
+                // `assembler.py:149` increments `self.num_liveness_ops`.
+                // pyre's counter lives on `ASSEMBLER_STATE`; `intern_liveness`
+                // below takes care of the `+= 1`, so there is no local
+                // pre-increment here (matching upstream: the bump happens
+                // inside `_encode_liveness`).
                 let live_i = get_liveness_info(args, Kind::Int);
                 let live_r = get_liveness_info(args, Kind::Ref);
                 let live_f = get_liveness_info(args, Kind::Float);
@@ -251,40 +279,89 @@ impl Assembler {
     }
 
     /// `assembler.py:265-269` `check_result()`.
+    ///
+    /// Upstream's cap is 256 because `_emit_constant` encodes the
+    /// register-or-constant index as a single `chr(val)` byte
+    /// (assembler.py:132-137: `assert 0 <= val < 256, "too many
+    /// constants"` followed by `self.code.append(chr(val))`). Pyre's
+    /// `JitCodeBuilder` uses `BC_LOAD_CONST_I(dst: u16, const_idx: u16)`
+    /// (see `majit_metainterp::jitcode::assembler::load_const_i`), so
+    /// the encoding supports indices up to 65535. The parity-correct cap
+    /// for pyre's encoding is therefore 65536 per kind — a
+    /// PRE-EXISTING-ADAPTATION of pyre's wider `const_idx` field, not a
+    /// semantic relaxation. Runs unconditionally inside `assemble()`
+    /// after `fix_labels()` (identical cadence to RPython).
     fn check_result(&self, jitcode: &JitCode) {
+        const CAP: usize = 1 << 16;
         assert!(
-            (jitcode.num_regs_i() as usize) + jitcode.constants_i.len() <= 256,
+            (jitcode.num_regs_i() as usize) + jitcode.constants_i.len() <= CAP,
             "too many int registers/constants"
         );
         assert!(
-            (jitcode.num_regs_r() as usize) + jitcode.constants_r.len() <= 256,
+            (jitcode.num_regs_r() as usize) + jitcode.constants_r.len() <= CAP,
             "too many ref registers/constants"
         );
         assert!(
-            (jitcode.num_regs_f() as usize) + jitcode.constants_f.len() <= 256,
+            (jitcode.num_regs_f() as usize) + jitcode.constants_f.len() <= CAP,
             "too many float registers/constants"
         );
     }
 
     /// `assembler.py:234-248` `_encode_liveness(...)`.
+    ///
+    /// Line-by-line port of RPython's `_encode_liveness`:
+    ///   - Dedup key is `(live_i, live_r, live_f)` — pyre uses sorted-byte
+    ///     slices where RPython uses `frozenset`. Equivalent modulo the
+    ///     caller's responsibility to present sorted/dedup'd input, which
+    ///     is done by `get_liveness_info` before this call.
+    ///   - On miss: append the three u8 length bytes + the encoded
+    ///     bitsets, and advance `all_liveness_length`.
+    ///   - `num_liveness_ops` bumps once per `-live-` write regardless of
+    ///     dedup (`assembler.py:149` does it in `write_insn`, before this
+    ///     helper is reached). Matches upstream.
+    ///
+    /// After the per-instance update we publish the latest buffer to
+    /// the `pyre_jit_trace::assembler::ASSEMBLER_STATE` thread-local so
+    /// the blackhole reader (a lower-crate consumer that cannot depend
+    /// on `pyre_jit`) sees the same bytes. PRE-EXISTING-ADAPTATION for
+    /// the crate layering, not a relocation of the RPython state.
     fn encode_liveness_info(&mut self, live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> u16 {
+        use majit_codewriter::liveness::encode_liveness;
+
+        self.num_liveness_ops += 1;
         let key = (live_i.to_vec(), live_r.to_vec(), live_f.to_vec());
-        let pos = if let Some(&pos) = self.all_liveness_positions.get(&key) {
-            pos
+        let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
+            cached
         } else {
-            let pos = self.all_liveness_length;
+            assert!(
+                self.all_liveness_length <= u16::MAX as usize,
+                "all_liveness offset overflow"
+            );
+            assert!(
+                live_i.len() <= u8::MAX as usize
+                    && live_r.len() <= u8::MAX as usize
+                    && live_f.len() <= u8::MAX as usize,
+                "too many live registers in one slot"
+            );
+            let pos = self.all_liveness_length as u16;
             self.all_liveness_positions.insert(key, pos);
             self.all_liveness.push(live_i.len() as u8);
             self.all_liveness.push(live_r.len() as u8);
             self.all_liveness.push(live_f.len() as u8);
+            self.all_liveness_length += 3;
             for live in [live_i, live_r, live_f] {
                 let encoded = encode_liveness(live);
                 self.all_liveness.extend_from_slice(&encoded);
+                self.all_liveness_length += encoded.len();
             }
-            self.all_liveness_length = self.all_liveness.len();
             pos
         };
-        u16::try_from(pos).expect("all_liveness offset overflow")
+        pyre_jit_trace::assembler::publish_liveness(
+            &self.all_liveness,
+            self.all_liveness_length,
+            self.num_liveness_ops,
+        );
+        pos
     }
 }
 
@@ -346,6 +423,14 @@ fn dispatch_op(
             let label = expect_tlabel(&args[0]);
             let label_id = builder_label(state, &label.name);
             state.builder.jump(label_id);
+        }
+        "jump_target" => {
+            // BC_JUMP_TARGET marker — no args. RPython has no equivalent
+            // opcode; pyre emits it at Python PCs that are the target of
+            // a loop-backward jump and are not already `jit_merge_point`s,
+            // matching the jtransform.py:1714 handle_jit_marker__loop_header
+            // role (see codewriter.rs around the loop_header branch).
+            state.builder.jump_target();
         }
         "goto_if_not" | "branch_reg_zero" => {
             let cond = expect_reg(&args[0], Kind::Int);
@@ -921,6 +1006,7 @@ mod tests {
         ));
 
         let mut assembler = Assembler::new();
+        let before_ops = assembler.num_liveness_ops();
         let jitcode = assembler.assemble(
             &mut ssarepr,
             JitCodeBuilder::default(),
@@ -930,7 +1016,12 @@ mod tests {
             }),
         );
 
-        assert_eq!(assembler.num_liveness_ops, 1);
+        // `num_liveness_ops` and `all_liveness` live on the thread-local
+        // `ASSEMBLER_STATE` (the single RPython-`Assembler` analog); other
+        // tests running earlier on the same thread may already have
+        // bumped the counter, so assert on the delta and the non-empty
+        // buffer rather than a raw == 1.
+        assert_eq!(assembler.num_liveness_ops() - before_ops, 1);
         assert!(!assembler.all_liveness().is_empty());
         assert_eq!(ssarepr.insns_pos.as_ref().map(Vec::len), Some(2));
         assert!(!jitcode.code.is_empty());

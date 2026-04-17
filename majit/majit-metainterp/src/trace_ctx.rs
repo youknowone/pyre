@@ -255,6 +255,17 @@ impl TraceCtx {
         Self::new(recorder, 0)
     }
 
+    /// Create a TraceCtx for tests whose input args have mixed types.
+    /// Analog of RPython `MetaInterp.create_empty_loop()` +
+    /// `inputargs = [Box(tp) for tp in types]`.
+    pub fn for_test_types(types: &[majit_ir::Type]) -> Self {
+        let mut recorder = Trace::new();
+        for &tp in types {
+            recorder.record_input_arg(tp);
+        }
+        Self::new(recorder, 0)
+    }
+
     /// Take the recorder out of this context (consumes self).
     pub fn into_recorder(self) -> Trace {
         self.recorder

@@ -13,11 +13,14 @@
 /// into a single bytecode-to-bytecode translation.
 ///
 /// The Assembler (majit JitCodeBuilder) is RPython's assembler.py equivalent.
-use std::cell::UnsafeCell;
+use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 
 use majit_ir::OpCode;
 use majit_metainterp::jitcode::{JitCode, JitCodeBuilder, LivenessInfo};
+
+use super::assembler::Assembler;
+use super::ssa_emitter::SSAReprEmitter;
 use pyre_interpreter::bytecode::{CodeObject, Instruction, OpArgState};
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
@@ -130,9 +133,14 @@ impl PyJitCode {
 /// Compiles Python CodeObjects into JitCode for blackhole execution.
 ///
 /// RPython: CodeWriter class in codewriter/codewriter.py.
-/// RPython's CodeWriter holds an Assembler (shared across all JitCodes)
-/// and a CallControl. For pyre, each CodeObject gets its own JitCodeBuilder
-/// since Python functions are compiled lazily.
+/// `codewriter.py:20-23` stores `self.assembler = Assembler()` once on
+/// the CodeWriter and reuses it across every `transform_graph_to_jitcode`
+/// call so `all_liveness` / `num_liveness_ops` accumulate over the
+/// whole translator session. pyre mirrors that ownership via the
+/// `RefCell<Assembler>` field below: the thread-local
+/// `with_codewriter(...)` accessor hands out a single long-lived
+/// instance, so every compiled jitcode in a thread's lifetime shares
+/// the same `Assembler` and its per-kind counters actually accumulate.
 pub struct CodeWriter {
     /// Blackhole helper function pointers, registered once.
     ///
@@ -165,6 +173,12 @@ pub struct CodeWriter {
     pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Build list: (argc, item0, item1) → new list.
     pub build_list_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `codewriter.py:22` `self.assembler = Assembler()`.
+    ///
+    /// Single Assembler instance shared across every `transform_graph_to_jitcode`
+    /// call on this CodeWriter. `all_liveness` / `all_liveness_positions` /
+    /// `num_liveness_ops` accumulate here just like the upstream object.
+    assembler: RefCell<Assembler>,
 }
 
 impl CodeWriter {
@@ -197,6 +211,7 @@ impl CodeWriter {
             load_const_fn,
             store_subscr_fn,
             build_list_fn,
+            assembler: RefCell::new(Assembler::new()),
         }
     }
 
@@ -253,7 +268,7 @@ impl CodeWriter {
         // RPython: self.assembler = Assembler() + JitCode(graph.name, ...)
         // (rpython/jit/codewriter/jitcode.py:14-15 takes name as the first
         // __init__ argument; majit's JitCodeBuilder::set_name mirrors that).
-        let mut assembler = JitCodeBuilder::default();
+        let mut assembler = SSAReprEmitter::new();
         assembler.set_name(code.obj_name.to_string());
 
         // RPython regalloc.py: keep kind-separated register files.
@@ -472,7 +487,21 @@ impl CodeWriter {
             // interpreter (eval.rs:92 `target_depth = frame.nlocals() +
             // frame.ncells() + entry.depth`) uses when an exception handler
             // unwinds the frame.
-            // pyopcode.py:172 `self.last_instr = intmask(next_instr)` parity.
+            //
+            // pyopcode.py:172 `self.last_instr = intmask(next_instr)` —
+            // virtualizable contract from pypy/module/pypyjit/interp_jit.py:25
+            // (`PyFrame._virtualizable_ = ['last_instr', ...]`). Emitted per
+            // Python bytecode instruction so `frame.f_lasti` /
+            // `PyFrame.get_last_lineno` observe the correct PC even inside
+            // a JIT-compiled frame, matching the interpreter exactly.
+            //
+            // Each py_pc+1 is distinct, so the int constant pool grows with
+            // the function size. Pyre's BC_LOAD_CONST_I encodes the pool
+            // index as u16 (see jitcode/assembler.rs:load_const_i), so the
+            // pool can hold up to 65536 distinct values — unlike RPython's
+            // 1-byte `chr(val)` encoding (assembler.py:132-137) that caps
+            // at 256. The widened cap is a PRE-EXISTING-ADAPTATION of
+            // pyre's chosen BC encoding, not a semantic change.
             if is_portal {
                 assembler.load_const_i_value(int_tmp0, (py_pc + 1) as i64);
                 assembler.vable_setfield_int(VABLE_NEXT_INSTR_FIELD_IDX, int_tmp0);
@@ -1090,12 +1119,20 @@ impl CodeWriter {
         // return/raise/goto/unreachable. No end-of-code sentinel needed —
         // falling off the end is unreachable if all bytecodes are covered.
 
-        // RPython parity: JitCodeBuilder tracks has_abort via abort() calls
-        // (BC_ABORT=13). abort_permanent() (BC_ABORT_PERMANENT=14) does not
-        // set has_abort. This codewriter only uses abort_permanent() for
-        // unsupported bytecodes, so has_abort comes from the assembler.
-        // The flag lives on the builder, not on the finished JitCode —
-        // matching RPython jitcode.py which has no has_abort field.
+        // pyre-only PyJitCode.has_abort: a "this jitcode cannot be
+        // blackhole-dispatched, pipe straight to the interpreter" flag.
+        // RPython has no such flag (rpython/jit/codewriter/jitcode.py:14
+        // — no abort tracking on JitCode). Upstream's `Assembler.abort()`
+        // (assembler.py:177-181, bhimpl_abort) emits BC_ABORT so the
+        // blackhole raises SwitchToBlackhole(ABORT_ESCAPE) at runtime;
+        // `abort_permanent()` is a different pyre-only bytecode we emit
+        // for genuinely unsupported Python opcodes, and its execution
+        // path already raises/aborts correctly from the blackhole. We
+        // keep has_abort narrowly scoped to `abort()` emissions (matches
+        // the JitCodeBuilder flag shape) so the flag's meaning doesn't
+        // drift into "assembler overflow" or "abort_permanent present"
+        // — both of which the assembler/blackhole already handle without
+        // a front-end gate.
         let mut has_abort = assembler.has_abort_flag();
 
         // liveness.py parity: generate LivenessInfo at each bytecode PC.
@@ -1145,39 +1182,39 @@ impl CodeWriter {
             liveness
         };
 
-        // assembler.py:234-248 `_encode_liveness` parity: intern each
-        // liveness triple in the single global all_liveness string and patch
-        // the inline `live/` marker with that global 2-byte offset.
+        // liveness.py:19-23 parity: fill each SSARepr Insn::Live with the
+        // live register triple computed above. Assembler::assemble's
+        // encode_liveness_info (routed through
+        // pyre_jit_trace::state::intern_liveness) interns the bytes and
+        // emits the BC_LIVE opcode plus 2-byte global offset.
+        //
+        // Overflow detection matches the earlier direct-builder loop:
+        // if liveness_regs_to_u8_sorted rejects a register >= 256 or
+        // intern_liveness runs out of u16 offset space, mark the jitcode
+        // unexecutable (has_abort = true) so the caller falls back to
+        // the interpreter. See liveness_regs_to_u8_sorted's doc comment.
         {
             let mut liveness_overflow = false;
             for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
                 let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
                 let live_r_bytes = liveness_regs_to_u8_sorted(&entry.live_r_regs);
                 let live_f_bytes = liveness_regs_to_u8_sorted(&entry.live_f_regs);
-                let (live_i_bytes, live_r_bytes, live_f_bytes) =
-                    match (live_i_bytes, live_r_bytes, live_f_bytes) {
-                        (Some(i), Some(r), Some(f)) => (i, r, f),
-                        _ => {
-                            liveness_overflow = true;
-                            break;
-                        }
-                    };
-                match pyre_jit_trace::state::intern_liveness(
-                    &live_i_bytes,
-                    &live_r_bytes,
-                    &live_f_bytes,
-                ) {
-                    Some(offset) => assembler.patch_live_offset(patch_offset, offset),
-                    None => {
-                        liveness_overflow = true;
-                        break;
-                    }
+                if live_i_bytes.is_none() || live_r_bytes.is_none() || live_f_bytes.is_none() {
+                    liveness_overflow = true;
+                    break;
                 }
+                assembler.fill_live_args(
+                    patch_offset,
+                    &entry.live_i_regs,
+                    &entry.live_r_regs,
+                    &entry.live_f_regs,
+                );
             }
             if liveness_overflow {
-                // Mark the jitcode as unexecutable; overflow means the
-                // encoder could not fit into the u16 offset space. See
-                // `liveness_regs_to_u8_sorted` comment for the TODO.
+                // Propagate to the builder so Assembler::assemble can
+                // skip its check_result assertion — the JitCode produced
+                // here will never reach the blackhole anyway.
+                assembler.set_abort_flag(true);
                 has_abort = true;
             }
         }
@@ -1199,7 +1236,23 @@ impl CodeWriter {
             assembler.jump(labels[site.handler_py_pc]);
         }
 
-        let mut jitcode = assembler.finish();
+        // pc_map[py_pc] currently holds SSARepr insn indices (returned by
+        // SSAReprEmitter::current_pos()). Translate them to JitCode byte
+        // offsets via ssarepr.insns_pos, populated during
+        // Assembler::assemble (assembler.py:41-44). Runtime readers
+        // (get_live_vars_info, resume dispatch) expect byte offsets.
+        //
+        // `codewriter.py:67` `self.assembler.assemble(ssarepr, jitcode, num_regs)`
+        // parity: borrow the CodeWriter's single Assembler so
+        // `all_liveness` / `num_liveness_ops` continue to accumulate
+        // across every jitcode compiled on this thread. The throwaway
+        // `SSAReprEmitter::finish_and_translate_positions()` path is
+        // retained only for unit tests.
+        let (mut jitcode, pc_map_bytes) = {
+            let mut asm = self.assembler.borrow_mut();
+            assembler.finish_with_positions(&mut *asm, &pc_map)
+        };
+        let pc_map = pc_map_bytes;
 
         // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
         // pyre uses index 0 (single jitdriver) for portal jitcodes.
@@ -1290,6 +1343,41 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 thread_local! {
     static JITCODE_CACHE: UnsafeCell<HashMap<usize, PyJitCode>> =
         UnsafeCell::new(HashMap::new());
+
+    /// `codewriter.py:20-23` single long-lived `CodeWriter` per thread.
+    ///
+    /// Matches RPython's "CodeWriter holds the Assembler" ownership model.
+    /// All four `pyre/pyre-jit` call sites now route through
+    /// `with_codewriter(...)` so every jitcode compiled on a thread's
+    /// lifetime shares the same `Assembler` instance, letting its
+    /// `all_liveness` / `num_liveness_ops` accumulate across calls just
+    /// like upstream.
+    static CODEWRITER: OnceCell<CodeWriter> = const { OnceCell::new() };
+}
+
+/// `codewriter.py:20-23` accessor. Initialises the thread-local
+/// `CodeWriter` on first use with the standard `bh_*` helper pointers
+/// (every current caller uses the same bundle). Additional call sites
+/// should route through here rather than calling `CodeWriter::new(...)`
+/// inline — a fresh CodeWriter-per-call splits the Assembler's
+/// accumulator and diverges from RPython parity.
+pub fn with_codewriter<R>(f: impl FnOnce(&CodeWriter) -> R) -> R {
+    CODEWRITER.with(|cell| {
+        let writer = cell.get_or_init(|| {
+            CodeWriter::new(
+                crate::call_jit::bh_call_fn,
+                crate::call_jit::bh_load_global_fn,
+                crate::call_jit::bh_compare_fn,
+                crate::call_jit::bh_binary_op_fn,
+                crate::call_jit::bh_box_int_fn,
+                crate::call_jit::bh_truth_fn,
+                crate::call_jit::bh_load_const_fn,
+                crate::call_jit::bh_store_subscr_fn,
+                crate::call_jit::bh_build_list_fn,
+            )
+        });
+        f(writer)
+    })
 }
 
 /// Get or compile JitCode for a CodeObject.
@@ -1345,18 +1433,9 @@ pub fn ensure_jitcode_for(
     w_code: *const (),
     merge_point_pc: Option<usize>,
 ) {
-    let writer = CodeWriter::new(
-        crate::call_jit::bh_call_fn,
-        crate::call_jit::bh_load_global_fn,
-        crate::call_jit::bh_compare_fn,
-        crate::call_jit::bh_binary_op_fn,
-        crate::call_jit::bh_box_int_fn,
-        crate::call_jit::bh_truth_fn,
-        crate::call_jit::bh_load_const_fn,
-        crate::call_jit::bh_store_subscr_fn,
-        crate::call_jit::bh_build_list_fn,
-    );
-    let _ = get_jitcode(code, w_code, &writer, merge_point_pc);
+    with_codewriter(|writer| {
+        let _ = get_jitcode(code, w_code, writer, merge_point_pc);
+    });
 }
 
 /// jitcode.py:18: `jitcode.jitdriver_sd is not None`.

@@ -172,19 +172,21 @@ fn _compute_liveness_must_continue(
                     // `liveness.py:74-75`.
                     follow_label(&mut alive, label2alive, lbl);
                 }
-                Operand::Descr(DescrOperand::SwitchDict(descr)) => {
-                    // `liveness.py:76-78`:
-                    //   elif isinstance(x, SwitchDictDescr):
-                    //       for key, label in x._labels:
-                    //           follow_label(label)
-                    for (_, label) in &descr.labels {
-                        follow_label(&mut alive, label2alive, label);
+                Operand::Descr(rc) => match &**rc {
+                    DescrOperand::SwitchDict(descr) => {
+                        // `liveness.py:76-78`:
+                        //   elif isinstance(x, SwitchDictDescr):
+                        //       for key, label in x._labels:
+                        //           follow_label(label)
+                        for (_, label) in &descr.labels {
+                            follow_label(&mut alive, label2alive, label);
+                        }
                     }
-                }
-                Operand::Descr(DescrOperand::Bh(_)) => {
-                    // RPython `liveness.py:59-78` ignores non-`SwitchDictDescr`
-                    // descrs — they contribute no control-flow edges.
-                }
+                    DescrOperand::Bh(_) => {
+                        // RPython `liveness.py:59-78` ignores non-`SwitchDictDescr`
+                        // descrs — they contribute no control-flow edges.
+                    }
+                },
                 _ => {}
             }
         }
@@ -579,7 +581,7 @@ mod tests {
         s.insns.push(Insn::Live(Vec::new()));
         s.insns.push(Insn::op(
             "fooswitch",
-            vec![Operand::Descr(
+            vec![Operand::descr(
                 super::super::flatten::DescrOperand::SwitchDict(descr),
             )],
         ));

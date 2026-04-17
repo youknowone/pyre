@@ -16,6 +16,8 @@
 //! `---` and generic `Op` instructions) plus `Operand` for everything
 //! that appears inside a tuple.
 
+use std::rc::Rc;
+
 use majit_codewriter::jitcode::BhDescr;
 
 /// `rpython/jit/codewriter/flatten.py:59` `KINDS = ['int', 'ref', 'float']`.
@@ -300,10 +302,18 @@ pub enum Operand {
     /// `assembler.py:197-206` `elif isinstance(x, AbstractDescr)` /
     /// `liveness.py:76` `elif isinstance(x, SwitchDictDescr)` — either a
     /// runtime-resolved descr (`BhDescr`) or an SSARepr-side
-    /// `SwitchDictDescr` with a live `_labels` table. The assembler
-    /// records the descr in its table and emits its 16-bit index;
-    /// liveness reads `_labels` to follow switch-target edges.
-    Descr(DescrOperand),
+    /// `SwitchDictDescr` with a live `_labels` table.
+    ///
+    /// Wrapped in `Rc` so cloning the `Operand` preserves Python object
+    /// identity: `assembler.py:197-199` keys `self._descr_dict` on
+    /// `id(x)`, and two SSARepr sites that share the SAME descr object
+    /// MUST dedup to the same `descrs` index. With `Rc`, callers that
+    /// build an SSARepr `clone()` the `Rc` (pointer-preserving) while
+    /// still being able to construct distinct descrs with
+    /// `Rc::new(...)` when identity should differ. A plain
+    /// `DescrOperand` value field would lose this distinction on every
+    /// `Clone`.
+    Descr(Rc<DescrOperand>),
     /// `IndirectCallTargets` — list of jitcodes for `indirect_call`.
     IndirectCallTargets(IndirectCallTargets),
     /// majit IR `OpCode` passed verbatim to `record_binop_*` /
@@ -318,6 +328,20 @@ pub enum Operand {
 impl Operand {
     pub fn reg(kind: Kind, index: u16) -> Self {
         Operand::Register(Register::new(kind, index))
+    }
+
+    /// Wrap a `DescrOperand` into a fresh `Rc` and build an `Operand`.
+    /// Callers that want two `Operand::Descr`s to dedup to the same
+    /// `descrs` index must `Rc::clone` the `Rc` returned by this call
+    /// rather than invoking `descr()` twice with equal values.
+    pub fn descr(value: DescrOperand) -> Self {
+        Operand::Descr(Rc::new(value))
+    }
+
+    /// Build an `Operand::Descr` from an existing `Rc<DescrOperand>`.
+    /// Preserves identity for dedup (`assembler.py:197-199`).
+    pub fn descr_rc(value: Rc<DescrOperand>) -> Self {
+        Operand::Descr(value)
     }
 }
 

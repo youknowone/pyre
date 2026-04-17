@@ -417,22 +417,18 @@ impl MIFrame {
         // symbolic stack.
         let sym = self.sym();
         if let Some(idx) = sym.symbolic_locals.iter().position(|&slot| slot == value) {
-            return sym
-                .symbolic_local_types
-                .get(idx)
-                .copied()
-                .unwrap_or(Type::Ref);
+            if let Some(&tp) = sym.symbolic_local_types.get(idx) {
+                return tp;
+            }
         }
         let stack_only = sym.stack_only_depth().min(sym.symbolic_stack.len());
         if let Some(idx) = sym.symbolic_stack[..stack_only]
             .iter()
             .position(|&slot| slot == value)
         {
-            return sym
-                .symbolic_stack_types
-                .get(idx)
-                .copied()
-                .unwrap_or(Type::Ref);
+            if let Some(&tp) = sym.symbolic_stack_types.get(idx) {
+                return tp;
+            }
         }
         let ctx_ref: &TraceCtx = unsafe { &*self.ctx };
         ctx_ref.get_opref_type(value).unwrap_or(Type::Ref)

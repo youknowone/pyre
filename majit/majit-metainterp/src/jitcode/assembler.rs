@@ -133,6 +133,29 @@ impl JitCodeBuilder {
         self.num_regs_r
     }
 
+    /// Current num_regs_f. Callers that need the full per-kind register
+    /// ceiling (e.g. `SSAReprEmitter::finish_with`) read all three.
+    pub fn num_regs_f(&self) -> u16 {
+        self.num_regs_f
+    }
+
+    /// `assembler.py` parity: size of the int constant pool (used by
+    /// assemble-time bounds checks that allow constant virtual-register
+    /// indices `num_regs_i .. num_regs_i + num_consts_i()`).
+    pub fn num_consts_i(&self) -> u16 {
+        self.constants_i.len() as u16
+    }
+
+    /// Same as `num_consts_i` for the ref constant pool.
+    pub fn num_consts_r(&self) -> u16 {
+        self.constants_r.len() as u16
+    }
+
+    /// Same as `num_consts_i` for the float constant pool.
+    pub fn num_consts_f(&self) -> u16 {
+        self.constants_f.len() as u16
+    }
+
     pub fn load_const_i_value(&mut self, dst: u16, value: i64) {
         let const_idx = self.add_const_i(value);
         self.load_const_i(dst, const_idx);

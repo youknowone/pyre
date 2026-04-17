@@ -492,18 +492,11 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
 
     // RPython: blackhole_from_resumedata() → setposition + consume_one_section
     // For pyre, we compile Python bytecodes to JitCode and load frame state.
-    let writer = crate::jit::codewriter::CodeWriter::new(
-        bh_call_fn,
-        bh_load_global_fn,
-        bh_compare_fn,
-        bh_binary_op_fn,
-        bh_box_int_fn,
-        bh_truth_fn,
-        bh_load_const_fn,
-        bh_store_subscr_fn,
-        crate::call_jit::bh_build_list_fn,
-    );
-    let pyjitcode = crate::jit::codewriter::get_jitcode(code, frame.pycode, &writer, None);
+    // codewriter.py:20-23 parity: reuse the thread-local CodeWriter so the
+    // single shared Assembler keeps accumulating across jitcodes.
+    let pyjitcode = crate::jit::codewriter::with_codewriter(|writer| {
+        crate::jit::codewriter::get_jitcode(code, frame.pycode, writer, None)
+    });
 
     // Map Python PC → JitCode PC.
     // resume.py:928/1338 parity: rd_numb pc is consumed as-is. RPython does
@@ -786,18 +779,11 @@ pub fn resume_in_blackhole(
         return BlackholeResult::Failed;
     }
 
-    let writer = crate::jit::codewriter::CodeWriter::new(
-        bh_call_fn,
-        bh_load_global_fn,
-        bh_compare_fn,
-        bh_binary_op_fn,
-        bh_box_int_fn,
-        bh_truth_fn,
-        bh_load_const_fn,
-        bh_store_subscr_fn,
-        crate::call_jit::bh_build_list_fn,
-    );
-
+    // codewriter.py:20-23 parity: the CodeWriter-owned Assembler lives
+    // on the thread-local singleton so each `get_jitcode` call below
+    // shares the same accumulator. The `with_codewriter` closure wraps
+    // the per-section get_jitcode call at ~line 1074 on a best-effort
+    // basis since the rest of this function does not need the writer.
     thread_local! {
         static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
@@ -874,7 +860,9 @@ pub fn resume_in_blackhole(
         // call.py:148: jitcode via get_jitcode (jitdriver_sd set on portal).
         // virtualizable.py:126-137: code from resume data, not heap.
         let w_code = section.code;
-        let pyjitcode = crate::jit::codewriter::get_jitcode(code, w_code, &writer, None);
+        let pyjitcode = crate::jit::codewriter::with_codewriter(|writer| {
+            crate::jit::codewriter::get_jitcode(code, w_code, writer, None)
+        });
         let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
             pyjitcode.metadata.pc_map[py_pc]
         } else {
@@ -1529,20 +1517,9 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
     // to a pyre JitCode via CodeWriter.
-    let writer = crate::jit::codewriter::CodeWriter::new(
-        bh_call_fn,
-        bh_load_global_fn,
-        bh_compare_fn,
-        bh_binary_op_fn,
-        bh_box_int_fn,
-        bh_truth_fn,
-        bh_load_const_fn,
-        bh_store_subscr_fn,
-        crate::call_jit::bh_build_list_fn,
-    );
-    // resume.py:1339 jitcodes[jitcode_pos]:
-    // jitcode_index is a sequential index into MetaInterpStaticData.jitcodes.
-    // Resolve to CodeObject via code_for_jitcode_index, then compile jitcode.
+    // codewriter.py:20-23 parity: each resolve_jitcode invocation routes
+    // through `with_codewriter(...)` so the thread-local CodeWriter's
+    // single Assembler keeps accumulating.
     let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
             return None;
@@ -1559,7 +1536,9 @@ pub fn blackhole_resume_via_rd_numb(
             return None;
         }
         let code = unsafe { &*raw_code };
-        let pyjitcode = crate::jit::codewriter::get_jitcode(code, code_ptr, &writer, None);
+        let pyjitcode = crate::jit::codewriter::with_codewriter(|writer| {
+            crate::jit::codewriter::get_jitcode(code, code_ptr, writer, None)
+        });
         if pyjitcode.has_abort_opcode() {
             return None;
         }

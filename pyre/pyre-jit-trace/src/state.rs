@@ -198,6 +198,22 @@ impl MetaInterpStaticData {
         self.finish_setup_done = true;
     }
 
+    /// pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)` —
+    /// refreshes the staticdata mirror after each writer-side append.
+    pub(crate) fn set_liveness_info(&mut self, bytes: Vec<u8>) {
+        self.liveness_info = bytes;
+    }
+}
+
+/// Crate-local helper so sibling modules can refresh
+/// `MetaInterpStaticData.liveness_info` without leaking the private
+/// type through public API signatures.
+pub(crate) fn publish_liveness_info(bytes: Vec<u8>) {
+    METAINTERP_SD.with(|r| r.borrow_mut().set_liveness_info(bytes));
+}
+
+#[allow(dead_code)]
+impl MetaInterpStaticData {
     /// codewriter.py:68: get or create JitCode for a CodeObject.
     /// Returns a stable pointer (Box ensures no reallocation moves).
     fn jitcode_for(&mut self, code: *const ()) -> *const JitCode {
@@ -321,7 +337,7 @@ use std::cell::RefCell;
 
 thread_local! {
     /// warmspot.py:282: MetaInterp.staticdata (per-thread for no-GIL).
-    static METAINTERP_SD: RefCell<MetaInterpStaticData> =
+    pub(crate) static METAINTERP_SD: RefCell<MetaInterpStaticData> =
         RefCell::new(MetaInterpStaticData::new());
 }
 
@@ -4913,7 +4929,7 @@ mod tests {
                         expected_len_descr_idx: u32,
                         case_name: &str,
                         expect_box_alloc: bool| {
-            let mut ctx = TraceCtx::for_test(2);
+            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, symbolic_value_type]);
             let list = OpRef(0);
             let value = OpRef(1);
             let mut frame = Box::new(PyFrame::new(code.clone()));
