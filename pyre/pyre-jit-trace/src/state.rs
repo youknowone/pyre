@@ -4395,7 +4395,7 @@ mod tests {
             Value::Int(4),                            // valuestackdepth
             Value::Ref(GcRef(0)),                     // debugdata
             Value::Ref(GcRef(0)),                     // lastblock
-            Value::Ref(GcRef(0)),                     // namespace
+            Value::Ref(GcRef(0)),                     // w_globals
             Value::Ref(GcRef(w_int_new(1) as usize)), // local a
             Value::Ref(GcRef(w_int_new(2) as usize)), // local b
             Value::Ref(GcRef(w_int_new(3) as usize)), // local c
@@ -5047,10 +5047,14 @@ mod tests {
             .as_ref()
             .expect("branch guard should carry explicit fail args");
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        // fail_args: [frame, ni, code, vsd, debugdata, lastblock, ns, lower_stack, ...]
-        assert!(fail_args.len() >= 8);
+        // fail_args layout: [frame, {scalar header fields...}, stack slots...]
+        // Scalar header has NUM_SCALAR_INPUTARGS - 1 entries; total scalar
+        // count including frame is NUM_SCALAR_INPUTARGS. First box slot is
+        // at index NUM_SCALAR_INPUTARGS.
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        assert!(fail_args.len() >= n + 1);
         assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[7], lower_stack);
+        assert_eq!(fail_args[n], lower_stack);
     }
 
     #[test]
@@ -5187,12 +5191,16 @@ mod tests {
 
         let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
 
-        // fail_args: [frame, ni, code, vsd, debugdata, lastblock, ns, local0, stack0, stack1]
-        assert_eq!(fail_args.len(), 10);
+        // fail_args layout: [frame, {scalar header fields...}, locals..., stack...]
+        // virtualizable.py:86 read_boxes: all static fields in order.
+        // Scalar header = NUM_SCALAR_INPUTARGS - 1 (excludes frame) fields:
+        //   last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals.
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        assert_eq!(fail_args.len(), n + 3);
         assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[7], local0);
-        assert_eq!(fail_args[8], stack0);
-        assert_eq!(fail_args[9], stack1);
+        assert_eq!(fail_args[n], local0);
+        assert_eq!(fail_args[n + 1], stack0);
+        assert_eq!(fail_args[n + 2], stack1);
     }
 
     #[test]
