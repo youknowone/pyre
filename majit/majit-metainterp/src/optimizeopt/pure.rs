@@ -270,10 +270,6 @@ impl RecentPureOpTable {
         })
     }
 
-    fn clear(&mut self) {
-        *self = Self::new(self.history_length);
-    }
-
     fn history_length(&self) -> usize {
         self.history_length
     }
