@@ -5,5 +5,6 @@
 ///     └── Assembler386 (x86/assembler.py)
 pub mod arch;
 pub mod assembler;
+pub mod callbuilder;
 pub mod regalloc;
 pub mod reghint;

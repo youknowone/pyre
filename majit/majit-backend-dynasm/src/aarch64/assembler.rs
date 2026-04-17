@@ -29,35 +29,9 @@ use crate::jitframe::{
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;
 
-const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = [
-    crate::regloc::RegLoc::new(0, false),
-    crate::regloc::RegLoc::new(1, false),
-    crate::regloc::RegLoc::new(2, false),
-    crate::regloc::RegLoc::new(3, false),
-    crate::regloc::RegLoc::new(4, false),
-    crate::regloc::RegLoc::new(5, false),
-    crate::regloc::RegLoc::new(6, false),
-    crate::regloc::RegLoc::new(7, false),
-    crate::regloc::RegLoc::new(8, false),
-    crate::regloc::RegLoc::new(9, false),
-    crate::regloc::RegLoc::new(10, false),
-    crate::regloc::RegLoc::new(11, false),
-    crate::regloc::RegLoc::new(12, false),
-    crate::regloc::RegLoc::new(13, false),
-    crate::regloc::RegLoc::new(19, false),
-    crate::regloc::RegLoc::new(20, false),
-];
+const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = crate::aarch64::registers::ALL_REGS;
 
-const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
-    crate::regloc::RegLoc::new(0, true),
-    crate::regloc::RegLoc::new(1, true),
-    crate::regloc::RegLoc::new(2, true),
-    crate::regloc::RegLoc::new(3, true),
-    crate::regloc::RegLoc::new(4, true),
-    crate::regloc::RegLoc::new(5, true),
-    crate::regloc::RegLoc::new(6, true),
-    crate::regloc::RegLoc::new(7, true),
-];
+const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = crate::aarch64::registers::ALL_VFP_REGS;
 
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
 enum ResolvedArg {

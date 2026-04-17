@@ -6,6 +6,7 @@
 
 use crate::regalloc::LifetimeManager;
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
+use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
 use majit_ir::{Op, OpCode, OpRef, Type};
 use std::collections::HashMap;
 
@@ -13,69 +14,6 @@ use std::collections::HashMap;
 pub const SAVE_DEFAULT_REGS: u8 = 0;
 pub const SAVE_GCREF_REGS: u8 = 1;
 pub const SAVE_ALL_REGS: u8 = 2;
-
-/// x86/callbuilder.py:83 `CallBuilder64.ARGUMENTS_GPR` on Linux/macOS.
-const ARGUMENTS_GPR: &[RegLoc] = &[
-    RegLoc {
-        value: 7,
-        is_xmm: false,
-    }, // rdi
-    RegLoc {
-        value: 6,
-        is_xmm: false,
-    }, // rsi
-    RegLoc {
-        value: 2,
-        is_xmm: false,
-    }, // rdx
-    RegLoc {
-        value: 1,
-        is_xmm: false,
-    }, // rcx
-    RegLoc {
-        value: 8,
-        is_xmm: false,
-    }, // r8
-    RegLoc {
-        value: 9,
-        is_xmm: false,
-    }, // r9
-];
-
-const ARGUMENTS_XMM: &[RegLoc] = &[
-    RegLoc {
-        value: 0,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 1,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 2,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 3,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 4,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 5,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 6,
-        is_xmm: true,
-    },
-    RegLoc {
-        value: 7,
-        is_xmm: true,
-    },
-];
 
 /// reghint.py:29 X86RegisterHints.
 pub struct RegisterHints {

@@ -9,29 +9,13 @@
 //! and lifetime logic still lives in the shared base, just like
 //! upstream's RPython aarch64 inherits from llsupport.
 
+use crate::aarch64::registers;
 use crate::regloc::RegLoc;
 
 /// aarch64/registers.py:14
 ///   `all_regs = registers[:14] + [x19, x20] #, x21, x22]`
 pub fn all_core_regs() -> Vec<RegLoc> {
-    vec![
-        RegLoc::new(0, false),
-        RegLoc::new(1, false),
-        RegLoc::new(2, false),
-        RegLoc::new(3, false),
-        RegLoc::new(4, false),
-        RegLoc::new(5, false),
-        RegLoc::new(6, false),
-        RegLoc::new(7, false),
-        RegLoc::new(8, false),
-        RegLoc::new(9, false),
-        RegLoc::new(10, false),
-        RegLoc::new(11, false),
-        RegLoc::new(12, false),
-        RegLoc::new(13, false),
-        RegLoc::new(19, false),
-        RegLoc::new(20, false),
-    ]
+    registers::ALL_REGS.to_vec()
 }
 
 /// aarch64/registers.py:43
@@ -41,43 +25,19 @@ pub fn all_core_regs() -> Vec<RegLoc> {
 /// subset (x0..x13) — the regs whose contents must be assumed
 /// clobbered after a `bl`.  Mirrored verbatim here.
 pub fn save_around_call_core_regs() -> Vec<RegLoc> {
-    vec![
-        RegLoc::new(0, false),
-        RegLoc::new(1, false),
-        RegLoc::new(2, false),
-        RegLoc::new(3, false),
-        RegLoc::new(4, false),
-        RegLoc::new(5, false),
-        RegLoc::new(6, false),
-        RegLoc::new(7, false),
-        RegLoc::new(8, false),
-        RegLoc::new(9, false),
-        RegLoc::new(10, false),
-        RegLoc::new(11, false),
-        RegLoc::new(12, false),
-        RegLoc::new(13, false),
-    ]
+    registers::CALLER_RESP.to_vec()
 }
 
 /// aarch64/registers.py: `all_vfp_regs = vfpregisters[:8]`.  Pyre's
 /// VFP allocator pool stays at the upstream cap of 8 (d0..d7).
 pub fn all_float_regs() -> Vec<RegLoc> {
-    vec![
-        RegLoc::new(0, true),
-        RegLoc::new(1, true),
-        RegLoc::new(2, true),
-        RegLoc::new(3, true),
-        RegLoc::new(4, true),
-        RegLoc::new(5, true),
-        RegLoc::new(6, true),
-        RegLoc::new(7, true),
-    ]
+    registers::ALL_VFP_REGS.to_vec()
 }
 
 /// aarch64/registers.py:18 `fp = x29`.  RPython's frame-pointer
 /// register on AAPCS64.
 pub fn frame_reg() -> RegLoc {
-    RegLoc::new(29, false)
+    registers::FP
 }
 
 /// aarch64/locations.py: `call_result_location` returns x0 for GPR
@@ -104,14 +64,6 @@ pub fn core_reg_index(reg: RegLoc) -> Option<usize> {
         _ => None,
     }
 }
-
-/// aarch64/registers.py:21 `ip1 = x17` — scratch register reserved for
-/// large-immediate stitching (movz/movk sequences).  Available to the
-/// shared regalloc base as a tmp slot via the per-arch re-export.
-pub const IP1: RegLoc = RegLoc {
-    value: 17,
-    is_xmm: false,
-};
 
 /// aarch64/regalloc.py:962 nursery-bump path clobbers `[r.x0, r.x1]`.
 /// Exported as a per-arch pair so the shared regalloc base can spill

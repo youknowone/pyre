@@ -37,8 +37,13 @@ fn check_imm_arg(arg: i64) -> bool {
     arg >= 0 && arg < DEFAULT_IMM_SIZE
 }
 
-// IP1 — scratch register for large immediates (aarch64 r.ip1 = x17,
-// x86_64 reservation in arch_regalloc::IP1).  Re-exported from per-arch.
+// Large-immediate scratch register:
+//   aarch64 → registers.ip1 (`aarch64/registers.py`)
+//   x86_64  → regloc.X86_64_SCRATCH_REG (`x86/regloc.py`)
+#[cfg(target_arch = "aarch64")]
+use crate::aarch64::registers::IP1 as LARGE_IMM_SCRATCH;
+#[cfg(target_arch = "x86_64")]
+use crate::regloc::X86_64_SCRATCH_REG as LARGE_IMM_SCRATCH;
 
 // ── Lifetime ───────────────────────────────────────────────────────
 
@@ -700,8 +705,8 @@ use crate::aarch64::regalloc as arch_regalloc;
 use crate::x86::regalloc as arch_regalloc;
 
 use arch_regalloc::{
-    IP1, MALLOC_NURSERY_CLOBBER, MALLOC_NURSERY_RESULT, all_core_regs, all_float_regs,
-    call_result_fpr, call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
+    MALLOC_NURSERY_CLOBBER, MALLOC_NURSERY_RESULT, all_core_regs, all_float_regs, call_result_fpr,
+    call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
 };
 
 // Per-arch reghint pass.  Upstream RPython ships reghint only under
@@ -2903,8 +2908,8 @@ impl RegAlloc {
             Loc::Immed(ImmedLoc::new(ofs))
         } else {
             self.pending_moves
-                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(IP1)));
-            Loc::Reg(IP1)
+                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(LARGE_IMM_SCRATCH)));
+            Loc::Reg(LARGE_IMM_SCRATCH)
         };
         // aarch64/regalloc.py:536: nsize = op.getarg(2).getint()
         let nsize = if op.args.len() > 2 {
@@ -3024,8 +3029,8 @@ impl RegAlloc {
         } else {
             // aarch64/regalloc.py:529-530: ofs_loc = r.ip1; self.assembler.load(ofs_loc, imm(ofs))
             self.pending_moves
-                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(IP1)));
-            Loc::Reg(IP1)
+                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(LARGE_IMM_SCRATCH)));
+            Loc::Reg(LARGE_IMM_SCRATCH)
         };
         // aarch64/regalloc.py:531: return [value_loc, base_loc, ofs_loc, imm(size)]
         self.perform_discard(

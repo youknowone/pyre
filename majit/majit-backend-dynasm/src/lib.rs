@@ -9,6 +9,7 @@
 ///   x86/assembler.py        → x86/assembler.rs (Assembler386)
 ///   aarch64/assembler.py    → aarch64/assembler.rs (AssemblerARM64)
 ///   aarch64/opassembler.py  → aarch64/opassembler.rs (ResOpAssembler)
+///   aarch64/registers.py    → aarch64/registers.rs
 ///
 /// arch.rs, codebuf.rs, guard.rs, regloc.rs are from llsupport/.
 // ── Shared modules (llsupport/ parity) ──
