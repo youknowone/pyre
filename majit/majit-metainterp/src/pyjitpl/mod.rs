@@ -8289,22 +8289,34 @@ impl<M: Clone> MetaInterp<M> {
     /// line-for-line identical to `pyjitpl.py:2178-2186`.
     ///
     /// Returns:
-    /// - `Err(ChangeFrame)` when the funcaddr resolved to an
-    ///   indirect-call target and `perform_call` raised `ChangeFrame`
-    ///   (control transfers into the inlined callee — no return value).
-    /// - `Ok(Some(box))` / `Ok(None)` when the call was emitted as a
-    ///   residual `CALL_*` IR op (caller continues with the residual
-    ///   return value).
+    /// - `Err(DoResidualCallAbort::ChangeFrame)` when the funcbox is a
+    ///   Const whose address resolves to an indirect-call target and
+    ///   `perform_call` raised `ChangeFrame` (control transfers into
+    ///   the inlined callee — no return value).
+    /// - `Err(DoResidualCallAbort::AbortEscape)` when `do_residual_call`
+    ///   bubbles up an `OS_NOT_IN_TRACE` blackhole switch.
+    /// - `Ok(Some((box, concrete)))` / `Ok(None)` when the call was
+    ///   emitted as a residual `CALL_*` IR op (caller continues with
+    ///   the residual return value).
+    ///
+    /// Signature matches RPython: `funcbox` is a typed triple (same
+    /// shape as `argboxes`), `descr_ref + descr_view` replace
+    /// RPython's `calldescr` argument (both handle and view are
+    /// needed because Rust cannot pass a trait object through an
+    /// `Arc<dyn Descr>` transparently).
     pub fn do_residual_or_indirect_call(
         &mut self,
-        funcbox_addr: Option<usize>,
+        funcbox: (crate::jitcode::JitArgKind, OpRef, i64),
         argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        calldescr: u64,
+        descr_ref: majit_ir::DescrRef,
+        descr_view: &dyn majit_ir::descr::CallDescr,
         pc: usize,
-    ) -> Result<Option<OpRef>, ChangeFrame> {
+    ) -> Result<Option<(OpRef, i64)>, DoResidualCallAbort> {
         // pyjitpl.py:2178: if isinstance(funcbox, Const):
-        if let Some(key) = funcbox_addr {
+        if funcbox.1.is_constant() {
             // pyjitpl.py:2179: sd = self.metainterp.staticdata
+            // pyjitpl.py:2180: key = funcbox.getaddr()
+            let key = funcbox.2 as usize;
             // pyjitpl.py:2181: jitcode = sd.bytecode_for_address(key)
             if let Some(jitcode) = self.staticdata.bytecode_for_address(key) {
                 // pyjitpl.py:2184: return self.metainterp.perform_call(jitcode, argboxes)
@@ -8313,43 +8325,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // pyjitpl.py:2186: return self.do_residual_call(funcbox, argboxes, calldescr, pc)
-        Ok(self.do_residual_call(funcbox_addr, argboxes, calldescr, pc))
-    }
-
-    /// pyjitpl.py:1995-2073 `MIFrame.do_residual_call`.
-    ///
-    /// **Stub.**  Returns `None` (no IR op emitted, caller continues
-    /// with the path it already takes).  The full upstream body is
-    /// not ported yet; the missing pieces are:
-    ///
-    /// 1. EffectInfo lookup off the calldescr to choose between
-    ///    `CALL_*`, `CALL_MAY_FORCE_*`, `CALL_LOOPINVARIANT_*`,
-    ///    `CALL_RELEASE_GIL_*`, `CALL_PURE_*` (pyjitpl.py:2003-2030).
-    /// 2. Heap-cache invalidation per EffectInfo
-    ///    (`heapcache.invalidate_caches_for_*` per pyjitpl.py:2031).
-    /// 3. Force-virtualizable / force-virtual handling
-    ///    (pyjitpl.py:2034-2050).
-    /// 4. `GUARD_NO_EXCEPTION` / `GUARD_NOT_FORCED` emission
-    ///    (pyjitpl.py:2052-2065).
-    /// 5. `assembler_call` / `assembler_call_jd` plumbing for
-    ///    `CALL_ASSEMBLER_*` (pyjitpl.py:2067-2073).
-    ///
-    /// Pyre's tracer (`trace_opcode.rs::call_callable_value`) still
-    /// owns the residual-call emission while these branches remain
-    /// unported; once the full body lands the tracer will delegate
-    /// here per Phase 10A of the porting plan.
-    pub fn do_residual_call(
-        &mut self,
-        _funcbox_addr: Option<usize>,
-        _argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        _calldescr: u64,
-        _pc: usize,
-    ) -> Option<OpRef> {
-        // Legacy wrapper.  Delegates to do_residual_call_full once the
-        // caller passes the typed funcbox + DescrRef + CallDescr view.
-        // Until do_residual_or_indirect_call grows the matching
-        // signature this entry preserves the pre-port stub return.
-        None
+        self.do_residual_call_full(funcbox, argboxes, descr_ref, descr_view, pc, false, None)
     }
 
     /// pyjitpl.py:1278-1321 `MIFrame._try_tco()`.
@@ -9788,29 +9764,41 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn do_residual_or_indirect_call_falls_through_when_no_jitcode() {
-        // pyjitpl.py:2174-2186 — when bytecode_for_address misses, the
-        // method returns Ok(self.do_residual_call(...)) instead of
-        // raising ChangeFrame.  Until pyre populates indirectcalltargets
-        // every call should land in the residual path.
-        let mut meta = MetaInterp::<()>::new(0);
-        let result = meta.do_residual_or_indirect_call(Some(0xdeadbeef), &[], 0, 0);
-        // Empty staticdata + stub do_residual_call → Ok(None).
-        assert!(matches!(result, Ok(None)));
-    }
-
-    #[test]
     fn do_residual_or_indirect_call_invokes_perform_call_on_hit() {
-        // After registering an indirect-call target, the method must
-        // route into perform_call (which raises ChangeFrame) instead of
-        // falling through to do_residual_call.
+        // pyjitpl.py:2174-2186 — hit path: after registering an indirect-call
+        // target, the method routes into perform_call (which raises
+        // ChangeFrame) instead of falling through to do_residual_call.
+        //
+        // Uses a typed Const funcbox whose concrete address equals the
+        // registered fnaddr so `bytecode_for_address(funcbox.getaddr())`
+        // returns Some(jitcode).
+        use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.staticdata
             .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(0xdeadbeef)]);
-        let result = meta.do_residual_or_indirect_call(Some(0xdeadbeef), &[], 0, 0);
-        // Hit path raises ChangeFrame.
-        assert!(matches!(result, Err(ChangeFrame)));
+        let funcbox: (JitArgKind, OpRef, i64) = (
+            JitArgKind::Ref,
+            // Const OpRef — `funcbox.1.is_constant()` must return true so
+            // the gate lookup runs; the concrete address lives in `.2`.
+            OpRef::from_const(0),
+            0xdeadbeef,
+        );
+        let effect = majit_ir::EffectInfo::default();
+        let descr_ref = majit_ir::descr::make_call_descr(vec![], majit_ir::Type::Void, effect);
+        let descr_view: &dyn majit_ir::descr::CallDescr = descr_ref
+            .as_call_descr()
+            .expect("SimpleCallDescr implements CallDescr");
+        let result =
+            meta.do_residual_or_indirect_call(funcbox, &[], descr_ref.clone(), descr_view, 0);
+        // Hit path raises ChangeFrame (wrapped as DoResidualCallAbort).
+        assert!(matches!(result, Err(DoResidualCallAbort::ChangeFrame)));
     }
+
+    // pyjitpl.py:2186 miss path (`self.do_residual_call(...)`) is covered by
+    // `do_residual_call_full`'s own tests — they exercise every branch
+    // (OS_NOT_IN_TRACE, force_virtual_or_virtualizable, CALL_MAY_FORCE,
+    // libffi, release_gil, regular CALL_*).  A miss-path unit test here
+    // would duplicate that fixture setup without adding coverage.
 
     #[test]
     fn finishframe_returns_ok_when_framestack_exhausted() {

@@ -7,7 +7,8 @@
 //! textual `SSARepr` opnames into `JitCodeBuilder` calls instead of growing
 //! `self.insns` into a runtime opcode table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use majit_codewriter::jitcode::BhDescr;
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
@@ -27,7 +28,9 @@ pub struct NumRegs {
 ///
 /// The persistent state kept across multiple `assemble()` calls matches the
 /// RPython fields that are semantically shared across jitcodes: the deduped
-/// `all_liveness` table and liveness statistics.
+/// `all_liveness` table, liveness statistics, and the `indirectcalltargets`
+/// set accumulated from every `IndirectCallTargets` operand emitted by the
+/// codewriter's `handle_regular_indirect_call` pass.
 #[derive(Debug, Default)]
 pub struct Assembler {
     /// `assembler.py:29` `self.all_liveness = []`.
@@ -38,6 +41,42 @@ pub struct Assembler {
     all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), usize>,
     /// `assembler.py:32` `self.num_liveness_ops = 0`.
     pub num_liveness_ops: usize,
+    /// `assembler.py:24` `self.indirectcalltargets = set()    # set of JitCodes`.
+    /// Accumulated across every `assemble()` call; `pyjitpl.py:2262`
+    /// `self.setup_indirectcalltargets(asm.indirectcalltargets)` pipes
+    /// this set to `MetaInterpStaticData.setup_indirectcalltargets`.
+    pub indirectcalltargets: HashSet<ArcByPtr>,
+}
+
+/// Identity-keyed wrapper around `Arc<JitCode>` so `HashSet<ArcByPtr>`
+/// matches RPython's `set of JitCodes` (Python set dedupes by object
+/// identity, not value equality).  Used as the element type of
+/// `Assembler::indirectcalltargets`.
+#[derive(Debug, Clone)]
+pub struct ArcByPtr(pub Arc<JitCode>);
+
+impl ArcByPtr {
+    pub fn new(jc: Arc<JitCode>) -> Self {
+        Self(jc)
+    }
+
+    pub fn into_inner(self) -> Arc<JitCode> {
+        self.0
+    }
+}
+
+impl PartialEq for ArcByPtr {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArcByPtr {}
+
+impl std::hash::Hash for ArcByPtr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0) as *const () as usize).hash(state);
+    }
 }
 
 /// Builder-local state created by `setup()` for one `assemble()` call.
@@ -86,6 +125,18 @@ impl Assembler {
 
     pub fn all_liveness(&self) -> &[u8] {
         &self.all_liveness
+    }
+
+    /// Return the accumulated indirect-call target set as a deduped
+    /// `Vec<Arc<JitCode>>`.  Matches the shape expected by
+    /// `MetaInterpStaticData::setup_indirectcalltargets` which pipes
+    /// `asm.indirectcalltargets` into the staticdata per
+    /// `pyjitpl.py:2262`.
+    pub fn indirectcalltargets_vec(&self) -> Vec<Arc<JitCode>> {
+        self.indirectcalltargets
+            .iter()
+            .map(|a| a.0.clone())
+            .collect()
     }
 
     /// `assembler.py:34-54` `assemble(self, ssarepr, jitcode=None, num_regs=None)`.
@@ -154,6 +205,24 @@ impl Assembler {
                 args,
                 result,
             } => {
+                // `assembler.py:208-209`:
+                //   elif isinstance(x, IndirectCallTargets):
+                //       self.indirectcalltargets.update(x.lst)
+                //
+                // RPython's `write_insn` iterates every operand and dispatches
+                // by Python type.  pyre's `dispatch_op` is keyed on `opname`
+                // (PRE-EXISTING-ADAPTATION — see below), so operand iteration
+                // is split: `IndirectCallTargets` is collected here before the
+                // opcode-specific lowering runs.  The operand is purely
+                // metadata for the call — it is not written into the jitcode
+                // byte stream (RPython emits nothing for this branch either).
+                for arg in args {
+                    if let Operand::IndirectCallTargets(targets) = arg {
+                        for jc in &targets.lst {
+                            self.indirectcalltargets.insert(ArcByPtr::new(jc.clone()));
+                        }
+                    }
+                }
                 // `assembler.py:197-206` registers descrs inline during op
                 // encoding, guarded by `self._descr_dict`. The previous
                 // pre-scan violated parity by interning every
@@ -926,4 +995,86 @@ mod tests {
     // `record_descr_operand` is invoked during its encoding and that
     // `SwitchDictDescr._labels` → `BhDescr::Switch.dict` round-trips via
     // `fix_labels()`.
+
+    /// `assembler.py:208-209` parity:
+    /// ```python
+    /// elif isinstance(x, IndirectCallTargets):
+    ///     self.indirectcalltargets.update(x.lst)
+    /// ```
+    /// An `Operand::IndirectCallTargets(...)` attached to any op must be
+    /// folded into `self.indirectcalltargets` with identity-dedup (RPython
+    /// uses a Python `set` which dedupes by object identity, not value).
+    fn make_test_jitcode(fnaddr: usize) -> Arc<JitCode> {
+        let mut jc = JitCodeBuilder::default().finish();
+        jc.fnaddr = fnaddr as i64;
+        Arc::new(jc)
+    }
+
+    #[test]
+    fn assemble_collects_indirectcalltargets_from_ops() {
+        use super::super::flatten::IndirectCallTargets;
+
+        let jc_a = make_test_jitcode(0x1000);
+        let jc_b = make_test_jitcode(0x2000);
+
+        let mut ssarepr = SSARepr::new("indirect");
+        // `abort_permanent` is a zero-descr op in pyre's dispatch table, so
+        // it tolerates the attached `IndirectCallTargets` operand without
+        // needing a live dispatch arm.  The parity-relevant behaviour —
+        // `write_insn` scanning the arg list and updating
+        // `self.indirectcalltargets` — does not depend on the op kind.
+        ssarepr.insns.push(Insn::op(
+            "abort_permanent",
+            vec![Operand::IndirectCallTargets(IndirectCallTargets {
+                lst: vec![jc_a.clone(), jc_b.clone(), jc_a.clone()],
+            })],
+        ));
+
+        let mut assembler = Assembler::new();
+        assembler.assemble(&mut ssarepr, JitCodeBuilder::default(), None);
+
+        // Identity-dedup: jc_a appears twice in the list, but the set keeps
+        // a single entry (Python `set.update` on JitCode identity).
+        assert_eq!(assembler.indirectcalltargets.len(), 2);
+        let vec = assembler.indirectcalltargets_vec();
+        assert_eq!(vec.len(), 2);
+        assert!(vec.iter().any(|a| Arc::ptr_eq(a, &jc_a)));
+        assert!(vec.iter().any(|a| Arc::ptr_eq(a, &jc_b)));
+    }
+
+    #[test]
+    fn assemble_accumulates_indirectcalltargets_across_ops() {
+        use super::super::flatten::IndirectCallTargets;
+
+        let jc_a = make_test_jitcode(0x1000);
+        let jc_b = make_test_jitcode(0x2000);
+        let jc_c = make_test_jitcode(0x3000);
+
+        let mut assembler = Assembler::new();
+
+        // First assemble() registers jc_a and jc_b.
+        let mut r1 = SSARepr::new("first");
+        r1.insns.push(Insn::op(
+            "abort_permanent",
+            vec![Operand::IndirectCallTargets(IndirectCallTargets {
+                lst: vec![jc_a.clone(), jc_b.clone()],
+            })],
+        ));
+        assembler.assemble(&mut r1, JitCodeBuilder::default(), None);
+
+        // Second assemble() registers jc_b (already present) and jc_c.
+        let mut r2 = SSARepr::new("second");
+        r2.insns.push(Insn::op(
+            "abort_permanent",
+            vec![Operand::IndirectCallTargets(IndirectCallTargets {
+                lst: vec![jc_b.clone(), jc_c.clone()],
+            })],
+        ));
+        assembler.assemble(&mut r2, JitCodeBuilder::default(), None);
+
+        // `assembler.py:24` persists `indirectcalltargets` across every
+        // `assemble()` call — the CodeWriter holds a single Assembler and
+        // the set accumulates for the whole build (codewriter.py:19-22).
+        assert_eq!(assembler.indirectcalltargets.len(), 3);
+    }
 }

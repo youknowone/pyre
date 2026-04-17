@@ -202,12 +202,14 @@ impl ListOfKind {
 ///         self.lst = lst       # list of JitCodes
 /// ```
 ///
-/// The list carries `JitCode` references for the `indirect_call` opcode.
-/// pyre does not currently emit `indirect_call` against user Python
-/// functions, so this type is unused but kept for structural parity.
+/// The list carries `JitCode` references (RPython `list of JitCodes`, in
+/// which each entry is a Python-object reference shared with other call
+/// sites and with the assembler's `indirectcalltargets` set).  pyre's
+/// parity representation is `Vec<Arc<JitCode>>` — `Arc` provides the
+/// shared-reference semantics of a Python object reference.
 #[derive(Debug, Clone, Default)]
 pub struct IndirectCallTargets {
-    pub lst: Vec<majit_metainterp::jitcode::JitCode>,
+    pub lst: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
 }
 
 /// `rpython/jit/codewriter/jitcode.py:131-143` `class SwitchDictDescr`

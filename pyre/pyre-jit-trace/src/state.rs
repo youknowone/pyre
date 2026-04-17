@@ -79,6 +79,17 @@ impl JitCode {
 /// pyre: per-thread equivalent (no-GIL runtime). Indices assigned
 /// lazily at trace-time (no codewriter phase). Portal gets 0,
 /// inline callees get 1, 2, ….
+///
+/// PRE-EXISTING-ADAPTATION: the RPython-orthodox
+/// `MetaInterpStaticData` lives in
+/// `majit_metainterp::pyjitpl::MetaInterpStaticData`.  pyre embeds it
+/// as the `canonical` field below and delegates every RPython method
+/// (`setup_indirectcalltargets`, `bytecode_for_address`, …) through
+/// it, so there is exactly one port of each of those methods.  The
+/// pyre-local fields (`by_code`, `jitcodes`, `finish_setup_done`,
+/// `op_*`, `liveness_info`) stay here because pyre's lazy-compilation
+/// model has no RPython equivalent for them; they are a minimal pyre
+/// adaptation layer on top of the canonical staticdata.
 struct MetaInterpStaticData {
     /// codewriter.py:80: CodeObject* → index into jitcodes vec.
     by_code: std::collections::HashMap<usize, usize>,
@@ -117,6 +128,16 @@ struct MetaInterpStaticData {
     op_float_return: u8,
     /// pyjitpl.py:2243 `self.op_void_return = insns.get('void_return/', -1)`.
     op_void_return: u8,
+
+    /// pyjitpl.py:2190 `class MetaInterpStaticData` — the canonical,
+    /// RPython-orthodox port.  Owns `indirectcalltargets`,
+    /// `globaldata.indirectcall_dict`, and every RPython staticdata
+    /// method (`setup_indirectcalltargets`, `bytecode_for_address`,
+    /// `setup_descrs`, `setup_list_of_addr2name`, …).  Reached from
+    /// pyre's module-level wrappers (`state::setup_indirectcalltargets`,
+    /// `state::bytecode_for_address`) and from future callers that
+    /// hold a `&mut MetaInterpStaticData` directly.
+    canonical: majit_metainterp::MetaInterpStaticData,
 }
 
 impl MetaInterpStaticData {
@@ -134,9 +155,33 @@ impl MetaInterpStaticData {
             op_ref_return: u8::MAX,
             op_float_return: u8::MAX,
             op_void_return: u8::MAX,
+            canonical: majit_metainterp::MetaInterpStaticData::new(),
         }
     }
 
+    /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
+    /// Thin delegate to the canonical port; exists solely so callers
+    /// that hold `&mut state::MetaInterpStaticData` can reach the
+    /// method without constructing a reference to the canonical
+    /// field themselves.
+    fn setup_indirectcalltargets(
+        &mut self,
+        targets: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
+    ) {
+        self.canonical.setup_indirectcalltargets(targets);
+    }
+
+    /// pyjitpl.py:2326-2343 `bytecode_for_address(fnaddress)`.
+    /// Thin delegate to the canonical port.
+    fn bytecode_for_address(
+        &mut self,
+        fnaddress: usize,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        self.canonical.bytecode_for_address(fnaddress)
+    }
+}
+
+impl MetaInterpStaticData {
     /// pyjitpl.py:2227-2243 `MetaInterpStaticData.setup_insns(self, insns)`:
     /// copy opcode numbers for the well-known bytecodes out of the
     /// assembler's `insns` dict in the same order as upstream.
@@ -250,6 +295,35 @@ pub fn liveness_info_snapshot() -> Vec<u8> {
 pub fn op_live() -> u8 {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| r.borrow().op_live)
+}
+
+/// pyjitpl.py:2248-2249 module-level entry point for
+/// `MetaInterpStaticData::setup_indirectcalltargets`.
+///
+/// RPython sets this at `pyjitpl.py:2262` during
+/// `finish_setup(codewriter, optimizer)` by piping
+/// `codewriter.assembler.indirectcalltargets` straight through.  pyre's
+/// codewriter driver calls this after every `Assembler::assemble`
+/// session so the staticdata reflects the assembler's latest target
+/// set.  Matching shape: `Vec<Arc<JitCode>>` comes from
+/// `Assembler::indirectcalltargets_vec` in `pyre-jit`.
+pub fn setup_indirectcalltargets(targets: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>) {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| r.borrow_mut().setup_indirectcalltargets(targets));
+}
+
+/// pyjitpl.py:2326-2343 module-level entry point for
+/// `MetaInterpStaticData::bytecode_for_address`.
+///
+/// RPython calls this from `MIFrame.do_residual_or_indirect_call`
+/// (`pyjitpl.py:2174-2186`) to check whether a `funcbox.getaddr()`
+/// Const corresponds to a known indirect-call target.  pyre's tracer
+/// consumer will route through here once Step 3 lands.
+pub fn bytecode_for_address(
+    fnaddress: usize,
+) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| r.borrow_mut().bytecode_for_address(fnaddress))
 }
 
 use std::cell::RefCell;
@@ -5696,5 +5770,67 @@ pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -
     } else {
         // Large ints are always stored as raw i64 in int strategy.
         true
+    }
+}
+
+#[cfg(test)]
+mod indirectcalltargets_tests {
+    //! Line-by-line parity tests for `pyjitpl.py:2248-2249` and
+    //! `pyjitpl.py:2326-2343`.  Tests exercise the local
+    //! `MetaInterpStaticData` methods directly — independent of the
+    //! thread-local `METAINTERP_SD` singleton so concurrent callers
+    //! (and unrelated tests that use the thread-local) do not alias.
+    use super::MetaInterpStaticData;
+    use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
+    use std::sync::Arc;
+
+    fn make_jitcode_with_fnaddr(fnaddr: usize) -> Arc<JitCode> {
+        let mut jc = JitCodeBuilder::default().finish();
+        jc.fnaddr = fnaddr as i64;
+        Arc::new(jc)
+    }
+
+    /// Freshly-constructed staticdata has no indirect-call targets.
+    /// Delegates through `canonical`; matches the behaviour of
+    /// `majit_metainterp::MetaInterpStaticData::new()` where the
+    /// `MetaInterpGlobalData` inside starts with every lazy cache
+    /// (`indirectcall_dict`, `addr2name`) set to `None`.
+    #[test]
+    fn bytecode_for_address_none_when_empty() {
+        let mut sd = MetaInterpStaticData::new();
+        assert!(sd.bytecode_for_address(0xdeadbeef).is_none());
+    }
+
+    /// `pyjitpl.py:2326-2343` hit path: registered fnaddrs resolve to
+    /// their JitCode.
+    #[test]
+    fn bytecode_for_address_returns_jitcode_when_registered() {
+        let mut sd = MetaInterpStaticData::new();
+        let j100 = make_jitcode_with_fnaddr(0x100);
+        let j200 = make_jitcode_with_fnaddr(0x200);
+        let j300 = make_jitcode_with_fnaddr(0x300);
+        sd.setup_indirectcalltargets(vec![j100.clone(), j200.clone(), j300.clone()]);
+
+        assert!(Arc::ptr_eq(&sd.bytecode_for_address(0x100).unwrap(), &j100));
+        assert!(Arc::ptr_eq(&sd.bytecode_for_address(0x200).unwrap(), &j200));
+        assert!(Arc::ptr_eq(&sd.bytecode_for_address(0x300).unwrap(), &j300));
+        assert!(sd.bytecode_for_address(0x400).is_none());
+    }
+
+    /// `pyjitpl.py:2248-2249` `setup_indirectcalltargets` parity:
+    /// every call replaces the targets list and invalidates the lazy
+    /// dict so the next lookup rebuilds from the new list.
+    #[test]
+    fn setup_indirectcalltargets_invalidates_cache() {
+        let mut sd = MetaInterpStaticData::new();
+        sd.setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(0x100)]);
+        assert!(sd.bytecode_for_address(0x100).is_some());
+        sd.setup_indirectcalltargets(vec![
+            make_jitcode_with_fnaddr(0x200),
+            make_jitcode_with_fnaddr(0x300),
+        ]);
+        assert!(sd.bytecode_for_address(0x100).is_none());
+        assert!(sd.bytecode_for_address(0x200).is_some());
+        assert!(sd.bytecode_for_address(0x300).is_some());
     }
 }

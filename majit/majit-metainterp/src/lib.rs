@@ -62,8 +62,8 @@ pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, ClosureRuntime, CompileOutcome,
     CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts,
     DetailedDriverRunOutcome, DriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
-    JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, RawCompileResult,
-    StandaloneFrameStack, trace_jitcode,
+    JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
+    MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, trace_jitcode,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::{MergePoint, TraceCtx};
