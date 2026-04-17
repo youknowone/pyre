@@ -69,8 +69,9 @@ impl CodeWriter {
 
         // Step 0: annotate + rtype (majit-specific)
         // RPython: types are already on Variable.concretetype from the rtyper.
-        let annotations = crate::translator::annotator::annrpython::annotate(graph);
-        let type_state = crate::translator::rtyper::rtyper::resolve_types(graph, &annotations);
+        let annotations = crate::translator_legacy::annotator::annrpython::annotate(graph);
+        let type_state =
+            crate::translator_legacy::rtyper::rtyper::resolve_types(graph, &annotations);
 
         // Step 1: jtransform (codewriter.py:42)
         // RPython: transform_graph(graph, cpu, callcontrol, portal_jd)
@@ -84,7 +85,7 @@ impl CodeWriter {
 
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
-        let value_kinds = crate::translator::rtyper::rtyper::build_value_kinds(&type_state);
+        let value_kinds = crate::translator_legacy::rtyper::rtyper::build_value_kinds(&type_state);
         let regallocs =
             crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
 

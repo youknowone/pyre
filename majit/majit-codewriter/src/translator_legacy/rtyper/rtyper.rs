@@ -1,6 +1,10 @@
 //! Type resolution pass.
 //!
-//! RPython equivalent: `rtyper/rtyper.py` RPythonTyper.
+//! **LEGACY.** Flat `ConcreteType` enum with ad-hoc lowering.
+//! Line-by-line port of `rtyper/rtyper.py:RPythonTyper` +
+//! `rtyper/rmodel.py:Repr` hierarchy is landing at
+//! `majit-rtyper/src/{rtyper,rmodel}.rs` (roadmap Phase 6). This file
+//! is deleted at roadmap commit P8.11.
 //!
 //! Transforms annotated ValueTypes into concrete low-level types
 //! and specializes operations accordingly.
@@ -8,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
-use crate::translator::annotator::annrpython::AnnotationState;
+use crate::translator_legacy::annotator::annrpython::AnnotationState;
 
 /// Concrete low-level type (RPython Repr.lowleveltype).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +192,7 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
 mod tests {
     use super::*;
     use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
-    use crate::translator::annotator::annrpython as annotate;
+    use crate::translator_legacy::annotator::annrpython as annotate;
 
     #[test]
     fn resolves_int_types() {

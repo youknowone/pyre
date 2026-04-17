@@ -237,10 +237,10 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
 /// Like `flatten()` but populates `value_kinds` from the TypeResolutionState.
 pub fn flatten_with_types(
     graph: &FunctionGraph,
-    types: &crate::translator::rtyper::rtyper::TypeResolutionState,
+    types: &crate::translator_legacy::rtyper::rtyper::TypeResolutionState,
 ) -> SSARepr {
     let mut result = flatten(graph);
-    result.value_kinds = crate::translator::rtyper::rtyper::build_value_kinds(types);
+    result.value_kinds = crate::translator_legacy::rtyper::rtyper::build_value_kinds(types);
     result
 }
 

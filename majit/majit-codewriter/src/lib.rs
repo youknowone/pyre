@@ -31,7 +31,13 @@ pub mod regalloc;
 pub mod support;
 #[cfg(test)]
 mod test_support;
-pub mod translator;
+// Phase 0 P1 (roadmap: line-by-line port of rpython/{flowspace,annotator,rtyper}):
+// `translator/` renamed to `translator_legacy/` because this tree is the
+// pre-roadmap ad-hoc majit implementation, not a line-by-line port of
+// `rpython/translator/`. The identifier `translator` is reserved for that
+// future port; legacy consumers must spell `translator_legacy::…`
+// explicitly. The legacy tree is deleted at roadmap commit P8.11.
+pub mod translator_legacy;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
 pub use flatten::{FlatOp, Label, RegKind, SSARepr, flatten, flatten_with_types};
@@ -51,16 +57,18 @@ pub use model::{
 pub use parse::{
     CallPath, OpcodeDispatchSelector, ParsedInterpreter, find_opcode_dispatch_match, parse_source,
 };
-pub use translator::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
-pub use translator::pipeline::{
+pub use translator_legacy::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
+pub use translator_legacy::pipeline::{
     PipelineConfig, PipelineOpcodeArm, PipelineResult, PortalSpec, ProgramPipelineResult,
     analyze_function, analyze_program,
 };
-pub use translator::rtyper::rtyper::{ConcreteType, TypeResolutionState, resolve_types};
+pub use translator_legacy::rtyper::rtyper::{ConcreteType, TypeResolutionState, resolve_types};
 
 use serde::{Deserialize, Serialize};
 
-use crate::translator::{annotator::annrpython as annotate, pipeline, rtyper::rtyper as rtype};
+use crate::translator_legacy::{
+    annotator::annrpython as annotate, pipeline, rtyper::rtyper as rtype,
+};
 
 /// Configuration for the canonical graph/pipeline analyzer.
 ///

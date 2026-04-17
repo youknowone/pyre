@@ -1,6 +1,14 @@
 //! End-to-end analysis pipeline.
 //!
-//! RPython equivalent: the full translation chain
+//! **LEGACY.** Majit-local driver that sequences the ad-hoc
+//! `annotate → resolve_types → flatten_with_types` chain. Not the
+//! same as RPython's `translator/driver.py` (TranslationDriver +
+//! SimpleTaskEngine); re-identification was considered and rejected.
+//! The rtyper-pipeline cutover (roadmap Phase 8) routes pyre compiles
+//! through `majit-rtyper` directly and bypasses this file; this file
+//! is deleted at roadmap commit P8.11.
+//!
+//! RPython-orthodox chain (when fully ported):
 //!   flowspace → annotator → rtyper → jtransform → flatten
 //!
 //! This module provides a single entry point that runs all passes
@@ -12,8 +20,8 @@ use crate::OpcodeDispatchSelector;
 use crate::flatten::{self, SSARepr};
 use crate::front::SemanticFunction;
 use crate::jtransform::{GraphTransformConfig, rewrite_graph};
-use crate::translator::annotator::annrpython::annotate;
-use crate::translator::rtyper::rtyper::resolve_types;
+use crate::translator_legacy::annotator::annrpython::annotate;
+use crate::translator_legacy::rtyper::rtyper::resolve_types;
 
 /// JitDriver portal binding.
 ///

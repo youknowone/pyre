@@ -181,7 +181,7 @@ pub struct Transformer<'a> {
     /// Type resolution state from the rtype pass.
     /// Used by `make_three_lists()` to split args by kind.
     /// RPython: types are on `Variable.concretetype` — we pass them explicitly.
-    type_state: Option<&'a crate::translator::rtyper::rtyper::TypeResolutionState>,
+    type_state: Option<&'a crate::translator_legacy::rtyper::rtyper::TypeResolutionState>,
     /// RPython: `Transformer.vable_array_vars`.
     /// Stores (array_index, itemsize, is_signed) per vable array variable.
     vable_array_vars: std::collections::HashMap<ValueId, (usize, usize, bool)>,
@@ -260,7 +260,7 @@ impl<'a> Transformer<'a> {
     /// RPython: types live on `Variable.concretetype`.
     pub fn with_type_state(
         mut self,
-        ts: &'a crate::translator::rtyper::rtyper::TypeResolutionState,
+        ts: &'a crate::translator_legacy::rtyper::rtyper::TypeResolutionState,
     ) -> Self {
         self.type_state = Some(ts);
         self
@@ -415,11 +415,11 @@ impl<'a> Transformer<'a> {
         if let Some(ts) = self.type_state {
             if let Some(ct) = ts.concrete_types.get(&v) {
                 return match ct {
-                    crate::translator::rtyper::rtyper::ConcreteType::Signed => 'i',
-                    crate::translator::rtyper::rtyper::ConcreteType::GcRef => 'r',
-                    crate::translator::rtyper::rtyper::ConcreteType::Float => 'f',
-                    crate::translator::rtyper::rtyper::ConcreteType::Void => 'v',
-                    crate::translator::rtyper::rtyper::ConcreteType::Unknown => 'r',
+                    crate::translator_legacy::rtyper::rtyper::ConcreteType::Signed => 'i',
+                    crate::translator_legacy::rtyper::rtyper::ConcreteType::GcRef => 'r',
+                    crate::translator_legacy::rtyper::rtyper::ConcreteType::Float => 'f',
+                    crate::translator_legacy::rtyper::rtyper::ConcreteType::Void => 'v',
+                    crate::translator_legacy::rtyper::rtyper::ConcreteType::Unknown => 'r',
                 };
             }
         }
@@ -1797,18 +1797,18 @@ impl<'a> Transformer<'a> {
 /// Resolve the IR types of call arguments, skipping Void.
 fn resolve_non_void_arg_types(
     args: &[ValueId],
-    type_state: Option<&crate::translator::rtyper::rtyper::TypeResolutionState>,
+    type_state: Option<&crate::translator_legacy::rtyper::rtyper::TypeResolutionState>,
 ) -> Vec<majit_ir::value::Type> {
     args.iter()
         .filter_map(|&v| {
             let kind = if let Some(ts) = type_state {
                 if let Some(ct) = ts.concrete_types.get(&v) {
                     match ct {
-                        crate::translator::rtyper::rtyper::ConcreteType::Signed => 'i',
-                        crate::translator::rtyper::rtyper::ConcreteType::GcRef => 'r',
-                        crate::translator::rtyper::rtyper::ConcreteType::Float => 'f',
-                        crate::translator::rtyper::rtyper::ConcreteType::Void => 'v',
-                        crate::translator::rtyper::rtyper::ConcreteType::Unknown => 'r',
+                        crate::translator_legacy::rtyper::rtyper::ConcreteType::Signed => 'i',
+                        crate::translator_legacy::rtyper::rtyper::ConcreteType::GcRef => 'r',
+                        crate::translator_legacy::rtyper::rtyper::ConcreteType::Float => 'f',
+                        crate::translator_legacy::rtyper::rtyper::ConcreteType::Void => 'v',
+                        crate::translator_legacy::rtyper::rtyper::ConcreteType::Unknown => 'r',
                     }
                 } else {
                     'r'

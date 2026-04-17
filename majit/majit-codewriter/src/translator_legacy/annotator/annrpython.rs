@@ -1,6 +1,9 @@
 //! Annotation propagation pass.
 //!
-//! RPython equivalent: `annotator/annrpython.py` RPythonAnnotator.
+//! **LEGACY.** Ad-hoc `ValueType`-flat-enum annotator.
+//! Line-by-line port of `annotator/annrpython.py:RPythonAnnotator` is
+//! landing at `majit-annotator/src/annrpython.rs` (roadmap Phase 5).
+//! This file is deleted at roadmap commit P8.11.
 //!
 //! Propagates ValueType annotations through the graph by analyzing
 //! each op's inputs and computing the output type. Iterates to
