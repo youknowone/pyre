@@ -1641,53 +1641,65 @@ struct CaDispatchEntry {
 /// Sentinel: finish_index not yet known (self-recursion before compile).
 const CA_FINISH_INDEX_UNKNOWN: u64 = u64::MAX;
 
-fn ca_dispatch_table() -> &'static Mutex<HashMap<u64, Box<CaDispatchEntry>>> {
-    static TABLE: OnceLock<Mutex<HashMap<u64, Box<CaDispatchEntry>>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+thread_local! {
+    /// Per-thread CALL_ASSEMBLER dispatch table. Entries are boxed so their
+    /// addresses are stable across HashMap resizes — the JIT-emitted call
+    /// site holds a raw `*const CaDispatchEntry` obtained via
+    /// `ca_dispatch_slot`. Thread-local is safe because the JIT code and
+    /// the entries live on the same thread; teardown is concurrent.
+    static CA_DISPATCH_TABLE: RefCell<HashMap<u64, Box<CaDispatchEntry>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Get or create the stable dispatch entry for a token.
-/// Returns the address of the entry (stable for process lifetime).
+/// Returns the address of the entry (stable for this thread's lifetime).
 fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatchEntry {
-    let mut table = ca_dispatch_table().lock().unwrap();
-    let entry = table.entry(token_number).or_insert_with(|| {
-        Box::new(CaDispatchEntry {
-            code_ptr: AtomicPtr::new(code_ptr as *mut u8),
-            finish_descr_ptr: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
-            guard_bridge_ptr: AtomicPtr::new(std::ptr::null_mut()),
-        })
-    });
-    // Update code_ptr if changed (e.g., recompilation)
-    entry.code_ptr.store(code_ptr as *mut u8, Ordering::Release);
-    &**entry as *const CaDispatchEntry
+    CA_DISPATCH_TABLE.with(|c| {
+        let mut table = c.borrow_mut();
+        let entry = table.entry(token_number).or_insert_with(|| {
+            Box::new(CaDispatchEntry {
+                code_ptr: AtomicPtr::new(code_ptr as *mut u8),
+                finish_descr_ptr: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
+                guard_bridge_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            })
+        });
+        // Update code_ptr if changed (e.g., recompilation)
+        entry.code_ptr.store(code_ptr as *mut u8, Ordering::Release);
+        &**entry as *const CaDispatchEntry
+    })
 }
 
 /// Update the finish_descr_ptr for a token's dispatch entry.
 /// Stores the FailDescr pointer (not index) for direct finish comparison.
 fn ca_dispatch_set_finish_descr_ptr(token_number: u64, finish_descr_ptr: i64) {
-    let table = ca_dispatch_table().lock().unwrap();
-    if let Some(entry) = table.get(&token_number) {
-        entry
-            .finish_descr_ptr
-            .store(finish_descr_ptr as u64, Ordering::Release);
-    }
+    CA_DISPATCH_TABLE.with(|c| {
+        if let Some(entry) = c.borrow().get(&token_number) {
+            entry
+                .finish_descr_ptr
+                .store(finish_descr_ptr as u64, Ordering::Release);
+        }
+    });
 }
 
 /// Update dispatch slot for redirect — updates both code_ptr and finish_descr_ptr.
 fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8, new_finish_descr_ptr: i64) {
-    let table = ca_dispatch_table().lock().unwrap();
-    if let Some(entry) = table.get(&old_token) {
-        entry
-            .code_ptr
-            .store(new_code_ptr as *mut u8, Ordering::Release);
-        entry
-            .finish_descr_ptr
-            .store(new_finish_descr_ptr as u64, Ordering::Release);
-    }
+    CA_DISPATCH_TABLE.with(|c| {
+        if let Some(entry) = c.borrow().get(&old_token) {
+            entry
+                .code_ptr
+                .store(new_code_ptr as *mut u8, Ordering::Release);
+            entry
+                .finish_descr_ptr
+                .store(new_finish_descr_ptr as u64, Ordering::Release);
+        }
+    });
 }
 
 fn ca_dispatch_remove(token_number: u64) {
-    ca_dispatch_table().lock().unwrap().remove(&token_number);
+    // `try_with`: `CraneliftBackend::drop` calls `unregister_call_assembler_target`
+    // which reaches here during thread TLS teardown. Silently no-op if TLS
+    // has already been torn down.
+    let _ = CA_DISPATCH_TABLE.try_with(|c| c.borrow_mut().remove(&token_number));
 }
 
 thread_local! {
