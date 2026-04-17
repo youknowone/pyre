@@ -510,25 +510,25 @@ echo ""
 
 #                NAME             SCRIPT                         TIMEOUT  DYNASM_VS_CPYTHON  DYNASM_VS_PYPY  CRANELIFT_VS_CPYTHON  CRANELIFT_VS_PYPY
 run_bench       "int_loop"       "$BENCH/int_loop.py"            5       ""                   1.5             ""                      1.5
-run_bench       "float_loop"     "$BENCH/float_loop.py"          5       ""                   3.0             ""                      3.0
-run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""                   2.0             1                       ""
-run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""                   1.5             ""                      1.5
+run_bench       "float_loop"     "$BENCH/float_loop.py"          5       ""                   1.0             ""                      2.5
+run_bench       "fib_loop"       "$BENCH/fib_loop.py"            5       ""                   1.5             1.0                     ""
+run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""                   1.0             ""                      1.0
 # Dynasm is already slower than CPython here; keep only a relaxed
 # CPython guard and do not add a PyPy criterion.
 run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       1.5                  ""              1                       8
 run_bench       "nested_loop"    "$BENCH/nested_loop.py"         5       ""                   2               ""                      2
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     6       ""                   ""              ""                      ""
 # Dynasm is slower than CPython on these; do not add a PyPy criterion.
-run_bench       "spectral_norm" "$BENCH/spectral_norm.py"       10      15                   ""              15                      ""
-run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       11                   ""              11                      ""
+run_bench       "spectral_norm" "$BENCH/spectral_norm.py"       10      10                   ""              10                      ""
+run_bench       "nbody"          "$BENCH/nbody_50k.py"           5       10                   ""              10                      ""
 run_bench       "fannkuch"       "$BENCH/fannkuch.py"            5       ""                   ""              ""                      ""
 # list per-strategy ops (Integer strategy stays without boxing on insert/pop/reverse/setslice)
 # PYPYLOG verified: all benchmarks hit guard_class(IntegerListStrategy) + ArrayS 8 ops.
 # Keep correctness against PyPy output, but use only CPython performance guards here.
 run_bench       "list_reverse"   "$BENCH/list_reverse.py"        5       7                    ""              7                       ""
 run_bench       "list_pop_append" "$BENCH/list_pop_append.py"    5       10                   ""              10                      ""
-run_bench       "list_insert"    "$BENCH/list_insert.py"         5       ""                   2               ""                      2
-run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       10                    ""              10                       ""
+run_bench       "list_insert"    "$BENCH/list_insert.py"         5       ""                   1.5             ""                      1.5
+run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       7                    ""              7                        ""
 
 echo ""
 if [ ${#RESULTS[@]} -gt 0 ]; then
