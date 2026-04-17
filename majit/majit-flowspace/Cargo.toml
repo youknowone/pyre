@@ -1,0 +1,9 @@
+[package]
+name = "majit-flowspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpython/flowspace/ — CPython bytecode to SSA FunctionGraph"
+
+[dependencies]

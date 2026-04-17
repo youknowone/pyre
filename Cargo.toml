@@ -21,6 +21,7 @@ members = [
     "majit/majit-macros",
     "majit/majit-metainterp",
     "majit/majit-codewriter",
+    "majit/majit-flowspace",
     "majit/examples/tlr",
     "majit/examples/tl",
     "majit/examples/tla",
@@ -67,6 +68,7 @@ majit-backend-wasm = { version = "0.0.2", path = "majit/majit-backend-wasm" }
 majit-gc = { version = "0.0.2", path = "majit/majit-gc" }
 majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
 majit-codewriter = { version = "0.0.2", path = "majit/majit-codewriter" }
+majit-flowspace = { version = "0.0.2", path = "majit/majit-flowspace" }
 
 # shared dependencies
 parking_lot = "0.12"
