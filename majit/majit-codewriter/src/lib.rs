@@ -838,6 +838,7 @@ pub fn generate_graph_code(result: &pipeline::ProgramPipelineResult) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+    use walkdir::WalkDir;
 
     fn read_pyre_file(name: &str) -> String {
         let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pyre/");
@@ -846,16 +847,12 @@ mod tests {
     }
 
     fn collect_rs_files(dir: &Path, sources: &mut Vec<String>) {
-        let entries = std::fs::read_dir(dir)
-            .unwrap_or_else(|_| panic!("failed to read dir {}", dir.display()));
-        for entry in entries {
-            let entry = entry.expect("dir entry");
+        for entry in WalkDir::new(dir) {
+            let entry = entry.unwrap_or_else(|_| panic!("failed to walk dir {}", dir.display()));
             let path = entry.path();
-            if path.is_dir() {
-                collect_rs_files(&path, sources);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
+            if entry.file_type().is_file() && path.extension().is_some_and(|ext| ext == "rs") {
                 sources.push(
-                    std::fs::read_to_string(&path)
+                    std::fs::read_to_string(path)
                         .unwrap_or_else(|_| panic!("failed to read {}", path.display())),
                 );
             }

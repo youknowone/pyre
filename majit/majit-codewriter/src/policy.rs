@@ -452,13 +452,10 @@ mod tests {
         state.unsafe_loopy_graphs.insert("zeta".into());
         state.unsafe_loopy_graphs.insert("alpha".into());
         state.unsafe_loopy_graphs.insert("mu".into());
-        let path = std::env::temp_dir().join(format!(
-            "majit-test-unsafe-loops-{}.txt",
-            std::process::id()
-        ));
-        state.dump_unsafe_loops(&path).expect("write");
-        let body = std::fs::read_to_string(&path).expect("read");
-        let _ = std::fs::remove_file(&path);
+        let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
+        let path = tmp.path();
+        state.dump_unsafe_loops(path).expect("write");
+        let body = std::fs::read_to_string(path).expect("read");
         assert_eq!(body, "alpha\nmu\nzeta\n");
     }
 

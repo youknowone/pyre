@@ -3,6 +3,8 @@ mod call_spec;
 #[path = "src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
+use walkdir::WalkDir;
+
 /// Build script for pyre-jit: runs majit-codewriter on the active pyre
 /// interpreter to auto-generate tracing code. This is the Rust
 /// equivalent of RPython's translation pipeline.
@@ -172,27 +174,22 @@ fn build_call_effect_overrides() -> Vec<majit_codewriter::CallEffectOverride> {
         .collect()
 }
 
-/// Recursively collect all .rs files from a directory.
+/// Collect all `.rs` files from a directory tree.
 fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        eprintln!("[pyre-jit-trace build.rs] warning: cannot read {dir}");
-        return;
-    };
-    for entry in entries {
+    for entry in WalkDir::new(dir) {
         let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            collect_rs_files(&path.to_string_lossy(), sources, paths);
-        } else if path.extension().map_or(false, |ext| ext == "rs") {
-            let path_str = path.to_string_lossy().to_string();
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    paths.push(path_str);
-                    sources.push(content);
-                }
-                Err(e) => {
-                    eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path_str}: {e}");
-                }
+        let path_str = path.to_string_lossy().to_string();
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                paths.push(path_str);
+                sources.push(content);
+            }
+            Err(e) => {
+                eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path_str}: {e}");
             }
         }
     }
