@@ -550,6 +550,22 @@ pub(crate) fn build_guard_metadata(
                                         base,
                                     }
                                 }
+                                // resume.py:763-870 VStr/VUni*Info — virtual
+                                // string materialization is not yet wired in
+                                // pyre. Compile path must fail loudly until
+                                // vstring.py's producer side is ported.
+                                majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
+                                | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
+                                | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
+                                | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
+                                | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
+                                | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
+                                    panic!(
+                                        "[jit] rd_virtuals[{vidx}] is VStr/VUni \
+                                         but vstring.py materialization is not \
+                                         ported yet (resume.py:763-870)"
+                                    );
+                                }
                                 majit_ir::RdVirtualInfo::Empty => {
                                     panic!("[jit] rd_virtuals[{vidx}] is Empty");
                                 }

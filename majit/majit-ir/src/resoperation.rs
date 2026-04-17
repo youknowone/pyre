@@ -162,6 +162,33 @@ pub enum RdVirtualInfo {
         offset: usize,
         fieldnums: Vec<i16>,
     },
+    /// resume.py:763 `VStrPlainInfo` — virtual byte-string built from
+    /// character fieldnums. `fieldnums` length = string length.
+    VStrPlainInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:781 `VStrConcatInfo` — virtual concatenation of two
+    /// strings. `fieldnums = [left, right]`.
+    VStrConcatInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:801 `VStrSliceInfo` — virtual slice of a larger string.
+    /// `fieldnums = [largerstr, start, length]`.
+    VStrSliceInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:817 `VUniPlainInfo` — unicode counterpart of VStrPlain.
+    VUniPlainInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:836 `VUniConcatInfo` — unicode counterpart of VStrConcat.
+    VUniConcatInfo {
+        fieldnums: Vec<i16>,
+    },
+    /// resume.py:856 `VUniSliceInfo` — unicode counterpart of VStrSlice.
+    VUniSliceInfo {
+        fieldnums: Vec<i16>,
+    },
     Empty,
 }
 
@@ -299,6 +326,16 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: b2,
                 },
             ) => a1 == b1 && a2 == b2,
+            (Self::VStrPlainInfo { fieldnums: a }, Self::VStrPlainInfo { fieldnums: b }) => a == b,
+            (Self::VStrConcatInfo { fieldnums: a }, Self::VStrConcatInfo { fieldnums: b }) => {
+                a == b
+            }
+            (Self::VStrSliceInfo { fieldnums: a }, Self::VStrSliceInfo { fieldnums: b }) => a == b,
+            (Self::VUniPlainInfo { fieldnums: a }, Self::VUniPlainInfo { fieldnums: b }) => a == b,
+            (Self::VUniConcatInfo { fieldnums: a }, Self::VUniConcatInfo { fieldnums: b }) => {
+                a == b
+            }
+            (Self::VUniSliceInfo { fieldnums: a }, Self::VUniSliceInfo { fieldnums: b }) => a == b,
             (Self::Empty, Self::Empty) => true,
             _ => false,
         }
@@ -318,7 +355,13 @@ impl RdVirtualInfo {
             | Self::VArrayInfoNotClear { fieldnums, .. }
             | Self::VArrayStructInfo { fieldnums, .. }
             | Self::VRawBufferInfo { fieldnums, .. }
-            | Self::VRawSliceInfo { fieldnums, .. } => Some(fieldnums),
+            | Self::VRawSliceInfo { fieldnums, .. }
+            | Self::VStrPlainInfo { fieldnums }
+            | Self::VStrConcatInfo { fieldnums }
+            | Self::VStrSliceInfo { fieldnums }
+            | Self::VUniPlainInfo { fieldnums }
+            | Self::VUniConcatInfo { fieldnums }
+            | Self::VUniSliceInfo { fieldnums } => Some(fieldnums),
             Self::Empty => None,
         }
     }
@@ -334,6 +377,37 @@ impl RdVirtualInfo {
     /// to decide whether a cached `_cached_vinfo` can be reused verbatim.
     pub fn equals(&self, other_fieldnums: &[i16]) -> bool {
         self.fieldnums().is_some_and(|fns| fns == other_fieldnums)
+    }
+
+    /// resume.py:584-585 `AbstractVirtualInfo.set_content(fieldnums)`:
+    ///
+    /// ```python
+    /// def set_content(self, fieldnums):
+    ///     self.fieldnums = fieldnums
+    /// ```
+    ///
+    /// Called by `ResumeDataVirtualAdder.make_virtual_info` (resume.py:313)
+    /// after `info.visitor_dispatch_virtual_type(self)` produced a fresh
+    /// vinfo — the visitor constructs the variant without fieldnums,
+    /// and this method stores the caller-supplied `fieldnums` onto it
+    /// before caching.
+    pub fn set_content(&mut self, new_fieldnums: Vec<i16>) {
+        match self {
+            Self::VirtualInfo { fieldnums, .. }
+            | Self::VStructInfo { fieldnums, .. }
+            | Self::VArrayInfoClear { fieldnums, .. }
+            | Self::VArrayInfoNotClear { fieldnums, .. }
+            | Self::VArrayStructInfo { fieldnums, .. }
+            | Self::VRawBufferInfo { fieldnums, .. }
+            | Self::VRawSliceInfo { fieldnums, .. }
+            | Self::VStrPlainInfo { fieldnums }
+            | Self::VStrConcatInfo { fieldnums }
+            | Self::VStrSliceInfo { fieldnums }
+            | Self::VUniPlainInfo { fieldnums }
+            | Self::VUniConcatInfo { fieldnums }
+            | Self::VUniSliceInfo { fieldnums } => *fieldnums = new_fieldnums,
+            Self::Empty => {}
+        }
     }
 }
 

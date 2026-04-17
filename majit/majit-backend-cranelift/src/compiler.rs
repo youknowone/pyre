@@ -10844,6 +10844,25 @@ fn collect_guards(
                                     .unwrap_or(ExitValueSourceLayout::Constant(0)),
                             }
                         }
+                        // resume.py:763-870 VStr/VUni*Info — virtual string
+                        // materialization requires `decoder.allocate_string`,
+                        // `string_setitem`, `concat_strings`, `slice_string`
+                        // from the host runtime. Until vstring.py's producer
+                        // side (info.py:142 VStringPlainInfo force_box etc.)
+                        // is ported, these variants must not reach recovery.
+                        // Fail loudly if a producer does emit one.
+                        majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
+                        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
+                        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
+                        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
+                        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
+                        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
+                            panic!(
+                                "cranelift recovery: VStr/VUni RdVirtualInfo \
+                                 reached without vstring.py materialization \
+                                 support (see resume.py:763-870)"
+                            )
+                        }
                         majit_ir::RdVirtualInfo::Empty => continue,
                     };
                     recovery_layout.virtual_layouts.push(layout);

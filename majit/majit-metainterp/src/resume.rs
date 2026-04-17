@@ -402,6 +402,18 @@ pub enum ResumeVirtualKind {
     Array,
     ArrayStruct,
     RawBuffer,
+    /// resume.py:763 VStrPlainInfo — virtual plain string.
+    StrPlain,
+    /// resume.py:781 VStrConcatInfo — virtual concatenated string.
+    StrConcat,
+    /// resume.py:801 VStrSliceInfo — virtual string slice.
+    StrSlice,
+    /// resume.py:817 VUniPlainInfo — virtual plain unicode string.
+    UniPlain,
+    /// resume.py:836 VUniConcatInfo — virtual concatenated unicode.
+    UniConcat,
+    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
+    UniSlice,
 }
 
 #[derive(Debug, Clone)]
@@ -1263,6 +1275,35 @@ pub enum VirtualInfo {
         /// Source of the parent buffer.
         parent: VirtualFieldSource,
     },
+    /// resume.py:763 VStrPlainInfo — virtual string (known characters).
+    VStrPlain {
+        /// Character values (as OpRef sources).
+        chars: Vec<VirtualFieldSource>,
+    },
+    /// resume.py:781 VStrConcatInfo — virtual string concat (left + right).
+    VStrConcat {
+        left: Box<VirtualFieldSource>,
+        right: Box<VirtualFieldSource>,
+    },
+    /// resume.py:801 VStrSliceInfo — virtual string slice.
+    VStrSlice {
+        source: Box<VirtualFieldSource>,
+        start: Box<VirtualFieldSource>,
+        length: Box<VirtualFieldSource>,
+    },
+    /// resume.py:817 VUniPlainInfo — virtual unicode string.
+    VUniPlain { chars: Vec<VirtualFieldSource> },
+    /// resume.py:836 VUniConcatInfo — virtual unicode concat.
+    VUniConcat {
+        left: Box<VirtualFieldSource>,
+        right: Box<VirtualFieldSource>,
+    },
+    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
+    VUniSlice {
+        source: Box<VirtualFieldSource>,
+        start: Box<VirtualFieldSource>,
+        length: Box<VirtualFieldSource>,
+    },
 }
 
 // PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
@@ -1342,6 +1383,22 @@ impl VirtualInfo {
                 .collect(),
             VirtualInfo::VRawBuffer { values, .. } => values.iter().collect(),
             VirtualInfo::VRawSlice { parent, .. } => vec![parent],
+            VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
+                chars.iter().collect()
+            }
+            VirtualInfo::VStrConcat { left, right } | VirtualInfo::VUniConcat { left, right } => {
+                vec![left.as_ref(), right.as_ref()]
+            }
+            VirtualInfo::VStrSlice {
+                source,
+                start,
+                length,
+            }
+            | VirtualInfo::VUniSlice {
+                source,
+                start,
+                length,
+            } => vec![source.as_ref(), start.as_ref(), length.as_ref()],
         }
     }
 
@@ -1354,6 +1411,12 @@ impl VirtualInfo {
             VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. } => {
                 ResumeVirtualKind::RawBuffer
             }
+            VirtualInfo::VStrPlain { .. } => ResumeVirtualKind::StrPlain,
+            VirtualInfo::VStrConcat { .. } => ResumeVirtualKind::StrConcat,
+            VirtualInfo::VStrSlice { .. } => ResumeVirtualKind::StrSlice,
+            VirtualInfo::VUniPlain { .. } => ResumeVirtualKind::UniPlain,
+            VirtualInfo::VUniConcat { .. } => ResumeVirtualKind::UniConcat,
+            VirtualInfo::VUniSlice { .. } => ResumeVirtualKind::UniSlice,
         }
     }
 
@@ -1440,7 +1503,15 @@ impl VirtualInfo {
                 descrs: descrs.clone(),
                 values: values.iter().map(|src| src.layout_summary()).collect(),
             },
-            VirtualInfo::VRawSlice { .. } => ResumeVirtualLayoutSummary::Struct {
+            // String/unicode virtual infos — represented as structs
+            // with synthetic field indices for reconstruction.
+            VirtualInfo::VRawSlice { .. }
+            | VirtualInfo::VStrPlain { .. }
+            | VirtualInfo::VStrConcat { .. }
+            | VirtualInfo::VStrSlice { .. }
+            | VirtualInfo::VUniPlain { .. }
+            | VirtualInfo::VUniConcat { .. }
+            | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
                 typedescr: None,
                 type_id: 0,
                 descr_index: 0,
@@ -1646,6 +1717,50 @@ pub fn rd_virtual_to_virtual_info(
             VirtualInfo::VRawSlice {
                 offset: *offset as i64,
                 parent,
+            }
+        }
+        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
+            let chars = fieldnums
+                .iter()
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .collect();
+            VirtualInfo::VStrPlain { chars }
+        }
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
+            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            VirtualInfo::VStrConcat { left, right }
+        }
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
+            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
+            VirtualInfo::VStrSlice {
+                source,
+                start,
+                length,
+            }
+        }
+        majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
+            let chars = fieldnums
+                .iter()
+                .map(|&tagged| tagged_to_source(tagged, consts, count))
+                .collect();
+            VirtualInfo::VUniPlain { chars }
+        }
+        majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            VirtualInfo::VUniConcat { left, right }
+        }
+        majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
+            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
+            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
+            VirtualInfo::VUniSlice {
+                source,
+                start,
+                length,
             }
         }
         majit_ir::RdVirtualInfo::Empty => VirtualInfo::VirtualObj {
@@ -2419,6 +2534,21 @@ impl MaterializedVirtual {
                 values: vec![MaterializedValue::Value(0); offsets.len()],
             },
             VirtualInfo::VRawSlice { .. } => MaterializedVirtual::Struct {
+                type_id: 0,
+                descr_index: 0,
+                fields: Vec::new(),
+            },
+            // resume.py:763-870 VStr/VUni*Info — virtual string shells
+            // reserved for future vstring.py port. Represented as struct
+            // shells for now (zero fields) so the materializer doesn't
+            // walk into them; actual allocate_string / string_setitem /
+            // concat_strings / slice_string still live on the roadmap.
+            VirtualInfo::VStrPlain { .. }
+            | VirtualInfo::VStrConcat { .. }
+            | VirtualInfo::VStrSlice { .. }
+            | VirtualInfo::VUniPlain { .. }
+            | VirtualInfo::VUniConcat { .. }
+            | VirtualInfo::VUniSlice { .. } => MaterializedVirtual::Struct {
                 type_id: 0,
                 descr_index: 0,
                 fields: Vec::new(),

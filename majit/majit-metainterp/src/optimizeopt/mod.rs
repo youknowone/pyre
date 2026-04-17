@@ -630,15 +630,15 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     ) -> Option<majit_ir::RdVirtualInfo> {
         let resolved = self.ctx.get_box_replacement(opref);
         let info = self.ctx.get_ptr_info(resolved)?;
-        // resume.py:307-315 make_virtual_info cache check.
+        // resume.py:307-315 `ResumeDataVirtualAdder.make_virtual_info`:
         //
         //     vinfo = info._cached_vinfo
         //     if vinfo is not None and vinfo.equals(fieldnums):
         //         return vinfo
-        //
-        // If a prior finish() already built the RdVirtualInfo for this
-        // PtrInfo instance and its fieldnums haven't changed, return the
-        // cached result directly instead of rebuilding.
+        //     vinfo = info.visitor_dispatch_virtual_type(self)
+        //     vinfo.set_content(fieldnums)
+        //     info._cached_vinfo = vinfo
+        //     return vinfo
         if let Some(cache) = info.cached_vinfo() {
             if let Some(vinfo) = cache.borrow().as_ref() {
                 if vinfo.equals(&fieldnums) {
@@ -646,215 +646,285 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 }
             }
         }
-        let result = match info {
-            PtrInfo::Virtual(vi) => {
-                let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
-                    .fields
-                    .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
-                    .map(|(fi, _)| {
-                        let fd = vi
-                            .field_descrs
-                            .get(*fi as usize)
-                            .and_then(|d| d.as_field_descr());
-                        majit_ir::FieldDescrInfo {
-                            index: *fi,
-                            offset: fd.map(|f| f.offset()).unwrap_or(0),
-                            field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
-                            field_size: fd.map(|f| f.field_size()).unwrap_or(8),
-                        }
-                    })
-                    .collect();
-                let descr_size = vi.descr.as_size_descr().map(|s| s.size()).unwrap_or(0);
-                Some(majit_ir::RdVirtualInfo::VirtualInfo {
-                    descr: Some(vi.descr.clone()),
-                    type_id: vi.descr.as_size_descr().map(|sd| sd.type_id()).unwrap_or(0),
-                    descr_index: vi.descr.index(),
-                    known_class: vi
-                        .known_class
-                        .map(|gc| gc.as_usize() as i64)
-                        .or_else(|| vi.descr.as_size_descr().map(|sd| sd.vtable() as i64))
-                        .filter(|&v| v != 0),
-                    fielddescrs,
-                    fieldnums,
-                    descr_size,
-                })
-            }
-            PtrInfo::VirtualStruct(vi) => {
-                let fielddescrs: Vec<majit_ir::FieldDescrInfo> = vi
-                    .fields
-                    .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
-                    .map(|(fi, _)| {
-                        let fd = vi
-                            .field_descrs
-                            .get(*fi as usize)
-                            .and_then(|d| d.as_field_descr());
-                        majit_ir::FieldDescrInfo {
-                            index: *fi,
-                            offset: fd.map(|f| f.offset()).unwrap_or(0),
-                            field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
-                            field_size: fd.map(|f| f.field_size()).unwrap_or(8),
-                        }
-                    })
-                    .collect();
-                let sd = vi.descr.as_size_descr();
-                let descr_size = sd.map(|s| s.size()).unwrap_or(0);
-                let tid = sd.map(|s| s.type_id()).unwrap_or(0);
-                Some(majit_ir::RdVirtualInfo::VStructInfo {
-                    typedescr: Some(vi.descr.clone()),
-                    type_id: tid,
-                    descr_index: vi.descr.index(),
-                    fielddescrs,
-                    fieldnums,
-                    descr_size,
-                })
-            }
-            PtrInfo::VirtualArray(vi) => {
-                let kind = vi
-                    .descr
-                    .as_array_descr()
-                    .map(|ad| match ad.item_type() {
-                        majit_ir::Type::Float => 2u8,
-                        majit_ir::Type::Int => 1u8,
-                        _ => 0u8,
-                    })
-                    .unwrap_or(0);
-                // resume.py:326-330: VArrayInfoClear/NotClear(arraydescr)
-                let ad = Some(vi.descr.clone());
-                let descr_index = vi.descr.index();
-                debug_assert!(
-                    ad.as_ref().map(|d| d.index()) == Some(descr_index),
-                    "arraydescr.index() != descr_index"
-                );
-                if vi.clear {
-                    Some(majit_ir::RdVirtualInfo::VArrayInfoClear {
-                        arraydescr: ad,
-                        descr_index,
-                        kind,
-                        fieldnums,
-                    })
-                } else {
-                    Some(majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                        arraydescr: ad,
-                        descr_index,
-                        kind,
-                        fieldnums,
-                    })
-                }
-            }
-            PtrInfo::VirtualArrayStruct(vi) => {
-                let fielddescr_indices: Vec<u32> = vi
-                    .element_fields
-                    .first()
-                    .map(|ef| ef.iter().map(|(idx, _)| *idx).collect())
-                    .unwrap_or_default();
-                let is = vi
-                    .descr
-                    .as_array_descr()
-                    .map(|ad| ad.item_size())
-                    .unwrap_or(0);
-                // info.py:701-704: visitor_dispatch_virtual_type
-                //   flddescrs = self.descr.get_all_fielddescrs()
-                //   return visitor.visit_varraystruct(self.descr, self.getlength(), flddescrs)
-                let canonical_fielddescrs: Vec<majit_ir::DescrRef> = vi
-                    .descr
-                    .as_array_descr()
-                    .and_then(|ad| ad.get_all_interiorfielddescrs())
-                    .map(|fds| fds.to_vec())
-                    .unwrap_or_else(|| vi.fielddescrs.clone());
-                let mut fo = Vec::new();
-                let mut fs = Vec::new();
-                let mut ft = Vec::new();
-                for fd in &canonical_fielddescrs {
-                    if let Some(ifd) = fd.as_interior_field_descr() {
-                        let fld = ifd.field_descr();
-                        fo.push(fld.offset());
-                        fs.push(fld.field_size());
-                        ft.push(match fld.field_type() {
-                            majit_ir::Type::Float => 2u8,
-                            majit_ir::Type::Int => 1u8,
-                            _ => 0u8,
-                        });
-                    } else {
-                        fo.push(fo.len() * 8);
-                        fs.push(8);
-                        ft.push(0);
-                    }
-                }
-                if ft.is_empty() {
-                    ft = vec![0u8; fielddescr_indices.len()];
-                }
-                let bs = vi
-                    .descr
-                    .as_array_descr()
-                    .map(|ad| ad.base_size())
-                    .unwrap_or(0);
-                // resume.py:332: VArrayStructInfo(arraydescr, size, fielddescrs)
-                let struct_ad = Some(vi.descr.clone());
-                debug_assert!(
-                    struct_ad.as_ref().map(|d| d.index()) == Some(vi.descr.index()),
-                    "VArrayStructInfo: arraydescr.index() != descr_index"
-                );
-                Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
-                    arraydescr: struct_ad,
-                    descr_index: vi.descr.index(),
-                    size: vi.element_fields.len(),
-                    fielddescrs: canonical_fielddescrs,
-                    fielddescr_indices,
-                    field_types: ft,
-                    base_size: bs,
-                    item_size: is,
-                    field_offsets: fo,
-                    field_sizes: fs,
-                    fieldnums,
-                })
-            }
-            PtrInfo::VirtualRawBuffer(vi) => {
-                // info.py:445: visitor_dispatch_virtual_type →
-                // visit_vrawbuffer(func, size, offsets[:], descrs[:])
-                let offsets = vi.offsets.clone();
-                let descrs: Vec<majit_ir::ArrayDescrInfo> = vi
-                    .descrs
-                    .iter()
-                    .map(|d| {
-                        let ad = d.as_array_descr();
-                        majit_ir::ArrayDescrInfo {
-                            index: d.index(),
-                            base_size: ad.map_or(0, |a| a.base_size()),
-                            item_size: ad.map_or(8, |a| a.item_size()),
-                            item_type: ad.map_or(1, |a| {
-                                if a.is_array_of_pointers() {
-                                    0
-                                } else if a.is_array_of_floats() {
-                                    2
-                                } else {
-                                    1
-                                }
-                            }),
-                            is_signed: ad.map_or(true, |a| a.is_item_signed()),
-                        }
-                    })
-                    .collect();
-                Some(majit_ir::RdVirtualInfo::VRawBufferInfo {
-                    func: vi.func,
-                    size: vi.size,
-                    offsets,
-                    descrs,
-                    fieldnums,
-                })
-            }
-            _ => None,
-        };
+        let mut builder = RdVirtualInfoBuilder;
+        let mut vinfo = info.visitor_dispatch_virtual_type(&mut builder)??;
+        // resume.py:313: vinfo.set_content(fieldnums)
+        vinfo.set_content(fieldnums);
         // resume.py:314: info._cached_vinfo = vinfo
-        //
-        // On cache miss the freshly-built vinfo becomes the new cached
-        // entry. Future calls with matching fieldnums can short-circuit
-        // via the equals() check above.
-        if let (Some(cache), Some(vinfo)) = (info.cached_vinfo(), result.as_ref()) {
+        if let Some(cache) = info.cached_vinfo() {
             *cache.borrow_mut() = Some(vinfo.clone());
         }
-        result
+        Some(vinfo)
+    }
+}
+
+/// resume.py:298-357 `ResumeDataVirtualAdder` in its role as a
+/// `VirtualVisitor` — each `visit_*` builds a fresh `RdVirtualInfo`
+/// subclass without fieldnums (the caller attaches those via
+/// `set_content`). In pyre, `make_rd_virtual_info` lives on the
+/// `BoxEnv` impl (not on `ResumeDataVirtualAdder`) because PtrInfo
+/// lookup is the optimizer's responsibility, so the visitor adapter
+/// is this zero-sized helper instead of `ResumeDataVirtualAdder`
+/// itself.
+struct RdVirtualInfoBuilder;
+
+impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
+    type VInfo = Option<majit_ir::RdVirtualInfo>;
+
+    fn visit_not_virtual(&mut self, _value: OpRef) -> Self::VInfo {
+        // resume.py:317-318 `visit_not_virtual` asserts unreachable.
+        debug_assert!(false, "visit_not_virtual reached via virtual dispatch");
+        None
+    }
+
+    // resume.py:320-321 visit_virtual → VirtualInfo(descr, fielddescrs)
+    fn visit_virtual(
+        &mut self,
+        descr: &majit_ir::DescrRef,
+        fielddescr_indices: &[u32],
+        fielddescrs: &[majit_ir::DescrRef],
+    ) -> Self::VInfo {
+        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescr_indices
+            .iter()
+            .filter(|fi| !is_typeptr_field(**fi, fielddescrs, descr))
+            .map(|fi| {
+                let fd = fielddescrs
+                    .get(*fi as usize)
+                    .and_then(|d| d.as_field_descr());
+                majit_ir::FieldDescrInfo {
+                    index: *fi,
+                    offset: fd.map(|f| f.offset()).unwrap_or(0),
+                    field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
+                    field_size: fd.map(|f| f.field_size()).unwrap_or(8),
+                }
+            })
+            .collect();
+        let sd = descr.as_size_descr();
+        Some(majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: Some(descr.clone()),
+            type_id: sd.map(|s| s.type_id()).unwrap_or(0),
+            descr_index: descr.index(),
+            // resume.py:619 allocate_with_vtable(descr=self.descr) — the
+            // vtable is derived from descr; majit mirrors by reading it
+            // off the SizeDescr when the descr carries class info.
+            known_class: sd.map(|s| s.vtable() as i64).filter(|&v| v != 0),
+            fielddescrs: built_fielddescrs,
+            fieldnums: Vec::new(),
+            descr_size: sd.map(|s| s.size()).unwrap_or(0),
+        })
+    }
+
+    // resume.py:323-324 visit_vstruct → VStructInfo(typedescr, fielddescrs)
+    fn visit_vstruct(
+        &mut self,
+        typedescr: &majit_ir::DescrRef,
+        fielddescr_indices: &[u32],
+        fielddescrs: &[majit_ir::DescrRef],
+    ) -> Self::VInfo {
+        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescr_indices
+            .iter()
+            .filter(|fi| !is_typeptr_field(**fi, fielddescrs, typedescr))
+            .map(|fi| {
+                let fd = fielddescrs
+                    .get(*fi as usize)
+                    .and_then(|d| d.as_field_descr());
+                majit_ir::FieldDescrInfo {
+                    index: *fi,
+                    offset: fd.map(|f| f.offset()).unwrap_or(0),
+                    field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
+                    field_size: fd.map(|f| f.field_size()).unwrap_or(8),
+                }
+            })
+            .collect();
+        let sd = typedescr.as_size_descr();
+        Some(majit_ir::RdVirtualInfo::VStructInfo {
+            typedescr: Some(typedescr.clone()),
+            type_id: sd.map(|s| s.type_id()).unwrap_or(0),
+            descr_index: typedescr.index(),
+            fielddescrs: built_fielddescrs,
+            fieldnums: Vec::new(),
+            descr_size: sd.map(|s| s.size()).unwrap_or(0),
+        })
+    }
+
+    // resume.py:326-330 visit_varray → VArrayInfoClear / VArrayInfoNotClear
+    fn visit_varray(&mut self, arraydescr: &majit_ir::DescrRef, clear: bool) -> Self::VInfo {
+        let kind = arraydescr
+            .as_array_descr()
+            .map(|ad| match ad.item_type() {
+                majit_ir::Type::Float => 2u8,
+                majit_ir::Type::Int => 1u8,
+                _ => 0u8,
+            })
+            .unwrap_or(0);
+        let ad = Some(arraydescr.clone());
+        let descr_index = arraydescr.index();
+        Some(if clear {
+            majit_ir::RdVirtualInfo::VArrayInfoClear {
+                arraydescr: ad,
+                descr_index,
+                kind,
+                fieldnums: Vec::new(),
+            }
+        } else {
+            majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                arraydescr: ad,
+                descr_index,
+                kind,
+                fieldnums: Vec::new(),
+            }
+        })
+    }
+
+    // resume.py:332-333 visit_varraystruct → VArrayStructInfo
+    fn visit_varraystruct(
+        &mut self,
+        arraydescr: &majit_ir::DescrRef,
+        length: usize,
+        fielddescr_indices: &[u32],
+        fielddescrs: &[majit_ir::DescrRef],
+    ) -> Self::VInfo {
+        // info.py:701-704: visitor_dispatch_virtual_type always hands
+        // down the canonical get_all_interiorfielddescrs() list; fall
+        // back to the variant's cached fielddescrs when descr lacks it.
+        let canonical_fielddescrs: Vec<majit_ir::DescrRef> = arraydescr
+            .as_array_descr()
+            .and_then(|ad| ad.get_all_interiorfielddescrs())
+            .map(|fds| fds.to_vec())
+            .unwrap_or_else(|| fielddescrs.to_vec());
+        let mut fo = Vec::new();
+        let mut fs = Vec::new();
+        let mut ft = Vec::new();
+        for fd in &canonical_fielddescrs {
+            if let Some(ifd) = fd.as_interior_field_descr() {
+                let fld = ifd.field_descr();
+                fo.push(fld.offset());
+                fs.push(fld.field_size());
+                ft.push(match fld.field_type() {
+                    majit_ir::Type::Float => 2u8,
+                    majit_ir::Type::Int => 1u8,
+                    _ => 0u8,
+                });
+            } else {
+                fo.push(fo.len() * 8);
+                fs.push(8);
+                ft.push(0);
+            }
+        }
+        if ft.is_empty() {
+            ft = vec![0u8; fielddescr_indices.len()];
+        }
+        let ad = arraydescr.as_array_descr();
+        Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
+            arraydescr: Some(arraydescr.clone()),
+            descr_index: arraydescr.index(),
+            size: length,
+            fielddescrs: canonical_fielddescrs,
+            fielddescr_indices: fielddescr_indices.to_vec(),
+            field_types: ft,
+            base_size: ad.map(|a| a.base_size()).unwrap_or(0),
+            item_size: ad.map(|a| a.item_size()).unwrap_or(0),
+            field_offsets: fo,
+            field_sizes: fs,
+            fieldnums: Vec::new(),
+        })
+    }
+
+    // resume.py:335-336 visit_vrawbuffer → VRawBufferInfo
+    fn visit_vrawbuffer(
+        &mut self,
+        func: i64,
+        size: usize,
+        offsets: &[usize],
+        descrs: &[majit_ir::DescrRef],
+    ) -> Self::VInfo {
+        let descr_infos: Vec<majit_ir::ArrayDescrInfo> = descrs
+            .iter()
+            .map(|d| {
+                let ad = d.as_array_descr();
+                majit_ir::ArrayDescrInfo {
+                    index: d.index(),
+                    base_size: ad.map_or(0, |a| a.base_size()),
+                    item_size: ad.map_or(8, |a| a.item_size()),
+                    item_type: ad.map_or(1, |a| {
+                        if a.is_array_of_pointers() {
+                            0
+                        } else if a.is_array_of_floats() {
+                            2
+                        } else {
+                            1
+                        }
+                    }),
+                    is_signed: ad.map_or(true, |a| a.is_item_signed()),
+                }
+            })
+            .collect();
+        Some(majit_ir::RdVirtualInfo::VRawBufferInfo {
+            func,
+            size,
+            offsets: offsets.to_vec(),
+            descrs: descr_infos,
+            fieldnums: Vec::new(),
+        })
+    }
+
+    // resume.py:338-339 visit_vrawslice → VRawSliceInfo
+    fn visit_vrawslice(&mut self, offset: usize) -> Self::VInfo {
+        Some(majit_ir::RdVirtualInfo::VRawSliceInfo {
+            offset,
+            fieldnums: Vec::new(),
+        })
+    }
+
+    // resume.py:341-345 visit_vstrplain → VStrPlainInfo / VUniPlainInfo
+    fn visit_vstrplain(&mut self, is_unicode: bool) -> Self::VInfo {
+        Some(if is_unicode {
+            majit_ir::RdVirtualInfo::VUniPlainInfo {
+                fieldnums: Vec::new(),
+            }
+        } else {
+            majit_ir::RdVirtualInfo::VStrPlainInfo {
+                fieldnums: Vec::new(),
+            }
+        })
+    }
+
+    // resume.py:347-351 visit_vstrconcat → VStrConcatInfo / VUniConcatInfo
+    fn visit_vstrconcat(&mut self, is_unicode: bool) -> Self::VInfo {
+        Some(if is_unicode {
+            majit_ir::RdVirtualInfo::VUniConcatInfo {
+                fieldnums: Vec::new(),
+            }
+        } else {
+            majit_ir::RdVirtualInfo::VStrConcatInfo {
+                fieldnums: Vec::new(),
+            }
+        })
+    }
+
+    // resume.py:353-357 visit_vstrslice → VStrSliceInfo / VUniSliceInfo
+    fn visit_vstrslice(&mut self, is_unicode: bool) -> Self::VInfo {
+        Some(if is_unicode {
+            majit_ir::RdVirtualInfo::VUniSliceInfo {
+                fieldnums: Vec::new(),
+            }
+        } else {
+            majit_ir::RdVirtualInfo::VStrSliceInfo {
+                fieldnums: Vec::new(),
+            }
+        })
+    }
+
+    fn register_virtual_fields(&mut self, _virtualbox: OpRef, _fieldboxes: &[OpRef]) {
+        // resume.py:359-368 — field registration happens elsewhere in pyre
+        // (via resume.rs worklist + get_virtual_fields), not through the
+        // visitor. This adapter is only a builder for RdVirtualInfo.
+    }
+
+    fn already_seen_virtual(&mut self, _virtualbox: OpRef) -> bool {
+        // resume.py:380-386 — same split as register_virtual_fields; the
+        // pyre worklist tracks visited boxes directly.
+        false
     }
 }
 
@@ -1956,6 +2026,7 @@ impl OptContext {
                 // the previous iteration's virtual variant across.
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             };
             if new_info.lenbound.is_none() {
                 new_info.lenbound = Some(crate::optimizeopt::intutils::IntBound::nonnegative());
@@ -4175,6 +4246,7 @@ impl OptContext {
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             })
         } else if op.opcode == OpCode::Unicodelen {
             // optimizer.py:492-493: unicodelen → StrPtrInfo(mode_unicode)
@@ -4185,6 +4257,7 @@ impl OptContext {
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             })
         } else {
             // optimizer.py:494-495: assert False, "operations %s unsupported"
@@ -4228,6 +4301,7 @@ impl OptContext {
                 length: -1,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
     }
@@ -4362,7 +4436,7 @@ pub trait Optimization {
     fn export_cached_fields(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&std::collections::HashSet<OpRef>>,
+        _available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }
@@ -4380,7 +4454,7 @@ pub trait Optimization {
     fn export_cached_arrayitems(
         &self,
         _ctx: &mut OptContext,
-        _available_boxes: Option<&std::collections::HashSet<OpRef>>,
+        _available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         Vec::new()
     }

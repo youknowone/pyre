@@ -1144,7 +1144,7 @@ impl Optimizer {
     pub fn export_all_cached_fields(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&std::collections::HashSet<OpRef>>,
+        available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
     ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
@@ -1157,7 +1157,7 @@ impl Optimizer {
     pub fn export_all_cached_arrayitems(
         &self,
         ctx: &mut OptContext,
-        available_boxes: Option<&std::collections::HashSet<OpRef>>,
+        available_boxes: Option<&std::collections::HashMap<OpRef, ()>>,
     ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
         let mut result = Vec::new();
         for pass in &self.passes {
@@ -1169,6 +1169,23 @@ impl Optimizer {
     /// Pre-tag Phase 1 JUMP arg OpRefs as generation 0.
 
     /// Lock JUMP arg OpRefs so replace_op won't forward them.
+
+    /// optimizer.py:557 parity:
+    ///
+    /// ```python
+    /// self.resumedata_memo.update_counters(self.metainterp_sd.profiler)
+    /// ```
+    ///
+    /// RPython invokes `update_counters` at the tail of every
+    /// `propagate_all_forward` call, folding accumulated
+    /// NVIRTUALS / NVHOLES / NVREUSED from `resumedata_memo` into the
+    /// static-data profiler. In pyre the optimizer does not hold a
+    /// reference to `MetaInterp.stats`, so this is a thin accessor the
+    /// caller invokes after each optimize_loop / optimize_bridge /
+    /// propagate_all_forward exit to fold counters into the JIT stats.
+    pub fn update_counters(&self, stats: &mut crate::pyjitpl::JitStatsCounters) {
+        self.resumedata_memo.update_counters(stats);
+    }
 
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.

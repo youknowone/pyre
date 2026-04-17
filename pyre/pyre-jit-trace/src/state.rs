@@ -2993,6 +2993,24 @@ fn materialize_bridge_virtual(
             }
             buffer
         }
+        // resume.py:763-870 VStr/VUni*Info — bridge-virtual materialization
+        // for virtual strings requires vstring.py force_box port (info.py:142
+        // VStringPlainInfo etc.) + host runtime hooks for allocate_string /
+        // string_setitem / concat_strings / slice_string. Until those land,
+        // the bridge tracer must fail loudly on these variants rather than
+        // return NONE and corrupt downstream OpRef references.
+        majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
+        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
+        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
+        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
+            panic!(
+                "pyre-jit-trace bridge-virtual: VStr/VUni RdVirtualInfo \
+                 reached without vstring.py materialization support \
+                 (see resume.py:763-870)"
+            )
+        }
         majit_ir::RdVirtualInfo::Empty => OpRef::NONE,
     }
 }

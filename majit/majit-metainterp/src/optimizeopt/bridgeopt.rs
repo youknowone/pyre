@@ -897,12 +897,16 @@ pub fn serialize_optimizer_knowledge(
     env: &dyn majit_ir::BoxEnv,
     optimizer_knowledge: Option<&crate::resume::OptimizerKnowledgeForResume>,
 ) {
-    // bridgeopt.py:64-67: available_boxes = liveboxes ∩ liveboxes_from_env
-    let available_boxes: std::collections::HashSet<u32> = liveboxes
+    // bridgeopt.py:64-67 `available_boxes = {}` followed by
+    // `available_boxes[box] = None` — RPython uses a dict as a
+    // membership set (values are always None). Rust mirrors the dict
+    // shape with `HashMap<OpRef, ()>` rather than `HashSet<OpRef>` to
+    // keep structural parity with the RPython data-structure choice.
+    let available_boxes: std::collections::HashMap<OpRef, ()> = liveboxes
         .iter()
         .filter_map(|opt| *opt)
         .filter(|opref| numb_state.liveboxes.contains_key(opref.0))
-        .map(|opref| opref.0)
+        .map(|opref| (opref, ()))
         .collect();
 
     // bridgeopt.py:74-88: known classes bitfield
@@ -964,8 +968,8 @@ pub fn serialize_optimizer_knowledge(
         .iter()
         .copied()
         .filter(|&(obj, _, val)| {
-            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
-            let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
+            let obj_ok = env.is_const(obj) || available_boxes.contains_key(&obj);
+            let val_ok = env.is_const(val) || available_boxes.contains_key(&val);
             obj_ok && val_ok
         })
         .collect();
@@ -983,8 +987,8 @@ pub fn serialize_optimizer_knowledge(
         .iter()
         .copied()
         .filter(|&(obj, _, _, val)| {
-            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
-            let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
+            let obj_ok = env.is_const(obj) || available_boxes.contains_key(&obj);
+            let val_ok = env.is_const(val) || available_boxes.contains_key(&val);
             obj_ok && val_ok
         })
         .collect();
@@ -1003,7 +1007,7 @@ pub fn serialize_optimizer_knowledge(
         .loopinvariant_results
         .iter()
         .copied()
-        .filter(|&(_, result)| env.is_const(result) || available_boxes.contains(&result.0))
+        .filter(|&(_, result)| env.is_const(result) || available_boxes.contains_key(&result))
         .collect();
     numb_state.append_int(filtered_loopinvariant.len() as i32);
     for (const_ptr, result) in &filtered_loopinvariant {

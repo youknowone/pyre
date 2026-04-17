@@ -27,20 +27,42 @@ pub trait VirtualVisitor {
     /// walkvirtual.py:5
     fn visit_not_virtual(&mut self, value: OpRef) -> Self::VInfo;
 
-    /// walkvirtual.py:8; info.py:331-334
-    fn visit_virtual(&mut self, descr: &DescrRef, fielddescrs: &[DescrRef]) -> Self::VInfo;
+    /// walkvirtual.py:8; info.py:331-334.
+    ///
+    /// **Pyre adaptation**: `fielddescr_indices` is a pyre-specific extra
+    /// argument. RPython's visit_virtual receives only (descr, fielddescrs)
+    /// because RPython's `AbstractVirtualStructInfo.fielddescrs` includes
+    /// *all* slots and its paired `fieldnums` list uses UNINITIALIZED tags
+    /// for unassigned ones. Majit's `RdVirtualInfo.fielddescrs` stores
+    /// filled-only entries (matching `fieldnums` length), so the visitor
+    /// needs the original slot indices to populate `FieldDescrInfo.index`.
+    fn visit_virtual(
+        &mut self,
+        descr: &DescrRef,
+        fielddescr_indices: &[u32],
+        fielddescrs: &[DescrRef],
+    ) -> Self::VInfo;
 
-    /// walkvirtual.py:11; info.py:368-372
-    fn visit_vstruct(&mut self, typedescr: &DescrRef, fielddescrs: &[DescrRef]) -> Self::VInfo;
+    /// walkvirtual.py:11; info.py:368-372. See `visit_virtual` for the
+    /// `fielddescr_indices` adaptation rationale.
+    fn visit_vstruct(
+        &mut self,
+        typedescr: &DescrRef,
+        fielddescr_indices: &[u32],
+        fielddescrs: &[DescrRef],
+    ) -> Self::VInfo;
 
     /// walkvirtual.py:14; info.py:597-599
     fn visit_varray(&mut self, arraydescr: &DescrRef, clear: bool) -> Self::VInfo;
 
-    /// walkvirtual.py:17; info.py:700-704
+    /// walkvirtual.py:17; info.py:700-704. See `visit_virtual` for the
+    /// `fielddescr_indices` adaptation rationale (here the indices come
+    /// from each array element's `element_fields[0]` slot layout).
     fn visit_varraystruct(
         &mut self,
         arraydescr: &DescrRef,
         length: usize,
+        fielddescr_indices: &[u32],
         fielddescrs: &[DescrRef],
     ) -> Self::VInfo;
 

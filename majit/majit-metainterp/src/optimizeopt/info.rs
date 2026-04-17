@@ -278,6 +278,12 @@ pub struct StrPtrInfo {
     pub variant: VStringVariant,
     /// info.py:91-92: last_guard_pos
     pub last_guard_pos: i32,
+    /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` — inherited
+    /// through `StrPtrInfo(AbstractVirtualPtrInfo)` (vstring.py:50,55).
+    /// Same semantics as the sibling Virtual/VirtualArray/... variants:
+    /// `make_rd_virtual_info` dedups across finish() calls by comparing
+    /// fieldnums (resume.py:309-314).
+    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
 }
 
 /// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
@@ -1221,6 +1227,9 @@ impl PtrInfo {
             PtrInfo::VirtualArrayStruct(v) => Some(&v.cached_vinfo),
             PtrInfo::VirtualRawBuffer(v) => Some(&v.cached_vinfo),
             PtrInfo::VirtualRawSlice(v) => Some(&v.cached_vinfo),
+            // info.py:124-128 + vstring.py:50,55 — StrPtrInfo inherits
+            // _cached_vinfo from AbstractVirtualPtrInfo.
+            PtrInfo::Str(v) => Some(&v.cached_vinfo),
             _ => None,
         }
     }
@@ -1246,19 +1255,39 @@ impl PtrInfo {
     ) -> Option<V::VInfo> {
         match self {
             // info.py:331-334 InstancePtrInfo.visitor_dispatch_virtual_type
-            PtrInfo::Virtual(info) => Some(visitor.visit_virtual(&info.descr, &info.field_descrs)),
+            //
+            // **Pyre adaptation**: Majit's `fields` stores filled-only
+            // entries (`(field_index, OpRef)` pairs, no typeptr), so we
+            // forward the filled slot indices alongside the full descr
+            // list — see `walkvirtual::VirtualVisitor::visit_virtual` doc.
+            PtrInfo::Virtual(info) => {
+                let indices: Vec<u32> = info.fields.iter().map(|(fi, _)| *fi).collect();
+                Some(visitor.visit_virtual(&info.descr, &indices, &info.field_descrs))
+            }
             // info.py:369-372 StructPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualStruct(info) => {
-                Some(visitor.visit_vstruct(&info.descr, &info.field_descrs))
+                let indices: Vec<u32> = info.fields.iter().map(|(fi, _)| *fi).collect();
+                Some(visitor.visit_vstruct(&info.descr, &indices, &info.field_descrs))
             }
             // info.py:598-599 ArrayPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualArray(info) => Some(visitor.visit_varray(&info.descr, info.clear)),
             // info.py:701-704 ArrayStructInfo.visitor_dispatch_virtual_type
-            PtrInfo::VirtualArrayStruct(info) => Some(visitor.visit_varraystruct(
-                &info.descr,
-                info.element_fields.len(),
-                &info.fielddescrs,
-            )),
+            //
+            // **Pyre adaptation**: indices come from `element_fields[0]` —
+            // the per-element slot layout that each array item follows.
+            PtrInfo::VirtualArrayStruct(info) => {
+                let indices: Vec<u32> = info
+                    .element_fields
+                    .first()
+                    .map(|ef| ef.iter().map(|(fi, _)| *fi).collect())
+                    .unwrap_or_default();
+                Some(visitor.visit_varraystruct(
+                    &info.descr,
+                    info.element_fields.len(),
+                    &indices,
+                    &info.fielddescrs,
+                ))
+            }
             // info.py:445-450 RawBufferPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualRawBuffer(info) => {
                 Some(visitor.visit_vrawbuffer(info.func, info.size, &info.offsets, &info.descrs))
@@ -1678,6 +1707,7 @@ impl PtrInfo {
                         length: sinfo_full.length,
                         variant: VStringVariant::Ptr, // non-virtual
                         last_guard_pos: sinfo_full.last_guard_pos,
+                        cached_vinfo: std::cell::RefCell::new(None),
                     }),
                 );
 
@@ -3080,6 +3110,7 @@ mod tests {
                 _chars: vec![None, None],
             }),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         });
         assert!(plain.is_virtual());
 
@@ -3094,6 +3125,7 @@ mod tests {
                 lgtop: OpRef(3),
             }),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         });
         assert!(slice.is_virtual());
 
@@ -3108,6 +3140,7 @@ mod tests {
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         });
         assert!(concat.is_virtual());
 
@@ -3118,6 +3151,7 @@ mod tests {
             length: -1,
             variant: VStringVariant::Ptr,
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         });
         assert!(!ptr.is_virtual());
     }
@@ -3138,6 +3172,7 @@ mod tests {
                 _chars: vec![Some(OpRef(10)), Some(OpRef(11)), Some(OpRef(12))],
             }),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         });
 
         assert_eq!(
@@ -3169,6 +3204,7 @@ mod tests {
                     _chars: vec![Some(OpRef(10)), Some(OpRef(11)), Some(OpRef(12))],
                 }),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
 
@@ -3183,6 +3219,7 @@ mod tests {
                 lgtop: OpRef(21),
             }),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         });
         assert_eq!(slice.get_known_str_length(&ctx, 0), Some(2));
         assert_eq!(slice.get_constant_string_spec(&ctx, 0), Some(vec![98, 99]));
@@ -3199,6 +3236,7 @@ mod tests {
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
+            cached_vinfo: std::cell::RefCell::new(None),
         });
         ctx.set_ptr_info(
             OpRef(2),
@@ -3211,6 +3249,7 @@ mod tests {
                     _chars: vec![Some(OpRef(11)), Some(OpRef(12))],
                 }),
                 last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
             }),
         );
 

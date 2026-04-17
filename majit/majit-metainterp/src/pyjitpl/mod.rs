@@ -4089,6 +4089,8 @@ impl<M: Clone> MetaInterp<M> {
         // new_operations naturally — no restoration needed.
         let optimized_ops = optimized_ops;
         let num_ops_after = optimized_ops.len();
+        // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
+        optimizer.update_counters(&mut self.stats);
         // RPython compile.py:234 parity: transfer quasi-immutable deps
         // from optimizer to MetaInterp for post-compile watcher registration.
         self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
@@ -4423,6 +4425,8 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
 
+        // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
+        optimizer.update_counters(&mut self.stats);
         self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
 
         let num_ops_after = optimized_ops.len();
@@ -6117,6 +6121,8 @@ impl<M: Clone> MetaInterp<M> {
                 std::panic::resume_unwind(payload);
             }
         };
+        // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
+        optimizer.update_counters(&mut self.stats);
         // RPython-orthodox: unroll.py replay uses Const args directly;
         // no cross-trace constant pool merge step.
         if retrace_requested {
@@ -6473,6 +6479,8 @@ impl<M: Clone> MetaInterp<M> {
                 std::panic::resume_unwind(payload);
             }
         };
+        // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
+        optimizer.update_counters(&mut self.stats);
         // RPython-orthodox: no post-optimize cross-trace constant merge.
         // Short preamble replay (unroll.py) emits ops with Const args
         // directly; missing-constant recovery from source_trace is
