@@ -51,11 +51,6 @@ impl OptIntBounds {
         ctx.getintbound(opref)
     }
 
-    /// optimizer.py:115-125 setintbound — thin wrapper over `ctx.setintbound`.
-    fn setintbound(&mut self, opref: OpRef, bound: IntBound, ctx: &mut OptContext) {
-        ctx.setintbound(opref, &bound);
-    }
-
     /// Intersect a bound into the stored bound for opref. RPython:
     /// `self.getintbound(op).intersect(bound)` (mutates the IntBound stored
     /// on `op._forwarded` in place).
@@ -2478,7 +2473,7 @@ mod tests {
         // (everything else lives on `ctx.forwarded`), so we can spin up a
         // fresh one to drive the backward propagation step.
         let mut pass = OptIntBounds::new();
-        pass.setintbound(OpRef(1), IntBound::bounded(-5, -1), &mut ctx);
+        ctx.setintbound(OpRef(1), &IntBound::bounded(-5, -1));
         pass.propagate_bounds_backward(OpRef(1), &mut ctx);
         let b0 = ctx.getintbound(OpRef(0));
         assert!(
