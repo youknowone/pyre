@@ -76,7 +76,11 @@ fi
 
 BENCH=pyre/bench
 RESULTS=()
-ALL_COMPARISONS=()
+COMPARISON_NAMES=()
+COMPARISON_CPYTHON=()
+COMPARISON_PYPY=()
+COMPARISON_DYNASM=()
+COMPARISON_CRANELIFT=()
 DYNASM_PYRE=""
 CRANELIFT_PYRE=""
 DYNASM_PASS=0
@@ -94,12 +98,51 @@ time_user() {
     { /usr/bin/time -p "$@" >/dev/null; } 2>&1 | awk '/^user/{printf "%.2f\n", $2}'
 }
 
+comparison_index() {
+    local name="$1"
+    local i
+    for i in "${!COMPARISON_NAMES[@]}"; do
+        if [[ "${COMPARISON_NAMES[$i]}" == "$name" ]]; then
+            printf '%s\n' "$i"
+            return
+        fi
+    done
+    printf '%s\n' "-1"
+}
+
 append_comparison() {
     local backend="$1" name="$2" t_cpython="$3" t_pypy="$4" pyre_field="$5" note="${6:-}"
-    local row
-    row=$(printf '  %-10s  %-20s  %10s  %9s  %9s  %s' \
-        "$backend" "$name" "$t_cpython" "$t_pypy" "$pyre_field" "$note")
-    ALL_COMPARISONS+=("$row")
+    local idx cell
+    idx=$(comparison_index "$name")
+    if [[ "$idx" == "-1" ]]; then
+        idx="${#COMPARISON_NAMES[@]}"
+        COMPARISON_NAMES+=("$name")
+        COMPARISON_CPYTHON+=("$t_cpython")
+        COMPARISON_PYPY+=("$t_pypy")
+        COMPARISON_DYNASM+=("-")
+        COMPARISON_CRANELIFT+=("-")
+    else
+        COMPARISON_CPYTHON[$idx]="$t_cpython"
+        COMPARISON_PYPY[$idx]="$t_pypy"
+    fi
+
+    cell="$pyre_field"
+    if [[ -n "$note" ]]; then
+        note="${note#(}"
+        note="${note%)}"
+        note="${note% vs pypy}"
+        printf -v cell '%6s   %5s' "$pyre_field" "$note"
+    fi
+
+    case "$backend" in
+        dynasm)
+            COMPARISON_DYNASM[$idx]="$cell" ;;
+        cranelift)
+            COMPARISON_CRANELIFT[$idx]="$cell" ;;
+        *)
+            echo "ERROR: unknown backend '$backend' (use: dynasm, cranelift)" >&2
+            exit 1 ;;
+    esac
 }
 
 backend_timeout_scale() {
@@ -170,6 +213,56 @@ backend_enabled() {
     esac
 }
 
+print_backend_config() {
+    local parts=()
+    if backend_enabled dynasm; then
+        parts+=("dynasm=$DYNASM_PYRE(x$(backend_timeout_scale dynasm))")
+    fi
+    if backend_enabled cranelift; then
+        parts+=("cranelift=$CRANELIFT_PYRE(x$(backend_timeout_scale cranelift))")
+    fi
+    if [ ${#parts[@]} -gt 0 ]; then
+        printf 'backend: %s\n' "${parts[*]}"
+    fi
+}
+
+print_comparison_table() {
+    local i
+    bold "Comparison"; echo ""
+    if backend_enabled dynasm && backend_enabled cranelift; then
+        printf '  %-15s %8s %8s %18s %18s\n' "benchmark" "cpython" "pypy" "dynasm" "cranelift"
+        echo "  ──────────────────────────────────────────────────────────────────────────────────"
+        for i in "${!COMPARISON_NAMES[@]}"; do
+            printf '  %-15s %8s %8s %18s %18s\n' \
+                "${COMPARISON_NAMES[$i]}" \
+                "${COMPARISON_CPYTHON[$i]}" \
+                "${COMPARISON_PYPY[$i]}" \
+                "${COMPARISON_DYNASM[$i]}" \
+                "${COMPARISON_CRANELIFT[$i]}"
+        done
+    elif backend_enabled dynasm; then
+        printf '  %-15s %8s %8s %18s\n' "benchmark" "cpython" "pypy" "dynasm"
+        echo "  ────────────────────────────────────────────────────────────"
+        for i in "${!COMPARISON_NAMES[@]}"; do
+            printf '  %-15s %8s %8s %18s\n' \
+                "${COMPARISON_NAMES[$i]}" \
+                "${COMPARISON_CPYTHON[$i]}" \
+                "${COMPARISON_PYPY[$i]}" \
+                "${COMPARISON_DYNASM[$i]}"
+        done
+    elif backend_enabled cranelift; then
+        printf '  %-15s %8s %8s %18s\n' "benchmark" "cpython" "pypy" "cranelift"
+        echo "  ────────────────────────────────────────────────────────────"
+        for i in "${!COMPARISON_NAMES[@]}"; do
+            printf '  %-15s %8s %8s %18s\n' \
+                "${COMPARISON_NAMES[$i]}" \
+                "${COMPARISON_CPYTHON[$i]}" \
+                "${COMPARISON_PYPY[$i]}" \
+                "${COMPARISON_CRANELIFT[$i]}"
+        done
+    fi
+}
+
 scaled_timeout() {
     local base_timeout="$1"
     local scale="$2"
@@ -219,7 +312,6 @@ run_and_capture() {
 record_result() {
     local backend="$1" status="$2" name="$3" detail="$4"
     if [[ "$status" == "PASS" ]]; then
-        RESULTS+=("$(green "PASS") $backend $name  $detail")
         case "$backend" in
             dynasm) DYNASM_PASS=$((DYNASM_PASS + 1)) ;;
             cranelift) CRANELIFT_PASS=$((CRANELIFT_PASS + 1)) ;;
@@ -411,12 +503,7 @@ fi
 
 echo ""
 bold "pyre pre-merge check"; echo ""
-if backend_enabled dynasm; then
-    echo "binary[dynasm]: $DYNASM_PYRE  timeout-scale: $(backend_timeout_scale dynasm)"
-fi
-if backend_enabled cranelift; then
-    echo "binary[cranelift]: $CRANELIFT_PYRE  timeout-scale: $(backend_timeout_scale cranelift)"
-fi
+print_backend_config
 echo ""
 warmup_once "$BENCH/int_loop.py"
 echo ""
@@ -444,22 +531,10 @@ run_bench       "list_insert"    "$BENCH/list_insert.py"         5       ""     
 run_bench       "list_setslice"  "$BENCH/list_setslice.py"       5       10                    ""              10                       ""
 
 echo ""
-echo "─────────────────────────────────"
-for r in "${RESULTS[@]}"; do echo "  $r"; done
-echo "─────────────────────────────────"
-if backend_enabled dynasm; then
-    if [ $DYNASM_FAIL -gt 0 ]; then
-        echo "$(red "FAILED"): dynasm $DYNASM_FAIL failed, $DYNASM_PASS passed"
-    else
-        echo "$(green "ALL PASSED"): dynasm $DYNASM_PASS/$DYNASM_PASS"
-    fi
-fi
-if backend_enabled cranelift; then
-    if [ $CRANELIFT_FAIL -gt 0 ]; then
-        echo "$(red "FAILED"): cranelift $CRANELIFT_FAIL failed, $CRANELIFT_PASS passed"
-    else
-        echo "$(green "ALL PASSED"): cranelift $CRANELIFT_PASS/$CRANELIFT_PASS"
-    fi
+if [ ${#RESULTS[@]} -gt 0 ]; then
+    echo "─────────────────────────────────"
+    for r in "${RESULTS[@]}"; do echo "  $r"; done
+    echo "─────────────────────────────────"
 fi
 
 FAILED_BACKEND_RUNS=0
@@ -478,16 +553,27 @@ if backend_enabled cranelift; then
     ENABLED_BACKEND_RUNS=$((ENABLED_BACKEND_RUNS + 1))
 fi
 
+print_comparison_table
+echo ""
+if backend_enabled dynasm; then
+    if [ $DYNASM_FAIL -gt 0 ]; then
+        echo "$(red "FAILED"): dynasm $DYNASM_FAIL failed, $DYNASM_PASS passed"
+    else
+        echo "$(green "ALL PASSED"): dynasm $DYNASM_PASS/$DYNASM_PASS"
+    fi
+fi
+if backend_enabled cranelift; then
+    if [ $CRANELIFT_FAIL -gt 0 ]; then
+        echo "$(red "FAILED"): cranelift $CRANELIFT_FAIL failed, $CRANELIFT_PASS passed"
+    else
+        echo "$(green "ALL PASSED"): cranelift $CRANELIFT_PASS/$CRANELIFT_PASS"
+    fi
+fi
 if [ $FAILED_BACKEND_RUNS -gt 0 ]; then
     echo "$(red "FAILED"): $FAILED_BACKEND_RUNS backend run(s) failed"
 else
     echo "$(green "ALL PASSED"): ${ENABLED_BACKEND_RUNS}/${ENABLED_BACKEND_RUNS} backend run(s)"
 fi
-echo ""
-bold "Comparison"; echo ""
-printf '  %-10s  %-20s  %10s  %9s  %9s  %s\n' "backend" "benchmark" "cpython" "pypy" "pyre" ""
-echo "  ─────────────────────────────────────────────────────────────────────────────────────"
-for c in "${ALL_COMPARISONS[@]}"; do echo "$c"; done
 if [ $FAILED_BACKEND_RUNS -gt 0 ]; then
     exit 1
 fi
