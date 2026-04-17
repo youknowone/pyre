@@ -1722,9 +1722,12 @@ impl OptContext {
         self.force_op_from_preamble_op(&pop)
     }
 
-    /// shortpreamble.py:383-396,401-406: collect guards from PtrInfo
-    /// of preamble_op's args and result.
+    /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
+    /// info of preamble_op's args and result. RPython's `info = arg.get_forwarded()`
+    /// returns whatever is stored — PtrInfo *or* IntBound — and calls
+    /// `info.make_guards(...)` uniformly.
     fn collect_use_box_guards(&mut self, preamble_op: &Op) -> (Vec<Op>, Vec<Op>) {
+        use crate::optimizeopt::info::Forwarded;
         // shortpreamble.py:383-396: guards for InputArg args only
         let short_inputargs: Vec<OpRef> = self
             .imported_short_preamble_builder
@@ -1737,17 +1740,33 @@ impl OptContext {
             })
             .unwrap_or_default();
 
-        // Collect (arg, PtrInfo clone) pairs to avoid borrow conflicts
-        let arg_infos: Vec<(OpRef, PtrInfo)> = preamble_op
+        // Snapshot forwarded state per arg to avoid borrow conflicts during
+        // guard emission. `Forwarded::Info` carries PtrInfo; `Forwarded::IntBound`
+        // carries integer range info — both produce guards.
+        enum ForwardedInfo {
+            Ptr(PtrInfo),
+            Int(crate::optimizeopt::intutils::IntBound),
+        }
+        let snapshot_forwarded = |ctx: &Self, arg: OpRef| -> Option<ForwardedInfo> {
+            let replaced = ctx.get_box_replacement(arg);
+            let idx = replaced.0 as usize;
+            if idx >= ctx.forwarded.len() {
+                return None;
+            }
+            match &ctx.forwarded[idx] {
+                Forwarded::Info(info) => Some(ForwardedInfo::Ptr(info.clone())),
+                Forwarded::IntBound(b) => Some(ForwardedInfo::Int(b.clone())),
+                _ => None,
+            }
+        };
+        let arg_infos: Vec<(OpRef, ForwardedInfo)> = preamble_op
             .args
             .iter()
             .filter(|arg| short_inputargs.contains(arg))
-            .filter_map(|&arg| self.get_ptr_info(arg).cloned().map(|info| (arg, info)))
+            .filter_map(|&arg| snapshot_forwarded(self, arg).map(|info| (arg, info)))
             .collect();
-        let result_info = self
-            .get_ptr_info(preamble_op.pos)
-            .cloned()
-            .map(|info| (preamble_op.pos, info));
+        let result_info: Option<(OpRef, ForwardedInfo)> =
+            snapshot_forwarded(self, preamble_op.pos).map(|info| (preamble_op.pos, info));
 
         // Now generate guards — alloc_const directly allocates constant
         // OpRefs, matching RPython where ConstInt/ConstPtr are created inline.
@@ -1758,11 +1777,21 @@ impl OptContext {
             pos
         };
         for (arg, info) in &arg_infos {
-            info.make_guards(*arg, &mut arg_guards, &mut alloc_const);
+            match info {
+                ForwardedInfo::Ptr(p) => p.make_guards(*arg, &mut arg_guards, &mut alloc_const),
+                ForwardedInfo::Int(b) => b.make_guards(*arg, &mut arg_guards, &mut alloc_const),
+            }
         }
         let mut result_guards = Vec::new();
         if let Some((result_ref, info)) = &result_info {
-            info.make_guards(*result_ref, &mut result_guards, &mut alloc_const);
+            match info {
+                ForwardedInfo::Ptr(p) => {
+                    p.make_guards(*result_ref, &mut result_guards, &mut alloc_const)
+                }
+                ForwardedInfo::Int(b) => {
+                    b.make_guards(*result_ref, &mut result_guards, &mut alloc_const)
+                }
+            }
         }
         (arg_guards, result_guards)
     }
@@ -1951,14 +1980,12 @@ impl OptContext {
             OpInfo::Ptr(ptr_info) => {
                 self.setinfo_from_preamble(target, ptr_info, Some(exported_infos));
             }
-            // unroll.py:93-96 IntBound with widen().
+            // unroll.py:93-96 IntBound with widen(): intersect unconditionally.
             OpInfo::IntBound(bound) => {
                 let widened = bound.widen();
-                if widened.lower != i64::MIN || widened.upper != i64::MAX {
-                    self.with_intbound_mut(target, |bm| {
-                        let _ = bm.intersect(&widened);
-                    });
-                }
+                self.with_intbound_mut(target, |bm| {
+                    let _ = bm.intersect(&widened);
+                });
             }
             // unroll.py:97-98 FloatConstInfo: op.set_forwarded(preamble_info._const)
             OpInfo::FloatConst(f) => {
