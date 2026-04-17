@@ -10654,50 +10654,46 @@ pub struct SwitchToBlackhole {
     pub raising_exception: bool,
 }
 
-/// history.py `Counters.*` constants for `SwitchToBlackhole.reason`.
-/// Pyre carries them as raw `i32`s so the eventual hook payload stays
-/// stable; only the variants pyre currently signals are populated.
-///
-/// Values follow `rpython/rlib/jit.py` `class Counters` declaration
-/// order (ABORT_TOO_LONG=12, ABORT_BRIDGE=13, ABORT_BAD_LOOP=14).
+/// rlib/jit.py:1414 `Counters.*` constants used as
+/// `SwitchToBlackhole.reason`. Pyre carries them as raw `i32`s so the
+/// eventual hook payload stays stable. Values match the declaration
+/// order in jit.py:1416-1442 so future Counter additions slot in
+/// without renumbering.
+#[allow(dead_code)]
 pub mod counters {
-    /// `Counters.ABORT_ESCAPE` — an `OS_NOT_IN_TRACE` call raised.
-    pub const ABORT_ESCAPE: i32 = 0;
-    /// `Counters.ABORT_BRIDGE` — `compile.giveup()` per
-    /// `rpython/jit/metainterp/compile.py:27`.  Raised from the
-    /// `compile_trace` FINISH path when the optimizer / backend refuses
-    /// the trace (InvalidLoop, compile_loop Err).  pyjitpl.py:3218 and
-    /// pyjitpl.py:3243 call `compile.compile_trace` which in turn
-    /// dispatches to `compile.giveup()` on failure.
+    /// jit.py:1428 `Counters.ABORT_TOO_LONG`.
+    pub const ABORT_TOO_LONG: i32 = 12;
+    /// jit.py:1429 `Counters.ABORT_BRIDGE`.
     pub const ABORT_BRIDGE: i32 = 13;
-    /// `Counters.ABORT_BAD_LOOP` — `compile.compile_loop` failure at
-    /// the JUMP-terminated loop path (pyjitpl.py:3028).  Distinct from
-    /// `ABORT_BRIDGE` which covers the FINISH-terminated compile_trace
-    /// path.
+    /// jit.py:1430 `Counters.ABORT_BAD_LOOP`.
     pub const ABORT_BAD_LOOP: i32 = 14;
+    /// jit.py:1431 `Counters.ABORT_ESCAPE`.
+    pub const ABORT_ESCAPE: i32 = 15;
+    /// jit.py:1432 `Counters.ABORT_FORCE_QUASIIMMUT`.
+    pub const ABORT_FORCE_QUASIIMMUT: i32 = 16;
+    /// jit.py:1433 `Counters.ABORT_SEGMENTED_TRACE`.
+    pub const ABORT_SEGMENTED_TRACE: i32 = 17;
 }
 
 impl SwitchToBlackhole {
+    /// compile.py:27-29 giveup() — raises `SwitchToBlackhole(ABORT_BRIDGE)`.
+    ///
+    /// The canonical "the optimizer is about to crash, bail to blackhole"
+    /// escape hatch. Callers do `raise compile.giveup()` in RPython
+    /// (pyjitpl.py:1668/2899/3220/3245, optimizer.py:740). In Rust we
+    /// `return Err(SwitchToBlackhole::giveup())`.
+    pub fn giveup() -> Self {
+        Self {
+            reason: counters::ABORT_BRIDGE,
+            raising_exception: false,
+        }
+    }
+
     /// Construct a `SwitchToBlackhole(Counters.ABORT_ESCAPE)` per
     /// pyjitpl.py:3691-3692 — `OS_NOT_IN_TRACE` call raised during tracing.
     pub fn abort_escape() -> Self {
         Self {
             reason: counters::ABORT_ESCAPE,
-            raising_exception: false,
-        }
-    }
-
-    /// Construct a `SwitchToBlackhole(Counters.ABORT_BRIDGE)` — the
-    /// direct analog of `compile.giveup()` at
-    /// `rpython/jit/metainterp/compile.py:27`.  Used from the
-    /// `compile_trace` FINISH path (pyjitpl.py:3218, :3243 →
-    /// `compile.compile_trace` → `giveup()`) on InvalidLoop or
-    /// backend-compile failure, so both compile_done_with_this_frame
-    /// and compile_exit_frame_with_exception surface the same abort
-    /// reason upstream does.
-    pub fn giveup() -> Self {
-        Self {
-            reason: counters::ABORT_BRIDGE,
             raising_exception: false,
         }
     }

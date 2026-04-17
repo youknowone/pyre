@@ -1203,6 +1203,60 @@ impl PtrInfo {
         }
     }
 
+    /// info.py:331 / 369 / 376 / 445 / 485 / 598 / 701 +
+    /// vstring.py:211 / 263 / 333 `visitor_dispatch_virtual_type`.
+    ///
+    /// Each virtual `PtrInfo` subclass implements `visitor_dispatch_virtual_type(visitor)`
+    /// which calls the corresponding `visitor.visit_*()` method with the
+    /// subclass's static metadata (descr, fielddescrs, array clear flag,
+    /// raw buffer offsets, etc.). The visitor is free to produce a
+    /// `VInfo` per call; the same visitor pattern is shared by
+    /// `ResumeDataVirtualAdder` (resume.py:312) and `VirtualStateConstructor`
+    /// (virtualstate.py:721).
+    ///
+    /// Returns `None` for non-virtual `PtrInfo` variants — RPython's
+    /// `visitor_dispatch_virtual_type` is only defined on
+    /// `AbstractVirtualPtrInfo` subclasses, so callers must check
+    /// `is_virtual()` first.
+    pub fn visitor_dispatch_virtual_type<V: crate::walkvirtual::VirtualVisitor>(
+        &self,
+        visitor: &mut V,
+    ) -> Option<V::VInfo> {
+        match self {
+            // info.py:331-334 InstancePtrInfo.visitor_dispatch_virtual_type
+            PtrInfo::Virtual(info) => Some(visitor.visit_virtual(&info.descr, &info.field_descrs)),
+            // info.py:369-372 StructPtrInfo.visitor_dispatch_virtual_type
+            PtrInfo::VirtualStruct(info) => {
+                Some(visitor.visit_vstruct(&info.descr, &info.field_descrs))
+            }
+            // info.py:598-599 ArrayPtrInfo.visitor_dispatch_virtual_type
+            PtrInfo::VirtualArray(info) => Some(visitor.visit_varray(&info.descr, info.clear)),
+            // info.py:701-704 ArrayStructInfo.visitor_dispatch_virtual_type
+            PtrInfo::VirtualArrayStruct(info) => Some(visitor.visit_varraystruct(
+                &info.descr,
+                info.element_fields.len(),
+                &info.fielddescrs,
+            )),
+            // info.py:445-450 RawBufferPtrInfo.visitor_dispatch_virtual_type
+            PtrInfo::VirtualRawBuffer(info) => {
+                Some(visitor.visit_vrawbuffer(info.func, info.size, &info.offsets, &info.descrs))
+            }
+            // info.py:485-486 RawSlicePtrInfo.visitor_dispatch_virtual_type
+            PtrInfo::VirtualRawSlice(info) => Some(visitor.visit_vrawslice(info.offset)),
+            // vstring.py:211-212 / 263-264 / 333-334 per-variant dispatch
+            PtrInfo::Str(info) if info.is_virtual() => {
+                let is_unicode = info.mode != 0;
+                Some(match &info.variant {
+                    VStringVariant::Plain(_) => visitor.visit_vstrplain(is_unicode),
+                    VStringVariant::Concat(_) => visitor.visit_vstrconcat(is_unicode),
+                    VStringVariant::Slice(_) => visitor.visit_vstrslice(is_unicode),
+                    VStringVariant::Ptr => unreachable!("non-virtual Str reached virtual arm"),
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// info.py:137-160 / 222-226: force_box() emits the allocation and
     /// field writes via emit_extra(), recursively forcing child virtuals.
     ///

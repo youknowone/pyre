@@ -336,6 +336,31 @@ impl OptVirtualize {
         ctx.set_ptr_info(source_op.pos, PtrInfo::VirtualRawSlice(opinfo));
     }
 
+    /// virtualize.py:52-58 make_virtual_raw_memory
+    ///
+    /// Create a VirtualRawBufferInfo for a RAW_MALLOC_VARSIZE_CHAR
+    /// result. `func` comes from source_op.getarg(0); size is the
+    /// constant-folded allocation length.
+    fn make_virtual_raw_memory(
+        &mut self,
+        size: usize,
+        func: i64,
+        source_op: &Op,
+        ctx: &mut OptContext,
+    ) {
+        let opinfo = crate::optimizeopt::info::VirtualRawBufferInfo {
+            func,
+            size,
+            offsets: Vec::new(),
+            lengths: Vec::new(),
+            descrs: Vec::new(),
+            values: Vec::new(),
+            last_guard_pos: -1,
+            calldescr: source_op.descr.clone(),
+        };
+        ctx.set_ptr_info(source_op.pos, PtrInfo::VirtualRawBuffer(opinfo));
+    }
+
     /// Resolve a slice/buffer alias chain to the underlying parent OpRef and
     /// the cumulative byte offset. Returns `(parent, total_offset)` when the
     /// chain ends in a `VirtualRawBuffer`, or `None` otherwise.
@@ -1326,21 +1351,9 @@ impl Optimization for OptVirtualize {
                             //   self.last_emitted_operation = REMOVED
                             if op.num_args() >= 2 {
                                 if let Some(size) = ctx.get_constant_int(op.arg(1)) {
-                                    // resume.py:694: self.func = source_op.getarg(0).getint()
+                                    // virtualize.py:53 func = source_op.getarg(0).getint()
                                     let func = ctx.get_constant_int(op.arg(0)).unwrap_or(0);
-                                    let info = PtrInfo::VirtualRawBuffer(
-                                        crate::optimizeopt::info::VirtualRawBufferInfo {
-                                            func,
-                                            size: size as usize,
-                                            offsets: Vec::new(),
-                                            lengths: Vec::new(),
-                                            descrs: Vec::new(),
-                                            values: Vec::new(),
-                                            last_guard_pos: -1,
-                                            calldescr: op.descr.clone(),
-                                        },
-                                    );
-                                    ctx.set_ptr_info(op.pos, info);
+                                    self.make_virtual_raw_memory(size as usize, func, op, ctx);
                                     self.last_emitted_was_removed = true;
                                     return OptimizationResult::Remove;
                                 }
