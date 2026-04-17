@@ -25,35 +25,20 @@ use crate::jitframe::JitFrame;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 
-/// Per-target metadata for a CALL_ASSEMBLER callee token.
-///
-/// RPython stores `descr._ll_function_addr` on the target token alongside
-/// `compiled_loop_token._ll_initial_locs`, `frame_info`, and
-/// `outermost_jitdriver_sd.index_of_virtualizable`. Dynasm previously
-/// only kept the code address; the other fields are required to wire
-/// `handle_call_assembler` (rewrite.py:665-695) on the dynasm path.
-///
-/// `frame_info` is a leaked `Box<[isize; 2]>` with a stable address that
-/// survives across registry updates, matching RPython's in-place frame
-/// info allocation (rewrite.py:669).
-pub(crate) struct DynasmLoopTarget {
-    pub code_addr: usize,
-    pub num_inputs: usize,
-    pub num_scalar_inputargs: usize,
-    pub _ll_initial_locs: Vec<i32>,
-    pub index_of_virtualizable: i32,
-    pub frame_info: *mut [isize; 2],
-}
-
-unsafe impl Send for DynasmLoopTarget {}
-unsafe impl Sync for DynasmLoopTarget {}
-
 /// Global CALL_ASSEMBLER target registry.
 ///
-/// RPython stores `descr._ll_function_addr` on the target token. Dynasm
-/// resolves the target by token number at compile time, so keep a process-wide
-/// token_number -> DynasmLoopTarget map of compiled loop entries.
-static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, DynasmLoopTarget>>> =
+/// RPython stores `descr._ll_function_addr` on the target token
+/// (x86/assembler.py:599) so `CALL_ASSEMBLER` can resolve the callee
+/// address directly from the descriptor. pyre identifies callee tokens
+/// by `u64 token_number` inside `MetaCallAssemblerDescr` (pyre PRE-
+/// EXISTING-ADAPTATION — serializable descriptors), so a process-wide
+/// `token_number -> _ll_function_addr` index is required.
+///
+/// Metadata orthodox to `CompiledLoopToken` (`_ll_initial_locs`,
+/// `frame_info`, `index_of_virtualizable`) lives on the token itself,
+/// not in this registry — `handle_call_assembler` (rewrite.py:665-695)
+/// reads it from `token.compiled_loop_token`.
+static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
@@ -395,7 +380,7 @@ impl DynasmBackend {
         }
 
         // Search bridge fail_descrs in asmmemmgr_blocks
-        let blocks = token.asmmemmgr_blocks.lock();
+        let blocks = token.asmmemmgr_blocks();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if let Some(found) = bridge
@@ -442,7 +427,7 @@ impl DynasmBackend {
         {
             return found.clone();
         }
-        let blocks = token.asmmemmgr_blocks.lock();
+        let blocks = token.asmmemmgr_blocks();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if let Some(found) = bridge
@@ -468,54 +453,33 @@ impl DynasmBackend {
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
             .iter()
-            .filter(|(_k, t)| t.code_addr != 0) // exclude pending
-            .map(|(&k, t)| (k, t.code_addr))
+            .filter_map(|(&k, &addr)| if addr != 0 { Some((k, addr)) } else { None })
             .collect()
     }
 
     fn register_call_assembler_target(token_number: u64, code_addr: usize) {
-        let mut map = CALL_ASSEMBLER_TARGETS
+        CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned");
-        let entry = map.entry(token_number).or_insert_with(|| DynasmLoopTarget {
-            code_addr: 0,
-            num_inputs: 0,
-            num_scalar_inputargs: 0,
-            _ll_initial_locs: Vec::new(),
-            index_of_virtualizable: -1,
-            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
-        });
-        entry.code_addr = code_addr;
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .insert(token_number, code_addr);
     }
 
     fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
-        let mut map = CALL_ASSEMBLER_TARGETS
+        CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned");
-        let entry = map.entry(old_number).or_insert_with(|| DynasmLoopTarget {
-            code_addr: 0,
-            num_inputs: 0,
-            num_scalar_inputargs: 0,
-            _ll_initial_locs: Vec::new(),
-            index_of_virtualizable: -1,
-            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
-        });
-        entry.code_addr = new_addr;
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .insert(old_number, new_addr);
     }
 
-    /// Static entry point for lib.rs register_pending_call_assembler_target.
+    /// Static entry point for `lib.rs register_pending_call_assembler_target`.
+    /// Inserts `code_addr = 0` (pending) so `call_assembler_targets_snapshot`
+    /// filters it out; `compile_loop` overwrites with the real address.
     pub fn register_pending_call_assembler_target_static(token_number: u64) {
-        let mut map = CALL_ASSEMBLER_TARGETS
+        CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned");
-        map.entry(token_number).or_insert_with(|| DynasmLoopTarget {
-            code_addr: 0,
-            num_inputs: 0,
-            num_scalar_inputargs: 0,
-            _ll_initial_locs: Vec::new(),
-            index_of_virtualizable: -1,
-            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
-        });
+            .expect("CALL_ASSEMBLER_TARGETS poisoned")
+            .entry(token_number)
+            .or_insert(0);
     }
 }
 
@@ -609,10 +573,7 @@ impl Backend for DynasmBackend {
         // dangling pointers when a bridge-internal guard fires.
         // RPython's asmmemmgr ties code blocks and their resume
         // descriptors to the same compiled_loop_token lifetime.
-        original_token
-            .asmmemmgr_blocks
-            .lock()
-            .push(Box::new(compiled));
+        original_token.asmmemmgr_blocks().push(Box::new(compiled));
 
         Ok(AsmInfo {
             code_addr: bridge_addr,
@@ -856,14 +817,40 @@ impl Backend for DynasmBackend {
     ) -> Result<(), BackendError> {
         let old_compiled = Self::get_compiled(old);
         let new_compiled = Self::get_compiled(new);
-        // assembler.py:1148-1151 update_frame_info parity: propagate
-        // new loop's frame_depth to old token so that callers entering
-        // via the old token allocate a jitframe large enough for the
-        // new (potentially deeper) loop body.
-        let new_depth = new_compiled.frame_depth.load(Ordering::Acquire);
-        old_compiled
-            .frame_depth
-            .fetch_max(new_depth, Ordering::Release);
+        // x86/assembler.py:1148-1151 update_frame_info parity: propagate
+        // new loop's frame depth onto the old token and every token in
+        // its existing redirect chain. `baseofs = 0` for pyre — we do
+        // not track `get_baseofs_of_frame_field()` on the dynasm path
+        // (backends that need a non-zero base should pass it through
+        // their `self.cpu` equivalent).
+        if let (Some(new_clt), Some(old_clt)) = (
+            new.compiled_loop_token.as_ref(),
+            old.compiled_loop_token.as_ref(),
+        ) {
+            // Seed new's CompiledLoopToken.frame_info.jfi_frame_depth
+            // from the backend-specific compiled code depth so
+            // update_frame_info has a non-zero value to propagate.
+            let new_depth = new_compiled.frame_depth.load(Ordering::Acquire);
+            new_clt
+                .frame_info
+                .lock()
+                .update_frame_depth(0, new_depth as i64);
+            // model.py:316-329 update_frame_info — pass old CLT with a
+            // weak ref for the "append self to chain" step (line 328
+            // `new_loop_tokens.append(weakref.ref(oldlooptoken))`).
+            let old_weak = Arc::downgrade(old_clt);
+            new_clt.update_frame_info(old_clt, old_weak, 0);
+            // Keep the backend-specific frame_depth in lockstep so bridge
+            // codegen's existing readers (CompiledCode.frame_depth) also
+            // see the propagated value. PRE-EXISTING-ADAPTATION: RPython
+            // reads the depth back from `compiled_loop_token.frame_info`;
+            // dynasm's codegen reads `CompiledCode.frame_depth`. Writing
+            // both keeps the orthodox field authoritative while the
+            // reader migration lands.
+            old_compiled
+                .frame_depth
+                .fetch_max(new_depth, Ordering::Release);
+        }
         let old_addr = codebuf::buffer_ptr(&old_compiled.buffer);
         let new_addr = codebuf::buffer_ptr(&new_compiled.buffer);
         Asm::redirect_call_assembler(old_addr, new_addr);
@@ -906,7 +893,7 @@ impl Backend for DynasmBackend {
         if bridge_addr == 0 {
             return;
         }
-        let blocks = token.asmmemmgr_blocks.lock();
+        let blocks = token.asmmemmgr_blocks();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
@@ -1020,33 +1007,25 @@ impl Backend for DynasmBackend {
         &mut self,
         token_number: u64,
         _input_types: Vec<Type>,
-        num_inputs: usize,
-        num_scalar_inputargs: usize,
-        index_of_virtualizable: i32,
+        _num_inputs: usize,
+        _num_scalar_inputargs: usize,
+        _index_of_virtualizable: i32,
     ) {
-        // Insert with code_addr = 0 (pending). call_assembler_targets_snapshot
-        // will include this entry, but Assembler386.call_assembler_targets
-        // won't find a nonzero address, so the generated code takes the
-        // "unresolved target" path → helper trampoline → force_fn.
-        // compile_loop later overwrites with the real code_addr.
+        // Insert code_addr = 0 (pending). call_assembler_targets_snapshot
+        // excludes pending entries, so the generated CALL_ASSEMBLER code
+        // takes the "unresolved target" path → helper trampoline →
+        // force_fn. `compile_loop` overwrites with the real code_addr.
         //
-        // Populate metadata mirroring Cranelift's RegisteredLoopTarget so the
-        // GC rewriter's handle_call_assembler (rewrite.py:665-695) can later
-        // dispatch through the dynasm backend as well. For now no consumer
-        // reads these fields — see tasks #134 / #120.
-        let mut map = CALL_ASSEMBLER_TARGETS
-            .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned");
-        map.entry(token_number).or_insert_with(|| DynasmLoopTarget {
-            code_addr: 0,
-            num_inputs,
-            num_scalar_inputargs,
-            // regalloc.py:871 _ll_initial_locs — pyre uses contiguous
-            // word-sized inputarg slots, matching cranelift's convention.
-            _ll_initial_locs: (0..num_inputs).map(|i| (i as i32) * 8).collect(),
-            index_of_virtualizable,
-            frame_info: Box::into_raw(Box::new([0isize, 0isize])),
-        });
+        // The typed-metadata args (`num_inputs`, `num_scalar_inputargs`,
+        // `index_of_virtualizable`) are the cranelift backend's API —
+        // dynasm does not consume them because the address registry is
+        // purely a `token_number -> _ll_function_addr` index. RPython
+        // parity: `x86/assembler.py:599` stores `_ll_function_addr` on
+        // the looptoken; pyre serializes the token by number, so this
+        // HashMap is the minimum adaptation needed. Orthodox metadata
+        // (`_ll_initial_locs`, `frame_info`) lives on
+        // `token.compiled_loop_token` (`model.py:293-294`).
+        Self::register_pending_call_assembler_target_static(token_number);
     }
 
     fn compiled_fail_descr_layouts(
@@ -1067,7 +1046,7 @@ impl Backend for DynasmBackend {
             return Some(compiled.fail_descrs.iter().map(|d| d.layout()).collect());
         }
         // Search bridge fail_descrs in asmmemmgr_blocks.
-        let blocks = token.asmmemmgr_blocks.lock();
+        let blocks = token.asmmemmgr_blocks();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.trace_id == trace_id {
@@ -1089,7 +1068,7 @@ impl Backend for DynasmBackend {
         if bridge_addr == 0 {
             return None;
         }
-        let blocks = original_token.asmmemmgr_blocks.lock();
+        let blocks = original_token.asmmemmgr_blocks();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;

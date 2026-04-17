@@ -635,6 +635,154 @@ impl std::fmt::Debug for LoopVersionInfo {
     }
 }
 
+/// `rpython/jit/backend/llsupport/jitframe.py:30-40` `JITFRAMEINFO` parity.
+///
+/// Runtime frame depth/size carried on each `CompiledLoopToken`. Mutated
+/// in-place via `update_frame_depth` when bridges extend the frame layout.
+#[derive(Debug, Default)]
+pub struct JitFrameInfo {
+    /// `jitframe.py:33` `('jfi_frame_depth', lltype.Signed)`.
+    pub jfi_frame_depth: i64,
+    /// `jitframe.py:35` `('jfi_frame_size', lltype.Signed)`.
+    pub jfi_frame_size: i64,
+}
+
+impl JitFrameInfo {
+    /// `rpython/jit/backend/llsupport/jitframe.py:18-22`
+    /// `jitframeinfo_update_depth(jfi, base_ofs, new_depth)`.
+    pub fn update_frame_depth(&mut self, base_ofs: i64, new_depth: i64) {
+        // jitframe.py:8 `SIZEOFSIGNED = rffi.sizeof(lltype.Signed)`; 64-bit target.
+        const SIZEOFSIGNED: i64 = 8;
+        if new_depth > self.jfi_frame_depth {
+            self.jfi_frame_depth = new_depth;
+            self.jfi_frame_size = base_ofs + new_depth * SIZEOFSIGNED;
+        }
+    }
+
+    /// `rpython/jit/backend/llsupport/jitframe.py:24-26` `jitframeinfo_clear`.
+    pub fn clear(&mut self) {
+        self.jfi_frame_size = 0;
+        self.jfi_frame_depth = 0;
+    }
+}
+
+/// `rpython/jit/backend/model.py:292-338` `CompiledLoopToken` parity.
+///
+/// Per-loop metadata attached to `JitCellToken.compiled_loop_token`.
+/// Mutation goes through `parking_lot::Mutex` on individual fields because
+/// pyre reaches these from `&JitCellToken` shared refs (bridge compilation
+/// under concurrent execution) — RPython mutates through the GIL instead.
+pub struct CompiledLoopToken {
+    /// `model.py:299` `self.number = number`.
+    pub number: u64,
+    /// `model.py:300` `self.bridges_count = 0`.
+    pub bridges_count: parking_lot::Mutex<usize>,
+    /// `model.py:301` `self.invalidate_positions = []`.
+    pub invalidate_positions: parking_lot::Mutex<Vec<usize>>,
+    /// `model.py:302-304` `self.looptokens_redirected_to = []` — weak
+    /// references to `CompiledLoopToken` instances previously redirected
+    /// to this one via `redirect_call_assembler`.
+    /// `x86/assembler.py:1150-1151` shows that
+    /// `newlooptoken.compiled_loop_token.update_frame_info(
+    ///     oldlooptoken.compiled_loop_token, baseofs)` passes the
+    /// `CompiledLoopToken` (not `JitCellToken`), so the chain stores
+    /// weak refs to `CompiledLoopToken`.
+    pub looptokens_redirected_to: parking_lot::Mutex<Vec<std::sync::Weak<CompiledLoopToken>>>,
+    /// `model.py:293` `asmmemmgr_blocks = None` (class default — lazy-init
+    /// on first access, see `llsupport/assembler.py:184-188`
+    /// `get_asmmemmgr_blocks`). pyre eagerly initializes to an empty Vec;
+    /// the `None` sentinel is a Python idiom not needed on Rust.
+    pub asmmemmgr_blocks: parking_lot::Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    /// `model.py:294` `asmmemmgr_gcreftracers = None`; parity shape
+    /// reserved for the GC ref-tracer lifecycle (llsupport/assembler.py:190).
+    /// Eagerly empty (same rationale as `asmmemmgr_blocks`).
+    pub asmmemmgr_gcreftracers: parking_lot::Mutex<Vec<Arc<dyn std::any::Any + Send + Sync>>>,
+    /// `x86/assembler.py:514` `looptoken.compiled_loop_token.frame_info`
+    /// is populated by the backend when assembling this loop. Mutated
+    /// in-place by bridges via `update_frame_info` (model.py:316-329).
+    pub frame_info: parking_lot::Mutex<JitFrameInfo>,
+    /// `rpython/jit/backend/llsupport/regalloc.py:861-871`
+    /// `_set_initial_bindings` assigns
+    /// `looptoken.compiled_loop_token._ll_initial_locs = locs` — the
+    /// inputarg slot offsets (in bytes, relative to the frame base) that
+    /// `CALL_ASSEMBLER` uses in `handle_call_assembler`
+    /// (rewrite.py:673) to spill callee arguments.
+    pub _ll_initial_locs: parking_lot::Mutex<Vec<i32>>,
+}
+
+impl CompiledLoopToken {
+    /// `model.py:296-307` `__init__(self, cpu, number)`. The `cpu` is
+    /// implicit in pyre — the owning `Backend` holds the token lifetime.
+    pub fn new(number: u64) -> Self {
+        CompiledLoopToken {
+            number,
+            bridges_count: parking_lot::Mutex::new(0),
+            invalidate_positions: parking_lot::Mutex::new(Vec::new()),
+            looptokens_redirected_to: parking_lot::Mutex::new(Vec::new()),
+            asmmemmgr_blocks: parking_lot::Mutex::new(Vec::new()),
+            asmmemmgr_gcreftracers: parking_lot::Mutex::new(Vec::new()),
+            frame_info: parking_lot::Mutex::new(JitFrameInfo::default()),
+            _ll_initial_locs: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `model.py:309-314` `compiling_a_bridge(self)`. The accompanying
+    /// `self.cpu.tracker.total_compiled_bridges += 1` and
+    /// `debug_start/debug_print/debug_stop` on the RPython side are
+    /// **PRE-EXISTING-ADAPTATION** (pyre has no global `cpu.tracker`
+    /// counter and uses `tracing` crate instead of `rpython.rlib.debug`).
+    pub fn compiling_a_bridge(&self) {
+        *self.bridges_count.lock() += 1;
+    }
+
+    /// `rpython/jit/backend/model.py:316-329`
+    /// `update_frame_info(self, oldlooptoken, baseofs)`.
+    ///
+    /// `self` is the *new* looptoken's `CompiledLoopToken`, `oldlooptoken`
+    /// is the previous one (and its weak self-ref), `baseofs` is
+    /// `cpu.get_baseofs_of_frame_field()`. Propagates `self.frame_info`
+    /// depth to every `CompiledLoopToken` in
+    /// `oldlooptoken.looptokens_redirected_to` (dropping dead weak refs),
+    /// to `oldlooptoken` itself, and appends the provided weak ref to
+    /// this new token's redirect chain.
+    pub fn update_frame_info(
+        &self,
+        oldlooptoken: &CompiledLoopToken,
+        oldlooptoken_weak: std::sync::Weak<CompiledLoopToken>,
+        baseofs: i64,
+    ) {
+        // `model.py:317` `new_fi = self.frame_info`
+        // `model.py:318` `new_loop_tokens = []`
+        let new_fi_depth = self.frame_info.lock().jfi_frame_depth;
+        let mut new_loop_tokens: Vec<std::sync::Weak<CompiledLoopToken>> = Vec::new();
+        // `model.py:319-324` propagate depth through the old token's
+        // existing redirect chain, dropping dead weak refs (`ref()` →
+        // `None` in CPython), and keep the live ones.
+        let old_chain = oldlooptoken.looptokens_redirected_to.lock().clone();
+        for weak in old_chain {
+            if let Some(target) = weak.upgrade() {
+                target
+                    .frame_info
+                    .lock()
+                    .update_frame_depth(baseofs, new_fi_depth);
+                new_loop_tokens.push(weak);
+            }
+        }
+        // `model.py:325-326` update the old token's own frame_info.
+        oldlooptoken
+            .frame_info
+            .lock()
+            .update_frame_depth(baseofs, new_fi_depth);
+        // `model.py:327-328` `assert oldlooptoken is not None;
+        // new_loop_tokens.append(weakref.ref(oldlooptoken))` — the
+        // caller provides the weak ref (Rust can't derive it from a
+        // borrow alone; the owning Arc stays in `JitCellToken`).
+        new_loop_tokens.push(oldlooptoken_weak);
+        // `model.py:329` `self.looptokens_redirected_to = new_loop_tokens`
+        *self.looptokens_redirected_to.lock() = new_loop_tokens;
+    }
+}
+
 /// Token identifying a compiled loop. Bridges are attached to this.
 /// RPython history.py JitCellToken parity — green_key carried on token
 /// so the backend can identify the parent loop for bridge compilation.
@@ -666,38 +814,24 @@ pub struct JitCellToken {
     /// that this loop can jump to (via CALL_ASSEMBLER or JUMP).
     /// Prevents the target from being evicted while this loop is alive.
     pub keepalive_tokens: Vec<u64>,
-    /// llmodel.py:252 `compiled_loop_token.asmmemmgr_blocks` parity.
+    /// `rpython/jit/backend/model.py:292` `CompiledLoopToken` parity.
     ///
-    /// Backend-owned memory blocks (bridge ExecutableBuffers, etc.)
-    /// that must live as long as this token. Freed when the token is
-    /// dropped — mirrors RPython's `free_loop_and_bridges` which
-    /// iterates `asmmemmgr_blocks` and returns each block to the
-    /// `AsmMemoryManager` free-list.
+    /// Carries per-compilation metadata: `asmmemmgr_blocks` (owned bridge
+    /// memory blocks — `model.py:293`), `asmmemmgr_gcreftracers`
+    /// (`model.py:294`), `frame_info` (JIT frame layout —
+    /// `x86/assembler.py:514`), `bridges_count`, `invalidate_positions`,
+    /// `looptokens_redirected_to`. Populated eagerly by `JitCellToken::new`
+    /// so backends can update fields through `&JitCellToken`.
     ///
-    /// ## Why `parking_lot::Mutex`
-    ///
-    /// `compile_bridge` receives `&JitCellToken` (shared ref) because
-    /// the metainterp holds the token in a `HashMap` and may inspect
-    /// other fields concurrently.  Bridge compilation must append to
-    /// this vec through a shared ref → interior mutability is required.
-    ///
-    /// `RefCell` is insufficient: under free-threading (no-GIL Python),
-    /// multiple OS threads may hold references to the same
-    /// `JitCellToken` — one thread executing compiled code while
-    /// another compiles a bridge for a guard in the same loop.
-    /// `RefCell`'s single-threaded borrow checking would panic.
-    ///
-    /// `std::sync::Mutex` works but has two drawbacks:
-    ///   1. Poisoning on panic makes recovery cumbersome.
-    ///   2. On macOS/Linux, `pthread_mutex` is heavier than needed
-    ///      for an uncontended fast-path (bridge compilation is rare).
-    ///
-    /// `parking_lot::Mutex` avoids both: no poisoning semantics, and
-    /// the uncontended lock/unlock is a single atomic CAS — ideal for
-    /// the typical case where only one thread touches this field at a
-    /// time, with the Mutex serving as a correctness guard for the
-    /// rare concurrent bridge-compilation scenario.
-    pub asmmemmgr_blocks: parking_lot::Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    /// Interior mutability on fields uses `parking_lot::Mutex` because
+    /// bridge compilation and execution may see `&JitCellToken` from
+    /// multiple threads (compile_bridge receives `&JitCellToken`).
+    pub compiled_loop_token: Option<Arc<CompiledLoopToken>>,
+    /// `rpython/jit/backend/x86/assembler.py:599`
+    /// `looptoken._ll_function_addr = rawstart + functionpos` —
+    /// address of the compiled loop entry. 0 until `compile_loop`
+    /// assigns it.
+    pub _ll_function_addr: usize,
 }
 
 impl JitCellToken {
@@ -712,8 +846,30 @@ impl JitCellToken {
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,
             keepalive_tokens: Vec::new(),
-            asmmemmgr_blocks: parking_lot::Mutex::new(Vec::new()),
+            // `rpython/jit/backend/x86/assembler.py:514` creates the
+            // `compiled_loop_token` at the start of `assemble_loop` —
+            // i.e., lazily when the backend compiles the token. pyre
+            // initializes it eagerly here so the field is always present.
+            compiled_loop_token: Some(Arc::new(CompiledLoopToken::new(number))),
+            _ll_function_addr: 0,
         }
+    }
+
+    /// `rpython/jit/backend/llsupport/assembler.py:184-188`
+    /// `get_asmmemmgr_blocks(self, looptoken)` parity.
+    ///
+    /// Returns a mutex guard over the `asmmemmgr_blocks` vec on this
+    /// token's `compiled_loop_token`. Panics if the token has no
+    /// `compiled_loop_token` — `JitCellToken::new` sets this eagerly, so
+    /// production callers never hit the panic.
+    pub fn asmmemmgr_blocks(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, Vec<Box<dyn std::any::Any + Send>>> {
+        self.compiled_loop_token
+            .as_ref()
+            .expect("JitCellToken missing compiled_loop_token")
+            .asmmemmgr_blocks
+            .lock()
     }
 
     /// history.py:451-453: record_jump_to — record that this loop can
