@@ -105,7 +105,8 @@ impl LiveVars {
                 match instr {
                     Instruction::LoadFast { var_num }
                     | Instruction::LoadFastBorrow { var_num }
-                    | Instruction::LoadFastCheck { var_num } => {
+                    | Instruction::LoadFastCheck { var_num }
+                    | Instruction::LoadFastAndClear { var_num } => {
                         let i = var_num.get(op_arg).as_usize();
                         let word = i / 64;
                         if word < words_per_pc {
