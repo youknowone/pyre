@@ -415,6 +415,18 @@ pub struct MetaInterp<M: Clone> {
     /// 2. Write them back on guard failure (force)
     /// 3. Track field access as IR ops during tracing
     pub(crate) virtualizable_info: Option<VirtualizableInfo>,
+    /// pyjitpl.py:2155 / warmspot.py:519-525 `jd.greenfield_info`.
+    ///
+    /// Mirrors the per-jitdriver `GreenFieldInfo` upstream attaches at
+    /// warmspot setup time.  PRE-EXISTING-ADAPTATION: pyre's
+    /// MetaInterp keeps a single shared slot rather than the
+    /// per-`jitdrivers_sd[idx]` table because the metainterp-side
+    /// jitdrivers_sd port hasn't yet grown the field (codewriter side
+    /// has it on `JitDriverStaticData::greenfield_info`).  Consulted
+    /// by `_do_jit_force_virtual` (pyjitpl.py:2155) — the bail
+    /// condition fires when both `virtualizable_info` and this slot
+    /// are None.
+    pub(crate) greenfield_info: Option<crate::greenfield::GreenFieldInfo>,
     /// RPython metainterp_sd.virtualref_info — shared VirtualRefInfo.
     pub(crate) virtualref_info: crate::virtualref::VirtualRefInfo,
     /// JIT hooks for profiling and debugging.
@@ -981,6 +993,7 @@ impl<M: Clone> MetaInterp<M> {
             tracing: None,
             next_trace_id: 1,
             virtualizable_info: None,
+            greenfield_info: None,
             virtualref_info: crate::virtualref::VirtualRefInfo::new(),
             hooks: JitHooks::default(),
             pending_token: None,
@@ -1210,6 +1223,20 @@ impl<M: Clone> MetaInterp<M> {
     /// Get the virtualizable info.
     pub fn virtualizable_info(&self) -> Option<&VirtualizableInfo> {
         self.virtualizable_info.as_ref()
+    }
+
+    /// warmspot.py:519-525 `jd.greenfield_info = GreenFieldInfo(cpu, jd)`.
+    ///
+    /// Hosts that declare green fields (greens containing `.`) call
+    /// this between `JitDriver::new` and the first
+    /// `_do_jit_force_virtual` to mirror the upstream warmspot wiring.
+    pub fn set_greenfield_info(&mut self, info: crate::greenfield::GreenFieldInfo) {
+        self.greenfield_info = Some(info);
+    }
+
+    /// Borrow the greenfield info.
+    pub fn greenfield_info(&self) -> Option<&crate::greenfield::GreenFieldInfo> {
+        self.greenfield_info.as_ref()
     }
 
     /// Create an optimizer with virtualizable config if available.
@@ -1654,6 +1681,76 @@ impl<M: Clone> MetaInterp<M> {
     /// `_opimpl_setarrayitem_vable` (pyjitpl.py:1246) line up structurally.
     pub fn synchronize_virtualizable(&mut self, _vable_opref: OpRef) {
         // intentionally empty — see doc comment.
+    }
+
+    /// pyjitpl.py:3452-3464 `MetaInterp.load_fields_from_virtualizable()`.
+    ///
+    /// ```text
+    /// def load_fields_from_virtualizable(self):
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is not None:
+    ///         virtualizable_box = self.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         self.virtualizable_boxes = vinfo.read_boxes(self.cpu, virtualizable, 0)
+    ///         self.virtualizable_boxes.append(virtualizable_box)
+    /// ```
+    ///
+    /// Reloads the tracing-time `virtualizable_boxes` cache from the heap
+    /// object just before we abort to blackhole after an escaping residual
+    /// call. This mirrors the upstream "heap wins" direction on the escape
+    /// path so any forced writes become visible to the resumed interpreter.
+    pub fn load_fields_from_virtualizable(&mut self) {
+        let info = match self.virtualizable_info.clone() {
+            Some(info) => info,
+            None => return,
+        };
+        let vable_ptr = self.vable_ptr;
+        if vable_ptr.is_null() {
+            return;
+        }
+        let (vable_box, array_lengths) = match self.tracing.as_ref() {
+            Some(ctx) => {
+                let Some(vable_box) = ctx.standard_virtualizable_box() else {
+                    return;
+                };
+                let array_lengths = ctx
+                    .virtualizable_array_lengths()
+                    .map(|lengths| lengths.to_vec())
+                    .unwrap_or_default();
+                (vable_box, array_lengths)
+            }
+            None => return,
+        };
+        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(vable_ptr, &array_lengths) };
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        let mut boxes = Vec::with_capacity(
+            static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>() + 1,
+        );
+        for (index, value) in static_boxes.into_iter().enumerate() {
+            let opref = match info.static_fields[index].field_type {
+                majit_ir::Type::Int => ctx.const_int(value),
+                majit_ir::Type::Ref => ctx.const_ref(value),
+                majit_ir::Type::Float => ctx.const_float(value),
+                majit_ir::Type::Void => continue,
+            };
+            boxes.push(opref);
+        }
+        for (array_index, values) in array_boxes.into_iter().enumerate() {
+            let item_type = info.array_fields[array_index].item_type;
+            for value in values {
+                let opref = match item_type {
+                    majit_ir::Type::Int => ctx.const_int(value),
+                    majit_ir::Type::Ref => ctx.const_ref(value),
+                    majit_ir::Type::Float => ctx.const_float(value),
+                    majit_ir::Type::Void => continue,
+                };
+                boxes.push(opref);
+            }
+        }
+        boxes.push(vable_box);
+        ctx.set_virtualizable_boxes_with_info(boxes, &info, &array_lengths);
     }
 
     /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
@@ -8836,21 +8933,9 @@ impl<M: Clone> MetaInterp<M> {
     ///         return None, op
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream's
-    /// `warmrunnerstate.get_assembler_token(greenargs)` uses the
-    /// concrete green-arg values to look up the matching JitCellToken;
-    /// pyre's MetaInterp doesn't get the concrete greens at this site
-    /// (the args list passed in carries OpRefs only).  We therefore
-    /// record the CALL_ASSEMBLER_* op via the typed-descr path that
-    /// reuses the target jitdriver_sd's mainjitcode calldescr — the
-    /// JitCellToken plumbing folds into pyre's existing
-    /// `TraceCtx::call_assembler_typed` recorder hook
-    /// (trace_ctx.rs:2376) and stays correct because the descr already
-    /// encodes the target identity.
     pub fn direct_assembler_call(
         &mut self,
-        arglist: &[OpRef],
-        descr_ref: majit_ir::DescrRef,
+        arglist: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         descr_view: &dyn majit_ir::descr::CallDescr,
         targetjitdriver_sd: usize,
     ) -> (Option<OpRef>, Option<OpRef>) {
@@ -8861,23 +8946,27 @@ impl<M: Clone> MetaInterp<M> {
         };
         let num_green_args = target_sd.num_greens();
         // pyjitpl.py:3594-3595 greenargs = arglist[1:num+1]; args = arglist[num+1:]
-        // PRE-EXISTING-ADAPTATION: arglist here is the OpRef-only
-        // version (pyre's `_build_allboxes` already split funcbox to
-        // index 0 and the typed args follow).  Greenargs are sliced
-        // for parity but only their length matters at this site
-        // because the warmstate token lookup happens via the
-        // TraceCtx::call_assembler_typed descr path.
         if arglist.len() < num_green_args + 1 {
             return (None, None);
         }
-        let _greenargs = &arglist[1..num_green_args + 1];
-        let args: &[OpRef] = &arglist[num_green_args + 1..];
+        let greenargs = &arglist[1..num_green_args + 1];
+        let args = &arglist[num_green_args + 1..];
         // pyjitpl.py:3596 assert len(args) == targetjitdriver_sd.num_red_args
         debug_assert_eq!(
             args.len(),
             target_sd.num_reds(),
             "pyjitpl.py:3596 — direct_assembler_call args.len() must match num_red_args",
         );
+        // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs)
+        let green_values: Vec<i64> = greenargs.iter().map(|(_, _, value)| *value).collect();
+        let green_key = crate::green_key_hash(&green_values);
+        let (target_token, vable_index) = if let Some(token) = self.get_loop_token(green_key) {
+            (token.number, token.virtualizable_arg_index)
+        } else if let Some(token_number) = self.get_pending_token_number(green_key) {
+            (token_number, target_sd.virtualizable_arg_index())
+        } else {
+            return (None, None);
+        };
         // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
         let opnum = match descr_view.result_type() {
             majit_ir::Type::Int => OpCode::CallAssemblerI,
@@ -8886,17 +8975,30 @@ impl<M: Clone> MetaInterp<M> {
             majit_ir::Type::Void => OpCode::CallAssemblerN,
         };
         // pyjitpl.py:3602 op = self.history.record_nospec(opnum, args, valueconst, descr=token)
+        let opref_args: Vec<OpRef> = args.iter().map(|(_, opref, _)| *opref).collect();
+        let arg_types: Vec<Type> = args
+            .iter()
+            .map(|(kind, _, _)| match kind {
+                crate::jitcode::JitArgKind::Int => Type::Int,
+                crate::jitcode::JitArgKind::Ref => Type::Ref,
+                crate::jitcode::JitArgKind::Float => Type::Float,
+            })
+            .collect();
         let op_ref = {
             let ctx = match self.tracing.as_mut() {
                 Some(ctx) => ctx,
                 None => return (None, None),
             };
-            ctx.recorder.record_op_with_descr(opnum, args, descr_ref)
+            let descr = crate::make_call_assembler_descr(
+                target_token,
+                &arg_types,
+                descr_view.result_type(),
+                vable_index,
+            );
+            ctx.recorder.record_op_with_descr(opnum, &opref_args, descr)
         };
         // pyjitpl.py:3604-3608 return vablebox per jd.index_of_virtualizable.
-        let vablebox = target_sd
-            .virtualizable_arg_index()
-            .and_then(|idx| args.get(idx).copied());
+        let vablebox = vable_index.and_then(|idx| args.get(idx).map(|(_, opref, _)| *opref));
         (vablebox, Some(op_ref))
     }
 
@@ -9026,10 +9128,8 @@ impl<M: Clone> MetaInterp<M> {
         if !escaped {
             return Ok(());
         }
-        // pyjitpl.py:3367 self.load_fields_from_virtualizable() — pyre's
-        // existing tracer state-machine mirror is invoked from the
-        // trace-context dispatch loop on the matching guard fail path,
-        // so this method only signals the escape event upward.
+        // pyjitpl.py:3367 self.load_fields_from_virtualizable()
+        self.load_fields_from_virtualizable();
         // pyjitpl.py:3373-3375 raise SwitchToBlackhole(ABORT_ESCAPE,
         //                              raising_exception=True)
         Err(SwitchToBlackhole {
@@ -9088,27 +9188,29 @@ impl<M: Clone> MetaInterp<M> {
     ///         return None
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream's `greenfield_info` lives on
-    /// the per-jitdriver static data; pyre keeps a single
-    /// `virtualizable_info` slot on MetaInterp because the
-    /// jitdrivers_sd table on metainterp doesn't yet carry per-driver
-    /// greenfield_info (codewriter side does).  The bail condition
-    /// therefore checks `virtualizable_info` only — when greenfield-
-    /// only drivers ship, the metainterp jitdrivers_sd port will
-    /// supply the missing slot.
+    /// PRE-EXISTING-ADAPTATION: upstream's `virtualizable_info` /
+    /// `greenfield_info` live on the per-jitdriver static data
+    /// (`jd.jitdriver_sd.*`); pyre keeps single shared slots on
+    /// `MetaInterp` because the metainterp-side jitdrivers_sd port
+    /// hasn't grown the per-driver tables yet.  The bail check below
+    /// still consults both slots so greenfield-only drivers keep the
+    /// upstream semantics (pyjitpl.py:2155).
     pub fn _do_jit_force_virtual(
         &mut self,
         allboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
         _descr_view: &dyn majit_ir::descr::CallDescr,
         pc: usize,
-    ) -> Option<OpRef> {
+    ) -> Option<(OpRef, i64)> {
         debug_assert_eq!(
             allboxes.len(),
             2,
             "pyjitpl.py:2154 — _do_jit_force_virtual expects exactly 2 args",
         );
-        // pyjitpl.py:2155-2158: bail when neither virtualizable nor greenfield_info exists.
-        if self.virtualizable_info.is_none() {
+        // pyjitpl.py:2155-2158:
+        //   if (self.metainterp.jitdriver_sd.virtualizable_info is None and
+        //       self.metainterp.jitdriver_sd.greenfield_info is None):
+        //       return None
+        if self.virtualizable_info.is_none() && self.greenfield_info.is_none() {
             return None;
         }
         // pyjitpl.py:2159-2161: vref_box vs standard_box identity short-circuit.
@@ -9119,7 +9221,7 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .and_then(|ctx| ctx.standard_virtualizable_box())?;
         if vref_box == standard_box {
-            return Some(vref_box);
+            return Some((vref_box, vref_concrete));
         }
         // pyjitpl.py:2162-2163: heapcache short-circuit when the box is
         // known to NOT be the standard virtualizable.
@@ -9159,7 +9261,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         // pyjitpl.py:2167-2171: isstandard branch.
         if isstandard_int != 0 {
-            Some(standard_box)
+            Some((standard_box, standard_concrete))
         } else {
             None
         }
@@ -9241,8 +9343,8 @@ impl<M: Clone> MetaInterp<M> {
             self.clear_exception();
             // pyjitpl.py:2011-2014: OS_JIT_FORCE_VIRTUAL short-circuit.
             if effectinfo.oopspecindex == majit_ir::OopSpecIndex::JitForceVirtual {
-                if let Some(resbox) = self._do_jit_force_virtual(&allboxes, descr_view, _pc) {
-                    return Ok(Some((resbox, 0)));
+                if let Some(result) = self._do_jit_force_virtual(&allboxes, descr_view, _pc) {
+                    return Ok(Some(result));
                 }
             }
             // pyjitpl.py:2017: vable_and_vrefs_before_residual_call (stub)
@@ -9258,7 +9360,7 @@ impl<M: Clone> MetaInterp<M> {
             let (vablebox, resbox) = if assembler_call {
                 // pyjitpl.py:2053-2055: direct_assembler_call
                 let jd = _assembler_call_jd.unwrap_or(0);
-                self.direct_assembler_call(&opref_args, descr_ref.clone(), descr_view, jd)
+                self.direct_assembler_call(&allboxes, descr_view, jd)
             } else {
                 // pyjitpl.py:2057-2068: libffi → release_gil → may_force
                 let mut resbox = None;
@@ -11738,6 +11840,8 @@ mod metainterp_static_data_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::JitArgKind;
+    use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     #[cfg(feature = "cranelift")]
     use majit_backend::DeadFrame;
     #[cfg(feature = "cranelift")]
@@ -12033,6 +12137,12 @@ mod tests {
         arr: *const TraceEntryArray,
     }
 
+    #[repr(C)]
+    struct ResidualCallVableObj {
+        token: u64,
+        pc: i64,
+    }
+
     fn start_tracing_with_virtualizable(
         meta: &mut MetaInterp<()>,
         info: VirtualizableInfo,
@@ -12284,6 +12394,132 @@ mod tests {
 
         let ops = take_recorded_ops(&mut meta);
         assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn do_jit_force_virtual_preserves_standard_concrete_value() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+        let mut obj = ResidualCallVableObj { token: 0, pc: 41 };
+        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+        let vref_box = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int((&mut obj as *mut ResidualCallVableObj) as usize as i64)
+        };
+        let allboxes = [
+            (JitArgKind::Int, OpRef(99), 0),
+            (
+                JitArgKind::Int,
+                vref_box,
+                (&mut obj as *mut ResidualCallVableObj) as usize as i64,
+            ),
+        ];
+        let descr = make_call_descr(vec![Type::Int, Type::Int], Type::Int);
+
+        let result = meta
+            ._do_jit_force_virtual(
+                &allboxes,
+                descr.as_ref().as_call_descr().expect("call descr"),
+                0,
+            )
+            .expect("should resolve to standard virtualizable");
+
+        assert_eq!(result.0, OpRef(0));
+        assert_eq!(
+            result.1,
+            (&mut obj as *mut ResidualCallVableObj) as usize as i64
+        );
+    }
+
+    #[test]
+    fn load_fields_from_virtualizable_reloads_heap_values_into_boxes() {
+        let mut meta = MetaInterp::<()>::new(10);
+        start_tracing_with_virtualizable(
+            &mut meta,
+            test_vable_info_static_only(),
+            &[Value::Int(0x1234), Value::Int(41)],
+            Vec::new(),
+        );
+        let mut obj = ResidualCallVableObj { token: 0, pc: 99 };
+        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+
+        meta.load_fields_from_virtualizable();
+
+        let ctx = meta.trace_ctx().unwrap();
+        let boxes = ctx.collect_virtualizable_boxes().unwrap();
+        assert_eq!(ctx.const_value(boxes[0]), Some(99));
+        assert_eq!(boxes[1], OpRef(0));
+    }
+
+    #[test]
+    fn direct_assembler_call_uses_greenkey_token_in_descr() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.staticdata.jitdrivers_sd.push(JitDriverStaticData::new(
+            vec![("code", Type::Int)],
+            vec![("frame", Type::Int)],
+        ));
+        let green_key = crate::green_key_hash(&[55]);
+        let mut token = majit_backend::JitCellToken::new(4242);
+        token.virtualizable_arg_index = None;
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token,
+                num_inputs: 1,
+                meta: (),
+                front_target_tokens: Vec::new(),
+                retraced_count: 0,
+                root_trace_id: 0,
+                traces: HashMap::new(),
+                previous_tokens: Vec::new(),
+            },
+        );
+        let action = meta.force_start_tracing(777, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let frame_box = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(1234)
+        };
+        let green_box = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(55)
+        };
+        let func_box = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(9999)
+        };
+        let descr = make_call_descr(vec![Type::Int, Type::Int], Type::Int);
+
+        let (_vablebox, resbox) = meta.direct_assembler_call(
+            &[
+                (JitArgKind::Int, func_box, 9999),
+                (JitArgKind::Int, green_box, 55),
+                (JitArgKind::Int, frame_box, 1234),
+            ],
+            descr.as_ref().as_call_descr().expect("call descr"),
+            0,
+        );
+        assert!(
+            resbox.is_some(),
+            "compiled green key should resolve a token"
+        );
+
+        let ops = take_recorded_ops(&mut meta);
+        let call = ops
+            .into_iter()
+            .find(|op| op.opcode == OpCode::CallAssemblerI)
+            .expect("CALL_ASSEMBLER_I recorded");
+        let call_descr = call
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("call descr");
+        assert_eq!(call_descr.call_target_token(), Some(4242));
     }
 
     #[test]

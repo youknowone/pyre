@@ -136,7 +136,7 @@ pub fn analyze_multiple_pipeline_with_config(
     config: &AnalyzeConfig,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, None)
+    analyze_pipeline_from_parsed(&parsed_files, config, None, &|_, _| None)
 }
 
 /// Multi-file analysis with explicit layout provider.
@@ -150,13 +150,36 @@ pub fn analyze_multiple_pipeline_with_layout(
     layout_provider: &dyn layout::LayoutProvider,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, Some(layout_provider))
+    analyze_pipeline_from_parsed(&parsed_files, config, Some(layout_provider), &|_, _| None)
+}
+
+/// `make_virtualizable_infos` constructor closure type — mirrors the
+/// upstream `VirtualizableInfo(self, VTYPEPTR)` call (warmspot.py:543).
+/// `(jd_idx, vtypeptr_token) -> Option<handle>`.  Hosts that own a
+/// runtime `VirtualizableInfo` impl supply the constructor here.
+pub type VirtualizableInfoFactory<'a> =
+    dyn Fn(usize, &str) -> Option<std::sync::Arc<dyn call::VirtualizableInfoHandle>> + 'a;
+
+/// Multi-file analysis with explicit layout provider AND a
+/// `VirtualizableInfo` factory wired into
+/// `CallControl::make_virtualizable_infos` (warmspot.py:516).  The
+/// factory delegates the runtime constructor call from the codewriter
+/// (which sits below metainterp in the crate graph) back to the host.
+pub fn analyze_multiple_pipeline_with_vinfo_factory(
+    sources: &[&str],
+    config: &AnalyzeConfig,
+    layout_provider: Option<&dyn layout::LayoutProvider>,
+    vinfo_factory: &VirtualizableInfoFactory<'_>,
+) -> pipeline::ProgramPipelineResult {
+    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
+    analyze_pipeline_from_parsed(&parsed_files, config, layout_provider, vinfo_factory)
 }
 
 fn analyze_pipeline_from_parsed(
     parsed_files: &[parse::ParsedInterpreter],
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
+    vinfo_factory: &VirtualizableInfoFactory<'_>,
 ) -> pipeline::ProgramPipelineResult {
     let program = front::build_semantic_program_from_parsed_files(parsed_files);
     let mut pipeline = pipeline::analyze_program(&program, &config.pipeline);
@@ -418,16 +441,19 @@ fn analyze_pipeline_from_parsed(
         );
         // warmspot.py:515-545 WarmRunnerDesc.make_virtualizable_infos —
         // assigns jd.index_of_virtualizable, builds GreenFieldInfo
-        // when any green name contains '.', and (via the factory)
-        // would build VirtualizableInfo here too.  Pyre supplies a
-        // `|_, _| None` factory at codewrite time because the
-        // runtime VirtualizableInfo constructor lives in
-        // metainterp (`__build_virtualizable_info` →
-        // `MetaInterp::set_virtualizable_info` at jitdriver.rs:285);
-        // the codewriter slot is then overridden via
-        // `CallControl::set_jitdriver_virtualizable_info` if the host
-        // wants the codewriter side to consult the same handle.
-        call_control.make_virtualizable_infos(|_jd_idx, _vtypeptr_token| None);
+        // when any green name contains '.', and delegates the upstream
+        // `VirtualizableInfo(self, VTYPEPTR)` constructor call
+        // (warmspot.py:543) to `vinfo_factory`.  Hosts entering through
+        // `analyze_multiple_pipeline_with_vinfo_factory` supply a real
+        // closure that builds the metainterp-side `VirtualizableInfo`
+        // (e.g. via `majit_metainterp::virtualizable::VirtualizableInfo::
+        // build_for(VTYPEPTR)`); the default entry points pass
+        // `|_, _| None` so the codewriter slot stays empty until
+        // `MetaInterp::set_virtualizable_info` (jitdriver.rs:285) wires
+        // it at runtime.
+        call_control.make_virtualizable_infos(|jd_idx, vtypeptr_token| {
+            vinfo_factory(jd_idx, vtypeptr_token)
+        });
     }
     // Mark known builtins (elidable helpers).
     // RPython: detected via funcobj.graph.func.oopspec attribute.

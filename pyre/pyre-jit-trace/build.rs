@@ -43,36 +43,50 @@ fn main() {
     // `locals_cells_stack_w[*]` as virtualizable accesses before legacy
     // TracePattern classification runs.
     let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
-    let pipeline = majit_codewriter::analyze_multiple_pipeline_with_config(
-        &source_refs,
-        &majit_codewriter::AnalyzeConfig {
-            pipeline: majit_codewriter::PipelineConfig {
-                transform: majit_codewriter::GraphTransformConfig {
-                    vable_fields: virtualizable_spec::PYFRAME_VABLE_FIELDS
-                        .iter()
-                        .map(|(name, idx)| {
-                            majit_codewriter::VirtualizableFieldDescriptor::new(
-                                *name,
-                                Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
-                                *idx,
-                            )
-                        })
-                        .collect(),
-                    vable_arrays: virtualizable_spec::PYFRAME_VABLE_ARRAYS
-                        .iter()
-                        .map(|(name, idx)| {
-                            majit_codewriter::VirtualizableFieldDescriptor::new(
-                                *name,
-                                Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
-                                *idx,
-                            )
-                        })
-                        .collect(),
-                    call_effects: build_call_effect_overrides(),
-                    ..Default::default()
-                },
+    let analyze_config = majit_codewriter::AnalyzeConfig {
+        pipeline: majit_codewriter::PipelineConfig {
+            transform: majit_codewriter::GraphTransformConfig {
+                vable_fields: virtualizable_spec::PYFRAME_VABLE_FIELDS
+                    .iter()
+                    .map(|(name, idx)| {
+                        majit_codewriter::VirtualizableFieldDescriptor::new(
+                            *name,
+                            Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
+                            *idx,
+                        )
+                    })
+                    .collect(),
+                vable_arrays: virtualizable_spec::PYFRAME_VABLE_ARRAYS
+                    .iter()
+                    .map(|(name, idx)| {
+                        majit_codewriter::VirtualizableFieldDescriptor::new(
+                            *name,
+                            Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
+                            *idx,
+                        )
+                    })
+                    .collect(),
+                call_effects: build_call_effect_overrides(),
+                ..Default::default()
             },
         },
+    };
+    // warmspot.py:516 `vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)` —
+    // pyre's runtime `VirtualizableInfo` constructor lives in the
+    // `majit-metainterp` crate (`__build_virtualizable_info`) and runs
+    // at `JitDriver::new` (jitdriver.rs:285) where the field offsets
+    // resolved by `mem::offset_of!` are available.  build.rs cannot
+    // import that crate (no metainterp build-dep, and the offsets are
+    // a runtime fact), so the codewriter-side factory returns `None`
+    // here; the codewriter slot stays empty until the runtime metainterp
+    // setter overrides it.  PRE-EXISTING-ADAPTATION documented at
+    // `CallControl::make_virtualizable_infos`.
+    let vinfo_factory: &majit_codewriter::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
+    let pipeline = majit_codewriter::analyze_multiple_pipeline_with_vinfo_factory(
+        &source_refs,
+        &analyze_config,
+        None,
+        vinfo_factory,
     );
 
     // Generate tracing code from the canonical graph-first analysis result.
