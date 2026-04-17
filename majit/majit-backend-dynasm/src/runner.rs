@@ -415,8 +415,28 @@ impl DynasmBackend {
     /// convention.
     ///
     /// Panics if not found — in RPython, the faildescr is the exact
-    /// object, so there is no lookup-miss path.
+    /// object, so there is no lookup-miss path. Use `try_find_descr` for
+    /// query-style callers (e.g. `bridge_was_compiled` /
+    /// `compiled_bridge_fail_descr_layouts`) that legitimately probe
+    /// "is this guard already compiled?" and must treat the miss as
+    /// `None` (matching cranelift's `?`-on-miss semantics in
+    /// `compiler.rs:11723`).
     fn find_descr(token: &JitCellToken, trace_id: u64, fail_index: u32) -> Arc<DynasmFailDescr> {
+        Self::try_find_descr(token, trace_id, fail_index).unwrap_or_else(|| {
+            panic!(
+                "find_descr: (trace_id={}, fail_index={}) not found in \
+                 root loop or any bridge — RPython uses exact faildescr \
+                 object identity, so this lookup must succeed",
+                trace_id, fail_index
+            )
+        })
+    }
+
+    fn try_find_descr(
+        token: &JitCellToken,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Arc<DynasmFailDescr>> {
         let compiled = Self::get_compiled(token);
         // Normalize trace_id: 0 → root trace id
         let trace_id = if trace_id == 0 {
@@ -430,7 +450,7 @@ impl DynasmBackend {
             .iter()
             .find(|d| d.trace_id == trace_id && d.fail_index == fail_index)
         {
-            return found.clone();
+            return Some(found.clone());
         }
         let blocks = token.asmmemmgr_blocks();
         for block in blocks.iter() {
@@ -440,17 +460,11 @@ impl DynasmBackend {
                     .iter()
                     .find(|d| d.trace_id == trace_id && d.fail_index == fail_index)
                 {
-                    return found.clone();
+                    return Some(found.clone());
                 }
             }
         }
-
-        panic!(
-            "find_descr: (trace_id={}, fail_index={}) not found in \
-             root loop or any bridge — RPython uses exact faildescr \
-             object identity, so this lookup must succeed",
-            trace_id, fail_index
-        );
+        None
     }
 
     fn call_assembler_targets_snapshot() -> HashMap<u64, usize> {
@@ -1112,7 +1126,13 @@ impl Backend for DynasmBackend {
         source_trace_id: u64,
         source_fail_index: u32,
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        let source_descr = Self::find_descr(original_token, source_trace_id, source_fail_index);
+        // RPython faildescr lookup is by object identity, never misses.
+        // majit query-style callers (`bridge_was_compiled` etc.) probe
+        // by (trace_id, fail_index) and must treat the miss as `None`
+        // — match cranelift's `?` semantics in
+        // `compiler.rs:11723 compiled_bridge_fail_descr_layouts`.
+        let source_descr =
+            Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
         let bridge_addr = source_descr.bridge_addr();
         if bridge_addr == 0 {
             return None;

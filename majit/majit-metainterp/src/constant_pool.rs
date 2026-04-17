@@ -231,6 +231,14 @@ impl ConstantPool {
         &mut self.constants
     }
 
+    /// Ensure `next_const_idx` is beyond the given const-namespace key.
+    /// Used by bridge injection: constants with pre-assigned indices must
+    /// not be overwritten by subsequent `get_or_insert` allocations.
+    pub fn reserve_index_past(&mut self, opref_key: u32) {
+        let raw_idx = opref_key & !(1 << 31);
+        self.next_const_idx = self.next_const_idx.max(raw_idx + 1);
+    }
+
     /// Get a shared reference to the inner constants map.
     pub fn as_ref(&self) -> &HashMap<u32, i64> {
         &self.constants

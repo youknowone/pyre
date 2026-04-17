@@ -3819,11 +3819,27 @@ impl ResumeDataLoopMemo {
             // RPython: for each livebox, call getptrinfo(box).get_known_class(cpu).
             // The actual class pointer is recovered at deserialization time
             // via cpu.cls_of_box(frontend_boxes[i]).
+            //
+            // RPython Box.type parity: bridgeopt.py:77 uses `box.type != "r"`,
+            // where `box.type` is intrinsic/immutable. Pyre reads the same
+            // type that `finish()` stores in `numb_state.livebox_types` (this
+            // map feeds `fail_arg_types` / `livebox_types` on the deserialize
+            // side — see bridgeopt.rs:911). If we queried `env.get_type()`
+            // here instead, a livebox whose OptContext-side type differs from
+            // its numbering-time type would cause serialize/deserialize to
+            // disagree on which Ref-typed slots get a bitfield bit, producing
+            // an out-of-bounds rd_numb read in `deserialize_optimizer_knowledge`
+            // when super-instruction GEN widens the live register set.
             let mut bitfield: i32 = 0;
             let mut shifts = 0;
             for livebox in &liveboxes {
                 if let Some(opref) = livebox {
-                    if env.get_type(*opref) != majit_ir::Type::Ref {
+                    let livebox_tp = numb_state
+                        .livebox_types
+                        .get(&opref.0)
+                        .copied()
+                        .unwrap_or_else(|| env.get_type(*opref));
+                    if livebox_tp != majit_ir::Type::Ref {
                         continue;
                     }
                     bitfield <<= 1;

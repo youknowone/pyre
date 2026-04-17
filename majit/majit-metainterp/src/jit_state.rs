@@ -115,10 +115,12 @@ pub struct ResumeDataResult {
     pub virtualizable_values: Vec<majit_ir::resumedata::RebuiltValue>,
     /// resume.py:1045: virtualref box pairs (decoded from vref section).
     pub virtualref_values: Vec<majit_ir::resumedata::RebuiltValue>,
-    /// Rust-specific: constant OpRef entries for the optimizer pool.
-    /// No RPython equivalent (RPython uses ConstBox natively).
-    /// Each entry: (OpRef index >= 10000, raw value, type).
-    pub constants: Vec<(u32, i64, Type)>,
+    /// resume.py:1071 self.consts = storage.rd_consts parity. Bridge
+    /// resume reads use `consts[num - TAG_CONST_OFFSET]` (resume.py:1251)
+    /// so virtual materialization needs the rd_consts table verbatim;
+    /// decoded values reach the bridge tracer via `ctx.const_*` calls
+    /// at `decode_box` time, not via a parallel index table.
+    pub rd_consts: Vec<(i64, Type)>,
     /// resume.py:1042 num_failargs read from rd_numb header.
     /// Needed by `materialize_bridge_virtual` to translate negative TAGBOX
     /// numbers in `rd_virtuals` fieldnums (resume.py:1556-1564 decode_box:

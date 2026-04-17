@@ -2770,30 +2770,29 @@ impl<S: JitState> JitDriver<S> {
             }
         }
         self.trace_meta = Some(trace_meta);
-        // resume.py:1042: inject bridge frame constants into the trace's
-        // constant pool so the optimizer can fold them.
-        if let Some(ref bfm) = resume_data_result {
-            // resume.py:1042: inject bridge frame constants.
-            if !bfm.constants.is_empty() {
-                self.meta.inject_bridge_constants(&bfm.constants);
-            }
-            // resume.py:1047-1055 parity:
-            //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,
-            //   and bridge tracing continues from that restored interpreter
-            //   frame.  The authoritative slot metadata is therefore the
-            //   state rebuilt by `state.build_meta(resume_pc, env)`, not the
-            //   raw `RebuiltFrame.values` section.
-            //
-            // `RebuiltFrame.values` contains only the frame's register slots;
-            // it does NOT have the synthetic [frame, ni, vsd] header used by
-            // pyre's fallback `update_meta_for_bridge()` path.  Reinterpreting
-            // those slot values as header-prefixed fail_arg types shifts the
-            // frame layout and can mis-bind bridge return values.
-            //
-            // Keep `trace_meta` as built from the restored state when rd_numb
-            // is available; only the no-rd_numb fallback should call
-            // `update_meta_for_bridge()`.
-        }
+        // resume.py:1047-1055 parity:
+        //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,
+        //   and bridge tracing continues from that restored interpreter
+        //   frame.  The authoritative slot metadata is therefore the
+        //   state rebuilt by `state.build_meta(resume_pc, env)`, not the
+        //   raw `RebuiltFrame.values` section.
+        //
+        // `RebuiltFrame.values` contains only the frame's register slots;
+        // it does NOT have the synthetic [frame, ni, vsd] header used by
+        // pyre's fallback `update_meta_for_bridge()` path.  Reinterpreting
+        // those slot values as header-prefixed fail_arg types shifts the
+        // frame layout and can mis-bind bridge return values.
+        //
+        // Keep `trace_meta` as built from the restored state when rd_numb
+        // is available; only the no-rd_numb fallback should call
+        // `update_meta_for_bridge()`.
+        //
+        // Constants are NOT injected into the pool up-front: resume.py:1245
+        // `decode_box` returns live ConstInt/ConstPtr boxes at the moment
+        // each tagged value is read, so majit's parity path registers each
+        // constant via `ctx.const_int/const_ref/const_float` inside
+        // `setup_bridge_sym`'s resolve closure and inside
+        // `materialize_bridge_virtual`'s `decode_fieldnum`.
         self.resume_data_result = resume_data_result;
         let code_ptr = state.code_ptr();
         self.bridge_info = Some((green_key, trace_id, fail_index, code_ptr));

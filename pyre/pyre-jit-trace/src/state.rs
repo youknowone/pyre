@@ -2249,22 +2249,15 @@ fn materialize_bridge_virtual(
                     return ctx.const_null();
                 }
                 let ci = (val - TAG_CONST_OFFSET) as usize;
-                // resume_data.constants is the rebuilt mirror of `self.consts`,
-                // keyed by the OpRef the encoder assigned at numbering time
-                // (`OpRef::from_const(ci)`). Look it up by that key.
-                let opref = majit_ir::OpRef::from_const(ci as u32);
-                if let Some((_, raw, tp)) = resume_data
-                    .constants
-                    .iter()
-                    .find(|(idx, _, _)| *idx == opref.0)
-                {
-                    match tp {
-                        majit_ir::Type::Ref => ctx.const_ref(*raw),
-                        majit_ir::Type::Float => ctx.const_float(*raw),
-                        _ => ctx.const_int(*raw),
-                    }
-                } else {
-                    opref
+                let (raw, tp) = resume_data
+                    .rd_consts
+                    .get(ci)
+                    .copied()
+                    .unwrap_or((0, majit_ir::Type::Int));
+                match tp {
+                    majit_ir::Type::Ref => ctx.const_ref(raw),
+                    majit_ir::Type::Float => ctx.const_float(raw),
+                    _ => ctx.const_int(raw),
                 }
             }
             TAGVIRTUAL => {
@@ -2718,25 +2711,31 @@ impl JitState for PyreJitState {
         let mut virtuals_cache: std::collections::HashMap<usize, OpRef> =
             std::collections::HashMap::new();
 
-        // Resolve a `RebuiltValue` to the OpRef the bridge tracer should
-        // see. Box(n) → parent inputarg OpRef(n). Int/Const → constant
-        // pool OpRef (cursor advances per call). Virtual(vidx) →
-        // materialize the virtual at trace start via
-        // `materialize_bridge_virtual`, mirroring resume.py:945-956
-        // getvirtual_ptr → rd_virtuals[i].allocate →
-        // metainterp.execute_new_with_vtable.
+        // resume.py:1245 decode_box parity. Each tagged variant resolves
+        // to a live box whose `.type` is the kind the encoder dispatched:
+        //   TAGBOX   → liveboxes[n]                (Box)
+        //   TAGINT   → ConstInt(num)               (Int)
+        //   TAGCONST → self.consts[num-OFFSET]     (Const)
+        //   TAGVIRTUAL → self.getvirtual_*(num)    (Virtual)
+        // In majit a "live box" is an OpRef plus a registered entry in
+        // the trace's constant pool (for constants) or an inputarg slot
+        // (for boxes). Constants therefore MUST be registered through
+        // `ctx.const_int/const_ref/const_float` so the returned OpRef
+        // maps to a real value+type in the pool; synthesizing
+        // `OpRef::from_const(cursor)` without registration leaves a
+        // dangling index that the optimizer later re-types arbitrarily.
         let resolve = |ctx: &mut majit_metainterp::TraceCtx,
-                       cursor: &mut usize,
                        cache: &mut std::collections::HashMap<usize, OpRef>,
                        v: &RebuiltValue|
          -> OpRef {
             match v {
                 RebuiltValue::Box(n, _tp) => OpRef(*n as u32),
-                RebuiltValue::Int(_) | RebuiltValue::Const(..) => {
-                    let opref = majit_ir::OpRef::from_const(*cursor as u32);
-                    *cursor += 1;
-                    opref
-                }
+                RebuiltValue::Int(v) => ctx.const_int(*v as i64),
+                RebuiltValue::Const(raw, tp) => match tp {
+                    Type::Ref => ctx.const_ref(*raw),
+                    Type::Float => ctx.const_float(*raw),
+                    _ => ctx.const_int(*raw),
+                },
                 RebuiltValue::Virtual(vidx) => {
                     materialize_bridge_virtual(ctx, *vidx as usize, rd_virtuals, resume_data, cache)
                 }
@@ -2784,10 +2783,9 @@ impl JitState for PyreJitState {
         // `virtuals_cache` so shared virtuals are emitted exactly
         // once.
         let vvals = &resume_data.virtualizable_values;
-        let mut vable_cursor: usize = 0;
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         for (i, v) in vvals.iter().enumerate() {
-            let resolved = resolve(ctx, &mut vable_cursor, &mut virtuals_cache, v);
+            let resolved = resolve(ctx, &mut virtuals_cache, v);
             match i {
                 0 => {} // frame_ptr — implicit, no slot
                 1 => sym.vable_last_instr = resolved,
@@ -2871,7 +2869,7 @@ impl JitState for PyreJitState {
         rd_numb: Option<&[u8]>,
         rd_consts: Option<&[(i64, Type)]>,
     ) -> Option<majit_metainterp::ResumeDataResult> {
-        use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
+        use majit_ir::resumedata::rebuild_from_numbering;
 
         let rd_numb = rd_numb?;
         let rd_consts = rd_consts.unwrap_or(&[]);
@@ -2887,56 +2885,14 @@ impl JitState for PyreJitState {
             return None;
         }
 
-        // resume.py:1245 decode_box parity: TAGCONST and TAGINT entries
-        // become ConstPtr/ConstInt boxes in RPython. Rust needs explicit
-        // constant pool entries for the optimizer to see them.
-        // All sections (vable, vref, frame) are treated uniformly.
-        let mut constants = Vec::new();
-        let mut const_idx: u32 = 0;
-        for value in vable_values.iter().chain(vref_values.iter()) {
-            match value {
-                RebuiltValue::Const(raw, tp) => {
-                    constants.push((majit_ir::OpRef::from_const(const_idx).0, *raw, *tp));
-                    const_idx += 1;
-                }
-                RebuiltValue::Int(v) => {
-                    constants.push((
-                        majit_ir::OpRef::from_const(const_idx).0,
-                        *v as i64,
-                        Type::Int,
-                    ));
-                    const_idx += 1;
-                }
-                _ => {}
-            }
-        }
-        // resume.py:1245 decode_box parity: TAGINT → ConstInt(num) regardless
-        // of whether it came from vable, vref, or a frame slot.
-        for frame in &frames {
-            for value in &frame.values {
-                match value {
-                    RebuiltValue::Const(raw, tp) => {
-                        constants.push((majit_ir::OpRef::from_const(const_idx).0, *raw, *tp));
-                        const_idx += 1;
-                    }
-                    RebuiltValue::Int(v) => {
-                        constants.push((
-                            majit_ir::OpRef::from_const(const_idx).0,
-                            *v as i64,
-                            Type::Int,
-                        ));
-                        const_idx += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         Some(majit_metainterp::ResumeDataResult {
             frames,
             virtualizable_values: vable_values,
             virtualref_values: vref_values,
-            constants,
+            // resume.py:1071 self.consts = storage.rd_consts. Retained as
+            // a slice-owned copy so `decode_box` in virtual materialization
+            // (resume.py:1251) can index `consts[num - TAG_CONST_OFFSET]`.
+            rd_consts: rd_consts.to_vec(),
             // resume.py:1042 num_failargs from rd_numb header. Used by
             // bridge virtual materialization (resume.py:1556-1564 decode_box
             // negative-index normalization: `num + len(liveboxes)`).

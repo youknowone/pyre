@@ -2809,6 +2809,14 @@ impl OptContext {
             op.rd_virtuals = self.new_operations[idx].rd_virtuals.clone();
             op.rd_pendingfields = self.new_operations[idx].rd_pendingfields.clone();
             op.fail_args = self.new_operations[idx].fail_args.clone();
+            // bridgeopt.py parity: fail_arg_types carry the types the
+            // serializer used when writing the class-knowledge bitfield in
+            // rd_numb (memo.finish() uses numb_state.livebox_types). A
+            // shared guard's rd_numb encodes the donor's livebox type
+            // layout, so the sharer must inherit fail_arg_types too —
+            // otherwise `deserialize_optimizer_knowledge` (bridgeopt.rs:911)
+            // reconstructs a different Ref-set and reads past the buffer.
+            op.fail_arg_types = self.new_operations[idx].fail_arg_types.clone();
             // optimizer.py:698-699: _maybe_replace_guard_value after copy.
             if op.opcode == OpCode::GuardValue {
                 self.maybe_replace_guard_value(op);

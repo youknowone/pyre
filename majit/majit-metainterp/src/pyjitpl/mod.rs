@@ -5936,7 +5936,23 @@ impl<M: Clone> MetaInterp<M> {
                 let liveboxes: Vec<OpRef> = (0..bridge_inputargs.len())
                     .map(|i| OpRef(i as u32))
                     .collect();
-                let livebox_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
+                // bridgeopt.py parity: the deserializer's `liveboxes` type
+                // filter (box.type == "r") is driven by the type each box
+                // carried when the parent guard was finalized — that is
+                // `guard_op.fail_arg_types`. Pyre's `bridge_inputargs.tp`
+                // can diverge from that (the bridge tracer unboxes via
+                // getfield_gc_pure_i etc. so its inputargs see Int where
+                // the guard saw Ref), producing a serialize/deserialize
+                // bitfield-count mismatch → rd_numb overrun in
+                // `deserialize_optimizer_knowledge` once super-instruction
+                // GEN widens the live set. Use the parent guard's saved
+                // types instead so the deserializer matches the types the
+                // serializer used at memo.finish() time.
+                let livebox_types: Vec<Type> = guard_op
+                    .fail_arg_types
+                    .as_ref()
+                    .map(|v| v.clone())
+                    .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp).collect());
                 // unroll.py:183-188: frontend_inputargs = trace.inputargs
                 // RPython's frontend_boxes = trace.inputargs always matches
                 // liveboxes = trace.get_iter().inputargs in length.
@@ -6321,6 +6337,30 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
 
+        // RPython uses global ConstInt/ConstPtr boxes, so a bridge that
+        // references a parent-loop constant and a bridge that allocates
+        // a fresh one never land on the same "slot". majit instead uses
+        // per-trace, zero-based constant indices (ConstantPool), so a
+        // bridge's first `const_int` returns OpRef::from_const(0) — the
+        // same index the parent loop used. `compile_entry_bridge` later
+        // copies the parent's `constant_types` into the bridge
+        // optimizer's type map (so shared parent-constant references
+        // type-check); that copy overwrites the bridge's own fresh type
+        // for the colliding index and `getintbound` panics with
+        // Int/Ref mismatch. Reserve bridge's pool past the parent's
+        // highest const index so every new allocation is disjoint.
+        if let Some(source_trace) = compiled.traces.get(&norm_tid) {
+            let max_const = source_trace
+                .constants
+                .keys()
+                .copied()
+                .chain(source_trace.constant_types.keys().copied())
+                .max();
+            if let (Some(max), Some(ref mut ctx)) = (max_const, self.tracing.as_mut()) {
+                ctx.constants.reserve_index_past(max);
+            }
+        }
+
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
@@ -6433,21 +6473,6 @@ impl<M: Clone> MetaInterp<M> {
         let class_op = ctx.record_op(OpCode::SaveExcClass, &[class_const]);
         let value_op = ctx.record_op(OpCode::SaveException, &[value_const]);
         ctx.record_op(OpCode::RestoreException, &[class_op, value_op]);
-    }
-
-    /// No RPython equivalent — RPython uses ConstBox natively in traces.
-    /// Rust needs explicit constant pool injection for TAGCONST/TAGINT
-    /// entries decoded from rd_numb by rebuild_from_resumedata.
-    pub fn inject_bridge_constants(&mut self, constants: &[(u32, i64, Type)]) {
-        let Some(ref mut ctx) = self.tracing else {
-            return;
-        };
-        for &(opref_idx, value, tp) in constants {
-            ctx.constants.as_mut().insert(opref_idx, value);
-            if tp != Type::Int {
-                ctx.constants.mark_type(OpRef(opref_idx), tp);
-            }
-        }
     }
 
     // ── Guard Failure Recovery ─────────────────────────────────

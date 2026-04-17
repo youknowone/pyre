@@ -3306,6 +3306,17 @@ impl Optimizer {
         op.rd_numb = last.rd_numb.clone();
         op.rd_consts = last.rd_consts.clone();
         op.rd_virtuals = last.rd_virtuals.clone();
+        // bridgeopt.py parity: the class-knowledge bitfield baked into
+        // rd_numb is indexed by the donor's per-livebox type layout.
+        // `deserialize_optimizer_knowledge` reads that bitfield using the
+        // types it receives as `livebox_types`, which the bridge site
+        // sources from the shared guard's `fail_arg_types`. Dropping the
+        // copy here leaves the shared guard with `fail_arg_types=None`,
+        // the bridge code falls back to the bridge tracer's (unboxed)
+        // inputarg types, and the Ref count disagrees with the serializer
+        // → rd_numb over-read. See memory/fannkuch_reg20_root_cause.md.
+        op.fail_arg_types = last.fail_arg_types.clone();
+        op.rd_pendingfields = last.rd_pendingfields.clone();
         // optimizer.py:698-699: if guard_op.opnum == GUARD_VALUE: ...
         if op.opcode == OpCode::GuardValue {
             op = Self::_maybe_replace_guard_value(op, ctx);
@@ -3475,6 +3486,7 @@ impl Optimizer {
         newop.pos = op.pos;
         newop.descr = op.descr.clone();
         newop.fail_args = op.fail_args.clone();
+        newop.fail_arg_types = op.fail_arg_types.clone();
         newop.rd_numb = op.rd_numb.clone();
         newop.rd_consts = op.rd_consts.clone();
         newop.rd_virtuals = op.rd_virtuals.clone();
