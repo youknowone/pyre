@@ -7643,9 +7643,15 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// PRE-EXISTING-ADAPTATION: lives on `MetaInterp<M>` rather than
     /// `MIFrame` because of the borrow-checker constraint that already
-    /// moved `do_residual_or_indirect_call` here.  `record_result_of_call_pure`
-    /// and `make_result_of_lastop`'s pre-exception target_index plumbing
-    /// land in follow-ups; the rest of the body is line-for-line.
+    /// moved `do_residual_or_indirect_call` here.  `make_result_of_lastop`
+    /// is invoked on the framestack's current frame via `dst` —
+    /// upstream reads `target_index = ord(self.bytecode[self.pc-1])`
+    /// from MIFrame's bytecode, but pyre's call BC encodes `dst`
+    /// explicitly per call site, so callers thread it through.  Pass
+    /// `None` when the caller writes the result itself after
+    /// miframe_execute_varargs returns; pass `Some((kind, target_index))`
+    /// to match upstream's `self.make_result_of_lastop(op)` ordering
+    /// before `handle_possible_exception()` (pyjitpl.py:1951-1954).
     pub fn miframe_execute_varargs(
         &mut self,
         opnum: OpCode,
@@ -7654,34 +7660,81 @@ impl<M: Clone> MetaInterp<M> {
         descr_view: &dyn majit_ir::descr::CallDescr,
         exc: bool,
         pure: bool,
+        dst: Option<(crate::jitcode::JitArgKind, usize)>,
     ) -> Result<Option<(OpRef, i64)>, ChangeFrame> {
         // pyjitpl.py:1942: self.metainterp.clear_exception()
         self.clear_exception();
         // pyjitpl.py:1943: patch_pos = self.metainterp.history.get_trace_position()
-        // — pyre's recorder does not yet expose a trace-position handle
-        // for record_result_of_call_pure rewriting; the constant-fold
-        // cache lands separately so the pre-recording position is
-        // currently dropped.
+        let patch_pos = self.tracing.as_ref().map(|ctx| ctx.recorder.get_position());
         // pyjitpl.py:1944-1945: op = execute_and_record_varargs(...)
-        let op = self.execute_and_record_varargs(opnum, argboxes, descr_ref, descr_view);
-        // pyjitpl.py:1946-1949: pure constant-fold path.
-        // record_result_of_call_pure rewriting lands in a follow-up;
-        // for now `pure` only short-circuits the exception expectation
-        // when the executor returned a value (op.is_some()).
-        let exc = if pure && self.last_exc_value == 0 && op.is_some() {
-            // pyjitpl.py:1949: `exc and not isinstance(op, Const)`
-            // — without record_result_of_call_pure the op is never
-            // promoted to a Const, so `exc` keeps its incoming value.
-            exc
-        } else {
-            exc
-        };
+        let mut op =
+            self.execute_and_record_varargs(opnum, argboxes, descr_ref.clone(), descr_view);
+        // pyjitpl.py:1946-1948: `pure and not last_exc_value and op` →
+        //     op = self.metainterp.record_result_of_call_pure(op, argboxes,
+        //         descr, patch_pos, opnum)
+        let mut op_was_constant_folded = false;
+        if pure && self.last_exc_value == 0 {
+            if let (Some((opref, resvalue)), Some(patch_pos)) = (op, patch_pos) {
+                let result_value = match descr_view.result_type() {
+                    majit_ir::Type::Int => majit_ir::Value::Int(resvalue),
+                    majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(resvalue as usize)),
+                    majit_ir::Type::Float => {
+                        majit_ir::Value::Float(f64::from_bits(resvalue as u64))
+                    }
+                    majit_ir::Type::Void => majit_ir::Value::Void,
+                };
+                let opref_args: Vec<OpRef> = argboxes.iter().map(|(_, op, _)| *op).collect();
+                let concrete_arg_values: Vec<majit_ir::Value> = argboxes
+                    .iter()
+                    .map(|(kind, _, val)| match kind {
+                        crate::jitcode::JitArgKind::Int => majit_ir::Value::Int(*val),
+                        crate::jitcode::JitArgKind::Ref => {
+                            majit_ir::Value::Ref(majit_ir::GcRef(*val as usize))
+                        }
+                        crate::jitcode::JitArgKind::Float => {
+                            majit_ir::Value::Float(f64::from_bits(*val as u64))
+                        }
+                    })
+                    .collect();
+                if let Some(ctx) = self.tracing.as_mut() {
+                    let new_op = ctx.record_result_of_call_pure(
+                        opref,
+                        &opref_args,
+                        &concrete_arg_values,
+                        descr_ref,
+                        patch_pos,
+                        opnum,
+                        result_value,
+                    );
+                    // pyjitpl.py:1949: `exc = exc and not isinstance(op, Const)`
+                    // — record_result_of_call_pure returns a Const-typed
+                    // OpRef when all args fold to constants; that suppresses
+                    // the exception expectation since constant-folded ops
+                    // can't raise.
+                    op_was_constant_folded = ctx.constants_get_value(new_op).is_some();
+                    op = Some((new_op, resvalue));
+                }
+            }
+        }
+        // pyjitpl.py:1949: `exc = exc and not isinstance(op, Const)`
+        let exc = exc && !op_was_constant_folded;
         // pyjitpl.py:1950-1957: exception handling.
         if exc {
-            // pyjitpl.py:1951-1954: make_result_of_lastop(op) — pyre
-            // does not yet thread the call-site target_index into this
-            // method, so the result write to the caller frame happens
-            // through the dispatch loop instead.  Documented gap.
+            // pyjitpl.py:1951-1954: `if op is not None: self.make_result_of_lastop(op)`
+            // — must run BEFORE handle_possible_exception() so the
+            // result box is in the register snapshot when a guard fires
+            // (`get_list_of_active_boxes()`).  Pyre callers pass `dst`
+            // when they have decoded the call's target register; if
+            // `dst` is `None`, the caller is responsible for writing
+            // the result itself after we return (legacy dispatch path).
+            if let (Some((opref, concrete)), Some((kind, target_index))) = (op, dst) {
+                self.framestack.current_mut().make_result_of_lastop(
+                    kind,
+                    target_index,
+                    opref,
+                    concrete,
+                );
+            }
             self.handle_possible_exception()?;
         } else {
             // pyjitpl.py:1957: self.metainterp.assert_no_exception()
@@ -8570,6 +8623,7 @@ impl<M: Clone> MetaInterp<M> {
         descr_ref: majit_ir::DescrRef,
         descr_view: &dyn majit_ir::descr::CallDescr,
         pc: usize,
+        dst: Option<(crate::jitcode::JitArgKind, usize)>,
     ) -> Result<Option<(OpRef, i64)>, DoResidualCallAbort> {
         // pyjitpl.py:2178: if isinstance(funcbox, Const):
         if funcbox.1.is_constant() {
@@ -8584,7 +8638,9 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // pyjitpl.py:2186: return self.do_residual_call(funcbox, argboxes, calldescr, pc)
-        self.do_residual_call_full(funcbox, argboxes, descr_ref, descr_view, pc, false, None)
+        self.do_residual_call_full(
+            funcbox, argboxes, descr_ref, descr_view, pc, false, None, dst,
+        )
     }
 
     /// pyjitpl.py:1278-1321 `MIFrame._try_tco()`.
@@ -8719,121 +8775,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// pyjitpl.py:3553-3579 `MetaInterp.record_result_of_call_pure(op, argboxes, descr, patch_pos, opnum)`.
-    ///
-    /// ```python
-    /// def record_result_of_call_pure(self, op, argboxes, descr, patch_pos, opnum):
-    ///     """ Patch a CALL into a CALL_PURE.
-    ///     """
-    ///     resbox_as_const = executor.constant_from_op(op)
-    ///     is_cond_value = OpHelpers.is_cond_call_value(opnum)
-    ///     if is_cond_value:
-    ///         normargboxes = argboxes[1:]    # ignore the 'value' arg
-    ///     else:
-    ///         normargboxes = argboxes
-    ///     for argbox in normargboxes:
-    ///         if not isinstance(argbox, Const):
-    ///             break
-    ///     else:
-    ///         # all-constants: remove the CALL operation now and propagate a
-    ///         # constant result
-    ///         self.history.cut(patch_pos)
-    ///         return resbox_as_const
-    ///     # not all constants (so far): turn CALL into CALL_PURE
-    ///     arg_consts = [executor.constant_from_op(a) for a in normargboxes]
-    ///     self.call_pure_results[arg_consts] = resbox_as_const
-    ///     if is_cond_value:
-    ///         return op       # but COND_CALL_VALUE remains
-    ///     opnum = OpHelpers.call_pure_for_descr(descr)
-    ///     self.history.cut(patch_pos)
-    ///     newop = self.history.record_nospec(opnum, argboxes, resbox_as_const, descr)
-    ///     return newop
-    /// ```
-    ///
-    /// Returns `(OpRef, resvalue)` where the OpRef is either:
-    /// - the existing op (when COND_CALL_VALUE_*),
-    /// - a fresh ConstInt-equivalent OpRef (all-const path), or
-    /// - a freshly-recorded CALL_PURE_* op (mixed-args path).
-    pub fn record_result_of_call_pure(
-        &mut self,
-        op: OpRef,
-        resvalue: i64,
-        argboxes: &[OpRef],
-        descr_ref: majit_ir::DescrRef,
-        descr_view: &dyn majit_ir::descr::CallDescr,
-        patch_pos: majit_trace::recorder::TracePosition,
-        opnum: OpCode,
-    ) -> (OpRef, i64) {
-        // pyjitpl.py:3556: resbox_as_const = executor.constant_from_op(op)
-        // — pyre carries `resvalue` separately from the OpRef so the
-        // caller already has the concrete result; reuse it.
-        // pyjitpl.py:3557: is_cond_value = OpHelpers.is_cond_call_value(opnum)
-        let is_cond_value = opnum.is_cond_call_value();
-        // pyjitpl.py:3558-3561: normargboxes — drop the `value` arg for COND_CALL_VALUE_*
-        let normargboxes: &[OpRef] = if is_cond_value {
-            &argboxes[1..]
-        } else {
-            argboxes
-        };
-        // pyjitpl.py:3562-3569: for argbox in normargboxes: ... else (all-const path)
-        let ctx = match self.tracing.as_mut() {
-            Some(ctx) => ctx,
-            None => return (op, resvalue),
-        };
-        let mut all_const = true;
-        let mut arg_consts: Vec<majit_ir::Value> = Vec::with_capacity(normargboxes.len());
-        for &argbox in normargboxes {
-            match ctx.constants_get_value(argbox) {
-                Some(value) => arg_consts.push(value),
-                None => {
-                    all_const = false;
-                    break;
-                }
-            }
-        }
-        if all_const {
-            // pyjitpl.py:3568-3569: cut(patch_pos) + return resbox_as_const
-            ctx.cut_trace(patch_pos);
-            let resbox_as_const = match descr_view.result_type() {
-                majit_ir::Type::Int => ctx.const_int(resvalue),
-                majit_ir::Type::Ref => ctx.const_ref(resvalue),
-                majit_ir::Type::Float => ctx.const_float(resvalue),
-                majit_ir::Type::Void => OpRef::NONE,
-            };
-            return (resbox_as_const, resvalue);
-        }
-        // pyjitpl.py:3572-3573: arg_consts already collected; store in
-        // call_pure_results.  Pyre's TraceCtx exposes
-        // store_call_pure_result for this; key is the per-arg
-        // arg_consts vector and value is the concrete result Value.
-        let resvalue_v = match descr_view.result_type() {
-            majit_ir::Type::Int => majit_ir::Value::Int(resvalue),
-            majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(resvalue as usize)),
-            majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(resvalue as u64)),
-            majit_ir::Type::Void => majit_ir::Value::Void,
-        };
-        // arg_consts may be partial (we broke after the first non-const);
-        // re-collect the fully-typed list for the cache key.  pyjitpl.py
-        // only stores it on the all-const-but-still-not-folded branch
-        // (the `else` of the for-loop didn't fire so we know there is
-        // at least one non-const here).  Skipping the cache write keeps
-        // semantics intact — the cache only memoizes across a single
-        // trace's repeats.
-        let _ = arg_consts;
-        let _ = resvalue_v;
-        // pyjitpl.py:3574-3575: COND_CALL_VALUE_* keeps its op
-        if is_cond_value {
-            return (op, resvalue);
-        }
-        // pyjitpl.py:3576-3578: cut(patch_pos) + record CALL_PURE_*
-        ctx.cut_trace(patch_pos);
-        let pure_opnum = OpCode::call_pure_for_type(descr_view.result_type());
-        let newop = ctx
-            .recorder
-            .record_op_with_descr(pure_opnum, argboxes, descr_ref);
-        (newop, resvalue)
-    }
-
     /// pyjitpl.py:3581-3587 `MetaInterp.direct_call_may_force(argboxes, valueconst, calldescr)`.
     ///
     /// ```python
@@ -8925,19 +8866,61 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:3611-3669 `MetaInterp.direct_libffi_call`.
     ///
-    /// **Stub** — RPython's libffi-call optimization is highly
-    /// specialized to RPython's libffi binding (`OS_LIBFFI_CALL`).
-    /// Pyre does not currently expose libffi at the JIT layer; the
-    /// named entry returns `None` so `do_residual_call` falls
-    /// through to `direct_call_release_gil` / `direct_call_may_force`,
-    /// matching the upstream "may return None to mean 'can't handle
-    /// it myself'" contract (pyjitpl.py:2061).
+    /// ```python
+    /// def direct_libffi_call(self, argboxes, valueconst, orig_calldescr):
+    ///     assert self.staticdata.has_libffi_call
+    ///     box_cif_description = argboxes[1]
+    ///     if not isinstance(box_cif_description, ConstInt):
+    ///         return None     # cannot be handled by direct_libffi_call()
+    ///     cif_description = box_cif_description.getint()
+    ///     ...
+    ///     calldescr = self.cpu.calldescrof_dynamic(cif_description, extrainfo)
+    ///     if calldescr is None:
+    ///         return None     # cannot be handled by direct_libffi_call()
+    ///     ...
+    ///     return self.history.record_nospec(opnum,
+    ///                                       [c_saveall, argboxes[2]] + arg_boxes,
+    ///                                       valueconst, calldescr)
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre has no `cpu.calldescrof_dynamic`,
+    /// no `CIF_DESCRIPTION_P` layout reader, and no
+    /// `ffisupport.get_arg_descr` — the upstream specialization
+    /// reaches into `rpython.rlib.jit_libffi` which has no Rust
+    /// equivalent in pyre.  The early-return contract for
+    /// `argboxes[1] not ConstInt` and `cif_description == NULL` is
+    /// preserved so the dispatch in `do_residual_call` (pyjitpl.py:2061)
+    /// falls through to `direct_call_release_gil` / `direct_call_may_force`
+    /// the same way it would when upstream's `direct_libffi_call`
+    /// declines to handle the call.  Pyre never produces an
+    /// `OopSpecIndex::LibffiCall` today, so the dispatch path is dead
+    /// in production; the contract is matched here for the day a host
+    /// adds libffi support.
     pub fn direct_libffi_call(
         &mut self,
-        _argboxes: &[OpRef],
+        argboxes: &[OpRef],
         _descr_ref: majit_ir::DescrRef,
         _descr_view: &dyn majit_ir::descr::CallDescr,
     ) -> Option<OpRef> {
+        // pyjitpl.py:3622-3624: box_cif_description = argboxes[1];
+        //   if not isinstance(box_cif_description, ConstInt): return None
+        let box_cif_description = *argboxes.get(1)?;
+        let ctx = self.tracing.as_ref()?;
+        let cif_description = match ctx.constants_get_value(box_cif_description) {
+            Some(majit_ir::Value::Int(v)) => v,
+            _ => return None,
+        };
+        // pyjitpl.py:3631-3632: if calldescr is None: return None — pyre
+        // has no calldescrof_dynamic equivalent, so a NULL cif_description
+        // is the only case we can reject before bailing entirely.
+        if cif_description == 0 {
+            return None;
+        }
+        // The cif-driven specialized recording (pyjitpl.py:3633-3667)
+        // requires CIF_DESCRIPTION_P layout parsing + dynamic calldescr
+        // construction that pyre lacks.  Returning None makes the
+        // dispatch fall through to direct_call_release_gil /
+        // direct_call_may_force per pyjitpl.py:2061 contract.
         None
     }
 
@@ -9193,11 +9176,14 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.record_op(OpCode::VirtualRefFinish, &[vrefbox, virtualbox]);
         }
-        // pyjitpl.py:3387 `self.virtualref_boxes[i+1] = CONST_NULL`
+        // pyjitpl.py:3378 `self.virtualref_boxes[i+1] = CONST_NULL`
+        // — ref-typed null preserves the slot's Ref type so subsequent
+        // fail-arg type recovery and ref-typed guard processing match
+        // upstream (history.py:361 `CONST_NULL = ConstPtr(ConstPtr.value)`).
         let null_const = self
             .tracing
             .as_mut()
-            .map(|ctx| ctx.const_int(0))
+            .map(|ctx| ctx.const_null())
             .unwrap_or(OpRef(0));
         self.virtualref_boxes[i + 1] = (null_const, 0);
     }
@@ -9356,6 +9342,7 @@ impl<M: Clone> MetaInterp<M> {
         _pc: usize,
         assembler_call: bool,
         _assembler_call_jd: Option<usize>,
+        dst: Option<(crate::jitcode::JitArgKind, usize)>,
     ) -> Result<Option<(OpRef, i64)>, DoResidualCallAbort> {
         // pyjitpl.py:2002: allboxes = self._build_allboxes(funcbox, argboxes, descr)
         let allboxes = self._build_allboxes(funcbox, argboxes, descr_view, None);
@@ -9478,7 +9465,7 @@ impl<M: Clone> MetaInterp<M> {
             };
             let res = self.miframe_execute_varargs(
                 opnum, &allboxes, descr_ref, descr_view, /* exc = */ false,
-                /* pure = */ false,
+                /* pure = */ false, /* dst = */ None,
             )?;
             // pyjitpl.py:2109: heapcache.call_loopinvariant_now_known
             if descr_index >= 0 {
@@ -9507,7 +9494,7 @@ impl<M: Clone> MetaInterp<M> {
             majit_ir::Type::Float => OpCode::CallF,
             majit_ir::Type::Void => OpCode::CallN,
         };
-        Ok(self.miframe_execute_varargs(opnum, &allboxes, descr_ref, descr_view, exc, pure)?)
+        Ok(self.miframe_execute_varargs(opnum, &allboxes, descr_ref, descr_view, exc, pure, dst)?)
     }
 
     /// pyjitpl.py:1960-1993 `MIFrame._build_allboxes(funcbox, argboxes, descr, prepend_box=None)`.
@@ -9636,6 +9623,10 @@ impl<M: Clone> MetaInterp<M> {
             pc,
             assembler_call,
             Some(target_jd_index),
+            // pyjitpl.py:1430 — do_recursive_call's CALL_ASSEMBLER result
+            // is consumed via the dispatch loop's normal result-return
+            // path, not via make_result_of_lastop inside execute_varargs.
+            None,
         )
     }
 
@@ -9671,6 +9662,7 @@ impl<M: Clone> MetaInterp<M> {
         descr_view: &dyn majit_ir::descr::CallDescr,
         _pc: usize,
         is_value: bool,
+        dst: Option<(crate::jitcode::JitArgKind, usize)>,
     ) -> Result<Option<(OpRef, i64)>, ChangeFrame> {
         // pyjitpl.py:2130: allboxes = _build_allboxes(funcbox, argboxes, descr, prepend_box=condbox)
         let allboxes = self._build_allboxes(funcbox, argboxes, descr_view, Some(condbox));
@@ -9684,7 +9676,8 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2133: exc = effectinfo.check_can_raise()
         let exc = effectinfo.check_can_raise(false);
         if !is_value {
-            // pyjitpl.py:2138-2139: COND_CALL has no result, pure=False
+            // pyjitpl.py:2138-2139: COND_CALL has no result, pure=False.
+            // Void result → no register write needed, dst irrelevant.
             self.miframe_execute_varargs(
                 OpCode::CondCallN,
                 &allboxes,
@@ -9692,6 +9685,7 @@ impl<M: Clone> MetaInterp<M> {
                 descr_view,
                 exc,
                 /* pure = */ false,
+                /* dst = */ None,
             )
         } else {
             // pyjitpl.py:2141: opnum = OpHelpers.cond_call_value_for_descr(descr)
@@ -9704,7 +9698,7 @@ impl<M: Clone> MetaInterp<M> {
             };
             // pyjitpl.py:2144-2149: COND_CALL_VALUE_* with pure=True
             self.miframe_execute_varargs(
-                opnum, &allboxes, descr_ref, descr_view, exc, /* pure = */ true,
+                opnum, &allboxes, descr_ref, descr_view, exc, /* pure = */ true, dst,
             )
         }
     }
@@ -10374,7 +10368,7 @@ mod metainterp_static_data_tests {
             execute_varargs_void_helper as i64,
         );
         let result = meta
-            .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0)
+            .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok");
         // Empty effectinfo + Void descr → CallN emitted, returns None.
         assert!(result.is_none(), "void result must be None");
@@ -10402,7 +10396,8 @@ mod metainterp_static_data_tests {
             .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
         let (descr_ref, descr_view) = make_call_descr_void();
         let funcbox = (JitArgKind::Ref, OpRef::from_const(0), fnaddr as i64);
-        let result = meta.do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0);
+        let result =
+            meta.do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None);
         // Const funcbox + registered target → perform_call raises
         // ChangeFrame (wrapped in DoResidualCallAbort).
         assert!(matches!(result, Err(DoResidualCallAbort::ChangeFrame)));
@@ -10430,7 +10425,7 @@ mod metainterp_static_data_tests {
         let (descr_ref, descr_view) = make_call_descr_void();
         let funcbox = (JitArgKind::Ref, OpRef(100), fnaddr as i64); // non-Const
         let result = meta
-            .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0)
+            .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok — falls through to residual call, no ChangeFrame");
         assert!(result.is_none(), "void residual call returns None");
     }
@@ -10966,6 +10961,7 @@ mod metainterp_static_data_tests {
             /* pc = */ 0,
             /* assembler_call = */ false,
             /* assembler_call_jd = */ None,
+            /* dst = */ None,
         );
         let (opref, resvalue) = result.expect("Ok").expect("non-void Some");
         assert_eq!(resvalue, 4 + 6 * 1000);
@@ -11123,16 +11119,16 @@ mod metainterp_static_data_tests {
             descr_ref.clone(),
         );
 
-        let (resbox, resvalue) = meta.record_result_of_call_pure(
+        let _ = descr_view;
+        let resbox = meta.trace_ctx().unwrap().record_result_of_call_pure(
             call_op,
-            7,
             &[funcref, arg_const],
+            &[majit_ir::Value::Int(0xdead), majit_ir::Value::Int(42)],
             descr_ref,
-            &descr_view,
             patch_pos,
             OpCode::CallI,
+            majit_ir::Value::Int(7),
         );
-        assert_eq!(resvalue, 7);
 
         let ctx = meta.trace_ctx().expect("active trace");
         // The CallI must have been cut from the trace.
@@ -11235,6 +11231,7 @@ mod metainterp_static_data_tests {
             &descr_view,
             0,
             /* is_value = */ false,
+            /* dst = */ None,
         );
         assert!(matches!(result, Ok(None)));
         let ctx = meta.trace_ctx().expect("active trace");
@@ -11280,6 +11277,7 @@ mod metainterp_static_data_tests {
             &descr_view,
             0,
             /* is_value = */ true,
+            /* dst = */ None,
         );
         // execute_varargs_int_helper takes 2 args; with empty argboxes
         // the executor passes no args.  Pyre's call_int_function falls
@@ -11322,7 +11320,7 @@ mod metainterp_static_data_tests {
         );
 
         let result =
-            meta.do_residual_call_full(funcbox, &[], descr_ref, &descr_view, 0, false, None);
+            meta.do_residual_call_full(funcbox, &[], descr_ref, &descr_view, 0, false, None, None);
         let (opref, _resvalue) = result.expect("Ok").expect("Some(opref)");
 
         let ctx = meta.trace_ctx().expect("active trace");
@@ -11381,6 +11379,7 @@ mod metainterp_static_data_tests {
             &descr_view,
             /* exc = */ false,
             /* pure = */ false,
+            /* dst = */ None,
         );
         let op = result.expect("Ok(...)").expect("non-void must return Some");
         assert_eq!(op.1, 5 + 9 * 1000);
