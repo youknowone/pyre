@@ -705,6 +705,10 @@ impl Backend for DynasmBackend {
         let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
         assert!(!jf_ptr.is_null(), "execute_token: calloc failed");
         unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
+        // Register this libc-allocated jitframe with the GC so its
+        // interior Ref slots (pinned by gcmap bits) remain visible to
+        // the collector during CallMallocNursery slow-path collections.
+        majit_gc::shadow_stack::register_libc_jitframe(jf_ptr as usize);
 
         for (i, arg) in args.iter().enumerate() {
             let raw = match arg {
@@ -817,6 +821,7 @@ impl Backend for DynasmBackend {
             }
         }
 
+        majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
         DeadFrame {
@@ -875,6 +880,7 @@ impl Backend for DynasmBackend {
         }
         let exit_layout = Some(descr.layout());
 
+        majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
         majit_backend::RawExecResult {

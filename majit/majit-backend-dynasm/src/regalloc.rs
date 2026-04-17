@@ -1500,10 +1500,17 @@ impl RegisterManager {
 #[derive(Debug)]
 pub enum RegAllocOp {
     /// regalloc_perform(op_index, arglocs, result_loc)
+    ///
+    /// `gcmap` is a precomputed GC bitmap pointer captured at regalloc
+    /// time. Non-None for collecting calls (e.g., CallMallocNursery) so
+    /// the emit path can store it into `jf_gcmap` before a potentially
+    /// collecting call. None for ordinary ops — emit uses its own
+    /// gcmap path (guards compute theirs from faillocs).
     Perform {
         op_index: usize,
         arglocs: Vec<Loc>,
         result_loc: Option<Loc>,
+        gcmap: Option<usize>,
     },
     /// regalloc_perform_guard(op_index, arglocs, result_loc, faillocs)
     PerformGuard {
@@ -1970,6 +1977,29 @@ impl RegAlloc {
             op_index,
             arglocs,
             result_loc,
+            gcmap: None,
+        });
+    }
+
+    /// Variant of `perform` that captures the current regalloc state as a
+    /// GC bitmap, for collecting-call ops such as CallMallocNursery. The
+    /// emit path stores the returned pointer into `jf_gcmap` before the
+    /// slow-path call so the collector can trace live Refs pinned to the
+    /// jitframe.
+    fn perform_with_gcmap(
+        &mut self,
+        op_index: usize,
+        arglocs: Vec<Loc>,
+        result_loc: Option<Loc>,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.flush_moves(output);
+        let gcmap = self.get_gcmap(&[], false) as usize;
+        output.push(RegAllocOp::Perform {
+            op_index,
+            arglocs,
+            result_loc,
+            gcmap: Some(gcmap),
         });
     }
 
@@ -3295,7 +3325,7 @@ impl RegAlloc {
         // aarch64/regalloc.py:968: sizeloc = size_box.getint()
         let size_val = self.const_value(op.arg(0));
         let arglocs = vec![Loc::Immed(ImmedLoc::new(size_val))];
-        self.perform(i, arglocs, Some(Loc::Reg(result_reg)), output);
+        self.perform_with_gcmap(i, arglocs, Some(Loc::Reg(result_reg)), output);
     }
 
     /// aarch64/regalloc.py:979 prepare_op_call_malloc_nursery_varsize_frame parity.
@@ -3326,7 +3356,7 @@ impl RegAlloc {
             &mut self.longevity,
             &mut self.fm,
         );
-        self.perform(i, vec![sizeloc], Some(Loc::Reg(result_reg)), output);
+        self.perform_with_gcmap(i, vec![sizeloc], Some(Loc::Reg(result_reg)), output);
     }
 
     /// aarch64/regalloc.py:1004 prepare_op_call_malloc_nursery_varsize parity.
@@ -3361,7 +3391,7 @@ impl RegAlloc {
         let itemsize = self.const_value(op.args[1]);
         // aarch64/regalloc.py:1033: kind = op.getarg(0).getint()
         let kind = self.const_value(op.args[0]);
-        self.perform(
+        self.perform_with_gcmap(
             i,
             vec![
                 lengthloc,

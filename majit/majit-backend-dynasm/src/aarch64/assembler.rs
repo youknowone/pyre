@@ -193,6 +193,10 @@ pub struct AssemblerARM64 {
     pub(crate) mc: Assembler,
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
     pending_guard_tokens: Vec<GuardToken>,
+    /// GC bitmap to push before the current collecting call (e.g.,
+    /// CallMallocNursery slow path). Set by the `RegAllocOp::Perform`
+    /// emit path when `gcmap: Some(..)` is carried, cleared after.
+    pending_malloc_nursery_gcmap: Option<usize>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
     /// Fail descriptors built during assembly.
@@ -302,6 +306,7 @@ impl AssemblerARM64 {
         AssemblerARM64 {
             mc: Assembler::new().unwrap(),
             pending_guard_tokens: Vec::new(),
+            pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
             fail_descrs: Vec::new(),
             trace_id,
@@ -1250,6 +1255,7 @@ impl AssemblerARM64 {
                     op_index,
                     arglocs,
                     result_loc,
+                    gcmap,
                 } => {
                     let op = &ops[*op_index];
                     if std::env::var_os("MAJIT_LOG").is_some() {
@@ -1262,6 +1268,7 @@ impl AssemblerARM64 {
                             result_loc
                         );
                     }
+                    self.pending_malloc_nursery_gcmap = *gcmap;
                     self.regalloc_perform(
                         op,
                         *op_index,
@@ -1270,6 +1277,7 @@ impl AssemblerARM64 {
                         fail_index,
                         ops,
                     );
+                    self.pending_malloc_nursery_gcmap = None;
                     if !op.pos.is_none() {
                         self.value_types.insert(op.pos.0, op.result_type());
                     }
@@ -4574,9 +4582,16 @@ impl AssemblerARM64 {
         // Slow path: aarch64/assembler.py:707-713 parity.
         // push_gcmap(store=True) → call malloc_slowpath → pop_gcmap
         dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
-        // assembler.py:649-650: store gcmap to jf_gcmap (null = conservative trace)
-        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
-        dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+        // assembler.py:649-650: store gcmap to jf_gcmap so the collector
+        // can trace live Refs pinned to frame slots during the slow-path
+        // allocator call. The gcmap was captured at regalloc time in
+        // `perform_with_gcmap` and threaded via RegAllocOp::Perform.gcmap.
+        if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+            self.push_gcmap(gcmap as *mut usize);
+        } else {
+            let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
+            dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+        }
         self.emit_mov_imm64(0, total_size);
         self.emit_mov_imm64(
             2,
@@ -4584,6 +4599,7 @@ impl AssemblerARM64 {
         );
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         // pop_gcmap: clear jf_gcmap after collecting call
+        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
         dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
 
         dynasm!(self.mc ; .arch aarch64 ; =>done);

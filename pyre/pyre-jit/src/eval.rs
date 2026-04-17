@@ -22,6 +22,24 @@ use majit_ir::Value;
 use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
+/// Host tracer registered with majit-gc so `walk_jf_roots` can reach
+/// the interior Ref slots of our libc-allocated jitframes. The
+/// collector expects a callback that, given a jitframe payload
+/// address, reports each Ref slot pointer via `update`.
+///
+/// `jitframe_trace` reads `jf_gcmap` to know which of the trailing
+/// `jf_frame` slots hold Refs and calls back for each bit.
+unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe {
+        majit_metainterp::jitframe::jitframe_trace(
+            obj_addr as *mut majit_metainterp::jitframe::JitFrame,
+            |slot_ptr| {
+                update(slot_ptr as *mut majit_ir::GcRef);
+            },
+        );
+    }
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity: preserve per-frame
 /// resume data from the last guard failure. rd_numb provides frame
 /// boundaries (jitcode_index, pc); values are resolved from deadframe.
@@ -153,6 +171,15 @@ thread_local! {
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
         let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
+        // pyre allocates jitframes via `libc::calloc` (not nursery/oldgen),
+        // so the collector's standard `walk_jf_roots` visitor can't
+        // route them through `trace_and_update_object`. Register a
+        // host-side tracer that invokes `jitframe_trace` directly so
+        // Refs pinned to frame slots are visible to GC across minor
+        // collections triggered by CallMallocNursery slow paths.
+        majit_gc::shadow_stack::register_libc_jitframe_tracer(
+            pyre_libc_jitframe_tracer,
+        );
         // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
         // Layout: type_tag(u64, offset 0) | virtual_token(i64, offset 8) | forced(Ref, offset 16)
         // `forced` is a GC pointer → gc_ptr_offsets = [16].

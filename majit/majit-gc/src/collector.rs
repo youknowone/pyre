@@ -495,6 +495,10 @@ impl MiniMarkGC {
         // reads jf_gcmap from each jitframe and traces ref slots.
         // assembler.py:1122 (_call_header_shadowstack) pushes jf_ptr;
         // callbuilder.py:93 (push_gcmap) writes per-call gcmap to jf_gcmap.
+        // Collect libc-jitframe slots so we can traverse/update them
+        // after the walk finishes without reborrowing `self` inside the
+        // tracer callback.
+        let mut libc_jf_slots: Vec<*mut majit_ir::GcRef> = Vec::new();
         crate::shadow_stack::walk_jf_roots(|gcref| {
             if self.is_nursery_object_start(gcref.0) {
                 if !self.pinned_objects.contains(&gcref.0) {
@@ -505,8 +509,27 @@ impl MiniMarkGC {
                 // nursery refs traced directly. The custom_trace hook
                 // walks gcmap bits to find Ref slots.
                 self.trace_and_update_object(gcref.0);
+            } else if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
+                // pyre dynasm extension: jitframes allocated via
+                // `libc::calloc` in execute_token are neither in the
+                // nursery nor the old gen. The registered libc-jitframe
+                // tracer walks `jf_gcmap` bits to expose ref slots.
+                crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
+                    libc_jf_slots.push(slot_ptr);
+                });
             }
         });
+        for slot_ptr in libc_jf_slots {
+            let field_ref = unsafe { *slot_ptr };
+            if !field_ref.is_null() && self.is_nursery_object_start(field_ref.0) {
+                if !self.pinned_objects.contains(&field_ref.0) {
+                    let new_ref = self.copy_nursery_object(field_ref.0);
+                    unsafe {
+                        *slot_ptr = new_ref;
+                    }
+                }
+            }
+        }
 
         // Phase 1d: Process blackhole interpreter register banks.
         // blackhole.py BlackholeInterpreter.registers_r parity: each

@@ -57,6 +57,64 @@ static JF_ROOT_STACK: RootStackBuf = RootStackBuf {
     data: UnsafeCell::new([0; MAX_SHADOW_STACK_DEPTH * 2]),
 };
 
+/// Callback type for tracing a libc-allocated jitframe's interior.
+/// The jitframe lives in malloc memory (not nursery, not oldgen), so
+/// `trace_and_update_object` can't reach it via `self.types` lookup.
+/// The host crate registers a tracer that knows the JitFrame layout
+/// and walks `jf_gcmap` bits to expose Ref slots.
+///
+/// The callback receives the jitframe payload address and a closure
+/// that maps a nursery-pointing slot to its new forwarded address.
+pub type LibcJitframeTracer = unsafe fn(obj_addr: usize, update: &mut dyn FnMut(*mut GcRef));
+
+static LIBC_JF_TRACER: std::sync::OnceLock<LibcJitframeTracer> = std::sync::OnceLock::new();
+
+/// Register the host's libc-jitframe tracer. Call once at GC init.
+/// Subsequent calls are ignored (OnceLock semantics).
+pub fn register_libc_jitframe_tracer(tracer: LibcJitframeTracer) {
+    let _ = LIBC_JF_TRACER.set(tracer);
+}
+
+/// Track which pointers refer to libc-allocated jitframes so the GC
+/// visitor can safely dispatch to the registered tracer. Without this
+/// set the visitor cannot tell a libc-alloc'd jitframe from an
+/// unrelated foreign pointer that happens to sit on the shadow stack.
+thread_local! {
+    static LIBC_JF_REGISTRY: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Register a libc-allocated jitframe payload address. Must be called
+/// before pushing the jitframe onto the JF shadow stack.
+pub fn register_libc_jitframe(addr: usize) {
+    LIBC_JF_REGISTRY.with(|r| {
+        r.borrow_mut().insert(addr);
+    });
+}
+
+/// Unregister a libc-allocated jitframe address. Call once the
+/// jitframe memory is about to be freed.
+pub fn unregister_libc_jitframe(addr: usize) {
+    LIBC_JF_REGISTRY.with(|r| {
+        r.borrow_mut().remove(&addr);
+    });
+}
+
+/// Check whether an address was registered as a libc-allocated jitframe.
+pub fn is_libc_jitframe(addr: usize) -> bool {
+    LIBC_JF_REGISTRY.with(|r| r.borrow().contains(&addr))
+}
+
+/// Invoke the registered tracer if any. Returns true if tracer ran.
+pub fn trace_libc_jitframe(obj_addr: usize, update: &mut dyn FnMut(*mut GcRef)) -> bool {
+    if let Some(tracer) = LIBC_JF_TRACER.get() {
+        unsafe { tracer(obj_addr, update) };
+        true
+    } else {
+        false
+    }
+}
+
 /// gc.py:255 root_stack_top — pointer into JF_ROOT_STACK.
 /// Compiled code reads/writes this with inline MOV instructions.
 /// Initialized to point at the start of JF_ROOT_STACK.
