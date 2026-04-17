@@ -460,10 +460,15 @@ struct LoopTargetEntry {
 unsafe impl Send for LoopTargetEntry {}
 unsafe impl Sync for LoopTargetEntry {}
 
-static LOOP_TARGET_REGISTRY: OnceLock<Mutex<HashMap<usize, LoopTargetEntry>>> = OnceLock::new();
-
-fn loop_target_registry() -> &'static Mutex<HashMap<usize, LoopTargetEntry>> {
-    LOOP_TARGET_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+thread_local! {
+    /// Per-thread `TargetToken._ll_loop_code` registry. Same PRE-EXISTING-
+    /// ADAPTATION rationale as `CALL_ASSEMBLER_TARGETS` — pyre's u64-keyed
+    /// trampoline dispatch needs a runtime lookup that RPython avoids by
+    /// reading `target_token._ll_loop_code` off the descr directly.
+    /// Thread-local matches pyre's single-threaded JIT execution and
+    /// aligns with the adjacent `CALL_ASSEMBLER_TARGETS` migration.
+    static LOOP_TARGET_REGISTRY: RefCell<HashMap<usize, LoopTargetEntry>> =
+        RefCell::new(HashMap::new());
 }
 
 /// history.py:470 TargetToken identity key: Arc allocation address.
@@ -471,12 +476,12 @@ fn loop_target_registry() -> &'static Mutex<HashMap<usize, LoopTargetEntry>> {
 /// dict keyed by descriptor object identity.
 fn register_loop_target(descr: &majit_ir::DescrRef, entry: LoopTargetEntry) {
     let key = majit_ir::descr_identity(descr);
-    loop_target_registry().lock().unwrap().insert(key, entry);
+    LOOP_TARGET_REGISTRY.with(|r| r.borrow_mut().insert(key, entry));
 }
 
 fn lookup_loop_target(descr: &majit_ir::DescrRef) -> Option<LoopTargetEntry> {
     let key = majit_ir::descr_identity(descr);
-    loop_target_registry().lock().unwrap().get(&key).cloned()
+    LOOP_TARGET_REGISTRY.with(|r| r.borrow().get(&key).cloned())
 }
 
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
