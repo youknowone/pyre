@@ -13,25 +13,41 @@ use crate::regloc::{
 
 /// x86/regalloc.py X86_64_RegisterManager.all_regs — the GPR allocation
 /// pool.  Order chosen to prefer caller-save first (popped from end).
+#[cfg(not(target_os = "windows"))]
 pub fn all_core_regs() -> Vec<RegLoc> {
     vec![
         ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
     ]
 }
+#[cfg(target_os = "windows")]
+pub fn all_core_regs() -> Vec<RegLoc> {
+    vec![ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R14, R15]
+}
 
 /// x86/regalloc.py: caller-save GPR list (registers spilled around
 /// calls per System V AMD64 / Win64 ABI).
+#[cfg(not(target_os = "windows"))]
 pub fn save_around_call_core_regs() -> Vec<RegLoc> {
     vec![EAX, ECX, EDX, ESI, EDI, R8, R9, R10]
+}
+#[cfg(target_os = "windows")]
+pub fn save_around_call_core_regs() -> Vec<RegLoc> {
+    // x86/regalloc.py:73-74 `if WIN64: save_around_call_regs.remove(esi)`
+    vec![EAX, ECX, EDX, EDI, R8, R9, R10]
 }
 
 /// x86/regalloc.py X86_64_XMMRegisterManager.all_regs — XMM allocation
 /// pool (xmm15 reserved as scratch).
+#[cfg(not(target_os = "windows"))]
 pub fn all_float_regs() -> Vec<RegLoc> {
     vec![
         XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
         XMM14,
     ]
+}
+#[cfg(target_os = "windows")]
+pub fn all_float_regs() -> Vec<RegLoc> {
+    vec![XMM0, XMM1, XMM2, XMM3, XMM4]
 }
 
 /// `frame_reg` on x86_64 is RBP (callee-save), holding the JitFrame
