@@ -290,10 +290,16 @@ pub enum OpKind {
     /// matching RPython's `op.args[0]` which is a plain `Ptr(FuncType)`
     /// (`jtransform.py:546`).
     ///
-    /// Rust lowering detail: `dyn Trait` is a fat pointer `(data, vtable)`.
-    /// This op reads the method entry from the `vtable` half; `int_guard_value`
-    /// then pins the function address, which is a stable 1:1 function-of-type
-    /// identity (unlike the data half, which is object identity).
+    /// PRE-EXISTING-ADAPTATION: RPython's `indirect_call` receives the
+    /// callee function pointer directly as `op.args[0]` because lltype has
+    /// no fat-pointer `dyn Trait` — at the RTyper layer the pointer is
+    /// already a plain `Ptr(FuncType)`.  In Rust `&dyn Trait` is a
+    /// `(data, vtable)` fat pointer, so we need an extra op to project
+    /// the vtable slot down to the function address that `int_guard_value`
+    /// can pin.  Without this, the guard would pin receiver *object*
+    /// identity instead of callee *function* identity and every new
+    /// receiver would blow the guard.  No RPython counterpart; justified
+    /// by the Rust type system.
     FuncptrFromVtable {
         receiver: ValueId,
         trait_root: String,
