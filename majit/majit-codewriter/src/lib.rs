@@ -53,8 +53,8 @@ pub use parse::{
 };
 pub use translator::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
 pub use translator::pipeline::{
-    PipelineConfig, PipelineOpcodeArm, PipelineResult, ProgramPipelineResult, analyze_function,
-    analyze_program,
+    PipelineConfig, PipelineOpcodeArm, PipelineResult, PortalSpec, ProgramPipelineResult,
+    analyze_function, analyze_program,
 };
 pub use translator::rtyper::rtyper::{ConcreteType, TypeResolutionState, resolve_types};
 
@@ -420,24 +420,42 @@ fn analyze_pipeline_from_parsed(
     // RPython: setup_jitdriver(jitdriver_sd) — register portal + green/red layout.
     // PyPy interp_jit.py: greens = ['next_instr', 'is_being_profiled', 'pycode'],
     //                      reds = ['frame', 'ec'], virtualizables = ['frame']
-    let portal = parse::CallPath::from_segments(["execute_opcode_step"]);
+    // Callers can override the portal binding via `PipelineConfig::portal`.
+    let (portal_name, portal_greens, portal_reds, portal_virtualizables, portal_red_types) =
+        match &config.pipeline.portal {
+            Some(spec) => (
+                spec.name.clone(),
+                spec.greens.clone(),
+                spec.reds.clone(),
+                spec.virtualizables.clone(),
+                spec.red_types.clone(),
+            ),
+            None => (
+                "execute_opcode_step".to_string(),
+                vec![
+                    "next_instr".to_string(),
+                    "is_being_profiled".to_string(),
+                    "pycode".to_string(),
+                ],
+                vec!["frame".to_string(), "ec".to_string()],
+                // PyPy interp_jit.py: virtualizables = ['frame'] —
+                // jitdriver.virtualizables drives warmspot.py:527-545
+                // make_virtualizable_infos selection.
+                vec!["frame".to_string()],
+                // jit.py / interp_jit.py: red types parallel to reds.
+                // 'frame' is the virtualizable PyFrame; 'ec' is the
+                // ExecutionContext (the wrapping struct in pyre).
+                vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+            ),
+        };
+    let portal = parse::CallPath::from_segments([portal_name.as_str()]);
     if call_control.function_graphs().contains_key(&portal) {
         call_control.setup_jitdriver(
             portal,
-            vec![
-                "next_instr".to_string(),
-                "is_being_profiled".to_string(),
-                "pycode".to_string(),
-            ],
-            vec!["frame".to_string(), "ec".to_string()],
-            // PyPy interp_jit.py: virtualizables = ['frame'] —
-            // jitdriver.virtualizables drives warmspot.py:527-545
-            // make_virtualizable_infos selection.
-            vec!["frame".to_string()],
-            // jit.py / interp_jit.py: red types parallel to reds.
-            // 'frame' is the virtualizable PyFrame; 'ec' is the
-            // ExecutionContext (the wrapping struct in pyre).
-            vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+            portal_greens,
+            portal_reds,
+            portal_virtualizables,
+            portal_red_types,
         );
         // warmspot.py:515-545 WarmRunnerDesc.make_virtualizable_infos —
         // assigns jd.index_of_virtualizable, builds GreenFieldInfo
@@ -867,6 +885,19 @@ fn resolve_handler_calls(
 pub fn generate_trace_code_from_pipeline(result: &pipeline::ProgramPipelineResult) -> String {
     codegen::generate_from_pipeline(result)
 }
+
+/// Like [`generate_trace_code_from_pipeline`] but respects the selected
+/// [`codegen::CodegenFlavor`]. Callers outside of pyre (e.g. `aheui-jit`)
+/// opt for [`codegen::CodegenFlavor::Minimal`] to skip emission of
+/// pyre-specific helpers.
+pub fn generate_trace_code_from_pipeline_with_flavor(
+    result: &pipeline::ProgramPipelineResult,
+    flavor: codegen::CodegenFlavor,
+) -> String {
+    codegen::generate_from_pipeline_with_flavor(result, flavor)
+}
+
+pub use codegen::CodegenFlavor;
 
 /// Produce a recognition report: how much the pipeline understands.
 pub fn recognition_report(result: &pipeline::ProgramPipelineResult) -> codegen::RecognitionReport {

@@ -15,6 +15,30 @@ use crate::jtransform::{GraphTransformConfig, rewrite_graph};
 use crate::translator::annotator::annrpython::annotate;
 use crate::translator::rtyper::rtyper::resolve_types;
 
+/// JitDriver portal binding.
+///
+/// RPython equivalent: `JitDriverStaticData.portal_graph` + the driver's
+/// `greens=[...]`/`reds=[...]`/`virtualizables=[...]` declarations
+/// (`rlib/jit.py::JitDriver`).
+/// `CallControl.setup_jitdriver` consumes this to register the portal
+/// entry point and its green/red layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortalSpec {
+    /// Function name of the portal entry point (e.g. `"mainloop"` or
+    /// `"execute_opcode_step"`).
+    pub name: String,
+    pub greens: Vec<String>,
+    pub reds: Vec<String>,
+    /// Optional explicit virtualizable red names. Empty means no
+    /// virtualizable, which matches the common non-pyre case.
+    #[serde(default)]
+    pub virtualizables: Vec<String>,
+    /// Optional red-type identities parallel to `reds`, mirroring the
+    /// `_JIT_ENTER_FUNCTYPE.ARGS` information warmspot uses upstream.
+    #[serde(default)]
+    pub red_types: Vec<String>,
+}
+
 /// Configuration for the full analysis pipeline.
 ///
 /// RPython: implicit in `CodeWriter.__init__` + `CallControl.__init__`.
@@ -22,6 +46,11 @@ use crate::translator::rtyper::rtyper::resolve_types;
 pub struct PipelineConfig {
     /// jtransform configuration (virtualizable fields, call classification).
     pub transform: GraphTransformConfig,
+    /// Portal binding for `CallControl.setup_jitdriver`. When `None` the
+    /// pipeline falls back to the default pyre portal
+    /// (`execute_opcode_step`) for backwards compatibility with the
+    /// pyre-specific entry path.
+    pub portal: Option<PortalSpec>,
 }
 
 /// Result of running the full pipeline on a single function.
