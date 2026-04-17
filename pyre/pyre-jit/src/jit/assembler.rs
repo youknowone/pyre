@@ -463,18 +463,50 @@ fn dispatch_op(
         }
         "abort" => state.builder.abort(),
         "abort_permanent" => state.builder.abort_permanent(),
-        "move_i" | "int_copy" => {
-            let (dst, src) = expect_move(args, result, Kind::Int);
-            state.builder.move_i(dst, src);
-        }
-        "move_r" | "ref_copy" => {
-            let (dst, src) = expect_move(args, result, Kind::Ref);
-            state.builder.move_r(dst, src);
-        }
-        "move_f" | "float_copy" => {
-            let (dst, src) = expect_move(args, result, Kind::Float);
-            state.builder.move_f(dst, src);
-        }
+        // `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
+        // `v` is either a `Register` or a `Constant`. Register source
+        // lowers to `move_{i,r,f}`; Constant source lowers to
+        // `load_const_{i,r,f}_value`, matching the two argcode variants
+        // emitted by `assembler.py:162-174` (`i` for Register, `c` for
+        // Constant). The `move_*` aliases are the pyre-only pre-parity
+        // names that the B6 Phase 3b migration replaces with
+        // `{kind}_copy`.
+        "move_i" | "int_copy" => match source_operand(args, result) {
+            MoveSource::Reg(src) => {
+                let dst = expect_result_or_first_reg(args, result, Kind::Int);
+                let src = expect_reg(src, Kind::Int);
+                state.builder.move_i(dst, src);
+            }
+            MoveSource::ConstInt(value) => {
+                let dst = expect_result_or_first_reg(args, result, Kind::Int);
+                state.builder.load_const_i_value(dst, value);
+            }
+            other => panic!("int_copy expects Register or ConstInt, got {:?}", other),
+        },
+        "move_r" | "ref_copy" => match source_operand(args, result) {
+            MoveSource::Reg(src) => {
+                let dst = expect_result_or_first_reg(args, result, Kind::Ref);
+                let src = expect_reg(src, Kind::Ref);
+                state.builder.move_r(dst, src);
+            }
+            MoveSource::ConstRef(value) => {
+                let dst = expect_result_or_first_reg(args, result, Kind::Ref);
+                state.builder.load_const_r_value(dst, value);
+            }
+            other => panic!("ref_copy expects Register or ConstRef, got {:?}", other),
+        },
+        "move_f" | "float_copy" => match source_operand(args, result) {
+            MoveSource::Reg(src) => {
+                let dst = expect_result_or_first_reg(args, result, Kind::Float);
+                let src = expect_reg(src, Kind::Float);
+                state.builder.move_f(dst, src);
+            }
+            MoveSource::ConstFloat(value) => {
+                let dst = expect_result_or_first_reg(args, result, Kind::Float);
+                state.builder.load_const_f_value(dst, value);
+            }
+            other => panic!("float_copy expects Register or ConstFloat, got {:?}", other),
+        },
         "load_const_i" => {
             let (dst, value) = expect_load_const_i(args, result);
             state.builder.load_const_i_value(dst, value);
@@ -532,31 +564,37 @@ fn dispatch_op(
         // SpaceOperation names use `*_vable_*` infix. pyre's JitCodeBuilder
         // methods retain `vable_*` prefix as a PRE-EXISTING-ADAPTATION so
         // the rename is scoped to the Insn::Op key.
-        "getfield_vable_i" => {
+        // `rpython/jit/codewriter/jtransform.py:844,923` emits field
+        // accessors with the FULL kind name (`getfield_vable_int`,
+        // `setfield_vable_ref`, etc.). The short-form aliases
+        // (`getfield_vable_i`, …) are pre-existing pyre-side dispatch
+        // arms kept here for backwards compatibility with any caller
+        // that has not yet migrated to the RPython-parity names.
+        "getfield_vable_int" | "getfield_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state
                 .builder
                 .vable_getfield_int(dst, expect_small_u16(&args[0]));
         }
-        "getfield_vable_r" => {
+        "getfield_vable_ref" | "getfield_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
             state
                 .builder
                 .vable_getfield_ref(dst, expect_small_u16(&args[0]));
         }
-        "getfield_vable_f" => {
+        "getfield_vable_float" | "getfield_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state
                 .builder
                 .vable_getfield_float(dst, expect_small_u16(&args[0]));
         }
-        "setfield_vable_i" => state
+        "setfield_vable_int" | "setfield_vable_i" => state
             .builder
             .vable_setfield_int(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int)),
-        "setfield_vable_r" => state
+        "setfield_vable_ref" | "setfield_vable_r" => state
             .builder
             .vable_setfield_ref(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Ref)),
-        "setfield_vable_f" => state.builder.vable_setfield_float(
+        "setfield_vable_float" | "setfield_vable_f" => state.builder.vable_setfield_float(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Float),
         ),
@@ -613,6 +651,23 @@ fn dispatch_op(
                 expect_opcode(&args[0]),
                 expect_reg(&args[1], Kind::Int),
                 expect_reg(&args[2], Kind::Int),
+            );
+        }
+        // `rpython/jit/metainterp/resoperation.py` / `jtransform.py`
+        // emit per-OpCode opnames for integer comparisons and
+        // arithmetic. pyre routes these through the same
+        // `record_binop_i` builder (no IR-level difference because
+        // pyre's tracer emits the specific `OpCode` at trace time),
+        // but the SSARepr carries the RPython-parity opname so the
+        // Phase 3c switchover can reproduce the byte-level dispatch
+        // without a pyre-only `record_binop_i` entry.
+        "int_eq" => {
+            let dst = expect_result_reg(result, Kind::Int, "int_eq needs result");
+            state.builder.record_binop_i(
+                dst,
+                majit_ir::OpCode::IntEq,
+                expect_reg(&args[0], Kind::Int),
+                expect_reg(&args[1], Kind::Int),
             );
         }
         "record_binop_f" => {
@@ -927,6 +982,32 @@ fn expect_move(args: &[Operand], result: Option<&Register>, kind: Kind) -> (u16,
         return (dst.index, expect_reg(&args[0], kind));
     }
     (expect_reg(&args[0], kind), expect_reg(&args[1], kind))
+}
+
+/// `flatten.py:333` source operand for `{kind}_copy`. The source may
+/// be either a Register (argcode `'i'`/`'r'`/`'f'`) or a Constant
+/// (argcode `'c'` in short form). `MoveSource` captures the shape so
+/// the dispatch arm can lower to the right `JitCodeBuilder` method.
+#[derive(Debug)]
+enum MoveSource<'a> {
+    Reg(&'a Operand),
+    ConstInt(i64),
+    ConstRef(i64),
+    ConstFloat(i64),
+}
+
+fn source_operand<'a>(args: &'a [Operand], result: Option<&Register>) -> MoveSource<'a> {
+    let src_operand = if result.is_some() { &args[0] } else { &args[1] };
+    match src_operand {
+        Operand::Register(_) => MoveSource::Reg(src_operand),
+        Operand::ConstInt(v) => MoveSource::ConstInt(*v),
+        Operand::ConstRef(v) => MoveSource::ConstRef(*v),
+        Operand::ConstFloat(v) => MoveSource::ConstFloat(*v),
+        _ => panic!(
+            "source_operand: unexpected source operand {:?}",
+            src_operand
+        ),
+    }
 }
 
 fn expect_load_const_i(args: &[Operand], result: Option<&Register>) -> (u16, i64) {
