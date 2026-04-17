@@ -30,7 +30,7 @@
 /// the codewriter/metainterp jitdrivers_sd split (see
 /// `CallControl::make_virtualizable_infos`) means this struct is built
 /// without a back-pointer to the runtime jitdriver record.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GreenFieldInfo {
     /// greenfield.py:14 `self.red_index = jd.jitdriver.reds.index(objname)`
     /// — slot in `jitdriver.reds` that holds the unique green-field

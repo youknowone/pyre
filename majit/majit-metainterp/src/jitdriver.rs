@@ -93,6 +93,33 @@ pub struct JitDriverStaticData {
     /// `do_recursive_call`'s residual CALL_ASSEMBLER op
     /// (pyjitpl.py:1428-1429).
     pub portal_runner_adr: i64,
+    /// jitdriver.py:16 + warmspot.py:520-545 `jd.virtualizable_info`.
+    ///
+    /// Per-driver `VirtualizableInfo` populated during warmspot setup
+    /// (`make_virtualizable_infos`).  Read by
+    /// `MIFrame._do_jit_force_virtual` (pyjitpl.py:2155),
+    /// `vable_and_vrefs_before_residual_call` (pyjitpl.py:3320), and
+    /// peers that consult `self.metainterp.jitdriver_sd.virtualizable_info`.
+    /// Pyre keeps a duplicate single-slot on `MetaInterp` for the
+    /// production path that hasn't yet rerouted through this slot —
+    /// `MetaInterp::register_jitdriver_sd` propagates from MetaInterp
+    /// to here when both are present so per-driver readers stay in
+    /// sync without forcing the production registration refactor.
+    pub virtualizable_info: Option<crate::virtualizable::VirtualizableInfo>,
+    /// jitdriver.py:17 + warmspot.py:520-525 `jd.greenfield_info`.
+    ///
+    /// Per-driver `GreenFieldInfo` populated when `jd.jitdriver.greens`
+    /// contains a dotted name.  Read by `_do_jit_force_virtual`
+    /// (pyjitpl.py:2156) — the bail check fires when both this slot
+    /// and `virtualizable_info` are None.
+    pub greenfield_info: Option<crate::greenfield::GreenFieldInfo>,
+    /// jitdriver.py:28 + warmspot.py:529/538 `jd.index_of_virtualizable`.
+    ///
+    /// Index inside the red-arg list pointing to the virtualizable
+    /// argument; -1 when the driver has no virtualizable.  Mirrored
+    /// by `virtualizable_arg_index()` so legacy callers keep
+    /// returning `Option<usize>`.
+    pub index_of_virtualizable: i32,
 }
 
 impl JitDriverStaticData {
@@ -114,14 +141,24 @@ impl JitDriverStaticData {
         for (name, tp) in reds {
             vars.push(JitDriverVar::red(name, tp));
         }
-        JitDriverStaticData {
+        let mut sd = JitDriverStaticData {
             vars,
             virtualizable: virtualizable.map(str::to_string),
             result_type: Type::Ref,
             is_recursive: false,
             mainjitcode: None,
             portal_runner_adr: 0,
+            virtualizable_info: None,
+            greenfield_info: None,
+            index_of_virtualizable: -1,
+        };
+        // warmspot.py:529/538 — keep `index_of_virtualizable` in sync
+        // with the `virtualizable_arg_index()` derived from `reds`.
+        // Stays `-1` when the driver has no virtualizable.
+        if let Some(idx) = sd.virtualizable_arg_index() {
+            sd.index_of_virtualizable = idx as i32;
         }
+        sd
     }
 
     /// Get only the green variables.

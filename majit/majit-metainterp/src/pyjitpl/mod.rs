@@ -408,25 +408,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) compiled_loops: HashMap<u64, CompiledEntry<M>>,
     pub(crate) tracing: Option<TraceCtx>,
     pub(crate) next_trace_id: u64,
-    /// Virtualizable info for interpreter frame virtualization.
-    ///
-    /// When set, the JIT will:
-    /// 1. Read virtualizable fields at trace entry (synchronize)
-    /// 2. Write them back on guard failure (force)
-    /// 3. Track field access as IR ops during tracing
-    pub(crate) virtualizable_info: Option<VirtualizableInfo>,
-    /// pyjitpl.py:2155 / warmspot.py:519-525 `jd.greenfield_info`.
-    ///
-    /// Mirrors the per-jitdriver `GreenFieldInfo` upstream attaches at
-    /// warmspot setup time.  PRE-EXISTING-ADAPTATION: pyre's
-    /// MetaInterp keeps a single shared slot rather than the
-    /// per-`jitdrivers_sd[idx]` table because the metainterp-side
-    /// jitdrivers_sd port hasn't yet grown the field (codewriter side
-    /// has it on `JitDriverStaticData::greenfield_info`).  Consulted
-    /// by `_do_jit_force_virtual` (pyjitpl.py:2155) — the bail
-    /// condition fires when both `virtualizable_info` and this slot
-    /// are None.
-    pub(crate) greenfield_info: Option<crate::greenfield::GreenFieldInfo>,
     /// RPython metainterp_sd.virtualref_info — shared VirtualRefInfo.
     pub(crate) virtualref_info: crate::virtualref::VirtualRefInfo,
     /// JIT hooks for profiling and debugging.
@@ -992,8 +973,6 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: HashMap::new(),
             tracing: None,
             next_trace_id: 1,
-            virtualizable_info: None,
-            greenfield_info: None,
             virtualref_info: crate::virtualref::VirtualRefInfo::new(),
             hooks: JitHooks::default(),
             pending_token: None,
@@ -1125,7 +1104,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `live_values` is the pyre analog of RPython's `original_boxes`:
     /// the list of input values for the current trace.
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
-        let Some(info) = self.virtualizable_info.as_ref() else {
+        let Some(info) = self.virtualizable_info() else {
             return;
         };
         let array_lengths = self.trace_entry_vable_lengths(info);
@@ -1212,17 +1191,56 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state.decay_counters();
     }
 
+    /// Lazily ensure a default `JitDriverStaticData` slot exists.
+    ///
+    /// Returns the index of the slot (always 0 for single-driver pyre).
+    /// Pyre's production path constructs `JitDriver` without ever
+    /// calling `register_jitdriver_sd`, so per-driver readers would
+    /// otherwise see an empty `jitdrivers_sd` table.  This helper
+    /// installs a placeholder driver — empty greens/reds, no
+    /// virtualizable name — purely as a destination for
+    /// `set_virtualizable_info` / `set_greenfield_info` propagation.
+    /// When the host later registers a real driver via
+    /// `register_jitdriver_sd`, that driver gets index 1+ and reads
+    /// continue to consult the table linearly via `iter()`.
+    pub fn ensure_default_driver_sd(&mut self) -> usize {
+        if self.staticdata.jitdrivers_sd.is_empty() {
+            self.staticdata
+                .jitdrivers_sd
+                .push(crate::jitdriver::JitDriverStaticData::new(vec![], vec![]));
+        }
+        0
+    }
+
     /// Set virtualizable info for interpreter frame virtualization.
     ///
     /// This tells the JIT how to read/write interpreter frame fields
     /// during trace entry/exit.
+    ///
+    /// warmspot.py:545 `jd.virtualizable_info = vinfos[VTYPEPTR]` —
+    /// auto-creates a default `jitdrivers_sd[0]` entry if pyre's
+    /// production path hasn't registered one yet, then propagates to
+    /// every registered jitdriver_sd so per-driver readers
+    /// (`_do_jit_force_virtual`, `vable_*_residual_call`) see the info.
     pub fn set_virtualizable_info(&mut self, info: VirtualizableInfo) {
-        self.virtualizable_info = Some(info);
+        self.ensure_default_driver_sd();
+        for jd in self.staticdata.jitdrivers_sd.iter_mut() {
+            jd.virtualizable_info = Some(info.clone());
+        }
     }
 
-    /// Get the virtualizable info.
+    /// Get the active virtualizable info.
+    ///
+    /// jitdriver.py:16 parity — reads the first registered
+    /// `jitdrivers_sd` entry whose `virtualizable_info` slot is
+    /// populated.  `set_virtualizable_info` lazy-creates
+    /// `jitdrivers_sd[0]`, so production callers see the info as soon
+    /// as the host installs it at JIT init.
     pub fn virtualizable_info(&self) -> Option<&VirtualizableInfo> {
-        self.virtualizable_info.as_ref()
+        self.staticdata
+            .jitdrivers_sd
+            .iter()
+            .find_map(|jd| jd.virtualizable_info.as_ref())
     }
 
     /// warmspot.py:519-525 `jd.greenfield_info = GreenFieldInfo(cpu, jd)`.
@@ -1230,13 +1248,24 @@ impl<M: Clone> MetaInterp<M> {
     /// Hosts that declare green fields (greens containing `.`) call
     /// this between `JitDriver::new` and the first
     /// `_do_jit_force_virtual` to mirror the upstream warmspot wiring.
+    /// Auto-creates `jitdrivers_sd[0]` and propagates to every
+    /// registered driver.
     pub fn set_greenfield_info(&mut self, info: crate::greenfield::GreenFieldInfo) {
-        self.greenfield_info = Some(info);
+        self.ensure_default_driver_sd();
+        for jd in self.staticdata.jitdrivers_sd.iter_mut() {
+            jd.greenfield_info = Some(info.clone());
+        }
     }
 
-    /// Borrow the greenfield info.
+    /// Borrow the active greenfield info.
+    ///
+    /// jitdriver.py:17 parity — reads the first registered
+    /// `jitdrivers_sd` entry whose `greenfield_info` slot is populated.
     pub fn greenfield_info(&self) -> Option<&crate::greenfield::GreenFieldInfo> {
-        self.greenfield_info.as_ref()
+        self.staticdata
+            .jitdrivers_sd
+            .iter()
+            .find_map(|jd| jd.greenfield_info.as_ref())
     }
 
     /// Create an optimizer with virtualizable config if available.
@@ -1251,7 +1280,7 @@ impl<M: Clone> MetaInterp<M> {
             if !ctx.has_virtualizable_boxes() {
                 return None;
             }
-            self.virtualizable_info.as_ref().map(|info| {
+            self.virtualizable_info().map(|info| {
                 let mut config = info.to_optimizer_config();
                 config.array_lengths = ctx.virtualizable_array_lengths().unwrap_or(&[]).to_vec();
                 config
@@ -1700,7 +1729,7 @@ impl<M: Clone> MetaInterp<M> {
     /// call. This mirrors the upstream "heap wins" direction on the escape
     /// path so any forced writes become visible to the resumed interpreter.
     pub fn load_fields_from_virtualizable(&mut self) {
-        let info = match self.virtualizable_info.clone() {
+        let info = match self.virtualizable_info().cloned() {
             Some(info) => info,
             None => return,
         };
@@ -2062,7 +2091,7 @@ impl<M: Clone> MetaInterp<M> {
         constant_types: &mut HashMap<u32, Type>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
     ) {
-        let Some(vinfo) = self.virtualizable_info.as_ref() else {
+        let Some(vinfo) = self.virtualizable_info() else {
             return;
         };
         let Some(driver) = driver_descriptor else {
@@ -8960,10 +8989,21 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs)
         let green_values: Vec<i64> = greenargs.iter().map(|(_, _, value)| *value).collect();
         let green_key = crate::green_key_hash(&green_values);
+        // pyjitpl.py:3605-3608 — `jd.index_of_virtualizable >= 0` decides
+        // whether a vablebox is returned.  The token-derived path keeps
+        // its embedded index for backwards compatibility with tokens
+        // whose driver_sd `index_of_virtualizable` slot wasn't populated
+        // at codewriter setup; the pending-token branch reads the field
+        // directly per upstream parity.
         let (target_token, vable_index) = if let Some(token) = self.get_loop_token(green_key) {
             (token.number, token.virtualizable_arg_index)
         } else if let Some(token_number) = self.get_pending_token_number(green_key) {
-            (token_number, target_sd.virtualizable_arg_index())
+            let idx = if target_sd.index_of_virtualizable >= 0 {
+                Some(target_sd.index_of_virtualizable as usize)
+            } else {
+                None
+            };
+            (token_number, idx)
         } else {
             return (None, None);
         };
@@ -9038,7 +9078,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // pyjitpl.py:3326-3334 — vinfo path (FORCE_TOKEN + SETFIELD_GC).
-        let vinfo = match self.virtualizable_info.clone() {
+        let vinfo = match self.virtualizable_info().cloned() {
             Some(info) => info,
             None => return,
         };
@@ -9114,7 +9154,7 @@ impl<M: Clone> MetaInterp<M> {
     /// caller can route to the matching `aborted_tracing` /
     /// blackhole-resume path.
     pub fn vable_after_residual_call(&mut self, _funcbox: i64) -> Result<(), SwitchToBlackhole> {
-        let vinfo = match self.virtualizable_info.clone() {
+        let vinfo = match self.virtualizable_info().cloned() {
             Some(info) => info,
             None => return Ok(()),
         };
@@ -9188,13 +9228,6 @@ impl<M: Clone> MetaInterp<M> {
     ///         return None
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream's `virtualizable_info` /
-    /// `greenfield_info` live on the per-jitdriver static data
-    /// (`jd.jitdriver_sd.*`); pyre keeps single shared slots on
-    /// `MetaInterp` because the metainterp-side jitdrivers_sd port
-    /// hasn't grown the per-driver tables yet.  The bail check below
-    /// still consults both slots so greenfield-only drivers keep the
-    /// upstream semantics (pyjitpl.py:2155).
     pub fn _do_jit_force_virtual(
         &mut self,
         allboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
@@ -9210,7 +9243,7 @@ impl<M: Clone> MetaInterp<M> {
         //   if (self.metainterp.jitdriver_sd.virtualizable_info is None and
         //       self.metainterp.jitdriver_sd.greenfield_info is None):
         //       return None
-        if self.virtualizable_info.is_none() && self.greenfield_info.is_none() {
+        if self.virtualizable_info().is_none() && self.greenfield_info().is_none() {
             return None;
         }
         // pyjitpl.py:2159-2161: vref_box vs standard_box identity short-circuit.
@@ -10473,6 +10506,9 @@ mod metainterp_static_data_tests {
             is_recursive: false,
             mainjitcode: None,
             portal_runner_adr: 0,
+            virtualizable_info: None,
+            greenfield_info: None,
+            index_of_virtualizable: -1,
         };
         let _ = meta.staticdata.register_jitdriver_sd(driver);
         meta.framestack.push(crate::pyjitpl::MIFrame::new(
@@ -11285,7 +11321,8 @@ mod metainterp_static_data_tests {
             execute_varargs_int_helper as *const () as i64,
         );
 
-        let result = meta.do_residual_call_full(funcbox, &[], descr_ref, &descr_view, 0, false, None);
+        let result =
+            meta.do_residual_call_full(funcbox, &[], descr_ref, &descr_view, 0, false, None);
         let (opref, _resvalue) = result.expect("Ok").expect("Some(opref)");
 
         let ctx = meta.trace_ctx().expect("active trace");
