@@ -255,11 +255,8 @@ pub struct HeapCache {
     field_cache: HashMap<(OpRef, u32), OpRef>,
 
     heap_cache: HashMap<u32, CacheEntry>,
+    /// heapcache.py: `cached_arrayitems` — nested map descr → ConstInt-index → CacheEntry.
     heap_array_cache: HashMap<u32, HashMap<u32, CacheEntry>>,
-
-    /// Array item cache: (array_ref, index_opref, descr_index) -> cached value.
-    /// heapcache.py: `cached_arrayitems`.
-    array_cache: HashMap<(OpRef, OpRef, u32), OpRef>,
 
     /// Known class map: object_ref -> class pointer.
     /// RPython: CacheEntry 내부. Vec indexed by OpRef.0.
@@ -321,7 +318,6 @@ impl HeapCache {
             field_cache: HashMap::new(),
             heap_cache: HashMap::new(),
             heap_array_cache: HashMap::new(),
-            array_cache: HashMap::new(),
             known_class: Vec::new(),
             quasi_immut_known: HashSet::new(),
             is_unescaped: Vec::new(),
@@ -708,8 +704,16 @@ impl HeapCache {
             Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
         };
         self.field_cache.retain(|&(obj, _), _| still_unescaped(obj));
-        self.array_cache
-            .retain(|&(obj, _, _), _| still_unescaped(obj));
+        // heapcache.py:542-552: iterate cached_arrayitems and invalidate
+        // per-CacheEntry entries whose box is no longer unescaped.
+        let unescaped: Vec<bool> = (0..flags_snapshot.len())
+            .map(|i| still_unescaped(OpRef(i as u32)))
+            .collect();
+        for caches in self.heap_array_cache.values_mut() {
+            for cache in caches.values_mut() {
+                cache.invalidate_unescaped(&unescaped);
+            }
+        }
     }
 
     /// heapcache.py:502-506
@@ -1357,8 +1361,16 @@ impl HeapCache {
         self.getarrayitem_cache(array, index, descr)
     }
 
+    /// heapcache.py:542-553 getarrayitem: ConstInt-only lookup into
+    /// heap_array_cache[descr][index].read(box).
     pub fn getarrayitem_cache(&self, array: OpRef, index: OpRef, descr: u32) -> Option<OpRef> {
-        self.array_cache.get(&(array, index, descr)).copied()
+        if !index.is_constant() {
+            return None;
+        }
+        let entry = self.heap_array_cache.get(&descr)?.get(&index.0)?;
+        let seen_alloc = self.saw_allocation(array);
+        let opref = entry._getdict(seen_alloc).get(&array).copied()?;
+        Some(self.maybe_replace_with_const(opref))
     }
 
     /// Record an array item write.
@@ -1366,8 +1378,24 @@ impl HeapCache {
         self.setarrayitem_cache(array, index, descr, value)
     }
 
+    /// heapcache.py:573-585 setarrayitem: non-ConstInt clears the whole
+    /// descr submap; ConstInt writes via indexcache.do_write_with_aliasing.
     pub fn setarrayitem_cache(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
-        self.array_cache.insert((array, index, descr), value);
+        if !index.is_constant() {
+            if let Some(cache) = self.heap_array_cache.get_mut(&descr) {
+                cache.clear();
+            }
+            return;
+        }
+        let seen_alloc = self.saw_allocation(array);
+        let entry = self
+            .heap_array_cache
+            .entry(descr)
+            .or_default()
+            .entry(index.0)
+            .or_insert_with(CacheEntry::new);
+        entry._clear_cache_on_write(seen_alloc);
+        entry._getdict_mut(seen_alloc).insert(array, value);
     }
 
     /// Record an array item read.
@@ -1381,13 +1409,30 @@ impl HeapCache {
         self.getarrayitem_now_known(array, index, descr, value);
     }
 
+    /// heapcache.py:565-568 getarrayitem_now_known: ConstInt-only
+    /// read_now_known into indexcache.
     pub fn getarrayitem_now_known(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
-        self.array_cache.insert((array, index, descr), value);
+        if !index.is_constant() {
+            return;
+        }
+        let seen_alloc = self.saw_allocation(array);
+        let entry = self
+            .heap_array_cache
+            .entry(descr)
+            .or_default()
+            .entry(index.0)
+            .or_insert_with(CacheEntry::new);
+        entry._getdict_mut(seen_alloc).insert(array, value);
     }
 
-    /// Invalidate array caches for a specific array.
+    /// Invalidate array caches for a specific array across every descr/index.
     pub fn invalidate_array_cache(&mut self, array: OpRef) {
-        self.array_cache.retain(|&(a, _, _), _| a != array);
+        for cache in self.heap_array_cache.values_mut() {
+            for entry in cache.values_mut() {
+                entry.cache_anything.remove(&array);
+                entry.cache_seen_allocation.remove(&array);
+            }
+        }
     }
 
     // ── Quasi-immutable tracking (RPython heapcache.py quasi_immut_known) ──
@@ -1621,7 +1666,6 @@ impl HeapCache {
         self.likely_virtual_version = self.head_version;
         // heapcache.py:172-175: clear heap_cache + heap_array_cache.
         self.field_cache.clear();
-        self.array_cache.clear();
         self.heap_cache.clear();
         self.heap_array_cache.clear();
         // heapcache.py:176: need_guard_not_invalidated = True
@@ -1684,7 +1728,6 @@ impl HeapCache {
         assert!(self.head_version < HF_VERSION_MAX);
         self.head_version += HF_VERSION_INC;
         self.field_cache.clear();
-        self.array_cache.clear();
         self.heap_cache.clear();
         self.heap_array_cache.clear();
     }
