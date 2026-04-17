@@ -225,18 +225,24 @@ impl VirtualizableInfo {
     pub fn set_parent_descr(&mut self, descr: DescrRef) {
         self.parent_descr = Some(descr.clone());
         // virtualizable.py:28: self.vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
+        // descr.py:214-215 + heaptracker.py:97: index_in_parent counts
+        // non-void, non-typeptr fields in struct declaration order.
+        // Layout: [typeptr, vable_token(0), static_0(1), ..., array_ptr_0(n+1), ...]
         self.vable_token_descr = Some(Self::build_field_descr(
             &descr,
             self.token_offset,
             item_size_for_type(Type::Int),
             Type::Int,
             majit_ir::ArrayFlag::Unsigned,
+            0,
         ));
         // virtualizable.py:71-72: self.static_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
+        let num_static = self.static_fields.len();
         self._static_field_descrs = self
             .static_fields
             .iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(i, f)| {
                 let flag = majit_ir::ArrayFlag::from_field_type(f.field_type);
                 Self::build_field_descr(
                     &descr,
@@ -244,6 +250,7 @@ impl VirtualizableInfo {
                     item_size_for_type(f.field_type),
                     f.field_type,
                     flag,
+                    1 + i,
                 )
             })
             .collect();
@@ -253,7 +260,8 @@ impl VirtualizableInfo {
         self._array_field_descrs = self
             .array_fields
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(j, a)| {
                 let offset = a.field_offset;
                 Self::build_field_descr(
                     &descr,
@@ -261,6 +269,7 @@ impl VirtualizableInfo {
                     std::mem::size_of::<usize>(),
                     Type::Ref,
                     majit_ir::ArrayFlag::Pointer,
+                    1 + num_static + j,
                 )
             })
             .collect();
@@ -288,11 +297,12 @@ impl VirtualizableInfo {
         field_size: usize,
         field_type: Type,
         flag: majit_ir::ArrayFlag,
+        index_in_parent: usize,
     ) -> DescrRef {
         std::sync::Arc::new(
             majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
                 .with_flag(flag)
-                .with_parent_descr(parent.clone(), 0),
+                .with_parent_descr(parent.clone(), index_in_parent),
         )
     }
 
