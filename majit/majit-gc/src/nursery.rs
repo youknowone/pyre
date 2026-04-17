@@ -38,26 +38,6 @@ pub struct NurseryPtrs {
     pub top: *const u8,
 }
 
-/// framework.py:990-992 parity: pointer to the heap-allocated NurseryPtrs.
-/// Set once by Nursery::new(). nursery_global_addrs() returns field addresses
-/// from this struct, matching gc_adr_of_nursery_free / gc_adr_of_nursery_top.
-static mut NURSERY_PTRS: *mut NurseryPtrs = std::ptr::null_mut();
-
-/// gc.py:525-531 get_nursery_free_addr / get_nursery_top_addr parity.
-///
-/// Returns the stable addresses of the nursery free/top fields
-/// for Cranelift inline bump allocation.
-pub fn nursery_global_addrs() -> (usize, usize) {
-    unsafe {
-        let ptrs = NURSERY_PTRS;
-        debug_assert!(!ptrs.is_null());
-        (
-            std::ptr::addr_of!((*ptrs).free) as usize,
-            std::ptr::addr_of!((*ptrs).top) as usize,
-        )
-    }
-}
-
 /// Default nursery size: 896KB, matching incminimark's TRANSLATION_PARAMS.
 pub const DEFAULT_NURSERY_SIZE: usize = 896 * 1024;
 
@@ -91,9 +71,6 @@ impl Nursery {
         }
         let top = unsafe { start.add(size) };
         let ptrs = Box::new(NurseryPtrs { free: start, top });
-        unsafe {
-            NURSERY_PTRS = &*ptrs as *const NurseryPtrs as *mut NurseryPtrs;
-        }
         Nursery { start, size, ptrs }
     }
 
@@ -300,14 +277,15 @@ mod tests {
     }
 
     #[test]
-    fn test_nursery_global_addrs_stable() {
+    fn test_nursery_instance_addrs_stable() {
+        // gc.py:525-531 parity: nursery free/top addresses are per-instance
+        // fields of the live GC descriptor, not a process-global singleton.
         let nursery = Nursery::new(4096);
-        let (free_addr, top_addr) = nursery_global_addrs();
-        // The addresses should point to the NurseryPtrs fields
+        let free_addr = nursery.free_addr();
+        let top_addr = nursery.top_addr();
         assert_ne!(free_addr, 0);
         assert_ne!(top_addr, 0);
         assert_ne!(free_addr, top_addr);
-        // Reading through the address should give the current free pointer
         let free_val = unsafe { *(free_addr as *const *mut u8) };
         assert_eq!(free_val, nursery.free_ptr());
     }
