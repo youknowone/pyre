@@ -75,11 +75,13 @@ pub enum AbortReason {
 
 impl AbortReason {
     /// Map to the upstream `Counters.ABORT_*` integer for hook payloads.
+    /// Values follow the declaration order in `rpython/rlib/jit.py`
+    /// `class Counters` (ABORT_TOO_LONG=12, ABORT_BRIDGE=13, ABORT_BAD_LOOP=14).
     #[inline]
     pub const fn as_int(self) -> i32 {
         match self {
-            AbortReason::TooLong => 1,
-            AbortReason::Generic => 0,
+            AbortReason::TooLong => 12,
+            AbortReason::Generic => 13,
         }
     }
 }

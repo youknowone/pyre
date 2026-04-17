@@ -2293,11 +2293,10 @@ fn materialize_bridge_virtual(
                     return ctx.const_null();
                 }
                 let ci = (val - TAG_CONST_OFFSET) as usize;
-                let (raw, tp) = resume_data
-                    .rd_consts
-                    .get(ci)
-                    .copied()
-                    .unwrap_or((0, majit_ir::Type::Int));
+                // resume.py:1251 `box = self.consts[num - TAG_CONST_OFFSET]`
+                // — direct indexing, fail-fast on out-of-range (mirrors
+                // Python IndexError; never silently substitutes).
+                let (raw, tp) = resume_data.rd_consts[ci];
                 match tp {
                     majit_ir::Type::Ref => ctx.const_ref(raw),
                     majit_ir::Type::Float => ctx.const_float(raw),
