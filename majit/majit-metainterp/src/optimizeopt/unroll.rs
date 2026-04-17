@@ -4086,6 +4086,23 @@ fn assemble_peeled_trace_with_jump_args(
         if !source_slot.is_none() {
             if let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) {
                 input_remap.insert(source_slot, extended_label_arg);
+                // RPython Box-identity parity: the Case A/B end-of-preamble
+                // dedup may emit `fresh = SameAsX(source_slot)` so the preamble
+                // JUMP carries `fresh` while the body Label takes `source_slot`
+                // (one real backing value, two distinct OpRef identities in
+                // pyre's flat namespace). Body ops that inherited the tracer's
+                // reference to `fresh` (e.g. `IntLt(i, n_intval_alias)` where
+                // `n_intval_alias = fresh`) must also remap to the label arg,
+                // otherwise the dynasm backend reads `fresh`'s preamble-time
+                // caller-save register — which the first body Call clobbers —
+                // and iteration 2+ sees garbage. cranelift's SSA lowering
+                // papers over this (loop-invariant def reaches all uses),
+                // dynasm does not.
+                if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
+                    if !jump_source.is_none() && jump_source != source_slot {
+                        input_remap.insert(jump_source, extended_label_arg);
+                    }
+                }
             }
         }
     }
