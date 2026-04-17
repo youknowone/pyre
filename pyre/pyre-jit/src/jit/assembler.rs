@@ -158,6 +158,31 @@ impl Assembler {
             .collect()
     }
 
+    /// `assembler.py:300-305` `finished(self, callinfocollection)`.
+    ///
+    /// ```python
+    /// def finished(self, callinfocollection):
+    ///     # Helper called at the end of assembling.  Registers the extra
+    ///     # functions shown in _callinfo_for_oopspec.
+    ///     for func in callinfocollection.all_function_addresses_as_int():
+    ///         func = int2adr(func)
+    ///         self.see_raw_object(func.ptr)
+    /// ```
+    ///
+    /// Called from `codewriter.py:85` after the `enum_pending_graphs`
+    /// drain loop completes; registers raw helper-function addresses
+    /// into `list_of_addr2name` for `MetaInterpStaticData`'s
+    /// debug-symbol map.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre has no `oopspec` system, so the
+    /// callinfocollection is empty (see
+    /// [`super::call::CallInfoCollection`]) and the iteration is a
+    /// no-op. The slot is preserved so `make_jitcodes` calls through
+    /// at exactly the same point as `codewriter.py:85`.
+    pub fn finished(&mut self, callinfocollection: &super::call::CallInfoCollection) {
+        let _ = callinfocollection;
+    }
+
     /// `assembler.py:34-54` `assemble(self, ssarepr, jitcode=None, num_regs=None)`.
     pub fn assemble(
         &mut self,

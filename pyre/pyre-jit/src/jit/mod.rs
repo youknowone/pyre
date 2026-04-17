@@ -1,6 +1,7 @@
 pub mod assembler;
 pub mod call;
 pub mod codewriter;
+pub mod cpu;
 pub mod flatten;
 pub mod liveness;
 mod ssa_emitter;

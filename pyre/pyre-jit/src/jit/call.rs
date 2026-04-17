@@ -8,13 +8,20 @@
 //! pyre's "graph" is a `CodeObject` pointer; otherwise the field-by-field
 //! port matches upstream:
 //!
-//! | RPython `call.py`        | pyre `call.rs`           |
-//! |--------------------------|--------------------------|
-//! | `self.jitcodes`          | `self.jitcodes`          |
-//! | `self.unfinished_graphs` | `self.unfinished_graphs` |
-//! | `get_jitcode()`          | `get_jitcode()`          |
-//! | `grab_initial_jitcodes()`| `grab_initial_jitcodes()`|
-//! | `enum_pending_graphs()`  | `enum_pending_graphs()`  |
+//! | RPython `call.py`           | pyre `call.rs`              |
+//! |-----------------------------|-----------------------------|
+//! | `self.virtualref_info`      | `self.virtualref_info`      |
+//! | `self.has_libffi_call`      | `self.has_libffi_call`      |
+//! | `self.cpu`                  | `self.cpu`                  |
+//! | `self.jitdrivers_sd`        | `self.jitdrivers_sd`        |
+//! | `self.jitcodes`             | `self.jitcodes`             |
+//! | `self.unfinished_graphs`    | `self.unfinished_graphs`    |
+//! | `self.callinfocollection`   | `self.callinfocollection`   |
+//! | `__init__(cpu, jitdrivers_sd)` | `new(cpu, jitdrivers_sd)`|
+//! | `get_jitcode()`             | `get_jitcode()`             |
+//! | `grab_initial_jitcodes()`   | `grab_initial_jitcodes()`   |
+//! | `enum_pending_graphs()`     | `enum_pending_graphs()`     |
+//! | (n/a — pure-lookup helper)  | `find_jitcode()`            |
 //!
 //! PRE-EXISTING-ADAPTATION: RPython's CallControl is owned by a single
 //! `CodeWriter` instance (`warmspot.py:245`) for the lifetime of the JIT.
@@ -27,9 +34,63 @@ use std::collections::HashMap;
 use pyre_interpreter::CodeObject;
 
 use super::codewriter::{CodeWriter, PyJitCode};
+use super::cpu::Cpu;
+
+/// RPython: `rpython/jit/codewriter/effectinfo.py` `class CallInfoCollection`.
+///
+/// Owns the `_callinfo_for_oopspec` table that maps `oopspec_name → (calldescr,
+/// func_addr)` so `assembler.finished()` can register the raw helper addresses
+/// for symbolic debugging.
+///
+/// PRE-EXISTING-ADAPTATION: pyre has no `oopspec` system — every blackhole
+/// helper goes through `bh_*` C ABI thunks declared on `CodeWriter` directly,
+/// not through an indirected `_callinfo_for_oopspec` lookup. The struct is an
+/// empty shell so `CallControl` and `Assembler::finished` keep their RPython
+/// signatures intact; populating it would require an oopspec layer that
+/// pyre's Python-bytecode-direct lowering does not need.
+#[derive(Debug, Default)]
+pub struct CallInfoCollection;
+
+impl CallInfoCollection {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 /// RPython: `rpython/jit/codewriter/call.py:21` `class CallControl(object)`.
 pub struct CallControl {
+    /// call.py:22 `virtualref_info = None` — class-level default,
+    /// populated by `CodeWriter.setup_vrefinfo` (codewriter.py:91-94).
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre has no `virtualref` machinery yet
+    /// (no `@jit.virtual_ref` annotations, no `vref_info` lookup); the
+    /// slot is `None` and the setter is a no-op shell.
+    pub virtualref_info: Option<()>,
+
+    /// call.py:23 `has_libffi_call = False` — class-level default.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre has no `_call_aroundstate_target_`
+    /// rewriting in `getcalldescr`, so this stays `false`.
+    pub has_libffi_call: bool,
+
+    /// call.py:27 `self.cpu = cpu`.
+    ///
+    /// pyre's `Cpu` (see [`super::cpu::Cpu`]) bundles the blackhole
+    /// helper function pointers used by `transform_graph_to_jitcode`
+    /// to populate the `JitCode` fn-ptr table. The same `cpu` is also
+    /// reachable via `CodeWriter::cpu(&self)` (codewriter.py:21
+    /// `self.cpu = cpu`).
+    pub cpu: Cpu,
+
+    /// call.py:28 `self.jitdrivers_sd = jitdrivers_sd`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre has no `JitDriverStaticData` —
+    /// the portal is implicit (any CodeObject containing
+    /// `JUMP_BACKWARD`). The Vec stays empty; `grab_initial_jitcodes`
+    /// reads from the explicit `initial: &[...]` argument instead of
+    /// iterating this list.
+    pub jitdrivers_sd: Vec<()>,
+
     /// call.py:29 `self.jitcodes = {}` — map `{graph: jitcode}`.
     ///
     /// pyre keys on the opaque `CodeObject*` (erased to `usize`) rather
@@ -49,25 +110,45 @@ pub struct CallControl {
     /// new graph and drained by `enum_pending_graphs()` inside
     /// `make_jitcodes()` (codewriter.py:79).
     ///
-    /// pyre stores `(code_ptr, w_code)` pairs instead of bare graphs
-    /// because the drain loop — pyre's analog of
-    /// `assembler.finished(callinfocollection)` at codewriter.py:85 —
-    /// needs `w_code` to pipe `set_majit_jitcode` into
-    /// `MetaInterpStaticData`. RPython's Assembler reads this same
-    /// identity off each `JitCode` directly; pyre's `state::JitCode`
-    /// is keyed on `w_code` so we carry it through.
-    pub unfinished_graphs: Vec<(*const CodeObject, *const ())>,
+    /// pyre stores `(code_ptr, w_code, merge_point_pc)` triples instead
+    /// of bare graphs because the drain loop — pyre's analog of
+    /// `transform_graph_to_jitcode(graph, jitcode, ...)` at
+    /// codewriter.py:80 — needs `w_code` to pipe `set_majit_jitcode`
+    /// into `MetaInterpStaticData`, and `merge_point_pc` because pyre's
+    /// `transform_graph_to_jitcode` consumes it as the trace-entry hint
+    /// (RPython has no analog because portal PCs are statically known).
+    /// RPython's Assembler reads the `w_code`-equivalent identity off
+    /// each `JitCode` directly; pyre's `state::JitCode` is keyed on
+    /// `w_code` so we carry it through.
+    pub unfinished_graphs: Vec<(*const CodeObject, *const (), Option<usize>)>,
+
+    /// call.py:31 `self.callinfocollection = CallInfoCollection()`.
+    ///
+    /// Fed to `Assembler::finished()` at the end of
+    /// `CodeWriter::make_jitcodes` (codewriter.py:85). See
+    /// [`CallInfoCollection`] for the pyre-side shell rationale.
+    pub callinfocollection: CallInfoCollection,
 }
 
 impl CallControl {
     /// RPython: `CallControl.__init__(cpu=None, jitdrivers_sd=[])`
-    /// (call.py:25-47). pyre's cpu-equivalent lives on `CodeWriter`
-    /// directly (Phase A); the jitdrivers_sd analog will land with
-    /// `setup_jitdriver` in Phase D.
-    pub fn new() -> Self {
+    /// (call.py:25-47).
+    ///
+    /// PRE-EXISTING-ADAPTATION: `jitdrivers_sd` is `Vec<()>` because
+    /// pyre's portal is implicit (any CodeObject containing
+    /// `JUMP_BACKWARD`); future analyzer wiring (RaiseAnalyzer,
+    /// VirtualizableAnalyzer, …) can extend this method line-by-line.
+    pub fn new(cpu: Cpu, jitdrivers_sd: Vec<()>) -> Self {
+        // call.py:26 `assert isinstance(jitdrivers_sd, list)`.
+        // Rust's type system enforces this at compile time.
         Self {
+            virtualref_info: None,
+            has_libffi_call: false,
+            cpu,
+            jitdrivers_sd,
             jitcodes: HashMap::new(),
             unfinished_graphs: Vec::new(),
+            callinfocollection: CallInfoCollection::new(),
         }
     }
 
@@ -91,19 +172,16 @@ impl CallControl {
     /// PC, which must be re-recorded on the `PyJitCode` even after the
     /// initial eager compile. RPython has no analog because RPython
     /// portals have fixed entry PCs at flow-graph time.
-    pub fn grab_initial_jitcodes(
-        &mut self,
-        writer: &CodeWriter,
-        initial: &[(&CodeObject, *const (), Option<usize>)],
-    ) {
+    pub fn grab_initial_jitcodes(&mut self, initial: &[(&CodeObject, *const (), Option<usize>)]) {
         for (code, w_code, merge_point_pc) in initial {
             // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
-            // Inserts the new graph into `jitcodes` and pushes it onto
-            // `unfinished_graphs`. The `jitdriver_sd` assignment
-            // (call.py:148) already happens inside
-            // `CodeWriter::transform_graph_to_jitcode` at codewriter.rs:1654
-            // when `is_portal` is true.
-            let _ = self.get_jitcode(code, *w_code, writer, *merge_point_pc);
+            // Inserts an empty JitCode into `jitcodes` and pushes the
+            // graph onto `unfinished_graphs`; the body fill happens in
+            // `CodeWriter::make_jitcodes`'s drain loop. The
+            // `jitdriver_sd` assignment (call.py:148) already happens
+            // inside `CodeWriter::transform_graph_to_jitcode` when
+            // `is_portal` is true.
+            let _ = self.get_jitcode(code, *w_code, *merge_point_pc);
         }
     }
 
@@ -124,37 +202,47 @@ impl CallControl {
     ///     yield graph, self.jitcodes[graph]
     /// ```
     ///
-    /// pyre returns a single `(code_ptr, &PyJitCode)` tuple per call to
-    /// keep the return type simple in the absence of a proper
-    /// generator; callers loop until `None`.
-    pub fn enum_pending_graphs(&mut self) -> Option<(*const CodeObject, *const (), &PyJitCode)> {
-        let (code_ptr, w_code) = self.unfinished_graphs.pop()?;
-        let key = code_ptr as usize;
-        self.jitcodes.get(&key).map(|b| (code_ptr, w_code, &**b))
+    /// pyre returns the queue tuple per call (no `&PyJitCode` since the
+    /// drain replaces the entry by re-running
+    /// `transform_graph_to_jitcode`); callers loop until `None`.
+    pub fn enum_pending_graphs(&mut self) -> Option<(*const CodeObject, *const (), Option<usize>)> {
+        self.unfinished_graphs.pop()
     }
 
     /// RPython: `CallControl.get_jitcode(self, graph, called_from=None)`
     /// (call.py:155-172).
     ///
-    /// Returns the JitCode for `code`, compiling it if not cached.
-    /// Matches the upstream contract: first lookup the jitcodes dict;
-    /// on a miss construct a new JitCode, insert, and push the graph
-    /// onto `unfinished_graphs`.
+    /// ```python
+    /// def get_jitcode(self, graph, called_from=None):
+    ///     try:
+    ///         return self.jitcodes[graph]
+    ///     except KeyError:
+    ///         ...
+    ///         fnaddr, calldescr = self.get_jitcode_calldescr(graph)
+    ///         jitcode = JitCode(graph.name, fnaddr, calldescr,
+    ///                           called_from=called_from)
+    ///         self.jitcodes[graph] = jitcode
+    ///         self.unfinished_graphs.append(graph)
+    ///         return jitcode
+    /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre deviates from upstream in two
-    /// places.  `writer` is threaded through because
-    /// `transform_graph_to_jitcode` lives on `CodeWriter` (pyre's
-    /// eager-compile model does the flow-graph transform inline here,
-    /// not in a later drain pass), and `merge_point_pc` can be refined
-    /// after the first trace discovers the `MERGE_POINT` location so
-    /// the cache entry is rebuilt when it changes — RPython has no
-    /// such refinement because portal PCs are known at flow-graph
-    /// time.
+    /// pyre creates an empty `PyJitCode` skeleton (call.py:168 — RPython
+    /// `JitCode(name, fnaddr, calldescr)` without bytecode) and queues
+    /// the graph for the drain in `CodeWriter::make_jitcodes`, which
+    /// re-runs `transform_graph_to_jitcode` and replaces the slot with
+    /// the populated entry (codewriter.py:80
+    /// `transform_graph_to_jitcode(graph, jitcode, ...)`).
+    ///
+    /// PRE-EXISTING-ADAPTATION: `merge_point_pc` is a pyre-only refinement
+    /// — the first trace reveals the `MERGE_POINT` opcode's PC, which
+    /// must be re-recorded on the cache entry. When it changes the
+    /// entry is reset to a new skeleton and re-queued so the drain
+    /// recompiles with the refined hint. RPython has no analog because
+    /// portal PCs are statically known.
     pub fn get_jitcode(
         &mut self,
         code: &CodeObject,
         w_code: *const (),
-        writer: &CodeWriter,
         merge_point_pc: Option<usize>,
     ) -> &'static PyJitCode {
         let key = code as *const CodeObject as usize;
@@ -164,21 +252,20 @@ impl CallControl {
             true
         };
         if needs_rebuild {
-            // call.py:168-171 — create JitCode, insert, append to
-            // unfinished_graphs. Piping to `MetaInterpStaticData` is
-            // deferred to `CodeWriter::make_jitcodes` (the analog of
-            // `assembler.finished(callinfocollection)` at
-            // codewriter.py:85); draining pops each entry and pipes
-            // then, matching the upstream "transform in drain, pipe in
-            // finished" split.
-            let pyjitcode = writer.transform_graph_to_jitcode(code, w_code, merge_point_pc);
-            self.jitcodes.insert(key, Box::new(pyjitcode));
+            // call.py:168-171 — create JitCode skeleton, insert, append
+            // to unfinished_graphs. The body fill (jtransform / regalloc
+            // / flatten / assemble) is deferred to
+            // `CodeWriter::make_jitcodes`'s drain loop at
+            // codewriter.py:80 `transform_graph_to_jitcode(graph,
+            // jitcode, verbose, len(all_jitcodes))`.
+            self.jitcodes
+                .insert(key, Box::new(PyJitCode::skeleton(merge_point_pc)));
             // call.py:171 `self.unfinished_graphs.append(graph)`. pyre
             // also re-pushes on a merge_point_pc refinement so the
-            // drain picks the refined entry up again for the pipe
+            // drain picks the refined entry up again for the recompile
             // — see `make_jitcodes` at codewriter.rs.
             self.unfinished_graphs
-                .push((code as *const CodeObject, w_code));
+                .push((code as *const CodeObject, w_code, merge_point_pc));
         }
         let entry = self.jitcodes.get(&key).unwrap();
         // SAFETY: the per-thread `CodeWriter` singleton lives for the
@@ -191,15 +278,16 @@ impl CallControl {
         //
         // Caller contract: do not re-enter `get_jitcode` (or anything
         // else that can call `HashMap::insert` on `self.jitcodes`, such
-        // as the `merge_point_pc` refinement path) while still holding
-        // the returned reference. A refinement drops the previous Box
-        // and dangles the ref.
+        // as the `merge_point_pc` refinement path or the
+        // `make_jitcodes` drain replacing the skeleton with the
+        // populated entry) while still holding the returned reference.
+        // A refinement drops the previous Box and dangles the ref.
         unsafe { &*(&**entry as *const PyJitCode) }
     }
 }
 
 impl Default for CallControl {
     fn default() -> Self {
-        Self::new()
+        Self::new(Cpu::default(), Vec::new())
     }
 }

@@ -126,6 +126,36 @@ impl PyJitCode {
     pub fn has_abort_opcode(&self) -> bool {
         self.has_abort
     }
+
+    /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
+    /// (call.py:168 `jitcode = JitCode(graph.name, fnaddr, calldescr, ...)`).
+    ///
+    /// In RPython the `JitCode` constructor returns a fresh object whose
+    /// `code` / `descrs` / `liveness` arrays are all empty until
+    /// `assembler.assemble(...)` populates them later in
+    /// `make_jitcodes`'s drain loop (codewriter.py:80).  The skeleton
+    /// gives the dict an entry with a stable identity so re-entrant
+    /// `get_jitcode` calls (or pyre's `merge_point_pc` refinement
+    /// shortcut) can find an existing key without recompiling.
+    ///
+    /// Until the drain replaces the slot, the only field with meaningful
+    /// content is `merge_point_pc` (the refinement hint passed in by
+    /// `get_jitcode`).
+    pub fn skeleton(merge_point_pc: Option<usize>) -> Self {
+        Self {
+            jitcode: std::sync::Arc::new(JitCode::default()),
+            metadata: PyJitCodeMetadata {
+                pc_map: Vec::new(),
+                depth_at_py_pc: Vec::new(),
+                portal_frame_reg: 0,
+                portal_ec_reg: 0,
+                stack_base: 0,
+                liveness: Vec::new(),
+            },
+            has_abort: false,
+            merge_point_pc,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,36 +178,6 @@ impl PyJitCode {
 /// a `RefCell<Assembler>` field so `transform_graph_to_jitcode` can
 /// still mutate it under the immutable-by-default singleton borrow.
 pub struct CodeWriter {
-    /// Blackhole helper function pointers.
-    ///
-    /// RPython: `CallControl.cpu` supplies these via `callinfocollection`.
-    /// pyre embeds them directly on the CodeWriter since pyre has no
-    /// `cpu` struct yet.
-    /// bhimpl_residual_call: per-arity call helpers.
-    /// call_fn_0(callable) ... call_fn_8(callable, a0..a7).
-    pub call_fn: extern "C" fn(i64, i64) -> i64,
-    pub call_fn_0: extern "C" fn(i64) -> i64,
-    pub call_fn_2: extern "C" fn(i64, i64, i64) -> i64,
-    pub call_fn_3: extern "C" fn(i64, i64, i64, i64) -> i64,
-    pub call_fn_4: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_5: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    /// jtransform.py: namespace+code from getfield_vable_r.
-    pub load_global_fn: extern "C" fn(i64, i64, i64) -> i64,
-    pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
-    pub binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
-    /// Box a raw integer into a PyObject (w_int_new).
-    pub box_int_fn: extern "C" fn(i64) -> i64,
-    /// Truthiness check: PyObjectRef → raw 0 or 1.
-    pub truth_fn: extern "C" fn(i64) -> i64,
-    /// Load constant from frame's code object.
-    pub load_const_fn: extern "C" fn(i64, i64) -> i64,
-    /// Store subscript: obj[key] = value.
-    pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
-    /// Build list: (argc, item0, item1) → new list.
-    pub build_list_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `codewriter.py:22` `self.assembler = Assembler()`.
     ///
     /// Single Assembler instance shared across every `transform_graph_to_jitcode`
@@ -198,27 +198,64 @@ impl CodeWriter {
     /// `crate::call_jit`; Phase D.2 wired `callcontrol` as a field so
     /// `writer.callcontrol()` matches `self.callcontrol` in upstream.
     pub fn new() -> Self {
+        // codewriter.py:21-23 `self.cpu = cpu; self.assembler = Assembler();
+        //   self.callcontrol = CallControl(cpu, jitdrivers_sd)`.
+        // pyre owns the single `Cpu` on `CallControl`; `CodeWriter::cpu()`
+        // returns a borrow back out so the upstream attribute access
+        // pattern (`self.cpu`) still works.
+        let cpu = super::cpu::Cpu::new();
         Self {
-            call_fn: crate::call_jit::bh_call_fn,
-            call_fn_0: crate::call_jit::bh_call_fn_0,
-            call_fn_2: crate::call_jit::bh_call_fn_2,
-            call_fn_3: crate::call_jit::bh_call_fn_3,
-            call_fn_4: crate::call_jit::bh_call_fn_4,
-            call_fn_5: crate::call_jit::bh_call_fn_5,
-            call_fn_6: crate::call_jit::bh_call_fn_6,
-            call_fn_7: crate::call_jit::bh_call_fn_7,
-            call_fn_8: crate::call_jit::bh_call_fn_8,
-            load_global_fn: crate::call_jit::bh_load_global_fn,
-            compare_fn: crate::call_jit::bh_compare_fn,
-            binary_op_fn: crate::call_jit::bh_binary_op_fn,
-            box_int_fn: crate::call_jit::bh_box_int_fn,
-            truth_fn: crate::call_jit::bh_truth_fn,
-            load_const_fn: crate::call_jit::bh_load_const_fn,
-            store_subscr_fn: crate::call_jit::bh_store_subscr_fn,
-            build_list_fn: crate::call_jit::bh_build_list_fn,
             assembler: RefCell::new(Assembler::new()),
-            callcontrol: UnsafeCell::new(super::call::CallControl::new()),
+            callcontrol: UnsafeCell::new(super::call::CallControl::new(cpu, Vec::new())),
         }
+    }
+
+    /// `codewriter.py:21` `self.cpu = cpu`.
+    ///
+    /// Convenience accessor — pyre owns the single `Cpu` on
+    /// `CallControl` (call.py:27 `self.cpu = cpu`); upstream both
+    /// attributes point at the same object.
+    pub fn cpu(&self) -> &super::cpu::Cpu {
+        &self.callcontrol().cpu
+    }
+
+    /// RPython: `CodeWriter.setup_vrefinfo(self, vrefinfo)`
+    /// (codewriter.py:91-94).
+    ///
+    /// ```python
+    /// def setup_vrefinfo(self, vrefinfo):
+    ///     # must be called at most once
+    ///     assert self.callcontrol.virtualref_info is None
+    ///     self.callcontrol.virtualref_info = vrefinfo
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre has no `virtualref` machinery
+    /// (no `@jit.virtual_ref`, no `vref_info` lookup); the slot is
+    /// preserved so future warmspot wiring can call through with the
+    /// same name.
+    pub fn setup_vrefinfo(&self, vrefinfo: ()) {
+        // codewriter.py:93 `assert self.callcontrol.virtualref_info is None`.
+        assert!(self.callcontrol().virtualref_info.is_none());
+        // codewriter.py:94 `self.callcontrol.virtualref_info = vrefinfo`.
+        self.callcontrol().virtualref_info = Some(vrefinfo);
+    }
+
+    /// RPython: `CodeWriter.setup_jitdriver(self, jitdriver_sd)`
+    /// (codewriter.py:96-99).
+    ///
+    /// ```python
+    /// def setup_jitdriver(self, jitdriver_sd):
+    ///     # Must be called once per jitdriver.
+    ///     self.callcontrol.jitdrivers_sd.append(jitdriver_sd)
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre has no `JitDriverStaticData` —
+    /// the portal is implicit (any CodeObject containing
+    /// `JUMP_BACKWARD`). The slot accepts `()` so future warmspot
+    /// wiring can call through line-by-line.
+    pub fn setup_jitdriver(&self, jitdriver_sd: ()) {
+        // codewriter.py:99 `self.callcontrol.jitdrivers_sd.append(jitdriver_sd)`.
+        self.callcontrol().jitdrivers_sd.push(jitdriver_sd);
     }
 
     /// RPython: `self.callcontrol` (codewriter.py:23).
@@ -321,24 +358,25 @@ impl CodeWriter {
         // Register helper function pointers
         // RPython: CallControl manages fn addresses; assembler.finished()
         // writes them into callinfocollection.
-        let call_fn_idx = assembler.add_fn_ptr(self.call_fn as *const ());
-        let load_global_fn_idx = assembler.add_fn_ptr(self.load_global_fn as *const ());
-        let compare_fn_idx = assembler.add_fn_ptr(self.compare_fn as *const ());
-        let binary_op_fn_idx = assembler.add_fn_ptr(self.binary_op_fn as *const ());
-        let box_int_fn_idx = assembler.add_fn_ptr(self.box_int_fn as *const ());
-        let truth_fn_idx = assembler.add_fn_ptr(self.truth_fn as *const ());
-        let load_const_fn_idx = assembler.add_fn_ptr(self.load_const_fn as *const ());
-        let store_subscr_fn_idx = assembler.add_fn_ptr(self.store_subscr_fn as *const ());
-        let build_list_fn_idx = assembler.add_fn_ptr(self.build_list_fn as *const ());
+        let cpu = self.cpu();
+        let call_fn_idx = assembler.add_fn_ptr(cpu.call_fn as *const ());
+        let load_global_fn_idx = assembler.add_fn_ptr(cpu.load_global_fn as *const ());
+        let compare_fn_idx = assembler.add_fn_ptr(cpu.compare_fn as *const ());
+        let binary_op_fn_idx = assembler.add_fn_ptr(cpu.binary_op_fn as *const ());
+        let box_int_fn_idx = assembler.add_fn_ptr(cpu.box_int_fn as *const ());
+        let truth_fn_idx = assembler.add_fn_ptr(cpu.truth_fn as *const ());
+        let load_const_fn_idx = assembler.add_fn_ptr(cpu.load_const_fn as *const ());
+        let store_subscr_fn_idx = assembler.add_fn_ptr(cpu.store_subscr_fn as *const ());
+        let build_list_fn_idx = assembler.add_fn_ptr(cpu.build_list_fn as *const ());
         // Per-arity call helpers (appended AFTER existing fn_ptrs to preserve indices).
-        let call_fn_0_idx = assembler.add_fn_ptr(self.call_fn_0 as *const ());
-        let call_fn_2_idx = assembler.add_fn_ptr(self.call_fn_2 as *const ());
-        let call_fn_3_idx = assembler.add_fn_ptr(self.call_fn_3 as *const ());
-        let call_fn_4_idx = assembler.add_fn_ptr(self.call_fn_4 as *const ());
-        let call_fn_5_idx = assembler.add_fn_ptr(self.call_fn_5 as *const ());
-        let call_fn_6_idx = assembler.add_fn_ptr(self.call_fn_6 as *const ());
-        let call_fn_7_idx = assembler.add_fn_ptr(self.call_fn_7 as *const ());
-        let call_fn_8_idx = assembler.add_fn_ptr(self.call_fn_8 as *const ());
+        let call_fn_0_idx = assembler.add_fn_ptr(cpu.call_fn_0 as *const ());
+        let call_fn_2_idx = assembler.add_fn_ptr(cpu.call_fn_2 as *const ());
+        let call_fn_3_idx = assembler.add_fn_ptr(cpu.call_fn_3 as *const ());
+        let call_fn_4_idx = assembler.add_fn_ptr(cpu.call_fn_4 as *const ());
+        let call_fn_5_idx = assembler.add_fn_ptr(cpu.call_fn_5 as *const ());
+        let call_fn_6_idx = assembler.add_fn_ptr(cpu.call_fn_6 as *const ());
+        let call_fn_7_idx = assembler.add_fn_ptr(cpu.call_fn_7 as *const ());
+        let call_fn_8_idx = assembler.add_fn_ptr(cpu.call_fn_8 as *const ());
 
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
@@ -1730,6 +1768,7 @@ impl CodeWriter {
     ///
     /// ```python
     /// def make_jitcodes(self, verbose=False):
+    ///     log.info("making JitCodes...")
     ///     self.callcontrol.grab_initial_jitcodes()
     ///     count = 0
     ///     all_jitcodes = []
@@ -1737,50 +1776,93 @@ impl CodeWriter {
     ///         self.transform_graph_to_jitcode(graph, jitcode, verbose, len(all_jitcodes))
     ///         all_jitcodes.append(jitcode)
     ///         count += 1
+    ///         if not count % 500:
+    ///             log.info("Produced %d jitcodes" % count)
     ///     self.assembler.finished(self.callcontrol.callinfocollection)
+    ///     log.info("There are %d JitCode instances." % count)
+    ///     log.info("There are %d -live- ops. Size of liveness is %s bytes" % (
+    ///         self.assembler.num_liveness_ops, self.assembler.all_liveness_length))
     ///     return all_jitcodes
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `get_jitcode` is currently eager
-    /// (compiles during the call that pushes to `unfinished_graphs`),
-    /// so the `enum_pending_graphs` drain loop finds already-compiled
-    /// entries and does no additional work. A later phase will split
-    /// `get_jitcode` into skeleton-allocation + later fill so the drain
-    /// loop becomes the actual compile trigger, matching
-    /// `codewriter.py:80 transform_graph_to_jitcode(graph, jitcode, ...)`.
+    /// The pyre drain loop adds one extra step that RPython's drain does
+    /// not have: each freshly-compiled jitcode is published to
+    /// `pyre_jit_trace::set_majit_jitcode` so the lower
+    /// `pyre_jit_trace` crate (which cannot depend on pyre-jit) sees
+    /// the latest `JitCode` / `pc_map` / `liveness` slots. RPython's
+    /// equivalent is `MetaInterpStaticData::finish_setup` at
+    /// `pyjitpl.py:2255-2269`, which the assembler's `finished()` call
+    /// at `codewriter.py:85` is the upstream sibling of.
     ///
     /// The third tuple field — `merge_point_pc` — is a pyre-only
     /// refinement hook; see
     /// [`super::call::CallControl::grab_initial_jitcodes`].
-    pub fn make_jitcodes(&self, initial: &[(&CodeObject, *const (), Option<usize>)]) {
+    pub fn make_jitcodes(
+        &self,
+        initial: &[(&CodeObject, *const (), Option<usize>)],
+    ) -> Vec<*const PyJitCode> {
+        // codewriter.py:75 `log.info("making JitCodes...")` — pyre has no
+        // codewriter.py log channel, intentionally elided.
+
         // codewriter.py:76 `self.callcontrol.grab_initial_jitcodes()`.
-        self.callcontrol().grab_initial_jitcodes(self, initial);
+        self.callcontrol().grab_initial_jitcodes(initial);
+        // codewriter.py:77 `count = 0`.
+        let mut count: usize = 0;
+        // codewriter.py:78 `all_jitcodes = []`.
+        let mut all_jitcodes: Vec<*const PyJitCode> = Vec::new();
         // codewriter.py:79 `for graph, jitcode in
-        // self.callcontrol.enum_pending_graphs():`.
-        //
-        // PRE-EXISTING-ADAPTATION: the `transform_graph_to_jitcode`
-        // step at codewriter.py:80 already ran eagerly inside
-        // `get_jitcode` (pyre's Python-bytecode-direct lowering has no
-        // separate skeleton-then-fill flow). The drain loop is used to
-        // pipe each compiled jitcode into `MetaInterpStaticData` — the
-        // pyre analog of `self.assembler.finished(callinfocollection)`
-        // at codewriter.py:85 — centralising the
-        // `set_majit_jitcode` pipe that previously lived inside
-        // `CallControl::get_jitcode`.
+        //                     self.callcontrol.enum_pending_graphs():`.
         loop {
             let popped = self.callcontrol().enum_pending_graphs();
-            let Some((_graph, w_code, jitcode)) = popped else {
+            let Some((code_ptr, w_code, merge_point_pc)) = popped else {
                 break;
             };
-            if !jitcode.has_abort {
+            // codewriter.py:80 `self.transform_graph_to_jitcode(graph,
+            //                     jitcode, verbose, len(all_jitcodes))`.
+            //
+            // PRE-EXISTING-ADAPTATION: RPython mutates the empty JitCode
+            // skeleton in place (`assembler.assemble(ssarepr, jitcode,
+            // num_regs)` at codewriter.py:67), whereas pyre's
+            // `transform_graph_to_jitcode` returns a fresh `PyJitCode`
+            // because the underlying `JitCodeBuilder` produces an
+            // owned `JitCode`. We replace the skeleton entry in
+            // `jitcodes` with the populated one to keep upstream's
+            // "jitcode in dict has its body filled after drain"
+            // invariant.
+            let pyjitcode =
+                self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
+            // pyre-only: pipe the freshly populated entry to the lower
+            // `pyre_jit_trace` crate so the runtime side picks it up.
+            // RPython's equivalent is the
+            // `MetaInterpStaticData::finish_setup` pull at
+            // `pyjitpl.py:2255-2269`.
+            if !pyjitcode.has_abort {
                 pyre_jit_trace::set_majit_jitcode(
                     w_code,
-                    jitcode.jitcode.clone(),
-                    jitcode.metadata.pc_map.clone(),
-                    jitcode.metadata.liveness.clone(),
+                    pyjitcode.jitcode.clone(),
+                    pyjitcode.metadata.pc_map.clone(),
+                    pyjitcode.metadata.liveness.clone(),
                 );
             }
+            let key = code_ptr as usize;
+            let boxed = Box::new(pyjitcode);
+            let raw_ptr = &*boxed as *const PyJitCode;
+            self.callcontrol().jitcodes.insert(key, boxed);
+            // codewriter.py:81 `all_jitcodes.append(jitcode)`.
+            all_jitcodes.push(raw_ptr);
+            // codewriter.py:82 `count += 1`.
+            count += 1;
+            // codewriter.py:83-84 `if not count % 500: log.info(...)` —
+            // log channel intentionally elided.
         }
+        // codewriter.py:85 `self.assembler.finished(self.callcontrol.callinfocollection)`.
+        self.assembler
+            .borrow_mut()
+            .finished(&self.callcontrol().callinfocollection);
+        // codewriter.py:86-88 final log lines — elided.
+        let _ = count;
+        // codewriter.py:89 `return all_jitcodes`.
+        all_jitcodes
     }
 }
 
