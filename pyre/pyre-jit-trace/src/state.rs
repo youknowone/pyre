@@ -21,8 +21,18 @@ use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new, w_list
 use std::collections::HashMap;
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
-/// RPython creates JitCode objects with codewriter; pyre wraps
-/// CodeObject pointers with the same sequential index.
+///
+/// MetaInterpStaticData-side wrapper around the shared
+/// [`crate::PyJitCode`] payload. The payload `Arc` is the same heap
+/// allocation that `pyre_jit::jit::call::CallControl.jitcodes` holds
+/// for the same CodeObject — RPython's `MetaInterpStaticData.jitcodes`
+/// list and `CallControl.jitcodes` dict reference identical
+/// `JitCode` Python objects through Python's refcount semantics, and
+/// pyre mirrors that with a shared `Arc`. The wrapper keeps `code`
+/// (so `code_for_jitcode_index` can recover the wrapping
+/// `PyObjectRef` from a numeric index) and `index` (the SD-local
+/// `jitcode.index = len(all_jitcodes)` from codewriter.py:68) on the
+/// SD side, since neither is intrinsic to the `PyJitCode` payload.
 // SAFETY: JitCode is only written once (during creation) and then
 // read-only. The code pointer is stable for the program lifetime.
 unsafe impl Sync for JitCode {}
@@ -33,19 +43,11 @@ pub(crate) struct JitCode {
     pub code: *const (),
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
     pub index: i32,
-    /// RPython parity: owned majit JitCode (bytecodes, inline `-live-`).
-    /// Set by codewriter via set_majit_jitcode(). Owned here (inside
-    /// Box<JitCode> in MetaInterpStaticData.jitcodes) so the address is
-    /// stable — matches RPython's GC-heap JitCode.
-    pub majit_jitcode: Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
-    /// Pyre translation metadata: py_pc -> jitcode byte offset.
-    /// RPython does not need this because frame.pc is already a JitCode PC.
-    pub py_to_jit_pc: Vec<usize>,
-    /// Pyre liveness fallback used only when the global
-    /// `metainterp_sd.liveness_info` lookup cannot locate an entry
-    /// (e.g. merge-point only). Canonical decode reads the global bytes
-    /// at the offset embedded inline in `majit_jitcode.code`.
-    pub liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
+    /// Shared `PyJitCode` payload. Same `Arc` instance also lives in
+    /// `CallControl.jitcodes`. Refinements (e.g. a `merge_point_pc`
+    /// rebuild) replace this `Arc` in place so cached `*const JitCode`
+    /// pointers see the refreshed payload on the next field access.
+    pub payload: std::sync::Arc<crate::PyJitCode>,
 }
 
 impl JitCode {
@@ -216,18 +218,36 @@ pub(crate) fn publish_liveness_info(bytes: Vec<u8>) {
 impl MetaInterpStaticData {
     /// codewriter.py:68: get or create JitCode for a CodeObject.
     /// Returns a stable pointer (Box ensures no reallocation moves).
-    fn jitcode_for(&mut self, code: *const ()) -> *const JitCode {
+    ///
+    /// `supplied` carries the shared `Arc<PyJitCode>` from the
+    /// upstream codewriter (see [`COMPILE_JITCODE_FN`]); when present
+    /// we install it as the entry's payload so both stores reference
+    /// the same allocation. On a `by_code` hit a fresh `supplied`
+    /// replaces the existing payload — this is how a
+    /// `merge_point_pc`-driven recompile in `CallControl` propagates
+    /// to readers that hold a cached `*const JitCode`. When
+    /// `supplied` is `None` (no callback registered, or callback
+    /// declined), we fall back to a skeleton so the entry slot
+    /// exists with a well-formed `Arc`.
+    fn jitcode_for(
+        &mut self,
+        code: *const (),
+        supplied: Option<std::sync::Arc<crate::PyJitCode>>,
+    ) -> *const JitCode {
         let key = code as usize;
         if let Some(&idx) = self.by_code.get(&key) {
+            if let Some(arc) = supplied {
+                self.jitcodes[idx].payload = arc;
+            }
             return &*self.jitcodes[idx] as *const JitCode;
         }
+        let payload =
+            supplied.unwrap_or_else(|| std::sync::Arc::new(crate::PyJitCode::skeleton(None)));
         let index = self.jitcodes.len() as i32;
         let jitcode = Box::new(JitCode {
             code,
             index,
-            majit_jitcode: None,
-            py_to_jit_pc: Vec::new(),
-            liveness: Vec::new(),
+            payload,
         });
         let ptr = &*jitcode as *const JitCode;
         self.by_code.insert(key, self.jitcodes.len());
@@ -373,13 +393,16 @@ fn ensure_finish_setup() {
 /// then calls `transform_graph_to_jitcode` and `assembler.finished()`
 /// in one transitive pass. Pyre cannot perform that pass eagerly at
 /// warmspot time (no static callee discovery), so the lazy analog
-/// fires on every trace-side `jitcode_for` instead — the registered
-/// callback runs the same `grab_initial_jitcodes` → drain → set_majit
-/// pipeline for the one code object whose jitcode the tracer is about
-/// to record on a `MIFrame`. The fn pointer stays `Sync` because the
-/// upstream callback (`compile_jitcode_via_w_code`) reads
-/// `CodeWriter::instance()` which is itself per-thread.
-pub type CompileJitcodeFn = fn(*const ());
+/// fires on every trace-side `jitcode_for` instead.
+///
+/// The callback returns the shared `Arc<PyJitCode>` it just installed
+/// in `CallControl.jitcodes`; `jitcode_for` then stores the same
+/// `Arc` on the SD entry so both stores reference one allocation —
+/// the Rust analog of RPython's two stores holding the same Python
+/// object. The fn pointer stays `Sync` because the upstream callback
+/// (`compile_jitcode_via_w_code`) reads `CodeWriter::instance()`
+/// which is itself per-thread.
+pub type CompileJitcodeFn = fn(*const ()) -> Option<std::sync::Arc<crate::PyJitCode>>;
 
 static COMPILE_JITCODE_FN: std::sync::atomic::AtomicPtr<()> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -399,57 +422,27 @@ pub fn set_compile_jitcode_fn(f: CompileJitcodeFn) {
 /// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
 /// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
 ///
-/// Fires the registered compile callback before allocating the SD
-/// entry. RPython's equivalent is `cc.callcontrol.get_jitcode(graph)`
-/// being called inside jtransform, which both populates the
-/// `CallControl.jitcodes` dict and (transitively, via the
-/// `make_jitcodes` drain) fills the `MetaInterpStaticData.jitcodes`
-/// list with the populated `JitCode`. Pyre's lazy split makes the
-/// callback re-enter the codewriter for one code object on every
-/// tracer-side reference — see `set_compile_jitcode_fn`.
-///
-/// The internal `MetaInterpStaticData::jitcode_for` method
-/// (called from `set_majit_jitcode` while the drain is mid-pipe) does
-/// **not** route through here, so the callback never re-enters
-/// itself.
+/// Fires the registered compile callback before installing the SD
+/// entry; the callback returns the shared `Arc<PyJitCode>` from the
+/// upstream `CallControl.jitcodes` so both stores reference one
+/// allocation. RPython's equivalent is `cc.callcontrol.get_jitcode(graph)`
+/// inside jtransform, which inserts the JitCode object into the
+/// `CallControl.jitcodes` dict and lets the surrounding `make_jitcodes`
+/// drain populate `MetaInterpStaticData.jitcodes` — both holding the
+/// same Python object. Pyre's lazy split runs that pipeline for one
+/// code object per trace-side reference; see `set_compile_jitcode_fn`.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
     let cb = COMPILE_JITCODE_FN.load(std::sync::atomic::Ordering::Relaxed);
-    if !cb.is_null() {
+    let supplied = if cb.is_null() {
+        None
+    } else {
         // SAFETY: only `set_compile_jitcode_fn` writes to this slot,
         // and it stores a `CompileJitcodeFn` cast through `as *mut ()`.
         let f: CompileJitcodeFn = unsafe { std::mem::transmute(cb) };
-        f(code);
-    }
-    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
-}
-
-/// RPython parity: store owned majit JitCode into state::JitCode.
-/// Called by codewriter after PyJitCode compilation so that
-/// get_list_of_active_boxes can look up LivenessInfo from the same
-/// data source as consume_one_section (RPython all_liveness parity).
-/// The JitCode is cloned into the Box'd state::JitCode (stable heap
-/// address), matching RPython where JitCode is a GC-heap object in
-/// MetaInterpStaticData.jitcodes.
-pub fn set_majit_jitcode(
-    code: *const (),
-    majit_jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
-    py_to_jit_pc: Vec<usize>,
-    liveness: Vec<majit_metainterp::jitcode::LivenessInfo>,
-) {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let mut sd = r.borrow_mut();
-        // Ensure the JitCode entry exists.
-        let _ = sd.jitcode_for(code);
-        let key = code as usize;
-        if let Some(&idx) = sd.by_code.get(&key) {
-            let jc = &mut *sd.jitcodes[idx];
-            jc.majit_jitcode = Some(majit_jitcode);
-            jc.py_to_jit_pc = py_to_jit_pc;
-            jc.liveness = liveness;
-        }
-    });
+        f(code)
+    };
+    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, supplied))
 }
 
 /// warmspot.py:282 metainterp_sd.jitcodes[jitcode_index]:
@@ -482,20 +475,24 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         // inline `live/` bytecode, then read [len_i, len_r, len_f] from the
         // global metainterp_sd.liveness_info — the SAME all_liveness data
         // that get_list_of_active_boxes uses.
-        if let Some(ref jitcode) = jc.majit_jitcode {
-            if let Some(&jit_pc) = jc.py_to_jit_pc.get(pc as usize) {
-                let off = jitcode.get_live_vars_info(jit_pc, sd.op_live);
-                let all_liveness = &sd.liveness_info;
-                if off + 2 < all_liveness.len() {
-                    let length_i = all_liveness[off] as usize;
-                    let length_r = all_liveness[off + 1] as usize;
-                    let length_f = all_liveness[off + 2] as usize;
-                    return length_i + length_r + length_f;
-                }
-                // Fallback: LivenessInfo (merge-point only)
-                if let Some(info) = jc.liveness.iter().find(|i| i.pc as usize == jit_pc) {
-                    return info.total_live();
-                }
+        let payload = &jc.payload;
+        if let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) {
+            let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
+            let all_liveness = &sd.liveness_info;
+            if off + 2 < all_liveness.len() {
+                let length_i = all_liveness[off] as usize;
+                let length_r = all_liveness[off + 1] as usize;
+                let length_f = all_liveness[off + 2] as usize;
+                return length_i + length_r + length_f;
+            }
+            // Fallback: LivenessInfo (merge-point only)
+            if let Some(info) = payload
+                .metadata
+                .liveness
+                .iter()
+                .find(|i| i.pc as usize == jit_pc)
+            {
+                return info.total_live();
             }
         }
         // Fallback: LiveVars from CodeObject (backward-compat).
@@ -523,13 +520,26 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 }
 
 /// Sentinel null JitCode for uninitialized PyreSym.
-static NULL_JITCODE: JitCode = JitCode {
-    code: std::ptr::null(),
-    index: -1,
-    majit_jitcode: None,
-    py_to_jit_pc: Vec::new(),
-    liveness: Vec::new(),
-};
+///
+/// Cannot be `static` because `Arc::new` is not const; use a thread_local
+/// LazyCell so the initialiser runs once per thread and the resulting
+/// reference stays valid for the thread's lifetime.
+thread_local! {
+    static NULL_JITCODE_CELL: std::cell::OnceCell<JitCode> = const { std::cell::OnceCell::new() };
+}
+
+fn null_jitcode() -> &'static JitCode {
+    NULL_JITCODE_CELL.with(|cell| {
+        let r = cell.get_or_init(|| JitCode {
+            code: std::ptr::null(),
+            index: -1,
+            payload: std::sync::Arc::new(crate::PyJitCode::skeleton(None)),
+        });
+        // SAFETY: per-thread `OnceCell` initialises once; the
+        // resulting reference lives for the thread's lifetime.
+        unsafe { &*(r as *const JitCode) }
+    })
+}
 
 /// Traced value — RPython `FrontendOp(position, _resint/_resref/_resfloat)` parity.
 ///
@@ -1603,7 +1613,7 @@ impl PyreSym {
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
             // jitcode and concrete_namespace initialized below
-            jitcode: &NULL_JITCODE as *const JitCode,
+            jitcode: null_jitcode() as *const JitCode,
             concrete_namespace: std::ptr::null_mut(),
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),

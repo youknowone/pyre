@@ -216,9 +216,19 @@ impl MIFrame {
             *const Vec<usize>,
         ) = unsafe {
             let jc = &*jitcode_ptr_pre;
-            match jc.majit_jitcode.as_ref() {
-                Some(m) => (std::sync::Arc::as_ptr(m), &jc.py_to_jit_pc),
-                None => (std::ptr::null(), std::ptr::null()),
+            // An empty `pc_map` marks a skeleton payload (call.py:168
+            // creates the JitCode skeleton before the drain populates
+            // it; pyre's PyreSym sentinel `null_jitcode()` is in the
+            // same state). Treat skeletons as "not yet compiled" so
+            // the LiveVars fallback below kicks in instead of
+            // dereferencing the empty `JitCode`.
+            if jc.payload.metadata.pc_map.is_empty() {
+                (std::ptr::null(), std::ptr::null())
+            } else {
+                (
+                    std::sync::Arc::as_ptr(&jc.payload.jitcode),
+                    &jc.payload.metadata.pc_map as *const _,
+                )
             }
         };
         let all_liveness_snapshot = crate::state::liveness_info_snapshot();
@@ -283,13 +293,13 @@ impl MIFrame {
         // MetaInterpStaticData JitCode entry; upstream stores them on
         // metainterp_sd.
         //
-        // TRANSITIONAL: when `majit_jitcode` has not been populated yet
-        // (inlined-call frames without their own JitCode), fall back to
-        // the pyre-jit-trace LiveVars analysis. Pyre's call.py parity
-        // work will make every tracing frame carry a valid JitCode so
-        // this branch can be removed.
+        // Skeleton payload (no `pc_map` yet) → fall back to the
+        // pyre-jit-trace LiveVars analysis. With the call.py-parity
+        // jitcode_for callback wired up, this branch only fires for
+        // sentinel/null jitcodes (PyreSym::new_uninit) that never
+        // reach final code emission.
         let jc = unsafe { &*jitcode_ptr };
-        if jc.majit_jitcode.is_none() {
+        if jc.payload.metadata.pc_map.is_empty() {
             let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
             let live = if !raw_code_ptr.is_null() {
                 Some(liveness_for(raw_code_ptr))
@@ -311,16 +321,21 @@ impl MIFrame {
             }
             return boxes;
         }
-        let jit_pc = jc.py_to_jit_pc.get(live_pc).copied().unwrap_or_else(|| {
-            panic!(
-                "get_list_of_active_boxes: no pc_map entry for live_pc={}",
-                live_pc
-            )
-        });
+        let jit_pc = jc
+            .payload
+            .metadata
+            .pc_map
+            .get(live_pc)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "get_list_of_active_boxes: no pc_map entry for live_pc={}",
+                    live_pc
+                )
+            });
         let offset = jc
-            .majit_jitcode
-            .as_ref()
-            .expect("majit_jitcode checked above")
+            .payload
+            .jitcode
             .get_live_vars_info(jit_pc, crate::state::op_live());
         // pyjitpl.py:2264 parity: metainterp_sd owns the packed liveness
         // string; clone here because the thread-local borrow cannot escape.

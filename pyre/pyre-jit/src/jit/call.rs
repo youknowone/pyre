@@ -69,11 +69,11 @@ impl CallInfoCollection {
 /// PRE-EXISTING-ADAPTATION: pyre carries `w_code` and `merge_point_pc`
 /// alongside `portal_graph` because pyre's "graph" is a Python
 /// CodeObject with no flow-graph identity. `w_code` is the wrapping
-/// `PyObjectRef` so `set_majit_jitcode`'s callee table indexes by the
-/// same key the runtime uses; `merge_point_pc` is the Python PC of
-/// the `MERGE_POINT` opcode the first trace through the portal
-/// reveals (RPython has no analog because portal PCs are statically
-/// known at flow-graph time).
+/// `PyObjectRef`, threaded through so the runtime side keys its
+/// per-CodeObject lookups by the same identity; `merge_point_pc` is
+/// the Python PC of the `MERGE_POINT` opcode the first trace through
+/// the portal reveals (RPython has no analog because portal PCs are
+/// statically known at flow-graph time).
 #[derive(Clone, Copy)]
 pub struct JitDriverStaticData {
     /// RPython: `JitDriverStaticData.portal_graph`. The CodeObject
@@ -81,8 +81,8 @@ pub struct JitDriverStaticData {
     /// fires inside `grab_initial_jitcodes`.
     pub portal_graph: *const CodeObject,
     /// pyre-only: the `PyObjectRef` wrapper around `portal_graph`,
-    /// kept on the jd so `set_majit_jitcode` indexes its `JitCode`
-    /// table by the same identity the runtime uses.
+    /// kept on the jd so the trace-side jitcode table indexes by the
+    /// same identity the runtime uses.
     pub w_code: *const (),
     /// pyre-only refinement hint forwarded to `get_jitcode`.
     /// `Some(pc)` rebuilds the cached `PyJitCode` if the recorded
@@ -132,13 +132,17 @@ pub struct CallControl {
     /// than a flow-graph reference because pyre's "graph" is a Python
     /// bytecode object; the identity semantics are the same.
     ///
-    /// Values are `Box<PyJitCode>` so that the entry's heap address is
-    /// stable across `HashMap` rehashes. `get_jitcode` returns a
-    /// `&PyJitCode` elaborated into `'static` to match RPython's Python
-    /// semantics (see the SAFETY comment there); without boxing, a
-    /// later `insert` could rehash and invalidate a ref the caller
-    /// still holds.
-    pub jitcodes: HashMap<usize, Box<PyJitCode>>,
+    /// Values are `Arc<PyJitCode>` so the same allocation can sit in
+    /// `MetaInterpStaticData.jitcodes` too. RPython's two stores hold
+    /// references to identical Python `JitCode` objects through
+    /// refcount semantics; pyre mirrors that by sharing the `Arc` —
+    /// the `find_jitcode_arc` helper hands the trace-side
+    /// `state::jitcode_for` callback the same `Arc` it just installed
+    /// here. `get_jitcode` returns a `&PyJitCode` elaborated into
+    /// `'static` to match RPython's Python semantics (see the SAFETY
+    /// comment there); the `Arc` keeps the address stable across
+    /// `HashMap` rehashes.
+    pub jitcodes: HashMap<usize, std::sync::Arc<PyJitCode>>,
 
     /// call.py:30 `self.unfinished_graphs = []` — LIFO queue of graphs
     /// pending compilation. Populated by `get_jitcode()` when it sees a
@@ -148,13 +152,14 @@ pub struct CallControl {
     /// pyre stores `(code_ptr, w_code, merge_point_pc)` triples instead
     /// of bare graphs because the drain loop — pyre's analog of
     /// `transform_graph_to_jitcode(graph, jitcode, ...)` at
-    /// codewriter.py:80 — needs `w_code` to pipe `set_majit_jitcode`
-    /// into `MetaInterpStaticData`, and `merge_point_pc` because pyre's
-    /// `transform_graph_to_jitcode` consumes it as the trace-entry hint
-    /// (RPython has no analog because portal PCs are statically known).
-    /// RPython's Assembler reads the `w_code`-equivalent identity off
-    /// each `JitCode` directly; pyre's `state::JitCode` is keyed on
-    /// `w_code` so we carry it through.
+    /// codewriter.py:80 — needs `w_code` so the resulting `Arc<PyJitCode>`
+    /// is keyed correctly in `MetaInterpStaticData.jitcodes`, and
+    /// `merge_point_pc` because pyre's `transform_graph_to_jitcode`
+    /// consumes it as the trace-entry hint (RPython has no analog
+    /// because portal PCs are statically known). RPython's Assembler
+    /// reads the `w_code`-equivalent identity off each `JitCode`
+    /// directly; pyre's `state::JitCode` is keyed on `w_code` so we
+    /// carry it through.
     pub unfinished_graphs: Vec<(*const CodeObject, *const (), Option<usize>)>,
 
     /// call.py:31 `self.callinfocollection = CallInfoCollection()`.
@@ -219,7 +224,19 @@ impl CallControl {
     /// compilation side effect. Returns `None` if `code` has not been
     /// compiled yet.
     pub fn find_jitcode(&self, code: *const CodeObject) -> Option<&PyJitCode> {
-        self.jitcodes.get(&(code as usize)).map(|b| &**b)
+        self.jitcodes.get(&(code as usize)).map(|arc| arc.as_ref())
+    }
+
+    /// `Arc`-cloning variant used by the trace-side `state::jitcode_for`
+    /// callback: returns the same `Arc<PyJitCode>` the SD will store,
+    /// so both stores reference one allocation. RPython's
+    /// `MetaInterpStaticData.jitcodes` and `CallControl.jitcodes`
+    /// hold the same Python `JitCode` objects via refcount semantics;
+    /// this helper is the Rust analog.
+    pub fn find_jitcode_arc(&self, code: *const CodeObject) -> Option<std::sync::Arc<PyJitCode>> {
+        self.jitcodes
+            .get(&(code as usize))
+            .map(std::sync::Arc::clone)
     }
 
     /// RPython: `CallControl.enum_pending_graphs()` (call.py:150-153).
@@ -318,8 +335,10 @@ impl CallControl {
             // `CodeWriter::make_jitcodes`'s drain loop at
             // codewriter.py:80 `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
-            self.jitcodes
-                .insert(key, Box::new(PyJitCode::skeleton(merge_point_pc)));
+            self.jitcodes.insert(
+                key,
+                std::sync::Arc::new(PyJitCode::skeleton(merge_point_pc)),
+            );
             // call.py:171 `self.unfinished_graphs.append(graph)`. pyre
             // also re-pushes on a merge_point_pc refinement so the
             // drain picks the refined entry up again for the recompile
@@ -329,11 +348,11 @@ impl CallControl {
         }
         let entry = self.jitcodes.get(&key).unwrap();
         // SAFETY: the per-thread `CodeWriter` singleton lives for the
-        // thread's lifetime, and `PyJitCode` is owned through `Box` so
+        // thread's lifetime, and `PyJitCode` sits inside an `Arc` so
         // the heap address is stable across `HashMap` rehashes. The
         // `'static` promise mirrors RPython's Python semantics
         // (call.py returns the dict value directly and relies on
-        // refcounting to keep it alive); in Rust the Box pointer is
+        // refcounting to keep it alive); in Rust the `Arc` pointer is
         // the source of address stability.
         //
         // Caller contract: do not re-enter `get_jitcode` (or anything
@@ -341,8 +360,9 @@ impl CallControl {
         // as the `merge_point_pc` refinement path or the
         // `make_jitcodes` drain replacing the skeleton with the
         // populated entry) while still holding the returned reference.
-        // A refinement drops the previous Box and dangles the ref.
-        unsafe { &*(&**entry as *const PyJitCode) }
+        // A refinement drops the previous `Arc` slot and dangles the
+        // ref.
+        unsafe { &*(entry.as_ref() as *const PyJitCode) }
     }
 }
 

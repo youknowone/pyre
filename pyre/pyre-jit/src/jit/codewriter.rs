@@ -1989,14 +1989,12 @@ impl CodeWriter {
     ///     return all_jitcodes
     /// ```
     ///
-    /// The pyre drain loop adds one extra step that RPython's drain does
-    /// not have: each freshly-compiled jitcode is published to
-    /// `pyre_jit_trace::set_majit_jitcode` so the lower
-    /// `pyre_jit_trace` crate (which cannot depend on pyre-jit) sees
-    /// the latest `JitCode` / `pc_map` / `liveness` slots. RPython's
-    /// equivalent is `MetaInterpStaticData::finish_setup` at
-    /// `pyjitpl.py:2255-2269`, which the assembler's `finished()` call
-    /// at `codewriter.py:85` is the upstream sibling of.
+    /// Each freshly-compiled `PyJitCode` is `Arc`-wrapped before being
+    /// inserted into `CallControl.jitcodes`; the next trace-side
+    /// `state::jitcode_for(w_code)` callback hands the same `Arc`
+    /// to `MetaInterpStaticData.jitcodes`, so both stores reference
+    /// one allocation — the Rust analog of RPython's two stores
+    /// referencing the same Python `JitCode` via refcount semantics.
     ///
     /// `grab_initial_jitcodes` reads its seed list from
     /// [`super::call::CallControl::jitdrivers_sd`]; callers register
@@ -2034,24 +2032,18 @@ impl CodeWriter {
             // invariant.
             let pyjitcode =
                 self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
-            // pyre-only: pipe the freshly populated entry to the lower
-            // `pyre_jit_trace` crate so the runtime side picks it up.
-            // RPython's equivalent is the
-            // `MetaInterpStaticData::finish_setup` pull at
-            // `pyjitpl.py:2255-2269`.
-            if !pyjitcode.has_abort {
-                pyre_jit_trace::set_majit_jitcode(
-                    w_code,
-                    pyjitcode.jitcode.clone(),
-                    pyjitcode.metadata.pc_map.clone(),
-                    pyjitcode.metadata.liveness.clone(),
-                );
-            }
             let key = code_ptr as usize;
-            let boxed = Box::new(pyjitcode);
-            let raw_ptr = &*boxed as *const PyJitCode;
-            self.callcontrol().jitcodes.insert(key, boxed);
+            let arc = std::sync::Arc::new(pyjitcode);
+            let raw_ptr = std::sync::Arc::as_ptr(&arc);
+            self.callcontrol().jitcodes.insert(key, arc);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
+            //
+            // The `Arc` placed in `CallControl.jitcodes` above is the
+            // shared payload `MetaInterpStaticData.jitcodes` will hold
+            // too; the trace-side `state::jitcode_for` callback
+            // returns this same `Arc` to its caller, matching
+            // RPython's two stores referencing the same `JitCode`
+            // Python object via refcount semantics.
             all_jitcodes.push(raw_ptr);
             // codewriter.py:82 `count += 1`.
             count += 1;
@@ -2177,19 +2169,24 @@ pub fn ensure_jitcode_for(
 /// the jtransform path: only `eval.rs`'s portal entry refines the
 /// merge point with `Some(pc)` (warmspot.py:148-282 has fixed portal
 /// PCs at flow-graph time, so RPython has no equivalent refinement).
-fn compile_jitcode_via_w_code(w_code: *const ()) {
+fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitCode>> {
     if w_code.is_null() {
-        return;
+        return None;
     }
     let raw_code = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
     if raw_code.is_null() {
-        return;
+        return None;
     }
     let code = unsafe { &*raw_code };
     ensure_jitcode_for(code, w_code, None);
+    // Hand the populated `Arc` back to the trace-side caller so the
+    // SD entry stores the same allocation as `CallControl.jitcodes`.
+    CodeWriter::instance()
+        .callcontrol()
+        .find_jitcode_arc(code as *const _)
 }
 
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where
