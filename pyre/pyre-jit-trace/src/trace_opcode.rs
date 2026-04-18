@@ -631,43 +631,54 @@ impl MIFrame {
         idx: usize,
         value: OpRef,
     ) -> Result<(), PyError> {
-        // RPython pyjitpl.py opimpl_setlocal: stores the box directly.
-        // Unboxing happens at operation time (binary_float_value, etc.),
-        // not at store time.
+        // RPython pyjitpl.py opimpl_setlocal (via _opimpl_setarrayitem_vable
+        // for virtualizable locals) writes the value's Ref box directly
+        // into `virtualizable_boxes[flat_idx]` AND the frame's symbolic
+        // tracking. In RPython the stored box is always a Ref (boxed
+        // W_Root) because locals_cells_stack_w is declared as a
+        // W_Root array (virtualizable.py:86-98). pyre previously let
+        // `symbolic_locals[idx]` carry a raw Int/Float, relying on
+        // `close_loop_args_at`'s materialize step to rebox it at loop
+        // boundaries — but guard capture, bridge resume, and the
+        // recursive-CALL helper picker (`one_arg_callee_frame_helper`)
+        // all consult the stored value's type directly, so a raw Int
+        // slot would drive `_raw_int` frame creation against a caller
+        // stack that actually held a boxed Ref, reinterpreting the
+        // pointer as an int and producing pointers like 0x9EE5CDDE8 in
+        // the callee's `locals_w()[0]` (fib_recursive SIGBUS, 2026-04-18).
+        // Box on store so the symbolic slot always satisfies the
+        // Ref-typed virtualizable contract; explicit unbox happens at
+        // the op site that needs the raw payload.
         let stored_type = self.value_type(value);
+        let ref_value = match stored_type {
+            Type::Int => wrapint(ctx, value),
+            Type::Float => wrapfloat(ctx, value),
+            _ => value,
+        };
         let (has_vable, frame_ref, nlocals) = {
             let s = self.sym_mut();
             if idx >= s.symbolic_locals.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            s.symbolic_locals[idx] = value;
+            s.symbolic_locals[idx] = ref_value;
             if idx >= s.symbolic_local_types.len() {
                 s.symbolic_local_types.resize(idx + 1, Type::Ref);
             }
-            // Keep the traced value type for subsequent symbolic loads.
-            // The concrete virtualizable frame slot may still hold boxed
-            // GCREFs, but within the trace a local can legitimately carry a
-            // raw int/float until guard/loop materialization re-boxes it at
-            // the boundary.
-            s.symbolic_local_types[idx] = stored_type;
+            // virtualizable.py:86-98 read_boxes() parity: every item of
+            // locals_cells_stack_w is Ref.
+            s.symbolic_local_types[idx] = Type::Ref;
             (s.vable_array_base.is_some(), s.frame, s.nlocals)
         };
         // RPython pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
         //     self.metainterp.synchronize_virtualizable()
         //
-        // `virtualizable_boxes` is the RPython tracing-time mirror of the
-        // PyFrame's `locals_cells_stack_w` array. Keep it in sync with
-        // `symbolic_locals` so `close_loop_args_at`'s
-        // `set_virtualizable_box_at` writes the current SSA opref (not the
-        // preamble InputArg) into every slot. Without this mirror the
-        // deduped JUMP args end up consulting stale vable box state.
+        // `virtualizable_boxes` is the RPython tracing-time mirror of
+        // the PyFrame's `locals_cells_stack_w` array. Keep it in sync
+        // with `symbolic_locals` so `close_loop_args_at`'s
+        // `set_virtualizable_box_at` writes the current SSA opref (not
+        // the preamble InputArg) into every slot.
         if has_vable && idx < nlocals {
-            let ref_value = match stored_type {
-                Type::Int => wrapint(ctx, value),
-                Type::Float => wrapfloat(ctx, value),
-                _ => value,
-            };
             let _ = frame_ref;
             // NUM_SCALAR_INPUTARGS - 1 = 6 (scalar fields excluding the
             // frame-identity slot at index 0 of the inputarg stream).
