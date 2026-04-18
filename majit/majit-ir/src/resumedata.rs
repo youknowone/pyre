@@ -140,11 +140,6 @@ pub struct NumberingState {
     /// RPython Box.type parity: type of each TAGBOX livebox, captured at
     /// numbering time. Equivalent to Box.type being intrinsic in RPython.
     pub livebox_types: HashMap<u32, Type>,
-    /// virtualizable.py:read_boxes parity: vable_array entries get FRESH
-    /// TAGBOX numbers (RPython wrap() builds new FrontendOps each call).
-    /// pyre's flat OpRef model needs a side table to bypass dedup.
-    /// Each entry is (TAGBOX index, OpRef).
-    pub fresh_tagbox_entries: Vec<(i32, OpRef)>,
 }
 
 impl NumberingState {
@@ -155,7 +150,6 @@ impl NumberingState {
             num_boxes: 0,
             num_virtuals: 0,
             livebox_types: HashMap::new(),
-            fresh_tagbox_entries: Vec::new(),
         }
     }
 
@@ -253,52 +247,6 @@ impl ResumeDataLoopMemo {
             Type::Float => self.getconst_float(val),
             Type::Void => self.newconst(val, tp),
         }
-    }
-
-    /// virtualizable.py:read_boxes parity helper: tag each entry with a
-    /// FRESH TAGBOX, bypassing the liveboxes dedup cache. RPython's wrap()
-    /// builds a new FrontendOp per call, so vable boxes can never collide
-    /// with frame register boxes that happen to wrap the same value.
-    ///
-    /// In majit's flat OpRef model, this requires a side table — each
-    /// (TAGBOX index, OpRef) pair is recorded in
-    /// `numb_state.fresh_tagbox_entries`, and `_finalize_liveboxes_vec`
-    /// (or the caller) uses it to populate the liveboxes vec.
-    pub fn _number_boxes_fresh(
-        &mut self,
-        boxes: &[OpRef],
-        numb_state: &mut NumberingState,
-        env: &dyn BoxEnv,
-    ) -> Result<(), TagOverflow> {
-        for &raw_opref in boxes {
-            // resume.py:561-562 _gettagged: box is None → UNINITIALIZED
-            if raw_opref.is_none() {
-                numb_state.append_short(UNINITIALIZED_TAG);
-                continue;
-            }
-            let opref = env.get_box_replacement(raw_opref);
-            if opref.is_none() {
-                numb_state.append_short(UNINITIALIZED_TAG);
-                continue;
-            }
-            // resume.py:204-205: isinstance(box, Const)
-            if env.is_const(opref) {
-                let (val, tp) = env.get_const(opref);
-                let tagged = self.getconst(val, tp);
-                numb_state.append_short(tagged);
-                continue;
-            }
-            // Non-const: allocate fresh TAGBOX, do NOT touch liveboxes cache.
-            // virtualizable.py:wrap creates a new FrontendOp here.
-            let box_type = env.get_type(opref);
-            let tagged = tag(numb_state.num_boxes, TAGBOX)?;
-            let tagbox_idx = numb_state.num_boxes;
-            numb_state.num_boxes += 1;
-            numb_state.livebox_types.insert(opref.0, box_type);
-            numb_state.fresh_tagbox_entries.push((tagbox_idx, opref));
-            numb_state.append_short(tagged);
-        }
-        Ok(())
     }
 
     /// resume.py:196-223 _number_boxes — tag each box in the snapshot.
@@ -608,8 +556,24 @@ mod tests {
         }
     }
 
+    /// `_number_boxes` dedups by OpRef identity, matching RPython's
+    /// Box-identity dedup at resume.py:204-223 (see test_resume.py:744-768
+    /// — two distinct Box objects with identical attr values get different
+    /// tag numbers; identity is key, not value).
+    ///
+    /// Identity collisions between `vable_array` and `framestack` are
+    /// legitimate when an interpreter-level frame local has been assigned
+    /// to a virtualizable slot via `_opimpl_setfield_vable`
+    /// (pyjitpl.py:1193 `self.metainterp.virtualizable_boxes[index] =
+    /// valuebox`). At trace entry the slots have distinct OpRefs by
+    /// construction (pyjitpl/mod.rs `initialize_virtualizable` allocates
+    /// `OpRef(1..total_vable)`), mirroring RPython's fresh-box wrap at
+    /// `virtualizable.py:92` / `warmstate.py:73 wrap`.
+    ///
+    /// This test only exercises the collision path — it is *not* asserting
+    /// that vable and frame must always share identity.
     #[test]
-    fn number_virtualizable_boxes_share_livebox_identity_with_frames() {
+    fn number_boxes_dedups_on_opref_identity_collision() {
         let shared = OpRef(7);
         let snapshot = Snapshot {
             vable_array: vec![shared],
@@ -631,5 +595,42 @@ mod tests {
         assert_eq!(vable_values, vec![RebuiltValue::Box(0, Type::Ref)]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].values, vec![RebuiltValue::Box(0, Type::Ref)]);
+    }
+
+    /// Counterpart to `number_boxes_dedups_on_opref_identity_collision`:
+    /// when `vable_array` and `framestack` carry **distinct** OpRefs,
+    /// the numbering must assign them distinct TAGBOX indices. This
+    /// mirrors test_resume.py:744-768 `test_ResumeDataLoopMemo_number_boxes`
+    /// where two Box objects with identical attr values are still numbered
+    /// separately because they have different Python identities.
+    ///
+    /// This is the default at trace entry, when `initialize_virtualizable`
+    /// gives each vable slot its own fresh OpRef (see pyjitpl/mod.rs
+    /// and RPython's `virtualizable.py:86 read_boxes` +
+    /// `warmstate.py:73 wrap`).
+    #[test]
+    fn number_boxes_keeps_distinct_oprefs_distinct() {
+        let vable_opref = OpRef(7);
+        let frame_opref = OpRef(8);
+        let snapshot = Snapshot {
+            vable_array: vec![vable_opref],
+            vref_array: Vec::new(),
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 0,
+                boxes: vec![frame_opref],
+            }],
+        };
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let numb_state = memo.number(&snapshot, &TestEnv).unwrap();
+        let numbering = numb_state.create_numbering();
+        let (_, vable_values, _, frames) =
+            rebuild_from_numbering(&numbering, memo.consts(), &[Type::Ref, Type::Ref], None);
+
+        assert_eq!(numb_state.num_boxes, 2);
+        assert_eq!(vable_values, vec![RebuiltValue::Box(0, Type::Ref)]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].values, vec![RebuiltValue::Box(1, Type::Ref)]);
     }
 }

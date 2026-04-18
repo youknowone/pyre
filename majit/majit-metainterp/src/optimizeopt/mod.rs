@@ -3119,7 +3119,7 @@ impl OptContext {
         // resume.py:389-452: delegate to ResumeDataVirtualAdder.finish()
         let env = OptBoxEnv { ctx: self };
         let mut memo = ResumeDataLoopMemo::new();
-        let Ok(numb_state) = memo.number(&snapshot, &env) else {
+        let Ok(numb_state) = memo.number(&snapshot, &env, -1) else {
             return;
         };
 

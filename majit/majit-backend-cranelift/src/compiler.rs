@@ -4519,9 +4519,10 @@ fn emit_guard_exit(
 
         if let Some(accum) = accum_positions.get(&slot) {
             // _update_at_exit: reduce vector accumulator to scalar.
-            // vector_ext.py:130: vector_loc = accum_info.location (vector SSA)
-            // vector_ext.py:132: scalar_arg = accum_info.getoriginal() (type info only)
-            let vec_val = resolve_opref(builder, constants, accum.vector_loc);
+            // resume.py:28 + vector_ext.py:130: accum_info.location = vector SSA
+            // resume.py:47 + vector_ext.py:132: accum_info.getoriginal() → scalar
+            // type info only
+            let vec_val = resolve_opref(builder, constants, accum.location);
             let val_type = builder.func.dfg.value_type(vec_val);
 
             let reduced = if val_type == cl_types::F64X2 {
@@ -4529,10 +4530,10 @@ fn emit_guard_exit(
                 // _accum_reduce_mul (vector_ext.py:158-162): SHUFPD + MULSD
                 let lane0 = builder.ins().extractlane(vec_val, 0);
                 let lane1 = builder.ins().extractlane(vec_val, 1);
-                let scalar_f = match accum.operator {
+                let scalar_f = match accum.accum_operation {
                     '+' => builder.ins().fadd(lane0, lane1),
                     '*' => builder.ins().fmul(lane0, lane1),
-                    op => panic!("unsupported accum operator '{op}'"),
+                    op => panic!("unsupported accum_operation '{op}'"),
                 };
                 builder
                     .ins()
@@ -4542,10 +4543,10 @@ fn emit_guard_exit(
                 // PEXTRQ lane0, PEXTRQ lane1, ADD
                 let lane0 = builder.ins().extractlane(vec_val, 0);
                 let lane1 = builder.ins().extractlane(vec_val, 1);
-                match accum.operator {
+                match accum.accum_operation {
                     '+' => builder.ins().iadd(lane0, lane1),
                     '*' => builder.ins().imul(lane0, lane1),
-                    op => panic!("unsupported accum operator '{op}'"),
+                    op => panic!("unsupported accum_operation '{op}'"),
                 }
             };
             builder
@@ -10843,15 +10844,6 @@ fn collect_guards(
                                     .unwrap_or(ExitValueSourceLayout::Constant(0)),
                             }
                         }
-                        // resume.py:763-870 VStr/VUni info types — no pyre
-                        // producer yet; backing virtual-string materialization
-                        // lives on a future port of vstring.py. Skip safely.
-                        majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
-                        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
-                        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
-                        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
-                        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-                        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => continue,
                         majit_ir::RdVirtualInfo::Empty => continue,
                     };
                     recovery_layout.virtual_layouts.push(layout);

@@ -61,11 +61,6 @@ pub struct Optimizer {
     /// code depends on. After compilation, each dependency gets the loop's
     /// invalidation flag registered as a per-slot watcher.
     pub quasi_immutable_deps: std::collections::HashSet<(u64, u32)>,
-    /// optimizer.py: `resumedata_memo` — shared constant map for resume data.
-    /// Maps constant values to shared indices to reduce resume data size.
-    /// In RPython this is `resume.ResumeDataLoopMemo`; here we use a simple
-    /// HashMap since the full type lives in majit-meta (no circular dep).
-    resumedata_memo_consts: std::collections::HashMap<i64, u32>,
     /// Types of constant OpRefs from ConstantPool.constant_types.
     /// Used to distinguish Ref constants from Int in guard fail_args.
     pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
@@ -972,7 +967,6 @@ impl Optimizer {
             pendingfields: Vec::new(),
             can_replace_guards: true,
             quasi_immutable_deps: std::collections::HashSet::new(),
-            resumedata_memo_consts: std::collections::HashMap::new(),
             constant_types: std::collections::HashMap::new(),
             numbering_type_overrides: std::collections::HashMap::new(),
             imported_virtuals: Vec::new(),
@@ -1112,19 +1106,6 @@ impl Optimizer {
     /// Re-enable guard replacement.
     pub fn enable_guard_replacement(&mut self) {
         self.can_replace_guards = true;
-    }
-
-    /// optimizer.py: resumedata_memo — shared constant mapping for resume data.
-    /// Maps constant i64 values to shared indices so multiple guards
-    /// can reference the same constant without duplication.
-    pub fn resumedata_memo_get_or_insert(&mut self, value: i64) -> u32 {
-        let next_idx = self.resumedata_memo_consts.len() as u32;
-        *self.resumedata_memo_consts.entry(value).or_insert(next_idx)
-    }
-
-    /// Number of shared constants in the memo.
-    pub fn resumedata_memo_num_consts(&self) -> usize {
-        self.resumedata_memo_consts.len()
     }
 
     /// optimizer.py: quasi_immutable_deps[qmut] = None

@@ -553,18 +553,6 @@ pub(crate) fn build_guard_metadata(
                                 majit_ir::RdVirtualInfo::Empty => {
                                     panic!("[jit] rd_virtuals[{vidx}] is Empty");
                                 }
-                                // resume.py:763-870 VStr/VUni info types —
-                                // no pyre producer yet; vstring.py porting
-                                // of virtual string materialization is a
-                                // future step.
-                                majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
-                                | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
-                                | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
-                                | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
-                                | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-                                | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
-                                    panic!("[jit] virtual string info unexpected in pyre");
-                                }
                             }
                         })
                         .collect()
@@ -1701,7 +1689,7 @@ mod tests {
                 boxes: vec![OpRef(1)],
             }],
         };
-        let mut numb_state = memo.number(&snapshot, &env).unwrap();
+        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
         let rd_consts = memo.consts().to_vec();

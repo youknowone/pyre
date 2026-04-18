@@ -2994,15 +2994,6 @@ fn materialize_bridge_virtual(
             buffer
         }
         majit_ir::RdVirtualInfo::Empty => OpRef::NONE,
-        // resume.py:763-870 VStr/VUni info types — no pyre producer yet;
-        // materializing a virtual string requires porting vstring.py's
-        // VStringPlainInfo.force_box etc. Until then, bail out.
-        majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
-        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
-        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => OpRef::NONE,
     }
 }
 

@@ -58,6 +58,26 @@ pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
     (value as i32, index)
 }
 
+/// resumecode.py:70-73 numb_next_n_items — skip `size` items without
+/// returning values. Used by decoders that advance over a subsection.
+pub fn numb_next_n_items(buf: &[u8], size: usize, mut index: usize) -> usize {
+    for _ in 0..size {
+        let (_, new_index) = decode_varint(buf, index);
+        index = new_index;
+    }
+    index
+}
+
+/// resumecode.py:110-114 create_numbering(l) — module-level helper:
+/// build a single Writer from the list and return its encoded buffer.
+pub fn create_numbering(items: &[i32]) -> Vec<u8> {
+    let mut w = Writer::new(items.len());
+    for &item in items {
+        w.append_int(item);
+    }
+    w.create_numbering()
+}
+
 /// resumecode.py: unpack_numbering(numb)
 pub fn unpack_all(buf: &[u8]) -> Vec<i32> {
     let mut result = Vec::new();

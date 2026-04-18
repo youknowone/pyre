@@ -717,6 +717,15 @@ pub(crate) struct JitStatsCounters {
     loops_aborted: usize,
     bridges_compiled: usize,
     guard_failures: usize,
+    /// jitprof.Counters.NVIRTUALS — cumulative count of virtual entries
+    /// allocated across all finished resume data blobs (resume.py:290-291).
+    pub nvirtuals: usize,
+    /// jitprof.Counters.NVHOLES — entries in rd_virtuals that ended up unused
+    /// (resume.py:290-292).
+    pub nvholes: usize,
+    /// jitprof.Counters.NVREUSED — cached virtuals reused across resume
+    /// blobs (resume.py:290-293).
+    pub nvreused: usize,
 }
 
 /// Snapshot of cumulative JIT compilation statistics.
@@ -726,6 +735,12 @@ pub struct JitStats {
     pub loops_aborted: usize,
     pub bridges_compiled: usize,
     pub guard_failures: usize,
+    /// jitprof.Counters.NVIRTUALS (resume.py:290-291).
+    pub nvirtuals: usize,
+    /// jitprof.Counters.NVHOLES (resume.py:290-292).
+    pub nvholes: usize,
+    /// jitprof.Counters.NVREUSED (resume.py:290-293).
+    pub nvreused: usize,
 }
 
 /// Callback hooks for JIT events (compilation, guard failures, etc.).
@@ -1610,6 +1625,9 @@ impl<M: Clone> MetaInterp<M> {
             loops_aborted: self.stats.loops_aborted,
             bridges_compiled: self.stats.bridges_compiled,
             guard_failures: self.stats.guard_failures,
+            nvirtuals: self.stats.nvirtuals,
+            nvholes: self.stats.nvholes,
+            nvreused: self.stats.nvreused,
         }
     }
 

@@ -165,13 +165,6 @@ pub struct NumberingState {
     /// numbering time when env.get_type() is called. Eliminates the need
     /// for post-hoc type inference cascades in store_final_boxes_in_guard.
     pub livebox_types: std::collections::HashMap<u32, majit_ir::Type>,
-    /// virtualizable.py:read_boxes parity: each call to wrap() creates a
-    /// fresh FrontendOp with unique identity, so vable_array entries get
-    /// their own TAGBOX numbers even when they wrap the same value as a
-    /// frame box. In majit, OpRef u32 collisions force a side table:
-    /// (TAGBOX index, OpRef) pairs that bypass the liveboxes cache.
-    /// finish() uses these to populate the final liveboxes vec.
-    pub fresh_tagbox_entries: Vec<(i32, majit_ir::OpRef)>,
 }
 
 impl NumberingState {
@@ -182,7 +175,6 @@ impl NumberingState {
             num_boxes: 0,
             num_virtuals: 0,
             livebox_types: std::collections::HashMap::new(),
-            fresh_tagbox_entries: Vec::new(),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -410,18 +402,6 @@ pub enum ResumeVirtualKind {
     Array,
     ArrayStruct,
     RawBuffer,
-    /// resume.py: VStrPlainInfo — virtual plain string.
-    StrPlain,
-    /// resume.py: VStrConcatInfo — virtual concatenated string.
-    StrConcat,
-    /// resume.py: VStrSliceInfo — virtual string slice.
-    StrSlice,
-    /// resume.py: VUniPlainInfo — virtual plain unicode string.
-    UniPlain,
-    /// resume.py: VUniConcatInfo — virtual concatenated unicode.
-    UniConcat,
-    /// resume.py: VUniSliceInfo — virtual unicode slice.
-    UniSlice,
 }
 
 #[derive(Debug, Clone)]
@@ -1283,35 +1263,6 @@ pub enum VirtualInfo {
         /// Source of the parent buffer.
         parent: VirtualFieldSource,
     },
-    /// resume.py: VStrPlainInfo — virtual string (known characters).
-    VStrPlain {
-        /// Character values (as OpRef sources).
-        chars: Vec<VirtualFieldSource>,
-    },
-    /// resume.py: VStrConcatInfo — virtual string concat (left + right).
-    VStrConcat {
-        left: Box<VirtualFieldSource>,
-        right: Box<VirtualFieldSource>,
-    },
-    /// resume.py: VStrSliceInfo — virtual string slice.
-    VStrSlice {
-        source: Box<VirtualFieldSource>,
-        start: Box<VirtualFieldSource>,
-        length: Box<VirtualFieldSource>,
-    },
-    /// resume.py: VUniPlainInfo — virtual unicode string.
-    VUniPlain { chars: Vec<VirtualFieldSource> },
-    /// resume.py: VUniConcatInfo — virtual unicode concat.
-    VUniConcat {
-        left: Box<VirtualFieldSource>,
-        right: Box<VirtualFieldSource>,
-    },
-    /// resume.py: VUniSliceInfo — virtual unicode slice.
-    VUniSlice {
-        source: Box<VirtualFieldSource>,
-        start: Box<VirtualFieldSource>,
-        length: Box<VirtualFieldSource>,
-    },
 }
 
 // PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
@@ -1391,22 +1342,6 @@ impl VirtualInfo {
                 .collect(),
             VirtualInfo::VRawBuffer { values, .. } => values.iter().collect(),
             VirtualInfo::VRawSlice { parent, .. } => vec![parent],
-            VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
-                chars.iter().collect()
-            }
-            VirtualInfo::VStrConcat { left, right } | VirtualInfo::VUniConcat { left, right } => {
-                vec![left.as_ref(), right.as_ref()]
-            }
-            VirtualInfo::VStrSlice {
-                source,
-                start,
-                length,
-            }
-            | VirtualInfo::VUniSlice {
-                source,
-                start,
-                length,
-            } => vec![source.as_ref(), start.as_ref(), length.as_ref()],
         }
     }
 
@@ -1419,12 +1354,6 @@ impl VirtualInfo {
             VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. } => {
                 ResumeVirtualKind::RawBuffer
             }
-            VirtualInfo::VStrPlain { .. }
-            | VirtualInfo::VStrConcat { .. }
-            | VirtualInfo::VStrSlice { .. }
-            | VirtualInfo::VUniPlain { .. }
-            | VirtualInfo::VUniConcat { .. }
-            | VirtualInfo::VUniSlice { .. } => ResumeVirtualKind::Struct,
         }
     }
 
@@ -1511,15 +1440,7 @@ impl VirtualInfo {
                 descrs: descrs.clone(),
                 values: values.iter().map(|src| src.layout_summary()).collect(),
             },
-            // String/unicode virtual infos — represented as structs
-            // with synthetic field indices for reconstruction.
-            VirtualInfo::VRawSlice { .. }
-            | VirtualInfo::VStrPlain { .. }
-            | VirtualInfo::VStrConcat { .. }
-            | VirtualInfo::VStrSlice { .. }
-            | VirtualInfo::VUniPlain { .. }
-            | VirtualInfo::VUniConcat { .. }
-            | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
+            VirtualInfo::VRawSlice { .. } => ResumeVirtualLayoutSummary::Struct {
                 typedescr: None,
                 type_id: 0,
                 descr_index: 0,
@@ -1725,50 +1646,6 @@ pub fn rd_virtual_to_virtual_info(
             VirtualInfo::VRawSlice {
                 offset: *offset as i64,
                 parent,
-            }
-        }
-        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
-            let chars = fieldnums
-                .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
-                .collect();
-            VirtualInfo::VStrPlain { chars }
-        }
-        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
-            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            VirtualInfo::VStrConcat { left, right }
-        }
-        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
-            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
-            VirtualInfo::VStrSlice {
-                source,
-                start,
-                length,
-            }
-        }
-        majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
-            let chars = fieldnums
-                .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count))
-                .collect();
-            VirtualInfo::VUniPlain { chars }
-        }
-        majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
-            let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            VirtualInfo::VUniConcat { left, right }
-        }
-        majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
-            let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
-            let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
-            VirtualInfo::VUniSlice {
-                source,
-                start,
-                length,
             }
         }
         majit_ir::RdVirtualInfo::Empty => VirtualInfo::VirtualObj {
@@ -2541,13 +2418,7 @@ impl MaterializedVirtual {
                 descrs: descrs.clone(),
                 values: vec![MaterializedValue::Value(0); offsets.len()],
             },
-            VirtualInfo::VRawSlice { .. }
-            | VirtualInfo::VStrPlain { .. }
-            | VirtualInfo::VStrConcat { .. }
-            | VirtualInfo::VStrSlice { .. }
-            | VirtualInfo::VUniPlain { .. }
-            | VirtualInfo::VUniConcat { .. }
-            | VirtualInfo::VUniSlice { .. } => MaterializedVirtual::Struct {
+            VirtualInfo::VRawSlice { .. } => MaterializedVirtual::Struct {
                 type_id: 0,
                 descr_index: 0,
                 fields: Vec::new(),
@@ -2940,68 +2811,6 @@ impl ResumeDataVirtualAdder {
         self.add_virtual(VirtualInfo::VRawSlice { offset, parent })
     }
 
-    /// resume.py: visit_vstrplain() — add virtual plain string.
-    pub fn add_virtual_str_plain(&mut self, chars: Vec<VirtualFieldSource>) -> usize {
-        self.add_virtual(VirtualInfo::VStrPlain { chars })
-    }
-
-    /// resume.py: visit_vstrconcat() — add virtual string concat.
-    pub fn add_virtual_str_concat(
-        &mut self,
-        left: VirtualFieldSource,
-        right: VirtualFieldSource,
-    ) -> usize {
-        self.add_virtual(VirtualInfo::VStrConcat {
-            left: Box::new(left),
-            right: Box::new(right),
-        })
-    }
-
-    /// resume.py: visit_vstrslice() — add virtual string slice.
-    pub fn add_virtual_str_slice(
-        &mut self,
-        source: VirtualFieldSource,
-        start: VirtualFieldSource,
-        length: VirtualFieldSource,
-    ) -> usize {
-        self.add_virtual(VirtualInfo::VStrSlice {
-            source: Box::new(source),
-            start: Box::new(start),
-            length: Box::new(length),
-        })
-    }
-
-    /// resume.py: visit_vuniplain() — add virtual unicode string.
-    pub fn add_virtual_uni_plain(&mut self, chars: Vec<VirtualFieldSource>) -> usize {
-        self.add_virtual(VirtualInfo::VUniPlain { chars })
-    }
-
-    /// resume.py: visit_vuniconcat() — add virtual unicode concat.
-    pub fn add_virtual_uni_concat(
-        &mut self,
-        left: VirtualFieldSource,
-        right: VirtualFieldSource,
-    ) -> usize {
-        self.add_virtual(VirtualInfo::VUniConcat {
-            left: Box::new(left),
-            right: Box::new(right),
-        })
-    }
-
-    /// resume.py: visit_vunislice() — add virtual unicode slice.
-    pub fn add_virtual_uni_slice(
-        &mut self,
-        source: VirtualFieldSource,
-        start: VirtualFieldSource,
-        length: VirtualFieldSource,
-    ) -> usize {
-        self.add_virtual(VirtualInfo::VUniSlice {
-            source: Box::new(source),
-            start: Box::new(start),
-            length: Box::new(length),
-        })
-    }
-
     /// Build the final ResumeData.
     pub fn build(self) -> ResumeData {
         ResumeData {
@@ -3138,6 +2947,16 @@ impl ResumeDataLoopMemo {
         ((index << 2) | TAGCONST as i32) as i16
     }
 
+    /// resume.py:261-262 num_cached_boxes — length of the box dedup cache.
+    pub fn num_cached_boxes(&self) -> usize {
+        self.cached_boxes.len()
+    }
+
+    /// resume.py:275-276 num_cached_virtuals — length of the virtual dedup cache.
+    pub fn num_cached_virtuals(&self) -> usize {
+        self.cached_virtuals.len()
+    }
+
     /// resume.py:264 assign_number_to_box — returns a negative number.
     /// resume.py:264-273 assign_number_to_box(box, boxes).
     ///
@@ -3181,9 +3000,22 @@ impl ResumeDataLoopMemo {
         if let Some(&num) = self.cached_virtuals.get(&box_id) {
             return num;
         }
-        let num = -(self.cached_virtuals.len() as i32) - 1;
+        // resume.py:283: num = self.cached_virtuals[box] = -len(self.cached_virtuals) - 1
+        let num = -(self.num_cached_virtuals() as i32) - 1;
         self.cached_virtuals.insert(box_id, num);
         num
+    }
+
+    /// resume.py:290-293 update_counters(profiler).
+    ///
+    /// Roll the memo's cumulative NVIRTUALS / NVHOLES / NVREUSED into the
+    /// caller-supplied profiler. Called from optimizeopt/optimizer.py:557
+    /// once per trace compilation. The caller owns the profiler state;
+    /// the memo only exposes its counters.
+    pub fn update_counters(&self, profiler: &mut crate::pyjitpl::JitStatsCounters) {
+        profiler.nvirtuals += self.nvirtuals;
+        profiler.nvholes += self.nvholes;
+        profiler.nvreused += self.nvreused;
     }
 
     /// resume.py:286 clear_box_virtual_numbers.
@@ -3279,58 +3111,6 @@ impl ResumeDataLoopMemo {
             return tagged;
         }
         UNASSIGNED
-    }
-
-    /// virtualizable.py:read_boxes parity: number a snapshot section where
-    /// each non-Const entry must get a FRESH TAGBOX, bypassing the liveboxes
-    /// cache. Used for vable_array.
-    ///
-    /// In RPython, vable boxes are produced by `wrap(cpu, value, startindex+i)`,
-    /// which constructs a NEW XxxFrontendOp object with unique identity.
-    /// `_number_boxes` uses object identity as the dedup key, so vable boxes
-    /// never collide with frame boxes that happen to wrap the same value.
-    ///
-    /// In majit, OpRef u32 collisions defeat that natural dedup. This helper
-    /// emulates fresh identity by allocating a new TAGBOX per entry and
-    /// recording (tagbox, opref) in `numb_state.fresh_tagbox_entries`. The
-    /// pair is consumed by `finish()` when populating the liveboxes vec.
-    pub fn _number_boxes_fresh(
-        &mut self,
-        boxes: &[majit_ir::OpRef],
-        numb_state: &mut NumberingState,
-        env: &dyn BoxEnv,
-    ) -> Result<(), TagOverflow> {
-        for &raw_opref in boxes {
-            // resume.py:561-562 _gettagged: box is None → UNINITIALIZED
-            if raw_opref.is_none() {
-                numb_state.append_short(UNINITIALIZED_TAG);
-                continue;
-            }
-            let opref = env.get_box_replacement(raw_opref);
-            if opref.is_none() {
-                numb_state.append_short(UNINITIALIZED_TAG);
-                continue;
-            }
-            // resume.py:204-205: isinstance(box, Const) → getconst
-            // Const wrap() in RPython returns ConstInt/ConstPtr/ConstFloat,
-            // which DON'T have fresh identity — they go through getconst.
-            if env.is_const(opref) {
-                let (val, tp) = env.get_const(opref);
-                let tagged = self.getconst(val, tp);
-                numb_state.append_short(tagged);
-                continue;
-            }
-            // Non-const: allocate FRESH TAGBOX, do NOT touch liveboxes cache.
-            // virtualizable.py:wrap creates a new FrontendOp here.
-            let box_type = env.get_type(opref);
-            let tagged = tag(numb_state.num_boxes, TAGBOX)?;
-            let tagbox_idx = numb_state.num_boxes;
-            numb_state.num_boxes += 1;
-            numb_state.livebox_types.insert(opref.0, box_type);
-            numb_state.fresh_tagbox_entries.push((tagbox_idx, opref));
-            numb_state.append_short(tagged);
-        }
-        Ok(())
     }
 
     /// resume.py:192-226 _number_boxes — tag each box in a snapshot section.
@@ -3437,6 +3217,7 @@ impl ResumeDataLoopMemo {
         &mut self,
         snapshot: &Snapshot,
         env: &dyn BoxEnv,
+        minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
         let size_hint = snapshot.estimated_size();
         let mut numb_state = NumberingState::new(size_hint);
@@ -3445,7 +3226,18 @@ impl ResumeDataLoopMemo {
         numb_state.append_int(0); // slot 0: size of resume section
         numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
 
-        // resume.py:234-241: virtualizable array
+        // resume.py:236-239: if minimum_virtualizable_size != -1: the
+        // virtualizable itself is one entry in the array too, so use '>'.
+        if minimum_virtualizable_size != -1 {
+            debug_assert!(
+                snapshot.vable_array.len() as i64 > minimum_virtualizable_size,
+                "vable_array length {} not > minimum_virtualizable_size {}",
+                snapshot.vable_array.len(),
+                minimum_virtualizable_size
+            );
+        }
+
+        // resume.py:240-241: virtualizable array
         numb_state.append_int(snapshot.vable_array.len() as i32);
         self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
 
@@ -3534,16 +3326,6 @@ impl ResumeDataLoopMemo {
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 virtual_worklist.push(opref_id);
-            }
-        }
-
-        // virtualizable.py:read_boxes parity: vable_array entries get FRESH
-        // TAGBOX numbers via _number_boxes_fresh, bypassing the liveboxes
-        // cache. They live in numb_state.fresh_tagbox_entries instead, and
-        // must be added to the liveboxes vec at their assigned indices.
-        for &(tagbox_idx, opref) in &numb_state.fresh_tagbox_entries {
-            if (tagbox_idx as usize) < liveboxes.len() {
-                liveboxes[tagbox_idx as usize] = Some(opref);
             }
         }
 
@@ -3676,7 +3458,8 @@ impl ResumeDataLoopMemo {
         }
 
         // resume.py:454-509: _number_virtuals
-        let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.cached_boxes.len()];
+        // resume.py:460: new_liveboxes = [None] * memo.num_cached_boxes()
+        let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.num_cached_boxes()];
         let mut count = 0;
         // Iterate in insertion order (RPython dict iteration = insertion order).
         let keys: Vec<(u32, i16)> = new_liveboxes_order
@@ -3714,7 +3497,8 @@ impl ResumeDataLoopMemo {
         // resume.py:500-501: make_virtual_info(info, fieldnums) via BoxEnv dispatch
         let mut rd_virtuals: Vec<majit_ir::RdVirtualInfo> = Vec::new();
         if !virtual_fields.is_empty() {
-            let length = num_env_virtuals as usize + self.cached_virtuals.len();
+            // resume.py:491: length = num_env_virtuals + memo.num_cached_virtuals()
+            let length = num_env_virtuals as usize + self.num_cached_virtuals();
             rd_virtuals.resize(length, majit_ir::RdVirtualInfo::Empty);
             self.nvirtuals += length;
             self.nvholes += length - virtual_fields.len();
@@ -4399,7 +4183,7 @@ mod tests {
         env.constants
             .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
         let snapshot = Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
-        let numb_state = memo.number(&snapshot, &env).unwrap();
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
         // items[0] = total size
@@ -4437,7 +4221,7 @@ mod tests {
         env.constants
             .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
         let snapshot = Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
-        let mut numb_state = memo.number(&snapshot, &env).unwrap();
+        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
@@ -4468,7 +4252,7 @@ mod tests {
         env.virtuals.insert(2); // OpRef(2) is virtual (Ref type)
         env.types.insert(2, majit_ir::Type::Ref);
         let snapshot = Snapshot::single_frame(10, vec![OpRef(1), OpRef(2), OpRef(3)]);
-        let mut numb_state = memo.number(&snapshot, &env).unwrap();
+        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: finish() patches with len(newboxes) which is num_boxes
         // (not liveboxes which includes virtuals).
         numb_state.writer.patch(1, numb_state.num_boxes);
@@ -4498,7 +4282,7 @@ mod tests {
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
         let snapshot = Snapshot::single_frame(10, vec![OpRef(1), OpRef(2), OpRef(3)]);
-        let numb_state = memo.number(&snapshot, &env).unwrap();
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
         assert_eq!(items[1], 0);
@@ -4541,7 +4325,7 @@ mod tests {
             ],
         };
 
-        let mut numb_state = memo.number(&snapshot, &env).unwrap();
+        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
 
@@ -4593,7 +4377,7 @@ mod tests {
 
         let snapshot =
             Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2), OpRef(3)]);
-        let numb_state = memo.number(&snapshot, &env).unwrap();
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None);
 

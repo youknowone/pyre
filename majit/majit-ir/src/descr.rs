@@ -769,23 +769,67 @@ pub trait FailDescr: Descr {
     }
 }
 
-/// resume.py:65-80: AccumInfo — metadata attached to guard descriptors
+/// resume.py:65-85 AccumInfo — metadata attached to guard descriptors
 /// so deoptimization can reconstruct vector accumulators.
 ///
 /// Two distinct OpRefs following RPython's separation:
-///   - `variable`: original scalar accumulator (resume.py:29 getoriginal(),
-///     used for type inference)
-///   - `vector_loc`: vector SSA result holding the accumulated vector
-///     (regalloc.py:350 accuminfo.location, used by backend for lane reduction)
+///   - `variable`: resume.py:29/47 — the original scalar accumulator box
+///     (used for type inference; getoriginal() returns it).
+///   - `location`: resume.py:28 — the register/SSA location where the
+///     accumulated vector lives. regalloc.py:350 sets accuminfo.location;
+///     the backend reads it for extractlane + reduction at guard exit.
+///
+/// Field layout matches resume.py:24-85 (VectorInfo base + AccumInfo
+/// subclass flattened into one struct, since pyre's vector pass only
+/// produces the Accum variant). The sibling `UnpackAtExitInfo` subclass
+/// is provided below as a dead reservation matching RPython — RPython
+/// itself defines `UnpackAtExitInfo` (resume.py:59-63) but never
+/// instantiates it; this is the same cross-cutting pattern as
+/// `RawStructPtrInfo` (info.py:452, never instantiated).
 #[derive(Debug, Clone)]
 pub struct AccumVectorInfo {
+    /// resume.py:31/32 prev — next entry in the VectorInfo linked list.
+    /// RPython walks the chain via `next()` / `clone()`; pyre stores a
+    /// linked list per guard via `attach_vector_info` pushing onto a Vec,
+    /// with `prev` set at construction time. `None` marks list tail.
+    pub prev: Option<Box<AccumVectorInfo>>,
+    /// resume.py:27 failargs_pos — index in the guard's fail arguments.
     pub failargs_pos: usize,
-    /// resume.py:29: the original scalar variable (getoriginal()).
+    /// resume.py:29 variable — the original scalar variable (getoriginal()).
     pub variable: OpRef,
-    /// regalloc.py:350: vector register/SSA where the accumulated vector lives.
-    /// Backend reads this for extractlane + reduction at guard exit.
-    pub vector_loc: OpRef,
-    pub operator: char,
+    /// resume.py:28 location — register/SSA location of the accumulated
+    /// vector. regalloc.py:350 sets this.
+    pub location: OpRef,
+    /// resume.py:66/70 accum_operation — reduction operator ('+', '*', ...).
+    pub accum_operation: char,
+    /// resume.py:71 scalar — the reduced scalar value. RPython sets this
+    /// lazily during backend reduction at guard exit (assembler.py:739).
+    /// `OpRef::NONE` = unset (matches RPython `self.scalar = None`).
+    pub scalar: OpRef,
+}
+
+/// resume.py:59-63 UnpackAtExitInfo — VectorInfo subclass used for
+/// scheduling vector value unpack-on-exit at guard failures.
+///
+/// **Dead reservation** — RPython defines this class but never
+/// instantiates it (`grep UnpackAtExitInfo(` in `rpython/jit/` returns
+/// only the `instance_clone` self-reference at resume.py:61). The type
+/// is preserved here for line-by-line structural parity with
+/// `resume.py`; same cross-cutting pattern as `RawStructPtrInfo`
+/// (info.py:452-457). Should a future vector pass introduce a
+/// producer, the call sites should mirror RPython's `AccumInfo`
+/// handling (linked-list `prev` chain + `attach_vector_info`).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct UnpackAtExitInfo {
+    /// resume.py:31/32 prev — next entry in the VectorInfo linked list.
+    pub prev: Option<Box<UnpackAtExitInfo>>,
+    /// resume.py:27 failargs_pos — index in the guard's fail arguments.
+    pub failargs_pos: usize,
+    /// resume.py:29 variable — the original scalar variable.
+    pub variable: OpRef,
+    /// resume.py:28 location — register/SSA location of the value.
+    pub location: OpRef,
 }
 
 /// Descriptor for a fixed-size struct/object allocation.

@@ -223,20 +223,31 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
             }
             if let Some(entry) = state.accumulation.get(arg) {
                 // schedule.py:654-655: AccumInfo → descr.attach_vector_info
-                // resume.py:29,37: variable = original scalar (getoriginal())
-                // regalloc.py:350: location = vector register (set by backend)
-                // In Cranelift SSA, vector_loc is the vector OpRef from box_to_vbox.
-                let vector_loc = state
+                // resume.py:29,47: variable = original scalar (getoriginal())
+                // resume.py:28 + regalloc.py:350: location = vector register
+                // (set by backend). In Cranelift SSA, location is the
+                // vector OpRef pulled from box_to_vbox.
+                let location = state
                     .getvector_of_box(*arg)
                     .map(|(_, vec_ref)| vec_ref)
                     .unwrap_or(*arg);
                 if let Some(ref descr) = op.descr {
                     if let Some(fail_descr) = descr.as_fail_descr() {
                         fail_descr.attach_vector_info(majit_ir::AccumVectorInfo {
+                            // resume.py:31 prev — built at construction time;
+                            // attach_vector_info pushes onto a Vec whose end-of-list
+                            // equivalent is `None`. If multiple AccumInfos are
+                            // attached during scheduling, the visit order is the
+                            // Vec iteration order (no producer currently chains
+                            // them explicitly).
+                            prev: None,
                             failargs_pos: fi,
                             variable: *arg,
-                            vector_loc,
-                            operator: entry.operator,
+                            location,
+                            accum_operation: entry.operator,
+                            // resume.py:71 self.scalar = None (set lazily at
+                            // backend reduction).
+                            scalar: OpRef::NONE,
                         });
                     }
                 }
