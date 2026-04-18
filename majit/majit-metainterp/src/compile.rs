@@ -10,7 +10,7 @@ use majit_backend::{
     Backend, BackendError, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout,
     JitCellToken, TerminalExitLayout,
 };
-use majit_ir::{DescrRef, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Descr, DescrRef, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout, StoredResumeData};
@@ -1652,6 +1652,370 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
     fn force_token_slots(&self) -> &[usize] {
         &self.force_token_slots
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `rpython/jit/metainterp/compile.py:623-674` — finish/propagate descrs.
+//
+// These are ported as backend-agnostic `FailDescr` impls on the
+// `majit-metainterp` side so `compile_tmp_callback` and
+// `finish_setup` can reference the same singletons RPython does.
+// Backend-specific `done_with_this_frame_descr_*` singletons in
+// `majit-backend-cranelift` / `majit-backend-dynasm` remain for now;
+// they will be rewired to these types once every consumer has migrated.
+//
+// All items in this block carry `#[allow(dead_code)]` during Steps 2-4
+// of the `compile_tmp_callback` port; they go live together when
+// `compile_tmp_callback` replaces `Backend::register_pending_target`.
+// ──────────────────────────────────────────────────────────────────────
+
+/// `compile.py:623-624` `class _DoneWithThisFrameDescr(AbstractFailDescr):
+/// final_descr = True`.
+///
+/// Shared base fields for the four `DoneWithThisFrame*` subclasses —
+/// a stable `fail_arg_types` vector plus the `final_descr = True`
+/// marker exposed through `FailDescr::is_finish()`.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct DoneWithThisFrameDescrBase {
+    /// `history.py:122` `index = -1`.  For this descriptor family
+    /// `set_descr_index` is never called (no `setup_descrs` pass); we
+    /// keep the AbstractDescr default of -1.
+    descr_index: std::sync::atomic::AtomicI32,
+    /// `handle_fail` (`compile.py:632`, 641, 650, 659) reads the result
+    /// out of `deadframe[0]`.  pyre carries the same one-slot shape via
+    /// `fail_arg_types`.
+    fail_arg_types: Vec<Type>,
+}
+
+impl DoneWithThisFrameDescrBase {
+    fn new(fail_arg_types: Vec<Type>) -> Self {
+        Self {
+            descr_index: std::sync::atomic::AtomicI32::new(-1),
+            fail_arg_types,
+        }
+    }
+}
+
+/// `compile.py:626-629` `class DoneWithThisFrameDescrVoid(_DoneWithThisFrameDescr)`.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct DoneWithThisFrameDescrVoid(DoneWithThisFrameDescrBase);
+
+impl DoneWithThisFrameDescrVoid {
+    pub fn new() -> Self {
+        Self(DoneWithThisFrameDescrBase::new(Vec::new()))
+    }
+}
+
+impl Default for DoneWithThisFrameDescrVoid {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Descr for DoneWithThisFrameDescrVoid {
+    fn get_descr_index(&self) -> i32 {
+        self.0
+            .descr_index
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.0
+            .descr_index
+            .store(index, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for DoneWithThisFrameDescrVoid {
+    fn fail_index(&self) -> u32 {
+        u32::MAX
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.0.fail_arg_types
+    }
+    fn is_finish(&self) -> bool {
+        // `compile.py:624` `final_descr = True`.
+        true
+    }
+}
+
+/// `compile.py:631-638` `class DoneWithThisFrameDescrInt(_DoneWithThisFrameDescr)`.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct DoneWithThisFrameDescrInt(DoneWithThisFrameDescrBase);
+
+impl DoneWithThisFrameDescrInt {
+    pub fn new() -> Self {
+        Self(DoneWithThisFrameDescrBase::new(vec![Type::Int]))
+    }
+}
+
+impl Default for DoneWithThisFrameDescrInt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Descr for DoneWithThisFrameDescrInt {
+    fn get_descr_index(&self) -> i32 {
+        self.0
+            .descr_index
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.0
+            .descr_index
+            .store(index, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for DoneWithThisFrameDescrInt {
+    fn fail_index(&self) -> u32 {
+        u32::MAX
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.0.fail_arg_types
+    }
+    fn is_finish(&self) -> bool {
+        true
+    }
+}
+
+/// `compile.py:640-647` `class DoneWithThisFrameDescrRef(_DoneWithThisFrameDescr)`.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct DoneWithThisFrameDescrRef(DoneWithThisFrameDescrBase);
+
+impl DoneWithThisFrameDescrRef {
+    pub fn new() -> Self {
+        Self(DoneWithThisFrameDescrBase::new(vec![Type::Ref]))
+    }
+}
+
+impl Default for DoneWithThisFrameDescrRef {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Descr for DoneWithThisFrameDescrRef {
+    fn get_descr_index(&self) -> i32 {
+        self.0
+            .descr_index
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.0
+            .descr_index
+            .store(index, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for DoneWithThisFrameDescrRef {
+    fn fail_index(&self) -> u32 {
+        u32::MAX
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.0.fail_arg_types
+    }
+    fn is_finish(&self) -> bool {
+        true
+    }
+}
+
+/// `compile.py:649-656` `class DoneWithThisFrameDescrFloat(_DoneWithThisFrameDescr)`.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct DoneWithThisFrameDescrFloat(DoneWithThisFrameDescrBase);
+
+impl DoneWithThisFrameDescrFloat {
+    pub fn new() -> Self {
+        Self(DoneWithThisFrameDescrBase::new(vec![Type::Float]))
+    }
+}
+
+impl Default for DoneWithThisFrameDescrFloat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Descr for DoneWithThisFrameDescrFloat {
+    fn get_descr_index(&self) -> i32 {
+        self.0
+            .descr_index
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.0
+            .descr_index
+            .store(index, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for DoneWithThisFrameDescrFloat {
+    fn fail_index(&self) -> u32 {
+        u32::MAX
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.0.fail_arg_types
+    }
+    fn is_finish(&self) -> bool {
+        true
+    }
+}
+
+/// `compile.py:658-662` `class ExitFrameWithExceptionDescrRef(_DoneWithThisFrameDescr)`.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct ExitFrameWithExceptionDescrRef(DoneWithThisFrameDescrBase);
+
+impl ExitFrameWithExceptionDescrRef {
+    pub fn new() -> Self {
+        Self(DoneWithThisFrameDescrBase::new(vec![Type::Ref]))
+    }
+}
+
+impl Default for ExitFrameWithExceptionDescrRef {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Descr for ExitFrameWithExceptionDescrRef {
+    fn get_descr_index(&self) -> i32 {
+        self.0
+            .descr_index
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.0
+            .descr_index
+            .store(index, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for ExitFrameWithExceptionDescrRef {
+    fn fail_index(&self) -> u32 {
+        u32::MAX
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.0.fail_arg_types
+    }
+    fn is_finish(&self) -> bool {
+        // `compile.py:658` inherits `final_descr = True` from `_DoneWithThisFrameDescr`.
+        true
+    }
+}
+
+/// `compile.py:1092-1099` `class PropagateExceptionDescr(AbstractFailDescr)`.
+///
+/// `handle_fail` reads the exception out of the `deadframe` and raises
+/// `jitexc.ExitFrameWithExceptionRef`.  Stored on
+/// `JitDriverStaticData.propagate_exc_descr` and on
+/// `MetaInterpStaticData.propagate_exception_descr` so
+/// `compile_tmp_callback` can reference it when emitting the
+/// `GUARD_NO_EXCEPTION` descriptor.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct PropagateExceptionDescr {
+    /// `history.py:122` `index = -1` default.
+    descr_index: std::sync::atomic::AtomicI32,
+}
+
+impl PropagateExceptionDescr {
+    pub fn new() -> Self {
+        Self {
+            descr_index: std::sync::atomic::AtomicI32::new(-1),
+        }
+    }
+}
+
+impl Descr for PropagateExceptionDescr {
+    fn get_descr_index(&self) -> i32 {
+        self.descr_index.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.descr_index
+            .store(index, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for PropagateExceptionDescr {
+    fn fail_index(&self) -> u32 {
+        u32::MAX
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        // `compile.py:1141` `ResOperation(rop.GUARD_NO_EXCEPTION, [], descr=faildescr)`
+        // `operations[1].setfailargs([])` — no fail args.
+        &[]
+    }
+    fn is_finish(&self) -> bool {
+        // `compile.py:1092` `class PropagateExceptionDescr(AbstractFailDescr)` —
+        // inherits `final_descr = False`.  This is a guard descr, not a finish.
+        false
+    }
+}
+
+/// `compile.py:665-674` `def make_and_attach_done_descrs(targets)`.
+///
+/// Creates one instance of each `DoneWithThisFrameDescr*` +
+/// `ExitFrameWithExceptionDescrRef` and attaches them to each target
+/// under the attributes `done_with_this_frame_descr_{void,int,ref,float}`
+/// and `exit_frame_with_exception_descr_ref`.
+///
+/// pyre's `DescrContainer` trait (implemented by `MetaInterpStaticData`
+/// and the CPU stand-in) exposes the five `set_*` hooks that mirror
+/// the RPython `setattr(target, name, descr)` loop.
+#[allow(dead_code)]
+pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
+    let void: DescrRef = Arc::new(DoneWithThisFrameDescrVoid::new());
+    let int: DescrRef = Arc::new(DoneWithThisFrameDescrInt::new());
+    let ref_: DescrRef = Arc::new(DoneWithThisFrameDescrRef::new());
+    let float: DescrRef = Arc::new(DoneWithThisFrameDescrFloat::new());
+    let exc_ref: DescrRef = Arc::new(ExitFrameWithExceptionDescrRef::new());
+    for target in targets.iter_mut() {
+        target.set_done_with_this_frame_descr_void(void.clone());
+        target.set_done_with_this_frame_descr_int(int.clone());
+        target.set_done_with_this_frame_descr_ref(ref_.clone());
+        target.set_done_with_this_frame_descr_float(float.clone());
+        target.set_exit_frame_with_exception_descr_ref(exc_ref.clone());
+    }
+}
+
+/// Trait hooked by `make_and_attach_done_descrs`.
+///
+/// `compile.py:673-674` `setattr(target, name, descr)` — in RPython each
+/// target is a Python object with settable attributes; in Rust the
+/// five setters make the contract explicit.  `MetaInterpStaticData`
+/// implements this in a follow-up commit; for now the trait exists so
+/// `make_and_attach_done_descrs` has a concrete callee type.
+#[allow(dead_code)]
+pub trait DescrContainer {
+    fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef);
+    fn set_done_with_this_frame_descr_int(&mut self, descr: DescrRef);
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: DescrRef);
+    fn set_done_with_this_frame_descr_float(&mut self, descr: DescrRef);
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: DescrRef);
 }
 
 /// `rpython/jit/metainterp/compile.py:1101-1150` `compile_tmp_callback`.
