@@ -118,6 +118,8 @@ where
 /// points (`trace_jitcode`, test fixtures) take that path.
 pub struct JitCodeMachine<'mi, S, R> {
     frames: &'mi mut MIFrameStack,
+    last_exception_box: Option<OpRef>,
+    last_exception_value: i64,
     marker: PhantomData<(S, R)>,
 }
 
@@ -279,8 +281,71 @@ where
     ) -> Self {
         Self {
             frames,
+            last_exception_box: None,
+            last_exception_value: 0,
             marker: PhantomData,
         }
+    }
+
+    fn pop_exception_frame(&mut self, ctx: &mut TraceCtx) {
+        if let Some(frame) = self.frames.pop() {
+            if frame.inline_frame {
+                ctx.pop_inline_frame();
+            }
+        }
+    }
+
+    fn unwind_to_exception_handler(&mut self, ctx: &mut TraceCtx) -> TraceAction {
+        const SIZE_LIVE_OP: usize = majit_codewriter::liveness::OFFSET_SIZE + 1;
+
+        while !self.frames.is_empty() {
+            let mut handled = false;
+            {
+                let frame = self.frames.current_mut();
+                let code = &frame.jitcode.code;
+                let mut position = if frame.pc != 0 || frame.code_cursor == 0 {
+                    frame.pc
+                } else {
+                    frame.code_cursor
+                };
+
+                if position < code.len() {
+                    let mut opcode = code[position];
+                    if opcode == jitcode::BC_LIVE {
+                        position += SIZE_LIVE_OP;
+                        if position < code.len() {
+                            opcode = code[position];
+                        }
+                    }
+                    if opcode == jitcode::BC_CATCH_EXCEPTION && position + 2 < code.len() {
+                        let target =
+                            u16::from_le_bytes([code[position + 1], code[position + 2]]) as usize;
+                        frame.pc = target;
+                        frame.code_cursor = target;
+                        handled = true;
+                    } else if opcode == jitcode::BC_RVMPROF_CODE && position + 2 < code.len() {
+                        let leaving_idx = code[position + 1] as usize;
+                        let unique_id_idx = code[position + 2] as usize;
+                        let leaving = frame
+                            .int_values
+                            .get(leaving_idx)
+                            .and_then(|v| *v)
+                            .unwrap_or(0);
+                        let unique_id = frame
+                            .int_values
+                            .get(unique_id_idx)
+                            .and_then(|v| *v)
+                            .unwrap_or(0);
+                        crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                    }
+                }
+            }
+            if handled {
+                return TraceAction::Continue;
+            }
+            self.pop_exception_frame(ctx);
+        }
+        TraceAction::Abort
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
@@ -720,6 +785,131 @@ where
                     self.frames.current_mut().code_cursor = target;
                 }
             }
+            jitcode::BC_GOTO_IF_NOT_INT_LT
+            | jitcode::BC_GOTO_IF_NOT_INT_LE
+            | jitcode::BC_GOTO_IF_NOT_INT_EQ
+            | jitcode::BC_GOTO_IF_NOT_INT_NE
+            | jitcode::BC_GOTO_IF_NOT_INT_GT
+            | jitcode::BC_GOTO_IF_NOT_INT_GE => {
+                let (lhs_idx, rhs_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    (
+                        frame.next_u16() as usize,
+                        frame.next_u16() as usize,
+                        frame.next_u16() as usize,
+                    )
+                };
+                let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
+                let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
+                let opcode = match bytecode {
+                    jitcode::BC_GOTO_IF_NOT_INT_LT => OpCode::IntLt,
+                    jitcode::BC_GOTO_IF_NOT_INT_LE => OpCode::IntLe,
+                    jitcode::BC_GOTO_IF_NOT_INT_EQ => OpCode::IntEq,
+                    jitcode::BC_GOTO_IF_NOT_INT_NE => OpCode::IntNe,
+                    jitcode::BC_GOTO_IF_NOT_INT_GT => OpCode::IntGt,
+                    jitcode::BC_GOTO_IF_NOT_INT_GE => OpCode::IntGe,
+                    _ => unreachable!(),
+                };
+                let cond_value = eval_binop_i(opcode, lhs_value, rhs_value);
+                let cond = ctx.record_op(opcode, &[lhs, rhs]);
+                let guard = if cond_value == 0 {
+                    OpCode::GuardFalse
+                } else {
+                    OpCode::GuardTrue
+                };
+                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                if cond_value == 0 {
+                    self.frames.current_mut().code_cursor = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_FLOAT_LT
+            | jitcode::BC_GOTO_IF_NOT_FLOAT_LE
+            | jitcode::BC_GOTO_IF_NOT_FLOAT_EQ
+            | jitcode::BC_GOTO_IF_NOT_FLOAT_NE
+            | jitcode::BC_GOTO_IF_NOT_FLOAT_GT
+            | jitcode::BC_GOTO_IF_NOT_FLOAT_GE => {
+                let (lhs_idx, rhs_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    (
+                        frame.next_u16() as usize,
+                        frame.next_u16() as usize,
+                        frame.next_u16() as usize,
+                    )
+                };
+                let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
+                let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
+                let a = f64::from_bits(lhs_value as u64);
+                let b = f64::from_bits(rhs_value as u64);
+                let (opcode, taken) = match bytecode {
+                    jitcode::BC_GOTO_IF_NOT_FLOAT_LT => (OpCode::FloatLt, a < b),
+                    jitcode::BC_GOTO_IF_NOT_FLOAT_LE => (OpCode::FloatLe, a <= b),
+                    jitcode::BC_GOTO_IF_NOT_FLOAT_EQ => (OpCode::FloatEq, a == b),
+                    jitcode::BC_GOTO_IF_NOT_FLOAT_NE => (OpCode::FloatNe, a != b),
+                    jitcode::BC_GOTO_IF_NOT_FLOAT_GT => (OpCode::FloatGt, a > b),
+                    jitcode::BC_GOTO_IF_NOT_FLOAT_GE => (OpCode::FloatGe, a >= b),
+                    _ => unreachable!(),
+                };
+                let cond = ctx.record_op(opcode, &[lhs, rhs]);
+                let guard = if taken {
+                    OpCode::GuardTrue
+                } else {
+                    OpCode::GuardFalse
+                };
+                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                if !taken {
+                    self.frames.current_mut().code_cursor = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_PTR_EQ | jitcode::BC_GOTO_IF_NOT_PTR_NE => {
+                let (lhs_idx, rhs_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    (
+                        frame.next_u16() as usize,
+                        frame.next_u16() as usize,
+                        frame.next_u16() as usize,
+                    )
+                };
+                let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
+                let (rhs, rhs_value) = self.read_ref_reg(rhs_idx);
+                let (opcode, taken) = match bytecode {
+                    jitcode::BC_GOTO_IF_NOT_PTR_EQ => (OpCode::PtrEq, lhs_value == rhs_value),
+                    jitcode::BC_GOTO_IF_NOT_PTR_NE => (OpCode::PtrNe, lhs_value != rhs_value),
+                    _ => unreachable!(),
+                };
+                let cond = ctx.record_op(opcode, &[lhs, rhs]);
+                let guard = if taken {
+                    OpCode::GuardTrue
+                } else {
+                    OpCode::GuardFalse
+                };
+                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                if !taken {
+                    self.frames.current_mut().code_cursor = target;
+                }
+            }
+            jitcode::BC_CATCH_EXCEPTION => {
+                let _target = self.frames.current_mut().next_u16();
+            }
+            jitcode::BC_LAST_EXC_VALUE => {
+                let dst = self.frames.current_mut().next_u16() as usize;
+                let opref = self
+                    .last_exception_box
+                    .expect("last_exc_value without active exception");
+                let value = self.last_exception_value;
+                self.set_ref_reg(dst, Some(opref), Some(value));
+            }
+            jitcode::BC_RVMPROF_CODE => {
+                let (leaving_idx, unique_id_idx) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u8() as usize, frame.next_u8() as usize)
+                };
+                let leaving = self.frames.current_mut().int_values[leaving_idx].unwrap_or(0);
+                let unique_id = self.frames.current_mut().int_values[unique_id_idx].unwrap_or(0);
+                crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+            }
             jitcode::BC_JIT_MERGE_POINT => {
                 // blackhole.py:1066 bhimpl_jit_merge_point parity.
                 // Portal merge point: close the loop if at the traced header.
@@ -768,6 +958,7 @@ where
                     let return_i = decode_return_slot(frame);
                     let return_r = decode_return_slot(frame);
                     let return_f = decode_return_slot(frame);
+                    frame.pc = frame.code_cursor;
                     (sub_idx, arg_triples, return_i, return_r, return_f)
                 };
                 let pc = self.frames.current_mut().pc;
@@ -1400,6 +1591,24 @@ where
                 let (opref, concrete) = self.read_float_reg(src);
                 let promoted = ctx.promote_float(opref, concrete, 0);
                 self.set_float_reg(src, Some(promoted), Some(concrete));
+            }
+            jitcode::BC_RAISE => {
+                let src = self.frames.current_mut().next_u16() as usize;
+                let (opref, concrete) = self.read_ref_reg(src);
+                if concrete == 0 {
+                    return TraceAction::Abort;
+                }
+                self.last_exception_box = Some(opref);
+                self.last_exception_value = concrete;
+                self.pop_exception_frame(ctx);
+                return self.unwind_to_exception_handler(ctx);
+            }
+            jitcode::BC_RERAISE => {
+                if self.last_exception_value == 0 {
+                    return TraceAction::Abort;
+                }
+                self.pop_exception_frame(ctx);
+                return self.unwind_to_exception_handler(ctx);
             }
             jitcode::BC_ABORT => return TraceAction::Abort,
             jitcode::BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
@@ -2310,6 +2519,67 @@ mod tests {
         assert_eq!(
             recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
             OpCode::GuardNotForced
+        );
+    }
+
+    #[test]
+    fn goto_if_not_int_lt_records_compare_and_guard_false() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.load_const_i_value(0, 5);
+        builder.load_const_i_value(1, 3);
+        builder.goto_if_not_int_lt(0, 1, target);
+        builder.mark_label(target);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        assert!(
+            recorder.ops().iter().any(|op| op.opcode == OpCode::IntLt),
+            "goto_if_not_int_lt must record the fused comparison",
+        );
+        assert!(
+            recorder
+                .ops()
+                .iter()
+                .any(|op| op.opcode == OpCode::GuardFalse),
+            "false branch must guard on the failed comparison",
+        );
+    }
+
+    #[test]
+    fn raise_catch_inline_call_routes_to_handler_and_preserves_last_exc_value() {
+        let mut callee = JitCodeBuilder::new();
+        callee.load_const_r_value(0, 0xfeed);
+        callee.emit_raise(0);
+        let callee = callee.finish();
+
+        let mut caller = JitCodeBuilder::new();
+        let handler = caller.new_label();
+        let sub_idx = caller.add_sub_jitcode(callee);
+        caller.inline_call(sub_idx);
+        caller.catch_exception(handler);
+        caller.mark_label(handler);
+        caller.last_exc_value(0);
+        caller.ref_guard_value(0);
+        let jitcode = caller.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        assert!(
+            recorder
+                .ops()
+                .iter()
+                .any(|op| op.opcode == OpCode::GuardValue),
+            "handler must see last_exc_value and be able to promote it",
         );
     }
 }

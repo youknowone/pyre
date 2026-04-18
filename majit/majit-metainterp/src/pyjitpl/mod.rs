@@ -8118,27 +8118,62 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// pyjitpl.py:2515-2554 `MetaInterp.finishframe_exception()`.
+    /// pyjitpl.py:2506-2529 `MetaInterp.finishframe_exception()`.
     ///
-    /// **Stub** — RPython's body walks the framestack looking for an
-    /// exception handler bytecode (`opimpl_catch_exception`) and pops
-    /// frames that do not match.  Pyre's existing exception handling
-    /// lives in pyre-jit-trace's tracer and pyre's `MetaInterp` does
-    /// not yet replicate the catch-handler walk.  The named entry
-    /// stays so `handle_possible_exception` can call through; for now
-    /// it pops every frame and signals `ChangeFrame` if any caller
-    /// remains, matching the upstream shape.
+    /// Walk the framestack looking for an immediately-following
+    /// `catch_exception` bytecode, mirroring the upstream interpreter.
+    /// Frames without a handler are popped. `rvmprof_code` is decoded
+    /// in-place before the pop, matching the RPython side effect.
     pub fn finishframe_exception(&mut self) -> Result<(), ChangeFrame> {
-        // pyjitpl.py:2535: self.popframe()
+        const SIZE_LIVE_OP: usize = majit_codewriter::liveness::OFFSET_SIZE + 1;
+
         while !self.framestack.is_empty() {
-            self.popframe(true);
-            if !self.framestack.is_empty() {
-                // Caller frame present — RPython would inspect for a
-                // catch_exception handler.  Until that lands, signal
-                // ChangeFrame so the dispatch loop reattempts at the
-                // caller pc.
+            let mut handled = false;
+            {
+                let frame = self.framestack.current_mut();
+                let code = &frame.jitcode.code;
+                let mut position = if frame.pc != 0 || frame.code_cursor == 0 {
+                    frame.pc
+                } else {
+                    frame.code_cursor
+                };
+
+                if position < code.len() {
+                    let mut opcode = code[position];
+                    if opcode == crate::jitcode::BC_LIVE {
+                        position += SIZE_LIVE_OP;
+                        if position < code.len() {
+                            opcode = code[position];
+                        }
+                    }
+                    if opcode == crate::jitcode::BC_CATCH_EXCEPTION && position + 2 < code.len() {
+                        let target =
+                            u16::from_le_bytes([code[position + 1], code[position + 2]]) as usize;
+                        frame.pc = target;
+                        frame.code_cursor = target;
+                        handled = true;
+                    } else if opcode == crate::jitcode::BC_RVMPROF_CODE && position + 2 < code.len()
+                    {
+                        let leaving_idx = code[position + 1] as usize;
+                        let unique_id_idx = code[position + 2] as usize;
+                        let leaving = frame
+                            .int_values
+                            .get(leaving_idx)
+                            .and_then(|v| *v)
+                            .unwrap_or(0);
+                        let unique_id = frame
+                            .int_values
+                            .get(unique_id_idx)
+                            .and_then(|v| *v)
+                            .unwrap_or(0);
+                        crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                    }
+                }
+            }
+            if handled {
                 return Err(ChangeFrame);
             }
+            self.popframe(true);
         }
         Ok(())
     }
@@ -11642,6 +11677,58 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:3392: class_of_last_exc_is_const = True after.
         assert!(meta.class_of_last_exc_is_const);
         assert!(meta.last_exc_box.is_some());
+    }
+
+    #[test]
+    fn finishframe_exception_jumps_to_catch_handler() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        jitcode.code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 3, 0];
+        let jitcode = std::sync::Arc::new(jitcode);
+
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(jitcode, 0));
+        let result = meta.finishframe_exception();
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(meta.framestack.len(), 1, "handler frame must stay on stack");
+        assert_eq!(meta.framestack.current_mut().pc, 3);
+        assert_eq!(meta.framestack.current_mut().code_cursor, 3);
+    }
+
+    #[test]
+    fn finishframe_exception_skips_live_prefix_before_catch_handler() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        jitcode.code = vec![
+            crate::jitcode::BC_LIVE,
+            0,
+            0,
+            crate::jitcode::BC_CATCH_EXCEPTION,
+            6,
+            0,
+        ];
+        let jitcode = std::sync::Arc::new(jitcode);
+
+        let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
+        frame.pc = 0;
+        meta.framestack.push(frame);
+
+        let result = meta.finishframe_exception();
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(meta.framestack.current_mut().pc, 6);
+        assert_eq!(meta.framestack.current_mut().code_cursor, 6);
+    }
+
+    #[test]
+    fn finishframe_exception_pops_frames_without_handler() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = std::sync::Arc::new(crate::jitcode::JitCodeBuilder::new().finish());
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(jitcode, 0));
+
+        let result = meta.finishframe_exception();
+        assert!(matches!(result, Ok(())));
+        assert!(meta.framestack.is_empty());
     }
 
     #[test]
