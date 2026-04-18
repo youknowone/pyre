@@ -1693,9 +1693,18 @@ impl FlowContext {
             ConstantData::Code { code } => {
                 Ok(ConstValue::Code(Box::new(HostCode::from_code(code))))
             }
-            other => Err(FlowContextError::Flowing(FlowingError::new(format!(
-                "unsupported host constant in flowspace: {other:?}"
-            )))),
+            // upstream `Constant.value` 는 임의의 Python object 를
+            // 담을 수 있다. Rust 포트에서 bool / int / float / None /
+            // str / tuple / code 외의 variant (bytes, frozenset,
+            // complex 등) 는 현재 구조적 변환 대상이 아니지만 값을
+            // 유지해야 하므로 `HostObject::new_opaque` 로 싸서
+            // 살린다. flowspace 의 구조 분석 경로는 opaque object 를
+            // 그대로 Constant 에 보존하고, annotator 가 필요할 때
+            // 다시 들여다볼 수 있다.
+            other => {
+                let qualname = format!("opaque-{other:?}");
+                Ok(ConstValue::HostObject(HostObject::new_opaque(qualname)))
+            }
         }
     }
 

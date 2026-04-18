@@ -7,7 +7,7 @@
 //! `Signature.__repr__` is not tested (RPython uses `%r`-style string
 //! formatting; the Rust `Debug` impl differs).
 
-use majit_flowspace::argument::{CallSpec, Signature};
+use majit_flowspace::argument::{CallSpec, Signature, SignatureItem};
 use majit_flowspace::model::{ConstValue, Constant, Hlvalue};
 use std::collections::HashMap;
 
@@ -161,4 +161,38 @@ fn test_flatten_callspec() {
     assert_eq!(shape.shape_cnt, 5);
     assert_eq!(shape.shape_keys, vec!["d".to_string(), "e".into()]);
     assert_eq!(data, vec![hi(1), hi(2), hi(3), hi(4), hi(5), hi(7), hi(5)]);
+}
+
+#[test]
+fn signature_tuple_protocol_matches_upstream() {
+    // upstream `rpython/flowspace/argument.py:49` — `Signature.__len__`
+    // 은 항상 3, `Signature.__getitem__` 은 argnames / varargname /
+    // kwargname 순.
+    let sig = Signature::new(
+        vec!["a".into(), "b".into()],
+        Some("va".into()),
+        Some("kw".into()),
+    );
+    assert_eq!(sig.len_tuple(), 3);
+    match sig.getitem(0) {
+        SignatureItem::Argnames(names) => {
+            assert_eq!(names, &["a".to_string(), "b".into()]);
+        }
+        other => panic!("sig[0] unexpected: {other:?}"),
+    }
+    match sig.getitem(1) {
+        SignatureItem::Varargname(Some("va")) => {}
+        other => panic!("sig[1] unexpected: {other:?}"),
+    }
+    match sig.getitem(2) {
+        SignatureItem::Kwargname(Some("kw")) => {}
+        other => panic!("sig[2] unexpected: {other:?}"),
+    }
+}
+
+#[test]
+#[should_panic(expected = "Signature index out of range")]
+fn signature_getitem_three_panics() {
+    let sig = Signature::new(Vec::new(), None, None);
+    let _ = sig.getitem(3);
 }

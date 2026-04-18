@@ -98,6 +98,13 @@ enum HostObjectKind {
         class_obj: HostObject,
         args: Vec<ConstValue>,
     },
+    /// `Constant.value` 에 담긴 임의의 host object — flowspace 가 구조
+    /// 를 모르지만 보존해야 하는 값(예: 포팅되지 않은 `ConstantData`
+    /// variant, pyre-level opaque object). `qualname` 에 debug-only
+    /// 식별자를 기록하고, identity 는 `Arc::ptr_eq` 로 유지한다. 이
+    /// 키는 upstream 의 `Constant.value = <anonymous object>` 경로에
+    /// 대응한다.
+    Opaque,
 }
 
 impl PartialEq for HostObject {
@@ -246,6 +253,21 @@ impl HostObject {
                 kind: HostObjectKind::Instance { class_obj, args },
             }),
         }
+    }
+
+    /// `Constant.value` 에 담긴 임의 host object 를 carry. `qualname`
+    /// 은 debug 에 사용; identity 는 항상 새로운 Arc.
+    pub fn new_opaque(qualname: impl Into<String>) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::Opaque,
+            }),
+        }
+    }
+
+    pub fn is_opaque(&self) -> bool {
+        matches!(self.inner.kind, HostObjectKind::Opaque)
     }
 }
 
