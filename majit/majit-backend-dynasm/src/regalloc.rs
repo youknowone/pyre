@@ -2094,12 +2094,13 @@ impl RegAlloc {
     }
 
     /// Extract the integer value of a constant OpRef (like RPython's getint()).
+    ///
+    /// The constants map is keyed by `OpRef.0` (raw value, WITH the
+    /// CONST_BIT tag preserved) — see `convert_to_imm` at regalloc.rs
+    /// line 1475 and the fail-args handling at line 2079. This helper
+    /// must use the same key convention.
     fn const_value(&self, v: OpRef) -> i64 {
-        if v.is_constant() {
-            self.constants.get(&v.const_index()).copied().unwrap_or(0)
-        } else {
-            self.constants.get(&v.0).copied().unwrap_or(0)
-        }
+        self.constants.get(&v.0).copied().unwrap_or(0)
     }
 
     // ── walk_operations + consider_* ──
@@ -2581,7 +2582,7 @@ impl RegAlloc {
     fn consider_int_add(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let y = op.args[1];
         if y.is_constant() {
-            let val = self.constants.get(&y.const_index()).copied().unwrap_or(0);
+            let val = self.const_value(y);
             if fits_in_32bits(val) {
                 return self._consider_lea(op, i, output);
             }
@@ -2593,7 +2594,7 @@ impl RegAlloc {
     fn consider_int_sub(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let y = op.args[1];
         if y.is_constant() {
-            let val = self.constants.get(&y.const_index()).copied().unwrap_or(0);
+            let val = self.const_value(y);
             if fits_in_32bits(-val) {
                 return self._consider_lea(op, i, output);
             }
