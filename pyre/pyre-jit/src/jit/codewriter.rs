@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use majit_ir::OpCode;
 use majit_metainterp::jitcode::{JitCode, JitCodeBuilder, LivenessInfo};
+use pyre_jit_trace::{PyJitCode, PyJitCodeMetadata};
 
 use super::assembler::Assembler;
 use super::ssa_emitter::SSAReprEmitter;
@@ -45,42 +46,9 @@ fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
 }
 
-/// Pyre-only metadata attached to a Python CodeObject's compiled JitCode.
-///
-/// RPython does not need these fields because its bytecode PCs are already
-/// JitCode PCs. Pyre translates CPython bytecode to JitCode lazily, so the
-/// translation maps live here instead of polluting the canonical JitCode.
-pub struct PyJitCodeMetadata {
-    /// py_pc → jitcode byte offset. Named for RPython's `frame.pc →
-    /// jitcode position` flow; `set_majit_jitcode` clones this into
-    /// `state::JitCode.py_to_jit_pc` so the `pyjitpl` side can look up
-    /// without touching the pyre-jit codewriter crate.
-    pub pc_map: Vec<usize>,
-    /// Value-stack depth at each Python PC, in slots above stack_base.
-    pub depth_at_py_pc: Vec<u16>,
-    /// Register allocated for the portal's frame red argument.
-    pub portal_frame_reg: u16,
-    /// Register allocated for the portal's execution-context red argument.
-    pub portal_ec_reg: u16,
-    /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
-    pub stack_base: usize,
-    /// Pyre-local decoded liveness view used by `resume_in_blackhole`'s
-    /// per-section register fill. The canonical packed bytes live on
-    /// `MetaInterpStaticData.liveness_info` and are read via inline
-    /// `-live-` offsets embedded in `JitCode.code`.
-    pub liveness: Vec<LivenessInfo>,
-}
-
-/// Compiled JitCode plus pyre-only metadata.
-pub struct PyJitCode {
-    pub jitcode: std::sync::Arc<JitCode>,
-    pub metadata: PyJitCodeMetadata,
-    /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
-    /// Precomputed at compile time to avoid repeated bytecode scanning.
-    pub has_abort: bool,
-    /// Python PC of the jit_merge_point opcode (trace entry header).
-    pub merge_point_pc: Option<usize>,
-}
+// `PyJitCode` and `PyJitCodeMetadata` live in `pyre_jit_trace::pyjitcode`
+// so both the codewriter (here) and the trace/blackhole runtime can hold
+// the same `Arc<PyJitCode>` instances.
 
 #[derive(Clone, Copy)]
 struct ExceptionCatchSite {
@@ -422,43 +390,6 @@ fn liveness_regs_to_u8_sorted(regs: &[u16]) -> Option<Vec<u8>> {
     bytes.sort_unstable();
     bytes.dedup();
     Some(bytes)
-}
-
-impl PyJitCode {
-    /// Check if this jitcode has BC_ABORT opcodes.
-    pub fn has_abort_opcode(&self) -> bool {
-        self.has_abort
-    }
-
-    /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
-    /// (call.py:168 `jitcode = JitCode(graph.name, fnaddr, calldescr, ...)`).
-    ///
-    /// In RPython the `JitCode` constructor returns a fresh object whose
-    /// `code` / `descrs` / `liveness` arrays are all empty until
-    /// `assembler.assemble(...)` populates them later in
-    /// `make_jitcodes`'s drain loop (codewriter.py:80).  The skeleton
-    /// gives the dict an entry with a stable identity so re-entrant
-    /// `get_jitcode` calls (or pyre's `merge_point_pc` refinement
-    /// shortcut) can find an existing key without recompiling.
-    ///
-    /// Until the drain replaces the slot, the only field with meaningful
-    /// content is `merge_point_pc` (the refinement hint passed in by
-    /// `get_jitcode`).
-    pub fn skeleton(merge_point_pc: Option<usize>) -> Self {
-        Self {
-            jitcode: std::sync::Arc::new(JitCode::default()),
-            metadata: PyJitCodeMetadata {
-                pc_map: Vec::new(),
-                depth_at_py_pc: Vec::new(),
-                portal_frame_reg: 0,
-                portal_ec_reg: 0,
-                stack_base: 0,
-                liveness: Vec::new(),
-            },
-            has_abort: false,
-            merge_point_pc,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

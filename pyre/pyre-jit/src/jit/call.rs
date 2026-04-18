@@ -33,8 +33,9 @@ use std::collections::HashMap;
 
 use majit_codewriter::jitcode::BhCallDescr;
 use pyre_interpreter::CodeObject;
+use pyre_jit_trace::PyJitCode;
 
-use super::codewriter::{CodeWriter, PyJitCode};
+use super::codewriter::CodeWriter;
 use super::cpu::Cpu;
 
 /// RPython: `rpython/jit/codewriter/effectinfo.py` `class CallInfoCollection`.
