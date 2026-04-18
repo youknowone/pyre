@@ -1239,15 +1239,15 @@ impl CodeWriter {
                 }
 
                 // jtransform.py:1898 do_fixed_list_setitem vable case:
-                // Shadow write: keep move_r AND write to vable array.
-                // Pure vable write (RPython parity) blocked on the same
-                // virtualizable_boxes propagation gap as LoadFast above.
+                // Portal frames treat `locals_cells_stack_w` as the sole
+                // storage for locals — setarrayitem_vable_r writes from
+                // the value-stack slot directly, so no register-per-local
+                // shadow exists. Non-portal frames keep move_r (no vable
+                // in scope).
                 Instruction::StoreFast { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, reg, stack_base + current_depth);
-                    // Shadow write to vable array for consume_vable_info.
                     if is_portal {
                         emit_load_const_i!(
                             ssarepr,
@@ -1255,7 +1255,15 @@ impl CodeWriter {
                             int_tmp0,
                             local_to_vable_slot(reg as usize) as i64
                         );
-                        emit_vable_setarrayitem_ref!(ssarepr, assembler, 0_u16, int_tmp0, reg);
+                        emit_vable_setarrayitem_ref!(
+                            ssarepr,
+                            assembler,
+                            0_u16,
+                            int_tmp0,
+                            stack_base + current_depth
+                        );
+                    } else {
+                        emit_move_r!(ssarepr, assembler, reg, stack_base + current_depth);
                     }
                 }
 
