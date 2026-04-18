@@ -245,9 +245,16 @@ impl MIFrame {
                 let mut off = offset + 3;
                 use majit_codewriter::liveness::LivenessIterator;
                 // Note: `register_idx < nlocals` decode stays valid
-                // because the post-pass register allocator constrains
-                // locals to identity colors (see `color_kind` cross-edge
-                // loop in `pyre/pyre-jit/src/jit/regalloc.rs`).
+                // because the post-pass register allocator (a) keeps
+                // each local's color equal to its slot index via
+                // `enforce_input_args` (RPython parity:
+                // `flatten.py:88-100`), and (b) shifts every
+                // non-inputarg register's color above the inputarg
+                // range (PRE-EXISTING-ADAPTATION in
+                // `pyre/pyre-jit/src/jit/regalloc.rs::enforce_input_args`).
+                // Together those guarantee an INJECTIVE
+                // `color < nlocals ⇔ register holds local of that
+                // index` correspondence at trace-decode time.
                 let mut live_local_idxs: Vec<usize> = Vec::new();
                 for length in [length_i, length_r] {
                     if length == 0 {

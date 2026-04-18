@@ -1861,8 +1861,7 @@ impl CodeWriter {
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
         // The pyre-side post-pass scans the populated SSARepr to build
         // per-kind dependency graphs, runs chordal coloring on each,
-        // and returns a rename map + the `RegisterMapping::PerPc`
-        // table that blackhole resume reads.
+        // and returns the rename map applied to the SSARepr in place.
         let inputs = super::regalloc::ExternalInputs {
             portal_frame_reg,
             portal_ec_reg,
@@ -1872,32 +1871,34 @@ impl CodeWriter {
             // does not pre-load them into Ref registers.
             portal_inputs: portal_frame_reg != u16::MAX,
         };
-        let regalloc_result = super::regalloc::allocate_registers(
-            &assembler.ssarepr,
-            code.varnames.len(),
-            &depth_at_pc,
-            inputs,
-        );
+        let alloc_result =
+            super::regalloc::allocate_registers(&assembler.ssarepr, code.varnames.len(), inputs);
         let mut assembler = assembler;
-        super::regalloc::apply_rename(&mut assembler.ssarepr, &regalloc_result.rename);
+        super::regalloc::apply_rename(&mut assembler.ssarepr, &alloc_result.rename);
 
-        // The portal red-arg register indices stored on PyJitCodeMetadata
-        // are consumed by BlackholeInterpreter::fill_portal_registers
-        // (blackhole.rs:1133-1140). They must follow the same rename
-        // table so the values land in the renamed slots that the
-        // assembled JitCode reads from.
-        let portal_frame_reg = regalloc_result
-            .rename
-            .get(&(super::flatten::Kind::Ref, portal_frame_reg))
-            .copied()
-            .unwrap_or(portal_frame_reg);
-        let portal_ec_reg = regalloc_result
-            .rename
-            .get(&(super::flatten::Kind::Ref, portal_ec_reg))
-            .copied()
-            .unwrap_or(portal_ec_reg);
+        // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
+        // (or 0 if coloring is empty). Pass through to the Assembler
+        // step so `JitCode.num_regs_*` reflect the post-regalloc
+        // ceiling rather than the pre-regalloc PyFrame-slot range.
+        let num_regs = super::assembler::NumRegs {
+            int: alloc_result
+                .num_regs
+                .get(&super::flatten::Kind::Int)
+                .copied()
+                .unwrap_or(0),
+            ref_: alloc_result
+                .num_regs
+                .get(&super::flatten::Kind::Ref)
+                .copied()
+                .unwrap_or(0),
+            float: alloc_result
+                .num_regs
+                .get(&super::flatten::Kind::Float)
+                .copied()
+                .unwrap_or(0),
+        };
 
-        // codewriter.py:62-72 step 4 — assemble the SSARepr into an
+        // codewriter.py:67-72 step 4 — assemble the SSARepr into an
         // owned JitCode, translate pc_map insn indices to byte offsets,
         // and stamp the per-graph metadata. See `Self::finalize_jitcode`.
         self.finalize_jitcode(
@@ -1910,7 +1911,7 @@ impl CodeWriter {
             portal_ec_reg,
             has_abort,
             merge_point_pc,
-            regalloc_result.mapping,
+            num_regs,
         )
     }
 
@@ -1945,7 +1946,7 @@ impl CodeWriter {
         portal_ec_reg: u16,
         has_abort: bool,
         merge_point_pc: Option<usize>,
-        register_mapping: pyre_jit_trace::RegisterMapping,
+        num_regs: super::assembler::NumRegs,
     ) -> PyJitCode {
         // pc_map[py_pc] currently holds SSARepr insn indices (returned by
         // SSAReprEmitter::current_pos()). Translate them to JitCode byte
@@ -1959,7 +1960,7 @@ impl CodeWriter {
         // across every jitcode compiled on this thread.
         let (mut jitcode, pc_map_bytes) = {
             let mut asm = self.assembler.borrow_mut();
-            assembler.finish_with_positions(&mut *asm, &pc_map)
+            assembler.finish_with_positions(&mut *asm, &pc_map, num_regs)
         };
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` is assigned by
@@ -1994,11 +1995,6 @@ impl CodeWriter {
             portal_ec_reg,
             stack_base: frame_stack_base,
             liveness,
-            // codewriter.py:71 `jitcode.regallocs = regallocs`. The
-            // mapping is produced by `super::regalloc::allocate_registers`
-            // — currently a stub that returns the pinned layout, replaced
-            // by chordal coloring in Step 3+.
-            register_mapping,
         };
 
         PyJitCode {

@@ -468,168 +468,6 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     crate::eval::portal_runner(frame) as i64
 }
 
-/// RPython: blackhole.py resume_in_blackhole()
-///
-/// Compiles the frame's CodeObject to JitCode (via CodeWriter), creates
-/// a BlackholeInterpreter, loads frame state, and runs it.
-/// The blackhole has NO JIT entry points — structural isolation.
-///
-/// Returns `None` when the blackhole cannot run (e.g. the frame's Python
-/// PC is outside the jitcode's pc_map — a bug-tier condition in RPython's
-/// model, where the resume data is supposed to be consistent with the
-/// jitcode). Callers must fall back to the plain interpreter on `None`
-/// rather than treating it as a successful null result; RPython's
-/// `assembler_call_helper` asserts `handle_fail` never returns without
-/// raising, and a silent null would corrupt computations that depend on
-/// the call's return value (see `jit_force_recursive_call_raw_1`).
-fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
-    // blackhole.py:1067 bhimpl_jit_merge_point: raises
-    // ContinueRunningNormally. bh_call_fn_impl dispatches user calls
-    // via call_user_function_plain (no JIT re-entry), matching
-    // RPython's cpu.bh_call_r plain stub semantics.
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    let py_pc = frame.next_instr();
-
-    // RPython: blackhole_from_resumedata() → setposition + consume_one_section.
-    // The JitCode was populated earlier via make_jitcodes()/get_jitcode()
-    // during trace setup; here we only look up the compiled entry.
-    let writer = crate::jit::codewriter::CodeWriter::instance();
-    let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
-        Some(pjc) => pjc,
-        None => {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][bh-fail] blackhole_from_jit_frame: no JitCode for code {:p}",
-                    code as *const _,
-                );
-            }
-            return None;
-        }
-    };
-
-    // Map Python PC → JitCode PC.
-    // resume.py:928/1338 parity: rd_numb pc is consumed as-is. RPython does
-    // not silently restart from the function entry on out-of-range PC; an
-    // out-of-range PC means the resume data is corrupt. Match the other two
-    // pc_map call sites (blackhole_resume_via_rd_numb at line ~933,
-    // direct_run_blackhole_at at line ~1269) which return Failed/false on
-    // miss instead of silently restarting from 0 — a silent restart would
-    // re-execute the function from scratch and produce incorrect results.
-    let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
-        pyjitcode.metadata.pc_map[py_pc]
-    } else {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bh-fail] blackhole_from_jit_frame: py_pc={} out of pc_map (len={})",
-                py_pc,
-                pyjitcode.metadata.pc_map.len(),
-            );
-        }
-        return None;
-    };
-
-    // RPython: blackholeinterp = builder.acquire_interp()
-    // Use thread-local builder pool to avoid per-call allocation.
-    thread_local! {
-        static BH_BUILDER: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
-            std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
-    }
-    let builder = BH_BUILDER.with(|cell| unsafe { &mut *cell.get() });
-    let mut bh = builder.acquire_interp();
-    // RPython: blackholeinterp.setposition(jitcode, pc)
-    bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
-
-    // Direct PyFrame loading (not resume data — no enumerate_vars dispatch).
-    // frame.locals_cells_stack_w is always PyObjectRef → write_a_ref only.
-    // RPython's resume path uses enumerate_vars typed callbacks, but this
-    // pyre-specific path loads from the concrete frame directly.
-    //
-    // Register destinations come from `register_mapping`; the legacy
-    // pinned layout maps local `i` → register `i` and stack depth `d`
-    // → register `nlocals + d`. After regalloc lands the same accessor
-    // serves a `PerPc` table without changing this code.
-    let mapping = &pyjitcode.metadata.register_mapping;
-    let nlocals = code.varnames.len();
-    for local_idx in 0..nlocals {
-        let reg_idx = mapping.register_for_local(py_pc, local_idx) as usize;
-        if reg_idx == u16::MAX as usize {
-            continue;
-        }
-        if local_idx < frame.locals_w().len() && reg_idx < bh.registers_r.len() {
-            bh.setarg_r(reg_idx, frame.locals_w()[local_idx] as i64);
-        }
-    }
-
-    // Load value stack into blackhole register bank.
-    // locals_cells_stack_w layout: [locals..., cells..., stack...].
-    let ncells = pyre_interpreter::pyframe::ncells(code);
-    let frame_stack_base = nlocals + ncells;
-    let vsd = frame.valuestackdepth;
-    let stack_only_depth = vsd.saturating_sub(frame_stack_base);
-    for depth in 0..stack_only_depth {
-        let reg_idx = mapping.register_for_stack(py_pc, depth) as usize;
-        if reg_idx == u16::MAX as usize {
-            continue;
-        }
-        let frame_idx = frame_stack_base + depth;
-        if frame_idx < frame.locals_w().len() && reg_idx < bh.registers_r.len() {
-            bh.setarg_r(reg_idx, frame.locals_w()[frame_idx] as i64);
-        }
-    }
-
-    // blackhole.py bhimpl_getfield_vable_*: set virtualizable pointer.
-    // RPython: the virtualizable ptr is the frame itself.
-    bh.virtualizable_ptr = frame as *mut PyFrame as i64;
-    bh.virtualizable_info = crate::eval::get_virtualizable_info();
-    // Portal red-arg registers must be filled AFTER virtualizable_ptr.
-    // interp_jit.py:64 reds=['frame','ec']: ec = frame.execution_context.
-    let ec = frame.execution_context as i64;
-    bh.fill_portal_registers(
-        pyjitcode.metadata.portal_frame_reg,
-        pyjitcode.metadata.portal_ec_reg,
-        ec,
-    );
-
-    if majit_metainterp::majit_log_enabled() {
-        eprintln!(
-            "[jit][blackhole] setup pc={} nlocals={} regs_r_len={} vable_ptr={:#x}",
-            py_pc,
-            nlocals,
-            bh.registers_r.len(),
-            bh.virtualizable_ptr as u64,
-        );
-    }
-
-    // blackhole.py:1752 _run_forever(blackholeinterp, current_exc) parity:
-    // run_forever_with_portal loops resume_mainloop with portal_runner
-    // callback for ContinueRunningNormally dispatch (blackhole.py:1075
-    // bhimpl_recursive_call → portal_runner → JIT re-entry).
-    let portal_runner = |exc: &majit_metainterp::jitexc::JitException| -> Result<
-        (majit_metainterp::blackhole::BhReturnType, i64),
-        majit_metainterp::jitexc::JitException,
-    > { crate::eval::pyre_portal_runner(exc) };
-    let jit_exc =
-        majit_metainterp::blackhole::run_forever_with_portal(builder, bh, 0, Some(&portal_runner));
-
-    // warmspot.py:983-997 handle_jitexception dispatch:
-    use majit_metainterp::jitexc::JitException as MJitExc;
-    match jit_exc {
-        MJitExc::DoneWithThisFrameRef(gcref) => Some(gcref.0 as PyObjectRef),
-        MJitExc::DoneWithThisFrameInt(i) => {
-            Some(pyre_object::intobject::w_int_new(i) as PyObjectRef)
-        }
-        MJitExc::DoneWithThisFrameFloat(f) => {
-            Some(pyre_object::floatobject::w_float_new(f) as PyObjectRef)
-        }
-        MJitExc::DoneWithThisFrameVoid => Some(std::ptr::null_mut()),
-        MJitExc::ExitFrameWithExceptionRef(_) | MJitExc::ContinueRunningNormally { .. } => {
-            // Exception or CRN at bottommost level — caller dispatches
-            // to portal_runner (JIT-aware path, not plain interpreter).
-            None
-        }
-    }
-}
-
 /// jitexc.py JitException hierarchy — structural parity with RPython.
 ///
 /// `_run_forever` must exit via exactly one of these variants.
@@ -1351,18 +1189,17 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
-    // blackhole.py:1101-1132 bhimpl_recursive_call_r: calls
-    // cpu.bh_call_r(portal_runner_adr, ...) which re-enters JIT.
-    // warmspot.py:1021-1028: if blackhole can't run, portal_runner
-    // is the fallback (JIT-aware, not plain interpreter).
+    // blackhole.py:1101-1116 bhimpl_recursive_call_r: a recursive call
+    // from compiled assembler is `cpu.bh_call_r(portal_runner_adr, ...)`
+    // — i.e. it always re-enters through the portal runner. The portal
+    // runner (warmspot.py:944-953) calls `maybe_compile_and_run` and
+    // then `portal_ptr(*args)`, so the JIT-vs-interpreter decision is
+    // made there. There is no "try blackhole first, then fallback to
+    // portal_runner" path in RPython.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        let bh_result = match blackhole_from_jit_frame(frame) {
-            Some(r) => r,
-            None => crate::eval::portal_runner(frame),
-        };
         // warmspot.py:449 result_type=REF: always boxed Ref
-        bh_result as i64
+        crate::eval::portal_runner(frame) as i64
     };
     jit_drop_callee_frame(frame_ptr);
     result

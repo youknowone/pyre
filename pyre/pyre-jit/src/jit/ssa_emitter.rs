@@ -575,16 +575,19 @@ impl SSAReprEmitter {
     /// Used by the walker to convert its `pc_map` (Python PC →
     /// insn index) into the final byte-offset form that runtime
     /// readers expect.
+    ///
+    /// `num_regs` is the post-regalloc per-kind ceiling computed by
+    /// `super::regalloc::allocate_registers` from `max(color)+1`
+    /// (RPython parity: `codewriter.py:62-67`). Passing the
+    /// pre-regalloc builder values would over-allocate the
+    /// `JitCode.num_regs_*` slots that `Assembler::emit_reg`'s
+    /// 256-bound assertion (`assembler.py:73`) checks against.
     pub fn finish_with_positions(
         mut self,
         assembler: &mut Assembler,
         insn_positions: &[usize],
+        num_regs: NumRegs,
     ) -> (JitCode, Vec<usize>) {
-        let num_regs = NumRegs {
-            int: self.builder.num_regs_i(),
-            ref_: self.builder.num_regs_r(),
-            float: self.builder.num_regs_f(),
-        };
         let jitcode = assembler.assemble(&mut self.ssarepr, self.builder, Some(num_regs));
         let byte_positions =
             Self::insn_pos_to_byte_offset(&self.ssarepr, insn_positions.iter().copied());
@@ -596,8 +599,13 @@ impl SSAReprEmitter {
     /// CodeWriter-owned `Assembler` — see the note on `finish()`.
     #[cfg(test)]
     pub fn finish_and_translate_positions(self, insn_positions: &[usize]) -> (JitCode, Vec<usize>) {
+        let num_regs = NumRegs {
+            int: self.builder.num_regs_i(),
+            ref_: self.builder.num_regs_r(),
+            float: self.builder.num_regs_f(),
+        };
         let mut assembler = Assembler::new();
-        self.finish_with_positions(&mut assembler, insn_positions)
+        self.finish_with_positions(&mut assembler, insn_positions, num_regs)
     }
 
     // ---- internals ----

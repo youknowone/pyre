@@ -56,7 +56,11 @@ impl DependencyGraph {
         self.neighbours.entry(v2).or_default().insert(v1);
     }
 
-    fn coalesce(&mut self, vold: ValueId, vnew: ValueId) {
+    /// RPython: `color.py::DependencyGraph.coalesce(vold, vnew)`.
+    /// Folds `vold`'s adjacency list into `vnew` and removes `vold`.
+    /// Used by `RegAllocator.coalesce_variables` after a successful
+    /// union so the chordal coloring sees a single combined node.
+    pub fn coalesce(&mut self, vold: ValueId, vnew: ValueId) {
         if let Some(old_neighbours) = self.neighbours.remove(&vold) {
             for n in old_neighbours {
                 if let Some(ns) = self.neighbours.get_mut(&n) {
@@ -68,6 +72,14 @@ impl DependencyGraph {
                 }
             }
         }
+    }
+
+    /// RPython: `regalloc.py:105` `v0 not in dg.neighbours[w0]`.
+    /// Returns true iff there is an interference edge between `v1` and `v2`.
+    pub fn has_edge(&self, v1: ValueId, v2: ValueId) -> bool {
+        self.neighbours
+            .get(&v1)
+            .map_or(false, |ns| ns.contains(&v2))
     }
 
     fn getnodes(&self) -> Vec<ValueId> {
