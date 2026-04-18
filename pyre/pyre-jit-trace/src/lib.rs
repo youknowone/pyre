@@ -16,7 +16,7 @@ pub mod metainterp;
 pub mod pyjitcode;
 pub mod state;
 mod trace_opcode;
-pub use pyjitcode::{PyJitCode, PyJitCodeMetadata};
+pub use pyjitcode::{PyJitCode, PyJitCodeMetadata, RegisterMapping};
 pub use state::{CompileJitcodeFn, set_compile_jitcode_fn};
 pub mod trace;
 pub mod virtualizable_gen;

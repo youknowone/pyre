@@ -543,24 +543,35 @@ fn blackhole_from_jit_frame(frame: &mut PyFrame) -> Option<PyObjectRef> {
     // frame.locals_cells_stack_w is always PyObjectRef → write_a_ref only.
     // RPython's resume path uses enumerate_vars typed callbacks, but this
     // pyre-specific path loads from the concrete frame directly.
+    //
+    // Register destinations come from `register_mapping`; the legacy
+    // pinned layout maps local `i` → register `i` and stack depth `d`
+    // → register `nlocals + d`. After regalloc lands the same accessor
+    // serves a `PerPc` table without changing this code.
+    let mapping = &pyjitcode.metadata.register_mapping;
     let nlocals = code.varnames.len();
-    for i in 0..nlocals {
-        if i < frame.locals_w().len() {
-            bh.setarg_r(i, frame.locals_w()[i] as i64);
+    for local_idx in 0..nlocals {
+        let reg_idx = mapping.register_for_local(py_pc, local_idx) as usize;
+        if reg_idx == u16::MAX as usize {
+            continue;
+        }
+        if local_idx < frame.locals_w().len() && reg_idx < bh.registers_r.len() {
+            bh.setarg_r(reg_idx, frame.locals_w()[local_idx] as i64);
         }
     }
 
     // Load value stack into blackhole register bank.
     // locals_cells_stack_w layout: [locals..., cells..., stack...].
-    // stack_base in PyFrame = nlocals + ncells; in JitCode the value-stack
-    // temporaries live at registers_r[nlocals + d] (codewriter parity —
-    // BC_MOVE_R only, no BC_PUSH_R / BC_POP_R).
     let ncells = pyre_interpreter::pyframe::ncells(code);
     let frame_stack_base = nlocals + ncells;
     let vsd = frame.valuestackdepth;
-    for d in 0..vsd.saturating_sub(frame_stack_base) {
-        let frame_idx = frame_stack_base + d;
-        let reg_idx = nlocals + d;
+    let stack_only_depth = vsd.saturating_sub(frame_stack_base);
+    for depth in 0..stack_only_depth {
+        let reg_idx = mapping.register_for_stack(py_pc, depth) as usize;
+        if reg_idx == u16::MAX as usize {
+            continue;
+        }
+        let frame_idx = frame_stack_base + depth;
         if frame_idx < frame.locals_w().len() && reg_idx < bh.registers_r.len() {
             bh.setarg_r(reg_idx, frame.locals_w()[frame_idx] as i64);
         }

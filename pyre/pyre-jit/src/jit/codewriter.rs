@@ -1977,6 +1977,13 @@ impl CodeWriter {
             portal_ec_reg,
             stack_base: frame_stack_base,
             liveness,
+            // Step 1: pinned mapping (register == PyFrame slot index).
+            // Replaced by `RegisterMapping::PerPc` after regalloc lands
+            // (Step 4) — the accessor methods on `RegisterMapping`
+            // hide the variant from emit / blackhole call sites.
+            register_mapping: pyre_jit_trace::RegisterMapping::Pinned {
+                nlocals: code.varnames.len() as u16,
+            },
         };
 
         PyJitCode {
