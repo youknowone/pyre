@@ -35,6 +35,13 @@ mod test_support;
 // explicitly. The legacy tree is deleted at roadmap commit P8.11.
 pub mod translate_legacy;
 
+// `translator/` is the non-LEGACY home for RPython-orthodox port files —
+// see `translator/mod.rs` for the contract. Currently hosts
+// `translator/rtyper/{rclass.rs, rpbc.rs}`, the `rpython/rtyper/` 1:1
+// port. The matching `TypeResolutionState` infra still lives under
+// `translator_legacy/rtyper/rtyper.rs` until majit-rtyper Phase 6.
+pub mod translator;
+
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
 pub use flatten::{FlatOp, Label, RegKind, SSARepr, flatten, flatten_with_types};
 pub use front::{
@@ -140,7 +147,7 @@ pub fn analyze_multiple_pipeline_with_config(
     config: &AnalyzeConfig,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, None, &|_, _| None)
+    analyze_pipeline_from_parsed(&parsed_files, config, None, &|_, _| None, &[])
 }
 
 /// Multi-file analysis with explicit layout provider.
@@ -154,7 +161,13 @@ pub fn analyze_multiple_pipeline_with_layout(
     layout_provider: &dyn layout::LayoutProvider,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, Some(layout_provider), &|_, _| None)
+    analyze_pipeline_from_parsed(
+        &parsed_files,
+        config,
+        Some(layout_provider),
+        &|_, _| None,
+        &[],
+    )
 }
 
 /// `make_virtualizable_infos` constructor closure type — mirrors the
@@ -163,6 +176,15 @@ pub fn analyze_multiple_pipeline_with_layout(
 /// runtime `VirtualizableInfo` impl supply the constructor here.
 pub type VirtualizableInfoFactory<'a> =
     dyn Fn(usize, &str) -> Option<std::sync::Arc<dyn call::VirtualizableInfoHandle>> + 'a;
+
+/// Optional binding table from macro-generated helper path
+/// (`module_path!()::helper_name`) to the compiled trace-call address.
+///
+/// `#[jit_module]::__majit_helper_trace_fnaddrs()` produces this shape.
+/// `analyze_pipeline_from_parsed` strips the crate-name prefix and binds
+/// both canonical aliases (`helpers::foo` and `crate::helpers::foo`) on
+/// `CallControl` before `get_jitcode()` / `jtransform` query fnaddrs.
+pub type FnAddrBindings<'a> = [(&'a str, i64)];
 
 /// Multi-file analysis with explicit layout provider AND a
 /// `VirtualizableInfo` factory wired into
@@ -176,7 +198,50 @@ pub fn analyze_multiple_pipeline_with_vinfo_factory(
     vinfo_factory: &VirtualizableInfoFactory<'_>,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, layout_provider, vinfo_factory)
+    analyze_pipeline_from_parsed(&parsed_files, config, layout_provider, vinfo_factory, &[])
+}
+
+/// Multi-file analysis with explicit layout provider, optional
+/// `VirtualizableInfo` factory, and host-supplied compiled helper
+/// addresses.
+///
+/// This is the line-by-line `getfunctionptr(graph)` adapter for source-only
+/// codewriter consumers: pass the output of
+/// `#[jit_module]::__majit_helper_trace_fnaddrs()` here so `JitCode.fnaddr`
+/// and residual-call lowering use the real helper surface instead of the
+/// symbolic fallback.
+pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
+    sources: &[&str],
+    config: &AnalyzeConfig,
+    layout_provider: Option<&dyn layout::LayoutProvider>,
+    vinfo_factory: &VirtualizableInfoFactory<'_>,
+    fnaddr_bindings: &FnAddrBindings<'_>,
+) -> pipeline::ProgramPipelineResult {
+    let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
+    analyze_pipeline_from_parsed(
+        &parsed_files,
+        config,
+        layout_provider,
+        vinfo_factory,
+        fnaddr_bindings,
+    )
+}
+
+/// Multi-file analysis with compiled helper fnaddr bindings but without a
+/// virtualizable-info factory.
+pub fn analyze_multiple_pipeline_with_fnaddr_bindings(
+    sources: &[&str],
+    config: &AnalyzeConfig,
+    layout_provider: Option<&dyn layout::LayoutProvider>,
+    fnaddr_bindings: &FnAddrBindings<'_>,
+) -> pipeline::ProgramPipelineResult {
+    analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
+        sources,
+        config,
+        layout_provider,
+        &|_, _| None,
+        fnaddr_bindings,
+    )
 }
 
 fn analyze_pipeline_from_parsed(
@@ -184,6 +249,7 @@ fn analyze_pipeline_from_parsed(
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
+    fnaddr_bindings: &FnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
     let program = front::build_semantic_program_from_parsed_files(parsed_files);
     let mut pipeline = pipeline::analyze_program(&program, &config.pipeline);
@@ -383,6 +449,9 @@ fn analyze_pipeline_from_parsed(
             }
         }
     }
+    for &(full_path, fnaddr) in fnaddr_bindings {
+        call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
+    }
     // RPython: GC transformer sets _gctransformer_hint_close_stack_,
     // _gctransformer_hint_cannot_collect_ on functions, and
     // random_effects_on_gcobjs on external function objects.
@@ -580,7 +649,10 @@ fn build_canonical_opcode_dispatch(
     function_graphs: &std::collections::HashMap<parse::CallPath, model::FunctionGraph>,
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
-) -> (Vec<pipeline::PipelineOpcodeArm>, Vec<jitcode::JitCode>) {
+) -> (
+    Vec<pipeline::PipelineOpcodeArm>,
+    Vec<std::sync::Arc<jitcode::JitCode>>,
+) {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
 
@@ -595,16 +667,17 @@ fn build_canonical_opcode_dispatch(
 
     // RPython codewriter.py:74-89: make_jitcodes().
     //
-    // A single all_jitcodes collection accumulates across all phases.
-    // Indexed by alloc_index from get_jitcode(), guaranteeing
-    // all_jitcodes[i].index == i (RPython codewriter.py:80 invariant).
+    // `Arc<JitCode>` shells live in `CallControl::jitcodes`; the drain loop
+    // commits each shell's body via `JitCode::set_body`. After all phases,
+    // `collect_jitcodes_in_alloc_order` materialises the `all_jitcodes[]`
+    // vector with `all_jitcodes[i].index == i` (RPython codewriter.py:80
+    // invariant).
     let mut codewriter = codewriter::CodeWriter::new();
-    let mut jitcodes: Vec<Option<jitcode::JitCode>> = Vec::new();
 
     // Phase 1: RPython grab_initial_jitcodes + drain portal + callees.
     // RPython call.py:145-148.
     call_control.grab_initial_jitcodes();
-    codewriter.drain_pending_graphs(call_control, &pipeline_config.transform, &mut jitcodes);
+    codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
 
     // Phase 2: register each opcode arm body as a synthetic graph.
     //
@@ -632,12 +705,25 @@ fn build_canonical_opcode_dispatch(
         // Parser-level flatten — kept for snapshot tests / debug.
         let flattened = arm.body_graph.as_ref().map(|handler_graph| {
             let annotations = annotate::annotate(handler_graph);
-            let type_state = rtype::resolve_types(handler_graph, &annotations);
+            let mut type_state = rtype::resolve_types(handler_graph, &annotations);
+            // Run the rtyper-equivalent indirect_call lowering before
+            // jtransform so this snapshot path matches the canonical
+            // codewriter pipeline (post-rtyper graph has no
+            // `CallTarget::Indirect`). RPython rpbc.py:199-217.
+            let mut handler_graph_owned = handler_graph.clone();
+            crate::translator::rtyper::rpbc::lower_indirect_calls(
+                &mut handler_graph_owned,
+                &mut type_state,
+                &mut *call_control,
+            );
+            #[cfg(debug_assertions)]
+            crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&handler_graph_owned);
             let mut transformer = jtransform::Transformer::new(&pipeline_config.transform)
                 .with_callcontrol(&mut *call_control)
                 .with_type_state(&type_state);
-            let rewritten = transformer.transform(handler_graph);
-            flatten::flatten_with_types(&rewritten.graph, &type_state)
+            let rewritten = transformer.transform(&handler_graph_owned);
+            let rewritten_type_state = rtype::resolve_types(&rewritten.graph, &annotations);
+            flatten::flatten_with_types(&rewritten.graph, &rewritten_type_state)
         });
 
         // Register the arm body in CallControl + reserve a jitcode slot.
@@ -645,7 +731,7 @@ fn build_canonical_opcode_dispatch(
         let entry_jitcode_index = arm.body_graph.map(|body_graph| {
             let synthetic_path = synthetic_opcode_arm_path(&arm.selector, arm_id);
             call_control.register_function_graph(synthetic_path.clone(), body_graph);
-            call_control.get_jitcode(&synthetic_path)
+            call_control.get_jitcode(&synthetic_path).index
         });
 
         dispatch.push(pipeline::PipelineOpcodeArm {
@@ -663,15 +749,17 @@ fn build_canonical_opcode_dispatch(
     // callees discovered during the parser-level transform pass above. Each
     // gets transformed → assembled in turn, and any *new* callees they reach
     // are added to the queue and picked up by the same loop.
-    codewriter.drain_pending_graphs(call_control, &pipeline_config.transform, &mut jitcodes);
+    codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
 
     // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
         .assembler
         .finished(&call_control.callinfocollection);
 
-    // Unwrap: all_jitcodes[i].index == i by construction.
-    let jitcodes = jitcodes.into_iter().flatten().collect();
+    // Materialise `all_jitcodes[]` from the per-CallPath shells. RPython
+    // invariant `all_jitcodes[i].index == i` is preserved by allocation
+    // order in `CallControl::jitcode_alloc_order`.
+    let jitcodes = call_control.collect_jitcodes_in_alloc_order();
 
     (dispatch, jitcodes)
 }
@@ -1458,6 +1546,33 @@ mod tests {
             canonical_load_fast.flattened.as_ref().unwrap().insns.len() > 0,
             "canonical LoadFast flattened should have ops"
         );
+    }
+
+    #[test]
+    fn test_analyze_multiple_pipeline_with_fnaddr_bindings_stamps_real_jitcode_fnaddr() {
+        let source = r#"
+            fn helper_opaque(a: i64, b: i64) -> i64 {
+                a + b
+            }
+
+            fn execute_opcode_step() -> i64 {
+                helper_opaque(2, 3)
+            }
+        "#;
+
+        let result = analyze_multiple_pipeline_with_fnaddr_bindings(
+            &[source],
+            &AnalyzeConfig::default(),
+            None,
+            &[("testcrate::helper_opaque", 0x1234_5678)],
+        );
+
+        let helper = result
+            .jitcodes
+            .iter()
+            .find(|jitcode| jitcode.name == "helper_opaque")
+            .expect("helper_opaque jitcode");
+        assert_eq!(helper.fnaddr, 0x1234_5678);
     }
 
     #[test]

@@ -1494,6 +1494,10 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let helper_names: Vec<&Ident> = discovered.iter().map(|h| &h.fn_name).collect();
     let helper_attr_names: Vec<&str> = discovered.iter().map(|h| h.attr_name.as_str()).collect();
+    let helper_policy_fns: Vec<Ident> = discovered
+        .iter()
+        .map(|h| format_ident!("__majit_call_policy_{}", h.fn_name))
+        .collect();
 
     let registry_names = quote! {
         /// Hidden registry of automatically discovered JIT helpers.
@@ -1513,10 +1517,40 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         ];
     };
 
+    let registry_trace_fnaddrs = quote! {
+        /// Hidden registry mapping each discovered helper to the compiled
+        /// trace-call surface address used by `majit-codewriter`'s
+        /// `getfunctionptr(graph)` parity path.
+        #[doc(hidden)]
+        #[allow(dead_code)]
+        pub fn __majit_helper_trace_fnaddrs() -> ::std::vec::Vec<(&'static str, i64)> {
+            ::std::vec![
+                #({
+                    let (_, _inline_builder, __trace_target, __concrete_target) = #helper_policy_fns();
+                    let __trace_target = if __trace_target.is_null() {
+                        if __concrete_target.is_null() {
+                            #helper_names as *const ()
+                        } else {
+                            __concrete_target
+                        }
+                    } else {
+                        __trace_target
+                    };
+                    (
+                        concat!(module_path!(), "::", stringify!(#helper_names)),
+                        __trace_target as usize as i64,
+                    )
+                }),*
+            ]
+        }
+    };
+
     // Inject the registry constants into the module body
     let mut new_items = items.clone();
     new_items.push(syn::parse2(registry_names).expect("failed to parse registry_names"));
     new_items.push(syn::parse2(registry_policies).expect("failed to parse registry_policies"));
+    new_items
+        .push(syn::parse2(registry_trace_fnaddrs).expect("failed to parse registry_trace_fnaddrs"));
     module.content = Some((brace, new_items));
 
     quote! { #module }.into()

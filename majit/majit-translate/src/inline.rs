@@ -12,7 +12,16 @@
 use std::collections::HashMap;
 
 use crate::call::{CallControl, CallKind};
-use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId};
+use crate::model::{
+    BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
+};
+
+fn remap_call_funcptr<F: Fn(&ValueId) -> ValueId>(funcptr: &CallFuncPtr, remap: &F) -> CallFuncPtr {
+    match funcptr {
+        CallFuncPtr::Target(target) => CallFuncPtr::Target(target.clone()),
+        CallFuncPtr::Value(value) => CallFuncPtr::Value(remap(value)),
+    }
+}
 
 /// Inline all `Regular` calls in the graph, consulting `CallControl`
 /// for the inline/residual decision.
@@ -370,14 +379,25 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             value: remap(value),
             kind_char: *kind_char,
         },
-        OpKind::FuncptrFromVtable {
+        OpKind::VtableMethodPtr {
             receiver,
             trait_root,
             method_name,
-        } => OpKind::FuncptrFromVtable {
+        } => OpKind::VtableMethodPtr {
             receiver: remap(receiver),
             trait_root: trait_root.clone(),
             method_name: method_name.clone(),
+        },
+        OpKind::IndirectCall {
+            funcptr,
+            args,
+            graphs,
+            result_ty,
+        } => OpKind::IndirectCall {
+            funcptr: remap(funcptr),
+            args: args.iter().map(remap).collect(),
+            graphs: graphs.clone(),
+            result_ty: result_ty.clone(),
         },
         OpKind::RecordQuasiImmutField {
             base,
@@ -492,7 +512,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             args_f,
             result_kind,
         } => OpKind::CallElidable {
-            funcptr: funcptr.clone(),
+            funcptr: remap_call_funcptr(funcptr, &remap),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -508,7 +528,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_kind,
             indirect_targets,
         } => OpKind::CallResidual {
-            funcptr: funcptr.clone(),
+            funcptr: remap_call_funcptr(funcptr, &remap),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -524,7 +544,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             args_f,
             result_kind,
         } => OpKind::CallMayForce {
-            funcptr: funcptr.clone(),
+            funcptr: remap_call_funcptr(funcptr, &remap),
             descriptor: descriptor.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
@@ -660,7 +680,12 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         | OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![*value],
-        OpKind::FuncptrFromVtable { receiver, .. } => vec![*receiver],
+        OpKind::VtableMethodPtr { receiver, .. } => vec![*receiver],
+        OpKind::IndirectCall { funcptr, args, .. } => {
+            let mut v = vec![*funcptr];
+            v.extend(args.iter().copied());
+            v
+        }
         OpKind::RecordQuasiImmutField { base, .. } => vec![*base],
         OpKind::JitDebug { args, .. } => args.clone(),
         OpKind::VableFieldRead { .. } => vec![],
@@ -672,24 +697,36 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         OpKind::BinOp { lhs, rhs, .. } => vec![*lhs, *rhs],
         OpKind::UnaryOp { operand, .. } => vec![*operand],
         OpKind::CallElidable {
+            funcptr,
             args_i,
             args_r,
             args_f,
             ..
         }
         | OpKind::CallResidual {
+            funcptr,
             args_i,
             args_r,
             args_f,
             ..
         }
         | OpKind::CallMayForce {
+            funcptr,
             args_i,
             args_r,
             args_f,
             ..
+        } => {
+            let mut refs = match funcptr {
+                CallFuncPtr::Target(_) => Vec::new(),
+                CallFuncPtr::Value(value) => vec![*value],
+            };
+            refs.extend(args_i);
+            refs.extend(args_r);
+            refs.extend(args_f);
+            refs
         }
-        | OpKind::InlineCall {
+        OpKind::InlineCall {
             args_i,
             args_r,
             args_f,

@@ -38,6 +38,20 @@ fn test_discovered_helper_policies() {
 }
 
 #[test]
+fn test_helper_trace_fnaddrs_registry() {
+    let trace_fnaddrs = basic_module::__majit_helper_trace_fnaddrs();
+    assert_eq!(trace_fnaddrs.len(), 2);
+    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
+        *path == concat!(module_path!(), "::basic_module::helper_square")
+            && *addr == basic_module::__majit_call_target_helper_square as *const () as usize as i64
+    }));
+    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
+        *path == concat!(module_path!(), "::basic_module::helper_opaque")
+            && *addr == basic_module::__majit_call_target_helper_opaque as *const () as usize as i64
+    }));
+}
+
+#[test]
 fn test_functions_still_callable() {
     assert_eq!(basic_module::helper_square(5), 25);
     assert_eq!(basic_module::helper_opaque(2, 3), 5);
@@ -57,6 +71,8 @@ fn test_empty_discovery() {
     assert!(helpers.is_empty());
     let policies = empty_module::__MAJIT_HELPER_POLICIES;
     assert!(policies.is_empty());
+    let trace_fnaddrs = empty_module::__majit_helper_trace_fnaddrs();
+    assert!(trace_fnaddrs.is_empty());
 }
 
 #[jit_module]

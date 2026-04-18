@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::flatten::{FlatOp, Label, RegKind, SSARepr};
-use crate::jitcode::JitCode;
+use crate::jitcode::{BhCallDescr, JitCodeBody};
 use crate::model::ValueId;
 use crate::regalloc::RegAllocResult;
 
@@ -34,7 +34,13 @@ pub struct Assembler {
     /// (`assembler.py:208-209`).  RPython stores `JitCode` objects; we
     /// store their jitcode indices because codewriter owns the
     /// jitcode-index allocator.
-    pub indirectcalltargets: std::collections::HashSet<usize>,
+    /// RPython `assembler.py:209` `self.indirectcalltargets.update(x.lst)`:
+    /// a `set` of JitCode objects (Python identity dedup). pyre uses
+    /// `JitCodeHandle` as the identity-keyed wrapper around
+    /// `Arc<JitCode>` so the same shells handed out by
+    /// `CallControl::get_jitcode` survive into the metainterp side
+    /// without copying.
+    pub indirectcalltargets: std::collections::HashSet<crate::jitcode::JitCodeHandle>,
     /// RPython: Assembler.list_of_addr2name — (addr, name) pairs for debugging.
     /// In majit: (target_path, name) string pairs since we don't have raw addresses.
     pub list_of_addr2name: Vec<(String, String)>,
@@ -89,7 +95,7 @@ impl Assembler {
         &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
-    ) -> JitCode {
+    ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
         // Must run BEFORE assembly so -live- markers carry the full
         // set of alive registers.
@@ -138,30 +144,32 @@ impl Assembler {
         }
 
         // RPython assembler.py:271-281: jitcode.setup(code, ...)
-        // Equivalent of `jitcode.setup(...)` in `make_jitcode` — populate
-        // the JitCode shell with the assembled bytecode + register layout.
-        let mut jitcode = JitCode::new(ssarepr.name.clone());
-        jitcode.code = state.code;
-        jitcode.constants_i = state.constants_i;
+        // Build the body that the codewriter will commit into the
+        // pre-allocated `Arc<JitCode>` shell via `set_body`.
         // RPython jitcode.py:36 `assert num_regs_i < 256 and ...`. The
         // assembler limits register pressure via the same invariant.
         assert!(
             num_regs_i < 256 && num_regs_r < 256 && num_regs_f < 256,
             "too many registers (i={num_regs_i} r={num_regs_r} f={num_regs_f})"
         );
-        jitcode.c_num_regs_i = num_regs_i as u8;
-        jitcode.c_num_regs_r = num_regs_r as u8;
-        jitcode.c_num_regs_f = num_regs_f as u8;
-        jitcode.startpoints = state.startpoints;
-        jitcode.alllabels = state.alllabels;
-        jitcode.resulttypes = state.resulttypes;
         // RPython assembler.py:49 `jitcode._ssarepr = ssarepr`
-        jitcode._ssarepr = Some(ssarepr.clone());
-        // index + jitdriver_sd are set by CodeWriter after assembly
-        // (RPython codewriter.py:68 `jitcode.index = index`).
+        let body = JitCodeBody {
+            calldescr: BhCallDescr::default(),
+            code: state.code,
+            constants_i: state.constants_i,
+            constants_r: Vec::new(),
+            constants_f: Vec::new(),
+            c_num_regs_i: num_regs_i as u8,
+            c_num_regs_r: num_regs_r as u8,
+            c_num_regs_f: num_regs_f as u8,
+            startpoints: state.startpoints,
+            alllabels: state.alllabels,
+            resulttypes: state.resulttypes,
+            _ssarepr: Some(ssarepr.clone()),
+        };
 
         self.count_jitcodes += 1;
-        jitcode
+        body
     }
 
     /// RPython: `Assembler.write_insn(insn)` — assembler.py:140-223.
@@ -410,6 +418,7 @@ impl Assembler {
             // RPython jtransform.py:414-435: rewrite_call splits args
             // by kind via make_three_lists.
             OpKind::CallResidual {
+                funcptr,
                 descriptor: _,
                 args_i,
                 args_r,
@@ -418,6 +427,7 @@ impl Assembler {
                 ..
             }
             | OpKind::CallMayForce {
+                funcptr,
                 descriptor: _,
                 args_i,
                 args_r,
@@ -426,6 +436,7 @@ impl Assembler {
                 ..
             }
             | OpKind::CallElidable {
+                funcptr,
                 descriptor: _,
                 args_i,
                 args_r,
@@ -444,14 +455,29 @@ impl Assembler {
                     ..
                 } = &op.kind
                 {
-                    self.indirectcalltargets
-                        .extend(t.candidates.iter().copied());
+                    self.indirectcalltargets.extend(t.lst.iter().cloned());
                 }
                 let base = match &op.kind {
                     OpKind::CallMayForce { .. } => "call_may_force",
                     OpKind::CallElidable { .. } => "call_elidable",
                     _ => "residual_call",
                 };
+                // RPython `assembler.py:160-174` walks `op.args` in order:
+                // funcptr first, then calldescr. jtransform now
+                // materializes direct-call funcptrs as `ConstInt`
+                // values, so every post-jtransform call op reaches the
+                // assembler as `CallFuncPtr::Value(...)` and encodes the
+                // orthodox leading `i` operand.
+                match funcptr {
+                    crate::model::CallFuncPtr::Value(vid) => {
+                        let (reg, kc) = self.lookup_reg_with_kind(*vid, regallocs);
+                        state.code.push(reg);
+                        argcodes.push(kc);
+                    }
+                    crate::model::CallFuncPtr::Target(target) => {
+                        panic!("call op reached assembler without materialized funcptr: {target}");
+                    }
+                }
                 // RPython assembler.py:197-207: descriptor as 2-byte index
                 let descr_idx = self.descrs.len();
                 let calldescr = crate::jitcode::BhCallDescr {
@@ -539,13 +565,16 @@ impl Assembler {
             // RPython `rpython/jit/codewriter/jtransform.py:546` emits
             // `int_guard_value(op.args[0])` where `op.args[0]` is already a
             // `Ptr(FuncType)` integer after rtype.  Rust `&dyn Trait` is a
-            // fat pointer so we synthesize `funcptr_from_vtable(receiver)`
-            // and carry the `(trait_root, method_name)` pair via a
-            // `BhDescr::VtableMethod` descriptor.  The result register is
-            // the integer function address that `int_guard_value` and the
-            // subsequent `residual_call_*` consume — runtime lowering is
-            // deferred (B2/B3 in the indirect_call epic).
-            OpKind::FuncptrFromVtable {
+            // fat pointer so the rtyper-equivalent layer
+            // (`translator/rtyper/rclass.rs::class_get_method_ptr`) emits
+            // `OpKind::VtableMethodPtr(receiver)` with the
+            // `(trait_root, method_name)` pair; the assembler encodes it
+            // as `vtable_method_ptr/rd>i` carrying a `BhDescr::VtableMethod`.
+            // The result register is the integer function address that
+            // `int_guard_value` and the subsequent `residual_call_*`
+            // consume — backend lowering of the actual vtable slot read
+            // is deferred (separate epic).
+            OpKind::VtableMethodPtr {
                 receiver,
                 trait_root,
                 method_name,
@@ -1143,7 +1172,8 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecursiveCall { .. } => "recursive_call".into(),
         // RPython: no dedicated opname — the vtable entry becomes the `funcptr`
         // Variable that `int_guard_value` + `residual_call_*` consume.
-        OpKind::FuncptrFromVtable { .. } => "funcptr_from_vtable".into(),
+        OpKind::VtableMethodPtr { .. } => "vtable_method_ptr".into(),
+        OpKind::IndirectCall { .. } => "indirect_call".into(),
         // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Unknown { .. } => "unknown".into(),
@@ -1253,12 +1283,12 @@ mod tests {
             },
         );
         let mut asm = Assembler::new();
-        let jitcode = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble(&mut flat, &regallocs);
 
-        assert_eq!(jitcode.name, "test");
-        assert_eq!(jitcode.num_regs_i(), 0);
-        assert_eq!(jitcode.num_regs_r(), 0);
-        assert_eq!(jitcode.num_regs_f(), 0);
+        assert_eq!(flat.name, "test");
+        assert_eq!(body.c_num_regs_i as usize, 0);
+        assert_eq!(body.c_num_regs_r as usize, 0);
+        assert_eq!(body.c_num_regs_f as usize, 0);
         assert_eq!(asm.count_jitcodes(), 1);
     }
 
@@ -1317,12 +1347,65 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let jitcode = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble(&mut flat, &regallocs);
 
         // v0 dies when v1 is defined → they share a register → 1 int reg
-        assert_eq!(jitcode.num_regs_i(), 1);
-        assert_eq!(jitcode.num_regs_r(), 1);
-        assert_eq!(jitcode.num_regs_f(), 0);
+        assert_eq!(body.c_num_regs_i as usize, 1);
+        assert_eq!(body.c_num_regs_r as usize, 1);
+        assert_eq!(body.c_num_regs_f as usize, 0);
+    }
+
+    #[test]
+    fn assemble_direct_residual_call_encodes_leading_funcptr_operand() {
+        use crate::call::CallControl;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+        use crate::translator::annotator::annrpython::annotate;
+        use crate::translator::rtyper::rtyper::resolve_types;
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("caller");
+        let arg = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arg".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: crate::model::CallTarget::function_path(["custom_reader"]),
+                args: vec![arg],
+                result_ty: ValueType::Ref,
+            },
+            true,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+
+        let annotations = annotate(&graph);
+        let type_state = resolve_types(&graph, &annotations);
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
+        let rewritten = transformer.transform(&graph);
+        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
+        let value_kinds = crate::translator::rtyper::rtyper::build_value_kinds(&rewritten_types);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
+        let mut flat = crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types);
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            asm.insns.contains_key("residual_call_r_r/idR>r"),
+            "expected funcptr-first residual_call key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
     }
 
     /// `OpKind::RecordQuasiImmutField` must lower to a single opcode
@@ -1418,71 +1501,6 @@ mod tests {
             field_descr_names.contains(&"value") && field_descr_names.contains(&"mutate_value"),
             "expected Field descrs for `value` + `mutate_value`, got {:?}",
             field_descr_names
-        );
-    }
-
-    /// `OpKind::FuncptrFromVtable` must survive assembly with its
-    /// `(trait_root, method_name)` pair carried in a
-    /// `BhDescr::VtableMethod` so the runtime can resolve the receiver
-    /// fat pointer's vtable slot to a function address.  Counterpart of
-    /// the `op.args[0]` Variable RPython produces in
-    /// `rpython/jit/codewriter/jtransform.py:546`.
-    #[test]
-    fn assembles_funcptr_from_vtable_with_vtable_method_descr() {
-        use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
-
-        let mut graph = FunctionGraph::new("vtable_lookup");
-        let receiver = graph
-            .push_op(
-                graph.startblock,
-                OpKind::Input {
-                    name: "h".to_string(),
-                    ty: ValueType::Ref,
-                },
-                true,
-            )
-            .unwrap();
-        let funcptr = graph
-            .push_op(
-                graph.startblock,
-                OpKind::FuncptrFromVtable {
-                    receiver,
-                    trait_root: "Handler".to_string(),
-                    method_name: "run".to_string(),
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_terminator(graph.startblock, Terminator::Return(Some(funcptr)));
-
-        let mut value_kinds = HashMap::new();
-        value_kinds.insert(receiver, RegKind::Ref);
-        value_kinds.insert(funcptr, RegKind::Int);
-        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
-        let mut flat = crate::flatten::flatten(&graph);
-        let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
-
-        assert!(
-            asm.insns.contains_key("funcptr_from_vtable/rd>i"),
-            "expected key funcptr_from_vtable/rd>i, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
-        );
-        let vtable_descrs: Vec<(&str, &str)> = asm
-            .descrs
-            .iter()
-            .filter_map(|d| match d {
-                crate::jitcode::BhDescr::VtableMethod {
-                    trait_root,
-                    method_name,
-                } => Some((trait_root.as_str(), method_name.as_str())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            vtable_descrs,
-            vec![("Handler", "run")],
-            "expected exactly one VtableMethod descr for (Handler, run)"
         );
     }
 }

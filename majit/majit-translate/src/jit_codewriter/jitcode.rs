@@ -13,6 +13,8 @@
 //! this type directly, eliminating the fork.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,18 +50,22 @@ use serde::{Deserialize, Serialize};
 /// Field-by-field mapping below preserves the RPython names. Where
 /// RPython uses `chr(int)` to pack a 0..255 register count into a single
 /// byte we use `u8` directly; the value range is identical.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JitCode {
-    /// RPython `jitcode.py:15` `self.name = name`.
-    pub name: String,
-    /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`.
-    #[serde(default, skip_serializing)]
-    pub fnaddr: i64,
-    /// RPython `jitcode.py:17` `self.calldescr = calldescr`.
+/// Body of a `JitCode` — populated once by the assembler after
+/// `transform_graph_to_jitcode` runs the full codewriter pipeline.
+///
+/// RPython `jitcode.py:22-42` `JitCode.setup(...)`. RPython mutates the
+/// JitCode object in place; pyre groups the late-set fields into a body
+/// struct that is committed via `OnceLock::set` so `Arc<JitCode>` shells
+/// handed out by `CallControl::get_jitcode` can be filled while shared.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct JitCodeBody {
+    /// RPython `jitcode.py:17` `self.calldescr = calldescr`. RPython sets
+    /// this at construction because rtyper has resolved the function's
+    /// arg/result types upstream; pyre's rtyper-equivalent runs inside
+    /// the codewriter pipeline so calldescr is filled here as part of
+    /// the body. `transform_graph_to_jitcode` overrides the default with
+    /// the assembled `arg_classes`.
     pub calldescr: BhCallDescr,
-    /// RPython `jitcode.py:18` `self.jitdriver_sd = None`.
-    /// `Some(index)` for portal jitcodes (set by `grab_initial_jitcodes`).
-    pub jitdriver_sd: Option<usize>,
     /// RPython `jitcode.py:26` `self.code = code` — bytecode bytes.
     pub code: Vec<u8>,
     /// RPython `jitcode.py:32` `self.constants_i`.
@@ -88,20 +94,91 @@ pub struct JitCode {
     /// RPython `jitcode.py:42` `self._resulttypes = resulttypes` —
     /// debug-only map from bytecode offset to result type char.
     pub resulttypes: HashMap<usize, char>,
+    /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
+    /// flattened SSA representation, kept for `dump()` output. Set by
+    /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
+    #[serde(skip)]
+    pub _ssarepr: Option<crate::flatten::SSARepr>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JitCode {
+    /// RPython `jitcode.py:15` `self.name = name`.
+    pub name: String,
+    /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`. majit stores the
+    /// bound helper trace-call address when the host has supplied one,
+    /// otherwise the stable symbolic fallback key; the blackhole-side
+    /// inline-call descriptor may still patch its own cached copy from
+    /// `all_jitcodes[jitcode.index]`.
+    #[serde(default, skip_serializing)]
+    pub fnaddr: i64,
+    /// RPython `jitcode.py:18` `self.jitdriver_sd = None`. `Some(index)`
+    /// for portal jitcodes (set by `grab_initial_jitcodes` /
+    /// `drain_pending_graphs`). `OnceLock` allows the late single-set
+    /// after `Arc<JitCode>` shells have been cloned (e.g. into
+    /// `JitDriverStaticData.mainjitcode`). Use `jitdriver_sd()` /
+    /// `set_jitdriver_sd()`.
+    #[serde(with = "oncelock_usize_serde")]
+    pub jitdriver_sd: OnceLock<usize>,
     /// RPython `codewriter.py:68` `jitcode.index = index` — sequential
-    /// position in `all_jitcodes[]`. Set by `CodeWriter` after assembly.
-    /// Used by `inline_call` ops to reference callee jitcode by index.
+    /// position in `all_jitcodes[]`. Set at `CallControl::get_jitcode`
+    /// allocation time. Used by `inline_call` ops to reference callee
+    /// jitcode by index.
     pub index: usize,
     /// RPython `jitcode.py:19` `self._called_from = called_from` — debug:
     /// which call graph first triggered this jitcode's creation. In RPython
     /// this is a graph object; pyre uses an optional CallPath string.
     #[serde(default, skip_serializing)]
     pub _called_from: Option<String>,
-    /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
-    /// flattened SSA representation, kept for `dump()` output. Set by
-    /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
-    #[serde(skip)]
-    pub _ssarepr: Option<crate::flatten::SSARepr>,
+    /// Body — set once after assembly via `set_body`. Direct field accesses
+    /// like `jitcode.code` continue to work via `Deref<Target=JitCodeBody>`.
+    #[serde(with = "oncelock_body_serde")]
+    body: OnceLock<JitCodeBody>,
+}
+
+mod oncelock_usize_serde {
+    use std::sync::OnceLock;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(lock: &OnceLock<usize>, ser: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&lock.get().copied(), ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<OnceLock<usize>, D::Error> {
+        let opt: Option<usize> = Option::deserialize(de)?;
+        let lock = OnceLock::new();
+        if let Some(v) = opt {
+            let _ = lock.set(v);
+        }
+        Ok(lock)
+    }
+}
+
+mod oncelock_body_serde {
+    use std::sync::OnceLock;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::JitCodeBody;
+
+    pub fn serialize<S: Serializer>(
+        lock: &OnceLock<JitCodeBody>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&lock.get(), ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<OnceLock<JitCodeBody>, D::Error> {
+        let opt: Option<JitCodeBody> = Option::deserialize(de)?;
+        let lock = OnceLock::new();
+        if let Some(v) = opt {
+            let _ = lock.set(v);
+        }
+        Ok(lock)
+    }
 }
 
 impl JitCode {
@@ -113,31 +190,80 @@ impl JitCode {
     /// `constants_*`, `c_num_regs_*`, `startpoints`, etc. via the
     /// assembler.
     ///
-    /// `fnaddr`, `calldescr`, `_called_from`, and `_ssarepr` from RPython
-    /// are not yet ported (pyre lacks lltype function pointers and uses
-    /// `CallPath` instead of `funcptr._obj.graph`).
+    /// `calldescr`, `_called_from`, and `_ssarepr` from RPython are not
+    /// fully ported at construction time. `fnaddr` starts as 0 here and is
+    /// filled by `CallControl::get_jitcode()` when a graph-backed shell is
+    /// allocated.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             fnaddr: 0,
-            calldescr: BhCallDescr::default(),
-            jitdriver_sd: None,
-            code: Vec::new(),
-            constants_i: Vec::new(),
-            constants_r: Vec::new(),
-            constants_f: Vec::new(),
-            c_num_regs_i: 255,
-            c_num_regs_r: 255,
-            c_num_regs_f: 255,
-            startpoints: HashSet::new(),
-            alllabels: HashSet::new(),
-            resulttypes: HashMap::new(),
+            jitdriver_sd: OnceLock::new(),
             index: 0,
             _called_from: None,
-            _ssarepr: None,
+            body: OnceLock::new(),
         }
     }
 
+    /// Body accessor — panics if `set_body` has not run.
+    ///
+    /// RPython does not have an explicit body/header split; pyre groups
+    /// late-set fields here so `Arc<JitCode>` shells can be filled while
+    /// shared (e.g. when `IndirectCallTargets` already holds clones).
+    pub fn body(&self) -> &JitCodeBody {
+        self.body
+            .get()
+            .expect("JitCode body not yet set — call set_body() before reading body fields")
+    }
+
+    /// Optional body accessor — returns `None` while the JitCode is still
+    /// a shell awaiting assembly.
+    pub fn try_body(&self) -> Option<&JitCodeBody> {
+        self.body.get()
+    }
+
+    /// Commit the body once assembly has produced it. Panics on second
+    /// call (RPython equivalent: `JitCode.setup` is also called once per
+    /// jitcode lifetime).
+    pub fn set_body(&self, body: JitCodeBody) {
+        self.body
+            .set(body)
+            .map_err(|_| ())
+            .expect("JitCode body already set");
+    }
+
+    /// `Some(idx)` when this jitcode is the portal of jitdriver `idx`.
+    /// RPython `jitcode.py:18` `self.jitdriver_sd = None` (overwritten by
+    /// `grab_initial_jitcodes` / `drain_pending_graphs`).
+    pub fn jitdriver_sd(&self) -> Option<usize> {
+        self.jitdriver_sd.get().copied()
+    }
+
+    /// Set `jitdriver_sd` once. Panics on second call.
+    pub fn set_jitdriver_sd(&self, idx: usize) {
+        self.jitdriver_sd
+            .set(idx)
+            .expect("JitCode jitdriver_sd already set");
+    }
+
+    /// RPython `jitcode.py:17` reader. Convenience for callers that
+    /// would otherwise write `jitcode.body().calldescr`.
+    pub fn calldescr(&self) -> &BhCallDescr {
+        &self.body().calldescr
+    }
+}
+
+/// Allow existing callers to keep `jitcode.code`, `jitcode.constants_i`,
+/// `jitcode.startpoints`, etc. through `Deref<Target=JitCodeBody>`.
+/// Panics if the body has not been committed yet.
+impl Deref for JitCode {
+    type Target = JitCodeBody;
+    fn deref(&self) -> &JitCodeBody {
+        self.body()
+    }
+}
+
+impl JitCode {
     /// RPython `jitcode.py:114-119` `def dump(self)`:
     ///
     /// ```python
@@ -260,6 +386,80 @@ impl JitCode {
 impl std::fmt::Display for JitCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<JitCode {:?}>", self.name)
+    }
+}
+
+/// Identity-keyed handle around `Arc<JitCode>`, mirroring Python set/dict
+/// behaviour where `JitCode` instances are deduped by object identity
+/// (RPython `IndirectCallTargets.lst` is a list of JitCode objects;
+/// `Assembler.indirectcalltargets` is a `set` of those objects keyed by
+/// identity).
+///
+/// Callers use `JitCodeHandle::from(arc)` / `handle.into_inner()` to
+/// move between the wrapper and the underlying `Arc<JitCode>`. Display
+/// and Deref pass through to the inner JitCode.
+#[derive(Debug, Clone)]
+pub struct JitCodeHandle(pub std::sync::Arc<JitCode>);
+
+impl JitCodeHandle {
+    pub fn new(arc: std::sync::Arc<JitCode>) -> Self {
+        Self(arc)
+    }
+
+    pub fn into_inner(self) -> std::sync::Arc<JitCode> {
+        self.0
+    }
+
+    pub fn as_arc(&self) -> &std::sync::Arc<JitCode> {
+        &self.0
+    }
+}
+
+impl PartialEq for JitCodeHandle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for JitCodeHandle {}
+
+impl std::hash::Hash for JitCodeHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (std::sync::Arc::as_ptr(&self.0) as *const () as usize).hash(state);
+    }
+}
+
+impl std::ops::Deref for JitCodeHandle {
+    type Target = JitCode;
+    fn deref(&self) -> &JitCode {
+        &self.0
+    }
+}
+
+impl From<std::sync::Arc<JitCode>> for JitCodeHandle {
+    fn from(arc: std::sync::Arc<JitCode>) -> Self {
+        Self(arc)
+    }
+}
+
+mod jitcode_handle_serde {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{JitCode, JitCodeHandle};
+
+    impl Serialize for JitCodeHandle {
+        fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+            (*self.0).serialize(ser)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for JitCodeHandle {
+        fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+            let jc = JitCode::deserialize(de)?;
+            Ok(JitCodeHandle(Arc::new(jc)))
+        }
     }
 }
 

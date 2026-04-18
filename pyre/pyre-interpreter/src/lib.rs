@@ -20,6 +20,7 @@ pub mod executioncontext;
 pub mod frame_array;
 pub mod function;
 pub mod gateway;
+pub mod jit_fnaddr;
 pub mod listobject;
 pub mod opcode_ops;
 pub mod pycode;
@@ -51,6 +52,7 @@ pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, builtin_code_get, builtin_code_name,
     builtin_code_new, is_builtin_code, make_builtin_function, make_module_builtin_function,
 };
+pub use jit_fnaddr::*;
 pub use malachite_bigint::BigInt as PyBigInt;
 pub use opcode_ops::*;
 pub use pycode::*;

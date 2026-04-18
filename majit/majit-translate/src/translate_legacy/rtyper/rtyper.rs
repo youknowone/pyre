@@ -184,6 +184,10 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
                 ConcreteType::Signed
             }
         }
+        // Vtable funcptr extraction returns an integer pointer (RPython
+        // `op.args[0]` of `indirect_call` is `Ptr(FuncType)`).
+        OpKind::VtableMethodPtr { .. } => ConcreteType::Signed,
+        OpKind::IndirectCall { result_ty, .. } => valuetype_to_concrete(result_ty),
         _ => ConcreteType::Unknown,
     }
 }

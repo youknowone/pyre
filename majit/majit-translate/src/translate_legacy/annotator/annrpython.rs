@@ -163,7 +163,8 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         OpKind::CurrentTraceLength => ValueType::Int,
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Int,
         // RPython: vtable entry is a `Ptr(FuncType)` address.
-        OpKind::FuncptrFromVtable { .. } => ValueType::Int,
+        OpKind::VtableMethodPtr { .. } => ValueType::Int,
+        OpKind::IndirectCall { result_ty, .. } => result_ty.clone(),
         OpKind::CallElidable { result_kind, .. }
         | OpKind::CallResidual { result_kind, .. }
         | OpKind::CallMayForce { result_kind, .. }

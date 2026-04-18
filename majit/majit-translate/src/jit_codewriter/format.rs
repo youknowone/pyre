@@ -217,13 +217,12 @@ fn list_of_kind_repr(
     format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
 }
 
-/// format.py:20-23 — render a `funcptr` Constant slot.
+/// format.py:20-23 — render a `funcptr` slot.
 ///
 /// Upstream emits `$<* struct <name>>` for `Constant(lltype.Ptr(Struct))`
 /// and `$<value>` otherwise.  Pyre's codewrite-time funcptr surrogate is
-/// the [`crate::model::CallTarget`] stored on `CallDescriptor.target`,
-/// which we render in the `$<* function '<path>'>` shape that mirrors
-/// the upstream Ptr-to-Struct repr.
+/// either a symbolic [`crate::model::CallTarget`] or a runtime
+/// [`crate::model::ValueId`].
 fn call_target_repr(target: &crate::model::CallTarget) -> String {
     use crate::model::CallTarget;
     match target {
@@ -242,6 +241,16 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
             method_name,
         } => format!("$<* indirect 'dyn {trait_root}::{method_name}'>"),
         CallTarget::UnsupportedExpr => "$<unsupported call target>".to_string(),
+    }
+}
+
+fn call_funcptr_repr(
+    funcptr: &crate::model::CallFuncPtr,
+    kinds: &std::collections::HashMap<crate::model::ValueId, crate::flatten::RegKind>,
+) -> String {
+    match funcptr {
+        crate::model::CallFuncPtr::Target(target) => call_target_repr(target),
+        crate::model::CallFuncPtr::Value(value) => register_repr(*value, kinds),
     }
 }
 
@@ -377,7 +386,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
             args_f,
             ..
         } => {
-            let mut parts = vec![call_target_repr(funcptr)];
+            let mut parts = vec![call_funcptr_repr(funcptr, kinds)];
             // jtransform.py:430-433 — emit each ListOfKind only when the
             // matching kind char is in the signature.
             if !args_i.is_empty() {
@@ -547,7 +556,7 @@ mod tests {
     fn format_residual_call_emits_descr_and_listofkind() {
         // jtransform.py:414-435 + format.py:27,32-33.
         use crate::call::CallDescriptor;
-        use crate::model::{CallTarget, OpKind, SpaceOperation};
+        use crate::model::{CallFuncPtr, CallTarget, OpKind, SpaceOperation};
         use majit_ir::descr::EffectInfo;
 
         let mut ssa = empty_ssa();
@@ -559,7 +568,7 @@ mod tests {
         let descriptor = CallDescriptor::known(EffectInfo::default());
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::CallResidual {
-                funcptr,
+                funcptr: CallFuncPtr::Target(funcptr),
                 descriptor,
                 args_i: vec![ValueId(1)],
                 args_r: vec![ValueId(2)],

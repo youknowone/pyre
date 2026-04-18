@@ -88,11 +88,13 @@ fn main() {
     // setter overrides it.  PRE-EXISTING-ADAPTATION documented at
     // `CallControl::make_virtualizable_infos`.
     let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
-    let pipeline = majit_translate::analyze_multiple_pipeline_with_vinfo_factory(
+    let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
+    let pipeline = majit_translate::analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
         &source_refs,
         &analyze_config,
         None,
         vinfo_factory,
+        &fnaddr_bindings,
     );
 
     // Generate tracing code from the canonical graph-first analysis result.

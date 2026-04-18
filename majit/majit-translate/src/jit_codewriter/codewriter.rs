@@ -62,16 +62,32 @@ impl CodeWriter {
         graph: &FunctionGraph,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
-        index: usize,
-    ) -> (SSARepr, JitCode) {
+        jitcode: &std::sync::Arc<JitCode>,
+    ) -> SSARepr {
         // RPython: graph = copygraph(graph, shallowvars=True) (codewriter.py:38)
         // In Rust, Transformer.transform() already clones the graph.
 
         // Step 0: annotate + rtype (majit-specific)
         // RPython: types are already on Variable.concretetype from the rtyper.
         let annotations = crate::translate_legacy::annotator::annrpython::annotate(graph);
-        let type_state =
+        let mut type_state =
             crate::translate_legacy::rtyper::rtyper::resolve_types(graph, &annotations);
+
+        // Step 0b: rtyper-equivalent indirect_call lowering
+        // (`translator/rtyper/rpbc.rs::lower_indirect_calls`).
+        // RPython rpbc.py:199-217 emits `indirect_call(funcptr, *args,
+        // c_graphs)` during rtype; pyre runs the same pass here so
+        // jtransform sees `OpKind::IndirectCall` (with funcptr already
+        // a regular ValueId), never `CallTarget::Indirect`.
+        let mut graph_owned = graph.clone();
+        crate::translator::rtyper::rpbc::lower_indirect_calls(
+            &mut graph_owned,
+            &mut type_state,
+            callcontrol,
+        );
+        #[cfg(debug_assertions)]
+        crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
+        let graph = &graph_owned;
 
         // Step 1: jtransform (codewriter.py:42)
         // RPython: transform_graph(graph, cpu, callcontrol, portal_jd)
@@ -83,22 +99,33 @@ impl CodeWriter {
         };
         // Transformer is dropped here, releasing the &mut CallControl borrow.
 
+        // Re-resolve types on the post-jtransform graph: jtransform synthesizes
+        // fresh ValueIds (e.g. ConstInt funcptrs from `direct_funcptr_value`)
+        // that the original `type_state` never saw. The rerun supplies kinds
+        // for those new IDs so `build_value_kinds` covers every operand
+        // reaching regalloc/flatten. RPython has no analogue because its
+        // jtransform preserves Variable.concretetype on every newly created
+        // Variable; pyre's side-table needs the rebuild.
+        let rewritten_type_state =
+            crate::translate_legacy::rtyper::rtyper::resolve_types(&rewritten.graph, &annotations);
+
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
-        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
+        let value_kinds =
+            crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_type_state);
         let regallocs =
             crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
 
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
-        let mut ssarepr = flatten_with_types(&rewritten.graph, &type_state);
+        let mut ssarepr = flatten_with_types(&rewritten.graph, &rewritten_type_state);
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
         // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)
-        // In majit, assemble() calls compute_liveness() internally.
-        let mut jitcode = self.assembler.assemble(&mut ssarepr, &regallocs);
-        // RPython: jitcode.index = index (codewriter.py:68)
-        jitcode.index = index;
+        // In majit, assemble() calls compute_liveness() internally and now
+        // returns the body so the codewriter can fill calldescr before
+        // committing the shell via `set_body`.
+        let mut body = self.assembler.assemble(&mut ssarepr, &regallocs);
 
         // call.py:174-187 get_jitcode_calldescr:
         // Compute calldescr from the function's argument and result types.
@@ -113,11 +140,18 @@ impl CodeWriter {
                     None => arg_classes.push('i'),
                 }
             }
-            jitcode.calldescr = crate::jitcode::BhCallDescr {
+            body.calldescr = crate::jitcode::BhCallDescr {
                 arg_classes,
                 result_type: 'v', // default; overridden by portal setup
             };
         }
+
+        // Commit the body to the pre-allocated `Arc<JitCode>` shell.
+        // RPython mutates the JitCode in place; pyre uses `OnceLock`
+        // so that shells handed out earlier (e.g. into
+        // `JitDriverStaticData.mainjitcode` by `grab_initial_jitcodes`)
+        // see the same body without locking.
+        jitcode.set_body(body);
 
         if self.debug {
             eprintln!(
@@ -131,7 +165,7 @@ impl CodeWriter {
             );
         }
 
-        (ssarepr, jitcode)
+        ssarepr
     }
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
@@ -141,28 +175,24 @@ impl CodeWriter {
         &mut self,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
-    ) -> Vec<JitCode> {
+    ) -> Vec<std::sync::Arc<JitCode>> {
         // RPython: self.callcontrol.grab_initial_jitcodes() (codewriter.py:76)
         callcontrol.grab_initial_jitcodes();
         self.make_jitcodes_pending(callcontrol, config)
     }
 
-    /// Drain pending graphs and transform each into a JitCode.
+    /// Drain pending graphs and fill each `Arc<JitCode>` shell's body.
     ///
-    /// RPython codewriter.py:79-84: the enum_pending_graphs loop.
-    ///
-    /// Places each JitCode at `all_jitcodes[jitcode.index]` directly,
-    /// guaranteeing the RPython invariant `all_jitcodes[i].index == i`
-    /// without post-hoc sorting.
-    ///
-    /// RPython achieves this naturally because `jitcode.index = len(all_jitcodes)`
-    /// at append time (codewriter.py:80). majit uses `get_jitcode()` allocation
-    /// indices instead, so we place by index rather than append.
+    /// RPython codewriter.py:79-84: the enum_pending_graphs loop. Pyre
+    /// stores the allocated `Arc<JitCode>` shells inside
+    /// `CallControl::jitcodes`; this loop pops one path at a time and
+    /// commits its body via `JitCode::set_body`. The
+    /// `all_jitcodes[i].index == i` invariant (RPython codewriter.py:80)
+    /// is guaranteed by `CallControl::collect_jitcodes_in_alloc_order`.
     pub fn drain_pending_graphs(
         &mut self,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
-        all_jitcodes: &mut Vec<Option<JitCode>>,
     ) {
         // RPython: for graph, jitcode in self.callcontrol.enum_pending_graphs():
         //            self.transform_graph_to_jitcode(graph, jitcode, verbose, len(all_jitcodes))
@@ -171,28 +201,20 @@ impl CodeWriter {
         // During transform, new graphs may be discovered and added via
         // get_jitcode(). We pop one at a time to match RPython's yield semantics.
         loop {
-            let Some((path, alloc_index)) = callcontrol.enum_pending_graphs() else {
+            let Some((path, jitcode)) = callcontrol.enum_pending_graphs() else {
                 break;
             };
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
                 continue;
             };
-            let (_ssarepr, mut jitcode) =
-                self.transform_graph_to_jitcode(&graph, callcontrol, config, alloc_index);
+            let _ssarepr = self.transform_graph_to_jitcode(&graph, callcontrol, config, &jitcode);
 
             // RPython call.py:148: jd.mainjitcode.jitdriver_sd = jd
             for jd in callcontrol.jitdrivers_sd() {
                 if jd.portal_graph == path {
-                    jitcode.jitdriver_sd = Some(jd.index);
+                    jitcode.set_jitdriver_sd(jd.index);
                 }
             }
-
-            // Place at the correct index position.
-            // RPython: all_jitcodes[jitcode.index] == jitcode
-            if alloc_index >= all_jitcodes.len() {
-                all_jitcodes.resize_with(alloc_index + 1, || None);
-            }
-            all_jitcodes[alloc_index] = Some(jitcode);
         }
     }
 
@@ -203,12 +225,10 @@ impl CodeWriter {
         &mut self,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
-    ) -> Vec<JitCode> {
-        let mut all_jitcodes: Vec<Option<JitCode>> = Vec::new();
-        self.drain_pending_graphs(callcontrol, config, &mut all_jitcodes);
+    ) -> Vec<std::sync::Arc<JitCode>> {
+        self.drain_pending_graphs(callcontrol, config);
         self.assembler.finished(&callcontrol.callinfocollection);
-        // Unwrap: every slot must be filled.
-        all_jitcodes.into_iter().flatten().collect()
+        callcontrol.collect_jitcodes_in_alloc_order()
     }
 }
 

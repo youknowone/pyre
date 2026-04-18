@@ -112,8 +112,11 @@ pub struct ProgramPipelineResult {
     pub functions: Vec<PipelineResult>,
     pub opcode_dispatch: Vec<PipelineOpcodeArm>,
     /// RPython: all_jitcodes returned by CodeWriter.make_jitcodes() (codewriter.py:89).
-    /// Assembled JitCode bytecode for each transformed graph.
-    pub jitcodes: Vec<crate::jitcode::JitCode>,
+    /// Assembled JitCode bytecode for each transformed graph. `Arc` so the
+    /// shells handed out earlier (e.g. into
+    /// `JitDriverStaticData.mainjitcode` or `IndirectCallTargets`) share
+    /// identity with the values appearing here.
+    pub jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
@@ -140,9 +143,10 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     let vable_rewrites = transform_result.vable_rewrites;
     let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();
+    let rewritten_types = resolve_types(&transform_result.graph, &annotations);
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
-    let flattened = flatten::flatten_with_types(&transform_result.graph, &types);
+    let flattened = flatten::flatten_with_types(&transform_result.graph, &rewritten_types);
 
     PipelineResult {
         name: func.name.clone(),

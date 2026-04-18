@@ -207,9 +207,12 @@ pub struct JitDriverStaticData {
     pub red_types: Vec<String>,
     /// Portal graph path.
     pub portal_graph: CallPath,
-    /// RPython: `jd.mainjitcode` (call.py:147) — JitCode index for the portal.
-    /// Set by `grab_initial_jitcodes()`.
-    pub mainjitcode: Option<usize>,
+    /// RPython: `jd.mainjitcode` (call.py:147) — `Arc<JitCode>` shell for
+    /// the portal. Set by `grab_initial_jitcodes()`. Matches the
+    /// metainterp-side `JitDriverStaticData.mainjitcode` shape so the
+    /// codewriter→metainterp boundary is plain Arc handoff (no index
+    /// translation step).
+    pub mainjitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
     /// warmspot.py:533 `jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
     ///
     /// `-1` for drivers without a virtualizable, otherwise the slot
@@ -283,10 +286,27 @@ pub struct CallControl {
     /// RPython: detected via `funcobj.graph.func.oopspec`.
     builtin_targets: HashSet<CallPath>,
 
-    /// RPython: `CallControl.jitcodes` — map {graph_key: jitcode_index}.
-    /// Tracks which graphs have been assigned JitCode objects.
-    /// The index is assigned sequentially and used by InlineCall ops.
-    jitcodes: HashMap<CallPath, usize>,
+    /// RPython: `CallControl.jitcodes` — map {graph_key: JitCode}.
+    /// Pyre stores `Arc<JitCode>` shells so callers (e.g.
+    /// `IndirectCallTargets`, `JitDriverStaticData.mainjitcode`,
+    /// `enum_pending_graphs`) can hold stable handles before the assembler
+    /// commits the body via `OnceLock` interior mutability.
+    jitcodes: HashMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
+
+    /// RPython call.py:174-187 resolves `getfunctionptr(graph)` to the
+    /// graph's real helper address before constructing `JitCode(name,
+    /// fnaddr, calldescr)`. majit's source-only codewriter cannot derive
+    /// that address from a parsed `CallPath`, so hosts may pre-bind the
+    /// concrete trace-call surface here. Unbound paths still fall back to
+    /// the stable symbolic address shim.
+    function_fnaddrs: HashMap<CallPath, i64>,
+
+    /// Allocation order of `Arc<JitCode>` shells. `jitcode_alloc_order[i]`
+    /// is the path whose `JitCode.index == i`. Used by
+    /// `collect_jitcodes_in_alloc_order` to materialise the
+    /// `all_jitcodes[]` vector with the RPython invariant
+    /// `all_jitcodes[i].index == i` (codewriter.py:80).
+    jitcode_alloc_order: Vec<CallPath>,
 
     /// RPython: `CallControl.unfinished_graphs` — graphs pending assembly.
     unfinished_graphs: Vec<CallPath>,
@@ -632,6 +652,8 @@ impl CallControl {
             jitdrivers_sd: Vec::new(),
             builtin_targets: HashSet::new(),
             jitcodes: HashMap::new(),
+            function_fnaddrs: HashMap::new(),
+            jitcode_alloc_order: Vec::new(),
             unfinished_graphs: Vec::new(),
             callinfocollection: majit_ir::CallInfoCollection::new(),
             virtualizable_analyzer: majit_ir::effectinfo::VirtualizableAnalyzer,
@@ -786,6 +808,49 @@ impl CallControl {
         if !hints.is_empty() {
             self.function_hints.insert(path, hints);
         }
+    }
+
+    /// Bind a real helper trace-call address to a canonical CallPath.
+    ///
+    /// RPython obtains this from `getfunctionptr(graph)`; majit callers
+    /// that have access to the compiled helper surface can preload the
+    /// equivalent integer address here so `get_jitcode()` and
+    /// `fnaddr_for_target()` no longer fall back to symbolic hashes.
+    pub fn register_function_fnaddr(&mut self, path: CallPath, fnaddr: i64) {
+        self.function_fnaddrs.insert(path, fnaddr);
+    }
+
+    /// Consume a `#[jit_module]::__majit_helper_trace_fnaddrs()` entry.
+    ///
+    /// The macro-generated registry uses `module_path!()` and therefore
+    /// prefixes paths with the crate name (e.g. `"mycrate::helpers::foo"`),
+    /// while codewriter canonical paths are stored both as
+    /// `"helpers::foo"` and `"crate::helpers::foo"`. Bind both aliases so
+    /// either spelling resolves to the real helper address.
+    pub fn register_macro_helper_trace_fnaddr(&mut self, full_path: &str, fnaddr: i64) {
+        if fnaddr == 0 {
+            return;
+        }
+        let segments: Vec<&str> = full_path
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if segments.is_empty() {
+            return;
+        }
+        let canonical = if segments.len() > 1 {
+            &segments[1..]
+        } else {
+            &segments[..]
+        };
+        if canonical.is_empty() {
+            return;
+        }
+        self.register_function_fnaddr(CallPath::from_segments(canonical.iter().copied()), fnaddr);
+        let mut crate_alias = Vec::with_capacity(canonical.len() + 1);
+        crate_alias.push("crate");
+        crate_alias.extend(canonical.iter().copied());
+        self.register_function_fnaddr(CallPath::from_segments(crate_alias), fnaddr);
     }
 
     /// Register a trait impl method graph.
@@ -1367,16 +1432,20 @@ impl CallControl {
 
     /// RPython: `CallControl.get_jitcode(graph, called_from)`.
     ///
-    /// Retrieve or create a JitCode index for the given graph.
-    /// Returns the index that should be embedded in `InlineCall` ops
-    /// so the meta-interpreter can find the callee's bytecode.
+    /// Retrieve or create the `Arc<JitCode>` shell for the given graph.
+    /// The shell carries `name`/`index` plus the graph's bound helper
+    /// address when available, otherwise the stable symbolic fallback; the
+    /// body is filled later by `CodeWriter::transform_graph_to_jitcode`
+    /// via `JitCode::set_body`.
+    /// Callers that only need the integer index (e.g. `InlineCall` ops)
+    /// read `.index` on the returned shell.
     ///
     /// RPython call.py:155-172: creates JitCode(graph.name, fnaddr, calldescr)
     /// and adds graph to unfinished_graphs for later assembly.
-    pub fn get_jitcode(&mut self, path: &CallPath) -> usize {
+    pub fn get_jitcode(&mut self, path: &CallPath) -> std::sync::Arc<crate::jitcode::JitCode> {
         // RPython call.py:157-158: try: return self.jitcodes[graph]
-        if let Some(&index) = self.jitcodes.get(path) {
-            return index;
+        if let Some(arc) = self.jitcodes.get(path) {
+            return arc.clone();
         }
         // RPython call.py:159-165: except KeyError:
         //   must never produce JitCode for close_stack.
@@ -1387,9 +1456,54 @@ impl CallControl {
         );
         let index = self.next_jitcode_index;
         self.next_jitcode_index += 1;
-        self.jitcodes.insert(path.clone(), index);
+        // Shell name mirrors RPython `graph.name`. We use the path's last
+        // segment to stay readable in dumps; the assembler no longer
+        // touches the name (it lives on the shell from allocation).
+        let name = path
+            .last_segment()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{path:?}"));
+        let mut shell = crate::jitcode::JitCode::new(name);
+        shell.index = index;
+        shell.fnaddr = self
+            .function_fnaddrs
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| symbolic_fnaddr_for_path(path));
+        let arc = std::sync::Arc::new(shell);
+        self.jitcodes.insert(path.clone(), arc.clone());
+        self.jitcode_alloc_order.push(path.clone());
         self.unfinished_graphs.push(path.clone());
-        index
+        arc
+    }
+
+    /// Read-only handle lookup. Returns `None` for paths that have not
+    /// been allocated by `get_jitcode` yet.
+    pub fn jitcode_handle(
+        &self,
+        path: &CallPath,
+    ) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
+        self.jitcodes.get(path).cloned()
+    }
+
+    /// Collect every `Arc<JitCode>` shell whose body has been committed,
+    /// in allocation order. Shells whose graph was never registered (and
+    /// therefore never reached `transform_graph_to_jitcode`) are skipped.
+    /// This mirrors the previous `Vec<Option<JitCode>>.into_iter().flatten()`
+    /// shape and preserves `result[i].index == i` for the populated
+    /// subsequence (RPython codewriter.py:80 invariant).
+    pub fn collect_jitcodes_in_alloc_order(&self) -> Vec<std::sync::Arc<crate::jitcode::JitCode>> {
+        self.jitcode_alloc_order
+            .iter()
+            .filter_map(|p| {
+                let arc = self.jitcodes[p].clone();
+                if arc.try_body().is_some() {
+                    Some(arc)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// RPython: `CallControl.grab_initial_jitcodes()` (call.py:145-148).
@@ -1401,7 +1515,10 @@ impl CallControl {
     ///         jd.mainjitcode.jitdriver_sd = jd
     /// ```
     ///
-    /// Creates JitCode entries for portal graphs and sets back-references.
+    /// Allocates `Arc<JitCode>` shells for portal graphs and stores them
+    /// directly on each jitdriver. The `jitdriver_sd` back-reference is
+    /// committed later by `CodeWriter::drain_pending_graphs` once the
+    /// portal's body is assembled.
     pub fn grab_initial_jitcodes(&mut self) {
         // Collect portal paths first to avoid borrow conflict.
         let portals: Vec<(usize, CallPath)> = self
@@ -1412,10 +1529,8 @@ impl CallControl {
             .collect();
         for (jd_index, portal) in portals {
             // RPython: jd.mainjitcode = self.get_jitcode(jd.portal_graph)
-            let jitcode_index = self.get_jitcode(&portal);
-            // RPython: jd.mainjitcode.jitdriver_sd = jd
-            // (In majit, we store the jitcode index on the jitdriver.)
-            self.jitdrivers_sd[jd_index].mainjitcode = Some(jitcode_index);
+            let arc = self.get_jitcode(&portal);
+            self.jitdrivers_sd[jd_index].mainjitcode = Some(arc);
         }
     }
 
@@ -1432,10 +1547,12 @@ impl CallControl {
     /// During processing, new graphs may be added to `unfinished_graphs`
     /// via `get_jitcode()`, and the generator picks them up on the next
     /// iteration. We emulate this with `enum_pending_graphs()`.
-    pub fn enum_pending_graphs(&mut self) -> Option<(CallPath, usize)> {
+    pub fn enum_pending_graphs(
+        &mut self,
+    ) -> Option<(CallPath, std::sync::Arc<crate::jitcode::JitCode>)> {
         let path = self.unfinished_graphs.pop()?; // LIFO, matching RPython
-        let index = self.jitcodes[&path];
-        Some((path, index))
+        let arc = self.jitcodes[&path].clone();
+        Some((path, arc))
     }
 
     /// Classify a call target.
@@ -1568,6 +1685,22 @@ impl CallControl {
         }
     }
 
+    /// RPython `call.py:181-183` uses `getfunctionptr(graph)` to obtain the
+    /// integer funcptr identity for a call site. majit prefers a host-bound
+    /// trace-call address when one has been registered for the resolved
+    /// `CallPath`; otherwise it falls back to the stable symbolic address
+    /// shim for source-only analysis.
+    pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
+        if let Some(path) = self.target_to_path(target) {
+            return self
+                .function_fnaddrs
+                .get(&path)
+                .copied()
+                .unwrap_or_else(|| symbolic_fnaddr_for_path(&path));
+        }
+        symbolic_fnaddr_for_target(target)
+    }
+
     /// Resolve a method call to a concrete impl graph.
     ///
     /// RPython: method resolution happens at the type system level.
@@ -1698,6 +1831,30 @@ impl CallControl {
         }
     }
 
+    /// RPython `call.py:94-114` indirect branch after `rpbc.py` has already
+    /// attached the full family to the op: filter that family by
+    /// `is_candidate(graph)` and return only the regular-candidate subset.
+    ///
+    /// `graphs=None` means an unknown family (`graphanalyze.py:117-121`), so
+    /// there is no candidate subset to inline.
+    pub fn graphs_from_indirect_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+    ) -> Option<Vec<CallPath>> {
+        let graphs = graphs?;
+        let mut result = Vec::new();
+        for path in graphs {
+            if self.candidate_graphs.contains(path) {
+                result.push(path.clone());
+            }
+        }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
     /// Collect every registered impl `CallPath` for a
     /// `(trait_root, method_name)` family, regardless of whether each
     /// one is a regular candidate.  Used by family-wide validation
@@ -1739,6 +1896,17 @@ impl CallControl {
             }
         }
         Ok(())
+    }
+
+    /// RPython `call.py:116-139` indirect branch over an already-materialized
+    /// family: regular only when at least one family member is a candidate
+    /// graph, residual otherwise. Unknown families stay residual.
+    pub fn guess_indirect_call_kind(&self, graphs: Option<&[CallPath]>) -> CallKind {
+        if self.graphs_from_indirect_family(graphs).is_some() {
+            CallKind::Regular
+        } else {
+            CallKind::Residual
+        }
     }
 
     /// Access the function graphs map (for inline pass).
@@ -1870,6 +2038,20 @@ impl CallControl {
                             return true;
                         }
                     }
+                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                        None => return true, // graphanalyze.py:117-121 → top_result()
+                        Some(graphs) => {
+                            for callee_path in graphs {
+                                if self.analyze_can_raise_impl(
+                                    callee_path,
+                                    seen,
+                                    ignore_memoryerror,
+                                ) {
+                                    return true;
+                                }
+                            }
+                        }
+                    },
                     other => {
                         if op_can_raise(other, ignore_memoryerror) {
                             return true;
@@ -1909,6 +2091,16 @@ impl CallControl {
                             return true;
                         }
                     }
+                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                        None => return true, // BoolGraphAnalyzer.top_result()
+                        Some(graphs) => {
+                            for callee_path in graphs {
+                                if self.analyze_forces_virtualizable(callee_path, seen) {
+                                    return true;
+                                }
+                            }
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -1951,15 +2143,28 @@ impl CallControl {
         // Only recursive calls into graphs can propagate random effects.
         for block in &graph.blocks {
             for op in &block.operations {
-                if let OpKind::Call { target, .. } = &op.kind {
-                    let callee_path = match self.target_to_path(target) {
-                        Some(p) => p,
-                        // Unresolvable target = external call → False
-                        None => continue,
-                    };
-                    if self.analyze_random_effects(&callee_path, seen) {
-                        return true;
+                match &op.kind {
+                    OpKind::Call { target, .. } => {
+                        let callee_path = match self.target_to_path(target) {
+                            Some(p) => p,
+                            // Unresolvable target = external call → False
+                            None => continue,
+                        };
+                        if self.analyze_random_effects(&callee_path, seen) {
+                            return true;
+                        }
                     }
+                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                        None => return true, // BoolGraphAnalyzer.top_result()
+                        Some(graphs) => {
+                            for callee_path in graphs {
+                                if self.analyze_random_effects(callee_path, seen) {
+                                    return true;
+                                }
+                            }
+                        }
+                    },
+                    _ => {}
                 }
             }
         }
@@ -1985,14 +2190,27 @@ impl CallControl {
             for op in &block.operations {
                 // RPython: jit_force_quasi_immutable → true
                 // majit: no such op yet, but check calls transitively
-                if let OpKind::Call { target, .. } = &op.kind {
-                    let callee_path = match self.target_to_path(target) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    if self.analyze_can_invalidate(&callee_path, seen) {
-                        return true;
+                match &op.kind {
+                    OpKind::Call { target, .. } => {
+                        let callee_path = match self.target_to_path(target) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        if self.analyze_can_invalidate(&callee_path, seen) {
+                            return true;
+                        }
                     }
+                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                        None => return true, // BoolGraphAnalyzer.top_result()
+                        Some(graphs) => {
+                            for callee_path in graphs {
+                                if self.analyze_can_invalidate(callee_path, seen) {
+                                    return true;
+                                }
+                            }
+                        }
+                    },
+                    _ => {}
                 }
             }
         }
@@ -2043,16 +2261,29 @@ impl CallControl {
                 // majit codewriter graphs have no LL_OPERATIONS; the only
                 // operations that can trigger GC are transitive through calls.
                 // (All other OpKind variants are pure/field/array ops.)
-                if let OpKind::Call { target, .. } = &op.kind {
-                    // graphanalyze.py:139-164: analyze_direct_call — recurse
-                    let callee_path = match self.target_to_path(target) {
-                        Some(p) => p,
-                        // graphanalyze.py:60: external call → bottom_result (False)
-                        None => continue,
-                    };
-                    if self.analyze_can_collect(&callee_path, seen) {
-                        return true;
+                match &op.kind {
+                    OpKind::Call { target, .. } => {
+                        // graphanalyze.py:139-164: analyze_direct_call — recurse
+                        let callee_path = match self.target_to_path(target) {
+                            Some(p) => p,
+                            // graphanalyze.py:60: external call → bottom_result (False)
+                            None => continue,
+                        };
+                        if self.analyze_can_collect(&callee_path, seen) {
+                            return true;
+                        }
                     }
+                    OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                        None => return true, // BoolGraphAnalyzer.top_result()
+                        Some(graphs) => {
+                            for callee_path in graphs {
+                                if self.analyze_can_collect(callee_path, seen) {
+                                    return true;
+                                }
+                            }
+                        }
+                    },
+                    _ => {}
                 }
             }
         }
@@ -2070,11 +2301,7 @@ impl CallControl {
     /// If (1) is True and (2) is False → "mem" (MemoryErrorOnly).
     /// If (1) is True and (2) is True → True.
     /// If (1) is False → False.
-    fn cached_can_raise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
-        let path = match self.target_to_path(target) {
-            Some(p) => p,
-            None => return CanRaise::Yes,
-        };
+    fn cached_can_raise_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> CanRaise {
         if let Some(&result) = cache.can_raise.get(&path) {
             return result;
         }
@@ -2096,73 +2323,173 @@ impl CallControl {
                 CanRaise::MemoryErrorOnly
             }
         };
-        cache.can_raise.insert(path, result);
+        cache.can_raise.insert(path.clone(), result);
+        result
+    }
+
+    fn cached_can_raise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            None => return CanRaise::Yes,
+        };
+        self.cached_can_raise_path(&path, cache)
+    }
+
+    fn cached_can_raise_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        cache: &mut AnalysisCache,
+    ) -> CanRaise {
+        let graphs = match graphs {
+            Some(graphs) => graphs,
+            None => return CanRaise::Yes,
+        };
+        let mut result = CanRaise::No;
+        for path in graphs {
+            match self.cached_can_raise_path(path, cache) {
+                CanRaise::Yes => return CanRaise::Yes,
+                CanRaise::MemoryErrorOnly => result = CanRaise::MemoryErrorOnly,
+                CanRaise::No => {}
+            }
+        }
         result
     }
 
     /// Cached version of analyze_forces_virtualizable for a CallTarget.
     /// RPython: VirtualizableAnalyzer external calls → bottom_result (False).
-    fn cached_forces_virtualizable(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
-        let path = match self.target_to_path(target) {
-            Some(p) => p,
-            None => return false, // external → False (RPython bottom_result)
-        };
+    fn cached_forces_virtualizable_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
         if let Some(&result) = cache.forces_virtualizable.get(&path) {
             return result;
         }
         let mut seen = HashSet::new();
         let result = self.analyze_forces_virtualizable(&path, &mut seen);
-        cache.forces_virtualizable.insert(path, result);
+        cache.forces_virtualizable.insert(path.clone(), result);
         result
+    }
+
+    fn cached_forces_virtualizable(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            None => return false, // external → False (RPython bottom_result)
+        };
+        self.cached_forces_virtualizable_path(&path, cache)
+    }
+
+    fn cached_forces_virtualizable_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        cache: &mut AnalysisCache,
+    ) -> bool {
+        let graphs = match graphs {
+            Some(graphs) => graphs,
+            None => return true,
+        };
+        graphs
+            .iter()
+            .any(|path| self.cached_forces_virtualizable_path(path, cache))
     }
 
     /// Cached version of analyze_random_effects for a CallTarget.
     /// RPython: RandomEffectsAnalyzer defaults to False for external calls.
-    fn cached_random_effects(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
-        let path = match self.target_to_path(target) {
-            Some(p) => p,
-            None => return false, // external call → False (RPython default)
-        };
+    fn cached_random_effects_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
         if let Some(&result) = cache.random_effects.get(&path) {
             return result;
         }
         let mut seen = HashSet::new();
         let result = self.analyze_random_effects(&path, &mut seen);
-        cache.random_effects.insert(path, result);
+        cache.random_effects.insert(path.clone(), result);
         result
     }
 
-    /// Cached version of analyze_can_invalidate for a CallTarget.
-    fn cached_can_invalidate(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
+    fn cached_random_effects(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
         let path = match self.target_to_path(target) {
             Some(p) => p,
-            None => return false,
+            None => return false, // external call → False (RPython default)
         };
+        self.cached_random_effects_path(&path, cache)
+    }
+
+    fn cached_random_effects_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        cache: &mut AnalysisCache,
+    ) -> bool {
+        let graphs = match graphs {
+            Some(graphs) => graphs,
+            None => return true,
+        };
+        graphs
+            .iter()
+            .any(|path| self.cached_random_effects_path(path, cache))
+    }
+
+    /// Cached version of analyze_can_invalidate for a CallTarget.
+    fn cached_can_invalidate_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
         if let Some(&result) = cache.can_invalidate.get(&path) {
             return result;
         }
         let mut seen = HashSet::new();
         let result = self.analyze_can_invalidate(&path, &mut seen);
-        cache.can_invalidate.insert(path, result);
+        cache.can_invalidate.insert(path.clone(), result);
         result
+    }
+
+    fn cached_can_invalidate(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
+        let path = match self.target_to_path(target) {
+            Some(p) => p,
+            None => return false,
+        };
+        self.cached_can_invalidate_path(&path, cache)
+    }
+
+    fn cached_can_invalidate_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        cache: &mut AnalysisCache,
+    ) -> bool {
+        let graphs = match graphs {
+            Some(graphs) => graphs,
+            None => return true,
+        };
+        graphs
+            .iter()
+            .any(|path| self.cached_can_invalidate_path(path, cache))
     }
 
     /// Cached version of analyze_can_collect for a CallTarget.
     /// RPython: collect_analyzer.analyze(op, self.seen_gc) (collectanalyze.py).
     /// graphanalyze.py:60: analyze_external_call → bottom_result() (False).
+    fn cached_can_collect_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
+        if let Some(&result) = cache.can_collect.get(&path) {
+            return result;
+        }
+        let mut seen = HashSet::new();
+        let result = self.analyze_can_collect(&path, &mut seen);
+        cache.can_collect.insert(path.clone(), result);
+        result
+    }
+
     fn cached_can_collect(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
         let path = match self.target_to_path(target) {
             Some(p) => p,
             // graphanalyze.py:60: analyze_external_call → bottom_result() (False)
             None => return false,
         };
-        if let Some(&result) = cache.can_collect.get(&path) {
-            return result;
-        }
-        let mut seen = HashSet::new();
-        let result = self.analyze_can_collect(&path, &mut seen);
-        cache.can_collect.insert(path, result);
-        result
+        self.cached_can_collect_path(&path, cache)
+    }
+
+    fn cached_can_collect_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        cache: &mut AnalysisCache,
+    ) -> bool {
+        let graphs = match graphs {
+            Some(graphs) => graphs,
+            None => return true,
+        };
+        graphs
+            .iter()
+            .any(|path| self.cached_can_collect_path(path, cache))
     }
 
     // ── _canraise + getcalldescr (call.py:210-355) ──────────────────
@@ -2185,7 +2512,94 @@ impl CallControl {
     ///         return True
     /// ```
     pub fn _canraise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
+        if let CallTarget::Indirect {
+            trait_root,
+            method_name,
+        } = target
+        {
+            let graphs = self.all_impls_for_indirect(trait_root, method_name);
+            return self.cached_can_raise_family(Some(&graphs), cache);
+        }
         self.cached_can_raise(target, cache)
+    }
+
+    /// RPython `call.py:210-335` indirect-call variant where the full family
+    /// is already attached to the op. This runs every analyzer over the whole
+    /// family (or returns top for `graphs=None`) instead of inventing a fake
+    /// single `CallTarget`.
+    pub fn getcalldescr_indirect_family(
+        &self,
+        graphs: Option<&[CallPath]>,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        oopspecindex: OopSpecIndex,
+        extraeffect: Option<ExtraEffect>,
+        cache: &mut AnalysisCache,
+    ) -> CallDescriptor {
+        if let Some(graphs) = graphs {
+            if let Err(err) = self.check_indirect_call_family(graphs) {
+                panic!("getcalldescr: {err}");
+            }
+        }
+
+        if !arg_types.is_empty() {
+            if let Some(graph) = graphs
+                .into_iter()
+                .flatten()
+                .find_map(|path| self.function_graphs.get(path))
+            {
+                let expected_arity = graph.block(graph.startblock).inputargs.len();
+                if arg_types.len() != expected_arity {
+                    eprintln!(
+                        "[getcalldescr] WARNING: indirect family expects {expected_arity} args \
+                         but got {} (NON_VOID_ARGS mismatch)",
+                        arg_types.len()
+                    );
+                }
+            }
+        }
+
+        let random_effects = self.cached_random_effects_family(graphs, cache);
+        let mut extraeffect = extraeffect;
+        if random_effects {
+            extraeffect = Some(ExtraEffect::RandomEffects);
+        }
+
+        let can_invalidate = random_effects || self.cached_can_invalidate_family(graphs, cache);
+
+        if extraeffect.is_none() {
+            extraeffect = Some(if self.cached_forces_virtualizable_family(graphs, cache) {
+                ExtraEffect::ForcesVirtualOrVirtualizable
+            } else if matches!(
+                self.cached_can_raise_family(graphs, cache),
+                CanRaise::Yes | CanRaise::MemoryErrorOnly
+            ) {
+                ExtraEffect::CanRaise
+            } else {
+                ExtraEffect::CannotRaise
+            });
+        }
+
+        let extraeffect = extraeffect.unwrap_or(ExtraEffect::CanRaise);
+        let effects = analyze_readwrite_indirect_family(
+            graphs,
+            &self.function_graphs,
+            self,
+            &mut cache.descr_indices,
+        );
+        let can_collect = self.cached_can_collect_family(graphs, cache);
+        let effectinfo = effectinfo_from_writeanalyze(
+            effects,
+            extraeffect,
+            oopspecindex,
+            can_invalidate,
+            can_collect,
+        );
+
+        let _ = result_type;
+        CallDescriptor {
+            extra_info: effectinfo,
+        }
     }
 
     /// RPython: CallControl.getcalldescr(op, oopspecindex, extraeffect, ...)
@@ -2228,6 +2642,22 @@ impl CallControl {
         extraeffect: Option<ExtraEffect>,
         cache: &mut AnalysisCache,
     ) -> CallDescriptor {
+        if let CallTarget::Indirect {
+            trait_root,
+            method_name,
+        } = target
+        {
+            let graphs = self.all_impls_for_indirect(trait_root, method_name);
+            return self.getcalldescr_indirect_family(
+                Some(&graphs),
+                arg_types,
+                result_type,
+                oopspecindex,
+                extraeffect,
+                cache,
+            );
+        }
+
         // RPython `call.py:259-280` — indirect_call family-wide validation.
         //
         //   elif op.opname == 'indirect_call':
@@ -2396,6 +2826,22 @@ impl CallControl {
     }
 }
 
+fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {
+    use std::hash::Hasher;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
+    stable_symbolic_fnaddr(path)
+}
+
+pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
+    stable_symbolic_fnaddr(target)
+}
+
 impl Default for CallControl {
     fn default() -> Self {
         Self::new()
@@ -2444,10 +2890,62 @@ fn analyze_readwrite(
             &mut analysis.read_interiorfields,
             &mut analysis.write_interiorfields,
             &mut analysis.array_write_descrs,
+            &mut analysis.is_top,
         );
         // RPython: top_set only occurs from gc_add_memory_pressure (writeanalyze.py:72).
         // External calls return empty_set (bottom_result), not top_set.
         // We currently don't have gc_add_memory_pressure, so is_top stays false.
+    }
+    analysis
+}
+
+/// RPython `readwrite_analyzer.analyze(op, seen)` for `indirect_call`.
+///
+/// Unknown families (`graphs=None`) are `top_set`; known families are the
+/// union of every member graph's effects.
+fn analyze_readwrite_indirect_family(
+    graphs: Option<&[CallPath]>,
+    function_graphs: &HashMap<CallPath, FunctionGraph>,
+    cc: &CallControl,
+    descr_indices: &mut DescrIndexRegistry,
+) -> WriteAnalysis {
+    let mut analysis = WriteAnalysis {
+        read_fields: 0,
+        write_fields: 0,
+        read_arrays: 0,
+        write_arrays: 0,
+        read_interiorfields: 0,
+        write_interiorfields: 0,
+        array_write_descrs: Vec::new(),
+        is_top: false,
+    };
+    let graphs = match graphs {
+        Some(graphs) => graphs,
+        None => {
+            analysis.is_top = true;
+            return analysis;
+        }
+    };
+    let mut seen = HashSet::new();
+    for path in graphs {
+        collect_readwrite_effects(
+            path,
+            function_graphs,
+            cc,
+            descr_indices,
+            &mut seen,
+            &mut analysis.read_fields,
+            &mut analysis.write_fields,
+            &mut analysis.read_arrays,
+            &mut analysis.write_arrays,
+            &mut analysis.read_interiorfields,
+            &mut analysis.write_interiorfields,
+            &mut analysis.array_write_descrs,
+            &mut analysis.is_top,
+        );
+        if analysis.is_top {
+            break;
+        }
     }
     analysis
 }
@@ -2699,7 +3197,11 @@ fn collect_readwrite_effects(
     // effectinfo.py:201-206: collect actual array write DescrRefs
     // for single_write_descr_array population.
     array_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    is_top: &mut bool,
 ) {
+    if *is_top {
+        return;
+    }
     if !seen.insert(path.clone()) {
         return;
     }
@@ -2897,6 +3399,7 @@ fn collect_readwrite_effects(
                             read_interiorfields,
                             write_interiorfields,
                             array_write_descrs,
+                            is_top,
                         );
                     } else {
                         // RPython: analyze_external_call() → bottom_result() (empty_set).
@@ -2904,6 +3407,34 @@ fn collect_readwrite_effects(
                         // (NOT top_set — that only comes from gc_add_memory_pressure.)
                     }
                 }
+                OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
+                    None => {
+                        *is_top = true;
+                        return;
+                    }
+                    Some(graphs) => {
+                        for callee_path in graphs {
+                            collect_readwrite_effects(
+                                callee_path,
+                                function_graphs,
+                                cc,
+                                descr_indices,
+                                seen,
+                                read_fields,
+                                write_fields,
+                                read_arrays,
+                                write_arrays,
+                                read_interiorfields,
+                                write_interiorfields,
+                                array_write_descrs,
+                                is_top,
+                            );
+                            if *is_top {
+                                return;
+                            }
+                        }
+                    }
+                },
                 _ => {}
             }
         }
@@ -3229,7 +3760,11 @@ fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
         // ── vtable entry extraction: pure memory load, no raise ──
         // RPython: op.args[0] in indirect_call is a plain Variable,
         // the address extraction itself has no raising analogue.
-        OpKind::FuncptrFromVtable { .. } => false,
+        OpKind::VtableMethodPtr { .. } => false,
+        // ── indirect_call canraise comes from the family's calldescr ──
+        // (analyze() dispatch, not here). Not yet emitted; arm reserved
+        // for Phase B.
+        OpKind::IndirectCall { .. } => true,
 
         // ── Unknown ops: canraise.py:18 → True (conservative) ─────
         // RPython: log.WARNING("Unknown operation: %s" % op.opname)
@@ -3575,6 +4110,48 @@ mod tests {
 
         let unknown = CallTarget::function_path(["unknown_function"]);
         assert_eq!(cc.guess_call_kind(&unknown), CallKind::Residual);
+    }
+
+    #[test]
+    fn get_jitcode_shell_falls_back_to_symbolic_fnaddr() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["opcode_load_fast"]);
+        cc.register_function_graph(path.clone(), FunctionGraph::new("opcode_load_fast"));
+
+        let jitcode = cc.get_jitcode(&path);
+
+        assert_eq!(jitcode.fnaddr, symbolic_fnaddr_for_path(&path));
+    }
+
+    #[test]
+    fn get_jitcode_shell_uses_registered_fnaddr() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["helpers", "opaque_call"]);
+        cc.register_function_graph(path.clone(), FunctionGraph::new("opaque_call"));
+        cc.register_function_fnaddr(path.clone(), 0xfeed_beef);
+
+        let jitcode = cc.get_jitcode(&path);
+
+        assert_eq!(jitcode.fnaddr, 0xfeed_beef);
+    }
+
+    #[test]
+    fn register_macro_helper_trace_fnaddr_binds_canonical_and_crate_aliases() {
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr("testcrate::helpers::opaque_call", 0x1234);
+
+        assert_eq!(
+            cc.fnaddr_for_target(&CallTarget::function_path(["helpers", "opaque_call"])),
+            0x1234
+        );
+        assert_eq!(
+            cc.fnaddr_for_target(&CallTarget::function_path([
+                "crate",
+                "helpers",
+                "opaque_call"
+            ])),
+            0x1234
+        );
     }
 
     #[test]

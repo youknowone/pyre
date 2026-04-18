@@ -172,6 +172,15 @@ impl fmt::Display for CallTarget {
     }
 }
 
+/// RPython call ops always carry `op.args[0]` as the funcptr operand.
+/// Pyre keeps the same semantic slot but needs two Rust-level shapes:
+/// a symbolic direct-call target or a runtime `ValueId` for indirect calls.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CallFuncPtr {
+    Target(CallTarget),
+    Value(ValueId),
+}
+
 /// RPython `flatten.py:53-57`:
 ///
 /// ```python
@@ -182,14 +191,15 @@ impl fmt::Display for CallTarget {
 ///
 /// Sidecar attached to `OpKind::CallResidual` when the residual call is the
 /// tail of a regular-indirect lowering (`jtransform.py:547`).  The assembler
-/// merges `candidates` into `Assembler.indirectcalltargets` so the metainterp
-/// can later look up jitcodes by function-pointer address during runtime
-/// dispatch (`pyjitpl.py:2325-2343`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// merges the JitCode handles into `Assembler.indirectcalltargets` so the
+/// metainterp can later look up jitcodes by function-pointer address during
+/// runtime dispatch (`pyjitpl.py:2325-2343`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndirectCallTargets {
-    /// JitCode indices of every candidate impl in the `(trait, method)`
-    /// family.
-    pub candidates: Vec<usize>,
+    /// `Arc<JitCode>` shells (identity-keyed via `JitCodeHandle`) for
+    /// every candidate impl in the `(trait, method)` family.  Matches
+    /// RPython `flatten.py:55` `lst # list of JitCodes` shape.
+    pub lst: Vec<crate::jitcode::JitCodeHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -291,26 +301,39 @@ pub enum OpKind {
         /// 'i', 'r', or 'f' — the kind of the guarded value.
         kind_char: char,
     },
-    /// Extract the function-pointer address from a `dyn Trait` receiver's
-    /// vtable for a given method slot.  The produced value is integer-typed
-    /// and is the input to `int_guard_value` in `handle_regular_indirect_call`,
-    /// matching RPython's `op.args[0]` which is a plain `Ptr(FuncType)`
-    /// (`jtransform.py:546`).
+    /// Project a callee function pointer out of a `dyn Trait` receiver's
+    /// vtable for the named method slot.  Result is integer-typed so it
+    /// can be fed to `int_guard_value` (RPython `jtransform.py:546`).
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython's `indirect_call` receives the
-    /// callee function pointer directly as `op.args[0]` because lltype has
-    /// no fat-pointer `dyn Trait` — at the RTyper layer the pointer is
-    /// already a plain `Ptr(FuncType)`.  In Rust `&dyn Trait` is a
-    /// `(data, vtable)` fat pointer, so we need an extra op to project
-    /// the vtable slot down to the function address that `int_guard_value`
-    /// can pin.  Without this, the guard would pin receiver *object*
-    /// identity instead of callee *function* identity and every new
-    /// receiver would blow the guard.  No RPython counterpart; justified
-    /// by the Rust type system.
-    FuncptrFromVtable {
+    /// PRE-EXISTING-ADAPTATION of `rclass.py:371-377 getclsfield()`. RPython
+    /// emits a `cast_pointer + getfield(vtable_struct, method_name)` chain
+    /// because `ClassRepr` models the vtable as an explicit `Struct`. Rust
+    /// `dyn Trait` vtable layout is compiler-internal (unstable ABI), so
+    /// pyre cannot model the vtable as an IR struct — this single op stands
+    /// in for the chain and must be emitted by the rtyper-equivalent layer
+    /// (`translator/rtyper/rclass.rs`), never by `jtransform`.
+    VtableMethodPtr {
         receiver: ValueId,
         trait_root: String,
         method_name: String,
+    },
+    /// Indirect call — `op.args[0]` is the funcptr ValueId already produced
+    /// by the rtyper layer (e.g. from `VtableMethodPtr` for `dyn Trait`
+    /// dispatch). `args` are the full call arguments, including the
+    /// receiver. `graphs` mirrors the trailing `c_graphs` constant from
+    /// `rpbc.py:216`: `Some(full_family)` when known, `None` otherwise.
+    ///
+    /// RPython: `rpython/rtyper/rpbc.py:216-217`
+    /// ```python
+    /// vlist.append(hop.inputconst(Void, row_of_graphs.values()))
+    /// v = hop.genop('indirect_call', vlist, resulttype=rresult)
+    /// ```
+    /// Lowered downstream by `jtransform.py:410-412 rewrite_op_indirect_call`.
+    IndirectCall {
+        funcptr: ValueId,
+        args: Vec<ValueId>,
+        graphs: Option<Vec<crate::parse::CallPath>>,
+        result_ty: ValueType,
     },
     /// Virtualizable field read → reads from boxes, no heap op.
     /// RPython: `getfield_vable_i/r/f`
@@ -377,10 +400,11 @@ pub enum OpKind {
     //
     /// Elidable (pure) call — no side effects, result depends only on args.
     /// RPython: `call_elidable_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
-    /// `funcptr` mirrors `op.args[0]` (the function-pointer Variable);
-    /// `descriptor` carries the calldescr-equivalent EffectInfo.
+    /// `funcptr` mirrors `op.args[0]` in RPython. Direct calls keep a
+    /// symbolic target; indirect calls carry the runtime `ValueId`
+    /// produced by rtype.
     CallElidable {
-        funcptr: CallTarget,
+        funcptr: CallFuncPtr,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,
@@ -388,14 +412,13 @@ pub enum OpKind {
         result_kind: char,
     },
     /// Residual call — has side effects, must be preserved.
-    /// RPython: `residual_call_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
-    /// `funcptr` mirrors `op.args[0]` (the function-pointer Variable);
-    /// `descriptor` carries the calldescr-equivalent EffectInfo.
+    /// RPython: `residual_call_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`.
+    /// See `CallElidable` for `funcptr` semantics.
     /// `indirect_targets` mirrors the `IndirectCallTargets(lst)` sidecar
     /// that RPython appends to the extraargs for an indirect_call family
     /// (`jtransform.py:547`).  `None` for direct-call lowering.
     CallResidual {
-        funcptr: CallTarget,
+        funcptr: CallFuncPtr,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,
@@ -404,11 +427,10 @@ pub enum OpKind {
         indirect_targets: Option<IndirectCallTargets>,
     },
     /// May-force call — can trigger GC or force virtualizables.
-    /// RPython: `call_may_force_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`
-    /// `funcptr` mirrors `op.args[0]` (the function-pointer Variable);
-    /// `descriptor` carries the calldescr-equivalent EffectInfo.
+    /// RPython: `call_may_force_{kinds}_{reskind}(funcptr, calldescr, [i], [r], [f])`.
+    /// See `CallElidable` for `funcptr` semantics.
     CallMayForce {
-        funcptr: CallTarget,
+        funcptr: CallFuncPtr,
         descriptor: crate::call::CallDescriptor,
         args_i: Vec<ValueId>,
         args_r: Vec<ValueId>,

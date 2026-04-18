@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::call::CallDescriptor;
 use crate::model::{
-    CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
-    ValueType,
+    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, Terminator,
+    ValueId, ValueType,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -196,12 +196,12 @@ pub struct Transformer<'a> {
     /// RPython: DependencyTracker — caches transitive analysis results.
     /// Shared across all getcalldescr() calls within this transform pass.
     analysis_cache: crate::call::AnalysisCache,
-    /// Cursor into the running graph's `next_value` counter.  Kept in
+    /// Cursor into the running graph's `next_value` counter. Kept in
     /// sync with `FunctionGraph::next_value`: seeded from
     /// `graph.next_value` at `transform()` entry and written back at
-    /// exit.  `rewrite_op_indirect_call` uses this to synthesize a
-    /// fresh ValueId for the `FuncptrFromVtable` result (RPython's
-    /// implicit `Variable()` allocation in `jtransform.py:546`).
+    /// exit so any future rewrite rule that needs to synthesize a fresh
+    /// ValueId can pull one without colliding with the rtyper-equivalent
+    /// pass output.
     next_synthetic_value: usize,
 }
 
@@ -238,15 +238,6 @@ impl<'a> Transformer<'a> {
             analysis_cache: crate::call::AnalysisCache::default(),
             next_synthetic_value: 0,
         }
-    }
-
-    /// Allocate a fresh ValueId synchronized with the graph's
-    /// `next_value` counter.  Used by rewrite rules that need to
-    /// introduce a new intermediate value (e.g. `FuncptrFromVtable`).
-    fn allocate_synthetic_value(&mut self) -> ValueId {
-        let id = ValueId(self.next_synthetic_value);
-        self.next_synthetic_value += 1;
-        id
     }
 
     /// Set the CallControl for call kind dispatch.
@@ -320,6 +311,28 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    fn fresh_synthetic_value(&mut self) -> ValueId {
+        let value = ValueId(self.next_synthetic_value);
+        self.next_synthetic_value += 1;
+        value
+    }
+
+    fn direct_funcptr_value(&mut self, target: &CallTarget) -> (ValueId, SpaceOperation) {
+        let fnaddr = self
+            .callcontrol
+            .as_deref()
+            .map(|cc| cc.fnaddr_for_target(target))
+            .unwrap_or_else(|| crate::call::symbolic_fnaddr_for_target(target));
+        let value = self.fresh_synthetic_value();
+        (
+            value,
+            SpaceOperation {
+                result: Some(value),
+                kind: OpKind::ConstInt(fnaddr),
+            },
+        )
+    }
+
     /// RPython: Transformer.rewrite_operation() — dispatch to rewrite_op_*.
     fn rewrite_operation(&mut self, op: &SpaceOperation, graph_name: &str) -> RewriteResult {
         match &op.kind {
@@ -372,6 +385,27 @@ impl<'a> Transformer<'a> {
             } if self.config.classify_calls => {
                 self.rewrite_op_direct_call(op, target, args, result_ty, graph_name)
             }
+            // ── rewrite_op_indirect_call ──
+            // RPython jtransform.py:410-412. Pyre's rtyper-equivalent
+            // (`translator/rtyper/rpbc.rs`) lowers
+            // `OpKind::Call { target: CallTarget::Indirect, .. }` into
+            // `OpKind::IndirectCall { funcptr, args, graphs, .. }`
+            // before jtransform runs, so by this point the funcptr is
+            // already a regular ValueId and `args` still carry the full
+            // call argument list, including the receiver.
+            OpKind::IndirectCall {
+                funcptr,
+                args,
+                graphs,
+                result_ty,
+            } if self.config.classify_calls => self.lower_indirect_call_op(
+                op,
+                *funcptr,
+                args,
+                graphs.as_deref(),
+                result_ty,
+                graph_name,
+            ),
             // ── unknown ops ──
             OpKind::Unknown { kind } => {
                 self.notes.push(GraphTransformNote {
@@ -718,16 +752,21 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        // RPython `jtransform.py:406-412`:
-        //   def rewrite_op_direct_call(op):  ... handle_%s_call
-        //   def rewrite_op_indirect_call(op): ... handle_%s_indirect_call
+        // RPython `jtransform.py:406-408`:
+        //   def rewrite_op_direct_call(op): ... handle_%s_call
         //
-        // Our front-end distinguishes the two via `CallTarget::Indirect`
-        // rather than opname; re-enter the indirect entry point here so
-        // the regular vs residual split follows `guess_call_kind`.
-        if matches!(target, CallTarget::Indirect { .. }) {
-            return self.rewrite_op_indirect_call(op, target, args, result_ty, graph_name);
-        }
+        // The indirect path (`jtransform.py:410-412 rewrite_op_indirect_call`)
+        // is reached via `OpKind::IndirectCall` which the rtyper-equivalent
+        // layer (`translator/rtyper/rpbc.rs::lower_indirect_calls`) emits
+        // before jtransform runs, dispatched from `rewrite_operation` to
+        // `lower_indirect_call_op`. By this point, no `CallTarget::Indirect`
+        // can survive — that invariant is asserted in debug builds by
+        // `assert_no_indirect_call_targets`.
+        debug_assert!(
+            !matches!(target, CallTarget::Indirect { .. }),
+            "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
+             before reaching rewrite_op_direct_call",
+        );
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(target);
@@ -887,10 +926,7 @@ impl<'a> Transformer<'a> {
                     descriptor.extra_info.clone(),
                 );
 
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                target.hash(&mut hasher);
-                let func_as_int = hasher.finish();
+                let func_as_int = cc.fnaddr_for_target(target) as u64;
 
                 cc.callinfocollection
                     .add(oopspecindex, calldescr, func_as_int);
@@ -922,7 +958,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:477-478: get_jitcode(targetgraph)
         let jitcode_index = if let Some(cc) = self.callcontrol.as_mut() {
             let path = target_to_call_path(target);
-            cc.get_jitcode(&path)
+            cc.get_jitcode(&path).index
         } else {
             0
         };
@@ -1217,10 +1253,7 @@ impl<'a> Transformer<'a> {
                     result_ir_type,
                     descriptor.extra_info.clone(),
                 );
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                target.hash(&mut hasher);
-                let func_as_int = hasher.finish();
+                let func_as_int = cc.fnaddr_for_target(target) as u64;
                 cc.callinfocollection
                     .add(oopspecindex, calldescr, func_as_int);
                 cc.callinfocollection
@@ -1496,7 +1529,7 @@ impl<'a> Transformer<'a> {
         let note_detail = match &indirect_targets {
             Some(t) => format!(
                 "call {target} → residual indirect ({} candidates)",
-                t.candidates.len()
+                t.lst.len()
             ),
             None => format!("call {target} → residual"),
         };
@@ -1508,23 +1541,27 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:467: rewrite_call(op, 'residual_call', ...)
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
         // jtransform.py:547: `handle_regular_indirect_call` passes
         // `may_call_jitcodes=True`, which forces a trailing `-live-`.
         let can_raise = descriptor.extra_info.check_can_raise(false) || indirect_targets.is_some();
-        let mut ops = vec![SpaceOperation {
-            result: op.result,
-            kind: OpKind::CallResidual {
-                funcptr: target.clone(),
-                descriptor,
-                args_i,
-                args_r,
-                args_f,
-                result_kind,
-                indirect_targets,
+        let mut ops = vec![
+            funcptr_op,
+            SpaceOperation {
+                result: op.result,
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor,
+                    args_i,
+                    args_r,
+                    args_f,
+                    result_kind,
+                    indirect_targets,
+                },
             },
-        }];
+        ];
         if can_raise {
             ops.push(SpaceOperation {
                 result: None,
@@ -1534,177 +1571,136 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
-    /// RPython `jtransform.py:410-412`:
-    /// ```python
-    /// def rewrite_op_indirect_call(self, op):
-    ///     kind = self.callcontrol.guess_call_kind(op)
-    ///     return getattr(self, 'handle_%s_indirect_call' % kind)(op)
+    /// RPython orthodox dispatch for `OpKind::IndirectCall` — line-by-line
+    /// port of `jtransform.py:410-412 rewrite_op_indirect_call` +
+    /// `jtransform.py:538-553 handle_regular_indirect_call`.
+    ///
+    /// `funcptr` is the runtime ValueId already produced by the
+    /// rtyper-equivalent layer (`translator/rtyper/rpbc.rs::lower_indirect_calls`),
+    /// so this method does NOT synthesize anything — it emits exactly:
+    ///
+    /// ```text
+    /// [Live, IntGuardValue(funcptr, 'i'),
+    ///  CallResidual { funcptr: Value(funcptr),
+    ///                 indirect_targets: Some(IndirectCallTargets { lst }), .. },
+    ///  Live]    // trailing -live- because may_call_jitcodes=true
     /// ```
     ///
-    /// Regular  → `handle_regular_indirect_call` (guard + residual).
-    /// Residual → `handle_residual_indirect_call` (alias for
-    ///            `handle_residual_call`, `jtransform.py:536`).
-    ///
-    /// Builtin/Recursive branches don't arise for `dyn Trait` dispatch
-    /// in the Rust front-end today; if we see one, fall back to the
-    /// residual path to stay safe.
-    fn rewrite_op_indirect_call(
+    /// `lst` is built from `candidates` via `cc.get_jitcode(p)` which
+    /// returns the `Arc<JitCode>` shell from `CallControl::jitcodes`.
+    fn lower_indirect_call_op(
         &mut self,
         op: &SpaceOperation,
-        target: &CallTarget,
+        funcptr: ValueId,
         args: &[ValueId],
+        graphs: Option<&[crate::parse::CallPath]>,
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        let Some(cc) = self.callcontrol.as_deref() else {
-            // No CallControl → leave the op untouched (residual handling
-            // kicks in downstream if the effect table has an entry).
-            if let Some((descriptor, _)) = classify_call(target, &self.config.call_effects) {
-                return self
-                    .handle_residual_call(op, target, descriptor, args, result_ty, graph_name);
-            }
-            return RewriteResult::Keep;
-        };
-        let kind = cc.guess_call_kind(target);
-        match kind {
-            crate::call::CallKind::Regular => {
-                self.handle_regular_indirect_call(op, target, args, result_ty, graph_name)
-            }
-            // jtransform.py:536 `handle_residual_indirect_call = handle_residual_call`.
-            crate::call::CallKind::Residual
-            | crate::call::CallKind::Builtin
-            | crate::call::CallKind::Recursive => {
-                let non_void_args = resolve_non_void_arg_types(args, self.type_state);
-                let result_ir_type = value_type_to_ir_type(result_ty);
-                let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
-                let descriptor = cc_ref.getcalldescr(
-                    target,
-                    non_void_args,
-                    result_ir_type,
-                    OopSpecIndex::None,
-                    None,
-                    &mut self.analysis_cache,
-                );
-                self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
-            }
-        }
-    }
-
-    /// RPython `jtransform.py:538-553`:
-    /// ```python
-    /// def handle_regular_indirect_call(self, op):
-    ///     lst = []
-    ///     for targetgraph in self.callcontrol.graphs_from(op):
-    ///         lst.append(self.callcontrol.get_jitcode(targetgraph, ...))
-    ///     op0 = SpaceOperation('-live-', [], None)
-    ///     op1 = SpaceOperation('int_guard_value', [op.args[0]], None)
-    ///     op2 = self.handle_residual_call(op, [IndirectCallTargets(lst)], True)
-    ///     return [op0, op1] + op2
-    /// ```
-    ///
-    /// Rust adaptation: `op.args[0]` upstream is a `Ptr(FuncType)`; we
-    /// synthesize that value via `OpKind::FuncptrFromVtable` on the
-    /// `&dyn Trait` receiver (args[0]) so `GuardValue {kind='i'}` sees
-    /// an integer function-address just like upstream (PRE-EXISTING-
-    /// ADAPTATION cited at `jtransform.py:546`).
-    fn handle_regular_indirect_call(
-        &mut self,
-        op: &SpaceOperation,
-        target: &CallTarget,
-        args: &[ValueId],
-        result_ty: &ValueType,
-        graph_name: &str,
-    ) -> RewriteResult {
-        let (trait_root, method_name) = match target {
-            CallTarget::Indirect {
-                trait_root,
-                method_name,
-            } => (trait_root.clone(), method_name.clone()),
-            // Called only from `rewrite_op_indirect_call`, which is
-            // gated on `CallTarget::Indirect` above.
-            _ => unreachable!("handle_regular_indirect_call expects CallTarget::Indirect"),
-        };
-        // Collect candidate jitcode indices via a mutable borrow
-        // (`get_jitcode` may allocate a new index — RPython call.py:157-165).
-        // jtransform.py:541-544: `for targetgraph in callcontrol.graphs_from(op)`.
-        let cc_mut = self
-            .callcontrol
-            .as_deref_mut()
-            .expect("handle_regular_indirect_call requires CallControl");
-        let candidate_paths = cc_mut
-            .graphs_from_indirect(&trait_root, &method_name)
-            .unwrap_or_default();
-        let all_paths = cc_mut.all_impls_for_indirect(&trait_root, &method_name);
-        // call.py:259-280 family-wide validation.
-        if let Err(err) = cc_mut.check_indirect_call_family(&all_paths) {
-            panic!("rewrite_op_indirect_call ({trait_root}::{method_name}): {err}");
-        }
-        let jitcode_indices: Vec<usize> = candidate_paths
-            .iter()
-            .map(|p| cc_mut.get_jitcode(p))
-            .collect();
-        // Compute calldescr while we still hold `cc_mut`.
+        let (args_i, args_r, args_f) = self.make_three_lists(args);
+        let result_kind = value_type_to_kind(result_ty);
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
         let result_ir_type = value_type_to_ir_type(result_ty);
-        let descriptor = cc_mut.getcalldescr(
-            target,
+        let cc_mut = self
+            .callcontrol
+            .as_mut()
+            .expect("rewrite_op_indirect_call requires &mut CallControl");
+        let descriptor = cc_mut.getcalldescr_indirect_family(
+            graphs,
             non_void_args,
             result_ir_type,
             OopSpecIndex::None,
             None,
             &mut self.analysis_cache,
         );
-        // Pick the receiver variable (RPython `op.args[0]`).  In our
-        // lowering the receiver is always args[0].
-        let receiver = *args
-            .first()
-            .expect("dyn-Trait method call must have a receiver arg");
-        // jtransform.py:545-552 emit sequence.
-        let mut ops = Vec::<SpaceOperation>::new();
-        // op0: SpaceOperation('-live-', ...)
-        ops.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Live,
-        });
-        // Rust adaptation: materialize the vtable entry as an int-typed
-        // value, then apply `int_guard_value` to it.
-        let funcptr_vid = self.allocate_synthetic_value();
-        ops.push(SpaceOperation {
-            result: Some(funcptr_vid),
-            kind: OpKind::FuncptrFromVtable {
-                receiver,
-                trait_root: trait_root.clone(),
-                method_name: method_name.clone(),
-            },
-        });
-        // op1: SpaceOperation('int_guard_value', [op.args[0]], None)
-        ops.push(SpaceOperation {
-            result: None,
-            kind: OpKind::GuardValue {
-                value: funcptr_vid,
-                kind_char: 'i',
-            },
-        });
-        // op2: self.handle_residual_call(op, [IndirectCallTargets(lst)], True)
-        let indirect_targets = Some(crate::model::IndirectCallTargets {
-            candidates: jitcode_indices,
-        });
-        let residual = self.handle_residual_call_with_targets(
-            op,
-            target,
-            descriptor,
-            args,
-            result_ty,
-            graph_name,
-            indirect_targets,
-        );
-        match residual {
-            RewriteResult::Replace(tail) => {
-                ops.extend(tail);
+        match cc_mut.guess_indirect_call_kind(graphs) {
+            crate::call::CallKind::Regular => {
+                let candidates = cc_mut
+                    .graphs_from_indirect_family(graphs)
+                    .expect("regular indirect call must have candidate graphs");
+                let lst: Vec<crate::jitcode::JitCodeHandle> = candidates
+                    .iter()
+                    .map(|p| crate::jitcode::JitCodeHandle::new(cc_mut.get_jitcode(p)))
+                    .collect();
+
+                // jtransform.py:545-552 emit sequence:
+                //   op0 = SpaceOperation('-live-', [], None)
+                //   op1 = SpaceOperation('int_guard_value', [op.args[0]], None)
+                //   op2 = self.handle_residual_call(op, [IndirectCallTargets(lst)], True)
+                // then [op0, op1] + op2 (op2 is itself [residual_call, '-live-'])
+                let mut ops = Vec::<SpaceOperation>::with_capacity(4);
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::GuardValue {
+                        value: funcptr,
+                        kind_char: 'i',
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor,
+                        args_i,
+                        args_r,
+                        args_f,
+                        result_kind,
+                        indirect_targets: Some(crate::model::IndirectCallTargets { lst }),
+                    },
+                });
+                // jtransform.py:469-470: residual_call followed by -live-
+                // because `may_call_jitcodes=True` for the regular-indirect path.
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+
+                self.calls_classified += 1;
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: format!("indirect call → {} candidates", candidates.len()),
+                });
                 RewriteResult::Replace(ops)
             }
-            // `handle_residual_call_with_targets` always Replaces.
-            other => other,
+            crate::call::CallKind::Residual => {
+                let can_raise = descriptor.extra_info.check_can_raise(false);
+                self.calls_classified += 1;
+                self.notes.push(GraphTransformNote {
+                    function: graph_name.to_string(),
+                    detail: match graphs {
+                        Some(graphs) => {
+                            format!("call <indirect> → residual family ({} impls)", graphs.len())
+                        }
+                        None => "call <indirect> → residual unknown family".to_string(),
+                    },
+                });
+                let mut ops = vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor,
+                        args_i,
+                        args_r,
+                        args_f,
+                        result_kind,
+                        indirect_targets: None,
+                    },
+                }];
+                if can_raise {
+                    ops.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::Live,
+                    });
+                }
+                RewriteResult::Replace(ops)
+            }
+            crate::call::CallKind::Builtin | crate::call::CallKind::Recursive => {
+                unreachable!("indirect calls cannot classify as builtin/recursive")
+            }
         }
     }
 
@@ -1729,17 +1725,21 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
-        RewriteResult::Replace(vec![SpaceOperation {
-            result: op.result,
-            kind: OpKind::CallElidable {
-                funcptr: target.clone(),
-                descriptor,
-                args_i,
-                args_r,
-                args_f,
-                result_kind,
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
+        RewriteResult::Replace(vec![
+            funcptr_op,
+            SpaceOperation {
+                result: op.result,
+                kind: OpKind::CallElidable {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor,
+                    args_i,
+                    args_r,
+                    args_f,
+                    result_kind,
+                },
             },
-        }])
+        ])
     }
 
     /// RPython: may-force call — can trigger GC or force virtualizables.
@@ -1763,12 +1763,14 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
+            funcptr_op,
             SpaceOperation {
                 result: op.result,
                 kind: OpKind::CallMayForce {
-                    funcptr: target.clone(),
+                    funcptr: CallFuncPtr::Value(funcptr),
                     descriptor,
                     args_i,
                     args_r,
@@ -1897,6 +1899,16 @@ fn remap_list(
         .collect()
 }
 
+fn remap_call_funcptr(
+    funcptr: &CallFuncPtr,
+    aliases: &std::collections::HashMap<ValueId, ValueId>,
+) -> CallFuncPtr {
+    match funcptr {
+        CallFuncPtr::Target(target) => CallFuncPtr::Target(target.clone()),
+        CallFuncPtr::Value(value) => CallFuncPtr::Value(remap_value(*value, aliases)),
+    }
+}
+
 fn remap_op(
     op: &SpaceOperation,
     aliases: &std::collections::HashMap<ValueId, ValueId>,
@@ -1908,8 +1920,19 @@ fn remap_op(
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::GuardValue { .. }
-        | OpKind::FuncptrFromVtable { .. }
+        | OpKind::VtableMethodPtr { .. }
         | OpKind::Unknown { .. } => op.kind.clone(),
+        OpKind::IndirectCall {
+            funcptr,
+            args,
+            graphs,
+            result_ty,
+        } => OpKind::IndirectCall {
+            funcptr: remap_value(*funcptr, aliases),
+            args: remap_list(args, aliases),
+            graphs: graphs.clone(),
+            result_ty: result_ty.clone(),
+        },
         OpKind::RecordQuasiImmutField {
             base,
             field,
@@ -2110,7 +2133,7 @@ fn remap_op(
             args_f,
             result_kind,
         } => OpKind::CallElidable {
-            funcptr: funcptr.clone(),
+            funcptr: remap_call_funcptr(funcptr, aliases),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -2126,7 +2149,7 @@ fn remap_op(
             result_kind,
             indirect_targets,
         } => OpKind::CallResidual {
-            funcptr: funcptr.clone(),
+            funcptr: remap_call_funcptr(funcptr, aliases),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -2142,7 +2165,7 @@ fn remap_op(
             args_f,
             result_kind,
         } => OpKind::CallMayForce {
-            funcptr: funcptr.clone(),
+            funcptr: remap_call_funcptr(funcptr, aliases),
             descriptor: descriptor.clone(),
             args_i: remap_list(args_i, aliases),
             args_r: remap_list(args_r, aliases),
@@ -2385,7 +2408,7 @@ fn classify_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
 
     #[test]
     fn rewrite_graph_tags_vable_fields() {
@@ -2478,8 +2501,59 @@ mod tests {
         assert_eq!(result.calls_classified, 1);
         assert!(matches!(
             result.graph.block(graph.startblock).operations[0].kind,
+            OpKind::ConstInt(_)
+        ));
+        assert!(matches!(
+            result.graph.block(graph.startblock).operations[1].kind,
             OpKind::CallResidual { .. }
         ));
+    }
+
+    #[test]
+    fn residual_direct_call_materializes_funcptr_const() {
+        let mut cc = crate::call::CallControl::new();
+        let target = CallTarget::function_path(["custom_reader"]);
+        let mut graph = FunctionGraph::new("test");
+        let arg = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arg".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: target.clone(),
+                args: vec![arg],
+                result_ty: ValueType::Ref,
+            },
+            true,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + ConstInt + CallResidual + Live");
+        match &ops[1].kind {
+            OpKind::ConstInt(fnaddr) => {
+                assert_eq!(*fnaddr, cc.fnaddr_for_target(&target));
+            }
+            other => panic!("expected materialized funcptr ConstInt, got {other:?}"),
+        }
+        match &ops[2].kind {
+            OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(_),
+                ..
+            } => {}
+            other => panic!("expected CallResidual with runtime funcptr, got {other:?}"),
+        }
+        assert!(matches!(ops[3].kind, OpKind::Live));
     }
 
     #[test]
@@ -2508,15 +2582,12 @@ mod tests {
                 ..Default::default()
             },
         );
+        let ops = &result.graph.block(graph.startblock).operations;
         // RPython: always residual_call_*, effect in descriptor only.
-        assert!(matches!(
-            result.graph.block(graph.startblock).operations[0].kind,
-            OpKind::CallResidual { .. }
-        ));
+        assert!(matches!(ops[0].kind, OpKind::ConstInt(_)));
+        assert!(matches!(ops[1].kind, OpKind::CallResidual { .. }));
         // Verify the effect is correctly carried in the descriptor.
-        if let OpKind::CallResidual { descriptor, .. } =
-            &result.graph.block(graph.startblock).operations[0].kind
-        {
+        if let OpKind::CallResidual { descriptor, .. } = &ops[1].kind {
             assert!(
                 descriptor
                     .extra_info
@@ -2654,15 +2725,19 @@ mod tests {
 
     // ── RPython indirect_call plumbing tests — plan §Tests ──────────
 
-    /// Full pipeline: build a graph that calls `receiver.run()` on a
-    /// `dyn Handler` receiver with two registered impls, run the
-    /// transformer, and assert the emitted sequence is
-    /// `[Live, FuncptrFromVtable, GuardValue{kind='i'}, CallResidual{indirect_targets=Some}, Live]`.
-    /// RPython `jtransform.py:538-553` port parity.
+    /// Build a graph that calls `receiver.run()` on a `dyn Handler` receiver
+    /// with two registered impls, run the rtyper-equivalent
+    /// `lower_indirect_calls` pass and then `Transformer::transform`, and
+    /// assert the post-jtransform sequence is exactly
+    /// `[VtableMethodPtr, Live, GuardValue{kind='i'},
+    ///   CallResidual{funcptr=Value(_), indirect_targets=Some}, Live]`.
+    /// RPython `jtransform.py:410-412 + 538-553` orthodox port parity.
     #[test]
-    fn handle_regular_indirect_call_emit_order() {
+    fn lower_indirect_call_op_emit_order() {
         use crate::call::CallControl;
         use crate::model::FunctionGraph as CrateFG;
+        use crate::translate_legacy::annotator::annrpython::annotate;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls; use crate::translate_legacy::rtyper::rtyper::resolve_types;
 
         let mut cc = CallControl::new();
         cc.register_trait_method("run", Some("Handler"), "A", CrateFG::new("A::run"));
@@ -2692,21 +2767,30 @@ mod tests {
         );
         graph.set_terminator(graph.startblock, Terminator::Return(None));
 
+        // Run the rtyper-equivalent lowering before jtransform — this is
+        // what `codewriter.rs::transform_graph_to_jitcode` does for the
+        // canonical pipeline.
+        let annotations = annotate(&graph);
+        let mut type_state = resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
         let result = transformer.transform(&graph);
 
         let ops = &result.graph.block(graph.startblock).operations;
         // Strip the initial Input op.
         let post_input = &ops[1..];
         assert!(
-            matches!(post_input[0].kind, OpKind::Live),
-            "expected Live first, got {:?}",
+            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
+            "expected VtableMethodPtr first, got {:?}",
             post_input[0].kind
         );
         assert!(
-            matches!(post_input[1].kind, OpKind::FuncptrFromVtable { .. }),
-            "expected FuncptrFromVtable second, got {:?}",
+            matches!(post_input[1].kind, OpKind::Live),
+            "expected Live second, got {:?}",
             post_input[1].kind
         );
         match &post_input[2].kind {
@@ -2715,10 +2799,13 @@ mod tests {
         }
         match &post_input[3].kind {
             OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(_),
                 indirect_targets: Some(t),
                 ..
-            } => assert_eq!(t.candidates.len(), 2, "both impls should be candidates"),
-            other => panic!("expected CallResidual with indirect_targets, got {other:?}"),
+            } => assert_eq!(t.lst.len(), 2, "both impls should be candidates"),
+            other => panic!(
+                "expected CallResidual with runtime funcptr + indirect_targets, got {other:?}"
+            ),
         }
         // jtransform.py:547 handle_residual_call(..., may_call_jitcodes=True)
         // forces a trailing `-live-`.
@@ -2729,15 +2816,18 @@ mod tests {
         );
     }
 
-    /// End-to-end smoke: after `rewrite_op_indirect_call`, the
-    /// `CallResidual.indirect_targets` payload carries exactly one
-    /// jitcode index per candidate impl (assigned by
-    /// `CallControl::get_jitcode`).  This is what the assembler later
-    /// merges into `Assembler.indirectcalltargets` (`assembler.py:208-209`).
+    /// End-to-end smoke: after the rtyper-equivalent `lower_indirect_calls`
+    /// pass + `Transformer::transform`, the `CallResidual.indirect_targets`
+    /// payload carries exactly one `JitCodeHandle` per candidate impl
+    /// (each shell allocated by `CallControl::get_jitcode`). The assembler
+    /// later merges these handles into `Assembler.indirectcalltargets`
+    /// (RPython `assembler.py:208-209`).
     #[test]
     fn indirectcalltargets_reach_call_residual_payload() {
         use crate::call::CallControl;
         use crate::model::FunctionGraph as CrateFG;
+        use crate::translate_legacy::annotator::annrpython::annotate;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls; use crate::translate_legacy::rtyper::rtyper::resolve_types;
 
         let mut cc = CallControl::new();
         cc.register_trait_method("run", Some("Handler"), "A", CrateFG::new("A::run"));
@@ -2766,8 +2856,14 @@ mod tests {
         );
         graph.set_terminator(graph.startblock, Terminator::Return(None));
 
+        let annotations = annotate(&graph);
+        let mut type_state = resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+
         let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
         let result = transformer.transform(&graph);
 
         let residual = result
@@ -2783,9 +2879,10 @@ mod tests {
             })
             .expect("residual call with indirect_targets");
 
-        assert_eq!(residual.candidates.len(), 2);
-        // Jitcode indices are sequentially assigned from 0.
-        let mut sorted = residual.candidates.clone();
+        assert_eq!(residual.lst.len(), 2);
+        // Jitcode indices are sequentially assigned from 0; the handles
+        // carry their `JitCode.index` as the orthodox stable handle.
+        let mut sorted: Vec<usize> = residual.lst.iter().map(|h| h.index).collect();
         sorted.sort();
         assert_eq!(sorted, vec![0, 1]);
     }

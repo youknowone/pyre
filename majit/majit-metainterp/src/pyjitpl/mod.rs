@@ -11792,6 +11792,59 @@ mod metainterp_static_data_tests {
         assert!(meta.last_exc_box.is_some());
     }
 
+    fn make_catch_exception_jitcode() -> (std::sync::Arc<crate::jitcode::JitCode>, usize) {
+        use crate::jitcode::JitCodeBuilder;
+
+        let mut builder = JitCodeBuilder::new();
+        let live_patch = builder.live_placeholder();
+        builder.patch_live_offset(live_patch, 0);
+        let handler = builder.new_label();
+        builder.catch_exception(handler);
+        builder.mark_label(handler);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let target = jitcode.code.len();
+        (jitcode, target)
+    }
+
+    #[test]
+    fn finishframe_exception_jumps_to_current_frame_catch_handler() {
+        let (jitcode, target) = make_catch_exception_jitcode();
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.staticdata.op_live = crate::jitcode::BC_LIVE as i32;
+        meta.staticdata.op_catch_exception = crate::jitcode::BC_CATCH_EXCEPTION as i32;
+        meta.staticdata.op_rvmprof_code = -1;
+
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(jitcode, 0));
+        let result = meta.finishframe_exception();
+
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(meta.framestack.len(), 1);
+        assert_eq!(meta.framestack.current_mut().pc, target);
+    }
+
+    #[test]
+    fn finishframe_exception_pops_callee_then_jumps_to_caller_handler() {
+        let (caller, target) = make_catch_exception_jitcode();
+        let callee = std::sync::Arc::new(crate::jitcode::JitCodeBuilder::new().finish());
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.staticdata.op_live = crate::jitcode::BC_LIVE as i32;
+        meta.staticdata.op_catch_exception = crate::jitcode::BC_CATCH_EXCEPTION as i32;
+        meta.staticdata.op_rvmprof_code = -1;
+
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(caller, 0));
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(callee, 0));
+
+        let result = meta.finishframe_exception();
+
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(meta.framestack.len(), 1);
+        assert_eq!(meta.framestack.current_mut().pc, target);
+    }
+
     #[test]
     fn finishframe_exception_jumps_to_catch_handler() {
         let mut meta = MetaInterp::<()>::new(0);
