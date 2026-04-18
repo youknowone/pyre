@@ -128,39 +128,16 @@ impl LiveVars {
                     }
                     // Super-instructions LOAD_FAST_LOAD_FAST and
                     // LOAD_FAST_BORROW_LOAD_FAST_BORROW read two locals in
-                    // one opcode. Backward liveness must GEN both indices
-                    // to match the runtime read set; otherwise blackhole
-                    // resume at a guard PC feeding into this super-inst
-                    // leaves the target registers stale (their prior
-                    // content in the compiled frame never gets written
-                    // back when consume_one_section walks an empty
-                    // live-set). The extra live slots that caused the
-                    // 2026-04-17 regressions (SIGSEGV on null refs and
-                    // float-ULP drift) came from backward liveness alone
-                    // marking uninitialised slots; the forward-definedness
-                    // pass below (`defined_bits`) now intersects with the
-                    // backward set so only stores that actually dominate
-                    // the current PC count as live. This mirrors RPython's
-                    // jtransform.py behaviour of only inserting `-live-`
-                    // markers after the corresponding store.
-                    // TODO: enable once forward-definedness lands with
-                    // full stack-slot coverage — current pass only
-                    // tracks locals, so super-inst GEN drives some
-                    // stack-resident reads into uninitialised InputArg
-                    // slots (fannkuch SIGSEGV).
-                    // Instruction::LoadFastLoadFast { var_nums }
-                    // | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
-                    //     let pair = var_nums.get(op_arg);
-                    //     for i in [
-                    //         u32::from(pair.idx_1()) as usize,
-                    //         u32::from(pair.idx_2()) as usize,
-                    //     ] {
-                    //         let word = i / 64;
-                    //         if word < words_per_pc {
-                    //             live[word] |= 1u64 << (i % 64);
-                    //         }
-                    //     }
-                    // }
+                    // one opcode. Parity with RPython (single-read
+                    // opcodes only) would require decomposing the
+                    // super-inst at the PyJitCode level so backward
+                    // liveness sees each read separately. Until that
+                    // decomposition lands, manually GENing both indices
+                    // here causes live-register explosions near super-inst
+                    // PCs (fannkuch timeout 2026-04-19). Backward
+                    // propagation from downstream `LoadFast` reads
+                    // already marks these locals live for the common
+                    // case; leave the super-inst itself as a no-op.
                     Instruction::StoreFast { var_num } | Instruction::DeleteFast { var_num } => {
                         let i = var_num.get(op_arg).as_usize();
                         let word = i / 64;

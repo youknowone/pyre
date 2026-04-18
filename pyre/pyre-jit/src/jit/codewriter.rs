@@ -1298,12 +1298,20 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                 }
 
-                // Superinstruction: two consecutive LoadFast / LoadFastBorrow.
-                // Plain LoadFast (above) is safely lifted to vable_getarrayitem_ref;
-                // the paired superinstruction is kept on move_r until the
-                // snapshot-captured-Ref-with-Int-value issue seen on
-                // nbody/fannkuch (memory: superinstruction Phase 5 crash)
-                // is diagnosed and fixed.
+                // CPython 3.13 super-instructions LOAD_FAST_LOAD_FAST /
+                // LOAD_FAST_BORROW_LOAD_FAST_BORROW decompose to two plain
+                // LOAD_FAST reads. Portal parity with plain LoadFast would
+                // route both halves through vable_getarrayitem_ref, but the
+                // blackhole resume chain currently feeds the compiled
+                // deadframe through `write_all_boxes` with a partially
+                // resolved `vable_values` — routing the super-inst reads
+                // through the heap exposes stale heap slots that the
+                // deadframe-level path did not refresh (nested_loop wrong
+                // output 2026-04-19). Keep move_r here until
+                // `rebuild_from_numbering` + `_prepare_next_section` fully
+                // populate `vable_values` for the snapshot at the outer
+                // loop's `POP_JUMP_IF_FALSE` guard; then flip this arm to
+                // the vable path for full parity with plain LoadFast.
                 Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                 | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
