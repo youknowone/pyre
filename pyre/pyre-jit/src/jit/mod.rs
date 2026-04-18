@@ -4,6 +4,7 @@ pub mod codewriter;
 pub mod cpu;
 pub mod flatten;
 pub mod liveness;
+mod regalloc;
 mod ssa_emitter;
 pub use pyre_jit_trace::descr;
 pub mod executor;

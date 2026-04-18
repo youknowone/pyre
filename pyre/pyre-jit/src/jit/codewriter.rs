@@ -1882,6 +1882,18 @@ impl CodeWriter {
             emit_goto!(ssarepr, assembler, labels, site.handler_py_pc);
         }
 
+        // codewriter.py:45-47 `for kind in KINDS:
+        //   regallocs[kind] = perform_register_allocation(graph, kind)`
+        // The pyre-side post-pass scans the populated SSARepr to build
+        // per-kind dependency graphs, runs chordal coloring, and
+        // returns a rename + the `RegisterMapping` that blackhole
+        // resume reads. Stage-1 implementation is identity rename +
+        // `Pinned` mapping (see `super::regalloc` doc).
+        let regalloc_result =
+            super::regalloc::allocate_registers(&assembler.ssarepr, code.varnames.len());
+        let mut assembler = assembler;
+        super::regalloc::apply_rename(&mut assembler.ssarepr, &regalloc_result.rename);
+
         // codewriter.py:62-72 step 4 — assemble the SSARepr into an
         // owned JitCode, translate pc_map insn indices to byte offsets,
         // and stamp the per-graph metadata. See `Self::finalize_jitcode`.
@@ -1895,6 +1907,7 @@ impl CodeWriter {
             portal_ec_reg,
             has_abort,
             merge_point_pc,
+            regalloc_result.mapping,
         )
     }
 
@@ -1929,6 +1942,7 @@ impl CodeWriter {
         portal_ec_reg: u16,
         has_abort: bool,
         merge_point_pc: Option<usize>,
+        register_mapping: pyre_jit_trace::RegisterMapping,
     ) -> PyJitCode {
         // pc_map[py_pc] currently holds SSARepr insn indices (returned by
         // SSAReprEmitter::current_pos()). Translate them to JitCode byte
@@ -1977,13 +1991,11 @@ impl CodeWriter {
             portal_ec_reg,
             stack_base: frame_stack_base,
             liveness,
-            // Step 1: pinned mapping (register == PyFrame slot index).
-            // Replaced by `RegisterMapping::PerPc` after regalloc lands
-            // (Step 4) — the accessor methods on `RegisterMapping`
-            // hide the variant from emit / blackhole call sites.
-            register_mapping: pyre_jit_trace::RegisterMapping::Pinned {
-                nlocals: code.varnames.len() as u16,
-            },
+            // codewriter.py:71 `jitcode.regallocs = regallocs`. The
+            // mapping is produced by `super::regalloc::allocate_registers`
+            // — currently a stub that returns the pinned layout, replaced
+            // by chordal coloring in Step 3+.
+            register_mapping,
         };
 
         PyJitCode {
