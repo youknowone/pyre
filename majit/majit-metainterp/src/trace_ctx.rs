@@ -971,6 +971,24 @@ impl TraceCtx {
         self.virtualizable_boxes.is_some()
     }
 
+    /// Drop the tracing-time virtualizable_boxes mirror.
+    ///
+    /// Used at bridge entry: `init_symbolic` seeds the cache with OpRefs
+    /// derived from the *parent* loop's `vable_array_base`, but the
+    /// bridge owns a fresh inputarg stream (its own `OpRef(0..N)` bound
+    /// to parent-guard fail_args). Keeping the parent seed makes
+    /// subsequent `vable_getarrayitem_*` / `vable_setarrayitem_*` reads
+    /// return stale parent-loop OpRefs; clearing forces the vable path
+    /// to fall through to the raw `GetarrayitemGc` / `SetarrayitemGc`
+    /// (`ctx.has_virtualizable_boxes() == false` branch) until the
+    /// bridge itself reseeds via resume data — matching
+    /// rpython/jit/metainterp/pyjitpl.py:3400-3430 where the
+    /// `virtualizable_boxes` are rebuilt from the guard's resume data
+    /// before the bridge replays any vable op.
+    pub fn clear_virtualizable_boxes(&mut self) {
+        self.virtualizable_boxes = None;
+    }
+
     /// Set virtualizable_boxes with VirtualizableInfo and array lengths.
     /// Used by bridge tracing where the boxes are reconstructed from
     /// resume data (pyjitpl.py:3400 rebuild_state_after_failure parity).

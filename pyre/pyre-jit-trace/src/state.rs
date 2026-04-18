@@ -2946,6 +2946,40 @@ impl JitState for PyreJitState {
         // LOAD_FAST falling through to the vable_array_base branch uses
         // the heap-array path instead of synthesizing parent OpRefs.
         sym.vable_array_base = None;
+        // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
+        // a guard failure the tracing-time `virtualizable_boxes` mirror
+        // must be rebuilt from the resume data so subsequent vable
+        // ops see OpRefs drawn from the bridge's inputarg stream, not
+        // the parent loop's vable_array_base+i indices that
+        // init_symbolic seeded before setup_bridge_sym ran.
+        //
+        // Layout mirrors virtualizable.py:86-98 read_boxes():
+        //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
+        //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
+        //      vable_debugdata, vable_lastblock, vable_w_globals)
+        //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+nlocals] = array items
+        //     (bridge_locals)
+        //   boxes[-1] = vable identity (sym.frame)
+        // Bridge target loop header has stack_only=0, so the array slice
+        // only covers the locals portion; any stack-resident boxes in
+        // `vvals` beyond nlocals were intentionally dropped above.
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        let mut bridge_input_oprefs: Vec<OpRef> = Vec::with_capacity((num_scalars - 1) + nlocals);
+        bridge_input_oprefs.push(sym.vable_last_instr);
+        bridge_input_oprefs.push(sym.vable_pycode);
+        bridge_input_oprefs.push(sym.vable_valuestackdepth);
+        bridge_input_oprefs.push(sym.vable_debugdata);
+        bridge_input_oprefs.push(sym.vable_lastblock);
+        bridge_input_oprefs.push(sym.vable_w_globals);
+        bridge_input_oprefs.extend_from_slice(&bridge_locals);
+        let bridge_vable_ref = sym.frame;
+        let bridge_array_lengths = vec![nlocals];
+        ctx.init_virtualizable_boxes(
+            &info,
+            bridge_vable_ref,
+            &bridge_input_oprefs,
+            &bridge_array_lengths,
+        );
         // Bridge stack: the target loop header has stack_only=0.
         sym.symbolic_stack = Vec::new();
         sym.symbolic_stack_types = Vec::new();
