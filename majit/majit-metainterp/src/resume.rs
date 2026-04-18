@@ -3327,10 +3327,16 @@ impl ResumeDataLoopMemo {
                             UNASSIGNED
                         })
                         .collect();
+                    let reused =
+                        env.rd_virtual_info_would_be_reused(majit_ir::OpRef(opref_id), &fieldnums);
                     // resume.py:501: vinfo = self.make_virtual_info(info, fieldnums)
                     if let Some(rd_virt) =
                         env.make_rd_virtual_info(majit_ir::OpRef(opref_id), fieldnums)
                     {
+                        if reused {
+                            // resume.py:504-505: cached `_cached_vinfo` reused.
+                            self.nvreused += 1;
+                        }
                         rd_virtuals[num_idx] = rd_virt;
                     }
                 }
@@ -3588,7 +3594,17 @@ impl ResumeDataLoopMemo {
             );
         }
 
-        // resume.py:240-241: virtualizable array
+        // resume.py:240-241 virtualizable array. In RPython the vable
+        // section is numbered by the same `_number_boxes` as any other
+        // section; cached_boxes dedup on Box identity makes vable slots
+        // distinct from frame slots because `read_boxes()` (virtualizable.py:86)
+        // wraps each slot into a fresh `RefFrontendOp`/`IntFrontendOp`.
+        // pyre does not allocate fresh OpRef identities for vable slots
+        // — when a vable slot and a frame slot happen to share the same
+        // OpRef, they dedup into the same TAGBOX and recovery takes the
+        // shared slot through frame-section liveness (trace_opcode.rs
+        // build_virtualizable_boxes). Keeping this on the same code path
+        // as the frame section avoids a pyre-only side channel.
         numb_state.append_int(snapshot.vable_array.len() as i32);
         self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
 

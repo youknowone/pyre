@@ -492,6 +492,14 @@ pub trait BoxEnv {
     fn make_rd_virtual_info(&self, _opref: OpRef, _fieldnums: Vec<i16>) -> Option<RdVirtualInfo> {
         None
     }
+    /// resume.py:504-505 `if vinfo.fieldnums is not fieldnums: memo.nvreused += 1`.
+    ///
+    /// Returns true when `make_rd_virtual_info()` would reuse an already-cached
+    /// virtual info object for the given `(opref, fieldnums)` instead of
+    /// allocating a fresh one.
+    fn rd_virtual_info_would_be_reused(&self, _opref: OpRef, _fieldnums: &[i16]) -> bool {
+        false
+    }
 }
 
 /// A single IR operation.

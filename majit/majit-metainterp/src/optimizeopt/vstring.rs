@@ -295,21 +295,15 @@ fn force_child_for_string(opref: OpRef, ctx: &mut OptContext) -> OpRef {
     resolved
 }
 
-/// The OptString optimization pass.
-pub struct OptString {
-    /// Map from OpRef to the known length (as OpRef to a constant op or input).
-    known_lengths: HashMap<OpRef, OpRef>,
-    /// vstring.py: Track which OpRefs are unicode strings (vs byte strings).
-    /// Affects which opcodes are emitted during force (NEWUNICODE vs NEWSTR).
-    unicode_refs: std::collections::HashSet<OpRef>,
-}
+/// vstring.py:413 `class OptString(Optimization)` — stateless string/unicode
+/// optimization pass. All per-string state lives on `PtrInfo::Str`
+/// (length, mode, virtual variant, lgtop). STRLEN/UNICODELEN caching is
+/// wired through `OptPure` via `pure_from_args1`.
+pub struct OptString;
 
 impl OptString {
     pub fn new() -> Self {
-        OptString {
-            known_lengths: HashMap::new(),
-            unicode_refs: std::collections::HashSet::new(),
-        }
+        OptString
     }
 
     fn get_plain_info<'a>(
@@ -384,11 +378,14 @@ impl OptString {
         self.get_slice_info(opref, ctx).is_some()
     }
 
+    /// vstring.py: read the string mode (0 = byte string, 1 = unicode) from
+    /// the installed `StrPtrInfo`. Returns 0 when no PtrInfo is set — callers
+    /// inside the pass only hit this path for constant/forwarded refs where
+    /// the mode is not observable and defaulting to string is harmless.
     fn get_mode(&self, opref: OpRef, ctx: &OptContext) -> u8 {
         let resolved = ctx.get_box_replacement(opref);
         match ctx.get_ptr_info(resolved) {
             Some(PtrInfo::Str(sinfo)) => sinfo.mode,
-            _ if self.unicode_refs.contains(&resolved) => 1,
             _ => 0,
         }
     }
@@ -427,7 +424,7 @@ impl OptString {
 
     /// vstring.py:112-114 — get the strlen OpRef if already known,
     /// without emitting a new op. Checks lgtop first (RPython parity),
-    /// then known_lengths, then structurally-known constant length.
+    /// then structurally-known constant length on the virtual variant.
     fn getstrlen_if_known(&self, opref: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
         let resolved = ctx.get_box_replacement(opref);
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
@@ -435,9 +432,6 @@ impl OptString {
             if let Some(lgtop) = info.as_ref().get_cached_lgtop() {
                 return Some(lgtop);
             }
-        }
-        if let Some(&len_ref) = self.known_lengths.get(&resolved) {
-            return Some(ctx.get_box_replacement(len_ref));
         }
         // vstring.py:174: self.lgtop = ConstInt(len(self._chars))
         // RPython creates a pure ConstInt — no op emission.
@@ -484,29 +478,24 @@ impl OptString {
     }
 
     /// Get the known length of a virtual string as a constant, if available.
+    /// Delegates to `PtrInfo::Str::getstrlen` which walks Plain/Slice/Concat
+    /// variants. Matches vstring.py:171/251/281 `getstrlen()` per-variant.
     fn get_known_length(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
         let resolved = ctx.get_box_replacement(opref);
-        if let Some(info) = ctx.getptrinfo(resolved) {
-            let mode = self.get_mode(resolved, ctx);
-            if let Some(length) = info.as_ref().get_known_str_length(ctx, mode) {
-                return Some(length);
-            }
-        }
-        self.known_lengths
-            .get(&resolved)
-            .and_then(|len_ref| ctx.get_constant_int(*len_ref))
+        let info = ctx.getptrinfo(resolved)?;
+        let mode = self.get_mode(resolved, ctx);
+        info.as_ref().get_known_str_length(ctx, mode)
     }
 
-    /// Handle NEWSTR: virtualize if length is a small constant.
-    fn optimize_newstr(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    /// vstring.py:440-453 `_optimize_NEWSTR(self, op, mode)`. Virtualize if
+    /// length is a small constant; otherwise install a non-virtual StrPtrInfo
+    /// and emit the op. `postprocess_NEWSTR` (vstring.py:455-459) registers
+    /// `pure(STRLEN, op) = length_arg` for CSE via the pure cache.
+    fn _optimize_newstr(&mut self, op: &Op, mode: u8, ctx: &mut OptContext) -> OptimizationResult {
         let len_ref = op.arg(0);
         if let Some(len) = ctx.get_constant_int(len_ref) {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
-                let mode = if self.unicode_refs.contains(&op.pos) {
-                    1
-                } else {
-                    0
-                };
+                // vstring.py:450: self.make_vstring_plain(op, mode, length)
                 ctx.set_ptr_info(
                     op.pos,
                     PtrInfo::Str(StrPtrInfo {
@@ -521,14 +510,19 @@ impl OptString {
                         cached_vinfo: std::cell::RefCell::new(None),
                     }),
                 );
-                self.known_lengths.insert(op.pos, len_ref);
                 return OptimizationResult::Remove;
             }
         }
-        // vstring.py postprocess_NEWSTR: pure_from_args(STRLEN, op, length)
-        // Even for non-virtual NEWSTR, record that STRLEN(result) = length.
-        // This enables CSE to eliminate subsequent STRLEN calls.
-        self.known_lengths.insert(op.pos, len_ref);
+        // vstring.py:452: self.make_nonnull_str(op, mode); return self.emit(op)
+        ctx.make_nonnull_str(op.pos, mode);
+        // vstring.py:455-459 postprocess_NEWSTR / postprocess_NEWUNICODE:
+        //   self.pure_from_args1(mode.STRLEN, op, op.getarg(0))
+        let strlen_opcode = if mode == 1 {
+            OpCode::Unicodelen
+        } else {
+            OpCode::Strlen
+        };
+        ctx.register_pure_from_args1(strlen_opcode, op.pos, len_ref);
         OptimizationResult::PassOn
     }
 
@@ -752,7 +746,10 @@ impl OptString {
         }
     }
 
-    /// Dispatch oopspec calls to specialized handlers.
+    /// vstring.py:594-621 optimize_CALL_I — dispatch oopspec calls to
+    /// specialized handlers. Str* variants get `mode_string`, Uni* variants
+    /// get `mode_unicode`, paralleling the RPython table walk via
+    /// `_OS_offset_uni`.
     fn optimize_oopspec_call(
         &mut self,
         op: &Op,
@@ -760,10 +757,14 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match ei.oopspecindex {
-            OopSpecIndex::StrConcat => self.opt_call_stroruni_str_concat(op, ctx),
-            OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, ctx),
-            OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, ctx),
-            OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, ctx),
+            OopSpecIndex::StrConcat => self.opt_call_stroruni_str_concat(op, mode_string, ctx),
+            OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, mode_string, ctx),
+            OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, mode_string, ctx),
+            OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, mode_string, ctx),
+            OopSpecIndex::UniConcat => self.opt_call_stroruni_str_concat(op, mode_unicode, ctx),
+            OopSpecIndex::UniSlice => self.opt_call_stroruni_str_slice(op, mode_unicode, ctx),
+            OopSpecIndex::UniEqual => self.opt_call_stroruni_str_equal(op, mode_unicode, ctx),
+            OopSpecIndex::UniCmp => self.opt_call_stroruni_str_cmp(op, mode_unicode, ctx),
             OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, ctx),
             _ => {
                 self.force_args_if_virtual(op, ctx);
@@ -776,12 +777,12 @@ impl OptString {
     fn opt_call_stroruni_str_concat(
         &mut self,
         op: &Op,
+        mode: u8,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
             let vleft = ctx.get_box_replacement(op.arg(1));
             let vright = ctx.get_box_replacement(op.arg(2));
-            let mode = self.get_mode(vleft, ctx).max(self.get_mode(vright, ctx));
             ctx.make_nonnull_str(vleft, mode);
             ctx.make_nonnull_str(vright, mode);
             ctx.set_ptr_info(
@@ -807,10 +808,14 @@ impl OptString {
     }
 
     /// vstring.py:662-690 opt_call_stroruni_STR_SLICE
-    fn opt_call_stroruni_str_slice(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn opt_call_stroruni_str_slice(
+        &mut self,
+        op: &Op,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if op.num_args() >= 4 {
             let mut s = ctx.get_box_replacement(op.arg(1));
-            let mode = self.get_mode(s, ctx);
             ctx.make_nonnull_str(s, mode);
             let mut start = ctx.get_box_replacement(op.arg(2));
             let stop = ctx.get_box_replacement(op.arg(3));
@@ -842,12 +847,16 @@ impl OptString {
     }
 
     /// vstring.py:692-733 opt_call_stroruni_STR_EQUAL
-    fn opt_call_stroruni_str_equal(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn opt_call_stroruni_str_equal(
+        &mut self,
+        op: &Op,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if op.num_args() < 3 {
             self.force_args_if_virtual(op, ctx);
             return OptimizationResult::PassOn;
         }
-        let mode = self.get_mode(ctx.get_box_replacement(op.arg(1)), ctx);
         // vstring.py:693-696
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let arg2 = ctx.get_box_replacement(op.arg(2));
@@ -1094,12 +1103,16 @@ impl OptString {
     }
 
     /// vstring.py:816-838 opt_call_stroruni_STR_CMP
-    fn opt_call_stroruni_str_cmp(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn opt_call_stroruni_str_cmp(
+        &mut self,
+        op: &Op,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         if op.num_args() < 3 {
             self.force_args_if_virtual(op, ctx);
             return OptimizationResult::PassOn;
         }
-        let mode = self.get_mode(ctx.get_box_replacement(op.arg(1)), ctx);
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let arg2 = ctx.get_box_replacement(op.arg(2));
         // vstring.py:819-822: bail out if either info is missing
@@ -1174,7 +1187,6 @@ impl OptString {
                     if matches!(sinfo.variant, VStringVariant::Plain(_)) {
                         // vstring.py:847: i1.shrink(length)
                         Self::vstring_plain_shrink(sinfo, length as usize);
-                        self.known_lengths.remove(&arg1);
                         // vstring.py:849: self.make_equal_to(op, op.getarg(1))
                         ctx.replace_op(op.pos, arg1);
                         return OptimizationResult::Remove;
@@ -1196,7 +1208,10 @@ impl Default for OptString {
 impl Optimization for OptString {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         match op.opcode {
-            OpCode::Newstr => self.optimize_newstr(op, ctx),
+            // vstring.py:440-444 optimize_NEWSTR / optimize_NEWUNICODE:
+            // both dispatch to _optimize_NEWSTR(op, mode).
+            OpCode::Newstr => self._optimize_newstr(op, mode_string, ctx),
+            OpCode::Newunicode => self._optimize_newstr(op, mode_unicode, ctx),
             OpCode::Strsetitem => self.optimize_strsetitem(op, ctx),
             OpCode::Strgetitem => self.optimize_strgetitem(op, ctx),
             OpCode::Strlen => self.optimize_strlen(op, ctx),
@@ -1204,11 +1219,6 @@ impl Optimization for OptString {
 
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
-            OpCode::Newunicode => {
-                // Track that this is a unicode string for force_box.
-                self.unicode_refs.insert(op.pos);
-                self.optimize_newstr(op, ctx)
-            }
             OpCode::Unicodesetitem => self.optimize_strsetitem(op, ctx),
             OpCode::Unicodegetitem => self.optimize_strgetitem(op, ctx),
             OpCode::Unicodelen => self.optimize_strlen(op, ctx),
@@ -1261,11 +1271,6 @@ impl Optimization for OptString {
                 OptimizationResult::PassOn
             }
         }
-    }
-
-    fn setup(&mut self) {
-        self.known_lengths.clear();
-        self.unicode_refs.clear();
     }
 
     fn name(&self) -> &'static str {
@@ -1535,9 +1540,7 @@ mod tests {
         let left_ref = OpRef(10);
         let right_ref = OpRef(11);
         set_vstring_plain(&mut ctx, left_ref, vec![None; 3]);
-        pass.known_lengths.insert(left_ref, OpRef(100));
         set_vstring_plain(&mut ctx, right_ref, vec![None; 4]);
-        pass.known_lengths.insert(right_ref, OpRef(101));
 
         // Virtual concat
         let concat_ref = OpRef(12);
@@ -1629,10 +1632,13 @@ mod tests {
 
     #[test]
     fn test_getstrlen_uses_unicodelen_for_unicode() {
-        let mut pass = OptString::new();
+        let pass = OptString::new();
         let mut ctx = OptContext::new(10);
         let unicode_ref = OpRef(7);
-        pass.unicode_refs.insert(unicode_ref);
+        // vstring.py:452 make_nonnull_str(op, mode_unicode) installs a
+        // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
+        // selects UNICODELEN instead of STRLEN.
+        ctx.make_nonnull_str(unicode_ref, 1);
 
         let len_ref = pass.getstrlen(unicode_ref, &mut ctx);
         // getstrlen delegates to ctx.getstrlen_opref which emits via
@@ -1835,11 +1841,8 @@ mod tests {
         let b = OpRef(11);
         let c = OpRef(12);
         set_vstring_plain(&mut ctx, a, vec![None; 2]);
-        pass.known_lengths.insert(a, OpRef(100));
         set_vstring_plain(&mut ctx, b, vec![None; 3]);
-        pass.known_lengths.insert(b, OpRef(101));
         set_vstring_plain(&mut ctx, c, vec![None; 4]);
-        pass.known_lengths.insert(c, OpRef(102));
 
         // ab = concat(a, b)
         let ab = OpRef(20);
@@ -1865,9 +1868,7 @@ mod tests {
         let left = OpRef(10);
         let right = OpRef(11);
         set_vstring_plain(&mut ctx, left, vec![Some(OpRef(200)), Some(OpRef(201))]);
-        pass.known_lengths.insert(left, OpRef(100));
         set_vstring_plain(&mut ctx, right, vec![Some(OpRef(202)), Some(OpRef(203))]);
-        pass.known_lengths.insert(right, OpRef(101));
 
         let concat = OpRef(12);
         set_vstring_concat(&mut ctx, concat, left, right);

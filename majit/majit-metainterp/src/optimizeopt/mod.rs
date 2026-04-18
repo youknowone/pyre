@@ -619,6 +619,55 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     field_oprefs: vec![self.ctx.get_box_replacement(vi.parent)],
                 })
             }
+            // vstring.py:207-208 VStringPlainInfo._visitor_walk_recursive:
+            //   `visitor.register_virtual_fields(instbox, self._chars)`
+            //
+            // vstring.py:255-260 VStringSliceInfo._visitor_walk_recursive:
+            //   `visitor.register_virtual_fields(instbox, [self.s, self.start, self.lgtop])`
+            //   (then recurses into the parent string if it is itself virtual).
+            //
+            // vstring.py:319-325 VStringConcatInfo._visitor_walk_recursive:
+            //   `visitor.register_virtual_fields(instbox, [self.vleft, self.vright])`
+            //
+            // Only virtual StrPtrInfo variants register fields; a non-virtual
+            // `VStringVariant::Ptr` skips this arm (falls through to None).
+            PtrInfo::Str(sinfo) if sinfo.is_virtual() => {
+                use crate::optimizeopt::info::VStringVariant;
+                let field_oprefs: Vec<OpRef> = match &sinfo.variant {
+                    // vstring.py:207-208: self._chars. `None` slots represent
+                    // unfilled positions — the resume encoder later tags those
+                    // with UNINITIALIZED (matching how RPython treats missing
+                    // char boxes, since STRSETITEM may not have run for every
+                    // index yet at guard time).
+                    VStringVariant::Plain(p) => p
+                        ._chars
+                        .iter()
+                        .map(|slot| {
+                            slot.map(|r| self.ctx.get_box_replacement(r))
+                                .unwrap_or(OpRef::NONE)
+                        })
+                        .collect(),
+                    // vstring.py:255-257: [self.s, self.start, self.lgtop].
+                    VStringVariant::Slice(s) => vec![
+                        self.ctx.get_box_replacement(s.s),
+                        self.ctx.get_box_replacement(s.start),
+                        self.ctx.get_box_replacement(s.lgtop),
+                    ],
+                    // vstring.py:319-324: [self.vleft, self.vright].
+                    VStringVariant::Concat(c) => vec![
+                        self.ctx.get_box_replacement(c.vleft),
+                        self.ctx.get_box_replacement(c.vright),
+                    ],
+                    // Non-virtual `VStringVariant::Ptr` would not reach
+                    // here because of the `is_virtual()` guard above.
+                    VStringVariant::Ptr => Vec::new(),
+                };
+                Some(majit_ir::VirtualFieldsInfo {
+                    descr: None,
+                    known_class: None,
+                    field_oprefs,
+                })
+            }
             _ => None,
         }
     }
@@ -655,6 +704,20 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             *cache.borrow_mut() = Some(vinfo.clone());
         }
         Some(vinfo)
+    }
+
+    fn rd_virtual_info_would_be_reused(&self, opref: OpRef, fieldnums: &[i16]) -> bool {
+        let resolved = self.ctx.get_box_replacement(opref);
+        let Some(info) = self.ctx.get_ptr_info(resolved) else {
+            return false;
+        };
+        let Some(cache) = info.cached_vinfo() else {
+            return false;
+        };
+        cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|vinfo| vinfo.equals(fieldnums))
     }
 }
 

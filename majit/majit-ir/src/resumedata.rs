@@ -321,7 +321,11 @@ impl ResumeDataLoopMemo {
         numb_state.append_int(0); // slot 0: size of resume section
         numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
 
-        // resume.py:234-241: virtualizable array
+        // resume.py:240-241: virtualizable array. RPython numbers the
+        // vable section with the same `_number_boxes` as everything
+        // else; fresh Box identity is supplied by `read_boxes`/`wrap`
+        // at tracing time (virtualizable.py:86, warmstate.py:73), not
+        // by a resume-time bypass.
         numb_state.append_int(snapshot.vable_array.len() as i32);
         self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
 
@@ -556,58 +560,10 @@ mod tests {
         }
     }
 
-    /// `_number_boxes` dedups by OpRef identity, matching RPython's
-    /// Box-identity dedup at resume.py:204-223 (see test_resume.py:744-768
-    /// — two distinct Box objects with identical attr values get different
-    /// tag numbers; identity is key, not value).
-    ///
-    /// Identity collisions between `vable_array` and `framestack` are
-    /// legitimate when an interpreter-level frame local has been assigned
-    /// to a virtualizable slot via `_opimpl_setfield_vable`
-    /// (pyjitpl.py:1193 `self.metainterp.virtualizable_boxes[index] =
-    /// valuebox`). At trace entry the slots have distinct OpRefs by
-    /// construction (pyjitpl/mod.rs `initialize_virtualizable` allocates
-    /// `OpRef(1..total_vable)`), mirroring RPython's fresh-box wrap at
-    /// `virtualizable.py:92` / `warmstate.py:73 wrap`.
-    ///
-    /// This test only exercises the collision path — it is *not* asserting
-    /// that vable and frame must always share identity.
-    #[test]
-    fn number_boxes_dedups_on_opref_identity_collision() {
-        let shared = OpRef(7);
-        let snapshot = Snapshot {
-            vable_array: vec![shared],
-            vref_array: Vec::new(),
-            framestack: vec![SnapshotFrame {
-                jitcode_index: 0,
-                pc: 0,
-                boxes: vec![shared],
-            }],
-        };
-
-        let mut memo = ResumeDataLoopMemo::new();
-        let numb_state = memo.number(&snapshot, &TestEnv).unwrap();
-        let numbering = numb_state.create_numbering();
-        let (_, vable_values, _, frames) =
-            rebuild_from_numbering(&numbering, memo.consts(), &[Type::Ref, Type::Ref], None);
-
-        assert_eq!(numb_state.num_boxes, 1);
-        assert_eq!(vable_values, vec![RebuiltValue::Box(0, Type::Ref)]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].values, vec![RebuiltValue::Box(0, Type::Ref)]);
-    }
-
-    /// Counterpart to `number_boxes_dedups_on_opref_identity_collision`:
-    /// when `vable_array` and `framestack` carry **distinct** OpRefs,
-    /// the numbering must assign them distinct TAGBOX indices. This
-    /// mirrors test_resume.py:744-768 `test_ResumeDataLoopMemo_number_boxes`
-    /// where two Box objects with identical attr values are still numbered
-    /// separately because they have different Python identities.
-    ///
-    /// This is the default at trace entry, when `initialize_virtualizable`
-    /// gives each vable slot its own fresh OpRef (see pyjitpl/mod.rs
-    /// and RPython's `virtualizable.py:86 read_boxes` +
-    /// `warmstate.py:73 wrap`).
+    /// resume.py:192-226 `_number_boxes` dedups by Box identity. RPython
+    /// uses fresh Box objects (virtualizable.py:86 `read_boxes` + warmstate.py:73
+    /// `wrap`) so vable and frame sections never collide. Distinct OpRefs in
+    /// majit's model reproduce that: each OpRef gets its own TAGBOX.
     #[test]
     fn number_boxes_keeps_distinct_oprefs_distinct() {
         let vable_opref = OpRef(7);
