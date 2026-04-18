@@ -604,24 +604,21 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                // Read the live runtime value from the vable so subsequent
-                // tracer decisions (fold, promote, guard_value) see the real
-                // Python object, not a phantom NULL. Without this, Ref fail
-                // slots captured from virtualizable_boxes resume with 0.
-                let concrete = self.active_standard_virtualizable(ctx).map(|active| {
-                    let index_usize = usize::try_from(index_value).unwrap_or(0);
-                    let ainfo = &active.info.array_fields[array_idx];
-                    unsafe {
-                        crate::virtualizable::vable_read_array_item(
-                            active.obj_ptr as *const u8,
-                            ainfo,
-                            index_usize,
-                        )
-                    }
-                });
+                // pyjitpl.py:1219-1231 `_opimpl_getarrayitem_vable` (standard
+                // path). RPython returns `virtualizable_boxes[index]` — a
+                // single Box carrying both the traced reference and its
+                // concrete value. Pyre's `vable_getarrayitem_ref_indexed`
+                // returns the shadow OpRef from the same slot; the concrete
+                // value is carried separately by pyre's ref_values shadow
+                // table when the slot is later written by a traced op.  Do
+                // NOT peek the live PyFrame here — a heap read would
+                // introduce the stale/shadow divergence the user flagged
+                // (Issue 1, 2026-04-18), mixing a traced OpRef with a heap
+                // concrete that has not been flushed by
+                // synchronize_virtualizable.
                 let result =
                     ctx.vable_getarrayitem_ref_indexed(vable_opref, index, index_value, fdescr);
-                self.set_ref_reg(dest, Some(result), concrete);
+                self.set_ref_reg(dest, Some(result), None);
             }
             jitcode::BC_GETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
