@@ -112,10 +112,17 @@ impl ConstantPool {
             self.refresh_from_gc();
         }
         // Type-aware dedup: only match entries with matching type.
+        // Consult both `constant_types` (intrinsic pool type) and
+        // `numbering_type_overrides` (bridge-injected resume-data type)
+        // to prevent Ref-tagged slots (from `inject_bridge_constants`)
+        // from aliasing with Int constants — same rule as `get_or_insert`.
         for (&idx, &v) in &self.constants {
             if v == value {
-                match self.constant_types.get(&idx) {
-                    Some(&existing_tp) if existing_tp == tp => return OpRef(idx),
+                let pool_tp = self.constant_types.get(&idx).copied();
+                let override_tp = self.numbering_type_overrides.get(&idx).copied();
+                let existing_tp = pool_tp.or(override_tp);
+                match existing_tp {
+                    Some(existing) if existing == tp => return OpRef(idx),
                     None if tp == Type::Int => return OpRef(idx),
                     _ => continue,
                 }
