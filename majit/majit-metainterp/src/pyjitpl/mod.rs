@@ -4007,7 +4007,17 @@ impl<M: Clone> MetaInterp<M> {
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
-        recorder.finish(finish_args, crate::make_fail_descr_typed(finish_arg_types));
+        // `pyjitpl.py:3216-3217` `token = sd.done_with_this_frame_descr_<type>;
+        // self.history.record(rop.FINISH, exits, None, descr=token)`.
+        // Use the metainterp-attached singleton so FINISH identity is
+        // shared with the backend (see `attach_descrs_to_cpu`).  Falls
+        // back to `make_fail_descr_typed` only if the singleton was
+        // never attached (tests that bypass `MetaInterp::new`).
+        let finish_descr = self
+            .staticdata
+            .done_with_this_frame_descr_from_types(&finish_arg_types)
+            .unwrap_or_else(|| crate::make_fail_descr_typed(finish_arg_types.clone()));
+        recorder.finish(finish_args, finish_descr);
         let trace = recorder.get_trace();
         let trace_snapshots = trace.snapshots.clone();
 
@@ -11012,6 +11022,39 @@ impl MetaInterpStaticData {
         };
         crate::compile::make_and_attach_done_descrs(&mut [&mut sd]);
         sd
+    }
+
+    /// `compile.py:3204-3215` `token = sd.done_with_this_frame_descr_<name>`
+    /// — select the FINISH descr attached to this `MetaInterpStaticData`
+    /// for a given result type.  The returned `Arc` is the one
+    /// `make_and_attach_done_descrs` installed on self and (via
+    /// `attach_descrs_to_cpu`) on the backend, so FINISH ops get
+    /// pointer-identity parity with RPython.
+    pub fn done_with_this_frame_descr_for(&self, tp: Type) -> Option<majit_ir::DescrRef> {
+        match tp {
+            Type::Int => self.done_with_this_frame_descr_int.clone(),
+            Type::Ref => self.done_with_this_frame_descr_ref.clone(),
+            Type::Float => self.done_with_this_frame_descr_float.clone(),
+            Type::Void => self.done_with_this_frame_descr_void.clone(),
+        }
+    }
+
+    /// `compile.py:3204-3215` variant that resolves the result type from
+    /// the FINISH op's `fail_arg_types` slice: empty → Void, single-
+    /// element → that element.  Returns `None` for multi-arg FINISH
+    /// (a pyre-only declarative-driver shape) so callers can fall back
+    /// to `make_fail_descr_typed`; RPython itself never emits such
+    /// FINISH ops.
+    pub fn done_with_this_frame_descr_from_types(
+        &self,
+        finish_arg_types: &[Type],
+    ) -> Option<majit_ir::DescrRef> {
+        let tp = match finish_arg_types {
+            [] => Type::Void,
+            [tp] => *tp,
+            _ => return None,
+        };
+        self.done_with_this_frame_descr_for(tp)
     }
 
     /// `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
