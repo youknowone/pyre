@@ -11114,6 +11114,12 @@ impl MetaInterpStaticData {
             jd.portal_finishtoken = token.cloned();
             // `pyjitpl.py:2281` `jd.propagate_exc_descr = exc_descr`.
             jd.propagate_exc_descr = Some(exc_descr.clone());
+            // `warmspot.py:1013-1017` `jd.portal_calldescr =
+            // self.cpu.calldescrof(...)` — logically warmspot-side but
+            // pyre co-locates it here because pyre has no standalone
+            // warmspot module and the inputs (green/red types,
+            // result_type) are all final by this point.
+            jd.build_portal_calldescr();
         }
     }
 

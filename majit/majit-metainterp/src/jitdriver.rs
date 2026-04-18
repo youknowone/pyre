@@ -184,6 +184,41 @@ impl JitDriverStaticData {
         sd
     }
 
+    /// `warmspot.py:1013-1017` `jd.portal_calldescr = self.cpu.calldescrof(
+    ///     jd._PTR_PORTAL_FUNCTYPE.TO, ...ARGS, ...RESULT, EffectInfo.MOST_GENERAL)`.
+    ///
+    /// Populates `self.portal_calldescr` from `self.vars` (green + red
+    /// types, in declaration order) and `self.result_type`.  Idempotent:
+    /// a fresh descriptor is built every call so subsequent mutations of
+    /// `result_type` propagate.
+    pub fn build_portal_calldescr(&mut self) {
+        use majit_ir::{EffectInfo, SimpleCallDescr};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // `warmspot.py:1013` passes `EffectInfo.MOST_GENERAL` — the portal
+        // runner can do anything.
+        static NEXT_IDX: AtomicU32 = AtomicU32::new(0x4100_0000);
+        let idx = NEXT_IDX.fetch_add(1, Ordering::Relaxed);
+        // `warmspot.py:1015` `jd._PTR_PORTAL_FUNCTYPE.TO.ARGS`: the full
+        // argument list of the portal runner, i.e. green + red (same
+        // order as `vars`).  pyre keeps the same layout via `VarKind`.
+        let arg_types: Vec<Type> = self.vars.iter().map(|v| v.tp).collect();
+        // `descr.py:478` `result_signed = True` for signed ints; pyre
+        // defaults to signed since `Type::Int` is the 64-bit signed slot.
+        let result_size = match self.result_type {
+            Type::Void => 0,
+            _ => 8,
+        };
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleCallDescr::new(
+            idx,
+            arg_types,
+            self.result_type,
+            true,
+            result_size,
+            EffectInfo::MOST_GENERAL,
+        ));
+        self.portal_calldescr = Some(descr);
+    }
+
     /// Get only the green variables.
     pub fn greens(&self) -> Vec<&JitDriverVar> {
         self.vars
