@@ -901,7 +901,13 @@ fn init_callbacks() {
                 driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
                 ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
-                        crate::jit::codewriter::ensure_jitcode_for(unsafe { &*code }, w_code, None);
+                        // Trace-side callee compile — must NOT touch
+                        // `jitdrivers_sd`. See call.py:155-172 +
+                        // `feedback_setup_jitdriver_portal_only`.
+                        crate::jit::codewriter::compile_jitcode_for_callee(
+                            unsafe { &*code },
+                            w_code,
+                        );
                     }
                 },
             }));
@@ -1175,28 +1181,35 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
-    // jitcode.py:18: `jitcode.jitdriver_sd is not None` for portals.
+    // The codewriter-side portal check
+    // (`CallControl::jitdriver_sd_from_portal_graph`, codewriter.py:37)
+    // is the canonical "is this code a portal" answer once
+    // `setup_jitdriver` has registered it. The eval-side gate below
+    // is a different question — "should this **frame** go through the
+    // JIT machinery at all" — and stays a structural pyre-specific
+    // check because module-level `<module>` frames lack the
+    // function-scope PyFrame layout the JIT relies on.
     //
-    // pyre's eval-side `is_portal` is BROADER than the codewriter-side
-    // `codewriter::is_portal` (JUMP_BACKWARD scan): pyre routes every
-    // function-scope CodeObject through `jit_merge_point_hook` and
-    // `can_enter_jit` so that recursive calls into a previously-traced
-    // function reach `maybe_compile_and_run` even before the function's
-    // own loop runs. RPython does not need this because portals are an
-    // explicit registry (`jitdrivers_sd`), not an inferred property.
-    //
-    // The two narrowing alternatives both regress benchmarks:
-    //   - `codewriter::is_portal(code)` alone makes module-level
-    //     `<module>` with a top-level loop into a portal, breaking
-    //     `fib_recursive`/`nbody`/`list_*` jit_merge_point_keyed paths
-    //     (frames are not function-scope).
-    //   - `codewriter::is_portal(code) && name != "<module>"` skips
-    //     non-loop function frames and drops the recursive-call entry
-    //     point, surfacing as a TLS-drop panic in
+    // PRE-EXISTING-ADAPTATION: pyre routes every function-scope
+    // CodeObject through `jit_merge_point_hook` and `can_enter_jit`
+    // so that recursive calls into a previously-traced function reach
+    // `maybe_compile_and_run` even before the function's own loop
+    // runs. RPython does not need this because portals are an
+    // explicit registry (`jitdrivers_sd`), not an inferred property,
+    // and recursion goes through the portal_runner. Two narrowing
+    // alternatives both regress benchmarks:
+    //   - "is registered portal" alone (post-`setup_jitdriver`):
+    //     non-loop function frames never trigger registration, so
+    //     recursive entry never reaches `maybe_compile_and_run` —
+    //     surfaces as a TLS-drop panic in
     //     `test_inline_residual_user_call_with_many_args_stays_correct`.
+    //   - "has back-edge AND name != <module>": same problem —
+    //     non-loop function frames are skipped.
     //
     // Until pyre's portal/interpreter split is ported, the eval-side
-    // check stays pyre-specific: every non-module CodeObject is a portal.
+    // gate stays pyre-specific: every non-module CodeObject reaches
+    // the JIT machinery; the codewriter-side decides portal-ness via
+    // the registry.
     let is_portal: bool = &*code.obj_name != "<module>";
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
@@ -1331,7 +1344,7 @@ fn jit_merge_point_hook(
             // starts, populating all_liveness. In pyre, JitCode compilation is
             // lazy — ensure the code's JitCode (with liveness) exists before
             // tracing so get_list_of_active_boxes can use it.
-            crate::jit::codewriter::ensure_jitcode_for(code, frame.pycode, Some(pc));
+            crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode, Some(pc));
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
             let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
@@ -1813,7 +1826,7 @@ fn bound_reached(
                 || {},
                 |ctx, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
-                    crate::jit::codewriter::ensure_jitcode_for(
+                    crate::jit::codewriter::register_portal_jitdriver(
                         code,
                         frame.pycode,
                         Some(loop_header_pc),

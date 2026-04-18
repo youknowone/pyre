@@ -254,6 +254,24 @@ impl CallControl {
         self.unfinished_graphs.pop()
     }
 
+    /// RPython: `CallControl.jitdriver_sd_from_portal_graph(graph)` —
+    /// returns the `JitDriverStaticData` whose `portal_graph` matches
+    /// `code`, or `None` if `code` is not a registered portal. Used by
+    /// `CodeWriter::transform_graph_to_jitcode` (codewriter.py:37) to
+    /// learn whether a graph is a portal **before** running jtransform,
+    /// matching the RPython `portal_jd = self.callcontrol.…` lookup.
+    ///
+    /// pyre returns the jdindex (`usize`) instead of a borrowed `&jd`
+    /// so callers can keep mutating `CallControl` afterwards without
+    /// fighting the borrow checker; the index is stable across the
+    /// lifetime of `jitdrivers_sd` because `setup_jitdriver` only
+    /// appends and dedups.
+    pub fn jitdriver_sd_from_portal_graph(&self, code: *const CodeObject) -> Option<usize> {
+        self.jitdrivers_sd
+            .iter()
+            .position(|jd| jd.portal_graph == code)
+    }
+
     /// RPython: `CallControl.get_jitcode_calldescr(graph)` (call.py:174-187).
     ///
     /// ```python

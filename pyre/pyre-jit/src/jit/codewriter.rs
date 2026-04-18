@@ -673,13 +673,19 @@ impl CodeWriter {
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
         let mut live_patches: Vec<(usize, usize)> = Vec::with_capacity(num_instrs);
 
-        // jitcode.py:18: jitdriver_sd is not None for portals.
-        // call.py:148: jd.mainjitcode.jitdriver_sd = jd
-        // interp_jit.py:78: dispatch() has jit_merge_point — is the portal.
-        // pyre: every eval_loop_jit call acts as a portal (each Python
-        // function has its own dispatch loop), so all jitcodes with loop
-        // headers are portals.
-        let is_portal = !loop_header_pcs.is_empty();
+        // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
+        // — RPython looks up portal-ness in the registry that
+        // `setup_jitdriver` populates. pyre matches that: a code is a
+        // portal iff it is in `CallControl.jitdrivers_sd`. The portal
+        // path (`register_portal_jitdriver`) registers before the drain
+        // runs `transform_graph_to_jitcode`, so the lookup sees the
+        // entry; the callee path (`compile_jitcode_for_callee`) never
+        // touches `jitdrivers_sd`, so the lookup returns `None`. This
+        // replaces the older "any backedge → portal" heuristic.
+        let is_portal = self
+            .callcontrol()
+            .jitdriver_sd_from_portal_graph(code as *const CodeObject)
+            .is_some();
         // RPython parity: every backward jump goes through dispatch() →
         // jit_merge_point(). The blackhole's bhimpl_jit_merge_point raises
         // ContinueRunningNormally at the bottommost level. Ideally all
@@ -692,7 +698,14 @@ impl CodeWriter {
         // RPython jtransform.py:1690: jit_merge_point only in the portal
         // graph. merge_point_pc is the trace entry PC (from bound_reached).
         // Other loop headers use loop_header (no-op in the blackhole).
-        let merge_point_pc = merge_point_pc.or_else(|| loop_header_pcs.iter().copied().min());
+        let merge_point_pc = if is_portal {
+            merge_point_pc.or_else(|| loop_header_pcs.iter().copied().min())
+        } else {
+            // Callee — no jit_merge_point emit. RPython's jtransform.py:1690
+            // `jit_merge_point only in the portal graph` is the matching
+            // statement.
+            None
+        };
 
         // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
         // Each push/pop writes self.valuestackdepth = depth ± 1.
@@ -1880,7 +1893,6 @@ impl CodeWriter {
             liveness,
             portal_frame_reg,
             portal_ec_reg,
-            is_portal,
             has_abort,
             merge_point_pc,
         )
@@ -1915,7 +1927,6 @@ impl CodeWriter {
         liveness: Vec<LivenessInfo>,
         portal_frame_reg: u16,
         portal_ec_reg: u16,
-        is_portal: bool,
         has_abort: bool,
         merge_point_pc: Option<usize>,
     ) -> PyJitCode {
@@ -1934,9 +1945,17 @@ impl CodeWriter {
             assembler.finish_with_positions(&mut *asm, &pc_map)
         };
 
-        // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
-        // pyre uses index 0 (single jitdriver) for portal jitcodes.
-        jitcode.jitdriver_sd = if is_portal { Some(0) } else { None };
+        // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` is assigned by
+        // `assign_portal_jitdriver_indices` after the drain, where the
+        // jdindex is known from this code's position in
+        // `CallControl.jitdrivers_sd`. RPython's `JitCode` constructor
+        // (jitcode.py:18) leaves `jitdriver_sd = None` for non-portals;
+        // `grab_initial_jitcodes` is the single source of truth for
+        // the portal assignment, so we leave it `None` here too rather
+        // than guessing an index from a local `is_portal` flag (which
+        // would collide once a second portal lands or a non-portal
+        // slips in first).
+        jitcode.jitdriver_sd = None;
         // call.py:167 `(fnaddr, calldescr) = self.get_jitcode_calldescr(graph)`.
         // The values are constant across CodeObjects in pyre — see
         // [`super::call::CallControl::get_jitcode_calldescr`] for the
@@ -2007,12 +2026,29 @@ impl CodeWriter {
 
         // codewriter.py:76 `self.callcontrol.grab_initial_jitcodes()`.
         self.callcontrol().grab_initial_jitcodes();
-        // codewriter.py:77 `count = 0`.
-        let mut count: usize = 0;
-        // codewriter.py:78 `all_jitcodes = []`.
+        // codewriter.py:79-84 drain + per-jitcode assemble.
+        let all_jitcodes = self.drain_unfinished_graphs();
+        // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — assign
+        // jdindex to each portal's populated `PyJitCode` AFTER the
+        // drain so we use the actual position in
+        // `CallControl.jitdrivers_sd` instead of a hardcoded `Some(0)`.
+        self.assign_portal_jitdriver_indices();
+        // codewriter.py:86-88 final log lines — elided.
+        // codewriter.py:89 `return all_jitcodes`.
+        all_jitcodes
+    }
+
+    /// Drain `CallControl.unfinished_graphs` — the body shared between
+    /// [`Self::make_jitcodes`] (portal entry) and
+    /// [`compile_jitcode_for_callee`] (trace-side callee path).
+    ///
+    /// RPython's `make_jitcodes` (codewriter.py:79-85) drains the queue
+    /// once and then calls `assembler.finished()`. Both pyre adapters
+    /// run the same drain so each batch ends with `assembler.finished()`,
+    /// matching `codewriter.py:85`.
+    pub(crate) fn drain_unfinished_graphs(&self) -> Vec<*const PyJitCode> {
         let mut all_jitcodes: Vec<*const PyJitCode> = Vec::new();
-        // codewriter.py:79 `for graph, jitcode in
-        //                     self.callcontrol.enum_pending_graphs():`.
+        // codewriter.py:79 `for graph, jitcode in enum_pending_graphs():`.
         loop {
             let popped = self.callcontrol().enum_pending_graphs();
             let Some((code_ptr, w_code, merge_point_pc)) = popped else {
@@ -2023,13 +2059,11 @@ impl CodeWriter {
             //
             // PRE-EXISTING-ADAPTATION: RPython mutates the empty JitCode
             // skeleton in place (`assembler.assemble(ssarepr, jitcode,
-            // num_regs)` at codewriter.py:67), whereas pyre's
+            // num_regs)` at codewriter.py:67); pyre's
             // `transform_graph_to_jitcode` returns a fresh `PyJitCode`
-            // because the underlying `JitCodeBuilder` produces an
-            // owned `JitCode`. We replace the skeleton entry in
-            // `jitcodes` with the populated one to keep upstream's
-            // "jitcode in dict has its body filled after drain"
-            // invariant.
+            // and we replace the skeleton entry in `jitcodes` with the
+            // populated one so the "jitcode in dict has its body filled
+            // after drain" invariant is preserved.
             let pyjitcode =
                 self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
             let key = code_ptr as usize;
@@ -2037,27 +2071,43 @@ impl CodeWriter {
             let raw_ptr = std::sync::Arc::as_ptr(&arc);
             self.callcontrol().jitcodes.insert(key, arc);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
-            //
-            // The `Arc` placed in `CallControl.jitcodes` above is the
-            // shared payload `MetaInterpStaticData.jitcodes` will hold
-            // too; the trace-side `state::jitcode_for` callback
-            // returns this same `Arc` to its caller, matching
-            // RPython's two stores referencing the same `JitCode`
-            // Python object via refcount semantics.
             all_jitcodes.push(raw_ptr);
-            // codewriter.py:82 `count += 1`.
-            count += 1;
-            // codewriter.py:83-84 `if not count % 500: log.info(...)` —
-            // log channel intentionally elided.
         }
         // codewriter.py:85 `self.assembler.finished(self.callcontrol.callinfocollection)`.
         self.assembler
             .borrow_mut()
             .finished(&self.callcontrol().callinfocollection);
-        // codewriter.py:86-88 final log lines — elided.
-        let _ = count;
-        // codewriter.py:89 `return all_jitcodes`.
         all_jitcodes
+    }
+
+    /// call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — propagate the
+    /// jdindex from `CallControl.jitdrivers_sd` onto each portal's
+    /// inner `JitCode.jitdriver_sd`. RPython mutates the same Python
+    /// `JitCode` object the dict references; pyre uses
+    /// `Arc::get_mut` on the freshly-installed `Arc<PyJitCode>` (and
+    /// the inner `Arc<JitCode>`) for the same effect. Idempotent — a
+    /// later `make_jitcodes` call may find the `Arc` already cloned
+    /// into `MetaInterpStaticData.jitcodes` and skip the assignment;
+    /// the previously-set value still holds.
+    fn assign_portal_jitdriver_indices(&self) {
+        let cc = self.callcontrol();
+        // Snapshot the (key, jdindex) pairs first so the borrow on
+        // `cc.jitdrivers_sd` is released before we mutate `cc.jitcodes`.
+        let assignments: Vec<(usize, usize)> = cc
+            .jitdrivers_sd
+            .iter()
+            .enumerate()
+            .map(|(idx, jd)| (jd.portal_graph as usize, idx))
+            .collect();
+        for (key, idx) in assignments {
+            if let Some(arc) = cc.jitcodes.get_mut(&key) {
+                if let Some(pyjitcode) = std::sync::Arc::get_mut(arc) {
+                    if let Some(inner) = std::sync::Arc::get_mut(&mut pyjitcode.jitcode) {
+                        inner.jitdriver_sd = Some(idx);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2122,7 +2172,7 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 // `CallControl::get_jitcode` is the canonical entry point.
 // ---------------------------------------------------------------------------
 
-/// RPython parity: `setup_jitdriver` followed by `make_jitcodes` —
+/// Portal entry path: `setup_jitdriver` followed by `make_jitcodes` —
 /// the warmspot order at codewriter.py:74-99. RPython runs this once
 /// per `@jit_callback` decoration; pyre's portal discovery is lazy,
 /// so this adapter fires per JIT entry. `setup_jitdriver` dedups by
@@ -2132,11 +2182,15 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 ///
 /// `make_jitcodes` is then the canonical RPython no-arg call: it
 /// pulls its seed list from `CallControl.jitdrivers_sd` and runs
-/// `grab_initial_jitcodes` → drain → `assembler.finished()`. The
-/// final stages short-circuit on the second-and-later registration of
-/// any given portal because `get_jitcode` skips already-built
-/// entries.
-pub fn ensure_jitcode_for(
+/// `grab_initial_jitcodes` → drain → `assembler.finished()` →
+/// `assign_portal_jitdriver_indices`. The final stages short-circuit
+/// on the second-and-later registration of any given portal because
+/// `get_jitcode` skips already-built entries.
+///
+/// **Use this only for true portals.** Trace-side callee compiles go
+/// through [`compile_jitcode_for_callee`] so they never touch
+/// `jitdrivers_sd` — see `feedback_setup_jitdriver_portal_only`.
+pub fn register_portal_jitdriver(
     code: &pyre_interpreter::CodeObject,
     w_code: *const (),
     merge_point_pc: Option<usize>,
@@ -2153,22 +2207,40 @@ pub fn ensure_jitcode_for(
     writer.make_jitcodes();
 }
 
+/// Callee compile path: `CallControl.get_jitcode(graph)` followed by
+/// the shared drain — the analog of jtransform's
+/// `cc.callcontrol.get_jitcode(callee_graph)` (call.py:155-172) that
+/// inserts the callee into `CallControl.jitcodes` and lets the
+/// surrounding `make_jitcodes` drain transform it. RPython never
+/// touches `jitdrivers_sd` here; pyre matches that by going through
+/// `get_jitcode` + the shared drain helper directly, *not* through
+/// `setup_jitdriver`.
+pub fn compile_jitcode_for_callee(code: &pyre_interpreter::CodeObject, w_code: *const ()) {
+    let writer = CodeWriter::instance();
+    // call.py:155 `get_jitcode(graph)` — insert skeleton + queue.
+    let _ = writer.callcontrol().get_jitcode(code, w_code, None);
+    // codewriter.py:79-85 drain + assembler.finished() for the
+    // newly-queued entry. No portal-jitdriver assignment because
+    // this code is a callee, not a portal.
+    writer.drain_unfinished_graphs();
+}
+
 /// Trace-side hook registered with `pyre_jit_trace::set_compile_jitcode_fn`
 /// from `CodeWriter::new()`. Resolves the `w_code` (a `PyObjectRef`
-/// wrapping a `CodeObject`) and routes it through `ensure_jitcode_for`
-/// so the lazy `make_jitcodes` pipeline runs for one entry.
+/// wrapping a `CodeObject`) and routes it through
+/// [`compile_jitcode_for_callee`] so the lazy compile pipeline runs
+/// for one entry without polluting `jitdrivers_sd`.
 ///
 /// RPython parity: jtransform's call to `cc.callcontrol.get_jitcode(callee)`
-/// (call.py:155-172) inserts the callee into `CallControl.jitcodes` and
-/// queues it on `unfinished_graphs`; the surrounding `make_jitcodes`
-/// drain (codewriter.py:79-85) then transforms the queued graph and
-/// pipes the result through `assembler.finished()`. Pyre fires this
-/// callback per trace-side `state::jitcode_for(w_code)` so the same
-/// transitive closure the RPython warmspot builds eagerly is built
-/// lazily here, one callee at a time. `merge_point_pc=None` matches
-/// the jtransform path: only `eval.rs`'s portal entry refines the
-/// merge point with `Some(pc)` (warmspot.py:148-282 has fixed portal
-/// PCs at flow-graph time, so RPython has no equivalent refinement).
+/// (call.py:155-172) inserts the callee into `CallControl.jitcodes`
+/// and queues it on `unfinished_graphs`; the surrounding
+/// `make_jitcodes` drain (codewriter.py:79-85) then transforms the
+/// queued graph and pipes the result through `assembler.finished()`.
+/// Pyre fires this callback per trace-side `state::jitcode_for(w_code)`
+/// so the same transitive closure the RPython warmspot builds eagerly
+/// is built lazily here, one callee at a time. The callback explicitly
+/// must NOT call `setup_jitdriver` — see
+/// `feedback_setup_jitdriver_portal_only`.
 fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitCode>> {
     if w_code.is_null() {
         return None;
@@ -2181,7 +2253,7 @@ fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitC
         return None;
     }
     let code = unsafe { &*raw_code };
-    ensure_jitcode_for(code, w_code, None);
+    compile_jitcode_for_callee(code, w_code);
     // Hand the populated `Arc` back to the trace-side caller so the
     // SD entry stores the same allocation as `CallControl.jitcodes`.
     CodeWriter::instance()
@@ -2217,18 +2289,6 @@ pub fn find_loop_header_pcs(
         }
     }
     loop_header_pcs
-}
-
-/// jitcode.py:18: `jitcode.jitdriver_sd is not None`.
-///
-/// pyre checks the pre-compile signal — "does `code` contain any
-/// `JUMP_BACKWARD` instructions" — which is the exact condition that
-/// `transform_graph_to_jitcode` uses to set `JitCode.jitdriver_sd`
-/// (codewriter.rs). The check is pure (no cache mutation, no compile)
-/// so callers on the hot JIT-entry path can use it to classify a
-/// CodeObject before deciding whether to trace.
-pub fn is_portal(code: &pyre_interpreter::CodeObject) -> bool {
-    !find_loop_header_pcs(code).is_empty()
 }
 
 #[cfg(test)]
