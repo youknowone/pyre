@@ -1066,7 +1066,8 @@ impl FlowContext {
         self.appcall(callee, args_w)
     }
 
-    /// RPython `flowcontext.py:658-663` — `FlowContext.import_name`.
+    /// upstream `rpython/flowspace/flowcontext.py:658-663` —
+    /// `FlowContext.import_name`. Line-by-line:
     ///
     /// ```python
     /// def import_name(self, name, glob=None, loc=None, frm=None, level=-1):
@@ -1077,23 +1078,42 @@ impl FlowContext {
     ///     return const(mod)
     /// ```
     ///
-    /// Deviation from upstream (parity rule #1): the Rust port does
-    /// not execute Python's `__import__` at flow-graph-building time
-    /// because there is no Python runtime in-process. Instead the
-    /// result is recorded as a `direct_call(__import__, name, glob,
-    /// loc, frm, level)` SpaceOperation whose result Variable stands
-    /// in for `const(mod)`. The `except ImportError` unwind is modeled
-    /// by `record_maybe_raise_op`'s `Exception` exit case, which the
-    /// annotator later narrows.
+    /// Rust 포트는 Python `__import__` 를 직접 실행하지 않는다. 대신
+    /// `HOST_ENV.import_module(name)` 을 조회한다 — HOST_ENV 는
+    /// bootstrap 시점에 upstream 의 `specialcase.py` 가 참조하는 모듈
+    /// (os, os.path, rpython.rlib.rfile, rpython.rlib.rpath) 을
+    /// pre-populate 해둔다. 추가 모듈을 다뤄야 한다면 HOST_ENV 에 먼저
+    /// 등록해야 한다. 없는 이름은 upstream 의 `except ImportError` 경로
+    /// 와 동일하게 `Raise(const(ImportError))` 로 flowspace 를 이탈.
     pub(crate) fn import_name(&mut self, args: &[ConstValue]) -> Result<Hlvalue, FlowContextError> {
-        let hlargs: Vec<Hlvalue> = args
-            .iter()
-            .map(|value| Hlvalue::Constant(Constant::new(value.clone())))
-            .collect();
-        self.appcall_builtin("__import__", hlargs)
+        // upstream 시그니처 `(name, glob=None, loc=None, frm=None, level=-1)`.
+        let name = match args.first() {
+            Some(ConstValue::Str(s)) => s.clone(),
+            _ => {
+                return Err(FlowContextError::Flowing(FlowingError::new(
+                    "import_name: first argument must be a constant string",
+                )));
+            }
+        };
+        match HOST_ENV.import_module(&name) {
+            Some(module) => Ok(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                module,
+            )))),
+            None => {
+                let exc = FSException::new(
+                    exception_class_value("ImportError"),
+                    exception_instance_value(
+                        "ImportError",
+                        Some(format!("No module named '{name}'")),
+                    ),
+                );
+                Err(FlowContextError::Signal(FlowSignal::Raise { w_exc: exc }))
+            }
+        }
     }
 
-    /// RPython `flowcontext.py:673-680` — `FlowContext.import_from`.
+    /// upstream `rpython/flowspace/flowcontext.py:673-680` —
+    /// `FlowContext.import_from`. Line-by-line:
     ///
     /// ```python
     /// def import_from(self, w_module, w_name):
@@ -1106,30 +1126,57 @@ impl FlowContext {
     ///         raise Raise(const(exc))
     /// ```
     ///
-    /// The Rust port records `op.getattr(w_module, w_name)` through
-    /// `record_maybe_raise_op`. The `FlowingError → ImportError`
-    /// conversion path collapses to the common `Exception` exit case
-    /// at this layer because we lack a proper `op.getattr` evaluator
-    /// yet; the richer ImportError wrapping lands with
-    /// `flowspace/operation.py` (F3.3).
+    /// Rust 포트는 `w_module.value` 가 `HostObject::Module` 일 때
+    /// `module_get(name)` 으로 이름을 해석한다. 못 찾으면 upstream 의
+    /// `except FlowingError → Raise(ImportError)` 경로와 동일한 형태로
+    /// `Raise(const(ImportError))` 을 일으킨다.
     pub(crate) fn import_from(
         &mut self,
         w_module: Hlvalue,
         w_name: Hlvalue,
     ) -> Result<Hlvalue, FlowContextError> {
-        assert!(
-            matches!(w_module, Hlvalue::Constant(_)),
-            "import_from: w_module must be a Constant"
-        );
-        assert!(
-            matches!(w_name, Hlvalue::Constant(_)),
-            "import_from: w_name must be a Constant"
-        );
-        self.record_maybe_raise_op(
-            "getattr",
-            vec![w_module, w_name],
-            Self::common_exception_cases(),
-        )
+        let module = match &w_module {
+            Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(obj),
+                ..
+            }) if obj.is_module() => obj.clone(),
+            Hlvalue::Constant(_) => {
+                return Err(FlowContextError::Flowing(FlowingError::new(
+                    "import_from: w_module is not a module object",
+                )));
+            }
+            _ => {
+                return Err(FlowContextError::Flowing(FlowingError::new(
+                    "import_from: w_module must be a Constant",
+                )));
+            }
+        };
+        let name = match &w_name {
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Str(s),
+                ..
+            }) => s.clone(),
+            _ => {
+                return Err(FlowContextError::Flowing(FlowingError::new(
+                    "import_from: w_name must be a constant string",
+                )));
+            }
+        };
+        match module.module_get(&name) {
+            Some(obj) => Ok(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                obj,
+            )))),
+            None => {
+                let exc = FSException::new(
+                    exception_class_value("ImportError"),
+                    exception_instance_value(
+                        "ImportError",
+                        Some(format!("cannot import name '{name}'")),
+                    ),
+                );
+                Err(FlowContextError::Signal(FlowSignal::Raise { w_exc: exc }))
+            }
+        }
     }
 
     /// RPython `flowcontext.py:600-636` — `FlowContext.exc_from_raise`.
@@ -2634,19 +2681,43 @@ impl FlowContext {
                     }
                 }
                 Instruction::ImportName { .. } => {
+                    // upstream `flowcontext.py:665-671`:
+                    //     modulename = self.getname_u(nameindex)
+                    //     glob = self.w_globals.value
+                    //     fromlist = self.popvalue().value
+                    //     level = self.popvalue().value
+                    //     w_obj = self.import_name(modulename, glob, None, fromlist, level)
+                    //     self.pushvalue(w_obj)
                     let w_fromlist = self.pop_hlvalue()?;
                     let w_level = self.pop_hlvalue()?;
                     let w_modulename = self.getname_w(oparg as usize)?;
-                    let w_module = self.record_maybe_raise_op(
-                        "import_name",
-                        vec![
-                            w_modulename,
-                            Hlvalue::Constant(self.w_globals.clone()),
-                            w_fromlist,
-                            w_level,
-                        ],
-                        vec![exception_class_value("ImportError")],
-                    )?;
+                    let modulename = match &w_modulename {
+                        Hlvalue::Constant(Constant {
+                            value: ConstValue::Str(s),
+                            ..
+                        }) => s.clone(),
+                        other => {
+                            return Err(FlowContextError::Flowing(FlowingError::new(format!(
+                                "IMPORT_NAME: expected str name, got {other:?}"
+                            ))));
+                        }
+                    };
+                    let glob = self.w_globals.value.clone();
+                    let fromlist = match &w_fromlist {
+                        Hlvalue::Constant(Constant { value, .. }) => value.clone(),
+                        _ => ConstValue::None,
+                    };
+                    let level = match &w_level {
+                        Hlvalue::Constant(Constant { value, .. }) => value.clone(),
+                        _ => ConstValue::Int(-1),
+                    };
+                    let w_module = self.import_name(&[
+                        ConstValue::Str(modulename),
+                        glob,
+                        ConstValue::None,
+                        fromlist,
+                        level,
+                    ])?;
                     self.pushvalue(StackElem::Value(w_module));
                     Ok(None)
                 }
@@ -2677,16 +2748,16 @@ impl FlowContext {
                     Ok(None)
                 }
                 Instruction::ImportFrom { .. } => {
+                    // upstream `flowcontext.py:682-685`:
+                    //     w_name = self.getname_w(nameindex)
+                    //     w_module = self.peekvalue()
+                    //     self.pushvalue(self.import_from(w_module, w_name))
                     let w_name = self.getname_w(oparg as usize)?;
                     let w_module = match self.peekvalue() {
                         StackElem::Value(value) => value,
                         StackElem::Signal(signal) => return Err(FlowContextError::Signal(signal)),
                     };
-                    let w_value = self.record_maybe_raise_op(
-                        "getattr",
-                        vec![w_module, w_name],
-                        vec![exception_class_value("ImportError")],
-                    )?;
+                    let w_value = self.import_from(w_module, w_name)?;
                     self.pushvalue(StackElem::Value(w_value));
                     Ok(None)
                 }
