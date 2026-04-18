@@ -611,6 +611,41 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         idx: usize,
     ) -> Result<OpRef, PyError> {
+        // pyjitpl.py:1231 `_opimpl_getarrayitem_vable` (standard path):
+        //     return self.metainterp.virtualizable_boxes[index]
+        //
+        // When the standard virtualizable is active, read the current OpRef
+        // straight from the virtualizable_boxes cache (seeded by
+        // initialize_virtualizable at setup_tracing, mirrored by
+        // store_local_value on every STORE_FAST). This is the RPython
+        // orthodox read path: no extra IR op, shadow-state only.
+        //
+        // Pyre's flat layout puts locals at flat indices
+        // `num_static_extra_boxes .. num_static + nlocals`, i.e.
+        // `NUM_SCALAR_INPUTARGS - 1 + idx`. The scalar static fields live
+        // before the array items, the standard-vable identity
+        // (`virtualizable_boxes[-1]`) after.
+        let vable_entry = {
+            let s = self.sym();
+            if s.vable_array_base.is_some() && s.bridge_local_oprefs.is_none() {
+                let flat_idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1 + idx;
+                ctx.virtualizable_box_at(flat_idx)
+            } else {
+                None
+            }
+        };
+        if let Some(op) = vable_entry {
+            let s = self.sym_mut();
+            if idx >= s.symbolic_locals.len() {
+                return Err(PyError::type_error("local index out of range in trace"));
+            }
+            // Sync symbolic_locals with the vable read so downstream
+            // consumers that still consult the cache-field directly
+            // (close_loop_args_at until Phase B migrates it) see the
+            // same OpRef.
+            s.symbolic_locals[idx] = op;
+            return Ok(op);
+        }
         let s = self.sym_mut();
         if idx >= s.symbolic_locals.len() {
             return Err(PyError::type_error("local index out of range in trace"));
@@ -626,6 +661,8 @@ impl MIFrame {
             } else if let Some(base) = s.vable_array_base {
                 // Virtualizable: locals[idx] was loaded in the preamble
                 // and carried as a JUMP arg. OpRef(base + idx) references it.
+                // Reached only when virtualizable_boxes has no entry (e.g.
+                // very early in setup, before initialize_virtualizable runs).
                 s.symbolic_locals[idx] = OpRef(base + idx as u32);
             } else {
                 let idx_const = ctx.const_int(idx as i64);
