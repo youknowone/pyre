@@ -507,6 +507,19 @@ impl CodeWriter {
         // returns a borrow back out so the upstream attribute access
         // pattern (`self.cpu`) still works.
         let cpu = super::cpu::Cpu::new();
+        // Register the trace-side `jitcode_for` compile callback the
+        // first time any `CodeWriter` is constructed in this process.
+        // This is the lazy analog of jtransform's eager call to
+        // `cc.callcontrol.get_jitcode(callee_graph)` (call.py:155):
+        // when the tracer references a callee's `JitCode`, the same
+        // `make_jitcodes` pipeline (codewriter.py:74-89) runs for that
+        // one entry so `CallControl.find_jitcode` and
+        // `MetaInterpStaticData.jitcodes` agree before the blackhole
+        // resume looks anything up (resume.py:1338).
+        static INIT_COMPILE_CALLBACK: std::sync::Once = std::sync::Once::new();
+        INIT_COMPILE_CALLBACK.call_once(|| {
+            pyre_jit_trace::set_compile_jitcode_fn(compile_jitcode_via_w_code);
+        });
         Self {
             assembler: RefCell::new(Assembler::new()),
             callcontrol: UnsafeCell::new(super::call::CallControl::new(cpu, Vec::new())),
@@ -2188,6 +2201,37 @@ pub fn ensure_jitcode_for(
     merge_point_pc: Option<usize>,
 ) {
     CodeWriter::instance().make_jitcodes(&[(code, w_code, merge_point_pc)]);
+}
+
+/// Trace-side hook registered with `pyre_jit_trace::set_compile_jitcode_fn`
+/// from `CodeWriter::new()`. Resolves the `w_code` (a `PyObjectRef`
+/// wrapping a `CodeObject`) and routes it through `ensure_jitcode_for`
+/// so the lazy `make_jitcodes` pipeline runs for one entry.
+///
+/// RPython parity: jtransform's call to `cc.callcontrol.get_jitcode(callee)`
+/// (call.py:155-172) inserts the callee into `CallControl.jitcodes` and
+/// queues it on `unfinished_graphs`; the surrounding `make_jitcodes`
+/// drain (codewriter.py:79-85) then transforms the queued graph and
+/// pipes the result through `assembler.finished()`. Pyre fires this
+/// callback per trace-side `state::jitcode_for(w_code)` so the same
+/// transitive closure the RPython warmspot builds eagerly is built
+/// lazily here, one callee at a time. `merge_point_pc=None` matches
+/// the jtransform path: only `eval.rs`'s portal entry refines the
+/// merge point with `Some(pc)` (warmspot.py:148-282 has fixed portal
+/// PCs at flow-graph time, so RPython has no equivalent refinement).
+fn compile_jitcode_via_w_code(w_code: *const ()) {
+    if w_code.is_null() {
+        return;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return;
+    }
+    let code = unsafe { &*raw_code };
+    ensure_jitcode_for(code, w_code, None);
 }
 
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where

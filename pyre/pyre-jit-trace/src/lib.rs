@@ -15,7 +15,7 @@ pub mod liveness;
 pub mod metainterp;
 pub mod state;
 mod trace_opcode;
-pub use state::set_majit_jitcode;
+pub use state::{CompileJitcodeFn, set_compile_jitcode_fn, set_majit_jitcode};
 pub mod trace;
 pub mod virtualizable_gen;
 pub mod virtualizable_spec;

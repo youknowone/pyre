@@ -363,10 +363,64 @@ fn ensure_finish_setup() {
     });
 }
 
+/// Process-global hook the upper `pyre-jit` crate registers from
+/// `CodeWriter::new()` so the trace-side `jitcode_for` can drive the
+/// codewriter pipeline without `pyre_jit_trace` taking a build
+/// dependency on `pyre-jit`. RPython parity: jtransform's lookup of a
+/// callee graph in `cc.callcontrol.get_jitcode(callee)` (call.py:155)
+/// directly populates `CallControl.jitcodes` and queues the entry on
+/// `unfinished_graphs`; `make_jitcodes`'s drain (codewriter.py:79-89)
+/// then calls `transform_graph_to_jitcode` and `assembler.finished()`
+/// in one transitive pass. Pyre cannot perform that pass eagerly at
+/// warmspot time (no static callee discovery), so the lazy analog
+/// fires on every trace-side `jitcode_for` instead — the registered
+/// callback runs the same `grab_initial_jitcodes` → drain → set_majit
+/// pipeline for the one code object whose jitcode the tracer is about
+/// to record on a `MIFrame`. The fn pointer stays `Sync` because the
+/// upstream callback (`compile_jitcode_via_w_code`) reads
+/// `CodeWriter::instance()` which is itself per-thread.
+pub type CompileJitcodeFn = fn(*const ());
+
+static COMPILE_JITCODE_FN: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Registered once per process from `CodeWriter::new()` (under a
+/// `Once` guard). Invoked by `jitcode_for` before the canonical
+/// `MetaInterpStaticData.jitcodes` insert so that
+/// `CallControl.jitcodes` is populated under the same RPython
+/// invariant: any code object whose `JitCode` index appears in
+/// `MetaInterpStaticData` also has a populated `PyJitCode` reachable
+/// through `CallControl.find_jitcode` for the blackhole/resume
+/// lookup (resume.py:1338 `metainterp_sd.jitcodes[jitcode_pos]`).
+pub fn set_compile_jitcode_fn(f: CompileJitcodeFn) {
+    COMPILE_JITCODE_FN.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
 /// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
+///
+/// Fires the registered compile callback before allocating the SD
+/// entry. RPython's equivalent is `cc.callcontrol.get_jitcode(graph)`
+/// being called inside jtransform, which both populates the
+/// `CallControl.jitcodes` dict and (transitively, via the
+/// `make_jitcodes` drain) fills the `MetaInterpStaticData.jitcodes`
+/// list with the populated `JitCode`. Pyre's lazy split makes the
+/// callback re-enter the codewriter for one code object on every
+/// tracer-side reference — see `set_compile_jitcode_fn`.
+///
+/// The internal `MetaInterpStaticData::jitcode_for` method
+/// (called from `set_majit_jitcode` while the drain is mid-pipe) does
+/// **not** route through here, so the callback never re-enters
+/// itself.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
+    let cb = COMPILE_JITCODE_FN.load(std::sync::atomic::Ordering::Relaxed);
+    if !cb.is_null() {
+        // SAFETY: only `set_compile_jitcode_fn` writes to this slot,
+        // and it stores a `CompileJitcodeFn` cast through `as *mut ()`.
+        let f: CompileJitcodeFn = unsafe { std::mem::transmute(cb) };
+        f(code);
+    }
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code))
 }
 
