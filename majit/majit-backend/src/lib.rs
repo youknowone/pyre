@@ -1091,6 +1091,24 @@ pub trait Backend: Send {
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
 
+    /// Register constant OpRef → i64 values consumed by the next
+    /// `compile_loop` / `compile_bridge` call.  Default is no-op — only
+    /// backends that honour constants at emit time override.  The
+    /// companion `set_constant_types` carries the per-OpRef `Type`
+    /// tag.
+    fn set_constants(&mut self, _constants: std::collections::HashMap<u32, i64>) {}
+
+    /// Register constant OpRef → `Type` annotations.
+    fn set_constant_types(&mut self, _constant_types: std::collections::HashMap<u32, Type>) {}
+
+    /// Force the next `compile_loop` / `compile_bridge` call to stamp
+    /// this trace id on exits.
+    fn set_next_trace_id(&mut self, _trace_id: u64) {}
+
+    /// Force the next `compile_loop` / `compile_bridge` call to attach
+    /// this header PC to synthesised exit recovery layouts.
+    fn set_next_header_pc(&mut self, _header_pc: u64) {}
+
     /// Register a placeholder for a pending token (RPython compile_tmp_callback).
     /// The placeholder has null code_ptr; call_assembler_fast_path detects this
     /// and falls back to force_fn. Replaced by the real target on compile_loop.

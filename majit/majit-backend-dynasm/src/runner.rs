@@ -243,28 +243,10 @@ impl DynasmBackend {
         self.vtable_offset
     }
 
-    /// Set constants for the next compile_loop/compile_bridge call.
-    pub fn set_constants(&mut self, constants: std::collections::HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
-    /// Set constant type annotations for the next compile call.
-    pub fn set_constant_types(
-        &mut self,
-        constant_types: std::collections::HashMap<u32, majit_ir::Type>,
-    ) {
-        self.constant_types = constant_types;
-    }
-
-    /// Force the next compile to use a specific trace id.
-    pub fn set_next_trace_id(&mut self, trace_id: u64) {
-        self.next_trace_id = trace_id;
-    }
-
-    /// Set the green_key (header PC) for the next compilation.
-    pub fn set_next_header_pc(&mut self, header_pc: u64) {
-        self.next_header_pc = header_pc;
-    }
+    // `set_constants`, `set_constant_types`, `set_next_trace_id`,
+    // `set_next_header_pc` are provided via the `Backend` trait impl
+    // below so `compile_tmp_callback` and other backend-agnostic
+    // consumers can reach them through `&mut dyn Backend`.
 
     /// Stub — dynasm doesn't need GC runtime ID.
     pub fn gc_runtime_id(&self) -> Option<u64> {
@@ -645,6 +627,25 @@ impl Backend for DynasmBackend {
             code_addr,
             code_size,
         })
+    }
+
+    fn set_constants(&mut self, constants: std::collections::HashMap<u32, i64>) {
+        self.constants = constants;
+    }
+
+    fn set_constant_types(
+        &mut self,
+        constant_types: std::collections::HashMap<u32, majit_ir::Type>,
+    ) {
+        self.constant_types = constant_types;
+    }
+
+    fn set_next_trace_id(&mut self, trace_id: u64) {
+        self.next_trace_id = trace_id;
+    }
+
+    fn set_next_header_pc(&mut self, header_pc: u64) {
+        self.next_header_pc = header_pc;
     }
 
     fn compile_bridge(

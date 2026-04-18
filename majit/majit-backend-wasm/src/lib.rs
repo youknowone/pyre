@@ -83,18 +83,9 @@ impl WasmBackend {
         self.vtable_offset
     }
 
-    /// Set the constant pool (CraneliftBackend parity).
-    pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
-    /// Set the next trace ID (CraneliftBackend parity).
-    pub fn set_next_trace_id(&mut self, trace_id: u64) {
-        self.trace_counter = trace_id;
-    }
-
-    /// Set the header PC (CraneliftBackend parity — no-op for wasm).
-    pub fn set_next_header_pc(&mut self, _header_pc: u64) {}
+    // `set_constants`, `set_next_trace_id`, `set_next_header_pc` are
+    // provided via the `Backend` trait impl below.  wasm has no
+    // `set_constant_types` inherent — the trait default (no-op) is used.
 
     /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
     ///
@@ -296,6 +287,17 @@ impl majit_backend::Backend for WasmBackend {
             code_size: wasm_bytes.len(),
         })
     }
+
+    fn set_constants(&mut self, constants: HashMap<u32, i64>) {
+        self.constants = constants;
+    }
+
+    fn set_next_trace_id(&mut self, trace_id: u64) {
+        self.trace_counter = trace_id;
+    }
+
+    // `set_constant_types` / `set_next_header_pc` use the trait default
+    // (no-op) — wasm does not currently honour either value.
 
     fn compile_bridge(
         &mut self,

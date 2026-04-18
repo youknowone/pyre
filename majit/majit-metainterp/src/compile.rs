@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use smallvec::smallvec;
+
 use majit_backend::{
     Backend, BackendError, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout,
     JitCellToken, TerminalExitLayout,
@@ -2045,66 +2047,150 @@ pub trait DescrContainer {
 ///
 /// # Parameters
 ///
-/// * `portal_calldescr` / `portal_finishtoken` / `propagate_exc_descr`
-///   are passed explicitly for now. `rpython/jit/metainterp/pyjitpl.py:
-///   2278-2281` places these on `JitDriverStaticData`; Step 2 moves the
-///   corresponding fields onto pyre's `JitDriverStaticData` and this
-///   signature narrows to take only the driver.
-#[allow(dead_code)]
+/// `jitdriver_sd` must have `portal_runner_adr`, `portal_calldescr`,
+/// `portal_finishtoken`, and `propagate_exc_descr` populated.  The
+/// first three are set by `warmspot.py:1010-1017`; the last two by
+/// `pyjitpl.py:2279-2281` (see
+/// `MetaInterpStaticData::finish_setup_descrs_for_jitdrivers`).
 pub fn compile_tmp_callback(
-    _backend: &mut dyn Backend,
-    _token_number: u64,
-    _red_arg_types: &[Type],
-    _greenboxes: &[Value],
-    _portal_runner_adr: i64,
-    _portal_calldescr: DescrRef,
-    _portal_finishtoken: DescrRef,
-    _propagate_exc_descr: DescrRef,
+    backend: &mut dyn Backend,
+    jitdriver_sd: &crate::jitdriver::JitDriverStaticData,
+    token_number: u64,
+    greenboxes: &[Value],
+    red_arg_types: &[Type],
 ) -> Result<Arc<JitCellToken>, BackendError> {
-    // compile.py:1107 `jitcell_token = make_jitcell_token(jitdriver_sd)`
-    //   pyre: `JitCellToken::new(token_number)` — `outermost_jitdriver_sd`
-    //   is carried on `MetaInterp::jitdriver_sd` rather than the token
-    //   itself (documented PRE-EXISTING-ADAPTATION in `jitdriver.rs`).
+    // `compile.py:1107` `jitcell_token = make_jitcell_token(jitdriver_sd)`.
+    let mut jitcell_token = JitCellToken::new(token_number);
     //
-    // compile.py:1110 `jl.tmp_callback(jitcell_token)` — JIT logger
-    //   marker. Skipped until `rpython/rlib/jit.py:jit_logger` is ported.
+    // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
+    // marker.  PRE-EXISTING-ADAPTATION: `rpython/rlib/jit.py`'s `jl`
+    // module is not ported; skip.
     //
-    // compile.py:1112-1124 build `inputargs` from `red_arg_types`:
-    //   INT  → InputArgInt / InputArg::int()
-    //   REF  → InputArgRef / InputArg::ref()
-    //   FLOAT → InputArgFloat / InputArg::float()
+    // `compile.py:1112` `nb_red_args = jitdriver_sd.num_red_args`.
+    let nb_red_args = jitdriver_sd.num_reds();
+    // `compile.py:1113` `assert len(redargtypes) == nb_red_args`.
+    assert_eq!(
+        red_arg_types.len(),
+        nb_red_args,
+        "compile_tmp_callback: red_arg_types length mismatch",
+    );
+    // `compile.py:1114-1124` build `inputargs`:
+    //     for kind in redargtypes:
+    //         if kind == history.INT:   box = InputArgInt()
+    //         elif kind == history.REF: box = InputArgRef()
+    //         elif kind == history.FLOAT: box = InputArgFloat()
+    //         ...
+    //         inputargs.append(box)
+    let inputargs: Vec<InputArg> = red_arg_types
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| match kind {
+            Type::Int => InputArg::new_int(i as u32),
+            Type::Ref => InputArg::new_ref(i as u32),
+            Type::Float => InputArg::new_float(i as u32),
+            Type::Void => panic!("compile_tmp_callback: void red arg is invalid"),
+        })
+        .collect();
+    let num_inputs = inputargs.len() as u32;
     //
-    // compile.py:1125-1127 assemble call args:
-    //   `funcbox = ConstInt(adr2int(portal_runner_adr))`
-    //   `callargs = [funcbox] + greenboxes + inputargs`
-    //   pyre: constants are registered via `Backend::set_constants` with
-    //   `OpRef >= 10_000`; the caller performs that registration and
-    //   passes us the assembled `Op::new(CallX, &[OpRef, ...])`. Step 2
-    //   adds a small helper that does the registration inline.
+    // `compile.py:1125-1126`
+    //     k = jitdriver_sd.portal_runner_adr
+    //     funcbox = history.ConstInt(adr2int(k))
     //
-    // compile.py:1130-1132 build call op:
-    //   `opnum = OpHelpers.call_for_descr(portal_calldescr)`
-    //     → `OpCode::CallI` / `CallR` / `CallF` / `CallN` based on
-    //       `portal_calldescr.result_type()`.
-    //   `call_op = ResOperation(opnum, callargs, descr=portal_calldescr)`
+    // `compile.py:1127` `callargs = [funcbox] + greenboxes + inputargs`.
     //
-    // compile.py:1133-1136 `finishargs = [call_op]` if non-void else `[]`.
+    // pyre layout: the CALL op's `args` slots reference `OpRef` numbers.
+    // InputArgs occupy `OpRef(0..num_inputs)`; constants (funcbox +
+    // greens) are allocated at `OpRef(CONST_BASE..)` and registered with
+    // the backend via `set_constants` / `set_constant_types`.  This
+    // matches the existing pyre convention that constants live at large
+    // OpRef indices with lookup through the backend's `constants` map.
+    const CONST_BASE: u32 = 10_000;
+    let mut constants: HashMap<u32, i64> = HashMap::new();
+    let mut constant_types: HashMap<u32, Type> = HashMap::new();
+    // `compile.py:1126` funcbox.
+    let funcbox_ref = OpRef(CONST_BASE);
+    constants.insert(funcbox_ref.0, jitdriver_sd.portal_runner_adr);
+    constant_types.insert(funcbox_ref.0, Type::Int);
+    // Green boxes follow in declaration order.
+    let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
+    callargs.push(funcbox_ref);
+    for (i, gb) in greenboxes.iter().enumerate() {
+        let g_ref = OpRef(CONST_BASE + 1 + i as u32);
+        let (raw, tp) = match *gb {
+            Value::Int(v) => (v, Type::Int),
+            Value::Ref(r) => (r.0 as i64, Type::Ref),
+            Value::Float(f) => (f.to_bits() as i64, Type::Float),
+            Value::Void => panic!("compile_tmp_callback: void greenbox"),
+        };
+        constants.insert(g_ref.0, raw);
+        constant_types.insert(g_ref.0, tp);
+        callargs.push(g_ref);
+    }
+    // Red args — inputargs occupy contiguous low OpRefs.
+    for (i, _) in inputargs.iter().enumerate() {
+        callargs.push(OpRef(i as u32));
+    }
     //
-    // compile.py:1138-1144 `operations = [call_op,
-    //   GUARD_NO_EXCEPTION(failargs=[], descr=propagate_exc_descr),
-    //   FINISH(finishargs, descr=portal_finishtoken)]`.
+    let portal_calldescr = jitdriver_sd
+        .portal_calldescr
+        .as_ref()
+        .expect("compile_tmp_callback: jd.portal_calldescr not set")
+        .clone();
+    let portal_finishtoken = jitdriver_sd
+        .portal_finishtoken
+        .as_ref()
+        .expect("compile_tmp_callback: jd.portal_finishtoken not set")
+        .clone();
+    let propagate_exc_descr = jitdriver_sd
+        .propagate_exc_descr
+        .as_ref()
+        .expect("compile_tmp_callback: jd.propagate_exc_descr not set")
+        .clone();
     //
-    // compile.py:1146 `cpu.compile_loop(inputargs, operations, jitcell_token,
-    //   log=False)` — the ordinary backend entry point; no "pending"
-    //   special-case in RPython.
+    // `compile.py:1130` `jd = jitdriver_sd`.
+    // `compile.py:1131` `opnum = OpHelpers.call_for_descr(jd.portal_calldescr)`.
+    let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
+    // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
+    // descr=jd.portal_calldescr)`.
+    let mut call_op = Op::with_descr(call_opcode, &callargs, portal_calldescr);
+    // The CALL writes to the first free OpRef after inputargs.
+    let call_result_ref = OpRef(num_inputs);
+    call_op.pos = call_result_ref;
     //
-    // compile.py:1148-1149 `if memory_manager is not None:
+    // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
+    // else: finishargs = []`.
+    let finishargs: Vec<OpRef> = if jitdriver_sd.result_type == Type::Void {
+        Vec::new()
+    } else {
+        vec![call_result_ref]
+    };
+    //
+    // `compile.py:1138-1144` operations = [call_op,
+    //   GUARD_NO_EXCEPTION(descr=faildescr),
+    //   FINISH(finishargs, descr=jd.portal_finishtoken)].
+    let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
+    // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
+    guard_op.fail_args = Some(smallvec![]);
+    let finish_op = Op::with_descr(OpCode::Finish, &finishargs, portal_finishtoken);
+    let operations = vec![call_op, guard_op, finish_op];
+    //
+    // `compile.py:1145` `operations = get_deep_immutable_oplist(operations)` —
+    // pyre has no immutable-list transformation.
+    //
+    // `compile.py:1146` `cpu.compile_loop(inputargs, operations, jitcell_token,
+    // log=False)`.
+    backend.set_constants(constants);
+    backend.set_constant_types(constant_types);
+    backend.compile_loop(&inputargs, &operations, &mut jitcell_token)?;
+    //
+    // `compile.py:1148-1149` `if memory_manager is not None:
     //   memory_manager.keep_loop_alive(jitcell_token)` — pyre's
-    //   `BaseJitCell` holds the `Arc<JitCellToken>` once
-    //   `set_procedure_token(token, tmp=true)` runs in `warmstate.rs`.
+    // `BaseJitCell` holds the `Arc<JitCellToken>` once
+    // `set_procedure_token(token, tmp=true)` runs in `warmstate.rs`.
     //
-    // compile.py:1150 `return jitcell_token`.
-    todo!("compile_tmp_callback: Step 2 of the compile_tmp_callback plan")
+    // `compile.py:1150` `return jitcell_token`.
+    Ok(Arc::new(jitcell_token))
 }
 
 #[cfg(test)]

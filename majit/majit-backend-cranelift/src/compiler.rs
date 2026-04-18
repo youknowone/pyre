@@ -5555,26 +5555,10 @@ impl CraneliftBackend {
         });
     }
 
-    /// Register constants available during the next `compile_loop` call.
-    pub fn set_constants(&mut self, constants: HashMap<u32, i64>) {
-        self.constants = constants;
-    }
-
-    /// Set constant type annotations for the next compile call.
-    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
-        self.constant_types = constant_types;
-    }
-
-    /// Force the next compile call to assign a specific trace id to all exits.
-    pub fn set_next_trace_id(&mut self, trace_id: u64) {
-        self.next_trace_id = Some(trace_id);
-    }
-
-    /// Force the next compile call to attach a specific header PC to
-    /// synthesized exit recovery layouts.
-    pub fn set_next_header_pc(&mut self, header_pc: u64) {
-        self.next_header_pc = Some(header_pc);
-    }
+    // `set_constants`, `set_constant_types`, `set_next_trace_id`,
+    // `set_next_header_pc` are provided via the `Backend` trait impl
+    // below so `compile_tmp_callback` and other backend-agnostic
+    // consumers can reach them through `&mut dyn Backend`.
 
     fn gc_rewriter(&self, constant_types: &HashMap<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
         let runtime_id = self.gc_runtime_id?;
@@ -11305,6 +11289,22 @@ impl majit_backend::Backend for CraneliftBackend {
         self.registered_call_assembler_tokens.insert(token.number);
         token.compiled = Some(Box::new(compiled));
         Ok(info)
+    }
+
+    fn set_constants(&mut self, constants: HashMap<u32, i64>) {
+        self.constants = constants;
+    }
+
+    fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
+        self.constant_types = constant_types;
+    }
+
+    fn set_next_trace_id(&mut self, trace_id: u64) {
+        self.next_trace_id = Some(trace_id);
+    }
+
+    fn set_next_header_pc(&mut self, header_pc: u64) {
+        self.next_header_pc = Some(header_pc);
     }
 
     fn register_pending_target(
