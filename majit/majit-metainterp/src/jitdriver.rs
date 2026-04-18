@@ -972,6 +972,13 @@ impl<S: JitState> JitDriver<S> {
                     // No targets: consume bridge_info, fall through.
                     self.bridge_info = None;
                 }
+                // pyjitpl.py:2983: compile_trace already compiled a bridge
+                // to the existing loop. Don't call compile_loop again.
+                if self.compile_trace_success_pending() {
+                    self.sym = None;
+                    self.trace_meta = None;
+                    return;
+                }
                 let Some(trace_meta) = self.trace_meta.as_ref() else {
                     self.meta.abort_trace(false);
                     self.sym = None;
