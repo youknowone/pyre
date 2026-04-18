@@ -3187,9 +3187,173 @@ impl FlowContext {
                         w_value: value,
                     }))
                 }
-                other => Err(FlowContextError::Flowing(FlowingError::new(format!(
-                    "opcode handler not implemented yet: {other:?}"
-                )))),
+                // ──── Adaptive-specialised families ────
+                // CPython 3.14's PEP 659 adaptive interpreter rewrites
+                // generic opcodes into specialised variants at runtime.
+                // `Instruction::deoptimize()` is supposed to collapse
+                // them back to their generic shape (`BinaryOp*` →
+                // `BinaryOp`, `Call*` → `Call`, …). If a variant reaches
+                // this match after the `instruction.deoptimize()` call at
+                // the top of `handle_bytecode`, `deoptimize()` missed it.
+                // Treat it as a bytecode-corruption bug — either upstream
+                // rustpython's `Instruction::deoptimize()` is incomplete
+                // or a new specialised opcode was added and never mapped.
+                Instruction::BinaryOpAddFloat
+                | Instruction::BinaryOpAddInt
+                | Instruction::BinaryOpAddUnicode
+                | Instruction::BinaryOpExtend
+                | Instruction::BinaryOpInplaceAddUnicode
+                | Instruction::BinaryOpMultiplyFloat
+                | Instruction::BinaryOpMultiplyInt
+                | Instruction::BinaryOpSubscrDict
+                | Instruction::BinaryOpSubscrGetitem
+                | Instruction::BinaryOpSubscrListInt
+                | Instruction::BinaryOpSubscrListSlice
+                | Instruction::BinaryOpSubscrStrInt
+                | Instruction::BinaryOpSubscrTupleInt
+                | Instruction::BinaryOpSubtractFloat
+                | Instruction::BinaryOpSubtractInt
+                | Instruction::CallAllocAndEnterInit
+                | Instruction::CallBoundMethodExactArgs
+                | Instruction::CallBoundMethodGeneral
+                | Instruction::CallBuiltinClass
+                | Instruction::CallBuiltinFast
+                | Instruction::CallBuiltinFastWithKeywords
+                | Instruction::CallBuiltinO
+                | Instruction::CallIsinstance
+                | Instruction::CallKwBoundMethod
+                | Instruction::CallKwNonPy
+                | Instruction::CallKwPy
+                | Instruction::CallLen
+                | Instruction::CallListAppend
+                | Instruction::CallMethodDescriptorFast
+                | Instruction::CallMethodDescriptorFastWithKeywords
+                | Instruction::CallMethodDescriptorNoargs
+                | Instruction::CallMethodDescriptorO
+                | Instruction::CallNonPyGeneral
+                | Instruction::CallPyExactArgs
+                | Instruction::CallPyGeneral
+                | Instruction::CallStr1
+                | Instruction::CallTuple1
+                | Instruction::CallType1
+                | Instruction::CompareOpFloat
+                | Instruction::CompareOpInt
+                | Instruction::CompareOpStr
+                | Instruction::ContainsOpDict
+                | Instruction::ContainsOpSet
+                | Instruction::ForIterGen
+                | Instruction::ForIterList
+                | Instruction::ForIterRange
+                | Instruction::ForIterTuple
+                | Instruction::LoadAttrClass
+                | Instruction::LoadAttrClassWithMetaclassCheck
+                | Instruction::LoadAttrGetattributeOverridden
+                | Instruction::LoadAttrInstanceValue
+                | Instruction::LoadAttrMethodLazyDict
+                | Instruction::LoadAttrMethodNoDict
+                | Instruction::LoadAttrMethodWithValues
+                | Instruction::LoadAttrModule
+                | Instruction::LoadAttrNondescriptorNoDict
+                | Instruction::LoadAttrNondescriptorWithValues
+                | Instruction::LoadAttrProperty
+                | Instruction::LoadAttrSlot
+                | Instruction::LoadAttrWithHint
+                | Instruction::LoadConstImmortal
+                | Instruction::LoadConstMortal
+                | Instruction::LoadGlobalBuiltin
+                | Instruction::LoadGlobalModule
+                | Instruction::LoadSuperAttrAttr
+                | Instruction::LoadSuperAttrMethod
+                | Instruction::ResumeCheck
+                | Instruction::SendGen
+                | Instruction::StoreAttrInstanceValue
+                | Instruction::StoreAttrSlot
+                | Instruction::StoreAttrWithHint
+                | Instruction::StoreSubscrDict
+                | Instruction::StoreSubscrListInt
+                | Instruction::ToBoolAlwaysTrue
+                | Instruction::ToBoolBool
+                | Instruction::ToBoolInt
+                | Instruction::ToBoolList
+                | Instruction::ToBoolNone
+                | Instruction::ToBoolStr
+                | Instruction::UnpackSequenceList
+                | Instruction::UnpackSequenceTuple
+                | Instruction::UnpackSequenceTwoTuple => Err(FlowContextError::BytecodeCorruption(
+                    BytecodeCorruption::new(format!(
+                        "specialised opcode reached handle_bytecode after deoptimize(): {instruction:?}"
+                    )),
+                )),
+                // ──── CPython 3.14 sys.monitoring instrumentation ────
+                // Instrumentation opcodes are runtime-only — they are
+                // never produced by the static compiler. If flowspace
+                // sees one, the host was executing an instrumented
+                // function that leaked into the flow graph. PEP 669
+                // instrumentation is orthogonal to RPython's translation
+                // model.
+                Instruction::InstrumentedCall
+                | Instruction::InstrumentedCallFunctionEx
+                | Instruction::InstrumentedCallKw
+                | Instruction::InstrumentedEndAsyncFor
+                | Instruction::InstrumentedEndFor
+                | Instruction::InstrumentedEndSend
+                | Instruction::InstrumentedForIter
+                | Instruction::InstrumentedInstruction
+                | Instruction::InstrumentedJumpBackward
+                | Instruction::InstrumentedJumpForward
+                | Instruction::InstrumentedLine
+                | Instruction::InstrumentedLoadSuperAttr
+                | Instruction::InstrumentedNotTaken
+                | Instruction::InstrumentedPopIter
+                | Instruction::InstrumentedPopJumpIfFalse
+                | Instruction::InstrumentedPopJumpIfNone
+                | Instruction::InstrumentedPopJumpIfNotNone
+                | Instruction::InstrumentedPopJumpIfTrue
+                | Instruction::InstrumentedResume
+                | Instruction::InstrumentedReturnValue
+                | Instruction::InstrumentedYieldValue => self.unsupported_rpython(format!(
+                    "sys.monitoring instrumentation is not RPython: {instruction:?}"
+                )),
+                // ──── JIT-internal / interpreter-internal ────
+                Instruction::EnterExecutor
+                | Instruction::InterpreterExit
+                | Instruction::JumpBackwardJit
+                | Instruction::JumpBackwardNoJit
+                | Instruction::Reserved => Err(FlowContextError::BytecodeCorruption(
+                    BytecodeCorruption::new(format!(
+                        "interpreter-internal opcode reached flowspace: {instruction:?}"
+                    )),
+                )),
+                // ──── ExtendedArg is consumed by the decoder ────
+                Instruction::ExtendedArg => Err(FlowContextError::BytecodeCorruption(
+                    BytecodeCorruption::new(
+                        "ExtendedArg should be absorbed by the bytecode decoder",
+                    ),
+                )),
+                // ──── 3.14 opcodes outside the RPython language subset ────
+                // `AnnotationsPlaceholder` / `PopBlock` / `SetupCleanup` /
+                // `SetupFinally` / `SetupWith` / `StoreFastMaybeNull` 등은
+                // `PseudoInstruction` 에만 존재하며 실제 `Instruction`
+                // enum 에 오지 않으므로 arm 불필요.
+                Instruction::CheckEgMatch => {
+                    self.unsupported_rpython("exception groups are not RPython")
+                }
+                Instruction::ExitInitCheck => {
+                    self.unsupported_rpython("`__init__` return-None check is not RPython")
+                }
+                Instruction::GetLen => {
+                    // Upstream flowspace 에서는 Python 2.7 형태로 `len(x)`
+                    // 를 `op.len(x)` 로 기록한다. 3.14 의 `GET_LEN` 은
+                    // match statement 의 보조 opcode 이며 RPython scope
+                    // 밖이다.
+                    self.unsupported_rpython("GET_LEN is used by match statements (not RPython)")
+                }
+                Instruction::GetYieldFromIter => {
+                    // `yield from` 은 `flowcontext.py` 에서도 일반
+                    // generator 경로로 빠진다; Rust 포트는 generator
+                    // 지원을 아직 넣지 않았다.
+                    self.unsupported_rpython("`yield from` is not supported by flowspace yet")
+                }
             }
         })();
         match step {
