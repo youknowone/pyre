@@ -1143,8 +1143,22 @@ impl<M: Clone> MetaInterp<M> {
         let Some(info) = self.virtualizable_info() else {
             return;
         };
-        let array_lengths = self.trace_entry_vable_lengths(info);
         let num_static = info.num_static_extra_boxes;
+        // Prefer the interpreter-provided array lengths (or heap-read
+        // fallback).  When neither channel is populated — the common case
+        // on pyre today — derive the array length from `live_values` so
+        // virtualizable_boxes covers ALL array slots actually passed in.
+        // RPython never has this fallback because its interpreter always
+        // carries vinfo.read_boxes(). Without it, pyre's
+        // virtualizable_boxes ends up holding only the scalar fields +
+        // vable_ref, leaving the load/store mirror at
+        // trace_opcode.rs::store_local_value pointing at nonexistent
+        // indices.
+        let mut array_lengths = self.trace_entry_vable_lengths(info);
+        if array_lengths.iter().all(|&l| l == 0) && info.array_fields.len() == 1 {
+            let inferred = live_values.len().saturating_sub(1 + num_static);
+            array_lengths = vec![inferred];
+        }
         let num_array_elems: usize = array_lengths.iter().sum();
         let total_vable = num_static + num_array_elems;
         if total_vable == 0 || live_values.len() < 1 + total_vable {
