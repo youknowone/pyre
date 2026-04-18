@@ -1885,14 +1885,42 @@ impl CodeWriter {
         // codewriter.py:45-47 `for kind in KINDS:
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
         // The pyre-side post-pass scans the populated SSARepr to build
-        // per-kind dependency graphs, runs chordal coloring, and
-        // returns a rename + the `RegisterMapping` that blackhole
-        // resume reads. Stage-1 implementation is identity rename +
-        // `Pinned` mapping (see `super::regalloc` doc).
-        let regalloc_result =
-            super::regalloc::allocate_registers(&assembler.ssarepr, code.varnames.len());
+        // per-kind dependency graphs, runs chordal coloring on each,
+        // and returns a rename map + the `RegisterMapping::PerPc`
+        // table that blackhole resume reads.
+        let inputs = super::regalloc::ExternalInputs {
+            portal_frame_reg,
+            portal_ec_reg,
+            // Portal frames carry a virtualizable + ec red argument
+            // pair (interp_jit.py:64-69). Non-portal callees pass red
+            // args via the call assembler edge; the dispatch loop
+            // does not pre-load them into Ref registers.
+            portal_inputs: portal_frame_reg != u16::MAX,
+        };
+        let regalloc_result = super::regalloc::allocate_registers(
+            &assembler.ssarepr,
+            code.varnames.len(),
+            &depth_at_pc,
+            inputs,
+        );
         let mut assembler = assembler;
         super::regalloc::apply_rename(&mut assembler.ssarepr, &regalloc_result.rename);
+
+        // The portal red-arg register indices stored on PyJitCodeMetadata
+        // are consumed by BlackholeInterpreter::fill_portal_registers
+        // (blackhole.rs:1133-1140). They must follow the same rename
+        // table so the values land in the renamed slots that the
+        // assembled JitCode reads from.
+        let portal_frame_reg = regalloc_result
+            .rename
+            .get(&(super::flatten::Kind::Ref, portal_frame_reg))
+            .copied()
+            .unwrap_or(portal_frame_reg);
+        let portal_ec_reg = regalloc_result
+            .rename
+            .get(&(super::flatten::Kind::Ref, portal_ec_reg))
+            .copied()
+            .unwrap_or(portal_ec_reg);
 
         // codewriter.py:62-72 step 4 — assemble the SSARepr into an
         // owned JitCode, translate pc_map insn indices to byte offsets,

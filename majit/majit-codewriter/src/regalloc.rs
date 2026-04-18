@@ -20,28 +20,35 @@ use crate::model::{Block, FunctionGraph, Terminator, ValueId};
 /// Interference graph for register allocation.
 ///
 /// RPython: `color.py::DependencyGraph`.
+///
+/// Public so non-FunctionGraph callers (pyre's CPython-bytecode
+/// codewriter; see `pyre/pyre-jit/src/jit/regalloc.rs`) can reuse the
+/// chordal coloring without round-tripping through `FunctionGraph`.
+/// Node identity is `ValueId`; per-kind callers can encode their
+/// kind-specific index as `ValueId(index)` because the coloring is
+/// run independently per kind (see `regalloc.py:8`).
 #[derive(Debug, Clone)]
-struct DependencyGraph {
+pub struct DependencyGraph {
     all_nodes: Vec<ValueId>,
     neighbours: HashMap<ValueId, HashSet<ValueId>>,
 }
 
 impl DependencyGraph {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             all_nodes: Vec::new(),
             neighbours: HashMap::new(),
         }
     }
 
-    fn add_node(&mut self, v: ValueId) {
+    pub fn add_node(&mut self, v: ValueId) {
         if !self.neighbours.contains_key(&v) {
             self.all_nodes.push(v);
             self.neighbours.insert(v, HashSet::new());
         }
     }
 
-    fn add_edge(&mut self, v1: ValueId, v2: ValueId) {
+    pub fn add_edge(&mut self, v1: ValueId, v2: ValueId) {
         if v1 == v2 {
             return;
         }
@@ -100,7 +107,7 @@ impl DependencyGraph {
 
     /// RPython: `DependencyGraph.find_node_coloring()`
     /// Uses `HashSet<usize>` — no color limit (fixes u64 overflow).
-    fn find_node_coloring(&self) -> HashMap<ValueId, usize> {
+    pub fn find_node_coloring(&self) -> HashMap<ValueId, usize> {
         let mut result = HashMap::new();
         for v in self.lexicographic_order() {
             let mut forbidden: HashSet<usize> = HashSet::new();

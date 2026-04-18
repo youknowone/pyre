@@ -244,19 +244,32 @@ impl MIFrame {
                 let _length_f = all_liveness[offset + 2] as u32;
                 let mut off = offset + 3;
                 use majit_codewriter::liveness::LivenessIterator;
-                let mut live_local_idxs: Vec<usize> = Vec::new();
-                for length in [length_i, length_r] {
-                    if length == 0 {
+                // Collect Ref live registers from this PC.
+                let mut live_ref_regs: std::collections::HashSet<u16> =
+                    std::collections::HashSet::new();
+                for (k, length) in [length_i, length_r].iter().enumerate() {
+                    if *length == 0 {
                         continue;
                     }
-                    let mut it = LivenessIterator::new(off, length, all_liveness);
+                    let mut it = LivenessIterator::new(off, *length, all_liveness);
                     while let Some(reg_idx) = it.next() {
-                        let idx = reg_idx as usize;
-                        if idx < nlocals_pre {
-                            live_local_idxs.push(idx);
+                        if k == 1 {
+                            // Ref kind only — locals live on the Ref register file.
+                            live_ref_regs.insert(reg_idx as u16);
                         }
                     }
                     off = it.offset;
+                }
+                // Note: `register_idx < nlocals` decode stays valid
+                // because the post-pass register allocator constrains
+                // locals to identity-color (see `color_kind` cross-edge
+                // loop in `pyre/pyre-jit/src/jit/regalloc.rs`).
+                let mut live_local_idxs: Vec<usize> = Vec::new();
+                for &reg_idx in &live_ref_regs {
+                    let idx = reg_idx as usize;
+                    if idx < nlocals_pre {
+                        live_local_idxs.push(idx);
+                    }
                 }
                 for idx in live_local_idxs {
                     let cur = self

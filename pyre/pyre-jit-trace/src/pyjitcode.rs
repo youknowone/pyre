@@ -62,6 +62,19 @@ pub enum RegisterMapping {
     },
 }
 
+/// Reverse-lookup target produced by [`RegisterMapping::role_of_register`].
+///
+/// Tells the trace recorder which logical PyFrame slot a given JIT
+/// register holds at a particular Python PC. Used by `trace_opcode.rs`
+/// to translate a liveness-bitset register index into the
+/// `symbolic_locals` / `symbolic_stack` slot whose `OpRef` should be
+/// saved on a guard-fail snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterRole {
+    Local(usize),
+    Stack(usize),
+}
+
 impl RegisterMapping {
     /// JIT register that holds the value of fast local `local_idx`
     /// at Python PC `py_pc`. Returns `u16::MAX` if the local is
@@ -86,6 +99,60 @@ impl RegisterMapping {
                 .get(py_pc)
                 .and_then(|row| row.get(depth).copied())
                 .unwrap_or(u16::MAX),
+        }
+    }
+
+    /// Reverse of [`register_for_local`] / [`register_for_stack`].
+    /// Returns the logical PyFrame slot held by JIT register
+    /// `reg_idx` at Python PC `py_pc`, or `None` if no logical slot
+    /// maps to this register at this PC.
+    ///
+    /// Used by trace recording to expand liveness-bitset register
+    /// indices into the `symbolic_locals` / `symbolic_stack` slots
+    /// whose `OpRef` must be captured on a guard-fail snapshot.
+    /// `Pinned` keeps the legacy "register index < nlocals → local,
+    /// else stack" decode; `PerPc` walks the per-PC tables.
+    pub fn role_of_register(
+        &self,
+        py_pc: usize,
+        reg_idx: u16,
+        nlocals: usize,
+        stack_depth: usize,
+    ) -> Option<RegisterRole> {
+        match self {
+            RegisterMapping::Pinned { nlocals: nl } => {
+                let nl = *nl as usize;
+                if (reg_idx as usize) < nl {
+                    Some(RegisterRole::Local(reg_idx as usize))
+                } else {
+                    let depth = (reg_idx as usize) - nl;
+                    if depth < stack_depth {
+                        Some(RegisterRole::Stack(depth))
+                    } else {
+                        None
+                    }
+                }
+            }
+            RegisterMapping::PerPc {
+                local_to_reg,
+                stack_to_reg,
+            } => {
+                if let Some(row) = local_to_reg.get(py_pc) {
+                    for (local_idx, &r) in row.iter().take(nlocals).enumerate() {
+                        if r == reg_idx {
+                            return Some(RegisterRole::Local(local_idx));
+                        }
+                    }
+                }
+                if let Some(row) = stack_to_reg.get(py_pc) {
+                    for (depth, &r) in row.iter().take(stack_depth).enumerate() {
+                        if r == reg_idx {
+                            return Some(RegisterRole::Stack(depth));
+                        }
+                    }
+                }
+                None
+            }
         }
     }
 }
