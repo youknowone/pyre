@@ -22,30 +22,11 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// RPython computes this from JitCode (register bytecodes) via
 /// backward dataflow. pyre computes from Python bytecodes using the
 /// same algorithm, with stack depth tracked via forward analysis.
-///
-/// Parity note — forward-definedness intersection:
-/// RPython's `-live-` markers are inserted post-store in jtransform.py
-/// (rpython/jit/codewriter/jtransform.py), so a local is never
-/// reported live before its first store. Pure backward liveness on
-/// CPython bytecode would mark an uninitialised slot as live whenever
-/// a later `LOAD_FAST` (or super-inst variant) reads it — the backward
-/// walk propagates through merge points without knowing whether any
-/// predecessor defined the slot. We compensate by computing forward
-/// definedness (function args + STORE_FAST / STORE_FAST_LOAD_FAST /
-/// STORE_FAST_STORE_FAST define; DELETE_FAST / LOAD_FAST_AND_CLEAR
-/// undefine) and intersecting it with backward liveness in
-/// `is_local_live`. This matches the "written to before, and read
-/// afterwards" language in liveness.py:9-10.
 pub struct LiveVars {
     /// Flat multi-word bitvector for local liveness.
     /// `live_bits[pc * words_per_pc + w]` = word w of bitvector at PC.
     /// No 64-slot cap: supports `words_per_pc * 64` locals.
     live_bits: Vec<u64>,
-    /// Forward definedness bitvector (same layout as `live_bits`):
-    /// bit i at PC p means local i has been stored on every path
-    /// reaching p. Intersected with `live_bits` so uninitialised
-    /// slots are never reported live.
-    defined_bits: Vec<u64>,
     /// Number of u64 words per PC (ceil(nlocals / 64)).
     words_per_pc: usize,
     /// Stack depth at each PC (forward analysis).
@@ -63,7 +44,6 @@ impl LiveVars {
         if n == 0 {
             return LiveVars {
                 live_bits: Vec::new(),
-                defined_bits: Vec::new(),
                 words_per_pc: 0,
                 stack_depth_at: Vec::new(),
             };
@@ -282,155 +262,8 @@ impl LiveVars {
             }
         }
 
-        // Forward definedness analysis.
-        //
-        // RPython's liveness markers (`-live-` in jtransform.py) are
-        // inserted by the graph rewriter after the store that defines a
-        // variable, so by construction a live slot has already been
-        // written on every reaching path. Pyre's backward-only pass on
-        // CPython bytecode misses this guarantee: a loop-carried read
-        // may propagate liveness into pre-store PCs where the local is
-        // still Py_NULL. Compute a forward "defined" lattice and
-        // intersect with `live_bits` at query time so the runtime only
-        // ever sees locals that have been stored on every reaching path.
-        //
-        // Lattice: top = "all locals defined", bottom = "no info yet".
-        // Entry is initialised with the function's argument slots set;
-        // every joining branch intersects (AND) to stay conservative.
-        // Fixed-point iterates until no bit changes — matches the
-        // standard forward-MOP formulation for must-analyses.
-        let mut defined_bits = vec![0u64; total];
-        let mut defined_known = vec![false; n + 1];
-
-        // Entry-defined locals: positional + keyword-only + *args + **kwargs.
-        // varnames layout matches CPython's localsplus: positional /
-        // kwonly / vararg / varkwarg in order, matching call.rs:180-214.
-        let entry_defined_count = {
-            let mut c = code.arg_count as usize + code.kwonlyarg_count as usize;
-            use pyre_interpreter::bytecode::CodeFlags;
-            if code.flags.contains(CodeFlags::VARARGS) {
-                c += 1;
-            }
-            if code.flags.contains(CodeFlags::VARKEYWORDS) {
-                c += 1;
-            }
-            c.min(nlocals)
-        };
-        for i in 0..entry_defined_count {
-            defined_bits[i / 64] |= 1u64 << (i % 64);
-        }
-        defined_known[0] = true;
-
-        // Worklist propagation: each visited PC contributes its post-op
-        // defined set to every reachable successor.
-        let mut worklist: Vec<usize> = vec![0];
-        let mut post = vec![0u64; words_per_pc];
-        while let Some(pc) = worklist.pop() {
-            if pc >= n {
-                continue;
-            }
-            // post = defined[pc] after gen/kill for this instruction.
-            let base = pc * words_per_pc;
-            for w in 0..words_per_pc {
-                post[w] = defined_bits[base + w];
-            }
-            let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
-                // Unknown instruction: propagate unchanged to pc+1.
-                propagate_defined(
-                    &post,
-                    pc + 1,
-                    words_per_pc,
-                    &mut defined_bits,
-                    &mut defined_known,
-                    &mut worklist,
-                );
-                continue;
-            };
-            match instr {
-                Instruction::StoreFast { var_num } => {
-                    let i = var_num.get(op_arg).as_usize();
-                    let word = i / 64;
-                    if word < words_per_pc {
-                        post[word] |= 1u64 << (i % 64);
-                    }
-                }
-                Instruction::StoreFastLoadFast { var_nums } => {
-                    let pair = var_nums.get(op_arg);
-                    let store_idx = u32::from(pair.idx_1()) as usize;
-                    let word = store_idx / 64;
-                    if word < words_per_pc {
-                        post[word] |= 1u64 << (store_idx % 64);
-                    }
-                    // idx_2 (load half) is NOT a define; reading an
-                    // undefined slot via the super-inst is caught by the
-                    // forward lattice staying 0.
-                }
-                Instruction::StoreFastStoreFast { var_nums } => {
-                    let pair = var_nums.get(op_arg);
-                    for i in [
-                        u32::from(pair.idx_1()) as usize,
-                        u32::from(pair.idx_2()) as usize,
-                    ] {
-                        let word = i / 64;
-                        if word < words_per_pc {
-                            post[word] |= 1u64 << (i % 64);
-                        }
-                    }
-                }
-                Instruction::DeleteFast { var_num } | Instruction::LoadFastAndClear { var_num } => {
-                    let i = var_num.get(op_arg).as_usize();
-                    let word = i / 64;
-                    if word < words_per_pc {
-                        post[word] &= !(1u64 << (i % 64));
-                    }
-                }
-                _ => {}
-            }
-
-            // Propagate to fallthrough (unless unconditional jump).
-            if !is_unconditional_jump(&instr) {
-                propagate_defined(
-                    &post,
-                    pc + 1,
-                    words_per_pc,
-                    &mut defined_bits,
-                    &mut defined_known,
-                    &mut worklist,
-                );
-            }
-            // Branch target.
-            if let Some(tgt) = target_pc(code, &instr, pc, op_arg) {
-                if tgt <= n {
-                    propagate_defined(
-                        &post,
-                        tgt,
-                        words_per_pc,
-                        &mut defined_bits,
-                        &mut defined_known,
-                        &mut worklist,
-                    );
-                }
-            }
-            // Exception handlers: on exception, control jumps to tgt.
-            // The handler sees the caller's current `post` (locals
-            // defined up to this point) — intersect into handler entry.
-            for (s, e, tgt) in &exc_handlers {
-                if pc >= *s && pc < *e && *tgt <= n {
-                    propagate_defined(
-                        &post,
-                        *tgt,
-                        words_per_pc,
-                        &mut defined_bits,
-                        &mut defined_known,
-                        &mut worklist,
-                    );
-                }
-            }
-        }
-
         LiveVars {
             live_bits,
-            defined_bits,
             words_per_pc,
             stack_depth_at,
         }
@@ -438,30 +271,15 @@ impl LiveVars {
 
     /// codewriter/liveness.py _live_vars(pc) parity — local registers.
     /// No slot-count cap: supports arbitrary number of locals.
-    ///
-    /// A slot counts as live only when it is (a) live on the backward
-    /// pass AND (b) defined on every forward path reaching `pc`. The
-    /// forward intersection matches RPython's jtransform.py placement
-    /// of `-live-` markers strictly after the dominating store, so
-    /// uninitialised slots cannot leak into guard snapshots or the
-    /// blackhole resume path even when a downstream super-instruction
-    /// reads them.
     pub fn is_local_live(&self, pc: usize, local_idx: usize) -> bool {
         let word = local_idx / 64;
         let bit = local_idx % 64;
         if word >= self.words_per_pc {
             return false; // index beyond tracked locals
         }
-        let live = self
-            .live_bits
+        self.live_bits
             .get(pc * self.words_per_pc + word)
-            .map_or(true, |w| (w >> bit) & 1 != 0);
-        if !live {
-            return false;
-        }
-        self.defined_bits
-            .get(pc * self.words_per_pc + word)
-            .map_or(false, |w| (w >> bit) & 1 != 0)
+            .map_or(true, |w| (w >> bit) & 1 != 0)
     }
 
     /// codewriter/liveness.py parity — stack registers.
@@ -487,45 +305,6 @@ impl LiveVars {
         self.stack_depth_at
             .get(pc)
             .map_or(false, |&d| d != usize::MAX)
-    }
-}
-
-/// Forward-definedness propagation helper.
-///
-/// Intersects `post` (defined set after the predecessor instruction)
-/// into the target PC's defined set. First touch initialises with a
-/// copy; subsequent touches AND, matching the must-analysis join rule.
-/// Queues `target` if the target's bitset changed.
-fn propagate_defined(
-    post: &[u64],
-    target: usize,
-    words_per_pc: usize,
-    defined_bits: &mut [u64],
-    defined_known: &mut [bool],
-    worklist: &mut Vec<usize>,
-) {
-    let base = target * words_per_pc;
-    if base + words_per_pc > defined_bits.len() {
-        return;
-    }
-    let mut changed = false;
-    if !defined_known[target] {
-        for w in 0..words_per_pc {
-            defined_bits[base + w] = post[w];
-        }
-        defined_known[target] = true;
-        changed = true;
-    } else {
-        for w in 0..words_per_pc {
-            let merged = defined_bits[base + w] & post[w];
-            if merged != defined_bits[base + w] {
-                defined_bits[base + w] = merged;
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        worklist.push(target);
     }
 }
 
