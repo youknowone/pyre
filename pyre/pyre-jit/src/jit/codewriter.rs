@@ -1786,33 +1786,32 @@ impl CodeWriter {
                 }
 
                 // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
-                // jtransform.py:1898 — each local write → setarrayitem_vable_r.
+                // jtransform.py:1898 — each local write → setarrayitem_vable_r
+                // in portal, move_r in non-portal. Mirrors plain StoreFast.
                 Instruction::StoreFastStoreFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
                     let reg_a = u32::from(pair.idx_1()) as u16;
                     let reg_b = u32::from(pair.idx_2()) as u16;
-                    current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, reg_a, stack_base + current_depth);
-                    current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, reg_b, stack_base + current_depth);
-                    // Shadow write both stores to vable array.
-                    if is_portal {
-                        emit_load_const_i!(
-                            ssarepr,
-                            assembler,
-                            int_tmp0,
-                            local_to_vable_slot(reg_a as usize) as i64,
-                        );
-                        emit_vable_setarrayitem_ref!(ssarepr, assembler, 0_u16, int_tmp0, reg_a);
-                        emit_load_const_i!(
-                            ssarepr,
-                            assembler,
-                            int_tmp0,
-                            local_to_vable_slot(reg_b as usize) as i64,
-                        );
-                        emit_vable_setarrayitem_ref!(ssarepr, assembler, 0_u16, int_tmp0, reg_b);
+                    for reg in [reg_a, reg_b] {
+                        current_depth -= 1;
+                        emit_vsd!(assembler, current_depth);
+                        if is_portal {
+                            emit_load_const_i!(
+                                ssarepr,
+                                assembler,
+                                int_tmp0,
+                                local_to_vable_slot(reg as usize) as i64,
+                            );
+                            emit_vable_setarrayitem_ref!(
+                                ssarepr,
+                                assembler,
+                                0_u16,
+                                int_tmp0,
+                                stack_base + current_depth
+                            );
+                        } else {
+                            emit_move_r!(ssarepr, assembler, reg, stack_base + current_depth);
+                        }
                     }
                 }
 
