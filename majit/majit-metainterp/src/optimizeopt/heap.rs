@@ -57,7 +57,7 @@ fn sort_array_index_entries_untranslated<T>(entries: &mut [(i64, T)]) {
     }
 }
 
-use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Type, descr::descr_identity};
+use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, descr::descr_identity};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -2945,41 +2945,6 @@ impl Optimization for OptHeap {
         }
     }
 
-    fn flush_virtualizable(&mut self, ctx: &mut OptContext) {
-        // Collect virtualizable lazy sets from all CachedFields.
-        let vable_entries: Vec<(u32, OpRef, Op)> = self
-            .cached_fields
-            .iter_mut()
-            .filter_map(|(field_idx, _, cf)| {
-                if let Some((obj, ref op)) = cf.lazy_set {
-                    if op.descr.as_ref().map_or(false, |d| d.is_virtualizable()) {
-                        let op = op.clone();
-                        cf.lazy_set = None;
-                        return Some((*field_idx, obj, op));
-                    }
-                }
-                None
-            })
-            .collect();
-        for (field_idx, obj, mut op) in vable_entries {
-            let value_ref = ctx.get_box_replacement(op.arg(1));
-            if let Some(mut info) = ctx.get_ptr_info(value_ref).cloned() {
-                if info.is_virtual() {
-                    info.force_box(value_ref, ctx);
-                }
-            }
-            for arg in op.args.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
-            }
-            let final_value = op.arg(1);
-            let descr = op.descr.clone();
-            let put_back_op = op.clone();
-            ctx.emit(op);
-            self.cache_field(obj, field_idx, descr.as_ref());
-            ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
-        }
-    }
-
     /// RPython heap.py: emitting_operation(op)
     /// Called for EVERY op about to be emitted, regardless of which pass emits it.
     /// This is how the heap optimizer forces lazy sets before guards even when
@@ -3091,52 +3056,6 @@ impl Optimization for OptHeap {
 
     fn name(&self) -> &'static str {
         "heap"
-    }
-
-    fn emit_remaining_lazy_directly(&mut self, ctx: &mut OptContext) {
-        let pending: Vec<(OpRef, Op)> = self
-            .cached_fields
-            .iter_mut()
-            .filter_map(|(_, _, cf)| cf.lazy_set.take())
-            .collect();
-        // Force any remaining virtual values before emit.
-        for (_obj, op) in &pending {
-            let orig_val = op.arg(1);
-            if let Some(mut info) = ctx.get_ptr_info(orig_val).cloned() {
-                if info.is_virtual() {
-                    info.force_box(orig_val, ctx);
-                }
-            }
-        }
-        for (_obj, mut op) in pending {
-            for arg in op.args.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
-            }
-            let val = op.arg(1);
-            if !val.is_none()
-                && val.0 >= ctx.num_inputs() as u32
-                && !ctx.is_constant(val)
-                && !ctx
-                    .new_operations
-                    .iter()
-                    .any(|o| o.pos == val && o.opcode.result_type() != Type::Void)
-            {
-                continue;
-            }
-            ctx.emit(op);
-        }
-        let pending_arr: Vec<(OpRef, Op)> = self
-            .cached_arrayitems
-            .iter_mut()
-            .flat_map(|(_, _, submap)| submap.const_indexes.values_mut())
-            .filter_map(|cai| cai.lazy_set.take())
-            .collect();
-        for (_obj, mut op) in pending_arr {
-            for arg in op.args.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
-            }
-            ctx.emit(op);
-        }
     }
 
     /// heap.py:825-846 OptHeap.serialize_optheap(available_boxes)
