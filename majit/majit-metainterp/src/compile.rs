@@ -1662,9 +1662,25 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
 // These are ported as backend-agnostic `FailDescr` impls on the
 // `majit-metainterp` side so `compile_tmp_callback` and
 // `finish_setup` can reference the same singletons RPython does.
-// Backend-specific `done_with_this_frame_descr_*` singletons in
-// `majit-backend-cranelift` / `majit-backend-dynasm` remain for now;
-// they will be rewired to these types once every consumer has migrated.
+//
+// Identity follow-up (`pyjitpl.py:2222` passes `[self, cpu]`, not
+// `[self]`):  RPython attaches a *single* `DoneWithThisFrameDescr*`
+// object to both `MetaInterpStaticData` and the CPU, so the FINISH
+// descr pointer the backend observes is the same Arc the metainterp
+// reads back in `handle_fail`.  pyre currently keeps the backend copy
+// as a separate `LazyLock<Arc<DynasmFailDescr>>` / cranelift
+// `RegisteredLoopTarget` singleton; the production consumers are
+//    - `majit-backend-dynasm/src/guard.rs:195-204`
+//    - `majit-backend-cranelift/src/compiler.rs` (RegisteredLoopTarget
+//      finish-descr caches)
+//    - `majit-metainterp/src/pyjitpl/mod.rs:10226`
+//      (`make_and_attach_done_descrs(&mut [&mut sd])`)
+// Unification means (a) storing these Arcs on `Backend` via a
+// `set_done_with_this_frame_descr_*` setter, (b) having the backend's
+// runtime pointer check (`jf_descr == done_with_this_frame_descr_int_ptr`)
+// read `Arc::as_ptr` of the stored Arc, and (c) extending the same
+// setter set to `PropagateExceptionDescr`.  All 5 files need to move
+// together so the fast path never sees a stale backend-only instance.
 //
 // All items in this block carry `#[allow(dead_code)]` during Steps 2-4
 // of the `compile_tmp_callback` port; they go live together when
@@ -2154,15 +2170,20 @@ pub fn compile_tmp_callback(
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
     let mut call_op = Op::with_descr(call_opcode, &callargs, portal_calldescr);
-    // The CALL writes to the first free OpRef after inputargs.
-    let call_result_ref = OpRef(num_inputs);
-    call_op.pos = call_result_ref;
     //
     // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
+    //
+    // A void CALL leaves no result OpRef — match `Op::default_pos()` /
+    // `OpRef::NONE` so dynasm/cranelift backends that only emit a store
+    // when `op.pos != NONE` (e.g. `x86/assembler.rs` CALL handler) don't
+    // produce a bogus result slot.
     let finishargs: Vec<OpRef> = if jitdriver_sd.result_type == Type::Void {
         Vec::new()
     } else {
+        // The CALL writes to the first free OpRef after inputargs.
+        let call_result_ref = OpRef(num_inputs);
+        call_op.pos = call_result_ref;
         vec![call_result_ref]
     };
     //

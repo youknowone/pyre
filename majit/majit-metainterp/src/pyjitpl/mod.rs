@@ -10974,10 +10974,19 @@ impl crate::compile::DescrContainer for MetaInterpStaticData {
 impl MetaInterpStaticData {
     pub fn new() -> Self {
         // `pyjitpl.py:2222` `compile.make_and_attach_done_descrs([self, cpu])`.
-        // The CPU half of the pair lands with `Backend::propagate_exception_descr`
-        // wiring in a follow-up commit; for now the MetaInterpStaticData
-        // half is attached here so `compile_tmp_callback` can reach the
-        // singletons via the jitdriver's `portal_finishtoken`.
+        // RPython passes `[self, cpu]` — the same `Arc<DoneWithThisFrameDescr*>`
+        // lands on both the metainterp and the backend so FINISH-descr
+        // identity matches across the fast-path comparisons in
+        // `llmodel.py` and the `handle_fail` dispatch in pyjitpl.
+        //
+        // pyre currently attaches only to `MetaInterpStaticData`; backends
+        // keep their own `LazyLock<Arc<DynasmFailDescr>>` /
+        // `RegisteredLoopTarget` singletons.  Unification needs new
+        // `Backend::set_done_with_this_frame_descr_*` setters that take
+        // these Arcs, plus a runtime-path update so
+        // `done_with_this_frame_descr_int_ptr()` returns `Arc::as_ptr` of
+        // the stored Arc.  See the follow-up note in
+        // `compile.rs:1565-…` for the five-file surface.
         let mut sd = Self {
             op_live: -1,
             op_goto: -1,
@@ -11094,12 +11103,22 @@ impl MetaInterpStaticData {
     /// landings (follow-up commit); `self.propagate_exception_descr`
     /// already stores the shared instance.
     pub fn finish_setup_descrs_for_jitdrivers(&mut self) {
-        // `pyjitpl.py:2273` `exc_descr = compile.PropagateExceptionDescr()`.
-        let exc_descr: majit_ir::DescrRef =
-            std::sync::Arc::new(crate::compile::PropagateExceptionDescr::new());
-        // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr` —
-        // the MetaInterpStaticData half of the (self, cpu) pair.
-        self.propagate_exception_descr = Some(exc_descr.clone());
+        // `pyjitpl.py:2273` `exc_descr = compile.PropagateExceptionDescr()` —
+        // a *single* shared instance across every jitdriver + the cpu.
+        // pyre's `register_jitdriver_sd` calls this method on every
+        // driver insertion, so create the descr lazily and reuse it on
+        // subsequent calls to preserve identity across drivers.
+        let exc_descr: majit_ir::DescrRef = match self.propagate_exception_descr.as_ref() {
+            Some(existing) => existing.clone(),
+            None => {
+                let fresh: majit_ir::DescrRef =
+                    std::sync::Arc::new(crate::compile::PropagateExceptionDescr::new());
+                // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr` —
+                // the MetaInterpStaticData half of the (self, cpu) pair.
+                self.propagate_exception_descr = Some(fresh.clone());
+                fresh
+            }
+        };
         // `pyjitpl.py:2274-2281` per-driver attachment.
         for jd in self.jitdrivers_sd.iter_mut() {
             // `pyjitpl.py:2275-2279` `token = getattr(self,
@@ -11118,8 +11137,12 @@ impl MetaInterpStaticData {
             // self.cpu.calldescrof(...)` — logically warmspot-side but
             // pyre co-locates it here because pyre has no standalone
             // warmspot module and the inputs (green/red types,
-            // result_type) are all final by this point.
-            jd.build_portal_calldescr();
+            // result_type) are all final by this point.  Build only
+            // on first attachment so later `register_jitdriver_sd`
+            // calls don't replace an already-published `Arc<Descr>`.
+            if jd.portal_calldescr.is_none() {
+                jd.build_portal_calldescr();
+            }
         }
     }
 
@@ -11470,6 +11493,9 @@ mod metainterp_static_data_tests {
             virtualizable_info: None,
             greenfield_info: None,
             index_of_virtualizable: -1,
+            portal_calldescr: None,
+            portal_finishtoken: None,
+            propagate_exc_descr: None,
         };
         let _ = std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
