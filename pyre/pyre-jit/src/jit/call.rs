@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 
+use majit_codewriter::jitcode::BhCallDescr;
 use pyre_interpreter::CodeObject;
 
 use super::codewriter::{CodeWriter, PyJitCode};
@@ -233,6 +234,38 @@ impl CallControl {
     /// `transform_graph_to_jitcode`); callers loop until `None`.
     pub fn enum_pending_graphs(&mut self) -> Option<(*const CodeObject, *const (), Option<usize>)> {
         self.unfinished_graphs.pop()
+    }
+
+    /// RPython: `CallControl.get_jitcode_calldescr(graph)` (call.py:174-187).
+    ///
+    /// ```python
+    /// def get_jitcode_calldescr(self, graph):
+    ///     fnptr = getfunctionptr(graph)
+    ///     FUNC = lltype.typeOf(fnptr).TO
+    ///     fnaddr = llmemory.cast_ptr_to_adr(fnptr)
+    ///     NON_VOID_ARGS = [ARG for ARG in FUNC.ARGS if ARG is not lltype.Void]
+    ///     calldescr = self.cpu.calldescrof(FUNC, tuple(NON_VOID_ARGS),
+    ///                                      FUNC.RESULT, EffectInfo.MOST_GENERAL)
+    ///     return (fnaddr, calldescr)
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's blackhole calls every Python
+    /// function through one `bh_portal_runner(frame: ref) -> ref`
+    /// stub — the C-ABI is identical for every CodeObject because the
+    /// portal runner unwraps the frame and dispatches dynamically. So
+    /// `(fnaddr, calldescr)` is constant across all graphs in pyre,
+    /// while RPython has one pair per `FUNC` type because lltype-typed
+    /// `direct_call` ops can carry varying signatures. Keeping the
+    /// method shape preserves the call.py:167
+    /// `(fnaddr, calldescr) = self.get_jitcode_calldescr(graph)` flow
+    /// even though both values are constants here.
+    pub fn get_jitcode_calldescr(&self, _graph: *const CodeObject) -> (i64, BhCallDescr) {
+        let fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
+        let calldescr = BhCallDescr {
+            arg_classes: "r".to_string(),
+            result_type: 'r',
+        };
+        (fnaddr, calldescr)
     }
 
     /// RPython: `CallControl.get_jitcode(self, graph, called_from=None)`

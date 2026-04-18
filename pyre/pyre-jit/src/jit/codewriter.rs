@@ -2006,20 +2006,19 @@ impl CodeWriter {
         // call.py:148 grab_initial_jitcodes: jd.mainjitcode.jitdriver_sd = jd
         // pyre uses index 0 (single jitdriver) for portal jitcodes.
         jitcode.jitdriver_sd = if is_portal { Some(0) } else { None };
-        // call.py:174-187 get_jitcode_calldescr: calldescr from function type.
-        // pyre portal: bh_portal_runner(frame_ptr: ref) -> ref.
-        // All Python functions share the same calling convention.
-        jitcode.calldescr = majit_codewriter::jitcode::BhCallDescr {
-            arg_classes: "r".to_string(),
-            result_type: 'r',
-        };
+        // call.py:167 `(fnaddr, calldescr) = self.get_jitcode_calldescr(graph)`.
+        // The values are constant across CodeObjects in pyre — see
+        // [`super::call::CallControl::get_jitcode_calldescr`] for the
+        // PRE-EXISTING-ADAPTATION rationale.
+        let (fnaddr, calldescr) = self
+            .callcontrol()
+            .get_jitcode_calldescr(code as *const CodeObject);
+        jitcode.fnaddr = fnaddr;
+        jitcode.calldescr = calldescr;
         // Per-code stack base in `locals_cells_stack_w`. RPython's JitCode
         // does not carry PyFrame layout data; keep it in PyJitCodeMetadata
         // and attach it to BlackholeInterpreter setup when pyre needs it.
         let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-        // call.py:167-169 jitcode.fnaddr = getfunctionptr(graph).
-        // pyre: all Python functions go through the single portal runner.
-        jitcode.fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
 
         let metadata = PyJitCodeMetadata {
             pc_map: pc_map_bytes,
