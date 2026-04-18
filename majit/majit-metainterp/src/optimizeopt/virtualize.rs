@@ -354,29 +354,6 @@ impl OptVirtualize {
         }
     }
 
-    /// Force all arguments that are virtual.
-    /// Extract the int payload from a VirtualStruct (e.g., W_IntObject's intval field).
-    fn has_any_virtual_arg(op: &Op, ctx: &OptContext) -> bool {
-        op.args.iter().any(|arg| {
-            let resolved = ctx.get_box_replacement(*arg);
-            Self::is_virtual(resolved, ctx)
-        })
-    }
-
-    fn force_all_args(&mut self, op: &Op, ctx: &mut OptContext) -> Op {
-        let mut new_op = op.clone();
-        for arg in &mut new_op.args {
-            let resolved = ctx.get_box_replacement(*arg);
-            if Self::is_virtual(resolved, ctx) {
-                let forced = self.force_virtual(resolved, ctx);
-                *arg = ctx.get_box_replacement(forced);
-            } else {
-                *arg = resolved;
-            }
-        }
-        new_op
-    }
-
     // ── Per-opcode handlers ──
 
     fn optimize_new_with_vtable(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
@@ -673,9 +650,12 @@ impl OptVirtualize {
                 }
             }
         }
-        // Force any virtual args before emitting the setarrayitem
-        if Self::has_any_virtual_arg(op, ctx) {
-            return OptimizationResult::Replace(self.force_all_args(op, ctx));
+        // virtualize.py:307: self.make_nonnull(op.getarg(0))
+        // Virtual value-arg is NOT forced here; _emit_operation
+        // (optimizer.py:623-625) forces it at final emission time so the
+        // SetfieldGc init ops precede this SetarrayitemGc in _newoperations.
+        if ctx.get_ptr_info(array_ref).is_none() {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
