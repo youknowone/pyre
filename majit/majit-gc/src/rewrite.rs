@@ -234,10 +234,23 @@ impl RewriteState {
 
     /// Create or reuse a constant OpRef in the constants pool.
     /// Returns an OpRef key that resolves to `value` at compile time.
+    ///
+    /// `OpRef` has two namespaces:
+    /// - high-bit keys (>= 2^31): tracer-owned constant OpRefs. Their
+    ///   values are stored in this same HashMap under the raw key.
+    /// - low-bit keys (starting at 10_000): rewriter-added constants.
+    ///
+    /// Backends (majit-backend-dynasm/src/regalloc.rs const_value,
+    /// majit-backend-cranelift/src/compiler.rs resolve_constant*) look up
+    /// `constants.get(&opref.0)` (raw key) first, so a returned high-bit
+    /// OpRef would resolve correctly. The scan below still restricts
+    /// reuse to low-bit keys to keep rewriter-emitted ops within the
+    /// rewriter's own namespace (reusing a tracer OpRef would make the
+    /// emitted op's provenance depend on tracer state in a way that's
+    /// easy to get wrong if the backend resolution rule ever changes).
     fn const_int(&mut self, value: i64) -> OpRef {
-        // Check if this constant already exists
         for (&key, &val) in &self.constants {
-            if val == value {
+            if val == value && (key & (1u32 << 31)) == 0 {
                 return OpRef(key);
             }
         }
