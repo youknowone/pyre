@@ -1348,6 +1348,22 @@ pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef>
     arr.as_slice().get(abs_idx).copied()
 }
 
+/// pyframe.py:107-110: `locals_cells_stack_w` length =
+/// `co_nlocals + ncellvars + nfreevars + co_stacksize`. Returns the
+/// full heap-side array length (matching `virtualizable.py:86-99
+/// read_boxes` which iterates `len(lst)` over the full array).
+pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
+    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { &*arr_ptr }.as_slice().len())
+}
+
 /// pyframe.py:111: valuestackdepth = co_nlocals + ncellvars + nfreevars.
 /// Returns the stack base index (nlocals + ncells) for the given frame.
 /// This is the number of non-stack slots in the unified locals_cells_stack_w
@@ -1768,18 +1784,35 @@ impl PyreSym {
         if let Some(base) = self.vable_array_base {
             let info = crate::frame_layout::build_pyframe_virtualizable_info();
             let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            // pyre layout: inputarg[0] = frame (= vable_ref), inputarg[1..NUM_SCALARS]
-            // = static scalar fields, inputarg[NUM_SCALARS..] = locals_cells_stack_w
-            // array items. `base` must equal NUM_SCALARS in portal mode.
-            let array_len = nlocals + stack_only_depth;
+            // virtualizable.py:86-99 read_boxes iterates `len(lst)` — the
+            // heap-side `locals_cells_stack_w` length, which is
+            // `num_locals + num_cells + max_stack` (pyframe.py:107-110).
+            // Match that shape so every interpreter-visible slot has a
+            // tracing-time mirror. The live prefix [0, nlocals+stack_only_depth)
+            // references the recorder's InputArg stream; reserved stack slots
+            // beyond the current stack pointer are NULL on the PyFrame heap
+            // (FixedObjectArray::filled(..., PY_NULL)) and mirror to a shared
+            // const-NULL OpRef — interpreter paths never touch those slots
+            // during tracing, and the placeholder keeps set_virtualizable_box_at
+            // indexable across the full heap array.
+            let live_prefix = nlocals + stack_only_depth;
+            let array_len = concrete_frame_array_len(concrete_frame).unwrap_or(live_prefix);
             let mut input_oprefs: Vec<OpRef> = Vec::with_capacity(num_scalars - 1 + array_len);
             // Static fields inputargs OpRef(1)..OpRef(NUM_SCALARS).
             for i in 1..num_scalars {
                 input_oprefs.push(OpRef(i as u32));
             }
-            // Array items inputargs OpRef(base..base + array_len).
-            for i in 0..array_len {
+            // Array items inputargs OpRef(base..base + live_prefix).
+            for i in 0..live_prefix {
                 input_oprefs.push(OpRef(base + i as u32));
+            }
+            // Reserved-but-unused stack slots (beyond live prefix) mirror to
+            // a single const-NULL OpRef.
+            if array_len > live_prefix {
+                let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+                for _ in live_prefix..array_len {
+                    input_oprefs.push(null_ref);
+                }
             }
             let vable_ref = OpRef(crate::virtualizable_gen::SYM_FRAME_IDX);
             let array_lengths = vec![array_len];
@@ -2957,14 +2990,19 @@ impl JitState for PyreJitState {
         //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
         //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
         //      vable_debugdata, vable_lastblock, vable_w_globals)
-        //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+nlocals] = array items
-        //     (bridge_locals)
+        //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+array_len] = array items
+        //     (bridge_locals followed by reserved stack slots)
         //   boxes[-1] = vable identity (sym.frame)
-        // Bridge target loop header has stack_only=0, so the array slice
-        // only covers the locals portion; any stack-resident boxes in
-        // `vvals` beyond nlocals were intentionally dropped above.
+        // pyframe.py:107-110 `locals_cells_stack_w` length =
+        // `nlocals + ncells + max_stack`. Pad beyond the bridge's live
+        // local prefix with a shared const-NULL OpRef so every
+        // interpreter-visible slot has a tracing-time mirror (matches
+        // the portal path above).
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let mut bridge_input_oprefs: Vec<OpRef> = Vec::with_capacity((num_scalars - 1) + nlocals);
+        let bridge_array_len =
+            concrete_frame_array_len(sym.concrete_vable_ptr as usize).unwrap_or(nlocals);
+        let mut bridge_input_oprefs: Vec<OpRef> =
+            Vec::with_capacity((num_scalars - 1) + bridge_array_len);
         bridge_input_oprefs.push(sym.vable_last_instr);
         bridge_input_oprefs.push(sym.vable_pycode);
         bridge_input_oprefs.push(sym.vable_valuestackdepth);
@@ -2972,8 +3010,14 @@ impl JitState for PyreJitState {
         bridge_input_oprefs.push(sym.vable_lastblock);
         bridge_input_oprefs.push(sym.vable_w_globals);
         bridge_input_oprefs.extend_from_slice(&bridge_locals);
+        if bridge_array_len > nlocals {
+            let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+            for _ in nlocals..bridge_array_len {
+                bridge_input_oprefs.push(null_ref);
+            }
+        }
         let bridge_vable_ref = sym.frame;
-        let bridge_array_lengths = vec![nlocals];
+        let bridge_array_lengths = vec![bridge_array_len];
         ctx.init_virtualizable_boxes(
             &info,
             bridge_vable_ref,
