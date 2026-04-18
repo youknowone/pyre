@@ -873,6 +873,147 @@ mod tests {
 /// bridgeopt.py:124 signature:
 /// deserialize_optimizer_knowledge(optimizer, resumestorage, frontend_boxes, liveboxes)
 ///
+/// bridgeopt.py:63-122 `serialize_optimizer_knowledge(optimizer,
+/// numb_state, liveboxes, liveboxes_from_env, memo)`.
+///
+/// Emits three serialized sections on every guard (RPython emits zeros
+/// when the optheap/optrewrite caches are empty; the deserializer relies
+/// on the sections always being present):
+///
+/// 1. known-class bitfield per Ref livebox (bridgeopt.py:74-90)
+/// 2. heap field + array item triples (bridgeopt.py:92-108)
+/// 3. loopinvariant call results (bridgeopt.py:113-122)
+///
+/// RPython splits the memo-side wrapper (`_add_optimizer_sections`,
+/// resume.py:570-574) from the serialize core (`serialize_optimizer_knowledge`,
+/// bridgeopt.py:63-122). pyre keeps the same split: this free function
+/// carries the core, and `ResumeDataLoopMemo::_add_optimizer_sections`
+/// forwards.
+pub fn serialize_optimizer_knowledge(
+    memo: &mut crate::resume::ResumeDataLoopMemo,
+    numb_state: &mut crate::resume::NumberingState,
+    liveboxes: &[Option<OpRef>],
+    new_liveboxes: &crate::resume::LiveboxMap,
+    env: &dyn majit_ir::BoxEnv,
+    optimizer_knowledge: Option<&crate::resume::OptimizerKnowledgeForResume>,
+) {
+    // bridgeopt.py:64-67: available_boxes = liveboxes ∩ liveboxes_from_env
+    let available_boxes: std::collections::HashSet<u32> = liveboxes
+        .iter()
+        .filter_map(|opt| *opt)
+        .filter(|opref| numb_state.liveboxes.contains_key(opref.0))
+        .map(|opref| opref.0)
+        .collect();
+
+    // bridgeopt.py:74-88: known classes bitfield
+    // RPython: for each livebox, call getptrinfo(box).get_known_class(cpu).
+    // The actual class pointer is recovered at deserialization time
+    // via cpu.cls_of_box(frontend_boxes[i]).
+    //
+    // RPython Box.type parity: bridgeopt.py:77 uses `box.type != "r"`,
+    // where `box.type` is intrinsic/immutable. Pyre reads the same
+    // type that `finish()` stores in `numb_state.livebox_types` (this
+    // map feeds `fail_arg_types` / `livebox_types` on the deserialize
+    // side — see bridgeopt.rs below). If we queried `env.get_type()`
+    // here instead, a livebox whose OptContext-side type differs from
+    // its numbering-time type would cause serialize/deserialize to
+    // disagree on which Ref-typed slots get a bitfield bit, producing
+    // an out-of-bounds rd_numb read in `deserialize_optimizer_knowledge`
+    // when super-instruction GEN widens the live register set.
+    let mut bitfield: i32 = 0;
+    let mut shifts = 0;
+    for livebox in liveboxes {
+        if let Some(opref) = livebox {
+            let livebox_tp = numb_state
+                .livebox_types
+                .get(&opref.0)
+                .copied()
+                .unwrap_or_else(|| env.get_type(*opref));
+            if livebox_tp != majit_ir::Type::Ref {
+                continue;
+            }
+            bitfield <<= 1;
+            // bridgeopt.py:79-80: info = getptrinfo(box)
+            // known_class = info is not None and info.get_known_class(cpu) is not None
+            if env.has_known_class(*opref) {
+                bitfield |= 1;
+            }
+            shifts += 1;
+            if shifts == 6 {
+                numb_state.append_int(bitfield);
+                bitfield = 0;
+                shifts = 0;
+            }
+        }
+    }
+    if shifts > 0 {
+        numb_state.append_int(bitfield << (6 - shifts));
+    }
+
+    // bridgeopt.py:92-122: heap knowledge
+    let Some(knowledge) = optimizer_knowledge else {
+        // bridgeopt.py:109-111,121-122: no optheap/optrewrite → zeros
+        numb_state.append_int(0); // struct fields count
+        numb_state.append_int(0); // array items count
+        numb_state.append_int(0); // loopinvariant count
+        return;
+    };
+    // bridgeopt.py:93: triples_struct = optimizer.optheap.serialize_optheap(available_boxes)
+    let filtered_fields: Vec<(OpRef, i32, OpRef)> = knowledge
+        .heap_fields
+        .iter()
+        .copied()
+        .filter(|&(obj, _, val)| {
+            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
+            let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
+            obj_ok && val_ok
+        })
+        .collect();
+    numb_state.append_int(filtered_fields.len() as i32);
+    for (obj, descr_idx, val) in &filtered_fields {
+        let obj_tag = memo._gettagged(*obj, env, &numb_state.liveboxes, new_liveboxes);
+        numb_state.writer.append_short(obj_tag as i32);
+        numb_state.append_int(*descr_idx);
+        let val_tag = memo._gettagged(*val, env, &numb_state.liveboxes, new_liveboxes);
+        numb_state.writer.append_short(val_tag as i32);
+    }
+    // bridgeopt.py:102-108: array items
+    let filtered_arrayitems: Vec<(OpRef, i64, i32, OpRef)> = knowledge
+        .heap_arrayitems
+        .iter()
+        .copied()
+        .filter(|&(obj, _, _, val)| {
+            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
+            let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
+            obj_ok && val_ok
+        })
+        .collect();
+    numb_state.append_int(filtered_arrayitems.len() as i32);
+    for (obj, index, descr_idx, val) in &filtered_arrayitems {
+        let obj_tag = memo._gettagged(*obj, env, &numb_state.liveboxes, new_liveboxes);
+        numb_state.writer.append_short(obj_tag as i32);
+        numb_state.append_int(*index as i32);
+        numb_state.append_int(*descr_idx);
+        let val_tag = memo._gettagged(*val, env, &numb_state.liveboxes, new_liveboxes);
+        numb_state.writer.append_short(val_tag as i32);
+    }
+
+    // bridgeopt.py:113-122: loopinvariant results
+    let filtered_loopinvariant: Vec<(i64, OpRef)> = knowledge
+        .loopinvariant_results
+        .iter()
+        .copied()
+        .filter(|&(_, result)| env.is_const(result) || available_boxes.contains(&result.0))
+        .collect();
+    numb_state.append_int(filtered_loopinvariant.len() as i32);
+    for (const_ptr, result) in &filtered_loopinvariant {
+        let const_tag = memo.getconst_int(*const_ptr);
+        numb_state.writer.append_short(const_tag as i32);
+        let result_tag = memo._gettagged(*result, env, &numb_state.liveboxes, new_liveboxes);
+        numb_state.writer.append_short(result_tag as i32);
+    }
+}
+
 /// `frontend_boxes`: runtime values from guard failure (RPython Box objects
 ///   with concrete references). Used by cls_of_box to read vtable.
 /// `cls_of_box`: model.py:199-201 cpu.cls_of_box(box) — reads typeptr from

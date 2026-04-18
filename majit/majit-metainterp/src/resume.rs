@@ -3075,9 +3075,230 @@ impl ResumeDataLoopMemo {
         new_liveboxes_order.push(opref.0);
     }
 
+    /// resume.py:454-509 `_number_virtuals(liveboxes, num_env_virtuals)`.
+    ///
+    /// Walks `new_liveboxes` in insertion order, converts UNASSIGNED /
+    /// UNASSIGNEDVIRTUAL tags into real negative numbers via
+    /// `assign_number_to_box` / `assign_number_to_virtual`, then
+    /// materializes each virtual's fieldnums through
+    /// `env.make_rd_virtual_info` and stores them into the returned
+    /// `rd_virtuals` Vec.
+    ///
+    /// `liveboxes` is extended in place with the freshly numbered boxes
+    /// (resume.py:484 `liveboxes.extend(new_liveboxes)`). Returns
+    /// `(rd_virtuals, nholes)` where nholes is used for the
+    /// `_invalidation_needed` heuristic check by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn _number_virtuals(
+        &mut self,
+        liveboxes: &mut Vec<Option<majit_ir::OpRef>>,
+        new_liveboxes: &mut LiveboxMap,
+        new_liveboxes_order: &[u32],
+        virtual_fields: &std::collections::HashMap<u32, majit_ir::VirtualFieldsInfo>,
+        num_env_virtuals: usize,
+        numb_state: &NumberingState,
+        env: &dyn majit_ir::BoxEnv,
+    ) -> (Vec<majit_ir::RdVirtualInfo>, usize) {
+        // resume.py:460: new_liveboxes = [None] * memo.num_cached_boxes()
+        let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.num_cached_boxes()];
+        let mut count = 0;
+        // Iterate in insertion order (RPython dict iteration = insertion order).
+        let keys: Vec<(u32, i16)> = new_liveboxes_order
+            .iter()
+            .filter_map(|&k| new_liveboxes.get(k).map(|v| (k, v)))
+            .collect();
+        for (opref_id, tagged) in keys {
+            let (_, tagbits) = untag(tagged);
+            if tagbits == TAGBOX {
+                // resume.py:472-473: index = assign_number_to_box; liveboxes[box] = tag(index, TAGBOX)
+                let index = self.assign_number_to_box_opt(opref_id, &mut new_boxes_list);
+                if let Ok(t) = tag(index, TAGBOX) {
+                    new_liveboxes.insert(opref_id, t);
+                }
+                count += 1;
+            } else {
+                debug_assert_eq!(tagbits, TAGVIRTUAL);
+                if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
+                    // resume.py:479-480: index = assign_number_to_virtual; liveboxes[box] = tag(index, TAGVIRTUAL)
+                    let index = self.assign_number_to_virtual(opref_id);
+                    if let Ok(t) = tag(index, TAGVIRTUAL) {
+                        new_liveboxes.insert(opref_id, t);
+                    }
+                }
+            }
+        }
+        // resume.py:483-484: new_liveboxes.reverse(); liveboxes.extend(new_liveboxes)
+        new_boxes_list.reverse();
+        for box_id in &new_boxes_list {
+            liveboxes.push(box_id.map(majit_ir::OpRef));
+        }
+        let nholes = new_boxes_list.len() - count;
+
+        // resume.py:488-506: create rd_virtuals
+        // resume.py:500-501: make_virtual_info(info, fieldnums) via BoxEnv dispatch
+        let mut rd_virtuals: Vec<majit_ir::RdVirtualInfo> = Vec::new();
+        if !virtual_fields.is_empty() {
+            // resume.py:491: length = num_env_virtuals + memo.num_cached_virtuals()
+            let length = num_env_virtuals + self.num_cached_virtuals();
+            rd_virtuals.resize(length, majit_ir::RdVirtualInfo::Empty);
+            // resume.py:493-494: memo.nvirtuals += length; memo.nvholes += length - len(vfieldboxes)
+            self.nvirtuals += length;
+            self.nvholes += length - virtual_fields.len();
+
+            for (&opref_id, vf) in virtual_fields {
+                // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
+                // Check both numb_state.liveboxes (env virtuals) and
+                // new_liveboxes (nested virtuals discovered via worklist).
+                let tagged = numb_state
+                    .liveboxes
+                    .get(opref_id)
+                    .or_else(|| new_liveboxes.get(opref_id))
+                    .unwrap_or(UNASSIGNEDVIRTUAL);
+                let (num, _) = untag(tagged);
+                // RPython uses Python negative indexing: virtuals[-1] = virtuals[len-1].
+                // Negative nums come from assign_number_to_virtual for nested virtuals.
+                let num_idx = if num >= 0 {
+                    num as usize
+                } else {
+                    (rd_virtuals.len() as i32 + num) as usize
+                };
+                if num_idx < rd_virtuals.len() {
+                    // resume.py:500: fieldnums = [self._gettagged(box) for box in fieldboxes]
+                    let fieldnums: Vec<i16> = vf
+                        .field_oprefs
+                        .iter()
+                        .map(|&opref| {
+                            // resume.py:560-568 _gettagged with pyre-specific fallback
+                            // to cached_boxes/cached_virtuals when the local
+                            // liveboxes entries are still UNASSIGNED/UNASSIGNEDVIRTUAL.
+                            if opref.is_none() {
+                                return UNINITIALIZED_TAG;
+                            }
+                            if env.is_const(opref) {
+                                let (val, tp) = env.get_const(opref);
+                                return self.getconst(val, tp);
+                            }
+                            if let Some(t) = numb_state.liveboxes.get(opref.0) {
+                                return t;
+                            }
+                            if let Some(t) = new_liveboxes.get(opref.0) {
+                                if tagged_eq(t, UNASSIGNED) {
+                                    if let Some(&num) = self.cached_boxes.get(&opref.0) {
+                                        return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
+                                    }
+                                }
+                                if tagged_eq(t, UNASSIGNEDVIRTUAL) {
+                                    if let Some(&num) = self.cached_virtuals.get(&opref.0) {
+                                        return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
+                                    }
+                                }
+                                return t;
+                            }
+                            UNASSIGNED
+                        })
+                        .collect();
+                    // resume.py:501: vinfo = self.make_virtual_info(info, fieldnums)
+                    if let Some(rd_virt) =
+                        env.make_rd_virtual_info(majit_ir::OpRef(opref_id), fieldnums)
+                    {
+                        rd_virtuals[num_idx] = rd_virt;
+                    }
+                }
+            }
+        }
+        (rd_virtuals, nholes)
+    }
+
+    /// resume.py:520-558 `_add_pending_fields(pending_setfields)`.
+    ///
+    /// Tags the target/value boxes of each pending SETFIELD_GC/SETARRAYITEM_GC
+    /// operation so the resume path can replay them against rehydrated
+    /// struct instances. RPython decodes descr/opnum/itemindex from a
+    /// `ResOperation` inline; pyre has already split the op into a
+    /// `GuardPendingFieldEntry` by the time finish() is called, so this
+    /// method only tags the target and value OpRefs in place.
+    fn _add_pending_fields(
+        &mut self,
+        pending_setfields: &mut [majit_ir::GuardPendingFieldEntry],
+        env: &dyn majit_ir::BoxEnv,
+        liveboxes_from_env: &LiveboxMap,
+        new_liveboxes: &LiveboxMap,
+    ) {
+        for pf in pending_setfields.iter_mut() {
+            let target = env.get_box_replacement(pf.target);
+            let value = env.get_box_replacement(pf.value);
+            // resume.py:548-549 num = self._gettagged(box); fieldnum = self._gettagged(fieldbox)
+            pf.target_tagged = self._gettagged(target, env, liveboxes_from_env, new_liveboxes);
+            pf.value_tagged = self._gettagged(value, env, liveboxes_from_env, new_liveboxes);
+        }
+    }
+
+    /// resume.py:570-574 `_add_optimizer_sections(numb_state, liveboxes, liveboxes_from_env)`.
+    ///
+    /// Delegates to bridgeopt.py:63-122 `serialize_optimizer_knowledge(optimizer,
+    /// numb_state, liveboxes, liveboxes_from_env, memo)`. Emits three
+    /// serialized sections on every guard (RPython emits zeros when the
+    /// optheap/optrewrite caches are empty; the deserializer relies on the
+    /// sections always being present):
+    ///
+    /// 1. known-class bitfield per Ref livebox (bridgeopt.py:74-90)
+    /// 2. heap field + array item triples (bridgeopt.py:92-108)
+    /// 3. loopinvariant call results (bridgeopt.py:113-122)
+    ///
+    /// RPython's `memo` is `self`; `numb_state.liveboxes` plays the role of
+    /// the caller's `liveboxes_from_env` (the dict-like live-set). Pyre
+    /// additionally carries an explicit `new_liveboxes` map so the per-
+    /// guard tagged numbers assigned during `_number_virtuals` line up with
+    /// the optimizer_knowledge lookup.
+    fn _add_optimizer_sections(
+        &mut self,
+        numb_state: &mut NumberingState,
+        liveboxes: &[Option<majit_ir::OpRef>],
+        new_liveboxes: &LiveboxMap,
+        env: &dyn majit_ir::BoxEnv,
+        optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
+    ) {
+        // resume.py:572-574: serialize_optimizer_knowledge(
+        //     self.optimizer, numb_state, liveboxes, liveboxes_from_env, self.memo)
+        crate::optimizeopt::bridgeopt::serialize_optimizer_knowledge(
+            self,
+            numb_state,
+            liveboxes,
+            new_liveboxes,
+            env,
+            optimizer_knowledge,
+        );
+    }
+
+    /// resume.py:511-518 `_invalidation_needed(nliveboxes, nholes)`.
+    ///
+    /// Heuristic for when the shared memo's cached-box dedup should be
+    /// flushed after a successful resume encoding:
+    ///
+    /// ```python
+    /// def _invalidation_needed(self, nliveboxes, nholes):
+    ///     failargs_limit = memo.metainterp_sd.options.failargs_limit
+    ///     if nliveboxes > (failargs_limit // 2):
+    ///         if nholes > nliveboxes // 3:
+    ///             return True
+    ///     return False
+    /// ```
+    ///
+    /// pyre uses the IR's compile-time FAILARGS_LIMIT (majit_ir:value.rs:201)
+    /// as the metainterp option isn't wired yet. Matches RPython semantics
+    /// exactly: "lots of live boxes, many of them holes" → invalidate.
+    fn _invalidation_needed(&self, nliveboxes: usize, nholes: usize) -> bool {
+        // resume.py:514-517
+        let failargs_limit = majit_ir::FAILARGS_LIMIT;
+        if nliveboxes > failargs_limit / 2 && nholes > nliveboxes / 3 {
+            return true;
+        }
+        false
+    }
+
     /// resume.py:560-568 _gettagged — resolve an OpRef to its tagged number.
     /// Looks up in liveboxes_from_env first, then new_liveboxes, then constant.
-    fn _gettagged(
+    pub(crate) fn _gettagged(
         &mut self,
         opref: majit_ir::OpRef,
         env: &dyn majit_ir::BoxEnv,
@@ -3457,276 +3678,41 @@ impl ResumeDataLoopMemo {
             }
         }
 
-        // resume.py:454-509: _number_virtuals
-        // resume.py:460: new_liveboxes = [None] * memo.num_cached_boxes()
-        let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.num_cached_boxes()];
-        let mut count = 0;
-        // Iterate in insertion order (RPython dict iteration = insertion order).
-        let keys: Vec<(u32, i16)> = new_liveboxes_order
-            .iter()
-            .filter_map(|&k| new_liveboxes.get(k).map(|v| (k, v)))
-            .collect();
-        for (opref_id, tagged) in keys {
-            let (_, tagbits) = untag(tagged);
-            if tagbits == TAGBOX {
-                // resume.py:472-473: index = assign_number_to_box; liveboxes[box] = tag(index, TAGBOX)
-                let index = self.assign_number_to_box_opt(opref_id, &mut new_boxes_list);
-                if let Ok(t) = tag(index, TAGBOX) {
-                    new_liveboxes.insert(opref_id, t);
-                }
-                count += 1;
-            } else {
-                debug_assert_eq!(tagbits, TAGVIRTUAL);
-                if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
-                    // resume.py:479-480: index = assign_number_to_virtual; liveboxes[box] = tag(index, TAGVIRTUAL)
-                    let index = self.assign_number_to_virtual(opref_id);
-                    if let Ok(t) = tag(index, TAGVIRTUAL) {
-                        new_liveboxes.insert(opref_id, t);
-                    }
-                }
-            }
-        }
-        // resume.py:483-484: new_liveboxes.reverse(); liveboxes.extend(new_liveboxes)
-        new_boxes_list.reverse();
-        for box_id in &new_boxes_list {
-            liveboxes.push(box_id.map(majit_ir::OpRef));
-        }
-        let nholes = new_boxes_list.len() - count;
+        // resume.py:454-509 self._number_virtuals(liveboxes, num_env_virtuals)
+        let (rd_virtuals, nholes) = self._number_virtuals(
+            &mut liveboxes,
+            &mut new_liveboxes,
+            &new_liveboxes_order,
+            &virtual_fields,
+            num_env_virtuals as usize,
+            &numb_state,
+            env,
+        );
 
-        // resume.py:488-506: create rd_virtuals
-        // resume.py:500-501: make_virtual_info(info, fieldnums) via BoxEnv dispatch
-        let mut rd_virtuals: Vec<majit_ir::RdVirtualInfo> = Vec::new();
-        if !virtual_fields.is_empty() {
-            // resume.py:491: length = num_env_virtuals + memo.num_cached_virtuals()
-            let length = num_env_virtuals as usize + self.num_cached_virtuals();
-            rd_virtuals.resize(length, majit_ir::RdVirtualInfo::Empty);
-            self.nvirtuals += length;
-            self.nvholes += length - virtual_fields.len();
-
-            for (&opref_id, vf) in &virtual_fields {
-                // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
-                // Check both numb_state.liveboxes (env virtuals) and
-                // new_liveboxes (nested virtuals discovered via worklist).
-                let tagged = numb_state
-                    .liveboxes
-                    .get(opref_id)
-                    .or_else(|| new_liveboxes.get(opref_id))
-                    .unwrap_or(UNASSIGNEDVIRTUAL);
-                let (num, _) = untag(tagged);
-                // RPython uses Python negative indexing: virtuals[-1] = virtuals[len-1].
-                // Negative nums come from assign_number_to_virtual for nested virtuals.
-                let num_idx = if num >= 0 {
-                    num as usize
-                } else {
-                    (rd_virtuals.len() as i32 + num) as usize
-                };
-                if num_idx < rd_virtuals.len() {
-                    // resume.py:500: fieldnums = [self._gettagged(box) for box in fieldboxes]
-                    let fieldnums: Vec<i16> = vf
-                        .field_oprefs
-                        .iter()
-                        .map(|&opref| {
-                            // resume.py:560-568: _gettagged
-                            if opref.is_none() {
-                                return UNINITIALIZED_TAG;
-                            }
-                            // resume.py:563-564: isinstance(box, Const)
-                            if env.is_const(opref) {
-                                let (val, tp) = env.get_const(opref);
-                                return self.getconst(val, tp);
-                            }
-                            // resume.py:566-567: liveboxes_from_env
-                            if let Some(t) = numb_state.liveboxes.get(opref.0) {
-                                return t;
-                            }
-                            // Then check new_liveboxes
-                            if let Some(t) = new_liveboxes.get(opref.0) {
-                                // If still UNASSIGNED, get the real tag from cached_boxes
-                                if tagged_eq(t, UNASSIGNED) {
-                                    if let Some(&num) = self.cached_boxes.get(&opref.0) {
-                                        return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
-                                    }
-                                }
-                                if tagged_eq(t, UNASSIGNEDVIRTUAL) {
-                                    if let Some(&num) = self.cached_virtuals.get(&opref.0) {
-                                        return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
-                                    }
-                                }
-                                return t;
-                            }
-                            UNASSIGNED
-                        })
-                        .collect();
-                    // resume.py:501: vinfo = self.make_virtual_info(info, fieldnums)
-                    if let Some(rd_virt) =
-                        env.make_rd_virtual_info(majit_ir::OpRef(opref_id), fieldnums)
-                    {
-                        rd_virtuals[num_idx] = rd_virt;
-                    }
-                }
-            }
+        // resume.py:508-509: if self._invalidation_needed(...): memo.clear_box_virtual_numbers()
+        if self._invalidation_needed(liveboxes.len(), nholes) {
+            self.clear_box_virtual_numbers();
         }
 
-        // resume.py:508-509: _invalidation_needed heuristic
-        if nholes > 0 && liveboxes.len() > majit_ir::FAILARGS_LIMIT / 2 {
-            if nholes > liveboxes.len() / 3 {
-                self.clear_box_virtual_numbers();
-            }
-        }
-
-        // resume.py:445, 520-558: _add_pending_fields(pending_setfields)
-        // Tag target and value in-place on GuardPendingFieldEntry.
-        for pf in pending_setfields.iter_mut() {
-            let target = env.get_box_replacement(pf.target);
-            let value = env.get_box_replacement(pf.value);
-            pf.target_tagged = self._gettagged(target, env, &numb_state.liveboxes, &new_liveboxes);
-            pf.value_tagged = self._gettagged(value, env, &numb_state.liveboxes, &new_liveboxes);
-        }
+        // resume.py:445 self._add_pending_fields(pending_setfields)
+        self._add_pending_fields(
+            pending_setfields,
+            env,
+            &numb_state.liveboxes,
+            &new_liveboxes,
+        );
 
         // resume.py:447: numb_state.patch(1, len(liveboxes))
         numb_state.writer.patch(1, liveboxes.len() as i32);
 
-        // resume.py:449: _add_optimizer_sections(numb_state, ...)
-        // bridgeopt.py:63-122: serialize_optimizer_knowledge
-        // RPython ALWAYS calls this — even guards without heap knowledge
-        // get the bitfield + zero counts. The deserializer relies on this.
-        {
-            // bridgeopt.py:64-67: available_boxes = liveboxes ∩ liveboxes_from_env
-            let available_boxes: std::collections::HashSet<u32> = liveboxes
-                .iter()
-                .filter_map(|opt| *opt)
-                .filter(|opref| numb_state.liveboxes.contains_key(opref.0))
-                .map(|opref| opref.0)
-                .collect();
-
-            // bridgeopt.py:74-88: known classes bitfield
-            // RPython: for each livebox, call getptrinfo(box).get_known_class(cpu).
-            // The actual class pointer is recovered at deserialization time
-            // via cpu.cls_of_box(frontend_boxes[i]).
-            //
-            // RPython Box.type parity: bridgeopt.py:77 uses `box.type != "r"`,
-            // where `box.type` is intrinsic/immutable. Pyre reads the same
-            // type that `finish()` stores in `numb_state.livebox_types` (this
-            // map feeds `fail_arg_types` / `livebox_types` on the deserialize
-            // side — see bridgeopt.rs:911). If we queried `env.get_type()`
-            // here instead, a livebox whose OptContext-side type differs from
-            // its numbering-time type would cause serialize/deserialize to
-            // disagree on which Ref-typed slots get a bitfield bit, producing
-            // an out-of-bounds rd_numb read in `deserialize_optimizer_knowledge`
-            // when super-instruction GEN widens the live register set.
-            let mut bitfield: i32 = 0;
-            let mut shifts = 0;
-            for livebox in &liveboxes {
-                if let Some(opref) = livebox {
-                    let livebox_tp = numb_state
-                        .livebox_types
-                        .get(&opref.0)
-                        .copied()
-                        .unwrap_or_else(|| env.get_type(*opref));
-                    if livebox_tp != majit_ir::Type::Ref {
-                        continue;
-                    }
-                    bitfield <<= 1;
-                    // bridgeopt.py:79-80: info = getptrinfo(box)
-                    // known_class = info is not None and info.get_known_class(cpu) is not None
-                    if env.has_known_class(*opref) {
-                        bitfield |= 1;
-                    }
-                    shifts += 1;
-                    if shifts == 6 {
-                        numb_state.append_int(bitfield);
-                        bitfield = 0;
-                        shifts = 0;
-                    }
-                }
-            }
-            if shifts > 0 {
-                numb_state.append_int(bitfield << (6 - shifts));
-            }
-
-            // bridgeopt.py:92-111: heap knowledge
-            if let Some(knowledge) = optimizer_knowledge {
-                // bridgeopt.py:93: triples_struct, triples_array = optimizer.optheap.serialize_optheap(available_boxes)
-                let filtered_fields: Vec<_> = knowledge
-                    .heap_fields
-                    .iter()
-                    .filter(|&&(obj, _, val)| {
-                        let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
-                        let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
-                        obj_ok && val_ok
-                    })
-                    .collect();
-                numb_state.append_int(filtered_fields.len() as i32);
-                for &&(obj, descr_idx, val) in &filtered_fields {
-                    numb_state.writer.append_short(self._gettagged(
-                        obj,
-                        env,
-                        &numb_state.liveboxes,
-                        &new_liveboxes,
-                    ) as i32);
-                    numb_state.append_int(descr_idx);
-                    numb_state.writer.append_short(self._gettagged(
-                        val,
-                        env,
-                        &numb_state.liveboxes,
-                        &new_liveboxes,
-                    ) as i32);
-                }
-                // bridgeopt.py:102-108: array items
-                let filtered_arrayitems: Vec<_> = knowledge
-                    .heap_arrayitems
-                    .iter()
-                    .filter(|&&(obj, _, _, val)| {
-                        let obj_ok = env.is_const(obj) || available_boxes.contains(&obj.0);
-                        let val_ok = env.is_const(val) || available_boxes.contains(&val.0);
-                        obj_ok && val_ok
-                    })
-                    .collect();
-                numb_state.append_int(filtered_arrayitems.len() as i32);
-                for &&(obj, index, descr_idx, val) in &filtered_arrayitems {
-                    numb_state.writer.append_short(self._gettagged(
-                        obj,
-                        env,
-                        &numb_state.liveboxes,
-                        &new_liveboxes,
-                    ) as i32);
-                    numb_state.append_int(index as i32);
-                    numb_state.append_int(descr_idx);
-                    numb_state.writer.append_short(self._gettagged(
-                        val,
-                        env,
-                        &numb_state.liveboxes,
-                        &new_liveboxes,
-                    ) as i32);
-                }
-
-                // bridgeopt.py:113-122: loopinvariant results
-                let filtered_loopinvariant: Vec<_> = knowledge
-                    .loopinvariant_results
-                    .iter()
-                    .filter(|&&(_, result)| {
-                        env.is_const(result) || available_boxes.contains(&result.0)
-                    })
-                    .collect();
-                numb_state.append_int(filtered_loopinvariant.len() as i32);
-                for &&(const_ptr, result) in &filtered_loopinvariant {
-                    numb_state
-                        .writer
-                        .append_short(self.getconst_int(const_ptr) as i32);
-                    numb_state.writer.append_short(self._gettagged(
-                        result,
-                        env,
-                        &numb_state.liveboxes,
-                        &new_liveboxes,
-                    ) as i32);
-                }
-            } else {
-                // bridgeopt.py:109-111,121-122: no optheap/optrewrite → zeros
-                numb_state.append_int(0); // struct fields count
-                numb_state.append_int(0); // array items count
-                numb_state.append_int(0); // loopinvariant count
-            }
-        }
+        // resume.py:449: self._add_optimizer_sections(numb_state, liveboxes, liveboxes_from_env)
+        self._add_optimizer_sections(
+            &mut numb_state,
+            &liveboxes,
+            &new_liveboxes,
+            env,
+            optimizer_knowledge,
+        );
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
         let rd_numb = numb_state.create_numbering();
