@@ -1755,6 +1755,36 @@ impl PyreSym {
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
         }
+        // pyjitpl.py:3458-3462 / virtualizable.py:86-99 read_boxes parity:
+        // seed the tracing-time `virtualizable_boxes` cache with the
+        // InputArg OpRefs that correspond to the portal's virtualizable
+        // layout (scalar fields followed by array items, with the
+        // virtualizable identity appended at `boxes[-1]`). Without this
+        // seeding, `vable_setarrayitem_indexed` / `vable_getarrayitem_*`
+        // fall through to raw SetarrayitemGc / GetarrayitemGc ops, and
+        // `close_loop_args_at`'s `set_virtualizable_box_at` mirror
+        // becomes a no-op — the very reason `MIFrame::store_local_value`
+        // cannot route through the standard vable path today.
+        if let Some(base) = self.vable_array_base {
+            let info = crate::frame_layout::build_pyframe_virtualizable_info();
+            let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            // pyre layout: inputarg[0] = frame (= vable_ref), inputarg[1..NUM_SCALARS]
+            // = static scalar fields, inputarg[NUM_SCALARS..] = locals_cells_stack_w
+            // array items. `base` must equal NUM_SCALARS in portal mode.
+            let array_len = nlocals + stack_only_depth;
+            let mut input_oprefs: Vec<OpRef> = Vec::with_capacity(num_scalars - 1 + array_len);
+            // Static fields inputargs OpRef(1)..OpRef(NUM_SCALARS).
+            for i in 1..num_scalars {
+                input_oprefs.push(OpRef(i as u32));
+            }
+            // Array items inputargs OpRef(base..base + array_len).
+            for i in 0..array_len {
+                input_oprefs.push(OpRef(base + i as u32));
+            }
+            let vable_ref = OpRef(crate::virtualizable_gen::SYM_FRAME_IDX);
+            let array_lengths = vec![array_len];
+            ctx.init_virtualizable_boxes(&info, vable_ref, &input_oprefs, &array_lengths);
+        }
     }
 
     /// Stack-only depth (number of values on the operand stack).
