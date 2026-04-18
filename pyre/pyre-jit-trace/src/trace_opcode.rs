@@ -461,13 +461,25 @@ impl MIFrame {
     }
 
     /// RPython Box push: symbolic OpRef + concrete value together.
+    ///
+    /// Parity: the operand stack for virtualizable portal frames lives
+    /// inside `locals_cells_stack_w` (virtualizable.py:86-98), a W_Root
+    /// array, so every pushed slot is a Ref box. `value_type` is kept
+    /// as a declared type hint but the stored OpRef is always boxed
+    /// here. Callers that want to keep a raw Int/Float payload must
+    /// unbox at the op site, not at push time.
     fn push_typed_value(
         &mut self,
-        _ctx: &mut TraceCtx,
+        ctx: &mut TraceCtx,
         value: OpRef,
         value_type: Type,
         concrete: ConcreteValue,
     ) {
+        let boxed = match value_type {
+            Type::Int => wrapint(ctx, value),
+            Type::Float => wrapfloat(ctx, value),
+            _ => value,
+        };
         let s = self.sym_mut();
         let stack_idx = s.stack_only_depth();
         if stack_idx >= s.symbolic_stack.len() {
@@ -476,8 +488,8 @@ impl MIFrame {
         if stack_idx >= s.symbolic_stack_types.len() {
             s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
         }
-        s.symbolic_stack[stack_idx] = value;
-        s.symbolic_stack_types[stack_idx] = value_type;
+        s.symbolic_stack[stack_idx] = boxed;
+        s.symbolic_stack_types[stack_idx] = Type::Ref;
         if stack_idx >= s.concrete_stack.len() {
             s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
         }
