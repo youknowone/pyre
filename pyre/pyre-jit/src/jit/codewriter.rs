@@ -1319,18 +1319,45 @@ impl CodeWriter {
 
                 // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
                 // idx_1 (store), then push idx_2 (load). Net depth 0.
-                // Both halves use register-bank moves (not vable read/write)
-                // pending A-3 Layer 2 (blackhole frame writeback); the
-                // codewriter side still has a real implementation so the
-                // trace doesn't abort on this super-instruction.
+                // Portal: store via setarrayitem_vable_r, load via
+                // getarrayitem_vable_r. Non-portal: move_r for both halves.
                 Instruction::StoreFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
                     let store_reg = u32::from(pair.idx_1()) as u16;
                     let load_reg = u32::from(pair.idx_2()) as u16;
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, store_reg, stack_base + current_depth);
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, load_reg);
+                    if is_portal {
+                        emit_load_const_i!(
+                            ssarepr,
+                            assembler,
+                            int_tmp0,
+                            local_to_vable_slot(store_reg as usize) as i64
+                        );
+                        emit_vable_setarrayitem_ref!(
+                            ssarepr,
+                            assembler,
+                            0_u16,
+                            int_tmp0,
+                            stack_base + current_depth
+                        );
+                        emit_load_const_i!(
+                            ssarepr,
+                            assembler,
+                            int_tmp0,
+                            local_to_vable_slot(load_reg as usize) as i64
+                        );
+                        emit_vable_getarrayitem_ref!(
+                            ssarepr,
+                            assembler,
+                            stack_base + current_depth,
+                            0_u16,
+                            int_tmp0
+                        );
+                    } else {
+                        emit_move_r!(ssarepr, assembler, store_reg, stack_base + current_depth);
+                        emit_move_r!(ssarepr, assembler, stack_base + current_depth, load_reg);
+                    }
                     current_depth += 1;
                     emit_vsd!(assembler, current_depth);
                 }
