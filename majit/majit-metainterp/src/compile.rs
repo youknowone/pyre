@@ -4,11 +4,13 @@
 //! management, backend layout merging, and trace post-processing (unboxing).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use majit_backend::{
-    CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout,
+    Backend, BackendError, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout,
+    JitCellToken, TerminalExitLayout,
 };
-use majit_ir::{GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout, StoredResumeData};
@@ -1556,6 +1558,95 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
     fn force_token_slots(&self) -> &[usize] {
         &self.force_token_slots
     }
+}
+
+/// `rpython/jit/metainterp/compile.py:1101-1150` `compile_tmp_callback`.
+///
+/// Make a `JitCellToken` that corresponds to assembler code that just
+/// calls back the interpreter.  Used temporarily: a fully compiled
+/// version of the code may end up replacing it via
+/// `redirect_call_assembler`.
+///
+/// The RPython-orthodox approach has **no separate "pending target
+/// registry"**: every `JitCellToken` points at a real compiled body.
+/// For an unfinished callee the body is a 3-op stub —
+/// `CALL portal_runner_adr(funcbox, *greenboxes, *inputargs)` →
+/// `GUARD_NO_EXCEPTION` → `FINISH` — which bounces control back into
+/// the interpreter. Once the real trace compiles,
+/// `redirect_call_assembler` (`x86/assembler.py:1138`) in-place patches
+/// `_ll_function_addr` so callers reach the real loop transparently.
+///
+/// # Wiring status (Step 1 of the `compile_tmp_callback` port plan)
+///
+/// This function is introduced as dead code. The production path still
+/// goes through `Backend::register_pending_target`. Step 2 routes
+/// `warmstate::get_assembler_token` (`warmstate.py:714-723`) through
+/// this function and marks the resulting cell with `tmp=true`. Step 3
+/// drops `register_pending_target` and the cranelift/dynasm pending
+/// placeholder registries entirely.
+///
+/// # Parameters
+///
+/// * `portal_calldescr` / `portal_finishtoken` / `propagate_exc_descr`
+///   are passed explicitly for now. `rpython/jit/metainterp/pyjitpl.py:
+///   2278-2281` places these on `JitDriverStaticData`; Step 2 moves the
+///   corresponding fields onto pyre's `JitDriverStaticData` and this
+///   signature narrows to take only the driver.
+#[allow(dead_code)]
+pub fn compile_tmp_callback(
+    _backend: &mut dyn Backend,
+    _token_number: u64,
+    _red_arg_types: &[Type],
+    _greenboxes: &[Value],
+    _portal_runner_adr: i64,
+    _portal_calldescr: DescrRef,
+    _portal_finishtoken: DescrRef,
+    _propagate_exc_descr: DescrRef,
+) -> Result<Arc<JitCellToken>, BackendError> {
+    // compile.py:1107 `jitcell_token = make_jitcell_token(jitdriver_sd)`
+    //   pyre: `JitCellToken::new(token_number)` — `outermost_jitdriver_sd`
+    //   is carried on `MetaInterp::jitdriver_sd` rather than the token
+    //   itself (documented PRE-EXISTING-ADAPTATION in `jitdriver.rs`).
+    //
+    // compile.py:1110 `jl.tmp_callback(jitcell_token)` — JIT logger
+    //   marker. Skipped until `rpython/rlib/jit.py:jit_logger` is ported.
+    //
+    // compile.py:1112-1124 build `inputargs` from `red_arg_types`:
+    //   INT  → InputArgInt / InputArg::int()
+    //   REF  → InputArgRef / InputArg::ref()
+    //   FLOAT → InputArgFloat / InputArg::float()
+    //
+    // compile.py:1125-1127 assemble call args:
+    //   `funcbox = ConstInt(adr2int(portal_runner_adr))`
+    //   `callargs = [funcbox] + greenboxes + inputargs`
+    //   pyre: constants are registered via `Backend::set_constants` with
+    //   `OpRef >= 10_000`; the caller performs that registration and
+    //   passes us the assembled `Op::new(CallX, &[OpRef, ...])`. Step 2
+    //   adds a small helper that does the registration inline.
+    //
+    // compile.py:1130-1132 build call op:
+    //   `opnum = OpHelpers.call_for_descr(portal_calldescr)`
+    //     → `OpCode::CallI` / `CallR` / `CallF` / `CallN` based on
+    //       `portal_calldescr.result_type()`.
+    //   `call_op = ResOperation(opnum, callargs, descr=portal_calldescr)`
+    //
+    // compile.py:1133-1136 `finishargs = [call_op]` if non-void else `[]`.
+    //
+    // compile.py:1138-1144 `operations = [call_op,
+    //   GUARD_NO_EXCEPTION(failargs=[], descr=propagate_exc_descr),
+    //   FINISH(finishargs, descr=portal_finishtoken)]`.
+    //
+    // compile.py:1146 `cpu.compile_loop(inputargs, operations, jitcell_token,
+    //   log=False)` — the ordinary backend entry point; no "pending"
+    //   special-case in RPython.
+    //
+    // compile.py:1148-1149 `if memory_manager is not None:
+    //   memory_manager.keep_loop_alive(jitcell_token)` — pyre's
+    //   `BaseJitCell` holds the `Arc<JitCellToken>` once
+    //   `set_procedure_token(token, tmp=true)` runs in `warmstate.rs`.
+    //
+    // compile.py:1150 `return jitcell_token`.
+    todo!("compile_tmp_callback: Step 2 of the compile_tmp_callback plan")
 }
 
 #[cfg(test)]
