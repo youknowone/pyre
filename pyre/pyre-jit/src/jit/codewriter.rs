@@ -565,13 +565,29 @@ impl CodeWriter {
     ///     self.callcontrol.jitdrivers_sd.append(jitdriver_sd)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `JitDriverStaticData` —
-    /// the portal is implicit (any CodeObject containing
-    /// `JUMP_BACKWARD`). The slot accepts `()` so future warmspot
-    /// wiring can call through line-by-line.
-    pub fn setup_jitdriver(&self, jitdriver_sd: ()) {
+    /// PRE-EXISTING-ADAPTATION: RPython appends unconditionally because
+    /// each `@jit_callback` decoration calls `setup_jitdriver` exactly
+    /// once at translation time. pyre's portal discovery is lazy and
+    /// fires on every JIT entry, so the same `portal_graph` would be
+    /// pushed repeatedly without the `find` guard below — `jitdrivers_sd`
+    /// would grow linearly with JIT entries instead of staying bounded
+    /// by the number of unique portals. The dedup updates the existing
+    /// jd's `merge_point_pc` so the refinement hint propagates into
+    /// the next `grab_initial_jitcodes` pass.
+    pub fn setup_jitdriver(&self, jitdriver_sd: super::call::JitDriverStaticData) {
+        let cc = self.callcontrol();
+        if let Some(existing) = cc
+            .jitdrivers_sd
+            .iter_mut()
+            .find(|j| j.portal_graph == jitdriver_sd.portal_graph)
+        {
+            if jitdriver_sd.merge_point_pc.is_some() {
+                existing.merge_point_pc = jitdriver_sd.merge_point_pc;
+            }
+            return;
+        }
         // codewriter.py:99 `self.callcontrol.jitdrivers_sd.append(jitdriver_sd)`.
-        self.callcontrol().jitdrivers_sd.push(jitdriver_sd);
+        cc.jitdrivers_sd.push(jitdriver_sd);
     }
 
     /// RPython: `self.callcontrol` (codewriter.py:23).
@@ -2052,18 +2068,17 @@ impl CodeWriter {
     /// `pyjitpl.py:2255-2269`, which the assembler's `finished()` call
     /// at `codewriter.py:85` is the upstream sibling of.
     ///
-    /// The third tuple field — `merge_point_pc` — is a pyre-only
-    /// refinement hook; see
-    /// [`super::call::CallControl::grab_initial_jitcodes`].
-    pub fn make_jitcodes(
-        &self,
-        initial: &[(&CodeObject, *const (), Option<usize>)],
-    ) -> Vec<*const PyJitCode> {
+    /// `grab_initial_jitcodes` reads its seed list from
+    /// [`super::call::CallControl::jitdrivers_sd`]; callers register
+    /// portals with [`Self::setup_jitdriver`] before invoking this
+    /// method (matching codewriter.py:74 — `setup_jitdriver` followed
+    /// by `make_jitcodes` is the upstream order).
+    pub fn make_jitcodes(&self) -> Vec<*const PyJitCode> {
         // codewriter.py:75 `log.info("making JitCodes...")` — pyre has no
         // codewriter.py log channel, intentionally elided.
 
         // codewriter.py:76 `self.callcontrol.grab_initial_jitcodes()`.
-        self.callcontrol().grab_initial_jitcodes(initial);
+        self.callcontrol().grab_initial_jitcodes();
         // codewriter.py:77 `count = 0`.
         let mut count: usize = 0;
         // codewriter.py:78 `all_jitcodes = []`.
@@ -2185,22 +2200,35 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 // `CallControl::get_jitcode` is the canonical entry point.
 // ---------------------------------------------------------------------------
 
-/// RPython parity: `codewriter.make_jitcodes()` (codewriter.py:74-89)
-/// is the single entry point that populates `MetaInterpStaticData`'s
-/// JitCode set before any tracing happens.
+/// RPython parity: `setup_jitdriver` followed by `make_jitcodes` —
+/// the warmspot order at codewriter.py:74-99. RPython runs this once
+/// per `@jit_callback` decoration; pyre's portal discovery is lazy,
+/// so this adapter fires per JIT entry. `setup_jitdriver` dedups by
+/// `portal_graph` so `jitdrivers_sd` stays bounded by the number of
+/// unique portals (see [`CodeWriter::setup_jitdriver`] for the
+/// PRE-EXISTING-ADAPTATION rationale).
 ///
-/// pyre-adaptation: Python's dynamic dispatch prevents static callee
-/// discovery, so pyre calls `make_jitcodes(&[portal_code])` at each JIT
-/// entry rather than once at warmspot init. The `merge_point_pc` tuple
-/// field threads through `CallControl::grab_initial_jitcodes` so that
-/// the first trace's MERGE_POINT PC refines the cached JitCode (see
-/// `super::call::CallControl::grab_initial_jitcodes`).
+/// `make_jitcodes` is then the canonical RPython no-arg call: it
+/// pulls its seed list from `CallControl.jitdrivers_sd` and runs
+/// `grab_initial_jitcodes` → drain → `assembler.finished()`. The
+/// final stages short-circuit on the second-and-later registration of
+/// any given portal because `get_jitcode` skips already-built
+/// entries.
 pub fn ensure_jitcode_for(
     code: &pyre_interpreter::CodeObject,
     w_code: *const (),
     merge_point_pc: Option<usize>,
 ) {
-    CodeWriter::instance().make_jitcodes(&[(code, w_code, merge_point_pc)]);
+    let writer = CodeWriter::instance();
+    // codewriter.py:96-99 `setup_jitdriver(jd)` — register the
+    // portal so `grab_initial_jitcodes` finds it.
+    writer.setup_jitdriver(super::call::JitDriverStaticData {
+        portal_graph: code as *const pyre_interpreter::CodeObject,
+        w_code,
+        merge_point_pc,
+    });
+    // codewriter.py:74 `make_jitcodes()` — drain everything pending.
+    writer.make_jitcodes();
 }
 
 /// Trace-side hook registered with `pyre_jit_trace::set_compile_jitcode_fn`

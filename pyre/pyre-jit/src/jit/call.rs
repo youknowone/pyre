@@ -57,6 +57,38 @@ impl CallInfoCollection {
     }
 }
 
+/// RPython: `rpython/jit/metainterp/warmspot.py` `JitDriverStaticData` —
+/// the per-portal record `CallControl.jitdrivers_sd` holds and
+/// `grab_initial_jitcodes` (call.py:145-148) iterates.  RPython's
+/// `JitDriverStaticData` carries far more (`name`, `index`,
+/// `mainjitcode`, `_green_args_spec`, …); pyre adds only the fields
+/// the lazy portal-discovery path actually consumes today.
+///
+/// PRE-EXISTING-ADAPTATION: pyre carries `w_code` and `merge_point_pc`
+/// alongside `portal_graph` because pyre's "graph" is a Python
+/// CodeObject with no flow-graph identity. `w_code` is the wrapping
+/// `PyObjectRef` so `set_majit_jitcode`'s callee table indexes by the
+/// same key the runtime uses; `merge_point_pc` is the Python PC of
+/// the `MERGE_POINT` opcode the first trace through the portal
+/// reveals (RPython has no analog because portal PCs are statically
+/// known at flow-graph time).
+#[derive(Clone, Copy)]
+pub struct JitDriverStaticData {
+    /// RPython: `JitDriverStaticData.portal_graph`. The CodeObject
+    /// the portal_runner enters when `get_jitcode(jd.portal_graph)`
+    /// fires inside `grab_initial_jitcodes`.
+    pub portal_graph: *const CodeObject,
+    /// pyre-only: the `PyObjectRef` wrapper around `portal_graph`,
+    /// kept on the jd so `set_majit_jitcode` indexes its `JitCode`
+    /// table by the same identity the runtime uses.
+    pub w_code: *const (),
+    /// pyre-only refinement hint forwarded to `get_jitcode`.
+    /// `Some(pc)` rebuilds the cached `PyJitCode` if the recorded
+    /// merge-point PC changes from a previous registration. RPython
+    /// has no analog because its portal PCs are statically known.
+    pub merge_point_pc: Option<usize>,
+}
+
 /// RPython: `rpython/jit/codewriter/call.py:21` `class CallControl(object)`.
 pub struct CallControl {
     /// call.py:22 `virtualref_info = None` — class-level default,
@@ -84,12 +116,13 @@ pub struct CallControl {
 
     /// call.py:28 `self.jitdrivers_sd = jitdrivers_sd`.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `JitDriverStaticData` —
-    /// the portal is implicit (any CodeObject containing
-    /// `JUMP_BACKWARD`). The Vec stays empty; `grab_initial_jitcodes`
-    /// reads from the explicit `initial: &[...]` argument instead of
-    /// iterating this list.
-    pub jitdrivers_sd: Vec<()>,
+    /// `grab_initial_jitcodes()` (call.py:145-148) iterates this list
+    /// and calls `get_jitcode(jd.portal_graph)` on each entry. pyre
+    /// populates the list lazily via `CodeWriter::setup_jitdriver`
+    /// (codewriter.py:96-99), once per unique portal CodeObject the
+    /// runtime decides to JIT — see [`JitDriverStaticData`] for the
+    /// pyre-only adapter fields.
+    pub jitdrivers_sd: Vec<JitDriverStaticData>,
 
     /// call.py:29 `self.jitcodes = {}` — map `{graph: jitcode}`.
     ///
@@ -133,12 +166,7 @@ pub struct CallControl {
 impl CallControl {
     /// RPython: `CallControl.__init__(cpu=None, jitdrivers_sd=[])`
     /// (call.py:25-47).
-    ///
-    /// PRE-EXISTING-ADAPTATION: `jitdrivers_sd` is `Vec<()>` because
-    /// pyre's portal is implicit (any CodeObject containing
-    /// `JUMP_BACKWARD`); future analyzer wiring (RaiseAnalyzer,
-    /// VirtualizableAnalyzer, …) can extend this method line-by-line.
-    pub fn new(cpu: Cpu, jitdrivers_sd: Vec<()>) -> Self {
+    pub fn new(cpu: Cpu, jitdrivers_sd: Vec<JitDriverStaticData>) -> Self {
         // call.py:26 `assert isinstance(jitdrivers_sd, list)`.
         // Rust's type system enforces this at compile time.
         Self {
@@ -160,28 +188,26 @@ impl CallControl {
     ///     jd.mainjitcode.jitdriver_sd = jd
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `jitdrivers_sd` list yet; the
-    /// "portal graph" is whatever CodeObject the hot-loop heuristic
-    /// decides to trace. Phase D will replace the pyre-specific
-    /// `initial: &[...]` parameter with the RPython iteration over
-    /// `jitdrivers_sd`; for now callers pass the initial codes (with an
-    /// optional `merge_point_pc` refinement, pyre-only) explicitly.
-    ///
-    /// The third tuple element — `merge_point_pc` — is a pyre-only
-    /// refinement: the first trace reveals the `MERGE_POINT` opcode's
-    /// PC, which must be re-recorded on the `PyJitCode` even after the
-    /// initial eager compile. RPython has no analog because RPython
-    /// portals have fixed entry PCs at flow-graph time.
-    pub fn grab_initial_jitcodes(&mut self, initial: &[(&CodeObject, *const (), Option<usize>)]) {
-        for (code, w_code, merge_point_pc) in initial {
+    /// PRE-EXISTING-ADAPTATION: pyre's `PyJitCode` does not carry the
+    /// `mainjitcode.jitdriver_sd = jd` back-reference (call.py:148)
+    /// because no runtime path reads it — `CallControl.jitcodes`
+    /// already provides the lookup the runtime needs. The iteration
+    /// itself matches RPython exactly.
+    pub fn grab_initial_jitcodes(&mut self) {
+        // Index loop because get_jitcode borrows `self.jitcodes`
+        // mutably, which would conflict with an immutable borrow over
+        // `self.jitdrivers_sd`. The values are Copy so the snapshot
+        // is cheap.
+        for i in 0..self.jitdrivers_sd.len() {
+            let portal_graph = self.jitdrivers_sd[i].portal_graph;
+            let w_code = self.jitdrivers_sd[i].w_code;
+            let merge_point_pc = self.jitdrivers_sd[i].merge_point_pc;
             // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
-            // Inserts an empty JitCode into `jitcodes` and pushes the
-            // graph onto `unfinished_graphs`; the body fill happens in
-            // `CodeWriter::make_jitcodes`'s drain loop. The
-            // `jitdriver_sd` assignment (call.py:148) already happens
-            // inside `CodeWriter::transform_graph_to_jitcode` when
-            // `is_portal` is true.
-            let _ = self.get_jitcode(code, *w_code, *merge_point_pc);
+            // Inserts an empty PyJitCode skeleton into `jitcodes` and
+            // pushes the graph onto `unfinished_graphs`; the body fill
+            // happens in `CodeWriter::make_jitcodes`'s drain loop.
+            let code = unsafe { &*portal_graph };
+            let _ = self.get_jitcode(code, w_code, merge_point_pc);
         }
     }
 
