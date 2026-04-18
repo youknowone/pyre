@@ -37,12 +37,25 @@ use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 // ── compile.py:665-674 done_with_this_frame singletons ──────────────
 //
-// RPython creates ONE global FailDescr per return type. ALL Finish ops
-// across ALL loops/bridges write the SAME descr pointer into jf_descr.
-// This makes the pointer comparison in _call_assembler_check_descr
-// (assembler.py:2274) always succeed for any callee finish.
+// Per-result-type `DoneWithThisFrame*` singletons.  Two slots coexist
+// for now (see Medium #2 follow-up in `majit-metainterp/src/compile.rs`
+// "Identity follow-up"):
 //
-// compile.py:665-674 make_and_attach_done_descrs
+//   - the cranelift-side `CraneliftFailDescr` `LazyLock`s below, used
+//     for the runtime classifier / `direct_descr` path that casts
+//     `jf_descr_raw` back to `*const CraneliftFailDescr`; and
+//
+//   - `OnceLock<DescrRef>` slots populated by
+//     `Backend::set_done_with_this_frame_descr_*` from the metainterp's
+//     `MetaInterpStaticData`.  `done_with_this_frame_descr_ptr`
+//     returns the metainterp `Arc::as_ptr` for embedding in jf_descr
+//     so `_call_assembler_check_descr` (assembler.py:2274) observes
+//     the same address the metainterp `handle_fail` does.
+//
+// The two slots are kept pointer-stable independently; fully merging
+// them (dropping `CraneliftFailDescr` singletons and threading a
+// `DescrRef`-based classifier) is tracked as a follow-up because it
+// restructures the `direct_descr` / `run_compiled_code` type flow.
 
 static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
@@ -101,7 +114,11 @@ static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<CraneliftFailDes
     });
 
 /// compile.py:665-674 parity: return the singleton FailDescr for a
-/// given Finish result type. ALL Finish ops must use this.
+/// given Finish result type.  Used by the `direct_descr` classifier
+/// path that needs a `CraneliftFailDescr` for `bridge_ref()` /
+/// `increment_fail_count()` access.  FINISH descrs never actually
+/// carry bridges, so the returned singleton functions purely as a
+/// "finish marker" there.
 fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFailDescr> {
     match result_types {
         [Type::Float] => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
@@ -109,6 +126,89 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFa
         [] => &DONE_WITH_THIS_FRAME_DESCR_VOID,
         _ => &DONE_WITH_THIS_FRAME_DESCR_INT,
     }
+}
+
+// `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
+// metainterp-side `Arc<DoneWithThisFrameDescr*>` re-published here
+// via `Backend::set_done_with_this_frame_descr_*`.  Used for the
+// jf_descr pointer written at FINISH emission so that pointer
+// identity matches the `Arc` stored on `MetaInterpStaticData`.
+
+static METAINTERP_DONE_VOID: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
+static METAINTERP_DONE_INT: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
+static METAINTERP_DONE_REF: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
+static METAINTERP_DONE_FLOAT: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
+static METAINTERP_EXIT_EXC_REF: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+static METAINTERP_PROPAGATE_EXC: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn set_done_with_this_frame_descr_void(descr: majit_ir::DescrRef) {
+    let _ = METAINTERP_DONE_VOID.set(descr);
+}
+pub(crate) fn set_done_with_this_frame_descr_int(descr: majit_ir::DescrRef) {
+    let _ = METAINTERP_DONE_INT.set(descr);
+}
+pub(crate) fn set_done_with_this_frame_descr_ref(descr: majit_ir::DescrRef) {
+    let _ = METAINTERP_DONE_REF.set(descr);
+}
+pub(crate) fn set_done_with_this_frame_descr_float(descr: majit_ir::DescrRef) {
+    let _ = METAINTERP_DONE_FLOAT.set(descr);
+}
+pub(crate) fn set_exit_frame_with_exception_descr_ref(descr: majit_ir::DescrRef) {
+    let _ = METAINTERP_EXIT_EXC_REF.set(descr);
+}
+pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
+    let _ = METAINTERP_PROPAGATE_EXC.set(descr);
+}
+
+/// `pyjitpl.py:2222` parity: pointer of the metainterp-attached
+/// `Arc<DoneWithThisFrameDescr*>` matching `result_types`.  Falls
+/// back to `done_with_this_frame_descr` (the cranelift-side
+/// singleton) when the metainterp has not attached yet; the
+/// classifier path keeps working in either case because both
+/// pointers route through the same FINISH fast path.
+///
+/// Unused until the full cranelift FINISH-emit unification lands;
+/// the helper stays alongside `match_metainterp_finish_descr` so the
+/// follow-up has a single place to flip the emit path.
+#[allow(dead_code)]
+fn done_with_this_frame_descr_ptr(result_types: &[Type]) -> i64 {
+    let slot = match result_types {
+        [Type::Float] => &METAINTERP_DONE_FLOAT,
+        [Type::Ref] => &METAINTERP_DONE_REF,
+        [] => &METAINTERP_DONE_VOID,
+        _ => &METAINTERP_DONE_INT,
+    };
+    if let Some(arc) = slot.get() {
+        return Arc::as_ptr(arc) as *const () as i64;
+    }
+    Arc::as_ptr(done_with_this_frame_descr(result_types)) as i64
+}
+
+/// Match `jf_descr_raw` against the metainterp-attached
+/// `DoneWithThisFrameDescr*` set.  Returns `Some((metainterp_arc,
+/// cranelift_singleton))` when the address is a metainterp finish
+/// descr; the paired cranelift singleton carries the result_type
+/// signature that runtime classifiers (`bridge_ref`, fail_arg_types)
+/// expect.
+fn match_metainterp_finish_descr(
+    jf_descr_raw: i64,
+) -> Option<(majit_ir::DescrRef, Arc<CraneliftFailDescr>)> {
+    let ptr = jf_descr_raw as usize;
+    for (slot, cl_singleton) in [
+        (&METAINTERP_DONE_INT, &*DONE_WITH_THIS_FRAME_DESCR_INT),
+        (&METAINTERP_DONE_FLOAT, &*DONE_WITH_THIS_FRAME_DESCR_FLOAT),
+        (&METAINTERP_DONE_REF, &*DONE_WITH_THIS_FRAME_DESCR_REF),
+        (&METAINTERP_DONE_VOID, &*DONE_WITH_THIS_FRAME_DESCR_VOID),
+    ] {
+        if let Some(arc) = slot.get() {
+            if Arc::as_ptr(arc) as *const () as usize == ptr {
+                return Some((arc.clone(), cl_singleton.clone()));
+            }
+        }
+    }
+    None
 }
 
 // ── JitFrame layout constants (jitframe.py:61-83) ───────────────────
@@ -2213,7 +2313,11 @@ fn register_call_assembler_target(
     ca_dispatch_slot(token.number, compiled.code_ptr);
     // Set the finish_descr_ptr so the direct call path can compare jf_descr
     // with the finish FailDescr pointer (RPython done_with_this_frame parity).
-    // compile.py:665-674: use the global singleton, not the per-trace pointer.
+    // compile.py:665-674: use the cranelift-side singleton (paired with
+    // the same result_type slot the metainterp-side `Arc` occupies); full
+    // identity unification with the metainterp `Arc` is tracked in the
+    // follow-up noted in `majit-metainterp/src/compile.rs` (Identity
+    // follow-up block).
     if let Some(finish_descr) = compiled.fail_descrs.iter().find(|d| d.is_finish()) {
         let ptr = Arc::as_ptr(done_with_this_frame_descr(&finish_descr.fail_arg_types)) as i64;
         ca_dispatch_set_finish_descr_ptr(token.number, ptr);
@@ -5050,6 +5154,18 @@ fn run_compiled_code_inner(
         (CALL_ASSEMBLER_DEADFRAME_SENTINEL, None)
     } else if jf_descr_raw == 0 {
         (0u32, None)
+    } else if let Some((metainterp_finish, cl_singleton)) =
+        match_metainterp_finish_descr(jf_descr_raw)
+    {
+        // `pyjitpl.py:2222` match — the metainterp-side
+        // `Arc<DoneWithThisFrameDescr*>` was written into jf_descr at
+        // FINISH emission.  Its `fail_index()` on `MetaFailDescr`
+        // semantics is u32::MAX (finish marker), which `run_compiled_code`
+        // consumers rely on.  Return the cranelift-side singleton as
+        // `direct_descr` so downstream `bridge_ref()` / `fail_arg_types`
+        // access keeps the same type as the non-metainterp path.
+        let _ = metainterp_finish;
+        (u32::MAX, Some(cl_singleton))
     } else {
         let descr_ptr = jf_descr_raw as *const CraneliftFailDescr;
         let fi = unsafe { &*descr_ptr }.fail_index();
@@ -11157,6 +11273,16 @@ fn collect_guards(
         // pointer. This makes _call_assembler_check_descr (assembler.py:2274)
         // work across bridges (bridge's Finish descr == main trace's).
         let fail_descr_ptr = if is_finish {
+            // compile.py:665-674 parity: write the metainterp-attached
+            // `Arc<DoneWithThisFrameDescr*>` pointer into jf_descr.  The
+            // classifier path (`match_metainterp_finish_descr`) routes
+            // this pointer back to a `CraneliftFailDescr` singleton for
+            // downstream consumers that need `bridge_ref`/fail_arg_types.
+            // TODO: the bridge FINISH path is currently crash-prone with
+            // this change (fib_recursive SIGSEGV under cranelift).  Keep
+            // the legacy cranelift singleton pointer for now until the
+            // blackhole-resume path is audited; the dynasm backend
+            // already uses the metainterp Arc cleanly.
             Arc::as_ptr(done_with_this_frame_descr(&descr.fail_arg_types)) as i64
         } else {
             Arc::as_ptr(&descr) as i64
@@ -11305,6 +11431,25 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn set_next_header_pc(&mut self, header_pc: u64) {
         self.next_header_pc = Some(header_pc);
+    }
+
+    fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
+        set_done_with_this_frame_descr_void(descr);
+    }
+    fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
+        set_done_with_this_frame_descr_int(descr);
+    }
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        set_done_with_this_frame_descr_ref(descr);
+    }
+    fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
+        set_done_with_this_frame_descr_float(descr);
+    }
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        set_exit_frame_with_exception_descr_ref(descr);
+    }
+    fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
+        set_propagate_exception_descr(descr);
     }
 
     fn register_pending_target(

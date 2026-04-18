@@ -2025,8 +2025,10 @@ pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
 /// `compile.py:673-674` `setattr(target, name, descr)` — in RPython each
 /// target is a Python object with settable attributes; in Rust the
 /// five setters make the contract explicit.  `MetaInterpStaticData`
-/// implements this in a follow-up commit; for now the trait exists so
-/// `make_and_attach_done_descrs` has a concrete callee type.
+/// and `dyn Backend` both implement this trait so a single call to
+/// `make_and_attach_done_descrs(&mut [&mut sd, &mut *backend])`
+/// mirrors RPython's `make_and_attach_done_descrs([self, cpu])`
+/// exactly.
 #[allow(dead_code)]
 pub trait DescrContainer {
     fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef);
@@ -2034,6 +2036,30 @@ pub trait DescrContainer {
     fn set_done_with_this_frame_descr_ref(&mut self, descr: DescrRef);
     fn set_done_with_this_frame_descr_float(&mut self, descr: DescrRef);
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: DescrRef);
+}
+
+/// `DescrContainer` blanket impl for `dyn Backend`.  Each setter
+/// forwards to the corresponding `Backend::set_*` trait method so
+/// backends that care about FINISH descr identity (dynasm / cranelift)
+/// can override and store the `Arc`.  Backends that don't override
+/// fall through to the no-op defaults — identity parity is still
+/// maintained on the `MetaInterpStaticData` side.
+impl DescrContainer for dyn Backend + '_ {
+    fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_void(self, descr);
+    }
+    fn set_done_with_this_frame_descr_int(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_int(self, descr);
+    }
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_ref(self, descr);
+    }
+    fn set_done_with_this_frame_descr_float(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_float(self, descr);
+    }
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: DescrRef) {
+        Backend::set_exit_frame_with_exception_descr_ref(self, descr);
+    }
 }
 
 /// `rpython/jit/metainterp/compile.py:1101-1150` `compile_tmp_callback`.

@@ -648,6 +648,25 @@ impl Backend for DynasmBackend {
         self.next_header_pc = header_pc;
     }
 
+    fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
+        crate::guard::set_done_with_this_frame_descr_void(descr);
+    }
+    fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
+        crate::guard::set_done_with_this_frame_descr_int(descr);
+    }
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        crate::guard::set_done_with_this_frame_descr_ref(descr);
+    }
+    fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
+        crate::guard::set_done_with_this_frame_descr_float(descr);
+    }
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        crate::guard::set_exit_frame_with_exception_descr_ref(descr);
+    }
+    fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
+        crate::guard::set_propagate_exception_descr(descr);
+    }
+
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,

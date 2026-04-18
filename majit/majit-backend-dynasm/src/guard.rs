@@ -196,37 +196,111 @@ impl std::fmt::Debug for DynasmFailDescr {
     }
 }
 
-/// compile.py:618-669 done_with_this_frame_descr — four type-specific
-/// singletons, matching RPython's DoneWithThisFrameDescrVoid/Int/Ref/Float.
+/// `compile.py:665-674` `make_and_attach_done_descrs([self, cpu])` —
+/// per-result-type `DoneWithThisFrame*` singleton attached by the
+/// metainterp side at `pyjitpl.py:2222`.  The `Arc` lives on
+/// `MetaInterpStaticData` and is re-published here via
+/// `Backend::set_done_with_this_frame_descr_*` so the CALL_ASSEMBLER
+/// fast path (`runner.rs::call_assembler_helper_trampoline`) can
+/// compare `jf_descr` against `Arc::as_ptr` of the same `Arc` the
+/// metainterp reads back in `handle_fail`.
 ///
-/// CALL_ASSEMBLER's fast path compares jf_descr against the type-appropriate
-/// singleton to decide whether the callee finished normally.
-static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+/// The attachment happens once during `MetaInterp::new`; the setters
+/// tolerate repeated calls and silently ignore attempts to change an
+/// already-set value (RPython-equivalent behaviour: the metainterp
+/// only ever constructs the pair once per CPU).
+static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+static PROPAGATE_EXCEPTION_DESCR: std::sync::OnceLock<majit_ir::DescrRef> =
+    std::sync::OnceLock::new();
+
+/// PRE-EXISTING-ADAPTATION: standalone backend tests construct a
+/// `DynasmBackend` without a `MetaInterp`, so the OnceLocks above
+/// remain unpopulated.  These fallbacks preserve the per-result-type
+/// distinct-pointer invariant the tests assert.  In the production
+/// path `MetaInterp::new` runs `attach_descrs_to_cpu` first, which
+/// fills the OnceLocks; the getter functions prefer the OnceLock
+/// result and only fall back here when it is still `None`.
+static FALLBACK_DONE_VOID: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![], true)));
-static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+static FALLBACK_DONE_INT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Int], true)));
-static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+static FALLBACK_DONE_REF: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true)));
-static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
+static FALLBACK_DONE_FLOAT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     std::sync::LazyLock::new(|| {
         Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Float], true))
     });
 
+pub(crate) fn set_done_with_this_frame_descr_void(descr: majit_ir::DescrRef) {
+    let _ = DONE_WITH_THIS_FRAME_DESCR_VOID.set(descr);
+}
+pub(crate) fn set_done_with_this_frame_descr_int(descr: majit_ir::DescrRef) {
+    let _ = DONE_WITH_THIS_FRAME_DESCR_INT.set(descr);
+}
+pub(crate) fn set_done_with_this_frame_descr_ref(descr: majit_ir::DescrRef) {
+    let _ = DONE_WITH_THIS_FRAME_DESCR_REF.set(descr);
+}
+pub(crate) fn set_done_with_this_frame_descr_float(descr: majit_ir::DescrRef) {
+    let _ = DONE_WITH_THIS_FRAME_DESCR_FLOAT.set(descr);
+}
+pub(crate) fn set_exit_frame_with_exception_descr_ref(descr: majit_ir::DescrRef) {
+    let _ = EXIT_FRAME_WITH_EXCEPTION_DESCR_REF.set(descr);
+}
+pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
+    let _ = PROPAGATE_EXCEPTION_DESCR.set(descr);
+}
+
+/// `Arc::as_ptr` of the metainterp-attached descr, falling back to
+/// the local `DynasmFailDescr` singleton when no attachment has
+/// happened (backend-only tests).
+fn descr_ref_ptr(
+    slot: &std::sync::OnceLock<majit_ir::DescrRef>,
+    fallback: &std::sync::LazyLock<Arc<DynasmFailDescr>>,
+) -> usize {
+    if let Some(arc) = slot.get() {
+        return Arc::as_ptr(arc) as *const () as usize;
+    }
+    Arc::as_ptr(fallback) as usize
+}
+
 /// compile.py:667 done_with_this_frame_descr_void
 pub fn done_with_this_frame_descr_void_ptr() -> usize {
-    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_VOID) as usize
+    descr_ref_ptr(&DONE_WITH_THIS_FRAME_DESCR_VOID, &FALLBACK_DONE_VOID)
 }
 /// compile.py:668 done_with_this_frame_descr_int
 pub fn done_with_this_frame_descr_int_ptr() -> usize {
-    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_INT) as usize
+    descr_ref_ptr(&DONE_WITH_THIS_FRAME_DESCR_INT, &FALLBACK_DONE_INT)
 }
 /// compile.py:669 done_with_this_frame_descr_ref
 pub fn done_with_this_frame_descr_ref_ptr() -> usize {
-    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_REF) as usize
+    descr_ref_ptr(&DONE_WITH_THIS_FRAME_DESCR_REF, &FALLBACK_DONE_REF)
 }
 /// compile.py:670 done_with_this_frame_descr_float
 pub fn done_with_this_frame_descr_float_ptr() -> usize {
-    Arc::as_ptr(&DONE_WITH_THIS_FRAME_DESCR_FLOAT) as usize
+    descr_ref_ptr(&DONE_WITH_THIS_FRAME_DESCR_FLOAT, &FALLBACK_DONE_FLOAT)
+}
+/// compile.py:671 exit_frame_with_exception_descr_ref
+pub fn exit_frame_with_exception_descr_ref_ptr() -> usize {
+    EXIT_FRAME_WITH_EXCEPTION_DESCR_REF
+        .get()
+        .map(|arc| Arc::as_ptr(arc) as *const () as usize)
+        .unwrap_or(0)
+}
+/// pyjitpl.py:2283 propagate_exception_descr
+pub fn propagate_exception_descr_ptr() -> usize {
+    PROPAGATE_EXCEPTION_DESCR
+        .get()
+        .map(|arc| Arc::as_ptr(arc) as *const () as usize)
+        .unwrap_or(0)
 }
 
 /// Return the type-appropriate done_with_this_frame_descr pointer.

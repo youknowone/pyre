@@ -1109,6 +1109,43 @@ pub trait Backend: Send {
     /// this header PC to synthesised exit recovery layouts.
     fn set_next_header_pc(&mut self, _header_pc: u64) {}
 
+    /// `compile.py:665-674` `make_and_attach_done_descrs([self, cpu])` —
+    /// per-result-type `DoneWithThisFrame*` singleton shared with
+    /// `MetaInterpStaticData`.  Attached once per CPU instance, matching
+    /// `pyjitpl.py:2222`.  Backends that use pointer identity for the
+    /// FINISH fast path (dynasm `is_done_with_this_frame_descr`,
+    /// cranelift CA dispatch) override to store the `Arc` and publish
+    /// `Arc::as_ptr` to the comparison sites.
+    fn set_done_with_this_frame_descr_void(&mut self, _descr: Arc<dyn Descr>) {}
+
+    /// `compile.py:665-674` `done_with_this_frame_descr_int` — INT-typed
+    /// variant.  See `set_done_with_this_frame_descr_void` for the
+    /// attachment contract.
+    fn set_done_with_this_frame_descr_int(&mut self, _descr: Arc<dyn Descr>) {}
+
+    /// `compile.py:665-674` `done_with_this_frame_descr_ref` — REF-typed
+    /// variant.  See `set_done_with_this_frame_descr_void` for the
+    /// attachment contract.
+    fn set_done_with_this_frame_descr_ref(&mut self, _descr: Arc<dyn Descr>) {}
+
+    /// `compile.py:665-674` `done_with_this_frame_descr_float` —
+    /// FLOAT-typed variant.  See `set_done_with_this_frame_descr_void`
+    /// for the attachment contract.
+    fn set_done_with_this_frame_descr_float(&mut self, _descr: Arc<dyn Descr>) {}
+
+    /// `compile.py:665-674` `exit_frame_with_exception_descr_ref` —
+    /// FINISH descr used by `compile_exit_frame_with_exception`
+    /// (`pyjitpl.py:3238-3245`).  See `set_done_with_this_frame_descr_void`
+    /// for the attachment contract.
+    fn set_exit_frame_with_exception_descr_ref(&mut self, _descr: Arc<dyn Descr>) {}
+
+    /// `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr`
+    /// — shared `PropagateExceptionDescr` instance used by
+    /// `compile_tmp_callback`'s `GUARD_NO_EXCEPTION` and by the
+    /// backend's propagate-exception slow path
+    /// (`x86/assembler.py:870`, `aarch64/assembler.py:566-572`).
+    fn set_propagate_exception_descr(&mut self, _descr: Arc<dyn Descr>) {}
+
     /// Register a placeholder for a pending token (RPython compile_tmp_callback).
     /// The placeholder has null code_ptr; call_assembler_fast_path detects this
     /// and falls back to force_fn. Replaced by the real target on compile_loop.

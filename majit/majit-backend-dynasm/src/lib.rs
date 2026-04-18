@@ -535,14 +535,61 @@ mod tests {
 
     // ── done_with_this_frame_descr: 4 type-specific singletons ──
 
+    /// Test-local stand-in for `compile::DoneWithThisFrameDescr*`
+    /// singletons.  The dynasm backend stores the metainterp-side
+    /// `Arc<dyn Descr>` in a process-global `OnceLock`, so seeding
+    /// from this test mirrors what `pyjitpl.py:2222`
+    /// (`make_and_attach_done_descrs([self, cpu])`) does at runtime.
+    #[derive(Debug)]
+    struct TestMarker(Type);
+    impl majit_ir::Descr for TestMarker {}
+    impl majit_ir::FailDescr for TestMarker {
+        fn fail_index(&self) -> u32 {
+            u32::MAX
+        }
+        fn fail_arg_types(&self) -> &[Type] {
+            match self.0 {
+                Type::Void => &[],
+                Type::Int => &[Type::Int],
+                Type::Ref => &[Type::Ref],
+                Type::Float => &[Type::Float],
+            }
+        }
+        fn is_finish(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn test_done_with_this_frame_descr_four_variants() {
+        use std::sync::Arc;
+        let void: majit_ir::DescrRef = Arc::new(TestMarker(Type::Void));
+        let int: majit_ir::DescrRef = Arc::new(TestMarker(Type::Int));
+        let ref_: majit_ir::DescrRef = Arc::new(TestMarker(Type::Ref));
+        let float: majit_ir::DescrRef = Arc::new(TestMarker(Type::Float));
+
+        // OnceLock-backed setters accept the first caller and ignore
+        // subsequent writes.  A prior test in the same process (or the
+        // `make_and_attach_done_descrs` path exercised via a MetaInterp)
+        // may have already filled some or all slots; either way, once
+        // the slot has a value, `_ptr()` returns a stable non-zero
+        // address for each of the four result types.
+        guard::set_done_with_this_frame_descr_void(void);
+        guard::set_done_with_this_frame_descr_int(int);
+        guard::set_done_with_this_frame_descr_ref(ref_);
+        guard::set_done_with_this_frame_descr_float(float);
+
         let void_ptr = guard::done_with_this_frame_descr_void_ptr();
         let int_ptr = guard::done_with_this_frame_descr_int_ptr();
         let ref_ptr = guard::done_with_this_frame_descr_ref_ptr();
         let float_ptr = guard::done_with_this_frame_descr_float_ptr();
 
-        // All four must be distinct.
+        // All four must be distinct (metainterp-side `DoneWithThisFrameDescr*`
+        // singletons are separate Arcs per result type).
+        assert_ne!(void_ptr, 0);
+        assert_ne!(int_ptr, 0);
+        assert_ne!(ref_ptr, 0);
+        assert_ne!(float_ptr, 0);
         assert_ne!(void_ptr, int_ptr);
         assert_ne!(void_ptr, ref_ptr);
         assert_ne!(void_ptr, float_ptr);

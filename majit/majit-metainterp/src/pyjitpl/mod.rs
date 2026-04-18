@@ -1073,7 +1073,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Create a new MetaInterp with the given compilation threshold.
     pub fn new(threshold: u32) -> Self {
-        MetaInterp {
+        let mut this = MetaInterp {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
             compiled_loops: HashMap::new(),
@@ -1123,7 +1123,19 @@ impl<M: Clone> MetaInterp<M> {
             box_names_memo: std::collections::HashMap::new(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
-        }
+        };
+        // `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
+        // now that both sides of the pair exist, publish the
+        // `MetaInterpStaticData`-side `DoneWithThisFrameDescr*` Arcs
+        // onto the backend so FINISH fast-path pointer identity works
+        // against the same `Arc` the metainterp reads back.
+        let MetaInterp {
+            ref staticdata,
+            ref mut backend,
+            ..
+        } = this;
+        staticdata.attach_descrs_to_cpu(backend);
+        this
     }
 
     /// Install a fresh [`ActiveTraceSession`] seeded with the frontend
@@ -11000,6 +11012,39 @@ impl MetaInterpStaticData {
         };
         crate::compile::make_and_attach_done_descrs(&mut [&mut sd]);
         sd
+    }
+
+    /// `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
+    /// the CPU half of the pair.  RPython does this in a single call
+    /// inside `MetaInterpStaticData.__init__`; pyre splits it in two
+    /// because `MetaInterpStaticData::new` runs before the backend
+    /// exists.  `MetaInterp::new` (which constructs both) calls this
+    /// method afterwards so the backend ends up owning clones of the
+    /// same `Arc<DoneWithThisFrameDescr*>` the metainterp already has.
+    ///
+    /// Also forwards `propagate_exception_descr` once
+    /// `finish_setup_descrs_for_jitdrivers` has created it — the
+    /// attachment is idempotent, so callers can run this after every
+    /// `register_jitdriver_sd` without harm.
+    pub fn attach_descrs_to_cpu(&self, cpu: &mut dyn majit_backend::Backend) {
+        if let Some(d) = &self.done_with_this_frame_descr_void {
+            cpu.set_done_with_this_frame_descr_void(d.clone());
+        }
+        if let Some(d) = &self.done_with_this_frame_descr_int {
+            cpu.set_done_with_this_frame_descr_int(d.clone());
+        }
+        if let Some(d) = &self.done_with_this_frame_descr_ref {
+            cpu.set_done_with_this_frame_descr_ref(d.clone());
+        }
+        if let Some(d) = &self.done_with_this_frame_descr_float {
+            cpu.set_done_with_this_frame_descr_float(d.clone());
+        }
+        if let Some(d) = &self.exit_frame_with_exception_descr_ref {
+            cpu.set_exit_frame_with_exception_descr_ref(d.clone());
+        }
+        if let Some(d) = &self.propagate_exception_descr {
+            cpu.set_propagate_exception_descr(d.clone());
+        }
     }
 
     /// pyjitpl.py:2227-2243 `setup_insns(insns)`.
