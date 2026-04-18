@@ -120,6 +120,26 @@ pub struct JitDriverStaticData {
     /// by `virtualizable_arg_index()` so legacy callers keep
     /// returning `Option<usize>`.
     pub index_of_virtualizable: i32,
+    /// jitdriver.py:11 `self.portal_calldescr ... rpython.jit.metainterp.warmspot`.
+    ///
+    /// `warmspot.py:1013` `jd.portal_calldescr = self.cpu.calldescrof(...)`.
+    /// The `CallDescr` describing the portal_runner signature; read by
+    /// `compile_tmp_callback` (`compile.py:1131-1132`) to pick the
+    /// `CALL_*` opcode and attach as the residual call's descr.
+    pub portal_calldescr: Option<majit_ir::DescrRef>,
+    /// jitdriver.py:21 `self.portal_finishtoken ... rpython.jit.metainterp.pyjitpl`.
+    ///
+    /// `pyjitpl.py:2279-2280` sets this to the type-appropriate
+    /// `MetaInterpStaticData.done_with_this_frame_descr_{int,ref,float,void}`
+    /// singleton.  Used as the `FINISH` descr emitted by
+    /// `compile_tmp_callback` (`compile.py:1142`).
+    pub portal_finishtoken: Option<majit_ir::DescrRef>,
+    /// jitdriver.py:22 `self.propagate_exc_descr .. rpython.jit.metainterp.pyjitpl`.
+    ///
+    /// `pyjitpl.py:2281` shares a single `PropagateExceptionDescr`
+    /// instance across all jitdrivers.  Used as the `GUARD_NO_EXCEPTION`
+    /// descr emitted by `compile_tmp_callback` (`compile.py:1141`).
+    pub propagate_exc_descr: Option<majit_ir::DescrRef>,
 }
 
 impl JitDriverStaticData {
@@ -151,6 +171,9 @@ impl JitDriverStaticData {
             virtualizable_info: None,
             greenfield_info: None,
             index_of_virtualizable: -1,
+            portal_calldescr: None,
+            portal_finishtoken: None,
+            propagate_exc_descr: None,
         };
         // warmspot.py:529/538 — keep `index_of_virtualizable` in sync
         // with the `virtualizable_arg_index()` derived from `reds`.

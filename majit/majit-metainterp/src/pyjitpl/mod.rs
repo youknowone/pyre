@@ -10859,6 +10859,21 @@ pub struct MetaInterpStaticData {
     /// upstream `finish_setup(codewriter)` callback because pyre's
     /// codewriter pipeline is split across crates.
     pub jitdrivers_sd: Vec<crate::jitdriver::JitDriverStaticData>,
+    /// `compile.py:667-671` `make_and_attach_done_descrs(targets)`
+    /// attaches these five singletons to every target.  RPython calls
+    /// `make_and_attach_done_descrs([self, cpu])` at
+    /// `pyjitpl.py:2222`.  pyre populates the `MetaInterpStaticData`
+    /// half in `MetaInterpStaticData::new`; the cpu/backend half lands
+    /// when `Backend::propagate_exception_descr` is wired (follow-up).
+    pub done_with_this_frame_descr_void: Option<majit_ir::DescrRef>,
+    pub done_with_this_frame_descr_int: Option<majit_ir::DescrRef>,
+    pub done_with_this_frame_descr_ref: Option<majit_ir::DescrRef>,
+    pub done_with_this_frame_descr_float: Option<majit_ir::DescrRef>,
+    /// `compile.py:671` `exit_frame_with_exception_descr_ref`.
+    pub exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
+    /// `pyjitpl.py:2273, 2283` `compile.PropagateExceptionDescr()` —
+    /// one instance per MetaInterp, shared across jitdrivers.
+    pub propagate_exception_descr: Option<majit_ir::DescrRef>,
     /// pyjitpl.py:2357-2373 `MetaInterpGlobalData`: lazy
     /// `addr2name` and `indirectcall_dict` caches.  Populated on first
     /// call to `bytecode_for_address` / `get_name_from_address`.
@@ -10938,9 +10953,32 @@ fn bytecode_for_address_in_targets<T>(
     dict.get(&fnaddress).cloned()
 }
 
+impl crate::compile::DescrContainer for MetaInterpStaticData {
+    fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
+        self.done_with_this_frame_descr_void = Some(descr);
+    }
+    fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
+        self.done_with_this_frame_descr_int = Some(descr);
+    }
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        self.done_with_this_frame_descr_ref = Some(descr);
+    }
+    fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
+        self.done_with_this_frame_descr_float = Some(descr);
+    }
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        self.exit_frame_with_exception_descr_ref = Some(descr);
+    }
+}
+
 impl MetaInterpStaticData {
     pub fn new() -> Self {
-        Self {
+        // `pyjitpl.py:2222` `compile.make_and_attach_done_descrs([self, cpu])`.
+        // The CPU half of the pair lands with `Backend::propagate_exception_descr`
+        // wiring in a follow-up commit; for now the MetaInterpStaticData
+        // half is attached here so `compile_tmp_callback` can reach the
+        // singletons via the jitdriver's `portal_finishtoken`.
+        let mut sd = Self {
             op_live: -1,
             op_goto: -1,
             op_catch_exception: -1,
@@ -10950,7 +10988,9 @@ impl MetaInterpStaticData {
             op_float_return: -1,
             op_void_return: -1,
             ..Self::default()
-        }
+        };
+        crate::compile::make_and_attach_done_descrs(&mut [&mut sd]);
+        sd
     }
 
     /// pyjitpl.py:2227-2243 `setup_insns(insns)`.
@@ -11004,6 +11044,10 @@ impl MetaInterpStaticData {
     pub fn register_jitdriver_sd(&mut self, jd: crate::jitdriver::JitDriverStaticData) -> usize {
         let idx = self.jitdrivers_sd.len();
         self.jitdrivers_sd.push(jd);
+        // `pyjitpl.py:2273-2281` — reattach the finish/exc descrs whenever
+        // the jitdriver list changes so new drivers pick up the same
+        // `portal_finishtoken` / `propagate_exc_descr` as the rest.
+        self.finish_setup_descrs_for_jitdrivers();
         idx
     }
 
@@ -11022,6 +11066,55 @@ impl MetaInterpStaticData {
         self._addr2name_keys = list_of_addr2name.iter().map(|(k, _)| *k).collect();
         self._addr2name_values = list_of_addr2name.into_iter().map(|(_, v)| v).collect();
         self.globaldata.lock().unwrap().addr2name = None;
+    }
+
+    /// `pyjitpl.py:2271-2283` — the tail of `finish_setup` that
+    /// attaches `portal_finishtoken` + `propagate_exc_descr` to each
+    /// `JitDriverStaticData` and publishes the shared
+    /// `PropagateExceptionDescr` on `self`.
+    ///
+    /// ```python
+    /// # pyjitpl.py:2271
+    /// # store this information for fastpath of call_assembler
+    /// # (only the paths that can actually be taken)
+    /// exc_descr = compile.PropagateExceptionDescr()
+    /// for jd in self.jitdrivers_sd:
+    ///     name = {history.INT: 'int', history.REF: 'ref',
+    ///             history.FLOAT: 'float', history.VOID: 'void'}[jd.result_type]
+    ///     token = getattr(self, 'done_with_this_frame_descr_%s' % name)
+    ///     jd.portal_finishtoken = token
+    ///     jd.propagate_exc_descr = exc_descr
+    /// self.cpu.propagate_exception_descr = exc_descr
+    /// ```
+    ///
+    /// pyre runs this after every `register_jitdriver_sd` so fresh
+    /// drivers inherit the already-wired descrs without a separate
+    /// `finish_setup(codewriter)` call.  The `cpu.propagate_exception_descr`
+    /// assignment is deferred until `Backend::propagate_exception_descr`
+    /// landings (follow-up commit); `self.propagate_exception_descr`
+    /// already stores the shared instance.
+    pub fn finish_setup_descrs_for_jitdrivers(&mut self) {
+        // `pyjitpl.py:2273` `exc_descr = compile.PropagateExceptionDescr()`.
+        let exc_descr: majit_ir::DescrRef =
+            std::sync::Arc::new(crate::compile::PropagateExceptionDescr::new());
+        // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr` —
+        // the MetaInterpStaticData half of the (self, cpu) pair.
+        self.propagate_exception_descr = Some(exc_descr.clone());
+        // `pyjitpl.py:2274-2281` per-driver attachment.
+        for jd in self.jitdrivers_sd.iter_mut() {
+            // `pyjitpl.py:2275-2279` `token = getattr(self,
+            // 'done_with_this_frame_descr_%s' % name)`.
+            let token = match jd.result_type {
+                Type::Int => self.done_with_this_frame_descr_int.as_ref(),
+                Type::Ref => self.done_with_this_frame_descr_ref.as_ref(),
+                Type::Float => self.done_with_this_frame_descr_float.as_ref(),
+                Type::Void => self.done_with_this_frame_descr_void.as_ref(),
+            };
+            // `pyjitpl.py:2280` `jd.portal_finishtoken = token`.
+            jd.portal_finishtoken = token.cloned();
+            // `pyjitpl.py:2281` `jd.propagate_exc_descr = exc_descr`.
+            jd.propagate_exc_descr = Some(exc_descr.clone());
+        }
     }
 
     /// pyjitpl.py:2305-2323 `get_name_from_address(addr)`.
