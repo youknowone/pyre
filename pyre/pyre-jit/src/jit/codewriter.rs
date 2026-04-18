@@ -219,26 +219,27 @@ fn register_helper_fn_pointers(
 }
 
 /// Patch the per-`-live-` slots in `assembler` with the
-/// register-byte vectors derived from `liveness`. Returns `true` if
-/// any vector failed the 8-bit packing precondition (i.e. a register
-/// index ≥ 256), in which case the caller sets `has_abort` so the
-/// blackhole falls back to the interpreter.
+/// register-byte vectors derived from `liveness`.
 ///
 /// RPython: `assembler.py:fill_live_args` is called inline by
-/// `assembler.assemble`'s `Insn::Live` branch; the overflow fallback
-/// is pyre-only (see `liveness_regs_to_u8_sorted`'s docs).
+/// `assembler.assemble`'s `Insn::Live` branch.
+///
+/// Note: the caller previously checked PRE-rename register indices
+/// against the 256-byte cap in `liveness.py:139` and routed overflow
+/// through a pyre-only `has_abort` fallback. After the post-pass
+/// register allocator (`super::regalloc::allocate_registers`) lands,
+/// the encoded indices are POST-rename and the cap fires only on
+/// pathological functions whose `nlocals` alone already exceeds 256
+/// — the same condition that crashes the RPython translator at
+/// `encode_liveness`'s `assert 0 <= char < 256`. We adopt the
+/// RPython-orthodox behavior (panic on overflow) by deleting the
+/// fallback path.
 fn fill_assembler_liveness(
     assembler: &mut SSAReprEmitter,
     liveness: &[LivenessInfo],
     live_patches: &[(usize, usize)],
-) -> bool {
+) {
     for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
-        let live_i_bytes = liveness_regs_to_u8_sorted(&entry.live_i_regs);
-        let live_r_bytes = liveness_regs_to_u8_sorted(&entry.live_r_regs);
-        let live_f_bytes = liveness_regs_to_u8_sorted(&entry.live_f_regs);
-        if live_i_bytes.is_none() || live_r_bytes.is_none() || live_f_bytes.is_none() {
-            return true;
-        }
         assembler.fill_live_args(
             patch_offset,
             &entry.live_i_regs,
@@ -246,7 +247,6 @@ fn fill_assembler_liveness(
             &entry.live_f_regs,
         );
     }
-    false
 }
 
 /// RPython: `liveness.py` `compute_liveness(ssarepr)` — backward
@@ -362,35 +362,15 @@ fn decode_exception_catch_sites(
     (catch_for_pc, catch_sites, handler_depth_at)
 }
 
-/// rpython/jit/codewriter/liveness.py:139 "we encode the bitsets of which of
-/// the 256 registers are live" — PyPy's compact liveness encoding treats a
-/// register index as a single byte and assumes the precondition holds. PyPy
-/// raises `AssertionError` (i.e. crashes the translator) if a JitCode ever
-/// emits a register index ≥ 256, so the orthodox behavior is "panic".
-///
-/// **Source-equivalence divergence:** the Rust port returns `None` instead
-/// of panicking, and the caller marks the JitCode with `has_abort = true`
-/// so the driver falls back to the interpreter at runtime
-/// (`pyre/pyre-jit/src/call_jit.rs:1819`). This is a deliberate safety net
-/// — pyre's regalloc can blow past 256 ref registers when stdlib functions
-/// load many locals + a deep value stack, and the orthodox panic would
-/// kill the entire process. The proper fix is to make pyre's regalloc
-/// produce ≤ 256 registers (e.g. by reusing dead slots), at which point
-/// this fallback can be replaced with a hard panic to match PyPy.
-///
-/// Until then, the divergence is documented here and in
-/// `pyre_unittest_landings_2026_04_09.md` so that any future
-/// source-equivalence audit can find it without re-discovering the gap.
-fn liveness_regs_to_u8_sorted(regs: &[u16]) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(regs.len());
-    for &reg in regs {
-        let reg = u8::try_from(reg).ok()?;
-        bytes.push(reg);
-    }
-    bytes.sort_unstable();
-    bytes.dedup();
-    Some(bytes)
-}
+// Note: the legacy `liveness_regs_to_u8_sorted` helper that returned
+// `Option<Vec<u8>>` to flag the 256-register cap is gone. The cap is
+// now enforced by `majit_codewriter::liveness::encode_liveness`'s
+// `assert!(char_ < 256)` (RPython `liveness.py:147-166` parity), and
+// the post-pass register allocator
+// (`super::regalloc::allocate_registers`) compresses the indices so
+// the cap fires only on pathological functions whose `nlocals` alone
+// exceeds 256 — the same condition that crashes the RPython
+// translator.
 
 // ---------------------------------------------------------------------------
 // RPython: codewriter/codewriter.py — class CodeWriter
@@ -1852,18 +1832,13 @@ impl CodeWriter {
             compute_liveness_table(code, num_instrs, nlocals, stack_base, &depth_at_pc, &pc_map);
 
         // liveness.py:19-23 parity: patch each SSARepr `-live-` slot
-        // with the per-PC register triple. See
-        // `fill_assembler_liveness` for the 8-bit overflow fallback —
-        // a register index ≥ 256 marks the jitcode unexecutable
-        // (has_abort = true) so the blackhole falls back to the
-        // interpreter.
-        if fill_assembler_liveness(&mut assembler, &liveness, &live_patches) {
-            // Propagate to the builder so Assembler::assemble can
-            // skip its check_result assertion — the JitCode produced
-            // here will never reach the blackhole anyway.
-            assembler.set_abort_flag(true);
-            has_abort = true;
-        }
+        // with the per-PC register triple. The post-pass register
+        // allocator below renames these registers to colors that fit
+        // in `encode_liveness`'s 8-bit precondition; the legacy
+        // pyre-only `has_abort` fallback for `register index ≥ 256`
+        // is gone (RPython parity: `liveness.py:147-166` panics if a
+        // post-regalloc register exceeds 256, and so do we).
+        fill_assembler_liveness(&mut assembler, &liveness, &live_patches);
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, assembler, site.landing_label);
@@ -2338,30 +2313,6 @@ pub fn find_loop_header_pcs(
     loop_header_pcs
 }
 
-#[cfg(test)]
-mod tests {
-    use super::liveness_regs_to_u8_sorted;
-
-    #[test]
-    fn liveness_regs_to_u8_sorted_sorts_and_dedups() {
-        assert_eq!(
-            liveness_regs_to_u8_sorted(&[7, 1, 7, 3]),
-            Some(vec![1, 3, 7])
-        );
-    }
-
-    /// rpython/jit/codewriter/liveness.py:139 enforces a 256-register cap.
-    /// Register indices `>= 256` cannot be encoded and the helper must
-    /// surface an overflow sentinel so the outer codewriter can fall back
-    /// to `BC_ABORT` instead of panicking at runtime.
-    #[test]
-    fn liveness_regs_to_u8_sorted_rejects_out_of_range_registers() {
-        assert_eq!(liveness_regs_to_u8_sorted(&[255, 256]), None);
-    }
-
-    /// Boundary: exactly 255 is still valid (u8::MAX).
-    #[test]
-    fn liveness_regs_to_u8_sorted_accepts_u8_max() {
-        assert_eq!(liveness_regs_to_u8_sorted(&[255]), Some(vec![255]));
-    }
-}
+// `liveness_regs_to_u8_sorted` tests removed alongside the helper.
+// The 256-register cap is now enforced inside `encode_liveness` and
+// covered by `majit_codewriter::liveness::encode_liveness*` tests.
