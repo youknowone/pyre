@@ -25,7 +25,9 @@ use super::ssa_emitter::SSAReprEmitter;
 use pyre_interpreter::bytecode::{CodeObject, Instruction, OpArgState};
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
-use super::flatten::{Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
+use super::flatten::{
+    CallFlavor, DescrOperand, Insn, Kind, ListOfKind, Operand, Register, ResKind, SSARepr, TLabel,
+};
 
 // ---------------------------------------------------------------------------
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
@@ -428,6 +430,147 @@ fn decode_exception_catch_sites(
 // the cap fires only on pathological functions whose `nlocals` alone
 // exceeds 256 — the same condition that crashes the RPython
 // translator.
+
+/// B6 Phase 3b dual emission entry point for residual calls.
+///
+/// Each per-PC handler that previously called one of `assembler.call_*_typed`
+/// directly now funnels through this helper. Two steps:
+///   1. `emit_residual_call_shape` pushes the upstream-canonical
+///      `residual_call_{kinds}_{reskind}` Insn into the walker-local
+///      `ssarepr` (the Phase 3c authoritative input).
+///   2. The matching `assembler.{...}_typed` call is dispatched below to
+///      preserve the runtime path (the `SSAReprEmitter::ssarepr` consumed
+///      by `Assembler::assemble` today still carries the pyre-only
+///      `call_*` opname). Once Phase 3c switches the assembler input,
+///      step 2 can be removed.
+fn emit_residual_call(
+    ssarepr: &mut SSARepr,
+    assembler: &mut SSAReprEmitter,
+    flavor: CallFlavor,
+    fn_idx: u16,
+    call_args: &[majit_metainterp::jitcode::JitCallArg],
+    reskind: ResKind,
+    dst: Option<u16>,
+) {
+    emit_residual_call_shape(ssarepr, flavor, fn_idx, call_args, reskind, dst);
+    match (flavor, reskind) {
+        (CallFlavor::Plain, ResKind::Int) => {
+            assembler.call_int_typed(fn_idx, call_args, dst.unwrap());
+        }
+        (CallFlavor::Plain, ResKind::Ref) => {
+            assembler.call_ref_typed(fn_idx, call_args, dst.unwrap());
+        }
+        (CallFlavor::MayForce, ResKind::Ref) => {
+            assembler.call_may_force_ref_typed(fn_idx, call_args, dst.unwrap());
+        }
+        (CallFlavor::MayForce, ResKind::Void) => {
+            assembler.call_may_force_void_typed_args(fn_idx, call_args);
+        }
+        (flavor, reskind) => panic!(
+            "emit_residual_call: unsupported runtime (flavor, reskind) = ({:?}, {:?})",
+            flavor, reskind
+        ),
+    }
+}
+
+/// Upstream-shape Insn builder for the walker-local `ssarepr`. See
+/// `emit_residual_call` for the dual-emit policy.
+///
+/// `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` emits
+///
+/// ```text
+/// SpaceOperation('%s_%s_%s' % (namebase, kinds, reskind),
+///                [fn, ListOfKind('int',   args_i),
+///                     ListOfKind('ref',   args_r),   # only if 'r' in kinds
+///                     ListOfKind('float', args_f),   # only if 'f' in kinds
+///                     calldescr],
+///                result)
+/// ```
+///
+/// where `kinds` is the smallest cover of actually-present arg kinds
+/// (`'r'` if only ref args, `'ir'` if int+ref, `'irf'` if floats are
+/// present or the result itself is float) and `reskind` ∈ {`i`, `r`,
+/// `f`, `v`}. `namebase = 'residual_call'` for the direct-call helper
+/// (`jtransform.py:460-471 handle_residual_call`).
+///
+/// This helper is the external-`SSARepr` side of the Phase 3b dual
+/// emission: every call site pairs a direct `assembler.call_*_typed(...)`
+/// (pushing a pyre-only `call_*` Insn into the runtime-consumed
+/// `SSAReprEmitter::ssarepr`) with one call here, which pushes the
+/// upstream-canonical shape into the walker-local `ssarepr` that
+/// Phase 3c will wire up as the authoritative `Assembler::assemble`
+/// input. Upstream stores `calldescr` (an `AbstractDescr` carrying
+/// `EffectInfo`) in the trailing slot; pyre threads a
+/// `DescrOperand::CallFlavor` there so Phase 3c's assembler dispatch
+/// can recover the (flavor, reskind) pair the runtime path resolves
+/// statically today.
+fn emit_residual_call_shape(
+    ssarepr: &mut SSARepr,
+    flavor: CallFlavor,
+    fn_idx: u16,
+    // Arguments in the C function's parameter order. `JitCallArg` carries
+    // its own kind tag so pyre's runtime builder can interleave kinds on
+    // the machine-code call. The SSARepr side projects this list into
+    // kind-separated sublists to match upstream shape — upstream itself
+    // loses per-C-parameter order in the SSARepr and relies on
+    // `calldescr` at `bh_call_*` time to reconstruct it.
+    call_args: &[majit_metainterp::jitcode::JitCallArg],
+    reskind: ResKind,
+    dst: Option<u16>,
+) {
+    use majit_metainterp::jitcode::JitArgKind;
+
+    // `rpython/jit/codewriter/jtransform.py:437-445 make_three_lists`.
+    let mut args_i: Vec<u16> = Vec::new();
+    let mut args_r: Vec<u16> = Vec::new();
+    let mut args_f: Vec<u16> = Vec::new();
+    for arg in call_args {
+        match arg.kind {
+            JitArgKind::Int => args_i.push(arg.reg),
+            JitArgKind::Ref => args_r.push(arg.reg),
+            JitArgKind::Float => args_f.push(arg.reg),
+        }
+    }
+
+    // `rewrite_call` kinds selection (jtransform.py:423-426).
+    let kinds: &str = if !args_f.is_empty() || reskind == ResKind::Float {
+        "irf"
+    } else if !args_i.is_empty() {
+        "ir"
+    } else {
+        "r"
+    };
+    let reskind_ch = reskind.as_char();
+    let opname = format!("residual_call_{kinds}_{reskind_ch}");
+
+    // SSARepr arg list: [Const(fn), ListI?, ListR, ListF?, Descr(flavor)].
+    let mut args: Vec<Operand> = Vec::with_capacity(5);
+    args.push(Operand::ConstInt(fn_idx as i64));
+    let reg_list = |kind: Kind, regs: &[u16]| {
+        Operand::ListOfKind(ListOfKind::new(
+            kind,
+            regs.iter().map(|&r| Operand::reg(kind, r)).collect(),
+        ))
+    };
+    if kinds.contains('i') {
+        args.push(reg_list(Kind::Int, &args_i));
+    }
+    if kinds.contains('r') {
+        args.push(reg_list(Kind::Ref, &args_r));
+    }
+    if kinds.contains('f') {
+        args.push(reg_list(Kind::Float, &args_f));
+    }
+    args.push(Operand::descr(DescrOperand::CallFlavor(flavor)));
+
+    let insn = match (reskind.to_kind(), dst) {
+        (Some(kind), Some(d)) => Insn::op_with_result(opname, args, Register::new(kind, d)),
+        (None, None) => Insn::op(opname, args),
+        (Some(_), None) => panic!("residual_call with non-void reskind requires dst"),
+        (None, Some(_)) => panic!("residual_call with void reskind must not have dst"),
+    };
+    ssarepr.insns.push(insn);
+}
 
 // ---------------------------------------------------------------------------
 // RPython: codewriter/codewriter.py — class CodeWriter
@@ -1292,10 +1435,14 @@ impl CodeWriter {
                 Instruction::LoadSmallInt { i } => {
                     let val = i.get(op_arg) as u32 as i64;
                     emit_load_const_i!(ssarepr, assembler, int_tmp0, val);
-                    assembler.call_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::Plain,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1307,13 +1454,17 @@ impl CodeWriter {
                     // jtransform.py: getfield_vable_r for pycode (field 1)
                     emit_vable_getfield_ref!(ssarepr, assembler, obj_tmp0, VABLE_CODE_FIELD_IDX);
                     emit_load_const_i!(ssarepr, assembler, int_tmp0, idx as i64);
-                    assembler.call_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::Plain,
                         load_const_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1410,13 +1561,18 @@ impl CodeWriter {
                         arg_regs_start,
                         stack_base + current_depth
                     ); // value
-                    assembler.call_may_force_void_typed_args(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         store_subscr_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
                             majit_metainterp::jitcode::JitCallArg::reference(arg_regs_start),
                         ],
+                        ResKind::Void,
+                        None,
                     );
                 }
 
@@ -1454,14 +1610,18 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                     let lhs_reg = stack_base + current_depth;
                     emit_load_const_i!(ssarepr, assembler, op_code_reg, op_val as i64);
-                    assembler.call_may_force_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(lhs_reg),
                             majit_metainterp::jitcode::JitCallArg::reference(rhs_reg),
                             majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1479,14 +1639,18 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                     let lhs_reg = stack_base + current_depth;
                     emit_load_const_i!(ssarepr, assembler, op_code_reg, op_val as i64);
-                    assembler.call_may_force_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(lhs_reg),
                             majit_metainterp::jitcode::JitCallArg::reference(rhs_reg),
                             majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1508,10 +1672,14 @@ impl CodeWriter {
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
                     emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
-                    assembler.call_int_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
-                        int_tmp0,
+                        ResKind::Int,
+                        Some(int_tmp0),
                     );
                     if target_py_pc < num_instrs {
                         emit_goto_if_not!(ssarepr, assembler, labels, int_tmp0, target_py_pc);
@@ -1534,10 +1702,14 @@ impl CodeWriter {
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
                     emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
-                    assembler.call_int_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
-                        int_tmp0,
+                        ResKind::Int,
+                        Some(int_tmp0),
                     );
                     if target_py_pc < num_instrs {
                         emit_goto_if_not_int_is_zero!(
@@ -1592,14 +1764,18 @@ impl CodeWriter {
                     );
                     emit_vable_getfield_ref!(ssarepr, assembler, obj_tmp1, VABLE_CODE_FIELD_IDX);
                     emit_load_const_i!(ssarepr, assembler, int_tmp0, raw_namei);
-                    assembler.call_may_force_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         load_global_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
                     if raw_namei & 1 != 0 {
@@ -1670,7 +1846,15 @@ impl CodeWriter {
                             7 => call_fn_7_idx,
                             _ => call_fn_8_idx,
                         };
-                        assembler.call_may_force_ref_typed(fn_idx, &call_args, obj_tmp0);
+                        emit_residual_call(
+                            &mut ssarepr,
+                            &mut assembler,
+                            CallFlavor::MayForce,
+                            fn_idx,
+                            &call_args,
+                            ResKind::Ref,
+                            Some(obj_tmp0),
+                        );
                     }
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1688,10 +1872,14 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                     emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
                     emit_load_const_i!(ssarepr, assembler, int_tmp0, 0);
-                    assembler.call_may_force_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
-                        obj_tmp1,
+                        ResKind::Ref,
+                        Some(obj_tmp1),
                     );
                     emit_load_const_i!(
                         ssarepr,
@@ -1700,14 +1888,18 @@ impl CodeWriter {
                         binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
                             .expect("subtract must have a jit binary-op tag"),
                     );
-                    assembler.call_may_force_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1757,14 +1949,18 @@ impl CodeWriter {
                     } else {
                         majit_metainterp::jitcode::JitCallArg::int(int_tmp0) // dummy
                     };
-                    assembler.call_may_force_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         build_list_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                             item0,
                             item1,
                         ],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1809,14 +2005,18 @@ impl CodeWriter {
                     emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth); // exception
                     // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
                     emit_load_const_i!(ssarepr, assembler, int_tmp0, 10); // isinstance op
-                    assembler.call_may_force_ref_typed(
+                    emit_residual_call(
+                        &mut ssarepr,
+                        &mut assembler,
+                        CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
-                        obj_tmp0,
+                        ResKind::Ref,
+                        Some(obj_tmp0),
                     );
                     emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
@@ -1988,10 +2188,14 @@ impl CodeWriter {
             let mut exc_slot = stack_base + site.stack_depth;
             if site.push_lasti {
                 emit_load_const_i!(ssarepr, assembler, int_tmp0, site.lasti_py_pc as i64);
-                assembler.call_ref_typed(
+                emit_residual_call(
+                    &mut ssarepr,
+                    &mut assembler,
+                    CallFlavor::Plain,
                     box_int_fn_idx,
                     &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
-                    obj_tmp0,
+                    ResKind::Ref,
+                    Some(obj_tmp0),
                 );
                 emit_move_r!(ssarepr, assembler, exc_slot, obj_tmp0);
                 exc_slot += 1;

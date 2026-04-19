@@ -927,6 +927,16 @@ fn record_descr_operand(state: &mut AssemblyState, descr: &DescrOperand) -> usiz
             });
             state.switch_descrs.push((index, switch.labels.clone()));
         }
+        DescrOperand::CallFlavor(_) => {
+            // `CallFlavor` stands in for the codewriter-layer `calldescr`
+            // at the SSARepr level but does not correspond to a runtime
+            // `BhDescr`. The `residual_call_*` dispatch arms consume the
+            // flavor directly (`dispatch_op` below) to pick the builder
+            // method, so the argcode `d` emission path must never see it.
+            panic!(
+                "record_descr_operand: CallFlavor must be consumed by dispatch_op, not encoded as 'd'"
+            );
+        }
     }
     index
 }

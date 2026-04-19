@@ -260,6 +260,84 @@ pub enum DescrOperand {
     /// SSARepr-side `SwitchDictDescr` before `attach()`; liveness reads
     /// its `labels` field to follow control-flow edges.
     SwitchDict(SwitchDictDescr),
+    /// `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` appends
+    /// an `AbstractDescr` (the `calldescr`) at the end of every
+    /// `residual_call_*` / `inline_call_*` arg list. The descr carries
+    /// `EffectInfo` that downstream (`rpython/jit/metainterp/optimizeopt/
+    /// rewrite.py`) consults to pick between `call_may_force_*`,
+    /// `call_release_gil_*`, `call_loopinvariant_*`, `call_pure_*`, and
+    /// `call_assembler_*`.
+    ///
+    /// pyre does not (yet) thread `EffectInfo` through the codewriter
+    /// layer, so this variant stands in for the calldescr and carries the
+    /// flavor directly. The assembler dispatch consumes it to pick the
+    /// same builder method the optimizeopt layer would have selected.
+    /// SSARepr shape still matches upstream 1:1: one descr operand per
+    /// residual call, final argument position.
+    CallFlavor(CallFlavor),
+}
+
+/// `rpython/jit/metainterp/optimizeopt/rewrite.py` `Rewrite.optimize_CALL_XXX`
+/// branches on `op.getdescr().effectinfo.extraeffect` to select between
+/// `call_may_force`, `call_release_gil`, `call_loopinvariant`, `call_pure`,
+/// and `call_assembler`. In pyre the codewriter knows statically which
+/// branch applies for each per-PC helper, so the enum is emitted directly
+/// into the calldescr slot rather than derived from `EffectInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallFlavor {
+    /// Plain residual call with no extra effect
+    /// (`rpython/jit/codewriter/effectinfo.py EF_CANNOT_RAISE` /
+    /// `EF_CAN_RAISE`).
+    Plain,
+    /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`. The builder emits
+    /// `call_may_force_*` so the metainterp forces virtualizable state
+    /// before the call. Maps to `JitCodeBuilder::call_may_force_*_typed`.
+    MayForce,
+    /// `EF_LOOPINVARIANT`. One-shot call memoised across the trace loop.
+    /// Maps to `JitCodeBuilder::call_loopinvariant_*_typed`.
+    LoopInvariant,
+    /// `EF_RELEASES_GIL`. Maps to `JitCodeBuilder::call_release_gil_*_typed`.
+    ReleaseGil,
+    /// `EF_ELIDABLE_*`. Maps to `JitCodeBuilder::call_pure_*_typed`.
+    Pure,
+    /// `jit.dont_look_inside` portal call — `bhimpl_call_assembler_*`.
+    /// Maps to `JitCodeBuilder::call_assembler_*_typed`.
+    Assembler,
+}
+
+/// `rpython/jit/codewriter/jtransform.py:423` `reskind =
+/// getkind(op.result.concretetype)[0]`. The four result-kind suffixes
+/// used by `residual_call_{kinds}_{reskind}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResKind {
+    Int,
+    Ref,
+    Float,
+    Void,
+}
+
+impl ResKind {
+    /// The single-character suffix used in `residual_call_{kinds}_{reskind}`.
+    /// `rpython/jit/codewriter/jtransform.py:434`
+    /// `'%s_%s_%s' % (namebase, kinds, reskind)`.
+    pub fn as_char(self) -> char {
+        match self {
+            ResKind::Int => 'i',
+            ResKind::Ref => 'r',
+            ResKind::Float => 'f',
+            ResKind::Void => 'v',
+        }
+    }
+
+    /// The non-void reskinds map to a `Kind` for the result `Register`.
+    pub fn to_kind(self) -> Option<Kind> {
+        match self {
+            ResKind::Int => Some(Kind::Int),
+            ResKind::Ref => Some(Kind::Ref),
+            ResKind::Float => Some(Kind::Float),
+            ResKind::Void => None,
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
