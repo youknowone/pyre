@@ -220,38 +220,6 @@ fn enforce_input_args(
             alloc.swapcolors(realcol, curcol);
         }
     }
-
-    // PRE-EXISTING-ADAPTATION (no RPython counterpart). The
-    // trace-side decode in `pyre/pyre-jit-trace/src/trace_opcode.rs`
-    // (and the bytecode walker) reads `register_idx < nlocals` as
-    // "register holds local `register_idx`'s value", which requires
-    // an INJECTIVE mapping in BOTH directions: not only must each
-    // inputarg land at color `realcol` (handled above), but no
-    // non-inputarg register may share a color in `0..n_inputs`
-    // either. RPython has no equivalent invariant because its
-    // blackhole resume reads PyFrame slots via `enumerate_vars`
-    // rather than reusing register indices.
-    //
-    // Push every non-inputarg register's color above the inputarg
-    // range by adding `n_inputs`. This preserves the chordal
-    // coloring's correctness (any two non-inputargs that previously
-    // shared a color still share `color + n_inputs`) and only
-    // separates non-inputargs that previously collided with an
-    // inputarg color. The cost is `num_regs_r` growing by
-    // `n_inputs`, which is acceptable until the trace-side decode
-    // is rewritten in terms of an explicit register_mapping (see
-    // reviewer plan step #5 — multi-session refactor).
-    let input_set: HashSet<u16> = input_indices.iter().copied().collect();
-    let n_inputs = input_indices.len() as u16;
-    if n_inputs > 0 {
-        for (v, color) in alloc.coloring.iter_mut() {
-            if !input_set.contains(v) {
-                *color = color.checked_add(n_inputs).expect(
-                    "enforce_input_args: color overflow when shifting non-inputargs above input range",
-                );
-            }
-        }
-    }
 }
 
 /// RPython `regalloc.py:6` `perform_register_allocation(graph, kind)`
@@ -751,14 +719,13 @@ mod tests {
     }
 
     /// (b) A dead local's color is reused by a later temp value at
-    /// the chordal-coloring stage. The pyre-only enforce_input_args
-    /// shift then lifts the temp's color above the inputarg range
-    /// so the trace-side `idx < nlocals` decode stays injective.
-    /// Tests both that the chordal coloring is willing to reuse
-    /// (no spurious cross-edge in the dependency graph) and that
-    /// the shift preserves the trace-side invariant.
+    /// the chordal-coloring stage (RPython `regalloc.py:54-60`).
+    /// `enforce_input_args` only swaps the inputarg colors into the
+    /// 0..n_inputs slots; non-inputarg colors are left where the
+    /// chordal allocator placed them, so a temp whose live range
+    /// starts after the inputarg dies legitimately reuses color 0.
     #[test]
-    fn dead_local_color_reused_then_shifted() {
+    fn dead_local_color_reused() {
         let mut ssarepr = SSARepr::new("t");
         ssarepr
             .insns
@@ -780,17 +747,15 @@ mod tests {
         let result = allocate_registers(&ssarepr, 1, inputs);
         let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
         assert_eq!(new(0), 0, "local 0 stays at color 0 (enforce_input_args)");
-        // Pre-shift, temp 100 would have color 0 (reuses dead local 0).
-        // Post-shift, it's pushed to color 0 + n_inputs = 1.
         assert_eq!(
             new(100),
-            1,
-            "temp 100 reuses dead local 0's color but is shifted above inputarg range"
+            0,
+            "temp 100 reuses dead local 0's color (chordal coloring)"
         );
         assert_eq!(
             result.num_regs.get(&Kind::Ref).copied(),
-            Some(2),
-            "1 inputarg color + 1 shifted temp color = 2"
+            Some(1),
+            "single color shared between inputarg and dead-range temp"
         );
     }
 
@@ -865,15 +830,12 @@ mod tests {
         );
     }
 
-    /// (e) PRE-EXISTING-ADAPTATION invariant: every non-inputarg
-    /// register's color lies STRICTLY above the inputarg range
-    /// (`color >= n_inputs`). The trace-side `idx < nlocals` decode
-    /// in `trace_opcode.rs` requires this injective separation.
-    /// (RPython has no equivalent because its blackhole resume reads
-    /// PyFrame slots via `enumerate_vars` rather than reusing
-    /// register indices.)
+    /// (e) RPython `enforce_input_args` only swaps inputargs into
+    /// 0..n_inputs; non-inputarg registers can reuse those colors
+    /// when the inputarg's live range has ended. This mirrors
+    /// `flatten.py:88-100` exactly.
     #[test]
-    fn non_inputarg_color_is_above_inputarg_range() {
+    fn non_inputarg_can_reuse_inputarg_color() {
         let mut ssarepr = SSARepr::new("t");
         ssarepr.insns.push(op_use(
             "read_local",
@@ -898,10 +860,9 @@ mod tests {
         };
         let result = allocate_registers(&ssarepr, 1, inputs);
         let new50 = result.rename.get(&(Kind::Ref, 50)).copied().unwrap_or(50);
-        assert!(
-            new50 >= 1,
-            "non-inputarg reg 50 must land at color >= n_inputs (1), got {}",
-            new50
+        assert_eq!(
+            new50, 0,
+            "non-inputarg reg 50 reuses dead inputarg 0's color (no shift)"
         );
     }
 }
