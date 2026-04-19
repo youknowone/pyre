@@ -2604,273 +2604,200 @@ impl CallControl {
         self.cached_can_raise(target, cache)
     }
 
-    /// RPython `call.py:210-335` indirect-call variant where the full family
-    /// is already attached to the op. This runs every analyzer over the whole
-    /// family (or returns top for `graphs=None`) instead of inventing a fake
-    /// single `CallTarget`.
-    pub fn getcalldescr_indirect_family(
+    /// RPython `call.py:210-335 CallControl.getcalldescr(op, ...)` —
+    /// line-by-line port.  One function that dispatches on `op.kind`:
+    ///
+    /// - `OpKind::Call` → direct_call branch (call.py:240-257): extract
+    ///   elidable / loopinvariant flags from the `funcobj`, validate the
+    ///   caller's NON_VOID_ARGS / RESULT against the callee graph.
+    /// - `OpKind::IndirectCall` → indirect_call branch (call.py:259-280):
+    ///   family-wide validation (reject mixed `_elidable_function_` etc.),
+    ///   family-witness signature check, family-wide analyzer caches.
+    ///
+    /// Both branches converge at call.py:281-335: random_effects,
+    /// can_invalidate, extraeffect resolution, effectinfo assembly,
+    /// post-condition asserts, and the final
+    /// `cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)` wrap.
+    pub fn getcalldescr(
         &self,
-        graphs: Option<&[CallPath]>,
+        op: &SpaceOperation,
         arg_types: Vec<Type>,
         result_type: Type,
         oopspecindex: OopSpecIndex,
         extraeffect: Option<ExtraEffect>,
         cache: &mut AnalysisCache,
     ) -> CallDescriptor {
-        if let Some(graphs) = graphs {
+        // Extract the direct-call target (if any) and indirect-call family
+        // (if any).  Exactly one is Some after the initial dispatch;
+        // downstream branches key off this.
+        enum CallShape<'a> {
+            Direct(&'a CallTarget),
+            Indirect(Option<&'a [CallPath]>),
+        }
+        let shape = match &op.kind {
+            OpKind::Call { target, .. } => CallShape::Direct(target),
+            OpKind::IndirectCall { graphs, .. } => CallShape::Indirect(graphs.as_deref()),
+            other => panic!("getcalldescr called on non-call op: {other:?}"),
+        };
+
+        // RPython call.py:240-257 direct_call branch: read `_elidable_function_`
+        // / `_jit_loop_invariant_` / `_call_aroundstate_target_` off the
+        // funcobj.  Indirect calls have no single funcobj so the flags are
+        // always false — they are enforced family-wide below.
+        let (elidable, loopinvariant) = match shape {
+            CallShape::Direct(target) => (self.is_elidable(target), self.is_loopinvariant(target)),
+            CallShape::Indirect(_) => (false, false),
+        };
+
+        // RPython call.py:259-280 indirect_call branch: family-wide
+        // validation. Reject families mixing elidable/loopinvariant/
+        // call_aroundstate with ordinary members.
+        if let CallShape::Indirect(Some(graphs)) = shape {
             if let Err(err) = self.check_indirect_call_family(graphs) {
                 panic!("getcalldescr: {err}");
             }
         }
 
-        // RPython `call.py:220-234`:
+        // RPython call.py:220-234 signature validation:
         //   NON_VOID_ARGS = [x.concretetype for x in op.args[1:]
-        //                                    if x.concretetype is not lltype.Void]
+        //                                    if x.concretetype is not Void]
         //   RESULT = op.result.concretetype
         //   FUNC = op.args[0].concretetype.TO
-        //   if NON_VOID_ARGS != [T for T in FUNC.ARGS if T is not lltype.Void]:
-        //       raise Exception(...)
-        //   if RESULT != FUNC.RESULT:
-        //       raise Exception(...)
-        //
-        // Indirect calls: the family invariant says every candidate
-        // shares one signature, so validate against the first resolvable
-        // graph.  Mismatch is a programming error, not a runtime condition
-        // — panic like upstream's `raise Exception`.
-        if let Some((witness_path, witness_graph)) = graphs
-            .into_iter()
-            .flatten()
-            .find_map(|path| self.function_graphs.get(path).map(|g| (path, g)))
-        {
-            let expected_arg_types = graph_non_void_arg_types(witness_graph);
-            if arg_types != expected_arg_types {
-                panic!(
-                    "indirect_call in family including {witness_path:?}: \
-                     calling a function with non-void arg kinds {expected_arg_types:?}, \
-                     but passing actual arg kinds {arg_types:?}",
-                );
+        //   if NON_VOID_ARGS != [T for T in FUNC.ARGS if T is not Void]: raise
+        //   if RESULT != FUNC.RESULT: raise
+        match shape {
+            CallShape::Direct(target) => {
+                // Warn-only for direct because pyre's static-analysis arity
+                // inference is approximate (see test_getcalldescr_rewrites).
+                if !arg_types.is_empty() {
+                    if let Some(path) = self.target_to_path(target) {
+                        if let Some(graph) = self.function_graphs.get(&path) {
+                            let expected_arity = graph.block(graph.startblock).inputargs.len();
+                            if arg_types.len() != expected_arity {
+                                eprintln!(
+                                    "[getcalldescr] WARNING: {target} expects \
+                                     {expected_arity} args but got {} \
+                                     (NON_VOID_ARGS mismatch)",
+                                    arg_types.len()
+                                );
+                            }
+                        }
+                    }
+                }
             }
-            let expected_result =
-                return_type_string_to_value_type(self.return_types.get(witness_path));
-            if result_type != expected_result {
-                panic!(
-                    "indirect_call in family including {witness_path:?}: \
-                     calling a function with return type {expected_result:?}, \
-                     but the actual return type is {result_type:?}",
-                );
-            }
-        }
-
-        let random_effects = self.cached_random_effects_family(graphs, cache);
-        let mut extraeffect = extraeffect;
-        if random_effects {
-            extraeffect = Some(ExtraEffect::RandomEffects);
-        }
-
-        let can_invalidate = random_effects || self.cached_can_invalidate_family(graphs, cache);
-
-        if extraeffect.is_none() {
-            extraeffect = Some(if self.cached_forces_virtualizable_family(graphs, cache) {
-                ExtraEffect::ForcesVirtualOrVirtualizable
-            } else if matches!(
-                self.cached_can_raise_family(graphs, cache),
-                CanRaise::Yes | CanRaise::MemoryErrorOnly
-            ) {
-                ExtraEffect::CanRaise
-            } else {
-                ExtraEffect::CannotRaise
-            });
-        }
-
-        let extraeffect = extraeffect.unwrap_or(ExtraEffect::CanRaise);
-        let effects = analyze_readwrite_indirect_family(
-            graphs,
-            &self.function_graphs,
-            self,
-            &mut cache.descr_indices,
-        );
-        let can_collect = self.cached_can_collect_family(graphs, cache);
-        let effectinfo = effectinfo_from_writeanalyze(
-            effects,
-            extraeffect,
-            oopspecindex,
-            can_invalidate,
-            can_collect,
-        );
-
-        // result_type drove the signature validation above; the
-        // CallDescriptor extra_info is the sole surface the optimizer
-        // consumes, matching upstream where `calldescrof(FUNC, ...,
-        // FUNC.RESULT, EffectInfo.MOST_GENERAL)` returns a
-        // `LLDescr`-wrapped EffectInfo and the RESULT is stored on the
-        // descr itself (tracked via `descr.result_type()` downstream,
-        // not re-packed here).
-        let _ = result_type;
-        CallDescriptor {
-            extra_info: effectinfo,
-        }
-    }
-
-    /// RPython: CallControl.getcalldescr(op, oopspecindex, extraeffect, ...)
-    /// (call.py:210-335).
-    ///
-    /// Determines the effect classification for a call target by running
-    /// graph-based analyzers, then builds and returns a CallDescriptor
-    /// with the computed EffectInfo.
-    ///
-    /// ```python
-    /// def getcalldescr(self, op, oopspecindex=OS_NONE,
-    ///                  extraeffect=None, extradescr=None, calling_graph=None):
-    ///     ...
-    ///     random_effects = self.randomeffects_analyzer.analyze(op)
-    ///     if random_effects:
-    ///         extraeffect = EF_RANDOM_EFFECTS
-    ///     can_invalidate = random_effects or self.quasiimmut_analyzer.analyze(op)
-    ///     if extraeffect is None:
-    ///         if self.virtualizable_analyzer.analyze(op):
-    ///             extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE
-    ///         elif loopinvariant:
-    ///             extraeffect = EF_LOOPINVARIANT
-    ///         elif elidable:
-    ///             cr = self._canraise(op)
-    ///             ...
-    ///         elif self._canraise(op):
-    ///             extraeffect = EF_CAN_RAISE
-    ///         else:
-    ///             extraeffect = EF_CANNOT_RAISE
-    ///     ...
-    ///     effectinfo = effectinfo_from_writeanalyze(...)
-    ///     return self.cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)
-    /// ```
-    pub fn getcalldescr(
-        &self,
-        target: &CallTarget,
-        arg_types: Vec<Type>,
-        result_type: Type,
-        oopspecindex: OopSpecIndex,
-        extraeffect: Option<ExtraEffect>,
-        cache: &mut AnalysisCache,
-    ) -> CallDescriptor {
-        if let CallTarget::Indirect {
-            trait_root,
-            method_name,
-        } = target
-        {
-            let graphs = self.all_impls_for_indirect(trait_root, method_name);
-            return self.getcalldescr_indirect_family(
-                Some(&graphs),
-                arg_types,
-                result_type,
-                oopspecindex,
-                extraeffect,
-                cache,
-            );
-        }
-
-        // RPython `call.py:259-280` — indirect_call family-wide validation.
-        //
-        //   elif op.opname == 'indirect_call':
-        //       graphs = op.args[-1].value
-        //       for graph in (graphs or ()):
-        //           if hasattr(graph.func, '_elidable_function_'): error
-        //           if hasattr(graph.func, '_jit_loop_invariant_'): error
-        //           if hasattr(graph.func, '_call_aroundstate_target_'): error
-        //           ... raise Exception("indirect call to family ...")
-        if let CallTarget::Indirect {
-            trait_root,
-            method_name,
-        } = target
-        {
-            let candidates = self.all_impls_for_indirect(trait_root, method_name);
-            if let Err(err) = self.check_indirect_call_family(&candidates) {
-                panic!("getcalldescr: {err}");
-            }
-        }
-
-        // RPython call.py:239-240: extract flags
-        let elidable = self.is_elidable(target);
-        let loopinvariant = self.is_loopinvariant(target);
-
-        // RPython call.py:223-234: check the number and type of arguments.
-        //   FUNC = op.args[0].concretetype.TO
-        //   if NON_VOID_ARGS != [T for T in FUNC.ARGS if T is not Void]:
-        //       raise Exception(...)
-        //   if RESULT != FUNC.RESULT:
-        //       raise Exception(...)
-        //
-        // In majit, we validate by looking up the callee's FunctionGraph inputs.
-        // RPython raises on mismatch; we warn (callee signatures are approximate
-        // in static analysis, so hard errors would be too strict).
-        if !arg_types.is_empty() {
-            if let Some(path) = self.target_to_path(target) {
-                if let Some(graph) = self.function_graphs.get(&path) {
-                    let expected_arity = graph.block(graph.startblock).inputargs.len();
-                    if arg_types.len() != expected_arity {
-                        eprintln!(
-                            "[getcalldescr] WARNING: {target} expects {expected_arity} args \
-                             but got {} (NON_VOID_ARGS mismatch)",
-                            arg_types.len()
+            CallShape::Indirect(graphs) => {
+                // Indirect family invariant: all candidates share one
+                // signature, so validate against the first resolvable
+                // witness.  Mismatch is a programming error — panic like
+                // RPython's `raise Exception`.
+                if let Some((witness_path, witness_graph)) = graphs
+                    .into_iter()
+                    .flatten()
+                    .find_map(|path| self.function_graphs.get(path).map(|g| (path, g)))
+                {
+                    let expected_arg_types = graph_non_void_arg_types(witness_graph);
+                    if arg_types != expected_arg_types {
+                        panic!(
+                            "indirect_call in family including {witness_path:?}: \
+                             calling a function with non-void arg kinds \
+                             {expected_arg_types:?}, but passing actual arg \
+                             kinds {arg_types:?}",
+                        );
+                    }
+                    let expected_result =
+                        return_type_string_to_value_type(self.return_types.get(witness_path));
+                    if result_type != expected_result {
+                        panic!(
+                            "indirect_call in family including {witness_path:?}: \
+                             calling a function with return type \
+                             {expected_result:?}, but the actual return type \
+                             is {result_type:?}",
                         );
                     }
                 }
             }
         }
 
-        // RPython call.py:282: random_effects = self.randomeffects_analyzer.analyze(op)
-        let random_effects = self.cached_random_effects(target, cache);
+        // RPython call.py:282-286: random_effects + can_invalidate.
+        let random_effects = match shape {
+            CallShape::Direct(target) => self.cached_random_effects(target, cache),
+            CallShape::Indirect(graphs) => self.cached_random_effects_family(graphs, cache),
+        };
         let mut extraeffect = extraeffect;
         if random_effects {
             extraeffect = Some(ExtraEffect::RandomEffects);
         }
+        let can_invalidate = random_effects
+            || match shape {
+                CallShape::Direct(target) => self.cached_can_invalidate(target, cache),
+                CallShape::Indirect(graphs) => self.cached_can_invalidate_family(graphs, cache),
+            };
 
-        // RPython call.py:285: can_invalidate = random_effects or quasiimmut_analyzer
-        let can_invalidate = random_effects || self.cached_can_invalidate(target, cache);
-
-        // RPython call.py:286-303: determine extraeffect
+        // RPython call.py:286-303: determine extraeffect when not caller-set.
         if extraeffect.is_none() {
-            extraeffect = Some(if self.cached_forces_virtualizable(target, cache) {
-                // call.py:288
+            let forces_vable = match shape {
+                CallShape::Direct(target) => self.cached_forces_virtualizable(target, cache),
+                CallShape::Indirect(graphs) => {
+                    self.cached_forces_virtualizable_family(graphs, cache)
+                }
+            };
+            extraeffect = Some(if forces_vable {
                 ExtraEffect::ForcesVirtualOrVirtualizable
             } else if loopinvariant {
-                // call.py:290
+                // call.py:290 — direct branch only.
                 ExtraEffect::LoopInvariant
             } else if elidable {
-                // call.py:292-298
-                match self._canraise(target, cache) {
+                // call.py:292-298 — direct branch only.
+                let canraise = match shape {
+                    CallShape::Direct(target) => self._canraise(target, cache),
+                    CallShape::Indirect(_) => unreachable!("indirect cannot be elidable"),
+                };
+                match canraise {
                     CanRaise::No => ExtraEffect::ElidableCannotRaise,
                     CanRaise::MemoryErrorOnly => ExtraEffect::ElidableOrMemoryError,
                     CanRaise::Yes => ExtraEffect::ElidableCanRaise,
                 }
-            } else if matches!(
-                self._canraise(target, cache),
-                CanRaise::Yes | CanRaise::MemoryErrorOnly
-            ) {
-                // call.py:299-300
-                ExtraEffect::CanRaise
             } else {
-                // call.py:302
-                ExtraEffect::CannotRaise
+                let canraise = match shape {
+                    CallShape::Direct(target) => self._canraise(target, cache),
+                    CallShape::Indirect(graphs) => self.cached_can_raise_family(graphs, cache),
+                };
+                match canraise {
+                    CanRaise::Yes | CanRaise::MemoryErrorOnly => ExtraEffect::CanRaise,
+                    CanRaise::No => ExtraEffect::CannotRaise,
+                }
             });
         }
-
         let extraeffect = extraeffect.unwrap_or(ExtraEffect::CanRaise);
 
-        // RPython call.py:249-251: loopinvariant functions must have no args
+        // RPython call.py:249-251: loopinvariant functions must have no args.
         if loopinvariant && !arg_types.is_empty() {
+            let target = match shape {
+                CallShape::Direct(t) => t,
+                _ => unreachable!(),
+            };
             panic!(
                 "getcalldescr: arguments not supported for loop-invariant \
                  function {target}"
             );
         }
 
-        // RPython call.py:305-318: check that the result is really as expected
+        // RPython call.py:305-318 post-conditions on elidable / loopinvariant.
         if loopinvariant && extraeffect != ExtraEffect::LoopInvariant {
+            let target = match shape {
+                CallShape::Direct(t) => t,
+                _ => unreachable!(),
+            };
             panic!(
                 "getcalldescr: {target} is marked loop-invariant but got \
                  extraeffect={extraeffect:?}"
             );
         }
         if elidable {
+            let target = match shape {
+                CallShape::Direct(t) => t,
+                _ => unreachable!(),
+            };
             if !matches!(
                 extraeffect,
                 ExtraEffect::ElidableCannotRaise
@@ -2882,25 +2809,31 @@ impl CallControl {
                      extraeffect={extraeffect:?}"
                 );
             }
-            // RPython call.py:315-318: elidable function must have a result
+            // call.py:315-318: elidable function must have a result
             if result_type == Type::Void {
                 panic!("getcalldescr: {target} is elidable but has no result");
             }
         }
 
-        // RPython call.py:320-324:
-        // effectinfo = effectinfo_from_writeanalyze(
-        //     self.readwrite_analyzer.analyze(op, self.seen_rw),
-        //     self.cpu, extraeffect, oopspecindex, can_invalidate,
-        //     call_release_gil_target, extradescr,
-        //     self.collect_analyzer.analyze(op, self.seen_gc))
-        let effects = analyze_readwrite(
-            target,
-            &self.function_graphs,
-            self,
-            &mut cache.descr_indices,
-        );
-        let can_collect = self.cached_can_collect(target, cache);
+        // RPython call.py:320-324 effectinfo assembly.
+        let effects = match shape {
+            CallShape::Direct(target) => analyze_readwrite(
+                target,
+                &self.function_graphs,
+                self,
+                &mut cache.descr_indices,
+            ),
+            CallShape::Indirect(graphs) => analyze_readwrite_indirect_family(
+                graphs,
+                &self.function_graphs,
+                self,
+                &mut cache.descr_indices,
+            ),
+        };
+        let can_collect = match shape {
+            CallShape::Direct(target) => self.cached_can_collect(target, cache),
+            CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
+        };
         let effectinfo = effectinfo_from_writeanalyze(
             effects,
             extraeffect,
@@ -2909,21 +2842,23 @@ impl CallControl {
             can_collect,
         );
 
-        // RPython call.py:326-332: assert post-conditions
+        // RPython call.py:326-332 post-conditions on elidable / loopinvariant.
         if elidable || loopinvariant {
             assert!(
                 effectinfo.extraeffect < ExtraEffect::ForcesVirtualOrVirtualizable,
-                "getcalldescr: elidable/loopinvariant {target} has \
-                 effect {:?} >= ForcesVirtualOrVirtualizable",
+                "getcalldescr: elidable/loopinvariant call has effect {:?} \
+                 >= ForcesVirtualOrVirtualizable",
                 effectinfo.extraeffect
             );
         }
 
-        // RPython call.py:334-335: cpu.calldescrof(FUNC, NON_VOID_ARGS, RESULT, effectinfo)
-        // Pyre's CallDescriptor mirrors the calldescr return only — the
-        // matching funcptr is plumbed separately by callers (typically
-        // from the same `target` they passed in here).
-        let _ = target;
+        // RPython call.py:334-335:
+        //   return self.cpu.calldescrof(FUNC, tuple(NON_VOID_ARGS), RESULT,
+        //                               effectinfo)
+        // Pyre's CallDescriptor mirrors just the effectinfo; the matching
+        // funcptr is plumbed separately by callers.  result_type drove the
+        // signature validation above.
+        let _ = result_type;
         CallDescriptor {
             extra_info: effectinfo,
         }
@@ -4500,7 +4435,7 @@ mod tests {
         let target = CallTarget::function_path(["pure_add"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Int,
             OopSpecIndex::None,
@@ -4522,7 +4457,7 @@ mod tests {
         let target = CallTarget::function_path(["failing_func"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Void,
             OopSpecIndex::None,
@@ -4544,7 +4479,7 @@ mod tests {
         let target = CallTarget::function_path(["pure_lookup"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Int,
             OopSpecIndex::None,
@@ -4569,7 +4504,7 @@ mod tests {
         let target = CallTarget::function_path(["elidable_raiser"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Int,
             OopSpecIndex::None,
@@ -4594,7 +4529,7 @@ mod tests {
         let target = CallTarget::function_path(["get_config"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Int,
             OopSpecIndex::None,
@@ -4621,7 +4556,7 @@ mod tests {
         let target = CallTarget::function_path(["forcer"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Void,
             OopSpecIndex::None,
@@ -4645,7 +4580,7 @@ mod tests {
         let target = CallTarget::function_path(["func"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Int,
             OopSpecIndex::None,
@@ -4686,7 +4621,7 @@ mod tests {
         let target = CallTarget::function_path(["caller"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Void,
             OopSpecIndex::None,
@@ -4706,7 +4641,7 @@ mod tests {
         let target = CallTarget::function_path(["unknown_extern"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Void,
             OopSpecIndex::None,
@@ -4752,7 +4687,7 @@ mod tests {
         let target = CallTarget::function_path(["accessor"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Void,
             OopSpecIndex::None,
@@ -4790,7 +4725,7 @@ mod tests {
         let target = CallTarget::function_path(["pure_writer"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Int,
             OopSpecIndex::None,
@@ -4864,7 +4799,7 @@ mod tests {
         let target = CallTarget::function_path(["rw_same_field"]);
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
-            &target,
+            &direct_call_op(target.clone()),
             Vec::new(),
             Type::Void,
             OopSpecIndex::None,
@@ -5333,10 +5268,10 @@ mod tests {
         cc.mark_elidable(CallPath::from_segments(["PureImpl", "bar"]));
         cc.find_all_graphs_for_tests();
 
-        let target = CallTarget::indirect("Foo", "bar");
+        let family = cc.all_impls_for_indirect("Foo", "bar");
         let mut cache = AnalysisCache::default();
         let _ = cc.getcalldescr(
-            &target,
+            &indirect_call_op(Some(family)),
             vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,

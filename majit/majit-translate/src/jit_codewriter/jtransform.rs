@@ -804,7 +804,7 @@ impl<'a> Transformer<'a> {
                             let cc_ref: &crate::call::CallControl =
                                 self.callcontrol.as_deref().unwrap();
                             cc_ref.getcalldescr(
-                                target,
+                                op,
                                 non_void_args,
                                 result_ir_type,
                                 OopSpecIndex::None,
@@ -908,7 +908,7 @@ impl<'a> Transformer<'a> {
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
-                target,
+                op,
                 non_void_args,
                 result_ir_type,
                 oopspecindex,
@@ -1244,7 +1244,7 @@ impl<'a> Transformer<'a> {
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
-                target,
+                op,
                 non_void_args,
                 result_ir_type,
                 oopspecindex,
@@ -1326,7 +1326,7 @@ impl<'a> Transformer<'a> {
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
-                target,
+                op,
                 non_void_args,
                 result_ir_type,
                 OopSpecIndex::None,
@@ -1427,7 +1427,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn rewrite_op_jit_record_known_result(
         &mut self,
-        _op: &SpaceOperation,
+        op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
         _result_ty: &ValueType,
@@ -1455,7 +1455,7 @@ impl<'a> Transformer<'a> {
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
-                target,
+                op,
                 non_void_args,
                 result_ir_type,
                 OopSpecIndex::None,
@@ -1617,8 +1617,8 @@ impl<'a> Transformer<'a> {
             .callcontrol
             .as_mut()
             .expect("rewrite_op_indirect_call requires &mut CallControl");
-        let descriptor = cc_mut.getcalldescr_indirect_family(
-            graphs,
+        let descriptor = cc_mut.getcalldescr(
+            op,
             non_void_args,
             result_ir_type,
             OopSpecIndex::None,
