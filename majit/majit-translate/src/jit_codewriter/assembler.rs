@@ -1409,6 +1409,107 @@ mod tests {
         );
     }
 
+    /// Boundary test (plan Rev 2 Phase E
+    /// `no_legacy_funcptr_from_vtable_after_new_pipeline`): after the
+    /// rtyper-equivalent `lower_indirect_calls` pass + jtransform +
+    /// assemble, no `funcptr_from_vtable/*` opcode key may survive.
+    /// The RPython-orthodox replacement is `vtable_method_ptr/rd>i`
+    /// emitted by `OpKind::VtableMethodPtr`
+    /// (`translator/rtyper/rclass.rs::class_get_method_ptr` ↔
+    /// `rpython/rtyper/rclass.py:371-377` + `rpython/rtyper/rpbc.py:1203-1205`).
+    /// `OpKind::FuncptrFromVtable` has been deleted from the enum
+    /// (Phase D compile-time guarantee); this test adds a runtime
+    /// guarantee at the assembled-opname level.
+    #[test]
+    fn no_legacy_funcptr_from_vtable_after_new_pipeline() {
+        use crate::call::CallControl;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
+        use crate::translate_legacy::annotator::annrpython::annotate;
+        use crate::translate_legacy::rtyper::rtyper::resolve_types;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
+
+        fn build_run_impl(name: &str) -> FunctionGraph {
+            let mut g = FunctionGraph::new(name);
+            g.push_op(
+                g.startblock,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+            g.set_terminator(g.startblock, Terminator::Return(None));
+            g
+        }
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method("run", Some("Handler"), "A", build_run_impl("A::run"));
+        cc.register_trait_method("run", Some("Handler"), "B", build_run_impl("B::run"));
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("outer");
+        let receiver = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "handler".into(),
+                    ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::indirect("Handler", "run"),
+                args: vec![receiver],
+                result_ty: ValueType::Void,
+            },
+            true,
+        );
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+
+        let annotations = annotate(&graph);
+        let mut type_state = resolve_types(&graph, &annotations);
+        lower_indirect_calls(&mut graph, &mut type_state, &cc);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state);
+        let rewritten = transformer.transform(&graph);
+        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
+        let value_kinds =
+            crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_types);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
+        let mut flat = crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types);
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        let legacy_keys: Vec<&String> = asm
+            .insns
+            .keys()
+            .filter(|k| k.starts_with("funcptr_from_vtable"))
+            .collect();
+        assert!(
+            legacy_keys.is_empty(),
+            "legacy funcptr_from_vtable opname survived after the new \
+             lower_indirect_calls + jtransform + assemble pipeline: {:?}",
+            legacy_keys,
+        );
+
+        let has_vtable_method_ptr = asm.insns.keys().any(|k| k.starts_with("vtable_method_ptr"));
+        assert!(
+            has_vtable_method_ptr,
+            "expected vtable_method_ptr opname from OpKind::VtableMethodPtr, \
+             insns keys: {:?}",
+            asm.insns.keys().collect::<Vec<_>>(),
+        );
+    }
+
     /// `OpKind::RecordQuasiImmutField` must lower to a single opcode
     /// keyed `record_quasiimmut_field/rdd`, with the field+mutate
     /// FieldDescriptor pair pushed as two `BhDescr::Field` entries — see
