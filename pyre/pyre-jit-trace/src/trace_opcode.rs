@@ -212,7 +212,6 @@ impl MIFrame {
         // below. Source for the live indices is
         // `PyJitCodeMetadata.liveness` (see Step A docstring on the main
         // path below for the rationale).
-        let nlocals_pre = self.sym().nlocals;
         let jitcode_ptr_pre = self.sym().jitcode;
         let live_local_idxs: Vec<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
@@ -222,23 +221,18 @@ impl MIFrame {
             if jc.payload.metadata.pc_map.is_empty() {
                 Vec::new()
             } else if let Some(live_info) = jc.payload.metadata.liveness.get(live_pc) {
-                // RPython `regalloc.py:54-60` analog at trace time:
-                // every register the post-regalloc layout flagged as
-                // alive AND falling in `0..nlocals` corresponds to a
-                // Python local at the matching index (via
-                // `enforce_input_args` in `pyre-jit/src/jit/regalloc.rs`).
-                let mut idxs: Vec<usize> = Vec::new();
-                for &reg_idx in live_info
+                // RPython `pyjitpl.py:218-225` analog: every live
+                // register index in the abstract register file
+                // (locals + stack tail) must resolve to an OpRef by
+                // encoder time. `registers_r` unifies both (Stage 3.4
+                // Phase C), so the prepass iterates the full live set
+                // without an `idx < nlocals` decode.
+                live_info
                     .live_i_regs
                     .iter()
                     .chain(live_info.live_r_regs.iter())
-                {
-                    let idx = reg_idx as usize;
-                    if idx < nlocals_pre {
-                        idxs.push(idx);
-                    }
-                }
-                idxs
+                    .map(|&reg_idx| reg_idx as usize)
+                    .collect::<Vec<usize>>()
             } else {
                 Vec::new()
             }
