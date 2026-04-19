@@ -8,26 +8,9 @@ use std::cmp::max;
 use majit_backend::JitCellToken;
 use majit_ir::OpCode;
 
-use super::{
-    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_CALL_ASSEMBLER_FLOAT,
-    BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID, BC_CALL_FLOAT,
-    BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT, BC_CALL_LOOPINVARIANT_REF,
-    BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT, BC_CALL_MAY_FORCE_INT,
-    BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT, BC_CALL_PURE_INT,
-    BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT, BC_CALL_RELEASE_GIL_INT,
-    BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION, BC_COND_CALL_VALUE_INT,
-    BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F,
-    BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I,
-    BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE,
-    BC_JIT_MERGE_POINT, BC_JUMP, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I,
-    BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY,
-    BC_LOOP_HEADER, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
-    BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F,
-    BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE, BC_REF_RETURN, BC_RERAISE, BC_RESIDUAL_CALL_VOID,
-    BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F,
-    BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
-    BC_STORE_STATE_VARRAY, JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode,
-};
+use crate::jitcode;
+
+use super::{JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode};
 
 #[derive(Default)]
 pub struct JitCodeBuilder {
@@ -163,7 +146,7 @@ impl JitCodeBuilder {
 
     pub fn load_const_i(&mut self, dst: u16, const_idx: u16) {
         self.touch_reg(dst);
-        self.push_u8(BC_LOAD_CONST_I);
+        self.push_u8(jitcode::BC_LOAD_CONST_I);
         self.push_u16(dst);
         self.push_u16(const_idx);
     }
@@ -173,7 +156,7 @@ impl JitCodeBuilder {
     /// Load a scalar state field value into an int register.
     pub fn load_state_field(&mut self, field_idx: u16, dest: u16) {
         self.touch_reg(dest);
-        self.push_u8(BC_LOAD_STATE_FIELD);
+        self.push_u8(jitcode::BC_LOAD_STATE_FIELD);
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
@@ -181,7 +164,7 @@ impl JitCodeBuilder {
     /// Store an int register value into a scalar state field.
     pub fn store_state_field(&mut self, field_idx: u16, src: u16) {
         self.touch_reg(src);
-        self.push_u8(BC_STORE_STATE_FIELD);
+        self.push_u8(jitcode::BC_STORE_STATE_FIELD);
         self.push_u16(field_idx);
         self.push_u16(src);
     }
@@ -191,7 +174,7 @@ impl JitCodeBuilder {
     pub fn load_state_array(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(dest);
-        self.push_u8(BC_LOAD_STATE_ARRAY);
+        self.push_u8(jitcode::BC_LOAD_STATE_ARRAY);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -202,7 +185,7 @@ impl JitCodeBuilder {
     pub fn store_state_array(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(src);
-        self.push_u8(BC_STORE_STATE_ARRAY);
+        self.push_u8(jitcode::BC_STORE_STATE_ARRAY);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -212,42 +195,42 @@ impl JitCodeBuilder {
 
     pub fn vable_getfield_int(&mut self, dest: u16, field_idx: u16) {
         self.touch_reg(dest);
-        self.push_u8(BC_GETFIELD_VABLE_I);
+        self.push_u8(jitcode::BC_GETFIELD_VABLE_I);
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_getfield_ref(&mut self, dest: u16, field_idx: u16) {
         self.touch_ref_reg(dest);
-        self.push_u8(BC_GETFIELD_VABLE_R);
+        self.push_u8(jitcode::BC_GETFIELD_VABLE_R);
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_getfield_float(&mut self, dest: u16, field_idx: u16) {
         self.touch_float_reg(dest);
-        self.push_u8(BC_GETFIELD_VABLE_F);
+        self.push_u8(jitcode::BC_GETFIELD_VABLE_F);
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_setfield_int(&mut self, field_idx: u16, src: u16) {
         self.touch_reg(src);
-        self.push_u8(BC_SETFIELD_VABLE_I);
+        self.push_u8(jitcode::BC_SETFIELD_VABLE_I);
         self.push_u16(field_idx);
         self.push_u16(src);
     }
 
     pub fn vable_setfield_ref(&mut self, field_idx: u16, src: u16) {
         self.touch_ref_reg(src);
-        self.push_u8(BC_SETFIELD_VABLE_R);
+        self.push_u8(jitcode::BC_SETFIELD_VABLE_R);
         self.push_u16(field_idx);
         self.push_u16(src);
     }
 
     pub fn vable_setfield_float(&mut self, field_idx: u16, src: u16) {
         self.touch_float_reg(src);
-        self.push_u8(BC_SETFIELD_VABLE_F);
+        self.push_u8(jitcode::BC_SETFIELD_VABLE_F);
         self.push_u16(field_idx);
         self.push_u16(src);
     }
@@ -255,7 +238,7 @@ impl JitCodeBuilder {
     pub fn vable_getarrayitem_int(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
         self.touch_reg(dest);
         self.touch_reg(index_reg);
-        self.push_u8(BC_GETARRAYITEM_VABLE_I);
+        self.push_u8(jitcode::BC_GETARRAYITEM_VABLE_I);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -264,7 +247,7 @@ impl JitCodeBuilder {
     pub fn vable_getarrayitem_ref(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
         self.touch_ref_reg(dest);
         self.touch_reg(index_reg);
-        self.push_u8(BC_GETARRAYITEM_VABLE_R);
+        self.push_u8(jitcode::BC_GETARRAYITEM_VABLE_R);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -273,7 +256,7 @@ impl JitCodeBuilder {
     pub fn vable_getarrayitem_float(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
         self.touch_float_reg(dest);
         self.touch_reg(index_reg);
-        self.push_u8(BC_GETARRAYITEM_VABLE_F);
+        self.push_u8(jitcode::BC_GETARRAYITEM_VABLE_F);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -282,7 +265,7 @@ impl JitCodeBuilder {
     pub fn vable_setarrayitem_int(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(src);
-        self.push_u8(BC_SETARRAYITEM_VABLE_I);
+        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_I);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -291,7 +274,7 @@ impl JitCodeBuilder {
     pub fn vable_setarrayitem_ref(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_ref_reg(src);
-        self.push_u8(BC_SETARRAYITEM_VABLE_R);
+        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_R);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -300,7 +283,7 @@ impl JitCodeBuilder {
     pub fn vable_setarrayitem_float(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_float_reg(src);
-        self.push_u8(BC_SETARRAYITEM_VABLE_F);
+        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_F);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -308,13 +291,13 @@ impl JitCodeBuilder {
 
     pub fn vable_arraylen(&mut self, dest: u16, array_idx: u16) {
         self.touch_reg(dest);
-        self.push_u8(BC_ARRAYLEN_VABLE);
+        self.push_u8(jitcode::BC_ARRAYLEN_VABLE);
         self.push_u16(array_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_force(&mut self) {
-        self.push_u8(BC_HINT_FORCE_VIRTUALIZABLE);
+        self.push_u8(jitcode::BC_HINT_FORCE_VIRTUALIZABLE);
     }
 
     /// Load from a virtualizable state array: emit GETARRAYITEM_RAW_I.
@@ -322,7 +305,7 @@ impl JitCodeBuilder {
     pub fn load_state_varray(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(dest);
-        self.push_u8(BC_LOAD_STATE_VARRAY);
+        self.push_u8(jitcode::BC_LOAD_STATE_VARRAY);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -333,7 +316,7 @@ impl JitCodeBuilder {
     pub fn store_state_varray(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(src);
-        self.push_u8(BC_STORE_STATE_VARRAY);
+        self.push_u8(jitcode::BC_STORE_STATE_VARRAY);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -344,7 +327,7 @@ impl JitCodeBuilder {
         self.touch_reg(dst);
         self.touch_reg(lhs);
         self.touch_reg(rhs);
-        self.push_u8(BC_RECORD_BINOP_I);
+        self.push_u8(jitcode::BC_RECORD_BINOP_I);
         self.push_u16(dst);
         self.push_u16(opcode_idx);
         self.push_u16(lhs);
@@ -355,7 +338,7 @@ impl JitCodeBuilder {
         let opcode_idx = self.intern_opcode(opcode);
         self.touch_reg(dst);
         self.touch_reg(src);
-        self.push_u8(BC_RECORD_UNARY_I);
+        self.push_u8(jitcode::BC_RECORD_UNARY_I);
         self.push_u16(dst);
         self.push_u16(opcode_idx);
         self.push_u16(src);
@@ -377,13 +360,146 @@ impl JitCodeBuilder {
 
     pub fn branch_reg_zero(&mut self, reg: u16, label: u16) {
         self.touch_reg(reg);
-        self.push_u8(BC_BRANCH_REG_ZERO);
+        self.push_u8(jitcode::BC_BRANCH_REG_ZERO);
         self.push_u16(reg);
         self.push_label_ref(label);
     }
 
+    // jtransform.py:196 `optimize_goto_if_not` folds
+    // `v = int_lt(a, b); exitswitch = v` into a single jitcode op
+    // emitted by flatten.py:247-250 as `goto_if_not_int_lt/iiL`.
+    // blackhole.py:864-911 semantics: take branch iff comparison is
+    // false, i.e. `int_lt(a, b) == False` → `position = target`.
+    pub fn goto_if_not_int_lt(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_reg(a);
+        self.touch_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_LT);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_int_le(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_reg(a);
+        self.touch_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_LE);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_int_eq(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_reg(a);
+        self.touch_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_EQ);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_int_ne(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_reg(a);
+        self.touch_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_NE);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_int_gt(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_reg(a);
+        self.touch_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_GT);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_int_ge(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_reg(a);
+        self.touch_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_GE);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    // blackhole.py:752-798 float variants — same semantics, float regs.
+    pub fn goto_if_not_float_lt(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_float_reg(a);
+        self.touch_float_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_LT);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_float_le(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_float_reg(a);
+        self.touch_float_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_LE);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_float_eq(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_float_reg(a);
+        self.touch_float_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_EQ);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_float_ne(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_float_reg(a);
+        self.touch_float_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_NE);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_float_gt(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_float_reg(a);
+        self.touch_float_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_GT);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_float_ge(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_float_reg(a);
+        self.touch_float_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_GE);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    // blackhole.py:922-936 ptr variants — ref regs.
+    pub fn goto_if_not_ptr_eq(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_ref_reg(a);
+        self.touch_ref_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_PTR_EQ);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_ptr_ne(&mut self, a: u16, b: u16, label: u16) {
+        self.touch_ref_reg(a);
+        self.touch_ref_reg(b);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_PTR_NE);
+        self.push_u16(a);
+        self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
     pub fn jump(&mut self, label: u16) {
-        self.push_u8(BC_JUMP);
+        self.push_u8(jitcode::BC_JUMP);
         self.push_label_ref(label);
     }
 
@@ -392,7 +508,7 @@ impl JitCodeBuilder {
     /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
     /// opimpl_loop_header records the jitdriver index for the trace.
     pub fn loop_header(&mut self, jdindex: u8) {
-        self.push_u8(BC_LOOP_HEADER);
+        self.push_u8(jitcode::BC_LOOP_HEADER);
         self.push_u8(jdindex);
     }
 
@@ -400,7 +516,7 @@ impl JitCodeBuilder {
     /// the shared all_liveness byte string. Returns the operand offset so the
     /// caller can patch it after computing liveness.
     pub fn live_placeholder(&mut self) -> usize {
-        self.push_u8(BC_LIVE);
+        self.push_u8(jitcode::BC_LIVE);
         let patch_offset = self.code.len();
         self.push_u16(0);
         patch_offset
@@ -414,14 +530,14 @@ impl JitCodeBuilder {
 
     /// RPython blackhole.py:969 `catch_exception/L`.
     pub fn catch_exception(&mut self, label: u16) {
-        self.push_u8(BC_CATCH_EXCEPTION);
+        self.push_u8(jitcode::BC_CATCH_EXCEPTION);
         self.push_label_ref(label);
     }
 
     /// RPython blackhole.py:993 `last_exc_value/>r`.
     pub fn last_exc_value(&mut self, dst: u16) {
         self.touch_ref_reg(dst);
-        self.push_u8(BC_LAST_EXC_VALUE);
+        self.push_u8(jitcode::BC_LAST_EXC_VALUE);
         self.push_u16(dst);
     }
 
@@ -439,7 +555,7 @@ impl JitCodeBuilder {
     /// `greens_r` = [pycode_reg] (constant slot)
     /// `reds_r`   = [frame_reg, ec_reg] (dedicated portal registers)
     pub fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
-        self.push_u8(BC_JIT_MERGE_POINT);
+        self.push_u8(jitcode::BC_JIT_MERGE_POINT);
         self.push_u8(0); // jdindex
         // gi: green int registers (next_instr, is_being_profiled)
         self.push_u8(greens_i.len() as u8);
@@ -465,30 +581,30 @@ impl JitCodeBuilder {
     }
 
     pub fn abort(&mut self) {
-        self.push_u8(BC_ABORT);
+        self.push_u8(jitcode::BC_ABORT);
         self.has_abort = true;
     }
 
     /// RPython bhimpl_ref_return: emit return-ref opcode.
     /// The return value is in register `src`.
     pub fn ref_return(&mut self, src: u16) {
-        self.push_u8(BC_REF_RETURN);
+        self.push_u8(jitcode::BC_REF_RETURN);
         self.push_u16(src);
     }
 
     pub fn abort_permanent(&mut self) {
-        self.push_u8(BC_ABORT_PERMANENT);
+        self.push_u8(jitcode::BC_ABORT_PERMANENT);
     }
 
     /// blackhole.py bhimpl_raise(excvalue): raise exception from register.
     pub fn emit_raise(&mut self, src: u16) {
-        self.push_u8(BC_RAISE);
+        self.push_u8(jitcode::BC_RAISE);
         self.push_u16(src);
     }
 
     /// blackhole.py bhimpl_reraise(): re-raise exception_last_value.
     pub fn emit_reraise(&mut self) {
-        self.push_u8(BC_RERAISE);
+        self.push_u8(jitcode::BC_RERAISE);
     }
 
     /// pyjitpl.py opimpl_int_guard_value: promote int register to constant.
@@ -496,19 +612,19 @@ impl JitCodeBuilder {
     /// Blackhole: no-op (value passes through).
     /// Tracing: emits GUARD_VALUE to specialize the trace on this value.
     pub fn int_guard_value(&mut self, src: u16) {
-        self.push_u8(BC_INT_GUARD_VALUE);
+        self.push_u8(jitcode::BC_INT_GUARD_VALUE);
         self.push_u16(src);
     }
 
     /// pyjitpl.py opimpl_ref_guard_value: promote ref register to constant.
     pub fn ref_guard_value(&mut self, src: u16) {
-        self.push_u8(BC_REF_GUARD_VALUE);
+        self.push_u8(jitcode::BC_REF_GUARD_VALUE);
         self.push_u16(src);
     }
 
     /// pyjitpl.py opimpl_float_guard_value: promote float register to constant.
     pub fn float_guard_value(&mut self, src: u16) {
-        self.push_u8(BC_FLOAT_GUARD_VALUE);
+        self.push_u8(jitcode::BC_FLOAT_GUARD_VALUE);
         self.push_u16(src);
     }
 
@@ -603,7 +719,7 @@ impl JitCodeBuilder {
         if let Some((_, caller_dst)) = return_f {
             self.touch_float_reg(caller_dst);
         }
-        self.push_u8(BC_INLINE_CALL);
+        self.push_u8(jitcode::BC_INLINE_CALL);
         self.push_u16(sub_jitcode_idx);
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
@@ -639,7 +755,7 @@ impl JitCodeBuilder {
     }
 
     pub fn residual_call_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(BC_RESIDUAL_CALL_VOID, fn_ptr_idx, arg_regs);
+        self.call_void_like(jitcode::BC_RESIDUAL_CALL_VOID, fn_ptr_idx, arg_regs);
     }
 
     pub fn call_may_force_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
@@ -648,7 +764,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_may_force_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(BC_CALL_MAY_FORCE_VOID, fn_ptr_idx, arg_regs);
+        self.call_void_like(jitcode::BC_CALL_MAY_FORCE_VOID, fn_ptr_idx, arg_regs);
     }
 
     pub fn call_release_gil_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
@@ -657,7 +773,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_release_gil_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(BC_CALL_RELEASE_GIL_VOID, fn_ptr_idx, arg_regs);
+        self.call_void_like(jitcode::BC_CALL_RELEASE_GIL_VOID, fn_ptr_idx, arg_regs);
     }
 
     pub fn call_loopinvariant_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
@@ -666,7 +782,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_loopinvariant_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(BC_CALL_LOOPINVARIANT_VOID, fn_ptr_idx, arg_regs);
+        self.call_void_like(jitcode::BC_CALL_LOOPINVARIANT_VOID, fn_ptr_idx, arg_regs);
     }
 
     pub fn call_assembler_void_args(&mut self, target_idx: u16, arg_regs: &[u16]) {
@@ -675,7 +791,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_assembler_void_typed_args(&mut self, target_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_assembler_void_like(BC_CALL_ASSEMBLER_VOID, target_idx, arg_regs);
+        self.call_assembler_void_like(jitcode::BC_CALL_ASSEMBLER_VOID, target_idx, arg_regs);
     }
 
     pub fn call_may_force_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -684,7 +800,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_may_force_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_int_like(BC_CALL_MAY_FORCE_INT, fn_ptr_idx, arg_regs, dst);
+        self.call_int_like(jitcode::BC_CALL_MAY_FORCE_INT, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_release_gil_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -698,7 +814,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_int_like(BC_CALL_RELEASE_GIL_INT, fn_ptr_idx, arg_regs, dst);
+        self.call_int_like(jitcode::BC_CALL_RELEASE_GIL_INT, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_loopinvariant_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -712,7 +828,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_int_like(BC_CALL_LOOPINVARIANT_INT, fn_ptr_idx, arg_regs, dst);
+        self.call_int_like(
+            jitcode::BC_CALL_LOOPINVARIANT_INT,
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+        );
     }
 
     pub fn call_assembler_int(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -721,7 +842,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_assembler_int_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_assembler_int_like(BC_CALL_ASSEMBLER_INT, target_idx, arg_regs, dst);
+        self.call_assembler_int_like(jitcode::BC_CALL_ASSEMBLER_INT, target_idx, arg_regs, dst);
     }
 
     pub fn call_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -735,11 +856,11 @@ impl JitCodeBuilder {
     }
 
     pub fn call_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_int_like(BC_CALL_INT, fn_ptr_idx, arg_regs, dst);
+        self.call_int_like(jitcode::BC_CALL_INT, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_pure_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_int_like(BC_CALL_PURE_INT, fn_ptr_idx, arg_regs, dst);
+        self.call_int_like(jitcode::BC_CALL_PURE_INT, fn_ptr_idx, arg_regs, dst);
     }
 
     // ── conditional_call / record_known_result (jtransform.py:1665-1688, 292-313) ──
@@ -754,7 +875,7 @@ impl JitCodeBuilder {
         typed_args: &[JitCallArg],
     ) {
         self.touch_reg(cond_reg);
-        self.call_cond_like(BC_COND_CALL_VOID, fn_ptr_idx, cond_reg, typed_args);
+        self.call_cond_like(jitcode::BC_COND_CALL_VOID, fn_ptr_idx, cond_reg, typed_args);
     }
 
     /// RPython: `conditional_call_value_ir_i(value, funcptr, calldescr, [i], [r])`
@@ -768,7 +889,7 @@ impl JitCodeBuilder {
         self.touch_reg(value_reg);
         self.touch_reg(dst);
         self.call_cond_value_like(
-            BC_COND_CALL_VALUE_INT,
+            jitcode::BC_COND_CALL_VALUE_INT,
             fn_ptr_idx,
             value_reg,
             typed_args,
@@ -787,7 +908,7 @@ impl JitCodeBuilder {
         self.touch_reg(value_reg);
         self.touch_reg(dst);
         self.call_cond_value_like(
-            BC_COND_CALL_VALUE_REF,
+            jitcode::BC_COND_CALL_VALUE_REF,
             fn_ptr_idx,
             value_reg,
             typed_args,
@@ -804,7 +925,7 @@ impl JitCodeBuilder {
     ) {
         self.touch_reg(result_reg);
         self.call_cond_like(
-            BC_RECORD_KNOWN_RESULT_INT,
+            jitcode::BC_RECORD_KNOWN_RESULT_INT,
             fn_ptr_idx,
             result_reg,
             typed_args,
@@ -820,7 +941,7 @@ impl JitCodeBuilder {
     ) {
         self.touch_reg(result_reg);
         self.call_cond_like(
-            BC_RECORD_KNOWN_RESULT_REF,
+            jitcode::BC_RECORD_KNOWN_RESULT_REF,
             fn_ptr_idx,
             result_reg,
             typed_args,
@@ -864,7 +985,7 @@ impl JitCodeBuilder {
     pub fn move_i(&mut self, dst: u16, src: u16) {
         self.touch_reg(dst);
         self.touch_reg(src);
-        self.push_u8(BC_MOVE_I);
+        self.push_u8(jitcode::BC_MOVE_I);
         self.push_u16(dst);
         self.push_u16(src);
     }
@@ -890,7 +1011,7 @@ impl JitCodeBuilder {
 
     pub fn load_const_r(&mut self, dst: u16, const_idx: u16) {
         self.touch_ref_reg(dst);
-        self.push_u8(BC_LOAD_CONST_R);
+        self.push_u8(jitcode::BC_LOAD_CONST_R);
         self.push_u16(dst);
         self.push_u16(const_idx);
     }
@@ -898,7 +1019,7 @@ impl JitCodeBuilder {
     pub fn move_r(&mut self, dst: u16, src: u16) {
         self.touch_ref_reg(dst);
         self.touch_ref_reg(src);
-        self.push_u8(BC_MOVE_R);
+        self.push_u8(jitcode::BC_MOVE_R);
         self.push_u16(dst);
         self.push_u16(src);
     }
@@ -914,11 +1035,11 @@ impl JitCodeBuilder {
     }
 
     pub fn call_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_ref_like(BC_CALL_REF, fn_ptr_idx, arg_regs, dst);
+        self.call_ref_like(jitcode::BC_CALL_REF, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_pure_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_ref_like(BC_CALL_PURE_REF, fn_ptr_idx, arg_regs, dst);
+        self.call_ref_like(jitcode::BC_CALL_PURE_REF, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_may_force_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -927,7 +1048,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_may_force_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_ref_like(BC_CALL_MAY_FORCE_REF, fn_ptr_idx, arg_regs, dst);
+        self.call_ref_like(jitcode::BC_CALL_MAY_FORCE_REF, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_release_gil_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -941,7 +1062,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_ref_like(BC_CALL_RELEASE_GIL_REF, fn_ptr_idx, arg_regs, dst);
+        self.call_ref_like(jitcode::BC_CALL_RELEASE_GIL_REF, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_loopinvariant_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -955,7 +1076,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_ref_like(BC_CALL_LOOPINVARIANT_REF, fn_ptr_idx, arg_regs, dst);
+        self.call_ref_like(
+            jitcode::BC_CALL_LOOPINVARIANT_REF,
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+        );
     }
 
     pub fn call_assembler_ref(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -964,7 +1090,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_assembler_ref_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_assembler_ref_like(BC_CALL_ASSEMBLER_REF, target_idx, arg_regs, dst);
+        self.call_assembler_ref_like(jitcode::BC_CALL_ASSEMBLER_REF, target_idx, arg_regs, dst);
     }
 
     // ── Float-typed builder methods ───────────────────────────
@@ -976,7 +1102,7 @@ impl JitCodeBuilder {
 
     pub fn load_const_f(&mut self, dst: u16, const_idx: u16) {
         self.touch_float_reg(dst);
-        self.push_u8(BC_LOAD_CONST_F);
+        self.push_u8(jitcode::BC_LOAD_CONST_F);
         self.push_u16(dst);
         self.push_u16(const_idx);
     }
@@ -984,7 +1110,7 @@ impl JitCodeBuilder {
     pub fn move_f(&mut self, dst: u16, src: u16) {
         self.touch_float_reg(dst);
         self.touch_float_reg(src);
-        self.push_u8(BC_MOVE_F);
+        self.push_u8(jitcode::BC_MOVE_F);
         self.push_u16(dst);
         self.push_u16(src);
     }
@@ -1000,11 +1126,11 @@ impl JitCodeBuilder {
     }
 
     pub fn call_float_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_float_like(BC_CALL_FLOAT, fn_ptr_idx, arg_regs, dst);
+        self.call_float_like(jitcode::BC_CALL_FLOAT, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_pure_float_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_float_like(BC_CALL_PURE_FLOAT, fn_ptr_idx, arg_regs, dst);
+        self.call_float_like(jitcode::BC_CALL_PURE_FLOAT, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_may_force_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -1018,7 +1144,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_float_like(BC_CALL_MAY_FORCE_FLOAT, fn_ptr_idx, arg_regs, dst);
+        self.call_float_like(jitcode::BC_CALL_MAY_FORCE_FLOAT, fn_ptr_idx, arg_regs, dst);
     }
 
     pub fn call_release_gil_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -1032,7 +1158,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_float_like(BC_CALL_RELEASE_GIL_FLOAT, fn_ptr_idx, arg_regs, dst);
+        self.call_float_like(
+            jitcode::BC_CALL_RELEASE_GIL_FLOAT,
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+        );
     }
 
     pub fn call_loopinvariant_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -1046,7 +1177,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_float_like(BC_CALL_LOOPINVARIANT_FLOAT, fn_ptr_idx, arg_regs, dst);
+        self.call_float_like(
+            jitcode::BC_CALL_LOOPINVARIANT_FLOAT,
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+        );
     }
 
     pub fn call_assembler_float(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -1060,7 +1196,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_assembler_float_like(BC_CALL_ASSEMBLER_FLOAT, target_idx, arg_regs, dst);
+        self.call_assembler_float_like(jitcode::BC_CALL_ASSEMBLER_FLOAT, target_idx, arg_regs, dst);
     }
 
     pub fn record_binop_f(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
@@ -1068,7 +1204,7 @@ impl JitCodeBuilder {
         self.touch_float_reg(dst);
         self.touch_float_reg(lhs);
         self.touch_float_reg(rhs);
-        self.push_u8(BC_RECORD_BINOP_F);
+        self.push_u8(jitcode::BC_RECORD_BINOP_F);
         self.push_u16(dst);
         self.push_u16(opcode_idx);
         self.push_u16(lhs);
@@ -1079,7 +1215,7 @@ impl JitCodeBuilder {
         let opcode_idx = self.intern_opcode(opcode);
         self.touch_float_reg(dst);
         self.touch_float_reg(src);
-        self.push_u8(BC_RECORD_UNARY_F);
+        self.push_u8(jitcode::BC_RECORD_UNARY_F);
         self.push_u16(dst);
         self.push_u16(opcode_idx);
         self.push_u16(src);

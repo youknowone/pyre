@@ -92,6 +92,32 @@ pub(crate) const BC_CATCH_EXCEPTION: u8 = 89;
 pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
 /// blackhole.py bhimpl_rvmprof_code: rvmprof enter/leave marker.
 pub(crate) const BC_RVMPROF_CODE: u8 = 91;
+
+// RPython jtransform.py:196 `optimize_goto_if_not` fuses
+// `v = int_lt(x, y); exitswitch = v` into
+// `exitswitch = ('int_lt', x, y)`, emitted by flatten.py:247-250 as
+// the jitcode op `goto_if_not_int_lt`. blackhole.py:864-944 consumes
+// the fused form with dedicated bhimpls.
+//
+// majit currently reserves one `BC_GOTO_IF_NOT_*` per RPython opname
+// variant; the 'c' short-const argcode (assembler.py:312 `USE_C_FORM`)
+// is not yet supported in the pyre JitCodeBuilder so only the canonical
+// `iiL` / `ffL` / `rrL` forms get a BC_* allocation here.
+pub(crate) const BC_GOTO_IF_NOT_INT_LT: u8 = 92;
+pub(crate) const BC_GOTO_IF_NOT_INT_LE: u8 = 93;
+pub(crate) const BC_GOTO_IF_NOT_INT_EQ: u8 = 94;
+pub(crate) const BC_GOTO_IF_NOT_INT_NE: u8 = 95;
+pub(crate) const BC_GOTO_IF_NOT_INT_GT: u8 = 96;
+pub(crate) const BC_GOTO_IF_NOT_INT_GE: u8 = 97;
+pub(crate) const BC_GOTO_IF_NOT_FLOAT_LT: u8 = 98;
+pub(crate) const BC_GOTO_IF_NOT_FLOAT_LE: u8 = 99;
+pub(crate) const BC_GOTO_IF_NOT_FLOAT_EQ: u8 = 100;
+pub(crate) const BC_GOTO_IF_NOT_FLOAT_NE: u8 = 101;
+pub(crate) const BC_GOTO_IF_NOT_FLOAT_GT: u8 = 102;
+pub(crate) const BC_GOTO_IF_NOT_FLOAT_GE: u8 = 103;
+pub(crate) const BC_GOTO_IF_NOT_PTR_EQ: u8 = 104;
+pub(crate) const BC_GOTO_IF_NOT_PTR_NE: u8 = 105;
+
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// Fixed majit blackhole opcode-name table.
@@ -132,6 +158,23 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("reraise/", BC_RERAISE);
     m.insert("last_exc_value/", BC_LAST_EXC_VALUE);
     m.insert("jit_merge_point/", BC_JIT_MERGE_POINT);
+
+    // jtransform.py:196 / flatten.py:247 — fused `goto_if_not_<op>_<type>`.
+    // Argcodes follow assembler.py:162-196: two registers + label.
+    m.insert("goto_if_not_int_lt/iiL", BC_GOTO_IF_NOT_INT_LT);
+    m.insert("goto_if_not_int_le/iiL", BC_GOTO_IF_NOT_INT_LE);
+    m.insert("goto_if_not_int_eq/iiL", BC_GOTO_IF_NOT_INT_EQ);
+    m.insert("goto_if_not_int_ne/iiL", BC_GOTO_IF_NOT_INT_NE);
+    m.insert("goto_if_not_int_gt/iiL", BC_GOTO_IF_NOT_INT_GT);
+    m.insert("goto_if_not_int_ge/iiL", BC_GOTO_IF_NOT_INT_GE);
+    m.insert("goto_if_not_float_lt/ffL", BC_GOTO_IF_NOT_FLOAT_LT);
+    m.insert("goto_if_not_float_le/ffL", BC_GOTO_IF_NOT_FLOAT_LE);
+    m.insert("goto_if_not_float_eq/ffL", BC_GOTO_IF_NOT_FLOAT_EQ);
+    m.insert("goto_if_not_float_ne/ffL", BC_GOTO_IF_NOT_FLOAT_NE);
+    m.insert("goto_if_not_float_gt/ffL", BC_GOTO_IF_NOT_FLOAT_GT);
+    m.insert("goto_if_not_float_ge/ffL", BC_GOTO_IF_NOT_FLOAT_GE);
+    m.insert("goto_if_not_ptr_eq/rrL", BC_GOTO_IF_NOT_PTR_EQ);
+    m.insert("goto_if_not_ptr_ne/rrL", BC_GOTO_IF_NOT_PTR_NE);
 
     m
 }

@@ -794,24 +794,7 @@ fn blackhole_with_recovery_layout(
 // (unlike trace IR which only has the traced path).
 // ============================================================================
 
-use crate::jitcode::{
-    self, BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO,
-    BC_CALL_ASSEMBLER_FLOAT, BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID,
-    BC_CALL_FLOAT, BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT,
-    BC_CALL_LOOPINVARIANT_REF, BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT,
-    BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT,
-    BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
-    BC_CALL_RELEASE_GIL_INT, BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_CATCH_EXCEPTION,
-    BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F,
-    BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL,
-    BC_JIT_MERGE_POINT, BC_JUMP, BC_LAST_EXC_VALUE, BC_LIVE, BC_LOAD_CONST_F, BC_LOAD_CONST_I,
-    BC_LOAD_CONST_R, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY,
-    BC_LOOP_HEADER, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_RAISE, BC_RECORD_BINOP_F,
-    BC_RECORD_BINOP_I, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_RETURN, BC_RERAISE,
-    BC_RESIDUAL_CALL_VOID, BC_RVMPROF_CODE, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
-    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, JitArgKind, JitCode,
-};
+use crate::jitcode::{self, JitArgKind, JitCode};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
 use crate::pyjitpl::{
     call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
@@ -855,7 +838,7 @@ pub use majit_codewriter::jitcode::{BhCallDescr, BhDescr};
 /// Per-jitdriver static data visible to the blackhole interpreter.
 ///
 /// Mirrors the subset of `metainterp_sd.jitdrivers_sd[jdindex]` that
-/// `bhimpl_recursive_call_*` and the BC_RECURSIVE_CALL dispatch consult
+/// `bhimpl_recursive_call_*` and the jitcode::BC_RECURSIVE_CALL dispatch consult
 /// (blackhole.py:1080-1099):
 /// - `result_type` selects which `bhimpl_recursive_call_{v,i,r,f}`
 ///   method handles the call (blackhole.py:1080-1093).
@@ -956,7 +939,7 @@ pub struct BlackholeInterpreter {
     pub nextblackholeinterp: Option<Box<BlackholeInterpreter>>,
     /// Return type of this frame.
     pub return_type: BhReturnType,
-    /// True when run() hit BC_ABORT (unsupported bytecode). Callers
+    /// True when run() hit jitcode::BC_ABORT (unsupported bytecode). Callers
     /// must not treat abort as DoneWithThisFrame — side effects from
     /// partial execution have corrupted state.
     pub aborted: bool,
@@ -975,7 +958,7 @@ pub struct BlackholeInterpreter {
     /// Read by CheckExcMatch and other exception opcodes in the handler.
     pub exception_last_value: i64,
     /// blackhole.py bhimpl_getfield_vable_*: pointer to the virtualizable
-    /// object (e.g. PyFrame). Used by BC_GETFIELD_VABLE_* bytecodes.
+    /// object (e.g. PyFrame). Used by jitcode::BC_GETFIELD_VABLE_* bytecodes.
     /// Set during blackhole setup from the guard failure's virtualizable ptr.
     pub virtualizable_ptr: i64,
     /// Pointer to the VirtualizableInfo describing field offsets.
@@ -984,7 +967,7 @@ pub struct BlackholeInterpreter {
     /// blackhole.py:1095-1099 / warmspot.py:1010-1013 — per-jitdriver
     /// static data indexed by `jdindex`.  Each entry carries the
     /// portal_runner_ptr, mainjitcode.calldescr and result_type that
-    /// `get_portal_runner` and the BC_RECURSIVE_CALL dispatch consult
+    /// `get_portal_runner` and the jitcode::BC_RECURSIVE_CALL dispatch consult
     /// (blackhole.py:1080-1093 selects `bhimpl_recursive_call_{v,i,r,f}`
     /// from `sd.jitdrivers_sd[jdindex].result_type`).
     ///
@@ -1632,60 +1615,60 @@ impl BlackholeInterpreter {
     /// RPython: bytecode dispatch in `dispatch_loop()`, each `bhimpl_*` method
     fn dispatch_one(&mut self, opcode: u8) -> Result<(), DispatchError> {
         match opcode {
-            BC_LIVE => {
+            jitcode::BC_LIVE => {
                 // blackhole.py:1605 bhimpl_live(pc): return pc + OFFSET_SIZE.
                 self.position += majit_codewriter::liveness::OFFSET_SIZE;
             }
-            BC_CATCH_EXCEPTION => {
+            jitcode::BC_CATCH_EXCEPTION => {
                 // blackhole.py:969 bhimpl_catch_exception(target): no-op in
                 // normal execution; skip the 2-byte label operand.
                 self.position += 2;
             }
-            BC_LAST_EXC_VALUE => {
+            jitcode::BC_LAST_EXC_VALUE => {
                 let dst = self.next_u16() as usize;
                 self.registers_r[dst] = self.exception_last_value;
             }
-            BC_RVMPROF_CODE => {
+            jitcode::BC_RVMPROF_CODE => {
                 let leaving_idx = self.next_u8() as usize;
                 let unique_id_idx = self.next_u8() as usize;
                 let leaving = self.registers_i[leaving_idx];
                 let unique_id = self.registers_i[unique_id_idx];
                 self.bhimpl_rvmprof_code(leaving, unique_id);
             }
-            BC_LOAD_CONST_I => {
+            jitcode::BC_LOAD_CONST_I => {
                 let dst = self.next_u16() as usize;
                 let const_idx = self.next_u16() as usize;
                 let value = self.jitcode.constants_i[const_idx];
                 self.registers_i[dst] = value;
             }
-            BC_LOAD_CONST_R => {
+            jitcode::BC_LOAD_CONST_R => {
                 let dst = self.next_u16() as usize;
                 let const_idx = self.next_u16() as usize;
                 let value = self.jitcode.constants_r[const_idx];
                 self.registers_r[dst] = value;
             }
-            BC_LOAD_CONST_F => {
+            jitcode::BC_LOAD_CONST_F => {
                 let dst = self.next_u16() as usize;
                 let const_idx = self.next_u16() as usize;
                 let value = self.jitcode.constants_f[const_idx];
                 self.registers_f[dst] = value;
             }
-            BC_MOVE_I => {
+            jitcode::BC_MOVE_I => {
                 let dst = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
                 self.registers_i[dst] = self.registers_i[src];
             }
-            BC_MOVE_R => {
+            jitcode::BC_MOVE_R => {
                 let dst = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
                 self.registers_r[dst] = self.registers_r[src];
             }
-            BC_MOVE_F => {
+            jitcode::BC_MOVE_F => {
                 let dst = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
                 self.registers_f[dst] = self.registers_f[src];
             }
-            BC_RECORD_BINOP_I => {
+            jitcode::BC_RECORD_BINOP_I => {
                 let dst = self.next_u16() as usize;
                 let opcode_idx = self.next_u16() as usize;
                 let lhs_idx = self.next_u16() as usize;
@@ -1713,7 +1696,7 @@ impl BlackholeInterpreter {
                     self.registers_i[dst] = eval_binop_i(opcode, lhs, rhs);
                 }
             }
-            BC_RECORD_UNARY_I => {
+            jitcode::BC_RECORD_UNARY_I => {
                 let dst = self.next_u16() as usize;
                 let opcode_idx = self.next_u16() as usize;
                 let src_idx = self.next_u16() as usize;
@@ -1721,7 +1704,7 @@ impl BlackholeInterpreter {
                 let value = self.registers_i[src_idx];
                 self.registers_i[dst] = eval_unary_i(opcode, value);
             }
-            BC_RECORD_BINOP_F => {
+            jitcode::BC_RECORD_BINOP_F => {
                 let dst = self.next_u16() as usize;
                 let opcode_idx = self.next_u16() as usize;
                 let lhs_idx = self.next_u16() as usize;
@@ -1731,7 +1714,7 @@ impl BlackholeInterpreter {
                 let rhs = self.registers_f[rhs_idx];
                 self.registers_f[dst] = eval_binop_f(opcode, lhs, rhs);
             }
-            BC_RECORD_UNARY_F => {
+            jitcode::BC_RECORD_UNARY_F => {
                 let dst = self.next_u16() as usize;
                 let opcode_idx = self.next_u16() as usize;
                 let src_idx = self.next_u16() as usize;
@@ -1739,7 +1722,7 @@ impl BlackholeInterpreter {
                 let value = self.registers_f[src_idx];
                 self.registers_f[dst] = eval_unary_f(opcode, value);
             }
-            BC_BRANCH_REG_ZERO => {
+            jitcode::BC_BRANCH_REG_ZERO => {
                 let cond_idx = self.next_u16() as usize;
                 let target = self.next_u16() as usize;
                 let cond = self.registers_i[cond_idx];
@@ -1756,11 +1739,158 @@ impl BlackholeInterpreter {
                     self.position = target;
                 }
             }
-            BC_JUMP => {
+            // blackhole.py:872-911 bhimpl_goto_if_not_int_*:
+            //   if a <cmp> b: return pc else return target
+            // i.e. take the target when the comparison is FALSE.
+            jitcode::BC_GOTO_IF_NOT_INT_LT => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_i[a_idx];
+                let b = self.registers_i[b_idx];
+                if !(a < b) {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_INT_LE => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_i[a_idx];
+                let b = self.registers_i[b_idx];
+                if !(a <= b) {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_INT_EQ => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_i[a_idx];
+                let b = self.registers_i[b_idx];
+                if a != b {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_INT_NE => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_i[a_idx];
+                let b = self.registers_i[b_idx];
+                if a == b {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_INT_GT => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_i[a_idx];
+                let b = self.registers_i[b_idx];
+                if !(a > b) {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_INT_GE => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_i[a_idx];
+                let b = self.registers_i[b_idx];
+                if !(a >= b) {
+                    self.position = target;
+                }
+            }
+            // blackhole.py:751-798 bhimpl_goto_if_not_float_*:
+            //   a = longlong.getrealfloat(a); b = longlong.getrealfloat(b)
+            //   if a <cmp> b: return pc else return target
+            jitcode::BC_GOTO_IF_NOT_FLOAT_LT => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = f64::from_bits(self.registers_f[a_idx] as u64);
+                let b = f64::from_bits(self.registers_f[b_idx] as u64);
+                if !(a < b) {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_FLOAT_LE => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = f64::from_bits(self.registers_f[a_idx] as u64);
+                let b = f64::from_bits(self.registers_f[b_idx] as u64);
+                if !(a <= b) {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_FLOAT_EQ => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = f64::from_bits(self.registers_f[a_idx] as u64);
+                let b = f64::from_bits(self.registers_f[b_idx] as u64);
+                if a != b {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_FLOAT_NE => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = f64::from_bits(self.registers_f[a_idx] as u64);
+                let b = f64::from_bits(self.registers_f[b_idx] as u64);
+                if a == b {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_FLOAT_GT => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = f64::from_bits(self.registers_f[a_idx] as u64);
+                let b = f64::from_bits(self.registers_f[b_idx] as u64);
+                if !(a > b) {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_FLOAT_GE => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = f64::from_bits(self.registers_f[a_idx] as u64);
+                let b = f64::from_bits(self.registers_f[b_idx] as u64);
+                if !(a >= b) {
+                    self.position = target;
+                }
+            }
+            // blackhole.py:922-934 bhimpl_goto_if_not_ptr_{eq,ne}.
+            jitcode::BC_GOTO_IF_NOT_PTR_EQ => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_r[a_idx];
+                let b = self.registers_r[b_idx];
+                if a != b {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_PTR_NE => {
+                let a_idx = self.next_u16() as usize;
+                let b_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_r[a_idx];
+                let b = self.registers_r[b_idx];
+                if a == b {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_JUMP => {
                 let target = self.next_u16() as usize;
                 self.position = target;
             }
-            BC_JIT_MERGE_POINT => {
+            jitcode::BC_JIT_MERGE_POINT => {
                 // blackhole.py:1066-1093 bhimpl_jit_merge_point parity.
                 // @arguments("self", "i", "I", "R", "F", "I", "R", "F")
                 // Decode jdindex + 6 typed register lists from bytecode.
@@ -1820,23 +1950,23 @@ impl BlackholeInterpreter {
                 }
                 return Err(DispatchError::LeaveFrame);
             }
-            BC_LOOP_HEADER => {
+            jitcode::BC_LOOP_HEADER => {
                 // blackhole.py:1062-1064 bhimpl_loop_header(jdindex): no-op.
                 // Argument byte is the jitdriver index (unused in blackhole).
                 let _jdindex = self.next_u8();
             }
-            BC_REF_RETURN => {
+            jitcode::BC_REF_RETURN => {
                 // RPython bhimpl_ref_return: return ref value to caller.
                 let src = self.next_u16() as usize;
                 self.tmpreg_r = self.registers_r[src];
                 self.return_type = BhReturnType::Ref;
                 return Err(DispatchError::LeaveFrame);
             }
-            BC_ABORT => {
+            jitcode::BC_ABORT => {
                 self.aborted = true;
                 return Err(DispatchError::LeaveFrame);
             }
-            BC_ABORT_PERMANENT => {
+            jitcode::BC_ABORT_PERMANENT => {
                 // blackhole.py bhimpl_raise parity: exception path bytecodes
                 // trigger RaiseException so handle_exception_in_frame can route
                 // to the except handler. If no TLS exception is available,
@@ -1850,7 +1980,7 @@ impl BlackholeInterpreter {
                 return Err(DispatchError::LeaveFrame);
             }
             // blackhole.py:1000 bhimpl_raise(excvalue)
-            BC_RAISE => {
+            jitcode::BC_RAISE => {
                 let src = self.next_u16() as usize;
                 let exc = self.registers_r[src];
                 if exc != 0 {
@@ -1860,7 +1990,7 @@ impl BlackholeInterpreter {
                 return Err(DispatchError::LeaveFrame);
             }
             // blackhole.py:1006 bhimpl_reraise()
-            BC_RERAISE => {
+            jitcode::BC_RERAISE => {
                 let exc = self.exception_last_value;
                 if exc != 0 {
                     return Err(DispatchError::RaiseException(exc));
@@ -1868,7 +1998,7 @@ impl BlackholeInterpreter {
                 self.aborted = true;
                 return Err(DispatchError::LeaveFrame);
             }
-            BC_INLINE_CALL => {
+            jitcode::BC_INLINE_CALL => {
                 let sub_idx = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
                 let mut arg_triples = Vec::with_capacity(num_args);
@@ -1937,12 +2067,12 @@ impl BlackholeInterpreter {
                 }
             }
             // -- Int-typed calls --
-            BC_CALL_INT
-            | BC_CALL_PURE_INT
-            | BC_CALL_MAY_FORCE_INT
-            | BC_CALL_RELEASE_GIL_INT
-            | BC_CALL_LOOPINVARIANT_INT
-            | BC_CALL_ASSEMBLER_INT => {
+            jitcode::BC_CALL_INT
+            | jitcode::BC_CALL_PURE_INT
+            | jitcode::BC_CALL_MAY_FORCE_INT
+            | jitcode::BC_CALL_RELEASE_GIL_INT
+            | jitcode::BC_CALL_LOOPINVARIANT_INT
+            | jitcode::BC_CALL_ASSEMBLER_INT => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
@@ -1963,12 +2093,12 @@ impl BlackholeInterpreter {
                 self.registers_i[dst] = result;
             }
             // -- Ref-typed calls --
-            BC_CALL_REF
-            | BC_CALL_PURE_REF
-            | BC_CALL_MAY_FORCE_REF
-            | BC_CALL_RELEASE_GIL_REF
-            | BC_CALL_LOOPINVARIANT_REF
-            | BC_CALL_ASSEMBLER_REF => {
+            jitcode::BC_CALL_REF
+            | jitcode::BC_CALL_PURE_REF
+            | jitcode::BC_CALL_MAY_FORCE_REF
+            | jitcode::BC_CALL_RELEASE_GIL_REF
+            | jitcode::BC_CALL_LOOPINVARIANT_REF
+            | jitcode::BC_CALL_ASSEMBLER_REF => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
@@ -2007,16 +2137,16 @@ impl BlackholeInterpreter {
                 // result == 0 without exception is a legitimate null ref
                 // (e.g., None object has non-zero address in pyre, so this
                 // only happens for actual PY_NULL returns which are rare
-                // but legal in generic majit BC_CALL_REF semantics).
+                // but legal in generic majit jitcode::BC_CALL_REF semantics).
                 self.registers_r[dst] = result;
             }
             // -- Float-typed calls --
-            BC_CALL_FLOAT
-            | BC_CALL_PURE_FLOAT
-            | BC_CALL_MAY_FORCE_FLOAT
-            | BC_CALL_RELEASE_GIL_FLOAT
-            | BC_CALL_LOOPINVARIANT_FLOAT
-            | BC_CALL_ASSEMBLER_FLOAT => {
+            jitcode::BC_CALL_FLOAT
+            | jitcode::BC_CALL_PURE_FLOAT
+            | jitcode::BC_CALL_MAY_FORCE_FLOAT
+            | jitcode::BC_CALL_RELEASE_GIL_FLOAT
+            | jitcode::BC_CALL_LOOPINVARIANT_FLOAT
+            | jitcode::BC_CALL_ASSEMBLER_FLOAT => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
@@ -2036,10 +2166,10 @@ impl BlackholeInterpreter {
                 self.registers_f[dst] = result;
             }
             // -- Void-typed calls --
-            BC_CALL_MAY_FORCE_VOID
-            | BC_CALL_RELEASE_GIL_VOID
-            | BC_CALL_LOOPINVARIANT_VOID
-            | BC_CALL_ASSEMBLER_VOID => {
+            jitcode::BC_CALL_MAY_FORCE_VOID
+            | jitcode::BC_CALL_RELEASE_GIL_VOID
+            | jitcode::BC_CALL_LOOPINVARIANT_VOID
+            | jitcode::BC_CALL_ASSEMBLER_VOID => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 // void calls have no dst field in bytecode (call_void_like encoding)
                 let num_args = self.next_u16() as usize;
@@ -2057,7 +2187,7 @@ impl BlackholeInterpreter {
                     return Err(DispatchError::LeaveFrame);
                 }
             }
-            BC_RESIDUAL_CALL_VOID => {
+            jitcode::BC_RESIDUAL_CALL_VOID => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
@@ -2075,22 +2205,22 @@ impl BlackholeInterpreter {
                 }
             }
             // -- State field access --
-            BC_LOAD_STATE_FIELD | BC_LOAD_STATE_VARRAY => {
+            jitcode::BC_LOAD_STATE_FIELD | jitcode::BC_LOAD_STATE_VARRAY => {
                 let _field_idx = self.next_u16();
                 let _dst = self.next_u16();
                 // No-op in blackhole: state fields are only meaningful
                 // during tracing with a JitCodeSym.
             }
-            BC_STORE_STATE_FIELD | BC_STORE_STATE_VARRAY => {
+            jitcode::BC_STORE_STATE_FIELD | jitcode::BC_STORE_STATE_VARRAY => {
                 let _field_idx = self.next_u16();
                 let _src = self.next_u16();
             }
-            BC_LOAD_STATE_ARRAY => {
+            jitcode::BC_LOAD_STATE_ARRAY => {
                 let _array_idx = self.next_u16();
                 let _elem_idx = self.next_u16();
                 let _dst = self.next_u16();
             }
-            BC_STORE_STATE_ARRAY => {
+            jitcode::BC_STORE_STATE_ARRAY => {
                 let _array_idx = self.next_u16();
                 let _elem_idx = self.next_u16();
                 let _src = self.next_u16();
@@ -2099,7 +2229,7 @@ impl BlackholeInterpreter {
             // blackhole.py:1446-1458 bhimpl_getfield_vable_i/r/f:
             //   fielddescr.get_vinfo().clear_vable_token(struct)
             //   return cpu.bh_getfield_gc_i/r/f(struct, fielddescr)
-            BC_GETFIELD_VABLE_I => {
+            jitcode::BC_GETFIELD_VABLE_I => {
                 let field_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let vinfo = unsafe { &*self.virtualizable_info };
@@ -2110,7 +2240,7 @@ impl BlackholeInterpreter {
                 let value = unsafe { *(ptr.add(offset) as *const i64) };
                 self.registers_i[dst] = value;
             }
-            BC_GETFIELD_VABLE_R => {
+            jitcode::BC_GETFIELD_VABLE_R => {
                 let field_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let vinfo = unsafe { &*self.virtualizable_info };
@@ -2120,7 +2250,7 @@ impl BlackholeInterpreter {
                 let value = unsafe { *(ptr.add(offset) as *const i64) };
                 self.registers_r[dst] = value;
             }
-            BC_GETFIELD_VABLE_F => {
+            jitcode::BC_GETFIELD_VABLE_F => {
                 let field_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let vinfo = unsafe { &*self.virtualizable_info };
@@ -2131,7 +2261,7 @@ impl BlackholeInterpreter {
                 self.registers_f[dst] = value;
             }
             // blackhole.py:1485-1495 bhimpl_setfield_vable_i/r/f
-            BC_SETFIELD_VABLE_I => {
+            jitcode::BC_SETFIELD_VABLE_I => {
                 let field_idx = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
                 let vinfo = unsafe { &*self.virtualizable_info };
@@ -2141,7 +2271,7 @@ impl BlackholeInterpreter {
                 let value = self.registers_i[src];
                 unsafe { *(ptr.add(offset) as *mut i64) = value };
             }
-            BC_SETFIELD_VABLE_R => {
+            jitcode::BC_SETFIELD_VABLE_R => {
                 let field_idx = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
                 let vinfo = unsafe { &*self.virtualizable_info };
@@ -2151,7 +2281,7 @@ impl BlackholeInterpreter {
                 let value = self.registers_r[src];
                 unsafe { *(ptr.add(offset) as *mut i64) = value };
             }
-            BC_SETFIELD_VABLE_F => {
+            jitcode::BC_SETFIELD_VABLE_F => {
                 let field_idx = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
                 let vinfo = unsafe { &*self.virtualizable_info };
@@ -2165,7 +2295,9 @@ impl BlackholeInterpreter {
             //   fielddescr.get_vinfo().clear_vable_token(vable)
             //   array = cpu.bh_getfield_gc_r(vable, fielddescr)
             //   return cpu.bh_getarrayitem_gc_i/r/f(array, index, arraydescr)
-            BC_GETARRAYITEM_VABLE_I | BC_GETARRAYITEM_VABLE_R | BC_GETARRAYITEM_VABLE_F => {
+            jitcode::BC_GETARRAYITEM_VABLE_I
+            | jitcode::BC_GETARRAYITEM_VABLE_R
+            | jitcode::BC_GETARRAYITEM_VABLE_F => {
                 let array_idx = self.next_u16() as usize;
                 let index_reg = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
@@ -2178,13 +2310,15 @@ impl BlackholeInterpreter {
                     crate::virtualizable::vable_read_array_item(ptr as *const u8, ainfo, index)
                 };
                 match opcode {
-                    BC_GETARRAYITEM_VABLE_I => self.registers_i[dst] = value,
-                    BC_GETARRAYITEM_VABLE_R => self.registers_r[dst] = value,
+                    jitcode::BC_GETARRAYITEM_VABLE_I => self.registers_i[dst] = value,
+                    jitcode::BC_GETARRAYITEM_VABLE_R => self.registers_r[dst] = value,
                     _ => self.registers_f[dst] = value,
                 }
             }
             // blackhole.py:1390-1403 bhimpl_setarrayitem_vable_i/r/f
-            BC_SETARRAYITEM_VABLE_I | BC_SETARRAYITEM_VABLE_R | BC_SETARRAYITEM_VABLE_F => {
+            jitcode::BC_SETARRAYITEM_VABLE_I
+            | jitcode::BC_SETARRAYITEM_VABLE_R
+            | jitcode::BC_SETARRAYITEM_VABLE_F => {
                 let array_idx = self.next_u16() as usize;
                 let index_reg = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
@@ -2194,8 +2328,8 @@ impl BlackholeInterpreter {
                 let ainfo = &vinfo.array_fields[array_idx];
                 let index = self.registers_i[index_reg] as usize;
                 let value = match opcode {
-                    BC_SETARRAYITEM_VABLE_I => self.registers_i[src],
-                    BC_SETARRAYITEM_VABLE_R => self.registers_r[src],
+                    jitcode::BC_SETARRAYITEM_VABLE_I => self.registers_i[src],
+                    jitcode::BC_SETARRAYITEM_VABLE_R => self.registers_r[src],
                     _ => self.registers_f[src],
                 };
                 unsafe {
@@ -2203,7 +2337,7 @@ impl BlackholeInterpreter {
                 }
             }
             // blackhole.py:1406-1409 bhimpl_arraylen_vable
-            BC_ARRAYLEN_VABLE => {
+            jitcode::BC_ARRAYLEN_VABLE => {
                 let array_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let vinfo = unsafe { &*self.virtualizable_info };
@@ -2213,7 +2347,7 @@ impl BlackholeInterpreter {
                 let len = unsafe { crate::virtualizable::vable_array_len(ptr as *const u8, ainfo) };
                 self.registers_i[dst] = len as i64;
             }
-            BC_HINT_FORCE_VIRTUALIZABLE => {
+            jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {
                 // No-op in blackhole
             }
             other => {
@@ -2264,7 +2398,7 @@ impl BlackholeInterpreter {
 // args + descr) and then call the corresponding `bhimpl_*_call_*`
 // method on the BlackholeInterpreter, which in turn routes through
 // `cpu().bh_call_{i,r,f,v}` exactly like RPython.  The legacy inline
-// `BC_RESIDUAL_CALL_*` / `BC_CALL_MAY_FORCE_*` branches in
+// `jitcode::BC_RESIDUAL_CALL_*` / `jitcode::BC_CALL_MAY_FORCE_*` branches in
 // `JitCodeMachine::dispatch_one` are pyre's IR-side fast path for
 // JIT-compiled traces and operate on a different bytecode encoding
 // (raw fn pointers, no calldescr); the codewriter-orthodox path runs

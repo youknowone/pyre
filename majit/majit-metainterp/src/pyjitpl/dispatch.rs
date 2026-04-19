@@ -5,26 +5,7 @@ use majit_backend::JitCellToken;
 use majit_ir::{OpCode, OpRef};
 
 use super::{MIFrame, MIFrameStack};
-use crate::jitcode::{
-    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_BRANCH_REG_ZERO, BC_CALL_ASSEMBLER_FLOAT,
-    BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID, BC_CALL_FLOAT,
-    BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT, BC_CALL_LOOPINVARIANT_REF,
-    BC_CALL_LOOPINVARIANT_VOID, BC_CALL_MAY_FORCE_FLOAT, BC_CALL_MAY_FORCE_INT,
-    BC_CALL_MAY_FORCE_REF, BC_CALL_MAY_FORCE_VOID, BC_CALL_PURE_FLOAT, BC_CALL_PURE_INT,
-    BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT, BC_CALL_RELEASE_GIL_INT,
-    BC_CALL_RELEASE_GIL_REF, BC_CALL_RELEASE_GIL_VOID, BC_COND_CALL_VALUE_INT,
-    BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_FLOAT_GUARD_VALUE, BC_GETARRAYITEM_VABLE_F,
-    BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I,
-    BC_GETFIELD_VABLE_R, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL, BC_INT_GUARD_VALUE,
-    BC_JIT_MERGE_POINT, BC_JUMP, BC_LOAD_CONST_F, BC_LOAD_CONST_I, BC_LOAD_CONST_R,
-    BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_LOOP_HEADER, BC_MOVE_F,
-    BC_MOVE_I, BC_MOVE_R, BC_RECORD_BINOP_F, BC_RECORD_BINOP_I, BC_RECORD_KNOWN_RESULT_INT,
-    BC_RECORD_KNOWN_RESULT_REF, BC_RECORD_UNARY_F, BC_RECORD_UNARY_I, BC_REF_GUARD_VALUE,
-    BC_RESIDUAL_CALL_VOID, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
-    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, JitArgKind, JitCallArg,
-    JitCallTarget, JitCode, MAX_HOST_CALL_ARITY,
-};
+use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY};
 use crate::{TraceAction, TraceCtx};
 
 pub trait JitCodeSym {
@@ -404,7 +385,7 @@ where
 
         let bytecode = self.frames.current_mut().next_u8();
         match bytecode {
-            BC_LOAD_CONST_I => {
+            jitcode::BC_LOAD_CONST_I => {
                 let (dst, value) = {
                     let frame = self.frames.current_mut();
                     let dst = frame.next_u16() as usize;
@@ -420,7 +401,7 @@ where
             }
 
             // -- State field access (register/tape machines) --
-            BC_LOAD_STATE_FIELD => {
+            jitcode::BC_LOAD_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
                 let opref = sym
@@ -431,14 +412,14 @@ where
                     .expect("state field concrete value not initialized");
                 self.set_int_reg(dest, Some(opref), Some(value));
             }
-            BC_STORE_STATE_FIELD => {
+            jitcode::BC_STORE_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
                 let (opref, value) = self.read_int_reg(src);
                 sym.set_state_field_ref(field_idx, opref);
                 sym.set_state_field_value(field_idx, value);
             }
-            BC_LOAD_STATE_ARRAY => {
+            jitcode::BC_LOAD_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
@@ -456,7 +437,7 @@ where
                     return TraceAction::Abort;
                 }
             }
-            BC_STORE_STATE_ARRAY => {
+            jitcode::BC_STORE_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
@@ -468,7 +449,7 @@ where
             }
 
             // -- First-class virtualizable access (RPython getfield_vable_*) --
-            BC_GETFIELD_VABLE_I => {
+            jitcode::BC_GETFIELD_VABLE_I => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
                 let Some((vable_opref, fielddescr)) =
@@ -479,7 +460,7 @@ where
                 let result = ctx.vable_getfield_int(vable_opref, fielddescr);
                 self.set_int_reg(dest, Some(result), Some(0));
             }
-            BC_GETFIELD_VABLE_R => {
+            jitcode::BC_GETFIELD_VABLE_R => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
                 let Some((vable_opref, fielddescr)) =
@@ -490,7 +471,7 @@ where
                 let result = ctx.vable_getfield_ref(vable_opref, fielddescr);
                 self.set_ref_reg(dest, Some(result), Some(0));
             }
-            BC_GETFIELD_VABLE_F => {
+            jitcode::BC_GETFIELD_VABLE_F => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
                 let Some((vable_opref, fielddescr)) =
@@ -501,7 +482,7 @@ where
                 let result = ctx.vable_getfield_float(vable_opref, fielddescr);
                 self.set_float_reg(dest, Some(result), Some(0));
             }
-            BC_SETFIELD_VABLE_I => {
+            jitcode::BC_SETFIELD_VABLE_I => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
                 let Some((vable_opref, fielddescr)) =
@@ -512,7 +493,7 @@ where
                 let (value, _) = self.read_int_reg(src);
                 ctx.vable_setfield(vable_opref, fielddescr, value);
             }
-            BC_SETFIELD_VABLE_R => {
+            jitcode::BC_SETFIELD_VABLE_R => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
                 let Some((vable_opref, fielddescr)) =
@@ -523,7 +504,7 @@ where
                 let (value, _) = self.read_ref_reg(src);
                 ctx.vable_setfield(vable_opref, fielddescr, value);
             }
-            BC_SETFIELD_VABLE_F => {
+            jitcode::BC_SETFIELD_VABLE_F => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
                 let Some((vable_opref, fielddescr)) =
@@ -534,7 +515,7 @@ where
                 let (value, _) = self.read_float_reg(src);
                 ctx.vable_setfield(vable_opref, fielddescr, value);
             }
-            BC_GETARRAYITEM_VABLE_I => {
+            jitcode::BC_GETARRAYITEM_VABLE_I => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
@@ -548,7 +529,7 @@ where
                     ctx.vable_getarrayitem_int_indexed(vable_opref, index, index_value, fdescr);
                 self.set_int_reg(dest, Some(result), Some(0));
             }
-            BC_GETARRAYITEM_VABLE_R => {
+            jitcode::BC_GETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
@@ -562,7 +543,7 @@ where
                     ctx.vable_getarrayitem_ref_indexed(vable_opref, index, index_value, fdescr);
                 self.set_ref_reg(dest, Some(result), Some(0));
             }
-            BC_GETARRAYITEM_VABLE_F => {
+            jitcode::BC_GETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
@@ -576,7 +557,7 @@ where
                     ctx.vable_getarrayitem_float_indexed(vable_opref, index, index_value, fdescr);
                 self.set_float_reg(dest, Some(result), Some(0));
             }
-            BC_SETARRAYITEM_VABLE_I => {
+            jitcode::BC_SETARRAYITEM_VABLE_I => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
@@ -589,7 +570,7 @@ where
                 let (value, _) = self.read_int_reg(src);
                 ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
             }
-            BC_SETARRAYITEM_VABLE_R => {
+            jitcode::BC_SETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
@@ -602,7 +583,7 @@ where
                 let (value, _) = self.read_ref_reg(src);
                 ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
             }
-            BC_SETARRAYITEM_VABLE_F => {
+            jitcode::BC_SETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
@@ -615,7 +596,7 @@ where
                 let (value, _) = self.read_float_reg(src);
                 ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
             }
-            BC_ARRAYLEN_VABLE => {
+            jitcode::BC_ARRAYLEN_VABLE => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
                 let Some((vable_opref, fdescr)) =
@@ -626,7 +607,7 @@ where
                 let result = ctx.vable_arraylen_vable(vable_opref, fdescr);
                 self.set_int_reg(dest, Some(result), Some(0));
             }
-            BC_HINT_FORCE_VIRTUALIZABLE => {
+            jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {
                 let Some(vable_opref) = ctx.standard_virtualizable_box() else {
                     return TraceAction::Abort;
                 };
@@ -635,7 +616,7 @@ where
 
             // -- Virtualizable state array access --
             // Array stays on heap; emit raw memory load/store IR ops.
-            BC_LOAD_STATE_VARRAY => {
+            jitcode::BC_LOAD_STATE_VARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
@@ -650,7 +631,7 @@ where
                 );
                 self.set_int_reg(dest, Some(result), Some(0));
             }
-            BC_STORE_STATE_VARRAY => {
+            jitcode::BC_STORE_STATE_VARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
@@ -666,7 +647,7 @@ where
                 );
             }
 
-            BC_RECORD_BINOP_I => {
+            jitcode::BC_RECORD_BINOP_I => {
                 let (dst, lhs_idx, rhs_idx, opcode) = {
                     let frame = self.frames.current_mut();
                     let dst = frame.next_u16() as usize;
@@ -704,7 +685,7 @@ where
                     self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
                 }
             }
-            BC_RECORD_UNARY_I => {
+            jitcode::BC_RECORD_UNARY_I => {
                 let (dst, src_idx, opcode) = {
                     let frame = self.frames.current_mut();
                     let dst = frame.next_u16() as usize;
@@ -721,7 +702,7 @@ where
                 let value = eval_unary_i(opcode, src_value);
                 self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
             }
-            BC_BRANCH_REG_ZERO => {
+            jitcode::BC_BRANCH_REG_ZERO => {
                 let (cond_idx, target) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
@@ -739,7 +720,7 @@ where
                     self.frames.current_mut().code_cursor = target;
                 }
             }
-            BC_JIT_MERGE_POINT => {
+            jitcode::BC_JIT_MERGE_POINT => {
                 // blackhole.py:1066 bhimpl_jit_merge_point parity.
                 // Portal merge point: close the loop if at the traced header.
                 let pc = self.frames.current_mut().pc;
@@ -747,7 +728,7 @@ where
                     return TraceAction::CloseLoop;
                 }
             }
-            BC_LOOP_HEADER => {
+            jitcode::BC_LOOP_HEADER => {
                 // pyjitpl.py:1527-1573 opimpl_loop_header. The 1-byte jdindex
                 // operand is the jitdriver index; pyre has a single jitdriver
                 // so we read and ignore it. Non-portal loop header marker
@@ -759,11 +740,11 @@ where
                     return TraceAction::CloseLoop;
                 }
             }
-            BC_JUMP => {
+            jitcode::BC_JUMP => {
                 let target = self.frames.current_mut().next_u16() as usize;
                 self.frames.current_mut().code_cursor = target;
             }
-            BC_INLINE_CALL => {
+            jitcode::BC_INLINE_CALL => {
                 let (sub_idx, arg_triples, return_i, return_r, return_f) = {
                     let frame = self.frames.current_mut();
                     let sub_idx = frame.next_u16() as usize;
@@ -818,11 +799,11 @@ where
                 sub_frame.return_f = return_f;
                 self.frames.push(sub_frame);
             }
-            BC_RESIDUAL_CALL_VOID
-            | BC_CALL_MAY_FORCE_VOID
-            | BC_CALL_RELEASE_GIL_VOID
-            | BC_CALL_LOOPINVARIANT_VOID
-            | BC_CALL_ASSEMBLER_VOID => {
+            jitcode::BC_RESIDUAL_CALL_VOID
+            | jitcode::BC_CALL_MAY_FORCE_VOID
+            | jitcode::BC_CALL_RELEASE_GIL_VOID
+            | jitcode::BC_CALL_LOOPINVARIANT_VOID
+            | jitcode::BC_CALL_ASSEMBLER_VOID => {
                 let (fn_ptr_idx, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
@@ -844,7 +825,7 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if bytecode == BC_CALL_ASSEMBLER_VOID {
+                if bytecode == jitcode::BC_CALL_ASSEMBLER_VOID {
                     let (token_number, concrete_ptr) = self
                         .frames
                         .current_mut()
@@ -865,26 +846,28 @@ where
                     } else {
                         target.concrete_ptr
                     };
-                    let active_vable = if bytecode == BC_CALL_MAY_FORCE_VOID {
+                    let active_vable = if bytecode == jitcode::BC_CALL_MAY_FORCE_VOID {
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
                     };
                     match bytecode {
-                        BC_RESIDUAL_CALL_VOID => ctx.call_void_typed(trace_ptr, &args, &arg_types),
-                        BC_CALL_MAY_FORCE_VOID => {
+                        jitcode::BC_RESIDUAL_CALL_VOID => {
+                            ctx.call_void_typed(trace_ptr, &args, &arg_types)
+                        }
+                        jitcode::BC_CALL_MAY_FORCE_VOID => {
                             ctx.call_may_force_void_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_RELEASE_GIL_VOID => {
+                        jitcode::BC_CALL_RELEASE_GIL_VOID => {
                             ctx.call_release_gil_void_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_LOOPINVARIANT_VOID => {
+                        jitcode::BC_CALL_LOOPINVARIANT_VOID => {
                             ctx.call_loopinvariant_void_typed(trace_ptr, &args, &arg_types)
                         }
                         _ => unreachable!(),
                     }
                     call_void_function(concrete_ptr, &concrete_args);
-                    if bytecode == BC_CALL_MAY_FORCE_VOID
+                    if bytecode == jitcode::BC_CALL_MAY_FORCE_VOID
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
@@ -895,11 +878,11 @@ where
                 }
             }
             // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
-            BC_COND_CALL_VOID
-            | BC_COND_CALL_VALUE_INT
-            | BC_COND_CALL_VALUE_REF
-            | BC_RECORD_KNOWN_RESULT_INT
-            | BC_RECORD_KNOWN_RESULT_REF => {
+            jitcode::BC_COND_CALL_VOID
+            | jitcode::BC_COND_CALL_VALUE_INT
+            | jitcode::BC_COND_CALL_VALUE_REF
+            | jitcode::BC_RECORD_KNOWN_RESULT_INT
+            | jitcode::BC_RECORD_KNOWN_RESULT_REF => {
                 let (first_reg, fn_ptr_idx, arg_regs, dst) = {
                     let frame = self.frames.current_mut();
                     let first_reg = frame.next_u16();
@@ -911,8 +894,10 @@ where
                         let reg = frame.next_u16();
                         arg_regs.push(JitCallArg { kind, reg });
                     }
-                    let dst = if matches!(bytecode, BC_COND_CALL_VALUE_INT | BC_COND_CALL_VALUE_REF)
-                    {
+                    let dst = if matches!(
+                        bytecode,
+                        jitcode::BC_COND_CALL_VALUE_INT | jitcode::BC_COND_CALL_VALUE_REF
+                    ) {
                         Some(frame.next_u16())
                     } else {
                         None
@@ -940,7 +925,7 @@ where
                     target.concrete_ptr
                 };
                 match bytecode {
-                    BC_COND_CALL_VOID => {
+                    jitcode::BC_COND_CALL_VOID => {
                         // RPython pyjitpl.py opimpl_conditional_call_ir_v:
                         //   if condition != 0: call func(args)
                         let first_val =
@@ -950,7 +935,7 @@ where
                             call_void_function(concrete_ptr, &concrete_args);
                         }
                     }
-                    BC_COND_CALL_VALUE_INT => {
+                    jitcode::BC_COND_CALL_VALUE_INT => {
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_i
                         let first_val =
                             self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
@@ -967,7 +952,7 @@ where
                         }
                         let _ = result;
                     }
-                    BC_COND_CALL_VALUE_REF => {
+                    jitcode::BC_COND_CALL_VALUE_REF => {
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_r:
                         // value is a ref — read from ref register bank.
                         let first_val =
@@ -985,13 +970,13 @@ where
                         }
                         let _ = result;
                     }
-                    BC_RECORD_KNOWN_RESULT_INT => {
+                    jitcode::BC_RECORD_KNOWN_RESULT_INT => {
                         // RPython pyjitpl.py opimpl_record_known_result_i:
                         let result_val =
                             self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
                         ctx.record_known_result_typed(result_val, trace_ptr, &args, &arg_types);
                     }
-                    BC_RECORD_KNOWN_RESULT_REF => {
+                    jitcode::BC_RECORD_KNOWN_RESULT_REF => {
                         // RPython pyjitpl.py opimpl_record_known_result_r:
                         let result_val =
                             self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
@@ -1000,7 +985,7 @@ where
                     _ => unreachable!(),
                 }
             }
-            BC_MOVE_I => {
+            jitcode::BC_MOVE_I => {
                 let (dst, src) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
@@ -1008,12 +993,12 @@ where
                 let (value, concrete) = self.read_int_reg(src);
                 self.set_int_reg(dst, Some(value), Some(concrete));
             }
-            BC_CALL_INT
-            | BC_CALL_PURE_INT
-            | BC_CALL_MAY_FORCE_INT
-            | BC_CALL_RELEASE_GIL_INT
-            | BC_CALL_LOOPINVARIANT_INT
-            | BC_CALL_ASSEMBLER_INT => {
+            jitcode::BC_CALL_INT
+            | jitcode::BC_CALL_PURE_INT
+            | jitcode::BC_CALL_MAY_FORCE_INT
+            | jitcode::BC_CALL_RELEASE_GIL_INT
+            | jitcode::BC_CALL_LOOPINVARIANT_INT
+            | jitcode::BC_CALL_ASSEMBLER_INT => {
                 let (opcode, fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let opcode = bytecode;
@@ -1037,7 +1022,7 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if opcode == BC_CALL_ASSEMBLER_INT {
+                if opcode == jitcode::BC_CALL_ASSEMBLER_INT {
                     let (token_number, concrete_ptr) = self
                         .frames
                         .current_mut()
@@ -1059,7 +1044,7 @@ where
                     } else {
                         target.concrete_ptr
                     };
-                    let active_vable = if opcode == BC_CALL_MAY_FORCE_INT {
+                    let active_vable = if opcode == jitcode::BC_CALL_MAY_FORCE_INT {
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
@@ -1068,8 +1053,8 @@ where
                     // first, executes, then patches via record_result_of_call_pure.
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     let traced = match opcode {
-                        BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
-                        BC_CALL_PURE_INT => {
+                        jitcode::BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
+                        jitcode::BC_CALL_PURE_INT => {
                             let patch_pos = ctx.get_trace_position();
                             let plain_op = ctx.call_int_typed(trace_ptr, &args, &arg_types);
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
@@ -1087,18 +1072,18 @@ where
                                 majit_ir::Value::Int(concrete),
                             )
                         }
-                        BC_CALL_MAY_FORCE_INT => {
+                        jitcode::BC_CALL_MAY_FORCE_INT => {
                             ctx.call_may_force_int_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_RELEASE_GIL_INT => {
+                        jitcode::BC_CALL_RELEASE_GIL_INT => {
                             ctx.call_release_gil_int_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_LOOPINVARIANT_INT => {
+                        jitcode::BC_CALL_LOOPINVARIANT_INT => {
                             ctx.call_loopinvariant_int_typed(trace_ptr, &args, &arg_types)
                         }
                         _ => unreachable!(),
                     };
-                    if opcode == BC_CALL_MAY_FORCE_INT
+                    if opcode == jitcode::BC_CALL_MAY_FORCE_INT
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
@@ -1110,7 +1095,7 @@ where
                 }
             }
             // -- Ref-typed bytecodes ----
-            BC_LOAD_CONST_R => {
+            jitcode::BC_LOAD_CONST_R => {
                 let (dst, value) = {
                     let frame = self.frames.current_mut();
                     let dst = frame.next_u16() as usize;
@@ -1124,7 +1109,7 @@ where
                 };
                 self.set_ref_reg(dst, Some(ctx.const_ref(value)), Some(value));
             }
-            BC_MOVE_R => {
+            jitcode::BC_MOVE_R => {
                 let (dst, src) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
@@ -1132,12 +1117,12 @@ where
                 let (value, concrete) = self.read_ref_reg(src);
                 self.set_ref_reg(dst, Some(value), Some(concrete));
             }
-            BC_CALL_REF
-            | BC_CALL_PURE_REF
-            | BC_CALL_MAY_FORCE_REF
-            | BC_CALL_RELEASE_GIL_REF
-            | BC_CALL_LOOPINVARIANT_REF
-            | BC_CALL_ASSEMBLER_REF => {
+            jitcode::BC_CALL_REF
+            | jitcode::BC_CALL_PURE_REF
+            | jitcode::BC_CALL_MAY_FORCE_REF
+            | jitcode::BC_CALL_RELEASE_GIL_REF
+            | jitcode::BC_CALL_LOOPINVARIANT_REF
+            | jitcode::BC_CALL_ASSEMBLER_REF => {
                 let (opcode, fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let opcode = bytecode;
@@ -1161,7 +1146,7 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if opcode == BC_CALL_ASSEMBLER_REF {
+                if opcode == jitcode::BC_CALL_ASSEMBLER_REF {
                     let (token_number, concrete_ptr) = self
                         .frames
                         .current_mut()
@@ -1183,15 +1168,15 @@ where
                     } else {
                         target.concrete_ptr
                     };
-                    let active_vable = if opcode == BC_CALL_MAY_FORCE_REF {
+                    let active_vable = if opcode == jitcode::BC_CALL_MAY_FORCE_REF {
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     let traced = match opcode {
-                        BC_CALL_REF => ctx.call_ref_typed(trace_ptr, &args, &arg_types),
-                        BC_CALL_PURE_REF => {
+                        jitcode::BC_CALL_REF => ctx.call_ref_typed(trace_ptr, &args, &arg_types),
+                        jitcode::BC_CALL_PURE_REF => {
                             let patch_pos = ctx.get_trace_position();
                             let plain_op = ctx.call_ref_typed(trace_ptr, &args, &arg_types);
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
@@ -1209,18 +1194,18 @@ where
                                 majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
                             )
                         }
-                        BC_CALL_MAY_FORCE_REF => {
+                        jitcode::BC_CALL_MAY_FORCE_REF => {
                             ctx.call_may_force_ref_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_RELEASE_GIL_REF => {
+                        jitcode::BC_CALL_RELEASE_GIL_REF => {
                             ctx.call_release_gil_ref_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_LOOPINVARIANT_REF => {
+                        jitcode::BC_CALL_LOOPINVARIANT_REF => {
                             ctx.call_loopinvariant_ref_typed(trace_ptr, &args, &arg_types)
                         }
                         _ => unreachable!(),
                     };
-                    if opcode == BC_CALL_MAY_FORCE_REF
+                    if opcode == jitcode::BC_CALL_MAY_FORCE_REF
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
@@ -1232,7 +1217,7 @@ where
                 }
             }
             // -- Float-typed bytecodes ---
-            BC_LOAD_CONST_F => {
+            jitcode::BC_LOAD_CONST_F => {
                 let (dst, value) = {
                     let frame = self.frames.current_mut();
                     let dst = frame.next_u16() as usize;
@@ -1246,7 +1231,7 @@ where
                 };
                 self.set_float_reg(dst, Some(ctx.const_float(value)), Some(value));
             }
-            BC_MOVE_F => {
+            jitcode::BC_MOVE_F => {
                 let (dst, src) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
@@ -1254,12 +1239,12 @@ where
                 let (value, concrete) = self.read_float_reg(src);
                 self.set_float_reg(dst, Some(value), Some(concrete));
             }
-            BC_CALL_FLOAT
-            | BC_CALL_PURE_FLOAT
-            | BC_CALL_MAY_FORCE_FLOAT
-            | BC_CALL_RELEASE_GIL_FLOAT
-            | BC_CALL_LOOPINVARIANT_FLOAT
-            | BC_CALL_ASSEMBLER_FLOAT => {
+            jitcode::BC_CALL_FLOAT
+            | jitcode::BC_CALL_PURE_FLOAT
+            | jitcode::BC_CALL_MAY_FORCE_FLOAT
+            | jitcode::BC_CALL_RELEASE_GIL_FLOAT
+            | jitcode::BC_CALL_LOOPINVARIANT_FLOAT
+            | jitcode::BC_CALL_ASSEMBLER_FLOAT => {
                 let (opcode, fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let opcode = bytecode;
@@ -1283,7 +1268,7 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if opcode == BC_CALL_ASSEMBLER_FLOAT {
+                if opcode == jitcode::BC_CALL_ASSEMBLER_FLOAT {
                     let (token_number, concrete_ptr) = self
                         .frames
                         .current_mut()
@@ -1305,15 +1290,17 @@ where
                     } else {
                         target.concrete_ptr
                     };
-                    let active_vable = if opcode == BC_CALL_MAY_FORCE_FLOAT {
+                    let active_vable = if opcode == jitcode::BC_CALL_MAY_FORCE_FLOAT {
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     let traced = match opcode {
-                        BC_CALL_FLOAT => ctx.call_float_typed(trace_ptr, &args, &arg_types),
-                        BC_CALL_PURE_FLOAT => {
+                        jitcode::BC_CALL_FLOAT => {
+                            ctx.call_float_typed(trace_ptr, &args, &arg_types)
+                        }
+                        jitcode::BC_CALL_PURE_FLOAT => {
                             let patch_pos = ctx.get_trace_position();
                             let plain_op = ctx.call_float_typed(trace_ptr, &args, &arg_types);
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
@@ -1334,18 +1321,18 @@ where
                                 majit_ir::Value::Float(f64::from_bits(concrete as u64)),
                             )
                         }
-                        BC_CALL_MAY_FORCE_FLOAT => {
+                        jitcode::BC_CALL_MAY_FORCE_FLOAT => {
                             ctx.call_may_force_float_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_RELEASE_GIL_FLOAT => {
+                        jitcode::BC_CALL_RELEASE_GIL_FLOAT => {
                             ctx.call_release_gil_float_typed(trace_ptr, &args, &arg_types)
                         }
-                        BC_CALL_LOOPINVARIANT_FLOAT => {
+                        jitcode::BC_CALL_LOOPINVARIANT_FLOAT => {
                             ctx.call_loopinvariant_float_typed(trace_ptr, &args, &arg_types)
                         }
                         _ => unreachable!(),
                     };
-                    if opcode == BC_CALL_MAY_FORCE_FLOAT
+                    if opcode == jitcode::BC_CALL_MAY_FORCE_FLOAT
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
@@ -1356,7 +1343,7 @@ where
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 }
             }
-            BC_RECORD_BINOP_F => {
+            jitcode::BC_RECORD_BINOP_F => {
                 let (dst, lhs_idx, rhs_idx, opcode) = {
                     let frame = self.frames.current_mut();
                     let dst = frame.next_u16() as usize;
@@ -1375,7 +1362,7 @@ where
                 let value = eval_binop_f(opcode, lhs_value, rhs_value);
                 self.set_float_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
             }
-            BC_RECORD_UNARY_F => {
+            jitcode::BC_RECORD_UNARY_F => {
                 let (dst, src_idx, opcode) = {
                     let frame = self.frames.current_mut();
                     let dst = frame.next_u16() as usize;
@@ -1394,28 +1381,28 @@ where
             }
             // pyjitpl.py opimpl_int_guard_value → implement_guard_value
             // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
-            BC_INT_GUARD_VALUE => {
+            jitcode::BC_INT_GUARD_VALUE => {
                 let src = self.frames.current_mut().next_u16() as usize;
                 let (opref, concrete) = self.read_int_reg(src);
                 let promoted = ctx.promote_int(opref, concrete, 0);
                 self.set_int_reg(src, Some(promoted), Some(concrete));
             }
             // pyjitpl.py opimpl_ref_guard_value → implement_guard_value
-            BC_REF_GUARD_VALUE => {
+            jitcode::BC_REF_GUARD_VALUE => {
                 let src = self.frames.current_mut().next_u16() as usize;
                 let (opref, concrete) = self.read_ref_reg(src);
                 let promoted = ctx.promote_ref(opref, concrete, 0);
                 self.set_ref_reg(src, Some(promoted), Some(concrete));
             }
             // pyjitpl.py:1515 opimpl_float_guard_value = _opimpl_guard_value
-            BC_FLOAT_GUARD_VALUE => {
+            jitcode::BC_FLOAT_GUARD_VALUE => {
                 let src = self.frames.current_mut().next_u16() as usize;
                 let (opref, concrete) = self.read_float_reg(src);
                 let promoted = ctx.promote_float(opref, concrete, 0);
                 self.set_float_reg(src, Some(promoted), Some(concrete));
             }
-            BC_ABORT => return TraceAction::Abort,
-            BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
+            jitcode::BC_ABORT => return TraceAction::Abort,
+            jitcode::BC_ABORT_PERMANENT => return TraceAction::AbortPermanent,
             other => panic!("unknown jitcode bytecode {other}"),
         }
 
