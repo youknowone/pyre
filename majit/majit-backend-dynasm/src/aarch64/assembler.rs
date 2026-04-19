@@ -362,8 +362,11 @@ impl AssemblerARM64 {
         ResolvedArg::Const(0)
     }
 
-    /// Allocate a frame slot for an OpRef and return the slot index.
-    /// Reuses existing slot if the OpRef already has one.
+    /// Allocate a frame slot for an OpRef and return the ABSOLUTE jitframe
+    /// slot index (already offset by JITFRAME_FIXED_SIZE so slot_offset()
+    /// yields the user-area byte offset directly).
+    ///
+    /// Reuses the existing slot if the OpRef has already been allocated.
     fn allocate_slot(&mut self, opref: OpRef) -> usize {
         if let Some(&existing) = self.opref_to_slot.get(&opref.0) {
             return existing;
@@ -841,24 +844,28 @@ impl AssemblerARM64 {
     // ----------------------------------------------------------------
 
     fn setup_input_state(&mut self, inputargs: &[InputArg]) {
+        // opref_to_slot stores ABSOLUTE jitframe slot indices so that
+        // slot_offset(slot) returns the correct byte offset directly.
+        // User position `p` maps to absolute slot `p + JITFRAME_FIXED_SIZE`.
         if let Some(ref input_locs) = self.bridge_input_locs {
-            let mut max_slot = 0;
+            let mut max_abs_slot = JITFRAME_FIXED_SIZE;
             for (ia, loc) in inputargs.iter().zip(input_locs.iter()) {
                 if let Loc::Frame(floc) = loc {
-                    self.opref_to_slot.insert(ia.index, floc.position);
-                    if floc.position >= max_slot {
-                        max_slot = floc.position + 1;
+                    let abs_slot = JITFRAME_FIXED_SIZE + floc.position;
+                    self.opref_to_slot.insert(ia.index, abs_slot);
+                    if abs_slot + 1 > max_abs_slot {
+                        max_abs_slot = abs_slot + 1;
                     }
                 }
                 self.value_types.insert(ia.index, ia.tp);
             }
-            self.next_slot = max_slot;
+            self.next_slot = max_abs_slot;
         } else {
             for (i, ia) in inputargs.iter().enumerate() {
-                self.opref_to_slot.insert(ia.index, i);
+                self.opref_to_slot.insert(ia.index, JITFRAME_FIXED_SIZE + i);
                 self.value_types.insert(ia.index, ia.tp);
             }
-            self.next_slot = inputargs.len();
+            self.next_slot = JITFRAME_FIXED_SIZE + inputargs.len();
         }
     }
 
@@ -1195,6 +1202,8 @@ impl AssemblerARM64 {
         } else {
             self.setup_input_state(inputargs);
         }
+        // input_slot_depth is an ABSOLUTE jitframe slot count (already
+        // offset by JITFRAME_FIXED_SIZE via setup_input_state).
         let input_slot_depth = self.next_slot;
 
         // ── Run register allocator ──
@@ -1207,23 +1216,32 @@ impl AssemblerARM64 {
         }
         // assembler.py:374 walk_operations — get allocation decisions.
         let ra_ops = ra.walk_operations(inputargs, ops);
-        let frame_slot_depth = input_slot_depth.max(ra.get_final_frame_depth());
-        self.frame_depth = self.frame_depth.max(frame_slot_depth + JITFRAME_FIXED_SIZE);
+        // ra.get_final_frame_depth() returns a USER-position count; convert
+        // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
+        let frame_slot_depth =
+            input_slot_depth.max(JITFRAME_FIXED_SIZE + ra.get_final_frame_depth());
+        self.frame_depth = self.frame_depth.max(frame_slot_depth);
 
         // Sync regalloc frame positions to opref_to_slot for backward
         // compatibility with genop_call/genop_call_assembler which still
         // use resolve_opref. When regalloc spills a value to a frame slot,
         // that slot's position must be visible to resolve_opref.
+        // opref_to_slot stores ABSOLUTE jitframe slots (user position +
+        // JITFRAME_FIXED_SIZE) so slot_offset(slot) gives the correct byte
+        // offset without further adjustment.
         for iarg in inputargs {
-            self.opref_to_slot.insert(iarg.index, iarg.index as usize);
+            self.opref_to_slot
+                .insert(iarg.index, JITFRAME_FIXED_SIZE + iarg.index as usize);
             self.value_types.insert(iarg.index, iarg.tp);
         }
         // Also sync any frame allocations from regalloc's FrameManager.
         for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
             if let Some(floc) = lifetime.current_frame_loc {
-                self.opref_to_slot.insert(opref.0, floc.position);
+                self.opref_to_slot
+                    .insert(opref.0, JITFRAME_FIXED_SIZE + floc.position);
             }
         }
+        // frame_slot_depth is already absolute (see calculation above).
         self.next_slot = frame_slot_depth;
 
         let mut fail_index = 0u32;
