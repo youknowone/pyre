@@ -2,11 +2,39 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use majit_backend::JitCellToken;
-use majit_ir::{OpCode, OpRef};
+use majit_ir::{OpCode, OpRef, Value};
 
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY};
 use crate::{TraceAction, TraceCtx};
+
+/// Decode a virtualizable shadow Value (RPython Box concrete) back into the
+/// raw int/ref/float bit pattern that pyre stores in register shadows
+/// (`frame.int_values`, `frame.ref_values`, `frame.float_values`).
+/// `Value::Void` means the vable layout was not available at read time (heap
+/// fallback) — callers substitute zero to preserve pre-existing behaviour for
+/// test-only paths. All three helpers must match the encoding convention used
+/// by `value_from_backend_constant_bits_typed`.
+fn value_as_int_bits(value: Value) -> i64 {
+    match value {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn value_as_ref_bits(value: Value) -> i64 {
+    match value {
+        Value::Ref(r) => r.as_usize() as i64,
+        _ => 0,
+    }
+}
+
+fn value_as_float_bits(value: Value) -> i64 {
+    match value {
+        Value::Float(f) => f.to_bits() as i64,
+        _ => 0,
+    }
+}
 
 pub trait JitCodeSym {
     fn begin_portal_op(&mut self, _pc: usize) {}
@@ -514,6 +542,15 @@ where
             }
 
             // -- First-class virtualizable access (RPython getfield_vable_*) --
+            // pyjitpl.py:1219-1231 `_opimpl_getarrayitem_vable` (and the
+            // getfield/setfield siblings).  RPython returns
+            // `virtualizable_boxes[index]`, a Box carrying both the traced
+            // reference AND its concrete value; pyre threads the concrete
+            // through the parallel `virtualizable_values` shadow seeded at
+            // `initialize_virtualizable` and updated on every
+            // `vable_setfield` / `vable_setarrayitem_indexed`.  Do NOT peek
+            // the live frame here — stale/shadow divergence caused the
+            // issue #1 from 2026-04-18.
             jitcode::BC_GETFIELD_VABLE_I => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
@@ -522,8 +559,8 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_getfield_int(vable_opref, fielddescr);
-                self.set_int_reg(dest, Some(result), Some(0));
+                let (opref, value) = ctx.vable_getfield_int(vable_opref, fielddescr);
+                self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::BC_GETFIELD_VABLE_R => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -533,8 +570,8 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_getfield_ref(vable_opref, fielddescr);
-                self.set_ref_reg(dest, Some(result), Some(0));
+                let (opref, value) = ctx.vable_getfield_ref(vable_opref, fielddescr);
+                self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::BC_GETFIELD_VABLE_F => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -544,8 +581,8 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_getfield_float(vable_opref, fielddescr);
-                self.set_float_reg(dest, Some(result), Some(0));
+                let (opref, value) = ctx.vable_getfield_float(vable_opref, fielddescr);
+                self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::BC_SETFIELD_VABLE_I => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -555,8 +592,8 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (value, _) = self.read_int_reg(src);
-                ctx.vable_setfield(vable_opref, fielddescr, value);
+                let (value, concrete) = self.read_int_reg(src);
+                ctx.vable_setfield(vable_opref, fielddescr, value, Value::Int(concrete));
             }
             jitcode::BC_SETFIELD_VABLE_R => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -566,8 +603,13 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (value, _) = self.read_ref_reg(src);
-                ctx.vable_setfield(vable_opref, fielddescr, value);
+                let (value, concrete) = self.read_ref_reg(src);
+                ctx.vable_setfield(
+                    vable_opref,
+                    fielddescr,
+                    value,
+                    Value::Ref(majit_ir::GcRef(concrete as usize)),
+                );
             }
             jitcode::BC_SETFIELD_VABLE_F => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -577,8 +619,13 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                let (value, _) = self.read_float_reg(src);
-                ctx.vable_setfield(vable_opref, fielddescr, value);
+                let (value, concrete) = self.read_float_reg(src);
+                ctx.vable_setfield(
+                    vable_opref,
+                    fielddescr,
+                    value,
+                    Value::Float(f64::from_bits(concrete as u64)),
+                );
             }
             jitcode::BC_GETARRAYITEM_VABLE_I => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -590,9 +637,9 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let result =
+                let (opref, value) =
                     ctx.vable_getarrayitem_int_indexed(vable_opref, index, index_value, fdescr);
-                self.set_int_reg(dest, Some(result), Some(0));
+                self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -604,21 +651,9 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                // pyjitpl.py:1219-1231 `_opimpl_getarrayitem_vable` (standard
-                // path). RPython returns `virtualizable_boxes[index]` — a
-                // single Box carrying both the traced reference and its
-                // concrete value. Pyre's `vable_getarrayitem_ref_indexed`
-                // returns the shadow OpRef from the same slot; the concrete
-                // value is carried separately by pyre's ref_values shadow
-                // table when the slot is later written by a traced op.  Do
-                // NOT peek the live PyFrame here — a heap read would
-                // introduce the stale/shadow divergence the user flagged
-                // (Issue 1, 2026-04-18), mixing a traced OpRef with a heap
-                // concrete that has not been flushed by
-                // synchronize_virtualizable.
-                let result =
+                let (opref, value) =
                     ctx.vable_getarrayitem_ref_indexed(vable_opref, index, index_value, fdescr);
-                self.set_ref_reg(dest, Some(result), None);
+                self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -630,9 +665,9 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let result =
+                let (opref, value) =
                     ctx.vable_getarrayitem_float_indexed(vable_opref, index, index_value, fdescr);
-                self.set_float_reg(dest, Some(result), Some(0));
+                self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::BC_SETARRAYITEM_VABLE_I => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -644,8 +679,15 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (value, _) = self.read_int_reg(src);
-                ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
+                let (value, concrete) = self.read_int_reg(src);
+                ctx.vable_setarrayitem_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    value,
+                    Value::Int(concrete),
+                );
             }
             jitcode::BC_SETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -657,8 +699,15 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (value, _) = self.read_ref_reg(src);
-                ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
+                let (value, concrete) = self.read_ref_reg(src);
+                ctx.vable_setarrayitem_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    value,
+                    Value::Ref(majit_ir::GcRef(concrete as usize)),
+                );
             }
             jitcode::BC_SETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -670,8 +719,15 @@ where
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (value, _) = self.read_float_reg(src);
-                ctx.vable_setarrayitem_indexed(vable_opref, index, index_value, fdescr, value);
+                let (value, concrete) = self.read_float_reg(src);
+                ctx.vable_setarrayitem_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    value,
+                    Value::Float(f64::from_bits(concrete as u64)),
+                );
             }
             jitcode::BC_ARRAYLEN_VABLE => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -2316,7 +2372,14 @@ mod tests {
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
         let vable_ref = ctx.const_int(999);
-        ctx.init_virtualizable_boxes(&info, vable_ref, &[field_box, array_box], &[1]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef(999)),
+            &[field_box, array_box],
+            &[Value::Int(111), Value::Int(222)],
+            &[1],
+        );
 
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);

@@ -565,7 +565,19 @@ pub(crate) fn seed_virtualizable_boxes(
         }
     }
     let array_lengths = vec![array_len];
-    ctx.init_virtualizable_boxes(&info, vable_ref, &input_oprefs, &array_lengths);
+    // Bridge-entry seed: OpRefs come from resume-data reconstruction but no
+    // live concrete values are available here — pass an empty `input_values`
+    // to disable the concrete shadow (see `init_virtualizable_boxes`
+    // doc-comment).  Consumers of `virtualizable_entry_at` will fall back
+    // to the zero placeholder, matching the shadow's pre-concrete state.
+    ctx.init_virtualizable_boxes(
+        &info,
+        vable_ref,
+        majit_ir::Value::Void,
+        &input_oprefs,
+        &[],
+        &array_lengths,
+    );
 }
 
 /// resume.py:1054 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
@@ -678,6 +690,20 @@ pub(crate) fn concrete_value_from_slot(obj: PyObjectRef) -> ConcreteValue {
         return ConcreteValue::Ref(pyre_object::PY_NULL);
     }
     ConcreteValue::from_pyobj(obj)
+}
+
+/// Convert pyre's `ConcreteValue` (tagged Int/Float/Ref/Null) into the
+/// `majit_ir::Value` encoding used by `TraceCtx.virtualizable_values`.
+/// `Null` maps to `Value::Ref(GcRef::NULL)` — the vable shadow must hold a
+/// typed value for every slot, so we round-trip untracked refs as NULL
+/// pointers rather than losing the type.
+pub(crate) fn concrete_to_value(concrete: ConcreteValue) -> majit_ir::Value {
+    match concrete {
+        ConcreteValue::Int(v) => majit_ir::Value::Int(v),
+        ConcreteValue::Float(v) => majit_ir::Value::Float(v),
+        ConcreteValue::Ref(r) => majit_ir::Value::Ref(majit_ir::GcRef(r as usize)),
+        ConcreteValue::Null => majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+    }
 }
 
 impl ConcreteValue {

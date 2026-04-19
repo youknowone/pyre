@@ -5,7 +5,7 @@
 
 use crate::state::*;
 
-use majit_ir::{DescrRef, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};

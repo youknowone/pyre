@@ -48,6 +48,12 @@ pub struct TraceCtx {
     /// (RPython parity: `virtualizable_boxes[-1]`). Used by gen_store_back_in_vable
     /// to distinguish standard vs nonstandard virtualizable.
     virtualizable_boxes: Option<Vec<OpRef>>,
+    /// Concrete shadow of `virtualizable_boxes`. Same layout, each slot carries
+    /// the current runtime `Value` (RPython Box ≡ OpRef + concrete value).
+    /// Seeded from `original_boxes` in `initialize_virtualizable` and kept in
+    /// sync on every standard vable write (`vable_setfield`,
+    /// `vable_setarrayitem_indexed`, `store_local_value` mirror).
+    virtualizable_values: Option<Vec<Value>>,
     /// VirtualizableInfo for the standard virtualizable (if any).
     virtualizable_info: Option<VirtualizableInfo>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
@@ -296,6 +302,7 @@ impl TraceCtx {
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
+            virtualizable_values: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             header_pc: 0,
@@ -342,6 +349,7 @@ impl TraceCtx {
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,
+            virtualizable_values: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             header_pc: 0,
@@ -913,21 +921,41 @@ impl TraceCtx {
     /// Initialize standard virtualizable boxes from input args.
     /// Called at trace start when a virtualizable is registered.
     ///
-    /// `input_oprefs` contains one OpRef per static field + array element,
-    /// in the same flat layout as `VirtualizableInfo::get_index_in_array`.
-    /// `vable_ref` is the OpRef of the virtualizable object (frame pointer).
+    /// `input_oprefs` / `input_values` contain one (OpRef, Value) pair per
+    /// static field + array element in the same flat layout as
+    /// `VirtualizableInfo::get_index_in_array`. `vable_ref` / `vable_ref_value`
+    /// are the OpRef and concrete of the virtualizable object (frame pointer).
     /// Boxes layout: [field0, ..., fieldN, arr[0], ..., arr[M], vable_ref]
     /// where `boxes[-1]` is the standard virtualizable identity (RPython parity).
     pub fn init_virtualizable_boxes(
         &mut self,
         info: &VirtualizableInfo,
         vable_ref: OpRef,
+        vable_ref_value: Value,
         input_oprefs: &[OpRef],
+        input_values: &[Value],
         array_lengths: &[usize],
     ) {
         let mut boxes = input_oprefs.to_vec();
         boxes.push(vable_ref); // RPython: virtualizable_boxes[-1] = vable identity
         self.virtualizable_boxes = Some(boxes);
+        if input_values.is_empty() {
+            // Caller has no live concrete values (e.g. bridge-entry rebuild
+            // helper in pyre-jit-trace::state::seed_virtualizable_boxes).
+            // Disable the concrete shadow; `virtualizable_entry_at` will
+            // return None and readers fall back to the zero placeholder,
+            // same as the pre-concrete-shadow state.
+            self.virtualizable_values = None;
+        } else {
+            assert_eq!(
+                input_oprefs.len(),
+                input_values.len(),
+                "init_virtualizable_boxes: OpRef and Value slices must match",
+            );
+            let mut values = input_values.to_vec();
+            values.push(vable_ref_value);
+            self.virtualizable_values = Some(values);
+        }
         self.virtualizable_info = Some(info.clone());
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
     }
@@ -948,7 +976,25 @@ impl TraceCtx {
             .and_then(|boxes| boxes.get(index).copied())
     }
 
-    /// Update a standard virtualizable box by flat index.
+    /// Read a standard virtualizable slot as (OpRef, concrete Value) — RPython
+    /// `virtualizable_boxes[index]` parity: a Box carries both the traced
+    /// reference and its concrete value. Callers that need to seed a register
+    /// with both halves of the Box (e.g. `BC_GETARRAYITEM_VABLE_R` →
+    /// `set_ref_reg`) MUST use this instead of `virtualizable_box_at`.
+    pub fn virtualizable_entry_at(&self, index: usize) -> Option<(OpRef, Value)> {
+        let boxes = self.virtualizable_boxes.as_ref()?;
+        let values = self.virtualizable_values.as_ref()?;
+        let opref = *boxes.get(index)?;
+        let value = *values.get(index)?;
+        Some((opref, value))
+    }
+
+    /// Update a standard virtualizable box (OpRef) by flat index.
+    ///
+    /// Used by SameAs dedup / `replace_box` walks — SSA-rename operations that
+    /// do NOT change the concrete value carried by the slot. For updates that
+    /// also change concrete (vable set{field,arrayitem}), use
+    /// `set_virtualizable_entry_at`.
     pub fn set_virtualizable_box_at(&mut self, index: usize, value: OpRef) -> bool {
         if let Some(boxes) = &mut self.virtualizable_boxes {
             if let Some(slot) = boxes.get_mut(index) {
@@ -957,6 +1003,22 @@ impl TraceCtx {
             }
         }
         false
+    }
+
+    /// Update both halves of a standard virtualizable slot (OpRef + concrete).
+    /// RPython `virtualizable_boxes[index] = valuebox` parity.
+    pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) -> bool {
+        let have_boxes = self
+            .virtualizable_boxes
+            .as_mut()
+            .and_then(|boxes| boxes.get_mut(index).map(|slot| *slot = opref))
+            .is_some();
+        let have_values = self
+            .virtualizable_values
+            .as_mut()
+            .and_then(|vals| vals.get_mut(index).map(|slot| *slot = value))
+            .is_some();
+        have_boxes && have_values
     }
 
     /// Return the standard virtualizable identity (`virtualizable_boxes[-1]`).
@@ -992,12 +1054,29 @@ impl TraceCtx {
     /// Set virtualizable_boxes with VirtualizableInfo and array lengths.
     /// Used by bridge tracing where the boxes are reconstructed from
     /// resume data (pyjitpl.py:3400 rebuild_state_after_failure parity).
+    ///
+    /// `values` carries the concrete shadow that parallels `boxes`. Callers
+    /// must pass the matching live values recovered from the guard's fail
+    /// args; an empty `values` slice disables the concrete shadow for the
+    /// duration of the bridge (only safe when the bridge does not execute
+    /// any `BC_GET*_VABLE_*` opcodes that feed `set_*_reg`).
     pub fn set_virtualizable_boxes_with_info(
         &mut self,
         boxes: Vec<OpRef>,
+        values: Vec<Value>,
         info: &VirtualizableInfo,
         array_lengths: &[usize],
     ) {
+        if !values.is_empty() {
+            assert_eq!(
+                boxes.len(),
+                values.len(),
+                "set_virtualizable_boxes_with_info: boxes/values length mismatch",
+            );
+            self.virtualizable_values = Some(values);
+        } else {
+            self.virtualizable_values = None;
+        }
         self.virtualizable_boxes = Some(boxes);
         self.virtualizable_info = Some(info.clone());
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
@@ -1319,10 +1398,15 @@ impl TraceCtx {
     ///      index = self._get_virtualizable_field_index(fielddescr)
     ///      return self.metainterp.virtualizable_boxes[index]
     /// ```
-    pub fn vable_getfield_int(&mut self, vable_opref: OpRef, fielddescr: DescrRef) -> OpRef {
+    pub fn vable_getfield_int(
+        &mut self,
+        vable_opref: OpRef,
+        fielddescr: DescrRef,
+    ) -> (OpRef, Value) {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // self.opimpl_getfield_gc_i(box, fielddescr)
-            return self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
+            let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
+            return (op, Value::Void);
         }
         // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
         // index = self._get_virtualizable_field_index(fielddescr)
@@ -1331,11 +1415,14 @@ impl TraceCtx {
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
-        if let (Some(idx), Some(boxes)) = (index, self.virtualizable_boxes.as_ref()) {
-            return boxes[idx];
+        if let Some(idx) = index {
+            if let Some(entry) = self.virtualizable_entry_at(idx) {
+                return entry;
+            }
         }
         // Fallback for tests/missing layout
-        self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr)
+        let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
+        (op, Value::Void)
     }
 
     /// Record a virtualizable field read with an explicit field descriptor.
@@ -1354,7 +1441,13 @@ impl TraceCtx {
     ///      self.metainterp.synchronize_virtualizable()
     ///      # XXX only the index'th field needs to be synchronized, really
     /// ```
-    pub fn vable_setfield(&mut self, vable_opref: OpRef, fielddescr: DescrRef, value: OpRef) {
+    pub fn vable_setfield(
+        &mut self,
+        vable_opref: OpRef,
+        fielddescr: DescrRef,
+        value: OpRef,
+        concrete: Value,
+    ) {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
             self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], fielddescr);
@@ -1367,8 +1460,7 @@ impl TraceCtx {
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index {
-            if let Some(boxes) = &mut self.virtualizable_boxes {
-                boxes[idx] = value;
+            if self.set_virtualizable_entry_at(idx, value, concrete) {
                 // self.metainterp.synchronize_virtualizable() — no-op in pyre.
                 return;
             }
@@ -1392,18 +1484,26 @@ impl TraceCtx {
     ///      index = self._get_virtualizable_field_index(fielddescr)
     ///      return self.metainterp.virtualizable_boxes[index]
     /// ```
-    pub fn vable_getfield_ref(&mut self, vable_opref: OpRef, fielddescr: DescrRef) -> OpRef {
+    pub fn vable_getfield_ref(
+        &mut self,
+        vable_opref: OpRef,
+        fielddescr: DescrRef,
+    ) -> (OpRef, Value) {
         if self.is_nonstandard_virtualizable(vable_opref) {
-            return self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
+            let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
+            return (op, Value::Void);
         }
         let index = self
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
-        if let (Some(idx), Some(boxes)) = (index, self.virtualizable_boxes.as_ref()) {
-            return boxes[idx];
+        if let Some(idx) = index {
+            if let Some(entry) = self.virtualizable_entry_at(idx) {
+                return entry;
+            }
         }
-        self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr)
+        let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
+        (op, Value::Void)
     }
 
     /// Record a virtualizable ref field read with an explicit field descriptor.
@@ -1421,18 +1521,26 @@ impl TraceCtx {
     ///      index = self._get_virtualizable_field_index(fielddescr)
     ///      return self.metainterp.virtualizable_boxes[index]
     /// ```
-    pub fn vable_getfield_float(&mut self, vable_opref: OpRef, fielddescr: DescrRef) -> OpRef {
+    pub fn vable_getfield_float(
+        &mut self,
+        vable_opref: OpRef,
+        fielddescr: DescrRef,
+    ) -> (OpRef, Value) {
         if self.is_nonstandard_virtualizable(vable_opref) {
-            return self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
+            let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
+            return (op, Value::Void);
         }
         let index = self
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
-        if let (Some(idx), Some(boxes)) = (index, self.virtualizable_boxes.as_ref()) {
-            return boxes[idx];
+        if let Some(idx) = index {
+            if let Some(entry) = self.virtualizable_entry_at(idx) {
+                return entry;
+            }
         }
-        self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr)
+        let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
+        (op, Value::Void)
     }
 
     /// Record a virtualizable array item read (GETARRAYITEM_GC_I).
@@ -1449,15 +1557,16 @@ impl TraceCtx {
         array_opref: OpRef,
         fdescr: &DescrRef,
         item_index: usize,
-    ) -> OpRef {
+    ) -> (OpRef, Value) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some(boxes) = &self.virtualizable_boxes {
-                return boxes[flat_idx];
+            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
+                return entry;
             }
         }
         let index = self.const_int(item_index as i64);
         let zero = self.const_int(0);
-        self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
+        let op = self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero]);
+        (op, Value::Void)
     }
 
     /// pyjitpl.py:1201-1216 `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
@@ -1512,20 +1621,20 @@ impl TraceCtx {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-    ) -> OpRef {
+    ) -> (OpRef, Value) {
         if self.is_nonstandard_virtualizable(vable_opref) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            return self.vable_getarrayitem_int(array_opref, index);
+            return (self.vable_getarrayitem_int(array_opref, index), Value::Void);
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // return self.metainterp.virtualizable_boxes[index]
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
         {
-            if let Some(boxes) = &self.virtualizable_boxes {
-                return boxes[flat_idx];
+            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
+                return entry;
             }
         }
         // Fallback: vable layout missing — go through getfield + arrayitem.
@@ -1534,7 +1643,7 @@ impl TraceCtx {
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_int_vable(array_opref, &fdescr, item_index)
         } else {
-            self.vable_getarrayitem_int(array_opref, index)
+            (self.vable_getarrayitem_int(array_opref, index), Value::Void)
         }
     }
 
@@ -1544,15 +1653,16 @@ impl TraceCtx {
         array_opref: OpRef,
         fdescr: &DescrRef,
         item_index: usize,
-    ) -> OpRef {
+    ) -> (OpRef, Value) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some(boxes) = &self.virtualizable_boxes {
-                return boxes[flat_idx];
+            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
+                return entry;
             }
         }
         let index = self.const_int(item_index as i64);
         let zero = self.const_int(0);
-        self.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero])
+        let op = self.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero]);
+        (op, Value::Void)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
@@ -1562,16 +1672,16 @@ impl TraceCtx {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-    ) -> OpRef {
+    ) -> (OpRef, Value) {
         if self.is_nonstandard_virtualizable(vable_opref) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            return self.vable_getarrayitem_ref(array_opref, index);
+            return (self.vable_getarrayitem_ref(array_opref, index), Value::Void);
         }
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
         {
-            if let Some(boxes) = &self.virtualizable_boxes {
-                return boxes[flat_idx];
+            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
+                return entry;
             }
         }
         let array_opref =
@@ -1579,7 +1689,7 @@ impl TraceCtx {
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_ref_vable(array_opref, &fdescr, item_index)
         } else {
-            self.vable_getarrayitem_ref(array_opref, index)
+            (self.vable_getarrayitem_ref(array_opref, index), Value::Void)
         }
     }
 
@@ -1589,15 +1699,16 @@ impl TraceCtx {
         array_opref: OpRef,
         fdescr: &DescrRef,
         item_index: usize,
-    ) -> OpRef {
+    ) -> (OpRef, Value) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some(boxes) = &self.virtualizable_boxes {
-                return boxes[flat_idx];
+            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
+                return entry;
             }
         }
         let index = self.const_int(item_index as i64);
         let zero = self.const_int(0);
-        self.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero])
+        let op = self.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero]);
+        (op, Value::Void)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
@@ -1607,16 +1718,19 @@ impl TraceCtx {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-    ) -> OpRef {
+    ) -> (OpRef, Value) {
         if self.is_nonstandard_virtualizable(vable_opref) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-            return self.vable_getarrayitem_float(array_opref, index);
+            return (
+                self.vable_getarrayitem_float(array_opref, index),
+                Value::Void,
+            );
         }
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
         {
-            if let Some(boxes) = &self.virtualizable_boxes {
-                return boxes[flat_idx];
+            if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
+                return entry;
             }
         }
         let array_opref =
@@ -1624,7 +1738,10 @@ impl TraceCtx {
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_float_vable(array_opref, &fdescr, item_index)
         } else {
-            self.vable_getarrayitem_float(array_opref, index)
+            (
+                self.vable_getarrayitem_float(array_opref, index),
+                Value::Void,
+            )
         }
     }
 
@@ -1637,11 +1754,11 @@ impl TraceCtx {
         fdescr: &DescrRef,
         item_index: usize,
         value: OpRef,
+        concrete: Value,
     ) {
         let flat_idx = self.vable_array_flat_index(fdescr, item_index);
         if let Some(idx) = flat_idx {
-            if let Some(boxes) = &mut self.virtualizable_boxes {
-                boxes[idx] = value;
+            if self.set_virtualizable_entry_at(idx, value, concrete) {
                 return;
             }
         }
@@ -1658,6 +1775,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: DescrRef,
         value: OpRef,
+        concrete: Value,
     ) {
         if self.is_nonstandard_virtualizable(vable_opref) {
             let array_opref =
@@ -1667,8 +1785,7 @@ impl TraceCtx {
         }
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
         {
-            if let Some(boxes) = &mut self.virtualizable_boxes {
-                boxes[flat_idx] = value;
+            if self.set_virtualizable_entry_at(flat_idx, value, concrete) {
                 // self.metainterp.synchronize_virtualizable() — no-op in pyre.
                 return;
             }
@@ -1676,7 +1793,7 @@ impl TraceCtx {
         let array_opref =
             self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
-            self.vable_setarrayitem_vable(array_opref, &fdescr, item_index, value);
+            self.vable_setarrayitem_vable(array_opref, &fdescr, item_index, value, concrete);
         } else {
             self.vable_setarrayitem(array_opref, index, value);
         }
