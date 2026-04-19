@@ -1822,6 +1822,13 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; nlocals]
         };
+        // Step 1.5 of the regalloc-parity refactor (RPython MIFrame
+        // pyjitpl.py:74-78 init): mirror the initial local OpRefs into
+        // the abstract register file. Identity color (= local idx)
+        // for now — Step 1.1/1.2 dual-write keeps this in sync at
+        // every load/store; init seed is the same per-trace baseline
+        // (bridge override / virtualizable inputarg / NONE).
+        self.registers_r = self.symbolic_locals.clone();
         let inputarg_slot_types = self.vable_array_base.map(|base| {
             let inputarg_types = ctx.inputarg_types();
             let locals: Vec<Type> = (0..nlocals)
