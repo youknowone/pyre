@@ -1896,18 +1896,22 @@ impl MIFrame {
                     ctx,
                     Some(array_item_type),
                 ));
-            } else if let Some(frame) = concrete_frame {
-                let val = frame
-                    .locals_w()
-                    .as_slice()
-                    .get(i)
-                    .copied()
-                    .unwrap_or(pyre_object::PY_NULL);
-                boxes.push(majit_trace::recorder::SnapshotTagged::Const(
-                    val as i64,
-                    array_item_type,
-                ));
             } else {
+                // PRE-EXISTING-ADAPTATION: legacy `register == PyFrame
+                // slot` conflation (plan Stage 3.4) lets STORE_FAST
+                // write an unboxed int into `locals_cells_stack_w[i]`
+                // when the trace IR optimizer promoted that local's
+                // OpRef to Int. Reading those raw bits back here and
+                // const-seeding them as `Const(val, Ref)` mistypes
+                // the value in the bridge optimizer's const_pool —
+                // verified root cause of the LoadFastLoadFast vable
+                // conversion regression (memory:
+                // vable_locals_lowering_analysis.md fix option b).
+                //
+                // Emit a NULL sentinel; the bridge resume will
+                // re-fetch the actual slot value via
+                // `vable_getarrayitem_r` against the live frame.
+                let _ = concrete_frame;
                 boxes.push(Self::opref_to_snapshot_tagged_for_slot(
                     OpRef::NONE,
                     ctx,
