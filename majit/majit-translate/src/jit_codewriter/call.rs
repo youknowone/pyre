@@ -5355,4 +5355,102 @@ mod tests {
             "inherent impls must not appear as indirect candidates"
         );
     }
+
+    /// A trait-default method (registered under the synthetic
+    /// `"<default methods of Trait>"` impl-type produced by
+    /// `parse.rs:327-332`) must show up in the same indirect-call
+    /// family as concrete overrides.  This keeps
+    /// `lower_indirect_calls`'s `all_impls_for_indirect(...)` family
+    /// correct when a `dyn Trait` receiver can route to either the
+    /// default body or an override at runtime — parity with RPython
+    /// `rpbc.py:199-217` `c_graphs = row_of_graphs.values()`, which
+    /// lists every graph reachable through the trait's vtable slot.
+    #[test]
+    fn dyn_trait_default_method_uses_same_indirect_family() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method("m", Some("Foo"), "A", FunctionGraph::new("A::m"));
+        cc.register_trait_method(
+            "m",
+            Some("Foo"),
+            "<default methods of Foo>",
+            FunctionGraph::new("<default methods of Foo>::m"),
+        );
+
+        let family = cc.all_impls_for_indirect("Foo", "m");
+        let segs: Vec<String> = family.iter().map(|p| p.segments.join("::")).collect();
+        assert!(
+            segs.iter().any(|s| s.starts_with("A")),
+            "family must include overriding impl A, got {segs:?}"
+        );
+        assert!(
+            segs.iter().any(|s| s.contains("<default methods of Foo>")),
+            "family must include trait default-method entry, got {segs:?}"
+        );
+        assert_eq!(
+            family.len(),
+            2,
+            "family must have exactly two members (default + override), got {segs:?}"
+        );
+    }
+
+    /// Two trait objects that differ only in their generic arguments
+    /// (`Handler<i64>` vs `Handler<String>`) must be treated as separate
+    /// indirect-call families.  Conflating them would produce a mixed
+    /// family whose candidates accept incompatible argument types —
+    /// `rpython/jit/codewriter/call.py:259-280`'s family validation
+    /// would reject the mixed descriptor, and the dispatch would
+    /// dead-end at runtime.  The family key passed to
+    /// `all_impls_for_indirect` must preserve the full `trait_root`
+    /// (including generic args), not a bare `Handler` root.
+    #[test]
+    fn dyn_trait_generic_family_key_preserved() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "run",
+            Some("Handler<i64>"),
+            "A",
+            FunctionGraph::new("A::run"),
+        );
+        cc.register_trait_method(
+            "run",
+            Some("Handler<String>"),
+            "B",
+            FunctionGraph::new("B::run"),
+        );
+
+        let i64_family = cc.all_impls_for_indirect("Handler<i64>", "run");
+        let string_family = cc.all_impls_for_indirect("Handler<String>", "run");
+        let bare_family = cc.all_impls_for_indirect("Handler", "run");
+
+        let segs =
+            |v: &[CallPath]| -> Vec<String> { v.iter().map(|p| p.segments.join("::")).collect() };
+
+        let i64_segs = segs(&i64_family);
+        let string_segs = segs(&string_family);
+        assert_eq!(
+            i64_family.len(),
+            1,
+            "Handler<i64> family must contain only A, got {i64_segs:?}"
+        );
+        assert!(
+            i64_segs[0].starts_with("A"),
+            "Handler<i64> must resolve to impl A, got {i64_segs:?}"
+        );
+        assert_eq!(
+            string_family.len(),
+            1,
+            "Handler<String> family must contain only B, got {string_segs:?}"
+        );
+        assert!(
+            string_segs[0].starts_with("B"),
+            "Handler<String> must resolve to impl B, got {string_segs:?}"
+        );
+        assert!(
+            bare_family.is_empty(),
+            "bare `Handler` (generic args stripped) must NOT match a \
+             generic-instantiated family — conflation would cross \
+             incompatible argument types; got {:?}",
+            segs(&bare_family),
+        );
+    }
 }
