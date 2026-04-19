@@ -1434,6 +1434,12 @@ struct DiscoveredHelper {
     attr_name: String,
     /// `None` for free fns, `Some(segments)` for impl methods.
     impl_type_segments: Option<Vec<Ident>>,
+    /// `Some(segments)` for trait impls (`impl Trait for Type { fn m }`),
+    /// carrying the trait path segments. Emitted in the fnaddr cast as
+    /// `<Type as Trait>::method` to disambiguate when a type has
+    /// multiple inherent/trait methods named `method`. `None` for
+    /// inherent impls (plain `<Type>::method`) and free fns.
+    trait_type_segments: Option<Vec<Ident>>,
 }
 
 /// Extract the identifier sequence from a `syn::Type::Path`, e.g.
@@ -1480,6 +1486,7 @@ fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
                             fn_name: func.sig.ident.clone(),
                             attr_name,
                             impl_type_segments: None,
+                            trait_type_segments: None,
                         });
                         // Only record the first JIT attribute per function
                         break;
@@ -1494,6 +1501,23 @@ fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
                 let Some(impl_segs) = impl_type_path_segments(&item_impl.self_ty) else {
                     continue;
                 };
+                // `impl Trait for Type { ... }` — carry the trait path
+                // so the fnaddr cast can disambiguate via
+                // `<Type as Trait>::method`. RPython `getfunctionptr(graph)`
+                // uses graph identity directly so no such aliasing exists
+                // upstream; in Rust a bare `<Type>::method` cast is
+                // ambiguous when the Type carries multiple trait methods
+                // with the same name (or a name-colliding inherent).
+                let trait_segs: Option<Vec<Ident>> =
+                    item_impl.trait_.as_ref().and_then(|(_, path, _)| {
+                        Some(
+                            path.segments
+                                .iter()
+                                .map(|seg| seg.ident.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                        .filter(|segs: &Vec<Ident>| !segs.is_empty())
+                    });
                 for impl_item in &item_impl.items {
                     let syn::ImplItem::Fn(method) = impl_item else {
                         continue;
@@ -1504,6 +1528,7 @@ fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
                                 fn_name: method.sig.ident.clone(),
                                 attr_name,
                                 impl_type_segments: Some(impl_segs.clone()),
+                                trait_type_segments: trait_segs.clone(),
                             });
                             break;
                         }
@@ -1610,59 +1635,30 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
-    let helper_addr_exprs: Vec<proc_macro2::TokenStream> = discovered
-        .iter()
-        .map(|h| {
-            let fn_name = &h.fn_name;
-            match &h.impl_type_segments {
-                // Free fn: route through the existing call-policy trampoline.
-                None => {
-                    let policy_fn = format_ident!("__majit_call_policy_{}", fn_name);
-                    quote! {
-                        {
-                            let (_, _inline_builder, __trace_target, __concrete_target) = #policy_fn();
-                            let __trace_target = if __trace_target.is_null() {
-                                if __concrete_target.is_null() {
-                                    #fn_name as *const ()
-                                } else {
-                                    __concrete_target
-                                }
-                            } else {
-                                __trace_target
-                            };
-                            __trace_target as usize as i64
-                        }
-                    }
-                }
-                // Impl method: direct associated-function pointer. Works
-                // for any signature Rust accepts as a `fn` pointer — free
-                // (no receiver), `&self`, `&mut self`, `self by value`.
-                Some(segs) => {
-                    let ty_path = path_tokens_from_segs(segs);
-                    quote! {
-                        <#ty_path>::#fn_name as *const () as usize as i64
-                    }
-                }
-            }
-        })
-        .collect();
+    let helper_addr_exprs: Vec<proc_macro2::TokenStream> =
+        discovered.iter().map(|h| impl_addr_expr(h)).collect();
 
-    // Structured impl-method registry: `(impl_type_joined, method, fnaddr)`.
-    // Consumers bind this through `CallControl::register_macro_impl_helper_trace_fnaddr`
-    // as the 2-segment CallPath `[impl_type_joined, method]` that matches
-    // the parser's canonical `self_ty_root`-keyed path (lib.rs:406-433).
+    // Structured impl-method registry:
+    //   `(module_path_with_crate, impl_type_as_written, method, fnaddr)`.
+    // The codewriter consumes this through
+    // `CallControl::register_macro_impl_helper_trace_fnaddr` which applies
+    // the parser's `qualify_type_name` rule (front/ast.rs:106) to decide
+    // whether to prepend the module prefix before registering the
+    // canonical 2-segment CallPath `[impl_type_joined, method]`
+    // (lib.rs:406-433).
     let impl_entries: Vec<proc_macro2::TokenStream> = discovered
         .iter()
         .filter_map(|h| {
             let segs = h.impl_type_segments.as_ref()?;
             let fn_name = &h.fn_name;
-            let ty_path = path_tokens_from_segs(segs);
-            let impl_type_joined = segs_joined(segs);
+            let impl_type_as_written = segs_joined(segs);
+            let addr = impl_addr_expr(h);
             Some(quote! {
                 (
-                    #impl_type_joined,
+                    module_path!(),
+                    #impl_type_as_written,
                     stringify!(#fn_name),
-                    <#ty_path>::#fn_name as *const () as usize as i64,
+                    #addr,
                 )
             })
         })
@@ -1701,15 +1697,18 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let registry_impl_trace_fnaddrs = quote! {
         /// Hidden registry mapping each discovered impl-method helper to
-        /// its `(impl_type_joined, method_name, fnaddr)` triple. Consumers
-        /// feed this through `CallControl::register_macro_impl_helper_trace_fnaddr`
-        /// which stores the 2-segment canonical CallPath
+        /// its `(module_path_with_crate, impl_type_as_written, method_name, fnaddr)`
+        /// 4-tuple. The codewriter consumes this through
+        /// `CallControl::register_macro_impl_helper_trace_fnaddr`, which
+        /// applies the parser's `qualify_type_name` rule
+        /// (front/ast.rs:106) to decide whether to prepend the module
+        /// prefix before storing the canonical 2-segment CallPath
         /// `[impl_type_joined, method]` — same shape the parser uses for
         /// `self_ty_root`-keyed methods (parse.rs:702, lib.rs:406-433).
         #[doc(hidden)]
         #[allow(dead_code)]
         pub fn __majit_helper_impl_trace_fnaddrs()
-            -> ::std::vec::Vec<(&'static str, &'static str, i64)>
+            -> ::std::vec::Vec<(&'static str, &'static str, &'static str, i64)>
         {
             ::std::vec![
                 #(#impl_entries),*
@@ -1730,6 +1729,50 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     module.content = Some((brace, new_items));
 
     quote! { #module }.into()
+}
+
+/// Emit the runtime address expression for a `DiscoveredHelper`:
+///
+/// * Free fn: route through `__majit_call_policy_<name>()` (no change).
+/// * Inherent impl (`impl Type { ... }`): `<Type>::method as *const ()`.
+/// * Trait impl (`impl Trait for Type { ... }`):
+///   `<Type as Trait>::method as *const ()` — fully-qualified trait
+///   method syntax, so the cast is unambiguous when the type carries
+///   multiple name-colliding inherent/trait methods. RPython's
+///   `getfunctionptr(graph)` uses graph identity directly so upstream
+///   never needs this disambiguation.
+fn impl_addr_expr(h: &DiscoveredHelper) -> proc_macro2::TokenStream {
+    let fn_name = &h.fn_name;
+    let Some(impl_segs) = h.impl_type_segments.as_ref() else {
+        let policy_fn = format_ident!("__majit_call_policy_{}", fn_name);
+        return quote! {
+            {
+                let (_, _inline_builder, __trace_target, __concrete_target) = #policy_fn();
+                let __trace_target = if __trace_target.is_null() {
+                    if __concrete_target.is_null() {
+                        #fn_name as *const ()
+                    } else {
+                        __concrete_target
+                    }
+                } else {
+                    __trace_target
+                };
+                __trace_target as usize as i64
+            }
+        };
+    };
+    let ty_path = path_tokens_from_segs(impl_segs);
+    match h.trait_type_segments.as_ref() {
+        Some(trait_segs) => {
+            let trait_path = path_tokens_from_segs(trait_segs);
+            quote! {
+                <#ty_path as #trait_path>::#fn_name as *const () as usize as i64
+            }
+        }
+        None => quote! {
+            <#ty_path>::#fn_name as *const () as usize as i64
+        },
+    }
 }
 
 /// Build a `concat!(stringify!(s1), "::", stringify!(s2), …)` token

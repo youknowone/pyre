@@ -875,14 +875,31 @@ impl CallControl {
     /// and `<Type as Trait>::method`.
     pub fn register_macro_impl_helper_trace_fnaddr(
         &mut self,
-        impl_type_joined: &str,
+        module_path_with_crate: &str,
+        impl_type_as_written: &str,
         method: &str,
         fnaddr: i64,
     ) {
-        if fnaddr == 0 || impl_type_joined.is_empty() || method.is_empty() {
+        if fnaddr == 0 || impl_type_as_written.is_empty() || method.is_empty() {
             return;
         }
-        self.register_function_fnaddr(CallPath::for_impl_method(impl_type_joined, method), fnaddr);
+        // front/ast.rs:106 `qualify_type_name`: bare types take the
+        // current module prefix; already-qualified types keep their
+        // exact written form.  Module prefix is everything after the
+        // first `::`-separated segment (the crate name) of
+        // `module_path_with_crate`, matching the parser's `prefix`
+        // argument which starts empty at crate root and accumulates
+        // submodule idents (parse.rs:314-318).
+        let module_prefix = module_path_with_crate
+            .split_once("::")
+            .map(|(_crate, rest)| rest)
+            .unwrap_or("");
+        let impl_type_joined = if impl_type_as_written.contains("::") || module_prefix.is_empty() {
+            impl_type_as_written.to_string()
+        } else {
+            format!("{module_prefix}::{impl_type_as_written}")
+        };
+        self.register_function_fnaddr(CallPath::for_impl_method(&impl_type_joined, method), fnaddr);
     }
 
     /// Register a trait impl method graph.
@@ -4291,14 +4308,21 @@ mod tests {
     }
 
     #[test]
-    fn register_macro_impl_helper_binds_simple_type() {
-        // Pyre's canonical impl-method CallPath for
-        // `impl Adder { fn add() }` at module `impl_module` is
-        // `CallPath::for_impl_method("impl_module::Adder", "add")` —
-        // impl_type is split on `::` so every segment has the same
-        // granularity as free-fn paths.
+    fn register_macro_impl_helper_qualifies_bare_type_with_module_prefix() {
+        // `impl Adder { fn add() }` at `mod impl_module` — macro emits
+        // `impl_type_as_written = "Adder"` (bare), and
+        // `module_path_with_crate = "testcrate::impl_module"`.  The
+        // codewriter must prepend the module prefix so the canonical
+        // CallPath matches the parser's `qualify_type_name("Adder",
+        // "impl_module") = "impl_module::Adder"` result
+        // (front/ast.rs:106).
         let mut cc = CallControl::new();
-        cc.register_macro_impl_helper_trace_fnaddr("impl_module::Adder", "add", 0xfeed_beef);
+        cc.register_macro_impl_helper_trace_fnaddr(
+            "testcrate::impl_module",
+            "Adder",
+            "add",
+            0xfeed_beef,
+        );
 
         assert_eq!(
             cc.fnaddr_for_target(&CallTarget::function_path(["impl_module", "Adder", "add"])),
@@ -4307,15 +4331,47 @@ mod tests {
     }
 
     #[test]
-    fn register_macro_impl_helper_binds_module_qualified_type() {
-        // `impl a::Foo { fn bar() }` — impl_type `"a::Foo"` splits into
-        // `[a, Foo]` and merges with the method to form `[a, Foo, bar]`.
+    fn register_macro_impl_helper_keeps_qualified_type_unchanged() {
+        // `impl a::Foo { fn bar() }` — already-qualified type must not
+        // get the module prefix prepended (front/ast.rs:107 returns
+        // bare-as-is when it contains `::`).  The canonical path
+        // matches `CallPath::for_impl_method("a::Foo", "bar")`.
         let mut cc = CallControl::new();
-        cc.register_macro_impl_helper_trace_fnaddr("a::Foo", "bar", 0x1234);
+        cc.register_macro_impl_helper_trace_fnaddr(
+            "testcrate::other_module",
+            "a::Foo",
+            "bar",
+            0x1234,
+        );
 
         assert_eq!(
             cc.fnaddr_for_target(&CallTarget::function_path(["a", "Foo", "bar"])),
             0x1234
+        );
+        // Must NOT also be bound under the module-prefixed form.
+        assert_ne!(
+            cc.fnaddr_for_target(&CallTarget::function_path([
+                "other_module",
+                "a",
+                "Foo",
+                "bar"
+            ])),
+            0x1234,
+        );
+    }
+
+    #[test]
+    fn register_macro_impl_helper_at_crate_root_has_no_prefix() {
+        // `#[jit_module]` at crate root: `module_path!()` is just the
+        // crate name, so after stripping the crate there's no module
+        // prefix; bare impl_type stays bare — matching the parser's
+        // `prefix = ""` at crate root (parse.rs:314-318).
+        let mut cc = CallControl::new();
+        cc.register_macro_impl_helper_trace_fnaddr("testcrate", "Adder", "add", 0xabcd);
+
+        assert_eq!(
+            cc.fnaddr_for_target(&CallTarget::function_path(["Adder", "add"])),
+            0xabcd
         );
     }
 

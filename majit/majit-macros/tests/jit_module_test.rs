@@ -202,26 +202,103 @@ fn test_jit_module_discovers_impl_methods_including_receivers() {
 #[test]
 fn test_jit_module_emits_structured_impl_trace_fnaddrs() {
     let entries = impl_walk_module::__majit_helper_impl_trace_fnaddrs();
-    // Entries are `(impl_type_joined, method, fnaddr)` triples.
+    // Entries are
+    //   `(module_path_with_crate, impl_type_as_written, method, fnaddr)`
+    // 4-tuples. The codewriter applies `qualify_type_name`
+    // (front/ast.rs:106) using `module_path_with_crate` to decide
+    // whether to prepend the module prefix.
     assert_eq!(entries.len(), 2);
+
+    let expected_module_path = concat!(module_path!(), "::impl_walk_module");
 
     let add_entry = entries
         .iter()
-        .find(|(ty, m, _)| *ty == "Adder" && *m == "add")
+        .find(|(_, ty, m, _)| *ty == "Adder" && *m == "add")
         .expect("Adder::add entry");
+    assert_eq!(add_entry.0, expected_module_path);
     assert_eq!(
-        add_entry.2,
+        add_entry.3,
         impl_walk_module::Adder::add as *const () as usize as i64,
     );
 
     let bump_entry = entries
         .iter()
-        .find(|(ty, m, _)| *ty == "Adder" && *m == "bump")
+        .find(|(_, ty, m, _)| *ty == "Adder" && *m == "bump")
         .expect("Adder::bump entry");
+    assert_eq!(bump_entry.0, expected_module_path);
     // Casting a `&self` associated fn to a plain `*const ()` works —
     // confirms Rust allows the coercion the reviewer called out.
     assert_eq!(
-        bump_entry.2,
+        bump_entry.3,
         impl_walk_module::Adder::bump as *const () as usize as i64,
+    );
+}
+
+// Trait-impl disambiguation: when a type implements a trait method
+// whose name could collide with an inherent method (or with another
+// trait's method), the macro must emit `<Type as Trait>::method` to
+// keep the fnaddr cast unambiguous. RPython `getfunctionptr(graph)`
+// (call.py:174) does not need this because it uses graph identity;
+// pyre's Rust-layer registry does need it.
+pub trait NameCollider {
+    fn conflict(&self) -> i64;
+}
+
+#[jit_module]
+mod trait_impl_module {
+    use super::NameCollider;
+    use majit_macros::unroll_safe;
+
+    pub struct Widget {
+        pub value: i64,
+    }
+
+    // Inherent method with the same name as the trait's — without
+    // `<Widget as NameCollider>::conflict` disambiguation the fnaddr
+    // cast would be rejected by rustc.
+    impl Widget {
+        #[unroll_safe]
+        pub fn conflict(&self) -> i64 {
+            self.value * 10
+        }
+    }
+
+    impl NameCollider for Widget {
+        #[unroll_safe]
+        fn conflict(&self) -> i64 {
+            self.value + 1
+        }
+    }
+}
+
+#[test]
+fn test_jit_module_disambiguates_trait_impl_with_as_trait_cast() {
+    let entries = trait_impl_module::__majit_helper_impl_trace_fnaddrs();
+    assert_eq!(entries.len(), 2, "both methods discovered: {entries:?}");
+
+    let widget = trait_impl_module::Widget { value: 3 };
+    // Find both entries.
+    let mut seen_inherent = false;
+    let mut seen_trait = false;
+    for (_module_path, ty, method, fnaddr) in &entries {
+        assert_eq!(*ty, "Widget");
+        assert_eq!(*method, "conflict");
+        // The fnaddr is one of the two method addresses; call through
+        // the address to verify which.
+        let fp: fn(&trait_impl_module::Widget) -> i64 =
+            unsafe { std::mem::transmute(*fnaddr as usize) };
+        let result = fp(&widget);
+        if result == 30 {
+            seen_inherent = true;
+        } else if result == 4 {
+            seen_trait = true;
+        } else {
+            panic!("unexpected conflict() result {result}");
+        }
+    }
+    assert!(seen_inherent, "inherent Widget::conflict entry missing");
+    assert!(
+        seen_trait,
+        "<Widget as NameCollider>::conflict entry missing"
     );
 }

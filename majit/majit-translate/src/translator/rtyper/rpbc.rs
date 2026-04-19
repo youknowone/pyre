@@ -96,7 +96,26 @@ pub fn lower_indirect_calls(
         );
         // RPython rpbc.py:216 `c_graphs = row_of_graphs.values()` — full
         // family without JIT candidate filtering.
-        let graphs = Some(call_control.all_impls_for_indirect(&trait_root, &method_name));
+        //
+        // `None` means "unknown family" — matches
+        // `rpython/translator/backendopt/graphanalyze.py:117`, where
+        // `graphs is None` short-circuits family analyzers to
+        // `top_result()` (conservative: canraise, can_invalidate, etc.
+        // default to True). `Some(vec![])` would instead be treated as
+        // "empty family → No/false" by every analyzer, which is unsafe
+        // when external/unregistered impls might still be called.
+        // Pyre's source-only parser only sees `#[trait_method]`-
+        // registered impls; if none are registered for a
+        // `(trait, method)` family, we don't know whether that's
+        // because the family is truly empty or because the impls live
+        // outside the analyzed sources, so we take the conservative
+        // `None` path.
+        let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
+        let graphs = if family.is_empty() {
+            None
+        } else {
+            Some(family)
+        };
         // The original Call op is now at index `oi + 1` because
         // `class_get_method_ptr` inserted `VtableMethodPtr` at `oi`.
         graph.blocks[bid].operations[oi + 1] = SpaceOperation {

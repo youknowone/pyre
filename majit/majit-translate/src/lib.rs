@@ -188,14 +188,17 @@ pub type VirtualizableInfoFactory<'a> =
 pub type FnAddrBindings<'a> = [(&'a str, i64)];
 
 /// Structured binding table for impl-method helpers.  Each entry is
-/// `(impl_type_joined, method_name, fnaddr)` — the same
-/// `[impl_type_joined, method]` 2-segment CallPath the parser stores
-/// for `self_ty_root`-keyed methods (lib.rs:406-433).
+/// `(module_path_with_crate, impl_type_as_written, method_name, fnaddr)`.
+/// The codewriter applies the parser's `qualify_type_name` rule
+/// (front/ast.rs:106) — bare types get the module prefix (minus crate
+/// name) prepended, qualified types are kept verbatim — before storing
+/// the canonical `[impl_type_joined, method]` 2-segment CallPath
+/// (lib.rs:406-433).
 ///
 /// `#[jit_module]::__majit_helper_impl_trace_fnaddrs()` produces this
 /// shape and `analyze_pipeline_from_parsed` feeds it through
 /// `CallControl::register_macro_impl_helper_trace_fnaddr`.
-pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, i64)];
+pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, &'a str, i64)];
 
 /// Multi-file analysis with explicit layout provider AND a
 /// `VirtualizableInfo` factory wired into
@@ -496,8 +499,13 @@ fn analyze_pipeline_from_parsed(
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }
-    for &(impl_type_joined, method, fnaddr) in impl_fnaddr_bindings {
-        call_control.register_macro_impl_helper_trace_fnaddr(impl_type_joined, method, fnaddr);
+    for &(module_path_with_crate, impl_type_as_written, method, fnaddr) in impl_fnaddr_bindings {
+        call_control.register_macro_impl_helper_trace_fnaddr(
+            module_path_with_crate,
+            impl_type_as_written,
+            method,
+            fnaddr,
+        );
     }
     // RPython: GC transformer sets _gctransformer_hint_close_stack_,
     // _gctransformer_hint_cannot_collect_ on functions, and
