@@ -17,12 +17,11 @@
 //!   `Constant`, *or* `FlowSignal` (signals are placed on the stack
 //!   between SETUP_*/POP_BLOCK). Rust introduces a `StackElem` enum;
 //!   upstream duck-typing is closed as one of two variants.
-//! * `FrameBlock` is imported from `flowcontext` (F3.4 skeleton);
+//! * `FrameBlock` is imported from `flowcontext`;
 //!   `FlowSignal` likewise. RPython uses lazy imports inside function
 //!   bodies (`from rpython.flowspace.flowcontext import FlowSignal`)
 //!   to break a module cycle. Rust has no lazy `use`; the cycle is
-//!   broken by sharing the types in `flowcontext.rs`, which is
-//!   skeletal until F3.4.
+//!   broken by sharing the types in `flowcontext.rs`.
 //! * RPython's `union()` dispatches on Python type-equality
 //!   (`type(w1) is not type(w2)`). Rust collapses this to
 //!   `FlowSignalTag` comparison — semantically identical for the
@@ -295,28 +294,27 @@ impl FrameState {
 
     /// RPython `FrameState.getoutputargs` — "Return the output
     /// arguments needed to link self to targetstate."
-    pub fn getoutputargs(&self, targetstate: &FrameState) -> Vec<Hlvalue> {
+    ///
+    /// Upstream (`framestate.py:92-99`) iterates over
+    /// `targetstate.mergeable`, and for every cell that is a
+    /// `Variable` on the target side, appends `self.mergeable[i]`
+    /// — whatever it is — to the result list. `self.mergeable[i]`
+    /// may be a `Variable`, a `Constant`, *or* Python `None`
+    /// (undefined-local sentinel from `locals_w`). The Rust
+    /// counterpart therefore returns `Vec<MergeCell>` (=
+    /// `Vec<Option<Hlvalue>>`): `None` carries the undefined-local
+    /// slot through intact, matching upstream's list-with-None
+    /// semantics.
+    pub fn getoutputargs(&self, targetstate: &FrameState) -> Vec<MergeCell> {
         let mergeable = self.mergeable_view();
         let target = targetstate.mergeable_view();
-        let mut out = Vec::new();
+        let mut result: Vec<MergeCell> = Vec::new();
         for (i, w_target) in target.iter().enumerate() {
             if matches!(w_target, Some(Hlvalue::Variable(_))) {
-                if let Some(cell) = mergeable.get(i).and_then(|c| c.clone()) {
-                    out.push(cell);
-                } else {
-                    // Upstream dereferences `mergeable[i]` directly; if
-                    // the source slot is `None`, upstream's
-                    // `result.append(mergeable[i])` appends `None`. No
-                    // RPython testsuite path exercises this; we keep
-                    // the list element-dropped with a debug assertion.
-                    debug_assert!(
-                        false,
-                        "getoutputargs: source slot {i} is None where target is Variable"
-                    );
-                }
+                result.push(mergeable.get(i).cloned().unwrap_or(None));
             }
         }
-        out
+        result
     }
 }
 
@@ -599,7 +597,19 @@ mod test {
         ]);
         let out = fs1.getoutputargs(&fs2);
         // Only slot[0] in fs2 is a Variable, so we pick fs1's slot[0].
-        assert_eq!(out, vec![v_src]);
+        assert_eq!(out, vec![Some(v_src)]);
+    }
+
+    #[test]
+    fn getoutputargs_preserves_undefined_local_at_variable_target() {
+        // RPython `test_framestate.py:test_getoutputargs` — when fs2's
+        // slot is a fresh Variable and fs1's slot is Python `None`
+        // (undefined local), upstream's `result.append(mergeable[i])`
+        // appends the `None`. We mirror that via `MergeCell::None`.
+        let fs1 = build_state(vec![None]);
+        let fs2 = build_state(vec![Some(Hlvalue::Variable(Variable::new()))]);
+        let out = fs1.getoutputargs(&fs2);
+        assert_eq!(out, vec![None]);
     }
 
     #[test]
@@ -656,7 +666,7 @@ mod test {
 
     #[test]
     fn blocklist_participates_in_matches_assertion() {
-        let block = FrameBlock::new(0, 0, FrameBlockKind::Unresolved);
+        let block = FrameBlock::new(0, 0, FrameBlockKind::Finally);
         let v = Variable::new();
         let fs1 = FrameState::new(
             vec![Some(Hlvalue::Variable(v.clone()))],

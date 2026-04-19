@@ -149,8 +149,11 @@ fn walks_store_and_load_global() {
 
 #[test]
 fn walks_build_tuple_list_and_unpack() {
+    // Destructure a parameter (not a literal tuple) so that the
+    // compiler cannot constant-fold the RHS into direct stores and
+    // must emit UnpackSequence.
     let host = HostCode::from_code(&compile_function_body(
-        "def f():\n    a, b = (1, 2)\n    return [a, b]\n",
+        "def f(t):\n    a, b = t\n    return [a, b]\n",
     ));
     let ops = collect_instructions(&host);
     assert!(contains_variant(&ops, |op| matches!(

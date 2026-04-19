@@ -71,16 +71,19 @@ impl Signature {
         }
         out
     }
+    /// Tuple-shaped accessor matching upstream's `(argnames,
+    /// varargname, kwargname)` protocol consumed by the annotator.
+    pub fn tuple_view(&self) -> (&[String], Option<&str>, Option<&str>) {
+        (
+            &self.argnames,
+            self.varargname.as_deref(),
+            self.kwargname.as_deref(),
+        )
+    }
 }
 
-// RPython's `Signature` additionally implements `__len__` / `__getitem__`
-// so it looks tuply for the annotator (argument.py:62-73). Rust's type
-// system cannot index heterogeneous tuple-like access; the annotator port
-// in Phase 5 handles this by pattern-matching on `Signature` directly
-// rather than `s[0] / s[1] / s[2]`, so no Rust equivalent is emitted.
-
 use crate::model::{Constant, Hlvalue};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// Shape key of a call site: `(shape_cnt, shape_keys, shape_star)`.
 ///
@@ -102,21 +105,20 @@ pub struct CallShape {
 ///
 /// RPython basis: `argument.py:76-125` — `class CallSpec`.
 ///
-/// ### Deviation from upstream (parity rule #1)
-///
-/// RPython's `keywords` field is an arbitrary `dict` whose iteration
-/// order is unstable (relies on `sorted()` at shape time). Rust
-/// uses `BTreeMap<String, Hlvalue>` so the internal order is already
-/// sorted — `_rawshape()` reads keys directly without an explicit
-/// sort. Upstream semantics preserved: the `shape_keys` tuple is
-/// always the sorted key list.
+/// Upstream stores `keywords` as a plain `dict`; its iteration order
+/// is unspecified. `_rawshape()` compensates with
+/// `tuple(sorted(self.keywords))`. Rust mirrors that storage model
+/// with `HashMap<String, Hlvalue>` and performs the same explicit
+/// sort in `rawshape()` so `shape_keys` is always the sorted key
+/// tuple. The storage itself carries no order, matching upstream
+/// semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallSpec {
     /// RPython `CallSpec.arguments_w`.
     pub arguments_w: Vec<Hlvalue>,
-    /// RPython `CallSpec.keywords` — `BTreeMap` replaces upstream's
-    /// unordered `dict`; see deviation note above.
-    pub keywords: BTreeMap<String, Hlvalue>,
+    /// RPython `CallSpec.keywords` — plain `HashMap` mirroring
+    /// upstream's unordered `dict`.
+    pub keywords: HashMap<String, Hlvalue>,
     /// RPython `CallSpec.w_stararg`.
     pub w_stararg: Option<Hlvalue>,
 }
@@ -125,7 +127,7 @@ impl CallSpec {
     /// RPython `CallSpec.__init__(args_w, keywords=None, w_stararg=None)`.
     pub fn new(
         arguments_w: Vec<Hlvalue>,
-        keywords: Option<BTreeMap<String, Hlvalue>>,
+        keywords: Option<HashMap<String, Hlvalue>>,
         w_stararg: Option<Hlvalue>,
     ) -> Self {
         CallSpec {
@@ -136,10 +138,15 @@ impl CallSpec {
     }
 
     /// RPython `CallSpec._rawshape()`.
+    ///
+    /// Upstream: `shape_keys = tuple(sorted(self.keywords))`. We sort
+    /// explicitly since `HashMap::keys()` has no guaranteed order.
     pub fn rawshape(&self) -> CallShape {
+        let mut shape_keys: Vec<String> = self.keywords.keys().cloned().collect();
+        shape_keys.sort();
         CallShape {
             shape_cnt: self.arguments_w.len(),
-            shape_keys: self.keywords.keys().cloned().collect(),
+            shape_keys,
             shape_star: self.w_stararg.is_some(),
         }
     }
@@ -150,9 +157,9 @@ impl CallSpec {
         let shape = self.rawshape();
         let mut data_w: Vec<Hlvalue> = self.arguments_w.clone();
         for key in &shape.shape_keys {
-            // BTreeMap key lookup is total since shape.shape_keys came
-            // from self.keywords.keys(); `unwrap` matches upstream's
-            // `self.keywords[key]` direct indexing.
+            // `shape.shape_keys` came from `self.keywords.keys()`;
+            // `unwrap` matches upstream's `self.keywords[key]` direct
+            // indexing.
             data_w.push(self.keywords.get(key).unwrap().clone());
         }
         if shape.shape_star {
@@ -174,13 +181,12 @@ impl CallSpec {
         match &self.w_stararg {
             None => self.arguments_w.clone(),
             Some(Hlvalue::Constant(stararg)) => {
-                let items = match &stararg.value {
-                    crate::model::ConstValue::Tuple(items)
-                    | crate::model::ConstValue::List(items) => items,
-                    other => panic!(
-                        "CallSpec.as_list expected tuple/list Constant for w_stararg, got {other:?}"
-                    ),
-                };
+                let items = sequence_items(&stararg.value).unwrap_or_else(|| {
+                    panic!(
+                        "CallSpec.as_list expected sequence Constant for w_stararg, got {:?}",
+                        stararg.value
+                    )
+                });
                 let mut out = self.arguments_w.clone();
                 out.extend(
                     items
@@ -202,7 +208,7 @@ impl CallSpec {
         let mut p = end_keys;
         let args_w: Vec<Hlvalue> = data_w[..shape_cnt].to_vec();
         let keyword_slice = &data_w[shape_cnt..end_keys];
-        let mut keywords: BTreeMap<String, Hlvalue> = BTreeMap::new();
+        let mut keywords: HashMap<String, Hlvalue> = HashMap::new();
         for (name, value) in shape.shape_keys.iter().zip(keyword_slice.iter()) {
             keywords.insert(name.clone(), value.clone());
         }
@@ -220,6 +226,10 @@ impl CallSpec {
             w_stararg,
         }
     }
+}
+
+fn sequence_items(value: &crate::model::ConstValue) -> Option<&[crate::model::ConstValue]> {
+    value.sequence_items()
 }
 
 #[cfg(test)]
@@ -263,7 +273,7 @@ mod test {
         Hlvalue::Constant(Constant::new(ConstValue::Int(n)))
     }
 
-    fn kw(pairs: &[(&str, i64)]) -> BTreeMap<String, Hlvalue> {
+    fn kw(pairs: &[(&str, i64)]) -> HashMap<String, Hlvalue> {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), hi(*v)))

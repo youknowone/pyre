@@ -18,11 +18,11 @@
 //! | `bytecode`                   | `bytecode.py`                   |
 //! | `framestate`                 | `framestate.py`                 |
 //! | `operation`       (Phase 3)  | `operation.py`                  |
-//! | `flowcontext`                | `flowcontext.py` (skeleton: FlowSignal + FrameBlock only; F3.4 adds SpamBlock/EggBlock/Recorder + opcode handlers) |
+//! | `flowcontext`                 | `flowcontext.py`                |
 //! | `flowcontext_py314` (Phase 3)| PYRE-ONLY, no RPython basis     |
 //! | `pygraph`         (Phase 3)  | `pygraph.py`                    |
 //! | `generator`       (Phase 3)  | `generator.py`                  |
-//! | `argument`                   | `argument.py` (partial: Signature only — CallSpec lands Phase 3 F3.2) |
+//! | `argument`                   | `argument.py`                   |
 //! | `objspace`        (Phase 3)  | `objspace.py`                   |
 //! | `specialcase`     (Phase 3)  | `specialcase.py`                |
 
@@ -31,3 +31,4 @@ pub mod bytecode;
 pub mod flowcontext;
 pub mod framestate;
 pub mod model;
+pub mod specialcase;

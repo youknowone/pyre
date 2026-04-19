@@ -15,23 +15,20 @@
 //! and asserts structural properties (checkgraph, copygraph, iter*,
 //! mkentrymap, block attributes, variable renaming).
 //!
-//! Deviations from upstream, per CLAUDE.md parity rule #1:
+//! Deviation from upstream, per CLAUDE.md parity rule #1:
 //!
 //! * RPython uses module-level `graph = pieces.graph` shared by all
 //!   tests. Rust rebuilds the graph per test via
 //!   `Pieces::build_sample_graph()` — safer under test parallelism
 //!   and avoids mutable shared state.
-//! * `test_graphattributes` checks `graph.source ==
-//!   inspect.getsource(sample_function)`. `graph.source` is deferred
-//!   to Phase 3 (`pygraph.py` port); the Rust test skips that
-//!   assertion and notes the deferral inline.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use majit_flowspace::model::{
-    Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link,
-    LinkRef, SpaceOperation, Variable, c_last_exception, checkgraph, copygraph, mkentrymap,
+    Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, ExceptionClass, FunctionGraph,
+    GraphFunc, Hlvalue, Link, LinkRef, SpaceOperation, Variable, c_last_exception, checkgraph,
+    copygraph, mkentrymap,
 };
 
 /// Upstream `class pieces` — the manually-built graph pieces.
@@ -222,7 +219,9 @@ fn test_checkgraph_accepts_canraise_exception_links() {
     let exceptional = Rc::new(RefCell::new(Link::new(
         vec![last_exception.clone(), last_exc_value.clone()],
         Some(graph.exceptblock.clone()),
-        Some(Hlvalue::Constant(Constant::new(ConstValue::Int(1)))),
+        Some(Hlvalue::Constant(Constant::new(
+            ConstValue::ExceptionClass(ExceptionClass::builtin("ValueError")),
+        ))),
     )));
     exceptional
         .borrow_mut()
@@ -235,7 +234,15 @@ fn test_checkgraph_accepts_canraise_exception_links() {
 #[test]
 fn test_copygraph() {
     // RPython test_model.py:51-53
-    let pieces = Pieces::build_sample_graph();
+    let mut pieces = Pieces::build_sample_graph();
+    pieces.graph.tag = Some("tagged".into());
+    pieces
+        .graph
+        .set_source("def sample_function(i):\n    return i\n");
+    let mut func = GraphFunc::new("sample_function", Constant::new(ConstValue::Placeholder));
+    func.filename = Some("sample.py".into());
+    func.firstlineno = Some(1);
+    pieces.graph.func = Some(func);
     let graph2 = copygraph(
         &pieces.graph,
         false,
@@ -243,6 +250,13 @@ fn test_copygraph() {
         false,
     );
     checkgraph(&graph2);
+    assert_eq!(graph2.tag.as_deref(), Some("tagged"));
+    assert_eq!(
+        graph2.source().unwrap(),
+        "def sample_function(i):\n    return i\n"
+    );
+    assert_eq!(graph2.filename().unwrap(), "sample.py");
+    assert_eq!(graph2.startline().unwrap(), 1);
 }
 
 #[test]
@@ -272,9 +286,18 @@ fn test_graphattributes() {
         graph.returnblock.borrow().inputargs
     );
 
-    // assert graph.source == inspect.getsource(sample_function)
-    // -- deferred to Phase 3 (pygraph.py port), when FunctionGraph
-    // gains a `source` attribute.
+    let mut graph = pieces.graph;
+    graph.set_source("def sample_function(i):\n    return i\n");
+    let mut func = GraphFunc::new("sample_function", Constant::new(ConstValue::Placeholder));
+    func.filename = Some("sample.py".into());
+    func.firstlineno = Some(1);
+    graph.func = Some(func);
+    assert_eq!(
+        graph.source().unwrap(),
+        "def sample_function(i):\n    return i\n"
+    );
+    assert_eq!(graph.filename().unwrap(), "sample.py");
+    assert_eq!(graph.startline().unwrap(), 1);
 }
 
 #[test]

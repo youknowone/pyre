@@ -11732,6 +11732,97 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn finishframe_exception_pops_callee_then_catches_in_caller() {
+        // pyjitpl.py:2506-2529 — cross-frame walk: callee raises,
+        // current frame has no catch_exception, outer frame does.
+        // Expected: popframe() drops the callee, then BC_CATCH_EXCEPTION
+        // in the caller routes control to the handler target.
+        let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        caller_jitcode.code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 5, 0];
+        let caller_jitcode = std::sync::Arc::new(caller_jitcode);
+
+        // Callee: non-CATCH opcode at pc 0. Use BC_LIVE (skip prefix)
+        // chased by a non-CATCH byte so finishframe_exception's LIVE
+        // skip lands on something that isn't a handler.
+        let mut callee_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        callee_jitcode.code = vec![0xff, 0, 0];
+        let callee_jitcode = std::sync::Arc::new(callee_jitcode);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(caller_jitcode, 0));
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(callee_jitcode, 0));
+
+        let result = meta.finishframe_exception();
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(
+            meta.framestack.len(),
+            1,
+            "callee must be popped; caller handler frame remains"
+        );
+        // Caller jumped to handler target (offset 5 from the
+        // BC_CATCH_EXCEPTION's 2-byte operand).
+        assert_eq!(meta.framestack.current_mut().pc, 5);
+        assert_eq!(meta.framestack.current_mut().code_cursor, 5);
+    }
+
+    #[test]
+    fn handle_possible_exception_routes_cross_frame_to_caller_handler() {
+        // End-to-end: pyjitpl.py:3380-3395. An exception is pending
+        // (`last_exc_value != 0`), the callee has no handler, the
+        // caller does. handle_possible_exception must:
+        //   (1) emit GUARD_EXCEPTION on the tracer;
+        //   (2) stash last_exc_box + mark class_of_last_exc_is_const;
+        //   (3) invoke finishframe_exception, which pops the callee
+        //       and routes the caller's pc to its BC_CATCH_EXCEPTION
+        //       handler target.
+        use crate::BackEdgeAction;
+
+        let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        caller_jitcode.code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 9, 0];
+        let caller_jitcode = std::sync::Arc::new(caller_jitcode);
+        let mut callee_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        callee_jitcode.code = vec![0xff, 0, 0];
+        let callee_jitcode = std::sync::Arc::new(callee_jitcode);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.cls_of_box = Some(|_| 0xcafef00d);
+        meta.last_exc_value = 0xbeef;
+
+        let action = meta.force_start_tracing(0, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(caller_jitcode, 0));
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(callee_jitcode, 0));
+
+        let result = meta.handle_possible_exception();
+        assert!(matches!(result, Err(ChangeFrame)));
+        assert_eq!(
+            meta.framestack.len(),
+            1,
+            "callee must be popped; caller handler frame remains"
+        );
+        assert_eq!(meta.framestack.current_mut().pc, 9);
+        assert!(meta.class_of_last_exc_is_const);
+        assert!(meta.last_exc_box.is_some());
+
+        let ctx = meta.trace_ctx().expect("active trace");
+        let op = ctx
+            .recorder
+            .ops()
+            .iter()
+            .find(|op| op.opcode == OpCode::GuardException)
+            .expect("GuardException must be recorded");
+        let typeptr = ctx
+            .constants_get_value(op.args[0])
+            .expect("typeptr constant");
+        assert_eq!(typeptr, majit_ir::Value::Int(0xcafef00d));
+    }
+
+    #[test]
     fn assert_no_exception_passes_when_value_zero() {
         let meta = MetaInterp::<()>::new(0);
         meta.assert_no_exception();

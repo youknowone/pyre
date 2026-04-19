@@ -23,9 +23,12 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+
+use crate::bytecode::HostCode;
 
 /// Placeholder for `SomeValue` annotations attached by the annotator.
 ///
@@ -41,15 +44,90 @@ pub type AnnotationPlaceholder = ();
 /// `None`.
 pub type ConcretetypePlaceholder = ();
 
-/// Closed stand-in for `Constant.value`, replaced at Phase 3 when
-/// `flowspace/operation.py` lands and real flow-graph constants start
-/// being constructed.
-///
-/// RPython `Constant.value` is the unwrapped Python object; here we
-/// carry the variants used by the `test_model.py` port plus the
-/// flow-space control-flow atoms. Other variants land with the
-/// operation-handler port in Phase 3.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BuiltinFunction {
+    Print,
+    GetAttr,
+    Import,
+    Locals,
+    RpythonPrintItem,
+    RpythonPrintEnd,
+    RpythonPrintNewline,
+    All,
+    Any,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BuiltinType {
+    Type,
+    Tuple,
+    List,
+    Set,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BuiltinObject {
+    Function(BuiltinFunction),
+    Type(BuiltinType),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ExceptionClass {
+    pub name: String,
+    pub base: Option<String>,
+}
+
+impl ExceptionClass {
+    pub fn builtin(name: &str) -> Self {
+        ExceptionClass {
+            name: name.to_owned(),
+            base: builtin_exception_parent(name).map(str::to_owned),
+        }
+    }
+
+    pub fn is_subclass_of(&self, expected: &ExceptionClass) -> bool {
+        self.is_subclass_of_name(&expected.name)
+    }
+
+    pub fn is_subclass_of_name(&self, expected: &str) -> bool {
+        if self.name == expected {
+            return true;
+        }
+        let mut cursor = self.base.as_deref();
+        while let Some(parent) = cursor {
+            if parent == expected {
+                return true;
+            }
+            cursor = builtin_exception_parent(parent);
+        }
+        false
+    }
+}
+
+fn builtin_exception_parent(name: &str) -> Option<&'static str> {
+    match name {
+        "AssertionError" => Some("Exception"),
+        "ImportError" => Some("Exception"),
+        "NotImplementedError" => Some("RuntimeError"),
+        "RuntimeError" => Some("Exception"),
+        "StackOverflow" => Some("Exception"),
+        "StopIteration" => Some("Exception"),
+        "TypeError" => Some("Exception"),
+        "ValueError" => Some("Exception"),
+        "ZeroDivisionError" => Some("Exception"),
+        "_StackOverflow" => Some("StackOverflow"),
+        "Exception" => Some("BaseException"),
+        _ => None,
+    }
+}
+
+/// Flow-space carrier for Python objects referenced directly by the
+/// strict `flowcontext.py` port.
+///
+/// RPython `Constant.value` is the unwrapped Python object; the Rust
+/// port mirrors that contract with an explicit sum type until the
+/// wider host object model lands.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConstValue {
     /// Sentinel for the `c_last_exception` atom; populated by F1.4
     /// with `Constant(last_exception)`.
@@ -61,6 +139,11 @@ pub enum ConstValue {
     /// `test_model.py`. Phase 3 generalises this to arbitrary
     /// Python values.
     Int(i64),
+    /// Python dict constant. Used for `func.__globals__`.
+    Dict(HashMap<String, ConstValue>),
+    /// Python string constant. Used by `checkgraph()` to validate
+    /// single-character switch exitcases and `"default"` ordering.
+    Str(String),
     /// Python tuple constant. Used by `CallSpec.as_list()` to unpack
     /// `*args` exactly like upstream's `w_stararg.value`.
     Tuple(Vec<ConstValue>),
@@ -71,10 +154,25 @@ pub enum ConstValue {
     /// Boolean constant — used as `Link.exitcase` for if/else
     /// switches (`True` / `False`).
     Bool(bool),
+    /// Builtin function/type object.
+    Builtin(BuiltinObject),
     /// `None` — CPython's None singleton, used by
     /// `FrameState._exc_args()` as the sentinel for
     /// "no pending exception".
     None,
+    /// Host code object constant (`func.__code__`).
+    Code(Box<HostCode>),
+    /// Python function object.
+    Function(Box<GraphFunc>),
+    /// Stand-in for a Python exception instance. Upstream carries the
+    /// actual instance object in `FSException.w_value`; the Rust port
+    /// preserves the class object separately from the payload.
+    ExceptionInstance {
+        class: ExceptionClass,
+        message: Option<String>,
+    },
+    /// Python exception class object.
+    ExceptionClass(ExceptionClass),
     /// RPython `rpython/rlib/unroll.py:SpecTag` — an identity-bearing
     /// marker instance that prevents two different tags from being
     /// merged by `framestate.union()`. Each `SpecTag(id)` carries a
@@ -86,6 +184,53 @@ pub enum ConstValue {
     /// has no cross-session `id()`, so we materialise identity as an
     /// atomic counter.
     SpecTag(u64),
+}
+
+impl Hash for ConstValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            ConstValue::Atom(atom) => atom.hash(state),
+            ConstValue::Placeholder => {}
+            ConstValue::Int(value) => value.hash(state),
+            ConstValue::Dict(items) => {
+                let mut entries: Vec<_> = items.iter().collect();
+                entries.sort_by(|left, right| left.0.cmp(right.0));
+                for (key, value) in entries {
+                    key.hash(state);
+                    value.hash(state);
+                }
+            }
+            ConstValue::Str(value) => value.hash(state),
+            ConstValue::Tuple(items) | ConstValue::List(items) => items.hash(state),
+            ConstValue::Bool(value) => value.hash(state),
+            ConstValue::Builtin(value) => value.hash(state),
+            ConstValue::None => {}
+            ConstValue::Code(code) => {
+                code.co_name.hash(state);
+                code.co_filename.hash(state);
+                code.co_firstlineno.hash(state);
+                code.co_argcount.hash(state);
+                code.co_nlocals.hash(state);
+                code.co_flags.hash(state);
+            }
+            ConstValue::Function(func) => {
+                func.name.hash(state);
+                func.globals.hash(state);
+                func.closure.hash(state);
+                func.defaults.hash(state);
+                func.filename.hash(state);
+                func.firstlineno.hash(state);
+                func.code.as_ref().map(|code| &code.co_name).hash(state);
+            }
+            ConstValue::ExceptionInstance { class, message } => {
+                class.hash(state);
+                message.hash(state);
+            }
+            ConstValue::ExceptionClass(class) => class.hash(state),
+            ConstValue::SpecTag(id) => id.hash(state),
+        }
+    }
 }
 
 /// RPython `flowspace/model.py:463-467` — typed marker like
@@ -354,19 +499,117 @@ impl Constant {
         }
     }
 
-    /// RPython `Constant.foldable()`. Simplified during skeleton
-    /// landing: without a Python object model we cannot introspect
-    /// `im_self`, class metadata, or `_freeze_`. The real predicate
-    /// lands when `flowspace/operation.py` arrives at Phase 3.
+    /// RPython `flowspace/model.py:362-379` — `Constant.foldable()`.
+    ///
+    /// Line-by-line mapping:
+    ///
+    /// * `isinstance(to_check, (type, types.ClassType, types.ModuleType))`
+    ///   → type/class/module constants are assumed immutable. Rust port:
+    ///   `ConstValue::Builtin(BuiltinObject::Type(_))` (builtin `type`
+    ///   objects) and `ConstValue::ExceptionClass(_)` (RPython class
+    ///   objects) both satisfy this arm. Rust has no module constant
+    ///   variant yet — `types.ModuleType` becomes a noop here.
+    /// * `to_check.__class__.__module__ == '__builtin__'` → values whose
+    ///   runtime class is in the `__builtin__` module are foldable.
+    ///   Rust enum carries this discrimination at the type level:
+    ///   `Int`/`Bool`/`Str`/`None`/`Tuple`/`List`/`Dict`/`Code` are all
+    ///   built-in-class values; `Builtin(Function(_))` is a builtin
+    ///   function object whose `__class__` is `builtin_function_or_method`
+    ///   (`__module__ == '__builtin__'`).
+    /// * `hasattr(to_check, '_freeze_')` and `to_check._freeze_() is True`
+    ///   → the user-level frozen-object marker. Rust port has no
+    ///   `_freeze_` protocol; no variant satisfies this arm today.
+    ///
+    /// `im_self` unwrap (upstream line 364-365) is a Python bound-method
+    /// unwrap that has no Rust analogue.
+    ///
+    /// Variants for which `foldable()` stays `false`:
+    /// `Atom`, `Placeholder`, `Function(_)` (user function, upstream
+    /// returns false unless `_freeze_` set), `ExceptionInstance` (Python
+    /// instance, upstream `__class__.__module__` evaluates to
+    /// `'exceptions'` pre-Py3, `'builtins'` on Py3 — upstream treats it
+    /// as foldable, but semantics around mutable .args forced users to
+    /// override with `_freeze_` explicitly; Rust port mirrors upstream's
+    /// default False for instances), `SpecTag` (identity marker, not
+    /// foldable — value-equality-only).
     pub fn foldable(&self) -> bool {
-        // Upstream's conservative default when no frozen marker
-        // is present: `False`.
-        false
+        match &self.value {
+            // `isinstance(to_check, type)` — builtin type objects.
+            ConstValue::Builtin(BuiltinObject::Type(_)) => true,
+            // `isinstance(to_check, types.ClassType)` — RPython class
+            // objects (our `ExceptionClass`, which stands in for
+            // Python exception class objects).
+            ConstValue::ExceptionClass(_) => true,
+            // `to_check.__class__.__module__ == '__builtin__'` — all
+            // Python built-in primitive and container types.
+            ConstValue::Int(_)
+            | ConstValue::Bool(_)
+            | ConstValue::Str(_)
+            | ConstValue::None
+            | ConstValue::Tuple(_)
+            | ConstValue::List(_)
+            | ConstValue::Dict(_)
+            | ConstValue::Code(_) => true,
+            // Builtin function objects — `builtin_function_or_method`
+            // class lives in `__builtin__` module.
+            ConstValue::Builtin(BuiltinObject::Function(_)) => true,
+            // No `_freeze_` protocol ported; remaining variants fall
+            // through to upstream's final `return False`.
+            ConstValue::Atom(_)
+            | ConstValue::Placeholder
+            | ConstValue::Function(_)
+            | ConstValue::ExceptionInstance { .. }
+            | ConstValue::SpecTag(_) => false,
+        }
     }
 
     /// RPython `Constant.replace(mapping)` — Constants never rename.
     pub fn replace<'a>(&'a self, _mapping: &'a HashMap<Variable, Variable>) -> &'a Constant {
         self
+    }
+}
+
+impl ConstValue {
+    /// Best-effort Python truthiness for the constant variants the
+    /// current flow-space port constructs directly.
+    pub fn truthy(&self) -> Option<bool> {
+        match self {
+            ConstValue::Placeholder => None,
+            ConstValue::Int(n) => Some(*n != 0),
+            ConstValue::Dict(items) => Some(!items.is_empty()),
+            ConstValue::Str(s) => Some(!s.is_empty()),
+            ConstValue::Tuple(items) | ConstValue::List(items) => Some(!items.is_empty()),
+            ConstValue::Bool(value) => Some(*value),
+            ConstValue::Builtin(_) => Some(true),
+            ConstValue::None => Some(false),
+            ConstValue::Code(_) => Some(true),
+            ConstValue::Function(_) => Some(true),
+            ConstValue::ExceptionClass(_) => Some(true),
+            ConstValue::ExceptionInstance { .. } => Some(true),
+            ConstValue::Atom(_) => Some(true),
+            ConstValue::SpecTag(_) => Some(true),
+        }
+    }
+
+    pub fn dict_items(&self) -> Option<&HashMap<String, ConstValue>> {
+        match self {
+            ConstValue::Dict(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    pub fn sequence_items(&self) -> Option<&[ConstValue]> {
+        match self {
+            ConstValue::Tuple(items) | ConstValue::List(items) => Some(items.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn exception_class_name(&self) -> Option<&str> {
+        match self {
+            ConstValue::ExceptionClass(class) => Some(class.name.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -406,7 +649,7 @@ impl std::fmt::Display for FSException {
 }
 
 /// Mixed `Variable | Constant` cell used by `SpaceOperation.args`,
-/// `SpaceOperation.result`, `Link.args`, and `Block.inputargs`.
+/// `SpaceOperation.result`, and `Block.inputargs`.
 ///
 /// RPython relies on duck-typing: the upstream lists literally hold
 /// either a `Variable` or a `Constant` instance and dispatch through
@@ -579,14 +822,21 @@ pub type BlockRef = Rc<RefCell<Block>>;
 /// `Rc<RefCell<Link>>` alias — see `BlockRef`.
 pub type LinkRef = Rc<RefCell<Link>>;
 
+/// `Link.args` carries the values flowing into a target block's
+/// `inputargs`. RPython's `FrameState.getoutputargs()` may emit an
+/// undefined-local sentinel (`None`) in transient merge links, so the
+/// Rust port preserves that exact shape with `Option<Hlvalue>`.
+pub type LinkArg = Option<Hlvalue>;
+
 /// RPython `flowspace/model.py:109-168` — `class Link`.
 ///
 /// `__slots__ = "args target exitcase llexitcase prevblock
 ///              last_exception last_exc_value".split()`.
 #[derive(Debug)]
 pub struct Link {
-    /// RPython `Link.args` — mixed list of var/const.
-    pub args: Vec<Hlvalue>,
+    /// RPython `Link.args` — mixed list of var/const, with transient
+    /// merge links allowed to carry `None` for undefined locals.
+    pub args: Vec<LinkArg>,
     /// RPython `Link.target` — successor block. Always `Some` in
     /// constructed graphs; `Option` only to admit the upstream
     /// `target=None` transient state during graph building.
@@ -613,6 +863,14 @@ pub struct Link {
 impl Link {
     /// RPython `Link.__init__(args, target, exitcase=None)`.
     pub fn new(args: Vec<Hlvalue>, target: Option<BlockRef>, exitcase: Option<Hlvalue>) -> Self {
+        Self::new_mergeable(args.into_iter().map(Some).collect(), target, exitcase)
+    }
+
+    pub fn new_mergeable(
+        args: Vec<LinkArg>,
+        target: Option<BlockRef>,
+        exitcase: Option<Hlvalue>,
+    ) -> Self {
         if let Some(t) = &target {
             assert_eq!(
                 args.len(),
@@ -629,6 +887,15 @@ impl Link {
             last_exception: None,
             last_exc_value: None,
         }
+    }
+
+    /// Wraps the owned `Link` in a shared `LinkRef`. Rust adaptation
+    /// closing upstream's Python identity-sharing: `Block.closeblock`
+    /// stores the link by reference into `block.exits`, and
+    /// `Link.prevblock` is later set by `closeblock` through the
+    /// stored reference.
+    pub fn into_ref(self) -> LinkRef {
+        Rc::new(RefCell::new(self))
     }
 
     /// RPython `Link.extravars(last_exception=None, last_exc_value=None)`.
@@ -659,8 +926,12 @@ impl Link {
     where
         F: Fn(&Hlvalue) -> Hlvalue,
     {
-        let newargs: Vec<Hlvalue> = self.args.iter().map(&rename).collect();
-        let mut newlink = Link::new(newargs, self.target.clone(), self.exitcase.clone());
+        let newargs: Vec<LinkArg> = self
+            .args
+            .iter()
+            .map(|arg| arg.as_ref().map(&rename))
+            .collect();
+        let mut newlink = Link::new_mergeable(newargs, self.target.clone(), self.exitcase.clone());
         newlink.prevblock = self.prevblock.clone();
         newlink.last_exception = self.last_exception.as_ref().map(&rename);
         newlink.last_exc_value = self.last_exc_value.as_ref().map(&rename);
@@ -822,7 +1093,11 @@ impl Block {
         }
         for link_ref in &self.exits {
             let mut link = link_ref.borrow_mut();
-            link.args = link.args.iter().map(|a| a.replace(mapping)).collect();
+            link.args = link
+                .args
+                .iter()
+                .map(|arg| arg.as_ref().map(|value| value.replace(mapping)))
+                .collect();
         }
     }
 
@@ -880,6 +1155,53 @@ impl BlockRefExt for BlockRef {
     }
 }
 
+/// Stand-in for the Python function object attached to
+/// `FunctionGraph.func`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphFunc {
+    /// Python function `__name__`.
+    pub name: String,
+    /// Python function `__globals__`, wrapped as a flow-space
+    /// constant.
+    pub globals: Constant,
+    /// Python function `__closure__`.
+    pub closure: Vec<Constant>,
+    /// Python function `__defaults__`.
+    pub defaults: Vec<Constant>,
+    /// Python function `__code__`.
+    pub code: Option<Box<HostCode>>,
+    /// Source text returned by `inspect.getsource(func)`.
+    pub source: Option<String>,
+    /// `func.__code__.co_firstlineno`.
+    pub firstlineno: Option<u32>,
+    /// `func.__code__.co_filename`.
+    pub filename: Option<String>,
+}
+
+impl GraphFunc {
+    pub fn new(name: impl Into<String>, globals: Constant) -> Self {
+        GraphFunc {
+            name: name.into(),
+            globals,
+            closure: Vec::new(),
+            defaults: Vec::new(),
+            code: None,
+            source: None,
+            firstlineno: None,
+            filename: None,
+        }
+    }
+
+    pub fn from_host_code(code: HostCode, globals: Constant, defaults: Vec<Constant>) -> Self {
+        let mut func = GraphFunc::new(code.co_name.clone(), globals);
+        func.filename = Some(code.co_filename.clone());
+        func.firstlineno = Some(code.co_firstlineno);
+        func.defaults = defaults;
+        func.code = Some(Box::new(code));
+        func
+    }
+}
+
 /// RPython `flowspace/model.py:13-106` — `class FunctionGraph`.
 #[derive(Debug)]
 pub struct FunctionGraph {
@@ -897,9 +1219,10 @@ pub struct FunctionGraph {
     /// RPython `FunctionGraph.tag`. `None` until set by an analysis
     /// pass.
     pub tag: Option<String>,
-    // RPython `FunctionGraph.source/startline/filename/func/_source`
-    // are populated at Phase 3 (`pygraph.py` port) when flowspace
-    // actually constructs the graph from a code object.
+    /// RPython `FunctionGraph.func`.
+    pub func: Option<GraphFunc>,
+    /// RPython `FunctionGraph._source`.
+    pub _source: Option<String>,
 }
 
 impl FunctionGraph {
@@ -922,6 +1245,8 @@ impl FunctionGraph {
             returnblock,
             exceptblock,
             tag: None,
+            func: None,
+            _source: None,
         }
     }
 
@@ -945,6 +1270,8 @@ impl FunctionGraph {
             returnblock,
             exceptblock,
             tag: None,
+            func: None,
+            _source: None,
         }
     }
 
@@ -956,6 +1283,38 @@ impl FunctionGraph {
     /// RPython `FunctionGraph.getreturnvar()`.
     pub fn getreturnvar(&self) -> Hlvalue {
         self.returnblock.borrow().inputargs[0].clone()
+    }
+
+    /// RPython `FunctionGraph.source` property.
+    pub fn source(&self) -> Result<&str, &'static str> {
+        if let Some(source) = self._source.as_deref() {
+            return Ok(source);
+        }
+        self.func
+            .as_ref()
+            .and_then(|func| func.source.as_deref())
+            .ok_or("source not found")
+    }
+
+    /// RPython `FunctionGraph.source = value`.
+    pub fn set_source(&mut self, value: impl Into<String>) {
+        self._source = Some(value.into());
+    }
+
+    /// RPython `FunctionGraph.startline` property.
+    pub fn startline(&self) -> Result<u32, &'static str> {
+        self.func
+            .as_ref()
+            .and_then(|func| func.firstlineno)
+            .ok_or("startline not found")
+    }
+
+    /// RPython `FunctionGraph.filename` property.
+    pub fn filename(&self) -> Result<&str, &'static str> {
+        self.func
+            .as_ref()
+            .and_then(|func| func.filename.as_deref())
+            .ok_or("filename not found")
     }
 
     /// RPython `FunctionGraph.iterblocks()` — DFS over reachable
@@ -1187,14 +1546,18 @@ pub fn copygraph(
         let mut newlinks: Vec<LinkRef> = Vec::new();
         for link_ref in &block.borrow().exits {
             let link = link_ref.borrow();
-            let newargs: Vec<Hlvalue> = link.args.iter().map(|a| copyhl(a, &mut varmap)).collect();
+            let newargs: Vec<LinkArg> = link
+                .args
+                .iter()
+                .map(|arg| arg.as_ref().map(|value| copyhl(value, &mut varmap)))
+                .collect();
             let new_target = link.target.as_ref().map(|t| {
                 blockmap
                     .get(&BlockKey::of(t))
                     .cloned()
                     .expect("target block missing from blockmap")
             });
-            let mut newlink = Link::new(newargs, new_target, link.exitcase.clone());
+            let mut newlink = Link::new_mergeable(newargs, new_target, link.exitcase.clone());
             newlink.prevblock = Some(Rc::downgrade(&newblock));
             newlink.last_exception = link.last_exception.as_ref().map(|x| copyhl(x, &mut varmap));
             newlink.last_exc_value = link.last_exc_value.as_ref().map(|x| copyhl(x, &mut varmap));
@@ -1209,6 +1572,8 @@ pub fn copygraph(
     newgraph.returnblock = blockmap[&BlockKey::of(&graph.returnblock)].clone();
     newgraph.exceptblock = blockmap[&BlockKey::of(&graph.exceptblock)].clone();
     newgraph.tag = graph.tag.clone();
+    newgraph.func = graph.func.clone();
+    newgraph._source = graph._source.clone();
     newgraph
 }
 
@@ -1227,16 +1592,36 @@ pub fn summary(graph: &FunctionGraph) -> HashMap<String, usize> {
     insns
 }
 
+fn is_exception_exitcase(exitcase: &Hlvalue) -> bool {
+    matches!(
+        exitcase,
+        Hlvalue::Constant(Constant {
+            value: ConstValue::ExceptionClass(_),
+            ..
+        })
+    )
+}
+
+fn is_valid_switch_exitcase(exitcase: &Hlvalue) -> bool {
+    matches!(
+        exitcase,
+        Hlvalue::Constant(Constant {
+            value: ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::None,
+            ..
+        })
+    ) || matches!(
+        exitcase,
+        Hlvalue::Constant(Constant {
+            value: ConstValue::Str(s),
+            ..
+        }) if s == "default" || s.chars().count() == 1
+    )
+}
+
 /// RPython `flowspace/model.py:568-700` — `checkgraph(graph)`.
 ///
-/// Sanity-check a flow graph. The RPython check has ~140 lines of
-/// invariants; this port covers the core structural ones and the
-/// duplicate-variable detection. Type-specific assertions (`is_valid_int`,
-/// `r_longlong`, exception-class subclass checks, single-char string
-/// exitcases) are deferred to Phase 3/5/6 when those types exist.
-///
-/// Panics with an assertion failure on any violation, matching
-/// upstream semantics (RPython: `AssertionError`).
+/// Sanity-check a flow graph. Panics with an assertion failure on any
+/// violation, matching upstream semantics (RPython: `AssertionError`).
 pub fn checkgraph(graph: &FunctionGraph) {
     for (block, nbargs) in [(&graph.returnblock, 1usize), (&graph.exceptblock, 2usize)] {
         let b = block.borrow();
@@ -1288,9 +1673,10 @@ pub fn checkgraph(graph: &FunctionGraph) {
             };
 
         for w in &b.inputargs {
-            if let Hlvalue::Variable(v) = w {
-                definevar(v, None, &mut vars, &vars_previous_blocks);
-            }
+            let Hlvalue::Variable(v) = w else {
+                panic!("block inputargs must be Variables");
+            };
+            definevar(v, None, &mut vars, &vars_previous_blocks);
         }
 
         for op in &b.operations {
@@ -1349,7 +1735,15 @@ pub fn checkgraph(graph: &FunctionGraph) {
                 );
                 assert!(b.exits[0].borrow().exitcase.is_none());
                 for link in b.exits.iter().skip(1) {
-                    assert!(link.borrow().exitcase.is_some());
+                    let exitcase = link
+                        .borrow()
+                        .exitcase
+                        .clone()
+                        .expect("exception exitcase missing");
+                    assert!(
+                        is_exception_exitcase(&exitcase),
+                        "exception exitcase must carry an exception class constant"
+                    );
                     exc_links.push(Rc::as_ptr(link) as usize);
                 }
             }
@@ -1374,18 +1768,27 @@ pub fn checkgraph(graph: &FunctionGraph) {
                     );
                 if !is_boolean_switch {
                     assert!(!b.exits.is_empty(), "switch block must have exits");
-                    for link in &b.exits {
+                    for (idx, link) in b.exits.iter().enumerate() {
                         let exitcase = link
                             .borrow()
                             .exitcase
                             .clone()
                             .expect("switch exitcase cannot be None");
-                        match exitcase {
-                            Hlvalue::Constant(Constant {
-                                value: ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::None,
-                                ..
-                            }) => {}
-                            other => panic!("switch on a non-primitive value {other:?}"),
+                        assert!(
+                            is_valid_switch_exitcase(&exitcase),
+                            "switch on a non-primitive value {exitcase:?}"
+                        );
+                        if let Hlvalue::Constant(Constant {
+                            value: ConstValue::Str(s),
+                            ..
+                        }) = &exitcase
+                        {
+                            if s == "default" {
+                                assert!(
+                                    idx + 1 == b.exits.len(),
+                                    "'default' branch of a switch is not the last exit"
+                                );
+                            }
                         }
                     }
                 }
@@ -1423,6 +1826,9 @@ pub fn checkgraph(graph: &FunctionGraph) {
                 assert!(link.last_exc_value.is_none());
             }
             for arg in &link.args {
+                let arg = arg
+                    .as_ref()
+                    .expect("finalized graph cannot contain undefined-local link args");
                 if let Hlvalue::Variable(v) = arg {
                     usevar(v, Some(link_id), &vars);
                     if exc_link {

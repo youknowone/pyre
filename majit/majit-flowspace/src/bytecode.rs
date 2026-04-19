@@ -26,8 +26,8 @@
 //! compiler core and driven through `pyre_interpreter::bytecode`.
 
 pub use pyre_interpreter::bytecode::{
-    BinaryOperator, CodeFlags, CodeObject, CodeUnit, ComparisonOperator, ConstantData, Instruction,
-    OpArg, OpArgState,
+    BinaryOperator, CodeFlags, CodeObject, CodeUnit, ComparisonOperator, ConstantData,
+    ExceptionTableEntry, Instruction, MakeFunctionFlag, OpArg, OpArgState,
 };
 
 use crate::argument::Signature;
@@ -101,6 +101,7 @@ pub fn cpython_code_signature(code: &HostCode) -> Signature {
 /// `co_code` to avoid a second copy into raw bytes. The RPython walker
 /// (F2.3 port of `HostCode.read`) becomes a `CodeUnits` iterator
 /// instead of a byte-level `ord(co_code[offset])` loop.
+#[derive(Clone, Debug)]
 pub struct HostCode {
     pub co_argcount: u32,
     pub co_nlocals: u32,
@@ -115,8 +116,31 @@ pub struct HostCode {
     pub co_name: String,
     pub co_firstlineno: u32,
     pub co_lnotab: Vec<u8>,
+    pub exceptiontable: Box<[u8]>,
     pub signature: Signature,
 }
+
+impl PartialEq for HostCode {
+    fn eq(&self, other: &Self) -> bool {
+        self.co_argcount == other.co_argcount
+            && self.co_nlocals == other.co_nlocals
+            && self.co_stacksize == other.co_stacksize
+            && self.co_flags == other.co_flags
+            && self.co_code.original_bytes() == other.co_code.original_bytes()
+            && self.consts == other.consts
+            && self.names == other.names
+            && self.co_varnames == other.co_varnames
+            && self.co_freevars == other.co_freevars
+            && self.co_filename == other.co_filename
+            && self.co_name == other.co_name
+            && self.co_firstlineno == other.co_firstlineno
+            && self.co_lnotab == other.co_lnotab
+            && self.exceptiontable == other.exceptiontable
+            && self.signature == other.signature
+    }
+}
+
+impl Eq for HostCode {}
 
 impl HostCode {
     /// RPython: `HostCode.__init__`.
@@ -140,6 +164,7 @@ impl HostCode {
         firstlineno: u32,
         lnotab: Vec<u8>,
         freevars: Vec<String>,
+        exceptiontable: Box<[u8]>,
     ) -> Self {
         assert!(nlocals as i64 >= 0, "nlocals must be non-negative");
         let mut host = Self {
@@ -156,6 +181,7 @@ impl HostCode {
             co_name: name,
             co_firstlineno: firstlineno,
             co_lnotab: lnotab,
+            exceptiontable,
             // Temporary placeholder until we fill it below — RPython
             // assigns inside the same __init__ call.
             signature: Signature::new(Vec::new(), None, None),
@@ -188,6 +214,7 @@ impl HostCode {
             firstlineno,
             code.linetable.iter().copied().collect(),
             code.freevars.iter().cloned().collect(),
+            code.exceptiontable.clone(),
         )
     }
 
@@ -202,6 +229,42 @@ impl HostCode {
     /// RPython: `HostCode.is_generator`.
     pub fn is_generator(&self) -> bool {
         self.co_flags & CO_GENERATOR != 0
+    }
+
+    /// Find the exception-table handler covering the given byte offset.
+    ///
+    /// RustPython stores exception-table offsets in code-unit indices.
+    /// `HostCode.read` and flowspace operate in byte offsets for
+    /// parity with RPython's `co_code` walk, so the adapter converts
+    /// to/from byte offsets here.
+    pub fn find_exception_handler(&self, offset: u32) -> Option<ExceptionTableEntry> {
+        if !offset.is_multiple_of(2) {
+            return None;
+        }
+        let unit_offset = offset / 2;
+        pyre_interpreter::bytecode::find_exception_handler(&self.exceptiontable, unit_offset).map(
+            |entry| ExceptionTableEntry {
+                start: entry.start * 2,
+                end: entry.end * 2,
+                target: entry.target * 2,
+                depth: entry.depth,
+                push_lasti: entry.push_lasti,
+            },
+        )
+    }
+
+    /// Decode the entire exception table into byte-offset entries.
+    pub fn decode_exception_table(&self) -> Vec<ExceptionTableEntry> {
+        pyre_interpreter::bytecode::decode_exception_table(&self.exceptiontable)
+            .into_iter()
+            .map(|entry| ExceptionTableEntry {
+                start: entry.start * 2,
+                end: entry.end * 2,
+                target: entry.target * 2,
+                depth: entry.depth,
+                push_lasti: entry.push_lasti,
+            })
+            .collect()
     }
 
     /// Decode the instruction starting at byte position `offset`.
