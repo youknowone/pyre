@@ -361,18 +361,6 @@ fn normalize_root_loop_entry_contract(
     Ok((inputargs, optimized_ops))
 }
 
-fn root_loop_inputargs_from_optimizer(
-    trace_inputargs: &[InputArg],
-    final_num_inputs: usize,
-) -> Vec<InputArg> {
-    let mut inputargs = trace_inputargs.to_vec();
-    inputargs.truncate(final_num_inputs);
-    while inputargs.len() < final_num_inputs {
-        inputargs.push(InputArg::from_type(Type::Int, inputargs.len() as u32));
-    }
-    inputargs
-}
-
 pub(crate) struct CompiledEntry<M> {
     pub(crate) token: JitCellToken,
     pub(crate) num_inputs: usize,
@@ -2843,19 +2831,33 @@ impl<M: Clone> MetaInterp<M> {
         // (derived from `opref_type` of each renamed inputarg). Consume it
         // here so the backend sees declared types that match the reduced
         // LABEL's args.
-        let root_inputargs = if let Some(types) = unroll_opt
+        // compile.py:341 parity: the optimizer's reduced LABEL contract
+        // (ExportedState.renamed_inputarg_types) is the only valid source of
+        // root inputarg types. RPython has no synthetic recovery when this
+        // is absent; abort compilation so the caller falls back to the
+        // interpreter instead of synthesizing Int-padded InputArgs.
+        let root_inputargs = match unroll_opt
             .final_exported_state
             .as_ref()
             .map(|es| es.renamed_inputarg_types.as_slice())
             .filter(|types| types.len() == final_num_inputs)
         {
-            types
+            Some(types) => types
                 .iter()
                 .enumerate()
                 .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
-                .collect()
-        } else {
-            root_loop_inputargs_from_optimizer(&trace.inputargs, final_num_inputs)
+                .collect::<Vec<_>>(),
+            None => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] abort compile: root loop missing ExportedState inputarg types \
+                         (final_num_inputs={final_num_inputs})",
+                    );
+                }
+                self.cancel_count += 1;
+                self.warm_state.reset_function_counts();
+                return CompileOutcome::Cancelled;
+            }
         };
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
             root_inputargs,
@@ -3636,24 +3638,30 @@ impl<M: Clone> MetaInterp<M> {
             constants.entry(k).or_insert(v);
         }
 
-        // pyjitpl.rs:2846-2859 parity (retrace path): the optimizer's reduced
-        // Label has its own per-slot types in `ExportedState.renamed_inputarg_types`.
-        // Using `trace.inputargs` first N is wrong (those are raw frame slots,
-        // not the optimizer's reduced-label slots). Derive InputArg.tp from the
-        // ExportedState instead.
-        let root_inputargs = if let Some(types) = unroll_opt
+        // compile.py:341 parity (retrace path): reduced LABEL contract must
+        // come from `ExportedState.renamed_inputarg_types`. RPython has no
+        // silent recovery when this is absent; abort the retrace instead of
+        // synthesizing Int-padded InputArgs from the raw trace prefix.
+        let root_inputargs: Vec<InputArg> = match unroll_opt
             .final_exported_state
             .as_ref()
             .map(|es| es.renamed_inputarg_types.as_slice())
             .filter(|types| types.len() == final_num_inputs)
         {
-            types
+            Some(types) => types
                 .iter()
                 .enumerate()
                 .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
-                .collect()
-        } else {
-            root_loop_inputargs_from_optimizer(&partial.inputargs, final_num_inputs)
+                .collect(),
+            None => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_retrace: missing ExportedState inputarg types \
+                         (final_num_inputs={final_num_inputs})",
+                    );
+                }
+                return false;
+            }
         };
         let (mut inputargs, combined_ops) =
             match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
@@ -12836,21 +12844,6 @@ mod tests {
         assert_eq!(normalized_inputargs.len(), 2);
         assert_eq!(normalized_ops[0].opcode, OpCode::Label);
         assert_eq!(normalized_ops[0].args.as_slice(), &[OpRef(0), OpRef(1)]);
-    }
-
-    #[test]
-    fn test_root_loop_inputargs_from_optimizer_truncates_to_optimizer_contract() {
-        let trace_inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_ref(2),
-        ];
-
-        let inputargs = root_loop_inputargs_from_optimizer(&trace_inputargs, 2);
-
-        assert_eq!(inputargs.len(), 2);
-        assert_eq!(inputargs[0].tp, Type::Ref);
-        assert_eq!(inputargs[1].tp, Type::Int);
     }
 
     #[derive(Debug)]
