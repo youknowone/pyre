@@ -1820,10 +1820,12 @@ impl CallControl {
                 let impl_type = self.resolve_method_impl_type(name, receiver_root.as_deref())?;
                 Some(CallPath::for_impl_method(impl_type, name.as_str()))
             }
-            // RPython: an `indirect_call` is a *family* of graphs — there is no
-            // single CallPath to resolve to.  `graphs_from_indirect` returns
-            // the Vec of candidates; target_to_path returns None so callers
-            // fall back to the family path.  `call.py:94-114` indirect branch.
+            // RPython: an `indirect_call` is a *family* of graphs — there is
+            // no single CallPath to resolve to.  Post-rtyper, indirect calls
+            // live as `OpKind::IndirectCall` and `graphs_from(op)` returns
+            // the candidate `Vec<CallPath>` directly; `target_to_path` only
+            // names direct_call-equivalent sites.  `call.py:94-114` indirect
+            // branch.
             CallTarget::Indirect { .. } => None,
             CallTarget::UnsupportedExpr => None,
         }
@@ -1937,8 +1939,9 @@ impl CallControl {
     /// Collect every registered impl type name for `method_name`, across
     /// all declaring traits.  Used by `resolve_method` /
     /// `resolve_method_impl_type` for concrete-receiver method calls
-    /// (RPython's `funcobj.graph` resolution).  `graphs_from_indirect`
-    /// uses the exact `(trait_root, method_name)` key instead.
+    /// (RPython's `funcobj.graph` resolution).  Indirect-call family
+    /// lookup uses the exact `(trait_root, method_name)` key via
+    /// `all_impls_for_indirect` instead.
     fn impls_for_method_name<'b>(&'b self, method_name: &str) -> Vec<&'b String> {
         self.trait_method_impls
             .iter()
@@ -5208,7 +5211,7 @@ mod tests {
     /// the family attached to the op, not mix impls across traits that
     /// share a method name.  RPython `call.py:103-112` indirect branch.
     #[test]
-    fn graphs_from_indirect_filters_by_trait() {
+    fn graphs_from_op_filters_by_indirect_family() {
         let mut cc = CallControl::new();
         cc.register_trait_method(
             "bar",

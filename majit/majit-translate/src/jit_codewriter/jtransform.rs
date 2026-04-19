@@ -1871,10 +1871,11 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
         // RPython: an indirect_call has no single jitcode-lookup path —
-        // the family is handled via `graphs_from_indirect` + IndirectCallTargets.
-        // This fallback returns a stub path only reached by callers that don't
-        // distinguish; the real consumer (`handle_regular_indirect_call`) uses
-        // the family path directly.
+        // the family is handled via the op-based `graphs_from(op)` +
+        // `IndirectCallTargets` sidecar.  This fallback returns a stub
+        // path only reached by callers that don't distinguish; the real
+        // consumer (`handle_regular_indirect_call`) uses the family path
+        // directly.
         CallTarget::Indirect {
             trait_root,
             method_name,
@@ -2998,10 +2999,11 @@ mod tests {
         let mut cc = CallControl::new();
         cc.register_trait_method("m", Some("T"), "A", build_impl("A::m"));
         cc.register_trait_method("m", Some("T"), "B", build_impl("B::m"));
-        // `getcalldescr_indirect_family` validates that the caller's
-        // `result_type` matches the witness impl's declared return type
-        // (`call.rs:2697-2705`).  Inject matching strings so the non-void
-        // kind-matrix cases resolve without panicking.
+        // The indirect branch of `getcalldescr(op)` validates that the
+        // caller's `result_type` matches the witness impl's declared
+        // return type (`call.rs` indirect-arm signature check).  Inject
+        // matching strings so the non-void kind-matrix cases resolve
+        // without panicking.
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Ref | ValueType::Unknown => "String",
@@ -3203,7 +3205,8 @@ mod tests {
 
     /// Same skeleton as `check_indirect_regular_call_kind` but drops
     /// `find_all_graphs_for_tests`, so `candidate_graphs` stays empty
-    /// and `guess_indirect_call_kind` falls through to `CallKind::Residual`.
+    /// and `guess_call_kind(op)` falls through to `CallKind::Residual`
+    /// via the `graphs_from(op)` call.py:137-139 fall-through.
     /// Emit is `[VtableMethodPtr, CallResidual{indirect_targets: None},
     /// Live?]` — the trailing `-live-` appears only when the descriptor's
     /// `can_raise` is true, which is the default for non-elidable
@@ -3265,8 +3268,9 @@ mod tests {
             );
         }
         // NOTE: intentionally *no* `find_all_graphs_for_tests` — that keeps
-        // `candidate_graphs` empty so `guess_indirect_call_kind` classifies
-        // this call as `CallKind::Residual`.
+        // `candidate_graphs` empty so `guess_call_kind(op)` classifies
+        // this call as `CallKind::Residual` via the call.py:137-139
+        // `graphs_from(op) is None` fall-through.
 
         let mut graph = FunctionGraph::new("outer");
         let receiver = graph
