@@ -449,6 +449,20 @@ fn dispatch_op(
             let label_id = builder_label(state, &label.name);
             state.builder.branch_reg_zero(cond, label_id);
         }
+        "goto_if_not_int_eq" => {
+            let lhs = expect_reg(&args[0], Kind::Int);
+            let rhs = expect_reg(&args[1], Kind::Int);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_int_eq(lhs, rhs, label_id);
+        }
+        "goto_if_not_int_ne" => {
+            let lhs = expect_reg(&args[0], Kind::Int);
+            let rhs = expect_reg(&args[1], Kind::Int);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_int_ne(lhs, rhs, label_id);
+        }
         "catch_exception" => {
             let label = expect_tlabel(&args[0]);
             let label_id = builder_label(state, &label.name);

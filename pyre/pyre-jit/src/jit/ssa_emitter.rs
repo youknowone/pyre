@@ -332,6 +332,28 @@ impl SSAReprEmitter {
         );
     }
 
+    pub fn goto_if_not_int_eq(&mut self, lhs: u16, rhs: u16, label: u16) {
+        self.push_op(
+            "goto_if_not_int_eq",
+            vec![
+                Operand::reg(Kind::Int, lhs),
+                Operand::reg(Kind::Int, rhs),
+                self.tlabel(label),
+            ],
+        );
+    }
+
+    pub fn goto_if_not_int_ne(&mut self, lhs: u16, rhs: u16, label: u16) {
+        self.push_op(
+            "goto_if_not_int_ne",
+            vec![
+                Operand::reg(Kind::Int, lhs),
+                Operand::reg(Kind::Int, rhs),
+                self.tlabel(label),
+            ],
+        );
+    }
+
     pub fn catch_exception(&mut self, label: u16) {
         self.push_op("catch_exception", vec![self.tlabel(label)]);
     }

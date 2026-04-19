@@ -1002,18 +1002,42 @@ impl CodeWriter {
             }};
         }
 
-        // `goto_if_not` is NOT dual-emitted either.
-        //
-        // `rpython/jit/codewriter/jtransform.py:196` and
-        // `rpython/jit/codewriter/flatten.py:247` emit the boolean
-        // exitswitch specialisation `goto_if_not_<opname>` (e.g.
-        // `goto_if_not_int_is_zero`), not a generic `goto_if_not` over
-        // an intermediate boolean register. pyre's bytecode walker
-        // currently produces the generic `branch_reg_zero` pattern —
-        // the same shape the deferred `PopJumpIfTrue/False` SSA emit
-        // would target. Emitting generic `goto_if_not` into the SSARepr
-        // would again commit to pyre's non-parity shape. Keep the
-        // handlers on the direct `branch_reg_zero` builder call.
+        // B6 Phase 3b dual emission for integer comparison exitswitches.
+        // RPython parity: `jtransform.py:196` + `flatten.py:247` encode
+        // boolean branches as `goto_if_not_<opname>` rather than a
+        // generic `goto_if_not` over a temporary boolean result.
+        macro_rules! emit_goto_if_not_int_eq {
+            ($ssarepr:expr, $asm:expr, $labels:expr, $lhs:expr, $rhs:expr, $py_pc:expr) => {{
+                let lhs = $lhs;
+                let rhs = $rhs;
+                let py_pc = $py_pc;
+                $ssarepr.insns.push(Insn::op(
+                    "goto_if_not_int_eq",
+                    vec![
+                        Operand::reg(Kind::Int, lhs),
+                        Operand::reg(Kind::Int, rhs),
+                        Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
+                    ],
+                ));
+                $asm.goto_if_not_int_eq(lhs, rhs, $labels[py_pc]);
+            }};
+        }
+        macro_rules! emit_goto_if_not_int_ne {
+            ($ssarepr:expr, $asm:expr, $labels:expr, $lhs:expr, $rhs:expr, $py_pc:expr) => {{
+                let lhs = $lhs;
+                let rhs = $rhs;
+                let py_pc = $py_pc;
+                $ssarepr.insns.push(Insn::op(
+                    "goto_if_not_int_ne",
+                    vec![
+                        Operand::reg(Kind::Int, lhs),
+                        Operand::reg(Kind::Int, rhs),
+                        Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
+                    ],
+                ));
+                $asm.goto_if_not_int_ne(lhs, rhs, $labels[py_pc]);
+            }};
+        }
 
         // B6 Phase 3b dual emission for the `*_vable_*` field/array
         // accessors. RPython parity: `jtransform.py:844`
@@ -1409,22 +1433,32 @@ impl CodeWriter {
                 }
 
                 // jtransform.py: rewrite_op_int_add etc.
+                //
+                // Call reads stack slots DIRECTLY rather than copying through
+                // obj_tmp0/obj_tmp1 temps. This keeps the call's argument
+                // registers inside the trace-tracked range (`symbolic_locals`
+                // + `symbolic_stack`), so guards fired across the op (e.g.
+                // `GUARD_NOT_FORCED_2` after a helper call) capture the
+                // lhs/rhs values in fail_args. See
+                // `memory/pyre_trace_temp_reg_tracking_gap_2026_04_19.md`.
                 Instruction::BinaryOp { op } => {
                     let op_val = binary_op_tag(op.get(op_arg))
                         .expect("unsupported binary op tag in jitcode lowering")
                         as u32;
+                    // Pop rhs (blackhole will see vsd reflect this pop).
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp1, stack_base + current_depth); // rhs
+                    let rhs_reg = stack_base + current_depth;
+                    // Pop lhs.
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth); // lhs
+                    let lhs_reg = stack_base + current_depth;
                     emit_load_const_i!(ssarepr, assembler, op_code_reg, op_val as i64);
                     assembler.call_may_force_ref_typed(
                         binary_op_fn_idx,
                         &[
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_metainterp::jitcode::JitCallArg::reference(lhs_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(rhs_reg),
                             majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
                         obj_tmp0,
@@ -1436,19 +1470,20 @@ impl CodeWriter {
 
                 // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
                 Instruction::CompareOp { opname } => {
+                    // Same stack-direct pattern as BinaryOp — see its comment.
                     let op_val = compare_op_tag(opname.get(op_arg)) as u32;
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp1, stack_base + current_depth); // rhs
+                    let rhs_reg = stack_base + current_depth;
                     current_depth -= 1;
                     emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth); // lhs
+                    let lhs_reg = stack_base + current_depth;
                     emit_load_const_i!(ssarepr, assembler, op_code_reg, op_val as i64);
                     assembler.call_may_force_ref_typed(
                         compare_fn_idx,
                         &[
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                            majit_metainterp::jitcode::JitCallArg::reference(lhs_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(rhs_reg),
                             majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
                         obj_tmp0,
@@ -1458,21 +1493,7 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                 }
 
-                // jtransform.py: optimize_goto_if_not → goto_if_not
-                // PopJumpIfFalse / PopJumpIfTrue intentionally do NOT push
-                // SSARepr entries for the `truth_fn + int_eq 0 + goto_if_not`
-                // chain. `rpython/jit/codewriter/jtransform.py:1212`
-                // rewrites `int_eq(x, 0)` to `int_is_zero(x)` (resp.
-                // `int_is_true`), and `jtransform.py:196` +
-                // `flatten.py:247` emit the boolean-exitswitch specialisation
-                // `goto_if_not_int_is_zero` instead of a generic
-                // `goto_if_not`. pyre currently has neither
-                // `int_is_zero/int_is_true` nor `goto_if_not_<opname>` in
-                // its builder vocabulary, so emitting the pyre-shaped
-                // sequence into the SSARepr would lock in a pyre-only shape.
-                // The direct builder calls below stay; when the builder
-                // grows exact RPython counterparts, this block becomes
-                // eligible for dual-emit again.
+                // jtransform.py: optimize_goto_if_not → goto_if_not_<opname>
                 Instruction::PopJumpIfFalse { delta } => {
                     let target_py_pc = jump_target_forward(
                         code,
@@ -1489,7 +1510,15 @@ impl CodeWriter {
                         int_tmp0,
                     );
                     if target_py_pc < num_instrs {
-                        assembler.branch_reg_zero(int_tmp0, labels[target_py_pc]);
+                        emit_load_const_i!(ssarepr, assembler, int_tmp1, 0);
+                        emit_goto_if_not_int_ne!(
+                            ssarepr,
+                            assembler,
+                            labels,
+                            int_tmp0,
+                            int_tmp1,
+                            target_py_pc
+                        );
                     }
                 }
 
@@ -1508,10 +1537,16 @@ impl CodeWriter {
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
                         int_tmp0,
                     );
-                    assembler.load_const_i_value(int_tmp1, 0);
-                    assembler.record_binop_i(int_tmp0, majit_ir::OpCode::IntEq, int_tmp0, int_tmp1);
                     if target_py_pc < num_instrs {
-                        assembler.branch_reg_zero(int_tmp0, labels[target_py_pc]);
+                        emit_load_const_i!(ssarepr, assembler, int_tmp1, 0);
+                        emit_goto_if_not_int_eq!(
+                            ssarepr,
+                            assembler,
+                            labels,
+                            int_tmp0,
+                            int_tmp1,
+                            target_py_pc
+                        );
                     }
                 }
 
