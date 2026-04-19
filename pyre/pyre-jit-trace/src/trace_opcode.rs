@@ -680,36 +680,38 @@ impl MIFrame {
         idx: usize,
         value: OpRef,
     ) -> Result<(), PyError> {
-        // RPython pyjitpl.py opimpl_setlocal (via _opimpl_setarrayitem_vable
-        // for virtualizable locals) writes the value's Ref box directly
-        // into `virtualizable_boxes[flat_idx]` AND the frame's symbolic
-        // tracking. In RPython the stored box is always a Ref (boxed
-        // W_Root) because locals_cells_stack_w is declared as a
-        // W_Root array (virtualizable.py:86-98). pyre previously let
-        // `symbolic_locals[idx]` carry a raw Int/Float, relying on
-        // `close_loop_args_at`'s materialize step to rebox it at loop
-        // boundaries — but guard capture, bridge resume, and the
-        // recursive-CALL helper picker (`one_arg_callee_frame_helper`)
-        // all consult the stored value's type directly, so a raw Int
-        // slot would drive `_raw_int` frame creation against a caller
-        // stack that actually held a boxed Ref, reinterpreting the
-        // pointer as an int and producing pointers like 0x9EE5CDDE8 in
-        // the callee's `locals_w()[0]` (fib_recursive SIGBUS, 2026-04-18).
-        // Box on store so the symbolic slot always satisfies the
-        // Ref-typed virtualizable contract; explicit unbox happens at
-        // the op site that needs the raw payload.
-        let stored_type = self.value_type(value);
-        let ref_value = match stored_type {
-            Type::Int => wrapint(ctx, value),
-            Type::Float => wrapfloat(ctx, value),
-            _ => value,
-        };
+        // RPython `_opimpl_setarrayitem_vable` (pyjitpl.py:1242-1247)
+        // writes the value's Ref box directly into
+        // `virtualizable_boxes[flat_idx]` AND the frame's symbolic
+        // tracking. `locals_cells_stack_w` is declared as a W_Root array
+        // (virtualizable.py:86-98), so the stored box must always be
+        // Ref. pyre's producers satisfy this contract BEFORE reaching
+        // this store: `push_typed_value` (trace_opcode.rs:471-482)
+        // wraps raw Int/Float with `wrapint` / `wrapfloat` when a value
+        // lands on the operand stack, so `pop_value` — and thus every
+        // STORE_FAST / STORE_FAST_LOAD_FAST / STORE_FAST_STORE_FAST
+        // handler (pyopcode.rs:394-430) — hands us a Ref. The earlier
+        // "box on store" safety net (d2e530f3b9) is therefore redundant
+        // in production; asserting the invariant here keeps any future
+        // non-push producer from slipping a raw Int/Float through
+        // (RPython Box.type parity — the fix belongs at the producer,
+        // not the consumer).
+        debug_assert_eq!(
+            self.value_type(value),
+            Type::Ref,
+            "store_local_value: expected Ref-typed box (locals_cells_stack_w \
+             is W_Root), got {:?} for {:?}. Producer must emit \
+             wrapint/wrapfloat before the value reaches the symbolic \
+             stack / local slot.",
+            self.value_type(value),
+            value,
+        );
         let (has_vable, frame_ref, nlocals) = {
             let s = self.sym_mut();
             if idx >= s.symbolic_locals.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            s.symbolic_locals[idx] = ref_value;
+            s.symbolic_locals[idx] = value;
             if idx >= s.symbolic_local_types.len() {
                 s.symbolic_local_types.resize(idx + 1, Type::Ref);
             }
@@ -734,7 +736,7 @@ impl MIFrame {
             // virtualizable_boxes layout is [scalars.., array_items..,
             // vable_ref], so local idx maps to `(NUM_SCALARS - 1) + idx`.
             let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + idx;
-            ctx.set_virtualizable_box_at(flat_idx, ref_value);
+            ctx.set_virtualizable_box_at(flat_idx, value);
         }
         Ok(())
     }

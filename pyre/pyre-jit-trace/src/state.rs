@@ -4524,16 +4524,16 @@ mod tests {
     }
 
     #[test]
-    fn test_store_local_value_wraps_raw_int_into_ref_for_vable_slot() {
-        // virtualizable.py:86-98 declares locals_cells_stack_w as a
-        // W_Root array, so `store_local_value` must box raw Int/Float
-        // traced values into a Ref before writing them into
-        // `symbolic_locals`. trace_opcode.rs:660-669 is the matching
-        // guard that emits `wrapint` / `wrapfloat` on store; earlier
-        // tracing kept the raw payload in `symbolic_locals` and reboxed
-        // at close-loop materialization, but the direct-box-on-store
-        // form is the invariant this test pins down (see commit
-        // d2e530f3b9 "box Int/Float locals on store" for motivation).
+    fn test_store_local_value_preserves_ref_slot_without_reboxing() {
+        // RPython Box.type parity: `_opimpl_setarrayitem_vable`
+        // (pyjitpl.py:1242-1247) writes the value's Ref box directly —
+        // it never reboxes at the consumer. `locals_cells_stack_w` is a
+        // W_Root array (virtualizable.py:86-98), so the producer side
+        // (`push_typed_value` on the operand stack) is responsible for
+        // wrapping Int/Float with `wrapint` / `wrapfloat` before the
+        // value flows into the stack or local slot. Pin the contract
+        // here: storing a pre-wrapped Ref leaves `symbolic_locals[idx]`
+        // pointing at the same OpRef with no additional op emitted.
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
@@ -4541,7 +4541,8 @@ mod tests {
         frame.locals_w_mut()[0] = w_int_new(41);
         frame.fix_array_ptrs();
         let mut ctx = TraceCtx::for_test(1);
-        let raw = OpRef(0);
+        // Pre-wrapped Ref — this is the shape producers hand us.
+        let ref_value = ctx.const_ref(pyre_object::PY_NULL as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.symbolic_locals = vec![OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
@@ -4558,26 +4559,14 @@ mod tests {
         };
 
         state
-            .with_ctx(|this, ctx| this.store_local_value(ctx, 0, raw))
-            .expect("store of raw traced int should succeed");
-        let wrapped = state.sym().symbolic_locals[0];
-        assert_ne!(
-            wrapped, raw,
-            "raw Int must be wrapped into a fresh Ref OpRef"
+            .with_ctx(|this, ctx| this.store_local_value(ctx, 0, ref_value))
+            .expect("store of pre-wrapped Ref should succeed");
+        assert_eq!(
+            state.sym().symbolic_locals[0],
+            ref_value,
+            "Ref value must be stored as-is, not reboxed",
         );
-        assert_ne!(wrapped, OpRef::NONE);
         assert_eq!(state.sym().symbolic_local_types[0], Type::Ref);
-
-        let loaded = <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, "x")
-            .expect("Ref-typed local should reload through the symbolic slot");
-        assert_eq!(loaded.opref, wrapped);
-
-        // Exactly one op emitted: the wrapint that boxes `raw` into the
-        // Ref slot. No extra object guards fire on reload because the
-        // slot was stored directly; load_local_checked_value emits only
-        // the guard_nonnull that is the Ref-typed load contract.
-        let recorder = ctx.into_recorder();
-        assert!(recorder.num_ops() >= 1);
     }
 
     #[test]
