@@ -588,17 +588,24 @@ impl PyreMetaInterp {
                 sym.symbolic_stack_types.truncate(target_stack_len);
                 sym.concrete_stack.truncate(target_stack_len);
                 sym.valuestackdepth = nlocals + target_stack_len;
+                // Stage 3.4 Phase A dual-write: mirror the stack
+                // truncation in the registers_r stack region.
+                if sym.registers_r.len() > nlocals + target_stack_len {
+                    sym.registers_r.truncate(nlocals + target_stack_len);
+                }
                 if entry.push_lasti {
                     sym.symbolic_stack.push(OpRef::NONE);
                     sym.symbolic_stack_types.push(Type::Ref);
                     sym.concrete_stack
                         .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
                     sym.valuestackdepth += 1;
+                    sym.registers_r.push(OpRef::NONE);
                 }
                 sym.symbolic_stack.push(exc_opref);
                 sym.symbolic_stack_types.push(Type::Ref);
                 sym.concrete_stack.push(ConcreteValue::Ref(exc_obj));
                 sym.valuestackdepth += 1;
+                sym.registers_r.push(exc_opref);
                 sym.pending_next_instr = Some(handler_pc);
 
                 // Sync concrete frame

@@ -1887,6 +1887,16 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; stack_only_depth]
         };
+        // Stage 3.4 Phase A dual-write: mirror the per-trace stack seed
+        // into `registers_r[nlocals..nlocals+stack_only_depth]` so every
+        // stack register has a register-file shadow. Readers still hit
+        // `symbolic_stack`; Phase B switches them to `registers_r` under
+        // the unified address space (abs_idx = nlocals + depth) and
+        // Phase C retires `symbolic_stack`. The macro's `collect_locals`
+        // path slices to `self.nlocals` to keep the stack mirror out of
+        // `collect_locals`; `collect_stack` still sources from
+        // `symbolic_stack`.
+        self.registers_r.extend(self.symbolic_stack.iter().copied());
         if let Some(ref overrides) = self.bridge_stack_types {
             let mut types = overrides.clone();
             types.resize(stack_only_depth, Type::Ref);

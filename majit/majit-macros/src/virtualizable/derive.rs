@@ -272,9 +272,20 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .map(|f| quote! { __args.push((self.#f, majit_ir::Type::Ref)); })
         .unwrap_or_default();
 
+    // Stage 3.4 Phase A: when a `#[vable(nlocals)]` companion field is
+    // declared, slice `locals_field` to the first `nlocals` entries so
+    // `collect_locals` only emits the locals view even if the vec was
+    // sized beyond `nlocals` to carry a dual-write stack mirror. The
+    // adjacent `collect_stack` handler continues to produce the stack
+    // slice from `stack_field`. Once Stage 3.4 Phase C retires
+    // `stack_field`, this slice becomes a no-op (full registers_r).
     let collect_locals = locals_field
         .map(|f| {
-            quote! { __args.extend_from_slice(&self.#f); }
+            if let Some(nl) = nlocals_field {
+                quote! { __args.extend_from_slice(&self.#f[..self.#nl.min(self.#f.len())]); }
+            } else {
+                quote! { __args.extend_from_slice(&self.#f); }
+            }
         })
         .unwrap_or_default();
 
@@ -289,11 +300,25 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
             quote! {}
         };
 
+    // Stage 3.4 Phase A: mirror the `collect_locals` slice in the typed
+    // path so stack-mirror entries stored beyond `nlocals` in `lf`
+    // are not emitted twice (once via collect_typed_locals, once via
+    // collect_typed_stack).
     let collect_typed_locals = if let (Some(lf), Some(ltf)) = (locals_field, local_types_field) {
-        quote! {
-            for (__i, &__opref) in self.#lf.iter().enumerate() {
-                let __tp = self.#ltf.get(__i).copied().unwrap_or(majit_ir::Type::Ref);
-                __args.push((__opref, __tp));
+        if let Some(nl) = nlocals_field {
+            quote! {
+                let __locals_len = self.#nl.min(self.#lf.len());
+                for (__i, &__opref) in self.#lf[..__locals_len].iter().enumerate() {
+                    let __tp = self.#ltf.get(__i).copied().unwrap_or(majit_ir::Type::Ref);
+                    __args.push((__opref, __tp));
+                }
+            }
+        } else {
+            quote! {
+                for (__i, &__opref) in self.#lf.iter().enumerate() {
+                    let __tp = self.#ltf.get(__i).copied().unwrap_or(majit_ir::Type::Ref);
+                    __args.push((__opref, __tp));
+                }
             }
         }
     } else {

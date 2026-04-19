@@ -285,7 +285,14 @@ impl MIFrame {
                 None
             };
             let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-            for (idx, slot) in registers_r.iter().enumerate() {
+            // Stage 3.4 Phase A: registers_r may carry a stack mirror
+            // beyond `nlocals` (dual-write from push/pop). The skeleton
+            // encoder's locals iteration must stop at `nlocals` so the
+            // `is_local_live(py_pc, idx)` query stays inside the local
+            // slot space. Phase B will switch this loop to the unified
+            // register-file view.
+            let locals_len = nlocals.min(registers_r.len());
+            for (idx, slot) in registers_r[..locals_len].iter().enumerate() {
                 let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
                 if is_live {
                     boxes.push(*slot);
@@ -448,6 +455,15 @@ impl MIFrame {
             s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
         }
         s.concrete_stack[stack_idx] = concrete;
+        // Stage 3.4 Phase A dual-write: mirror the push into the stack
+        // slot of `registers_r` (abs_idx = nlocals + stack_idx). Readers
+        // still hit `symbolic_stack`; Phase B switches them to
+        // `registers_r`.
+        let reg_idx = s.nlocals + stack_idx;
+        if reg_idx >= s.registers_r.len() {
+            s.registers_r.resize(reg_idx + 1, OpRef::NONE);
+        }
+        s.registers_r[reg_idx] = boxed;
         s.valuestackdepth += 1;
     }
 
@@ -475,6 +491,13 @@ impl MIFrame {
                 trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         let value = s.symbolic_stack[stack_idx];
+        // Stage 3.4 Phase A dual-write: keep registers_r stack mirror
+        // in sync with the lazy getarrayitem seed so Phase B readers
+        // observe the same OpRef regardless of pop-path.
+        let reg_idx = nlocals + stack_idx;
+        if reg_idx < s.registers_r.len() {
+            s.registers_r[reg_idx] = value;
+        }
         s.valuestackdepth -= 1;
         Ok(value)
     }
@@ -497,6 +520,12 @@ impl MIFrame {
                 trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
         }
         let value = s.symbolic_stack[stack_idx];
+        // Stage 3.4 Phase A dual-write: keep registers_r stack mirror
+        // in sync with lazy getarrayitem seeds on peek paths.
+        let reg_idx = nlocals + stack_idx;
+        if reg_idx < s.registers_r.len() {
+            s.registers_r[reg_idx] = value;
+        }
         Ok(value)
     }
 
@@ -556,6 +585,14 @@ impl MIFrame {
         // MIFrame Box tracking: swap concrete values too
         if top_idx < s.concrete_stack.len() && other_idx < s.concrete_stack.len() {
             s.concrete_stack.swap(top_idx, other_idx);
+        }
+        // Stage 3.4 Phase A dual-write: mirror the stack swap into
+        // registers_r[nlocals+top_idx] <-> registers_r[nlocals+other_idx]
+        // so Phase B readers observe the same ordering.
+        let reg_top = nlocals + top_idx;
+        let reg_other = nlocals + other_idx;
+        if reg_top < s.registers_r.len() && reg_other < s.registers_r.len() {
+            s.registers_r.swap(reg_top, reg_other);
         }
         Ok(())
     }
@@ -1123,6 +1160,15 @@ impl MIFrame {
             if s.symbolic_stack.len() < stack_only {
                 s.symbolic_stack.resize(stack_only, OpRef::NONE);
             }
+            // Stage 3.4 Phase A dual-write: ensure registers_r has slots
+            // reserved for `[nlocals, nlocals+stack_only)` so stack
+            // push/pop mirrors land in a pre-sized region. The stack
+            // mirror content stays in sync via push_typed_value /
+            // pop_value / peek_value / swap_values.
+            let min_regs_len = concrete_nlocals + stack_only;
+            if s.registers_r.len() < min_regs_len {
+                s.registers_r.resize(min_regs_len, OpRef::NONE);
+            }
         }
         self.flush_to_frame(ctx);
         // pyjitpl.py:2973 reached_loop_header: a merge-point resume enters
@@ -1154,6 +1200,13 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let stack_only = s.stack_only_depth();
+            // Stage 3.4 Phase A: `close_loop_args_at` builds JUMP args
+            // from registers_r (locals) + symbolic_stack (stack) in
+            // two bounded slices. registers_r may now also carry a
+            // stack mirror beyond `nlocals`; slice it to `nlocals` so
+            // the iteration below doesn't push stack entries twice
+            // (once via the locals loop, again via `collect_stack`).
+            let locals_len = s.nlocals.min(s.registers_r.len());
             (
                 s.frame,
                 s.vable_last_instr,
@@ -1163,7 +1216,7 @@ impl MIFrame {
                 s.vable_lastblock,
                 s.vable_w_globals,
                 s.nlocals,
-                s.registers_r.clone(),
+                s.registers_r[..locals_len].to_vec(),
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
                 s.symbolic_local_types.clone(),
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
@@ -1343,6 +1396,12 @@ impl MIFrame {
                         let stack_idx = local_idx - nlocals;
                         if stack_idx < s.symbolic_stack.len() {
                             s.symbolic_stack[stack_idx] = new_opref;
+                        }
+                        // Stage 3.4 Phase A dual-write: mirror the
+                        // dedup'd stack slot into the registers_r stack
+                        // region (abs index = local_idx = nlocals+stack_idx).
+                        if local_idx < s.registers_r.len() {
+                            s.registers_r[local_idx] = new_opref;
                         }
                     }
                 }
@@ -4225,17 +4284,25 @@ impl MIFrame {
                 s.symbolic_stack_types.truncate(target_stack_len);
                 s.concrete_stack.truncate(target_stack_len);
                 s.valuestackdepth = nlocals + target_stack_len;
+                // Stage 3.4 Phase A dual-write: mirror the stack
+                // truncation into the registers_r stack region so Phase
+                // B readers see the same depth bound.
+                if s.registers_r.len() > nlocals + target_stack_len {
+                    s.registers_r.truncate(nlocals + target_stack_len);
+                }
                 if entry.push_lasti {
                     s.symbolic_stack.push(OpRef::NONE);
                     s.symbolic_stack_types.push(Type::Ref);
                     s.concrete_stack
                         .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
                     s.valuestackdepth += 1;
+                    s.registers_r.push(OpRef::NONE);
                 }
                 s.symbolic_stack.push(exc_opref);
                 s.symbolic_stack_types.push(Type::Ref);
                 s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
                 s.valuestackdepth += 1;
+                s.registers_r.push(exc_opref);
             }
             // Sync concrete frame.
             let frame = unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::PyFrame) };
