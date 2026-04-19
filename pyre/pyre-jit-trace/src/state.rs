@@ -1523,26 +1523,6 @@ pub(crate) fn namespace_value_direct(ns: *mut PyNamespace, idx: usize) -> Option
     unsafe { &*ns }.get_slot(idx)
 }
 
-pub(crate) fn record_current_state_guard(
-    ctx: &mut TraceCtx,
-    frame: OpRef,
-    next_instr: OpRef,
-    code: OpRef,
-    stack_depth: OpRef,
-    namespace: OpRef,
-    locals: &[OpRef],
-    stack: &[OpRef],
-    opcode: OpCode,
-    args: &[OpRef],
-) {
-    let mut fail_args = vec![frame, next_instr, code, stack_depth, namespace];
-    fail_args.extend_from_slice(locals);
-    fail_args.extend_from_slice(stack);
-    let num_slots = fail_args.len() - crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    let fail_arg_types = crate::virtualizable_gen::virt_live_value_types(num_slots);
-    ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
-}
-
 /// virtualizable.py:44 + interp_jit.py:25-31 —
 /// `locals_cells_stack_w[*]` is declared as a W_Root array, so every
 /// item's JIT type is GCREF (Type::Ref). W_IntObject/W_FloatObject are
