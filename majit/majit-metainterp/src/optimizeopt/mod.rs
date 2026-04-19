@@ -672,7 +672,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         }
     }
 
-    fn make_rd_virtual_info(
+    fn make_virtual_info(
         &self,
         opref: OpRef,
         fieldnums: Vec<i16>,
@@ -706,7 +706,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         Some(vinfo)
     }
 
-    fn rd_virtual_info_would_be_reused(&self, opref: OpRef, fieldnums: &[i16]) -> bool {
+    fn virtual_info_would_be_reused(&self, opref: OpRef, fieldnums: &[i16]) -> bool {
         let resolved = self.ctx.get_box_replacement(opref);
         let Some(info) = self.ctx.get_ptr_info(resolved) else {
             return false;
@@ -724,7 +724,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
 /// resume.py:298-357 `ResumeDataVirtualAdder` in its role as a
 /// `VirtualVisitor` — each `visit_*` builds a fresh `RdVirtualInfo`
 /// subclass without fieldnums (the caller attaches those via
-/// `set_content`). In pyre, `make_rd_virtual_info` lives on the
+/// `set_content`). In pyre, `make_virtual_info` lives on the
 /// `BoxEnv` impl (not on `ResumeDataVirtualAdder`) because PtrInfo
 /// lookup is the optimizer's responsibility, so the visitor adapter
 /// is this zero-sized helper instead of `ResumeDataVirtualAdder`

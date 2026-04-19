@@ -489,15 +489,15 @@ pub trait BoxEnv {
     /// Dispatches on the virtual type (Virtual, VStruct, VArray, etc.)
     /// to produce the correct variant — matching RPython's
     /// `info.visitor_dispatch_virtual_type(self)` + `vinfo.set_content(fieldnums)`.
-    fn make_rd_virtual_info(&self, _opref: OpRef, _fieldnums: Vec<i16>) -> Option<RdVirtualInfo> {
+    fn make_virtual_info(&self, _opref: OpRef, _fieldnums: Vec<i16>) -> Option<RdVirtualInfo> {
         None
     }
     /// resume.py:504-505 `if vinfo.fieldnums is not fieldnums: memo.nvreused += 1`.
     ///
-    /// Returns true when `make_rd_virtual_info()` would reuse an already-cached
+    /// Returns true when `make_virtual_info()` would reuse an already-cached
     /// virtual info object for the given `(opref, fieldnums)` instead of
     /// allocating a fresh one.
-    fn rd_virtual_info_would_be_reused(&self, _opref: OpRef, _fieldnums: &[i16]) -> bool {
+    fn virtual_info_would_be_reused(&self, _opref: OpRef, _fieldnums: &[i16]) -> bool {
         false
     }
 }

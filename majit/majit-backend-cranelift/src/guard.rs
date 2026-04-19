@@ -11,7 +11,7 @@
 use crate::compiler::{register_gc_roots, unregister_gc_roots};
 use majit_backend::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
-use majit_ir::{AccumVectorInfo, DescrRef, FailDescr, GcRef, Type};
+use majit_ir::{AccumInfo, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -142,7 +142,7 @@ pub struct CraneliftFailDescr {
     pub fail_count: AtomicU32,
     /// schedule.py:654-655 / history.py:143-147 — vector guard metadata
     /// copied from the frontend fail descriptor during lowering.
-    pub vector_info: Vec<AccumVectorInfo>,
+    pub vector_info: Vec<AccumInfo>,
     /// Compiled bridge attached to this guard, if any.
     /// Write-once when bridge is compiled, read-only after.
     /// No lock — RPython compile.py attach_bridge has no lock (GIL).
@@ -530,7 +530,7 @@ impl FailDescr for CraneliftFailDescr {
         &self.force_token_slots
     }
 
-    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+    fn vector_info(&self) -> Vec<AccumInfo> {
         self.vector_info.clone()
     }
 

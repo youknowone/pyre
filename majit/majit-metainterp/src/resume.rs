@@ -2992,10 +2992,20 @@ pub struct ResumeDataLoopMemo {
     large_ints: HashMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
     refs: HashMap<i64, i16>,
-    /// resume.py:147 self.consts — i64 constant pool for encode_shared.
-    /// Becomes storage.rd_consts (resume.py:467).
+    /// NEW-DEVIATION from resume.py: parallel i64 constant pool used by
+    /// `encode_tagged_source` (via `encode_shared`) to build
+    /// `storage.rd_consts`. RPython has a single `self.consts` pool —
+    /// `_newconst(const)` appends to it and `tag(len, TAGCONST)` indexes
+    /// it. majit split the pool because rd_numb encoding stores i64
+    /// values instead of RPython's i16 `append_short` tagged values. A
+    /// future refactor should collapse `consts` + `rd_consts_pool` once
+    /// the numbering representation is unified.
     rd_consts_pool: Vec<i64>,
-    /// resume.py:155 self.large_ints — dedup index for rd_consts_pool.
+    /// NEW-DEVIATION companion to `rd_consts_pool`: dedup index (value →
+    /// position in `rd_consts_pool`). RPython does not have a separate
+    /// const-index table — `self.large_ints` / `self.refs` serve that
+    /// role, keyed by value and storing the tagged i16 result directly.
+    /// Collapses along with `rd_consts_pool` once the pools unify.
     const_indices: HashMap<i64, usize>,
     /// resume.py:150-151 — cached box/virtual numbering.
     pub cached_boxes: HashMap<u32, i32>,
@@ -3171,7 +3181,7 @@ impl ResumeDataLoopMemo {
 
     /// resume.py:370-374 register_box — add a non-const, non-seen box to
     /// new_liveboxes with UNASSIGNED or UNASSIGNEDVIRTUAL tag.
-    fn register_box_in_new_liveboxes(
+    fn register_box(
         &self,
         opref: majit_ir::OpRef,
         env: &dyn majit_ir::BoxEnv,
@@ -3211,7 +3221,7 @@ impl ResumeDataLoopMemo {
     /// UNASSIGNEDVIRTUAL tags into real negative numbers via
     /// `assign_number_to_box` / `assign_number_to_virtual`, then
     /// materializes each virtual's fieldnums through
-    /// `env.make_rd_virtual_info` and stores them into the returned
+    /// `env.make_virtual_info` and stores them into the returned
     /// `rd_virtuals` Vec.
     ///
     /// `liveboxes` is extended in place with the freshly numbered boxes
@@ -3328,10 +3338,10 @@ impl ResumeDataLoopMemo {
                         })
                         .collect();
                     let reused =
-                        env.rd_virtual_info_would_be_reused(majit_ir::OpRef(opref_id), &fieldnums);
+                        env.virtual_info_would_be_reused(majit_ir::OpRef(opref_id), &fieldnums);
                     // resume.py:501: vinfo = self.make_virtual_info(info, fieldnums)
                     if let Some(rd_virt) =
-                        env.make_rd_virtual_info(majit_ir::OpRef(opref_id), fieldnums)
+                        env.make_virtual_info(majit_ir::OpRef(opref_id), fieldnums)
                     {
                         if reused {
                             // resume.py:504-505: cached `_cached_vinfo` reused.
@@ -3712,7 +3722,7 @@ impl ResumeDataLoopMemo {
                 // resume.py:362-368: register_virtual_fields
                 for &field_opref in &vf.field_oprefs {
                     // resume.py:370-374: register_box
-                    self.register_box_in_new_liveboxes(
+                    self.register_box(
                         field_opref,
                         env,
                         &numb_state.liveboxes,
@@ -3745,14 +3755,14 @@ impl ResumeDataLoopMemo {
             let box_opref = env.get_box_replacement(pf.target);
             let fieldbox = env.get_box_replacement(pf.value);
             // resume.py:438-439: self.register_box(box); self.register_box(fieldbox)
-            self.register_box_in_new_liveboxes(
+            self.register_box(
                 box_opref,
                 env,
                 &numb_state.liveboxes,
                 &mut new_liveboxes,
                 &mut new_liveboxes_order,
             );
-            self.register_box_in_new_liveboxes(
+            self.register_box(
                 fieldbox,
                 env,
                 &numb_state.liveboxes,
@@ -3762,7 +3772,7 @@ impl ResumeDataLoopMemo {
             // resume.py:440-442: info.visitor_walk_recursive(fieldbox, self)
             if let Some(vf) = env.get_virtual_fields(fieldbox) {
                 for &field_opref in &vf.field_oprefs {
-                    self.register_box_in_new_liveboxes(
+                    self.register_box(
                         field_opref,
                         env,
                         &numb_state.liveboxes,
@@ -3799,7 +3809,7 @@ impl ResumeDataLoopMemo {
             }
             if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef(opref_id)) {
                 for &field_opref in &vf.field_oprefs {
-                    self.register_box_in_new_liveboxes(
+                    self.register_box(
                         field_opref,
                         env,
                         &numb_state.liveboxes,

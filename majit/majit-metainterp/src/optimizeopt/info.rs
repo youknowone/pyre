@@ -281,7 +281,7 @@ pub struct StrPtrInfo {
     /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` — inherited
     /// through `StrPtrInfo(AbstractVirtualPtrInfo)` (vstring.py:50,55).
     /// Same semantics as the sibling Virtual/VirtualArray/... variants:
-    /// `make_rd_virtual_info` dedups across finish() calls by comparing
+    /// `make_virtual_info` dedups across finish() calls by comparing
     /// fieldnums (resume.py:309-314).
     pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
 }
@@ -1216,7 +1216,7 @@ impl PtrInfo {
     ///
     /// Returns the per-instance `RefCell<Option<RdVirtualInfo>>` cache when
     /// `self` is one of the virtual variants that stores it; `None` for
-    /// non-virtual variants. `make_rd_virtual_info` (resume.py:307-315) uses
+    /// non-virtual variants. `make_virtual_info` (resume.py:307-315) uses
     /// this to dedup RdVirtualInfo allocations across multiple finish()
     /// calls that reference the same virtual.
     pub fn cached_vinfo(&self) -> Option<&std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>> {
@@ -2496,7 +2496,7 @@ pub struct VirtualInfo {
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — cached RdVirtualInfo for resume data
     /// dedup (resume.py:309-314). RefCell for interior mutability so
-    /// the immutable-receiver `make_rd_virtual_info` trait method can
+    /// the immutable-receiver `make_virtual_info` trait method can
     /// populate the cache on first miss.
     pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
 }

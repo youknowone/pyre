@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use majit_ir::{AccumVectorInfo, DescrRef, FailDescr, Type};
+use majit_ir::{AccumInfo, DescrRef, FailDescr, Type};
 
 use crate::resume::ResumeData;
 
@@ -35,7 +35,7 @@ struct MetaFailDescr {
     types: Vec<Type>,
     /// schedule.py:654: vector accumulation info attached during vectorization.
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
-    vector_info: UnsafeCell<Vec<AccumVectorInfo>>,
+    vector_info: UnsafeCell<Vec<AccumInfo>>,
 }
 
 // Safety: JIT is single-threaded. UnsafeCell replaces Mutex for rd_vector_info.
@@ -67,10 +67,10 @@ impl FailDescr for MetaFailDescr {
     fn fail_arg_types(&self) -> &[Type] {
         &self.types
     }
-    fn attach_vector_info(&self, info: AccumVectorInfo) {
+    fn attach_vector_info(&self, info: AccumInfo) {
         unsafe { &mut *self.vector_info.get() }.push(info);
     }
-    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+    fn vector_info(&self) -> Vec<AccumInfo> {
         unsafe { &mut *self.vector_info.get() }.clone()
     }
 }
@@ -87,7 +87,7 @@ struct ResumeGuardDescr {
     types: Vec<Type>,
     resume_data: ResumeData,
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
-    vector_info: UnsafeCell<Vec<AccumVectorInfo>>,
+    vector_info: UnsafeCell<Vec<AccumInfo>>,
 }
 
 unsafe impl Send for ResumeGuardDescr {}
@@ -118,10 +118,10 @@ impl FailDescr for ResumeGuardDescr {
     fn fail_arg_types(&self) -> &[Type] {
         &self.types
     }
-    fn attach_vector_info(&self, info: AccumVectorInfo) {
+    fn attach_vector_info(&self, info: AccumInfo) {
         unsafe { &mut *self.vector_info.get() }.push(info);
     }
-    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+    fn vector_info(&self) -> Vec<AccumInfo> {
         unsafe { &mut *self.vector_info.get() }.clone()
     }
 }
@@ -215,10 +215,10 @@ impl FailDescr for ResumeAtPositionDescr {
     fn fail_arg_types(&self) -> &[Type] {
         &self.inner.types
     }
-    fn attach_vector_info(&self, info: AccumVectorInfo) {
+    fn attach_vector_info(&self, info: AccumInfo) {
         unsafe { &mut *self.inner.vector_info.get() }.push(info);
     }
-    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+    fn vector_info(&self) -> Vec<AccumInfo> {
         unsafe { &mut *self.inner.vector_info.get() }.clone()
     }
 }
@@ -268,7 +268,7 @@ pub struct CompileLoopVersionDescr {
     fail_index: u32,
     types: Vec<Type>,
     resume_data: ResumeData,
-    vector_info: UnsafeCell<Vec<AccumVectorInfo>>,
+    vector_info: UnsafeCell<Vec<AccumInfo>>,
 }
 
 unsafe impl Send for CompileLoopVersionDescr {}
@@ -307,10 +307,10 @@ impl FailDescr for CompileLoopVersionDescr {
     fn loop_version(&self) -> bool {
         true
     }
-    fn attach_vector_info(&self, info: AccumVectorInfo) {
+    fn attach_vector_info(&self, info: AccumInfo) {
         unsafe { &mut *self.vector_info.get() }.push(info);
     }
-    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+    fn vector_info(&self) -> Vec<AccumInfo> {
         unsafe { &mut *self.vector_info.get() }.clone()
     }
 }

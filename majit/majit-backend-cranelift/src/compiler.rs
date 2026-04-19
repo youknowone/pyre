@@ -29,8 +29,8 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
-    AccumVectorInfo, CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode,
-    OpRef, Type, Value,
+    AccumInfo, CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRef,
+    Type, Value,
 };
 
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
@@ -4508,7 +4508,7 @@ fn emit_guard_exit(
     // vector_ext.py:119-156 _update_at_exit parity:
     // If accumulation is done in this loop, at the guard exit some vector
     // values must be reduced to scalars before storing to jf_frame.
-    let accum_positions: HashMap<usize, &AccumVectorInfo> = info
+    let accum_positions: HashMap<usize, &AccumInfo> = info
         .accum_info
         .iter()
         .map(|ai| (ai.failargs_pos, ai))
@@ -4997,7 +4997,7 @@ struct GuardInfo {
     /// vector_ext.py:119 _update_at_exit: accumulation metadata for vector
     /// reduction at guard exit. Each entry maps a fail_arg slot to its
     /// vector accumulator variable and reduction operator.
-    accum_info: Vec<AccumVectorInfo>,
+    accum_info: Vec<AccumInfo>,
 }
 
 fn identity_recovery_layout(

@@ -761,10 +761,10 @@ pub trait FailDescr: Descr {
 
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
     /// to a guard descriptor. Non-guard fail descriptors ignore this.
-    fn attach_vector_info(&self, _info: AccumVectorInfo) {}
+    fn attach_vector_info(&self, _info: AccumInfo) {}
 
     /// Read back any attached vector resume info.
-    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+    fn vector_info(&self) -> Vec<AccumInfo> {
         Vec::new()
     }
 }
@@ -787,12 +787,12 @@ pub trait FailDescr: Descr {
 /// instantiates it; this is the same cross-cutting pattern as
 /// `RawStructPtrInfo` (info.py:452, never instantiated).
 #[derive(Debug, Clone)]
-pub struct AccumVectorInfo {
+pub struct AccumInfo {
     /// resume.py:31/32 prev — next entry in the VectorInfo linked list.
     /// RPython walks the chain via `next()` / `clone()`; pyre stores a
     /// linked list per guard via `attach_vector_info` pushing onto a Vec,
     /// with `prev` set at construction time. `None` marks list tail.
-    pub prev: Option<Box<AccumVectorInfo>>,
+    pub prev: Option<Box<AccumInfo>>,
     /// resume.py:27 failargs_pos — index in the guard's fail arguments.
     pub failargs_pos: usize,
     /// resume.py:29 variable — the original scalar variable (getoriginal()).
@@ -2072,7 +2072,7 @@ pub struct SimpleFailDescr {
     is_finish: bool,
     trace_id: u64,
     /// schedule.py:654: vector accumulation info attached during vectorization.
-    vector_info: std::cell::UnsafeCell<Vec<AccumVectorInfo>>,
+    vector_info: std::cell::UnsafeCell<Vec<AccumInfo>>,
 }
 
 impl Clone for SimpleFailDescr {
@@ -2144,10 +2144,10 @@ impl FailDescr for SimpleFailDescr {
     fn trace_id(&self) -> u64 {
         self.trace_id
     }
-    fn attach_vector_info(&self, info: AccumVectorInfo) {
+    fn attach_vector_info(&self, info: AccumInfo) {
         unsafe { &mut *self.vector_info.get() }.push(info);
     }
-    fn vector_info(&self) -> Vec<AccumVectorInfo> {
+    fn vector_info(&self) -> Vec<AccumInfo> {
         unsafe { &mut *self.vector_info.get() }.clone()
     }
 }

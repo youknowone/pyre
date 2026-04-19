@@ -17,7 +17,7 @@
 ///
 /// # TODO — remaining RPython parity gaps
 ///
-/// - **Cranelift SIMD codegen**: vector_info (AccumVectorInfo) is stored on all
+/// - **Cranelift SIMD codegen**: vector_info (AccumInfo) is stored on all
 ///   guard FailDescr types (MetaFailDescr, SimpleFailDescr, ResumeGuardDescr),
 ///   but the Cranelift backend does not yet consume it during guard failure
 ///   recovery or register allocation. RPython's x86 backend reads
@@ -233,7 +233,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                     .unwrap_or(*arg);
                 if let Some(ref descr) = op.descr {
                     if let Some(fail_descr) = descr.as_fail_descr() {
-                        fail_descr.attach_vector_info(majit_ir::AccumVectorInfo {
+                        fail_descr.attach_vector_info(majit_ir::AccumInfo {
                             // resume.py:31 prev — built at construction time;
                             // attach_vector_info pushes onto a Vec whose end-of-list
                             // equivalent is `None`. If multiple AccumInfos are
