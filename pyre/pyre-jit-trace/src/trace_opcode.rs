@@ -634,6 +634,16 @@ impl MIFrame {
             }
         }
         let value = s.symbolic_locals[idx];
+        // Step 1.1 of the regalloc-parity refactor: mirror every
+        // load into the abstract register file (RPython MIFrame
+        // parity, pyjitpl.py:74-78). Color choice is identity
+        // (= Python local idx) for now — the abstract-color drift
+        // happens in later substeps once consumers (step 1.3+)
+        // start treating these indices as opaque.
+        if idx >= s.registers_r.len() {
+            s.registers_r.resize(idx + 1, OpRef::NONE);
+        }
+        s.registers_r[idx] = value;
         Ok(value)
     }
 
