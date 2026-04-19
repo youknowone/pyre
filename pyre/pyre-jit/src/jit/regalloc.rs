@@ -359,39 +359,44 @@ impl RegAllocator {
                         // RPython's regalloc runs BEFORE
                         // `compute_liveness` (`codewriter.py:44`
                         // vs `:55`), so `-live-` markers do not yet
-                        // exist at allocation time. Reviewer #1 is
-                        // correct that pyre's "fill liveness then
-                        // regalloc" order over-constrains the
-                        // interference graph relative to upstream.
+                        // exist at allocation time. pyre's
+                        // dispatch loop emits EMPTY `Insn::Live`
+                        // placeholders, then `fill_assembler_liveness`
+                        // (`codewriter.rs:237-249`) populates each
+                        // with the per-Python-PC `(live_i, live_r,
+                        // live_f)` triple from the Python-bytecode
+                        // LiveVars analysis. By the time this walk
+                        // runs the args contain only `Register`
+                        // operands (never `TLabel`), and the
+                        // `alive.insert(reg.index)` extension
+                        // preserves their lifetime through the
+                        // resume point — pyre's analog of RPython's
+                        // `link.args` keeping block-exit live vars
+                        // alive (`regalloc.py:46-48`).
                         //
-                        // However, simply skipping `Insn::Live`
-                        // here corrupts deoptimization: pyre's
-                        // GUARD opcodes do not carry an explicit
-                        // `fail_args` list (RPython's mechanism
-                        // for keeping deopt-only registers alive
-                        // through regalloc) — they rely on the
-                        // immediately-preceding `-live-` marker.
-                        // Skipping it lets a GUARD's result share
-                        // a color with a register the deopt
-                        // restore needs to read, producing
-                        // silent corruption (verified: nbody
-                        // SIGSEGV after the change).
-                        //
-                        // Removing this adaptation is the
-                        // dependency of reviewer #1's fix and
-                        // requires porting GUARD `fail_args` first
-                        // (RPython
-                        // `pyjitpl.store_final_boxes_in_guard` +
-                        // `jtransform` insertion of fail_args into
-                        // GUARD op args). Tracked alongside the
-                        // multi-session refactor for #2/#3.
+                        // Reviewer Item 1 (remove this branch) is
+                        // gated on Stage 3.4 (abstract register
+                        // file). The blocking coupling is
+                        // encoder-side: `get_list_of_active_boxes`
+                        // iterates `metadata.liveness` (Python
+                        // LiveVars indexed by pre-regalloc PyFrame
+                        // slot) and the blackhole decoder iterates
+                        // the jitcode's `-live-` bytes (indexed by
+                        // post-regalloc register color). Only after
+                        // both consumers read a single SSARepr-
+                        // backward source (Stage 3.4) can
+                        // `compute_liveness` subsume
+                        // `fill_assembler_liveness` and this branch
+                        // become dead code. Empirically verified:
+                        // swapping to `compute_liveness` post-rename
+                        // while leaving the encoder on LiveVars
+                        // crashes `test_recursive_global_reads`
+                        // (diverging sets of live registers).
                         for x in args {
-                            match x {
-                                Operand::Register(reg) if reg.kind == kind => {
+                            if let Operand::Register(reg) = x {
+                                if reg.kind == kind {
                                     alive.insert(reg.index);
                                 }
-                                Operand::TLabel(lbl) => follow_label(&mut alive, &label2alive, lbl),
-                                _ => {}
                             }
                         }
                     }
