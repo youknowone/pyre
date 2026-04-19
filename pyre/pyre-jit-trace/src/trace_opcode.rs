@@ -691,6 +691,14 @@ impl MIFrame {
             // virtualizable.py:86-98 read_boxes() parity: every item of
             // locals_cells_stack_w is Ref.
             s.symbolic_local_types[idx] = Type::Ref;
+            // Step 1.2 of the regalloc-parity refactor: mirror every
+            // store into the abstract register file. Identity color
+            // (= Python local idx) for now; later substeps drift to
+            // fresh colors.
+            if idx >= s.registers_r.len() {
+                s.registers_r.resize(idx + 1, OpRef::NONE);
+            }
+            s.registers_r[idx] = ref_value;
             (s.vable_array_base.is_some(), s.frame, s.nlocals)
         };
         // RPython pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
