@@ -471,29 +471,25 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             Some(jc) => jc,
             None => return 0,
         };
-        // jitcode.py:147 enumerate_vars parity: decode the offset from the
-        // inline `live/` bytecode, then read [len_i, len_r, len_f] from the
-        // global metainterp_sd.liveness_info — the SAME all_liveness data
-        // that get_list_of_active_boxes uses.
+        // Step A.3 of the regalloc-parity refactor: read the per-PC
+        // value count from `PyJitCodeMetadata.liveness` (the canonical
+        // pyre-side LivenessInfo store) instead of from the packed
+        // `Insn::Live` bytes embedded in the JitCode. Same data — both
+        // are populated by `compute_liveness_table` /
+        // `fill_assembler_liveness` — but reading the structured Vec
+        // avoids the byte-offset round-trip and removes one of the
+        // `Insn::Live` byte consumers ahead of Step B (where
+        // `fill_assembler_liveness` is replaced by RPython's
+        // `compute_liveness(&mut ssarepr)` line-by-line port; after
+        // that, the `Insn::Live` slot will carry register-interference
+        // semantics, NOT this Python-LiveVars view).
+        //
+        // The `metadata.liveness` Vec is indexed by Python PC
+        // (codewriter.rs:267-298), matching the `pc` argument here.
         let payload = &jc.payload;
-        if let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) {
-            let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
-            let all_liveness = &sd.liveness_info;
-            if off + 2 < all_liveness.len() {
-                let length_i = all_liveness[off] as usize;
-                let length_r = all_liveness[off + 1] as usize;
-                let length_f = all_liveness[off + 2] as usize;
-                return length_i + length_r + length_f;
-            }
-            // Fallback: LivenessInfo (merge-point only)
-            if let Some(info) = payload
-                .metadata
-                .liveness
-                .iter()
-                .find(|i| i.pc as usize == jit_pc)
-            {
-                return info.total_live();
-            }
+        let _ = sd.op_live; // op_live is no longer used; kept for future Insn::Live reads
+        if let Some(info) = payload.metadata.liveness.get(pc as usize) {
+            return info.total_live();
         }
         // Fallback: LiveVars from CodeObject (backward-compat).
         // Mirror trace_opcode.rs:get_list_of_active_boxes LiveVars path:

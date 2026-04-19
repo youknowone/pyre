@@ -380,6 +380,38 @@ impl RegAllocator {
                         }
                     }
                     Insn::Live(args) => {
+                        // PRE-EXISTING-ADAPTATION (no RPython
+                        // counterpart in `regalloc.py:26-77`).
+                        //
+                        // RPython's regalloc runs BEFORE
+                        // `compute_liveness` (`codewriter.py:44`
+                        // vs `:55`), so `-live-` markers do not yet
+                        // exist at allocation time. Reviewer #1 is
+                        // correct that pyre's "fill liveness then
+                        // regalloc" order over-constrains the
+                        // interference graph relative to upstream.
+                        //
+                        // However, simply skipping `Insn::Live`
+                        // here corrupts deoptimization: pyre's
+                        // GUARD opcodes do not carry an explicit
+                        // `fail_args` list (RPython's mechanism
+                        // for keeping deopt-only registers alive
+                        // through regalloc) — they rely on the
+                        // immediately-preceding `-live-` marker.
+                        // Skipping it lets a GUARD's result share
+                        // a color with a register the deopt
+                        // restore needs to read, producing
+                        // silent corruption (verified: nbody
+                        // SIGSEGV after the change).
+                        //
+                        // Removing this adaptation is the
+                        // dependency of reviewer #1's fix and
+                        // requires porting GUARD `fail_args` first
+                        // (RPython
+                        // `pyjitpl.store_final_boxes_in_guard` +
+                        // `jtransform` insertion of fail_args into
+                        // GUARD op args). Tracked alongside the
+                        // multi-session refactor for #2/#3.
                         for x in args {
                             match x {
                                 Operand::Register(reg) if reg.kind == kind => {

@@ -209,77 +209,53 @@ impl MIFrame {
         // fail_args. Mirror RPython's invariant by forcing lazy init
         // for each live local via the same `load_local_value` path that
         // LOAD_FAST uses, BEFORE snapshotting symbolic_locals below.
+        // Lazy-load any local that the LivenessInfo at `live_pc` says
+        // is alive but `symbolic_locals` hasn't materialised yet. Same
+        // RPython parity rationale as the loop below — a forward-live
+        // local that's never been LOAD_FASTed in this trace would
+        // otherwise leave OpRef::NONE in the snapshot. Source for the
+        // live indices is `PyJitCodeMetadata.liveness` (see Step A
+        // docstring on the main path below for the rationale).
         let nlocals_pre = self.sym().nlocals;
         let jitcode_ptr_pre = self.sym().jitcode;
-        let (majit_jitcode_raw, py_to_jit_pc_ptr): (
-            *const majit_metainterp::jitcode::JitCode,
-            *const Vec<usize>,
-        ) = unsafe {
+        let live_local_idxs: Vec<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
-            // An empty `pc_map` marks a skeleton payload (call.py:168
-            // creates the JitCode skeleton before the drain populates
-            // it; pyre's PyreSym sentinel `null_jitcode()` is in the
-            // same state). Treat skeletons as "not yet compiled" so
-            // the LiveVars fallback below kicks in instead of
-            // dereferencing the empty `JitCode`.
+            // Skeleton payload (no `pc_map` yet, no LivenessInfo) →
+            // skip the lazy-load preamble; the main path's
+            // skeleton-fallback branch handles the same case.
             if jc.payload.metadata.pc_map.is_empty() {
-                (std::ptr::null(), std::ptr::null())
+                Vec::new()
+            } else if let Some(live_info) = jc.payload.metadata.liveness.get(live_pc) {
+                // RPython `regalloc.py:54-60` analog at trace time:
+                // every register the post-regalloc layout flagged as
+                // alive AND falling in `0..nlocals` corresponds to a
+                // Python local at the matching index (via
+                // `enforce_input_args` in `pyre-jit/src/jit/regalloc.rs`).
+                let mut idxs: Vec<usize> = Vec::new();
+                for &reg_idx in live_info
+                    .live_i_regs
+                    .iter()
+                    .chain(live_info.live_r_regs.iter())
+                {
+                    let idx = reg_idx as usize;
+                    if idx < nlocals_pre {
+                        idxs.push(idx);
+                    }
+                }
+                idxs
             } else {
-                (
-                    std::sync::Arc::as_ptr(&jc.payload.jitcode),
-                    &jc.payload.metadata.pc_map as *const _,
-                )
+                Vec::new()
             }
         };
-        let all_liveness_snapshot = crate::state::liveness_info_snapshot();
-        if !majit_jitcode_raw.is_null() {
-            let majit_jc = unsafe { &*majit_jitcode_raw };
-            let py_to_jit_pc = unsafe { &*py_to_jit_pc_ptr };
-            let all_liveness = &all_liveness_snapshot;
-            if let Some(&jit_pc) = py_to_jit_pc.get(live_pc) {
-                let offset =
-                    majit_jc.get_live_vars_info(jit_pc, majit_metainterp::jitcode::BC_LIVE);
-                let length_i = all_liveness[offset] as u32;
-                let length_r = all_liveness[offset + 1] as u32;
-                let _length_f = all_liveness[offset + 2] as u32;
-                let mut off = offset + 3;
-                use majit_translate::liveness::LivenessIterator;
-                // Note: `register_idx < nlocals` decode stays valid
-                // because the post-pass register allocator (a) keeps
-                // each local's color equal to its slot index via
-                // `enforce_input_args` (RPython parity:
-                // `flatten.py:88-100`), and (b) shifts every
-                // non-inputarg register's color above the inputarg
-                // range (PRE-EXISTING-ADAPTATION in
-                // `pyre/pyre-jit/src/jit/regalloc.rs::enforce_input_args`).
-                // Together those guarantee an INJECTIVE
-                // `color < nlocals ⇔ register holds local of that
-                // index` correspondence at trace-decode time.
-                let mut live_local_idxs: Vec<usize> = Vec::new();
-                for length in [length_i, length_r] {
-                    if length == 0 {
-                        continue;
-                    }
-                    let mut it = LivenessIterator::new(off, length, all_liveness);
-                    while let Some(reg_idx) = it.next() {
-                        let idx = reg_idx as usize;
-                        if idx < nlocals_pre {
-                            live_local_idxs.push(idx);
-                        }
-                    }
-                    off = it.offset;
-                }
-                for idx in live_local_idxs {
-                    let cur = self
-                        .sym()
-                        .symbolic_locals
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(OpRef::NONE);
-                    if cur == OpRef::NONE {
-                        let _ = MIFrame::load_local_value(self, ctx, idx);
-                    }
-                }
+        for idx in live_local_idxs {
+            let cur = self
+                .sym()
+                .symbolic_locals
+                .get(idx)
+                .copied()
+                .unwrap_or(OpRef::NONE);
+            if cur == OpRef::NONE {
+                let _ = MIFrame::load_local_value(self, ctx, idx);
             }
         }
         let (nlocals, local_values, stack_values, jitcode_ptr) = {
@@ -344,78 +320,65 @@ impl MIFrame {
                     live_pc
                 )
             });
-        let offset = jc
+        // Step A of the regalloc-parity refactor: read the per-PC live
+        // register indices from `PyJitCodeMetadata.liveness` (the
+        // canonical pyre-side LivenessInfo store) instead of from the
+        // packed `Insn::Live` bytes embedded in the JitCode. Both stores
+        // currently carry the same data — `fill_assembler_liveness`
+        // patches `Insn::Live` slots with the same `LivenessInfo`
+        // contents — but the `Insn::Live` byte path also has a second
+        // consumer (regalloc's `make_dependencies`, which expects the
+        // RPython `compute_liveness` semantics: SSARepr-level register
+        // interference). Splitting the two consumers is the precondition
+        // for Step B (replace `fill_assembler_liveness` with the RPython
+        // `compute_liveness(&mut ssarepr)` line-by-line port).
+        //
+        // The `metadata.liveness` Vec is built by
+        // `compute_liveness_table` (codewriter.rs:267-298) with one
+        // entry per Python PC in `0..num_instrs`, so direct indexing by
+        // `live_pc` is correct (the `LivenessInfo.pc` field is a
+        // codewriter-side insn index that's NOT comparable to
+        // `metadata.pc_map[live_pc]`'s byte offset — `find()` would
+        // mismatch).
+        //
+        // pyjitpl.py:204-233 parity: iterate live_i, live_r, live_f
+        // banks and snapshot symbolic_locals/stack_values per register
+        // index. Same body as before; only the source of the index list
+        // changed.
+        let _ = jit_pc; // jit_pc is unused; lookup uses live_pc directly
+        let live_info = jc
             .payload
-            .jitcode
-            .get_live_vars_info(jit_pc, crate::state::op_live());
-        // pyjitpl.py:2264 parity: metainterp_sd owns the packed liveness
-        // string; clone here because the thread-local borrow cannot escape.
-        let all_liveness_bytes = crate::state::liveness_info_snapshot();
-        let all_liveness: &[u8] = &all_liveness_bytes;
-        // pyjitpl.py:204-206
-        let length_i = all_liveness[offset] as u32;
-        let length_r = all_liveness[offset + 1] as u32;
-        let length_f = all_liveness[offset + 2] as u32;
-        // pyjitpl.py:207
-        let mut offset = offset + 3;
-
-        // pyjitpl.py:212
-        let total = (length_i + length_r + length_f) as usize;
-        // pyjitpl.py:213-214: allocate a list of the correct size
+            .metadata
+            .liveness
+            .get(live_pc)
+            .unwrap_or_else(|| {
+                panic!(
+                    "get_list_of_active_boxes: no LivenessInfo at live_pc={} (metadata.liveness.len={})",
+                    live_pc,
+                    jc.payload.metadata.liveness.len()
+                )
+            });
+        let total = live_info.total_live();
         let mut boxes = Vec::with_capacity(total);
-
-        use majit_translate::liveness::LivenessIterator;
-
-        // pyjitpl.py:216-221 — int bank (always empty in pyre).
-        if length_i != 0 {
-            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            while let Some(reg_idx) = it.next() {
-                let idx = reg_idx as usize;
-                let val = if idx < nlocals {
-                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
-                } else {
-                    stack_values
-                        .get(idx - nlocals)
-                        .copied()
-                        .unwrap_or(OpRef::NONE)
-                };
-                boxes.push(val);
+        let snapshot = |idx: usize| -> OpRef {
+            if idx < nlocals {
+                local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+            } else {
+                stack_values
+                    .get(idx - nlocals)
+                    .copied()
+                    .unwrap_or(OpRef::NONE)
             }
-            offset = it.offset;
+        };
+        // pyjitpl.py:216-233 — int / ref / float banks in this order.
+        for &reg_idx in &live_info.live_i_regs {
+            boxes.push(snapshot(reg_idx as usize));
         }
-        // pyjitpl.py:222-227 — ref bank (pyre stores everything here).
-        if length_r != 0 {
-            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            while let Some(reg_idx) = it.next() {
-                let idx = reg_idx as usize;
-                let val = if idx < nlocals {
-                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
-                } else {
-                    stack_values
-                        .get(idx - nlocals)
-                        .copied()
-                        .unwrap_or(OpRef::NONE)
-                };
-                boxes.push(val);
-            }
-            offset = it.offset;
+        for &reg_idx in &live_info.live_r_regs {
+            boxes.push(snapshot(reg_idx as usize));
         }
-        // pyjitpl.py:228-233 — float bank (always empty in pyre).
-        if length_f != 0 {
-            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            while let Some(reg_idx) = it.next() {
-                let idx = reg_idx as usize;
-                let val = if idx < nlocals {
-                    local_values.get(idx).copied().unwrap_or(OpRef::NONE)
-                } else {
-                    stack_values
-                        .get(idx - nlocals)
-                        .copied()
-                        .unwrap_or(OpRef::NONE)
-                };
-                boxes.push(val);
-            }
-            let _ = offset; // consumed
+        for &reg_idx in &live_info.live_f_regs {
+            boxes.push(snapshot(reg_idx as usize));
         }
         boxes
     }
