@@ -500,7 +500,7 @@ impl ExitRecoveryLayout {
 }
 
 /// Static layout metadata for a backend fail descriptor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FailDescrLayout {
     /// Backend fail-index for this exit.
     pub fail_index: u32,
@@ -523,6 +523,17 @@ pub struct FailDescrLayout {
     /// Complete frame stack from innermost (this guard's frame) to outermost.
     /// Present when multi-frame reconstruction is supported.
     pub frame_stack: Option<Vec<ExitFrameLayout>>,
+    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
+    /// Propagated from the backend's fail descriptor so the frontend can
+    /// reconstruct the blackhole chain after a trace's `CompiledTrace` entry
+    /// has been evicted but the descriptor itself is still live.
+    pub rd_numb: Option<Vec<u8>>,
+    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
+    pub rd_consts: Option<Vec<(i64, Type)>>,
+    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
+    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    /// Deferred heap writes associated with this guard exit.
+    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
 /// Static layout metadata for a terminal exit within a compiled trace.
@@ -530,7 +541,7 @@ pub struct FailDescrLayout {
 /// Unlike [`FailDescrLayout`], terminal exits are keyed by the trace op index
 /// rather than a backend fail descriptor, because `JUMP` exits do not
 /// necessarily correspond to a deadframe-producing guard site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TerminalExitLayout {
     /// Trace op index of the terminal `FINISH`/`JUMP`.
     pub op_index: usize,
@@ -550,6 +561,15 @@ pub struct TerminalExitLayout {
     pub force_token_slots: Vec<usize>,
     /// Optional backend-origin recovery layout for this terminal exit.
     pub recovery_layout: Option<ExitRecoveryLayout>,
+    /// resume.py:450 — compact resume numbering (terminal exits rarely need
+    /// this, but propagate it for symmetry with `FailDescrLayout`).
+    pub rd_numb: Option<Vec<u8>>,
+    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
+    pub rd_consts: Option<Vec<(i64, Type)>>,
+    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
+    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    /// Deferred heap writes associated with this terminal exit.
+    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
 /// Result of compiling a loop or bridge.
@@ -1273,6 +1293,10 @@ pub trait Backend: Send {
             force_token_slots: descr.force_token_slots().to_vec(),
             recovery_layout: None,
             frame_stack: None,
+            rd_numb: None,
+            rd_consts: None,
+            rd_virtuals: None,
+            rd_pendingfields: None,
         })
     }
 

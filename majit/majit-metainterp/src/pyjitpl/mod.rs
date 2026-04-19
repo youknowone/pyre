@@ -901,10 +901,13 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: layout.force_token_slots,
                 recovery_layout: layout.recovery_layout,
                 resume_layout: None,
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals: None,
-                rd_pendingfields: None,
+                // Backend-side propagation of rd_numb from the fail descriptor
+                // keeps the blackhole resume path alive even after the
+                // frontend evicts the matching `StoredExitLayout`.
+                rd_numb: layout.rd_numb,
+                rd_consts: layout.rd_consts,
+                rd_virtuals: layout.rd_virtuals,
+                rd_pendingfields: layout.rd_pendingfields,
             })
     }
 
@@ -931,10 +934,12 @@ impl<M: Clone> MetaInterp<M> {
                 force_token_slots: layout.force_token_slots,
                 recovery_layout: layout.recovery_layout,
                 resume_layout: None,
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals: None,
-                rd_pendingfields: None,
+                // Terminal exits rarely carry rd_*, but propagate for symmetry
+                // with the guard-exit path.
+                rd_numb: layout.rd_numb,
+                rd_consts: layout.rd_consts,
+                rd_virtuals: layout.rd_virtuals,
+                rd_pendingfields: layout.rd_pendingfields,
             })
     }
 

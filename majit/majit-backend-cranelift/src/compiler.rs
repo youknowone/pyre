@@ -10873,6 +10873,14 @@ fn collect_guards(
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
         descr.gc_runtime_id = gc_runtime_id;
+        // resume.py:450-488 parity: propagate rd_* from op to descr so
+        // `compiled_exit_layout_from_backend` (pyjitpl/mod.rs:817-845) can
+        // reconstruct the blackhole chain even after the frontend's
+        // `CompiledTrace.exit_layouts` entry for this fail_index is evicted.
+        descr.rd_numb = op.rd_numb.clone();
+        descr.rd_consts = op.rd_consts.clone();
+        descr.rd_virtuals = op.rd_virtuals.clone();
+        descr.rd_pendingfields = op.rd_pendingfields.clone();
         let descr = Arc::new(descr);
         // store_hash is called after compile_loop by pyjitpl.rs using
         // jitcounter.fetch_next_hash() (compile.py:826-830 parity).
@@ -10983,6 +10991,13 @@ fn collect_terminal_exit_layouts(
                 gc_ref_slots,
                 force_token_slots,
                 recovery_layout,
+                // Terminal exits (FINISH/JUMP) don't carry per-guard resume
+                // data — RPython's jitdriver dispatches them via a separate
+                // path (DoneWithThisFrame / ContinueRunningNormally).
+                rd_numb: None,
+                rd_consts: None,
+                rd_virtuals: None,
+                rd_pendingfields: None,
             });
         }
 

@@ -153,6 +153,18 @@ pub struct CraneliftFailDescr {
     /// Used by force() to register the JitFrame as a GC root without
     /// relying on thread-local ACTIVE_GC_RUNTIME_ID.
     pub gc_runtime_id: Option<u64>,
+    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
+    /// Populated at compile time from the frontend's `StoredExitLayout` so
+    /// `compiled_exit_layout_from_backend` can reconstruct the blackhole
+    /// chain after the `CompiledTrace` entry is evicted but the descriptor
+    /// remains reachable via its backend-side handle.
+    pub rd_numb: Option<Vec<u8>>,
+    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
+    pub rd_consts: Option<Vec<(i64, Type)>>,
+    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
+    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    /// Deferred heap writes associated with this guard exit.
+    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
 impl std::fmt::Debug for CraneliftFailDescr {
@@ -265,6 +277,10 @@ impl CraneliftFailDescr {
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
             gc_runtime_id: None,
+            rd_numb: None,
+            rd_consts: None,
+            rd_virtuals: None,
+            rd_pendingfields: None,
         }
     }
 
@@ -302,6 +318,10 @@ impl CraneliftFailDescr {
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
             gc_runtime_id: None,
+            rd_numb: None,
+            rd_consts: None,
+            rd_virtuals: None,
+            rd_pendingfields: None,
         }
     }
 
@@ -458,6 +478,11 @@ impl CraneliftFailDescr {
             force_token_slots: self.force_token_slots.clone(),
             recovery_layout: recovery,
             frame_stack,
+            // resume.py:450-488 propagate rd_* for post-eviction reconstruction.
+            rd_numb: self.rd_numb.clone(),
+            rd_consts: self.rd_consts.clone(),
+            rd_virtuals: self.rd_virtuals.clone(),
+            rd_pendingfields: self.rd_pendingfields.clone(),
         }
     }
 }

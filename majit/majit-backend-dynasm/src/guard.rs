@@ -170,6 +170,13 @@ impl DynasmFailDescr {
             frame_stack: None,
             recovery_layout: self.recovery_layout(),
             trace_info: None,
+            // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
+            // can reach them after the frontend trace cache evicts the owning
+            // `CompiledTrace` entry (pyjitpl/mod.rs:817-845).
+            rd_numb: self.rd_numb.clone(),
+            rd_consts: self.rd_consts.clone(),
+            rd_virtuals: self.rd_virtuals.clone(),
+            rd_pendingfields: self.rd_pendingfields.clone(),
         }
     }
 }

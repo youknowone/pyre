@@ -670,10 +670,14 @@ pub(crate) fn merge_backend_exit_layouts(
                     force_token_slots: layout.force_token_slots.clone(),
                     recovery_layout: layout.recovery_layout.clone(),
                     resume_layout: None,
-                    rd_numb: None,
-                    rd_consts: None,
-                    rd_virtuals: None,
-                    rd_pendingfields: None,
+                    // Seed rd_* from the backend layout so freshly-inserted
+                    // entries carry resume data even when the frontend never
+                    // populated this `fail_index` in `finish_and_compile`
+                    // (e.g. bridges attached after the main trace).
+                    rd_numb: layout.rd_numb.clone(),
+                    rd_consts: layout.rd_consts.clone(),
+                    rd_virtuals: layout.rd_virtuals.clone(),
+                    rd_pendingfields: layout.rd_pendingfields.clone(),
                 });
         entry.source_op_index = layout.source_op_index;
         // Preserve exit_types from build_guard_metadata (which reconciles
@@ -686,6 +690,17 @@ pub(crate) fn merge_backend_exit_layouts(
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
         entry.recovery_layout = layout.recovery_layout.clone();
+
+        // rd_* is owned by the frontend optimizer (`store_final_boxes_in_guard`).
+        // Only backfill when the entry's rd_numb is None — never overwrite a
+        // frontend-computed numbering with a backend copy. The backend value
+        // mirrors the frontend's, but the frontend's is authoritative.
+        if entry.rd_numb.is_none() && layout.rd_numb.is_some() {
+            entry.rd_numb = layout.rd_numb.clone();
+            entry.rd_consts = layout.rd_consts.clone();
+            entry.rd_virtuals = layout.rd_virtuals.clone();
+            entry.rd_pendingfields = layout.rd_pendingfields.clone();
+        }
 
         // Merge backend frame_stack metadata into the stored resume layout.
         if let Some(frame_stack) = &layout.frame_stack {
