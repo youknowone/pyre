@@ -16,6 +16,18 @@ use crate::fail_descr::{make_fail_descr, make_fail_descr_typed};
 use crate::jitdriver::JitDriverStaticData;
 use crate::virtualizable::VirtualizableInfo;
 
+/// Inverse of `heap_value_for`: encode a typed `Value` into the raw i64
+/// bit-pattern that `VirtualizableInfo::write_field`/`write_array_item`
+/// interpret per field/item type.
+pub(crate) fn value_to_raw_bits(value: Value) -> i64 {
+    match value {
+        Value::Int(v) => v,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Ref(r) => r.as_usize() as i64,
+        Value::Void => 0,
+    }
+}
+
 /// Tracing context: wraps Trace + ConstantPool with convenience API.
 ///
 /// The interpreter uses this during trace recording to:
@@ -58,6 +70,13 @@ pub struct TraceCtx {
     virtualizable_info: Option<VirtualizableInfo>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
+    /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
+    /// Mirrored from `MetaInterp::vable_ptr` at trace/bridge-entry.  Used by
+    /// `synchronize_virtualizable` to write `virtualizable_values` back to
+    /// the live PyFrame after every standard vable setfield / setarrayitem
+    /// (virtualizable.py:101 write_boxes parity). `None` disables the
+    /// write — unit-test or init-before-run path.
+    virtualizable_heap_ptr: Option<*const u8>,
     /// Header PC at which this trace started (0 = function entry).
     pub header_pc: usize,
     /// When a cross-loop cut occurs (trace closes at inner loop header),
@@ -305,6 +324,7 @@ impl TraceCtx {
             virtualizable_values: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
             replacements: Vec::new(),
@@ -352,6 +372,7 @@ impl TraceCtx {
             virtualizable_values: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
+            virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
             replacements: Vec::new(),
@@ -966,6 +987,68 @@ impl TraceCtx {
         self.virtualizable_boxes.clone()
     }
 
+    // (synchronize_virtualizable helper follows)
+
+    /// Mirror of `MetaInterp::vable_ptr` used by `synchronize_virtualizable`.
+    /// Callers set this at trace/bridge-entry so writes to
+    /// `virtualizable_values` can propagate to the live PyFrame without
+    /// routing back through MetaInterp (pyjitpl.py:3446 write_boxes target).
+    pub fn set_virtualizable_heap_ptr(&mut self, ptr: *const u8) {
+        self.virtualizable_heap_ptr = if ptr.is_null() { None } else { Some(ptr) };
+    }
+
+    /// pyjitpl.py:3446-3450 `synchronize_virtualizable()`.
+    ///
+    /// Writes the concrete half of `virtualizable_boxes` (the
+    /// `virtualizable_values` shadow) back to the live virtualizable via
+    /// `VirtualizableInfo::write_all_boxes`. The trailing identity slot
+    /// (`virtualizable_boxes[-1]`) is excluded — RPython's `write_boxes`
+    /// stops at `self.num_arrays + self.static_fields.len()` and leaves the
+    /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
+    /// or `virtualizable_values` is unavailable.
+    pub(crate) fn synchronize_virtualizable(&self) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(values) = self.virtualizable_values.as_ref() else {
+            return;
+        };
+        let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
+            return;
+        };
+        let static_count = info.num_static_extra_boxes;
+        if values.len() < static_count {
+            return;
+        }
+        let mut static_bits: Vec<i64> = Vec::with_capacity(static_count);
+        for v in &values[..static_count] {
+            static_bits.push(value_to_raw_bits(*v));
+        }
+        let mut array_bits: Vec<Vec<i64>> = Vec::with_capacity(lengths.len());
+        let mut cursor = static_count;
+        for &len in lengths {
+            if cursor + len > values.len() {
+                return;
+            }
+            let mut items: Vec<i64> = Vec::with_capacity(len);
+            for v in &values[cursor..cursor + len] {
+                items.push(value_to_raw_bits(*v));
+            }
+            array_bits.push(items);
+            cursor += len;
+        }
+        // Safety: `heap_ptr` is cached at trace/bridge entry from
+        // `MetaInterp::vable_ptr`, which the JitState pins for the trace
+        // session's lifetime. `write_all_boxes` uses typed offsets derived
+        // from the same VirtualizableInfo used at the matching heap read.
+        unsafe {
+            info.write_all_boxes(heap_ptr as *mut u8, &static_bits, &array_bits);
+        }
+    }
+
     /// Read a standard virtualizable box by flat index.
     ///
     /// The last slot is the standard virtualizable identity itself
@@ -1516,7 +1599,9 @@ impl TraceCtx {
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index {
             if self.set_virtualizable_entry_at(idx, value, concrete) {
-                // self.metainterp.synchronize_virtualizable() — no-op in pyre.
+                // pyjitpl.py:3446 write_boxes parity: mirror the updated
+                // shadow slot back into the live virtualizable.
+                self.synchronize_virtualizable();
                 return;
             }
         }
@@ -1841,7 +1926,9 @@ impl TraceCtx {
         if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
         {
             if self.set_virtualizable_entry_at(flat_idx, value, concrete) {
-                // self.metainterp.synchronize_virtualizable() — no-op in pyre.
+                // pyjitpl.py:3446 write_boxes parity: mirror the updated
+                // shadow slot back into the live virtualizable.
+                self.synchronize_virtualizable();
                 return;
             }
         }

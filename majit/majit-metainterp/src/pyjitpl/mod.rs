@@ -231,6 +231,8 @@ fn heap_value_for(ty: Type, bits: i64) -> Value {
     }
 }
 
+pub(crate) use crate::trace_ctx::value_to_raw_bits;
+
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[majit_trace::recorder::Snapshot],
     constants: &mut std::collections::HashMap<u32, i64>,
@@ -1205,8 +1207,14 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Cache the current virtualizable object pointer for trace-entry setup.
+    /// Mirrored onto `TraceCtx::virtualizable_heap_ptr` so
+    /// `synchronize_virtualizable` can reach the live frame without a
+    /// callback back into MetaInterp.
     pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
         self.vable_ptr = ptr;
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.set_virtualizable_heap_ptr(ptr);
+        }
     }
 
     /// Cache fallback virtualizable array lengths for trace-entry box setup.
@@ -1895,15 +1903,15 @@ impl<M: Clone> MetaInterp<M> {
     ///     vinfo.write_boxes(virtualizable, self.virtualizable_boxes)
     /// ```
     ///
-    /// RPython mirrors the `virtualizable_boxes` model into the C-level
-    /// virtualizable struct so that subsequent runtime reads see the new
-    /// values. pyre's `virtualizable_boxes` (on TraceCtx) is the single
-    /// source of truth — there is no separate C struct to mirror into —
-    /// so this is a no-op. Kept as a named seam to make the call sites
-    /// at `_opimpl_setfield_vable` (pyjitpl.py:1194) and
-    /// `_opimpl_setarrayitem_vable` (pyjitpl.py:1246) line up structurally.
+    /// Delegates to `TraceCtx::synchronize_virtualizable`, which owns the
+    /// `virtualizable_values` shadow and the mirrored `vable_ptr`. Keeping
+    /// this thin wrapper preserves the RPython call-site spelling
+    /// (`self.metainterp.synchronize_virtualizable()`) at setfield_vable /
+    /// setarrayitem_vable sites that route through MetaInterp.
     pub fn synchronize_virtualizable(&mut self, _vable_opref: OpRef) {
-        // intentionally empty — see doc comment.
+        if let Some(ctx) = self.tracing.as_ref() {
+            ctx.synchronize_virtualizable();
+        }
     }
 
     /// pyjitpl.py:3452-3464 `MetaInterp.load_fields_from_virtualizable()`.
