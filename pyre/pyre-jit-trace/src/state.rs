@@ -519,6 +519,98 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     })
 }
 
+/// virtualizable.py:86-98 `read_boxes` parity: assemble the
+/// `virtualizable_boxes` layout the tracing-time vable mirror expects
+/// and hand it to `TraceCtx::init_virtualizable_boxes`. Used by both
+/// the root portal seed (`initialize_sym`) and the bridge entry rebuild
+/// (`setup_bridge_sym`). Matches RPython `virtualizable.py:139
+/// load_list_of_boxes`, producing `[static_fields..., array_items...,
+/// vable_box]` (the trailing `vable_box` is appended by
+/// `init_virtualizable_boxes`).
+///
+/// * `scalar_oprefs` — the NUM_SCALAR_INPUTARGS − 1 static field OpRefs
+///   in declaration order (last_instr, pycode, valuestackdepth,
+///   debugdata, lastblock, w_globals).
+/// * `array_items` — pre-resolved OpRefs for the heap-side
+///   `locals_cells_stack_w` array. Entries past `array_len` are ignored;
+///   short lists are padded with a shared const-NULL Ref so the vable
+///   mirror covers every interpreter-visible slot (virtualizable.py:109
+///   `assert len(boxes) == i + 1`).
+/// * `array_len` — the runtime PyFrame's
+///   `locals_cells_stack_w.len()`; `init_virtualizable_boxes` stores this
+///   as the sole entry in `virtualizable_array_lengths`.
+pub(crate) fn seed_virtualizable_boxes(
+    ctx: &mut TraceCtx,
+    vable_ref: OpRef,
+    scalar_oprefs: &[OpRef],
+    array_items: &[OpRef],
+    array_len: usize,
+) {
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+    let expected_scalars = num_scalars - 1;
+    assert_eq!(
+        scalar_oprefs.len(),
+        expected_scalars,
+        "seed_virtualizable_boxes: scalar_oprefs.len() must equal NUM_SCALAR_INPUTARGS - 1",
+    );
+    let mut input_oprefs: Vec<OpRef> = Vec::with_capacity(expected_scalars + array_len);
+    input_oprefs.extend_from_slice(scalar_oprefs);
+    let taken = array_items.len().min(array_len);
+    input_oprefs.extend_from_slice(&array_items[..taken]);
+    if taken < array_len {
+        let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+        for _ in taken..array_len {
+            input_oprefs.push(null_ref);
+        }
+    }
+    let array_lengths = vec![array_len];
+    ctx.init_virtualizable_boxes(&info, vable_ref, &input_oprefs, &array_lengths);
+}
+
+/// resume.py:1054 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
+/// Returns the register indices for live values at (jitcode_index, pc) in
+/// the same order the encoder wrote them — [int bank..., ref bank..., float
+/// bank...]. Each entry is the frame register/slot number that the decoded
+/// frames[0].values[j] should be written to, matching RPython's per-bank
+/// callback walk.
+pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let idx = jitcode_index as usize;
+        let Some(jc) = sd.jitcodes.get(idx) else {
+            return Vec::new();
+        };
+        let payload = &jc.payload;
+        let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) else {
+            return Vec::new();
+        };
+        let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
+        let all_liveness = &sd.liveness_info;
+        if off + 2 >= all_liveness.len() {
+            return Vec::new();
+        }
+        let length_i = all_liveness[off] as u32;
+        let length_r = all_liveness[off + 1] as u32;
+        let length_f = all_liveness[off + 2] as u32;
+        let mut cursor = off + 3;
+        let mut out: Vec<u32> = Vec::with_capacity((length_i + length_r + length_f) as usize);
+        use majit_translate::liveness::LivenessIterator;
+        for length in [length_i, length_r, length_f] {
+            if length == 0 {
+                continue;
+            }
+            let mut it = LivenessIterator::new(cursor, length, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                out.push(reg_idx);
+            }
+            cursor = it.offset;
+        }
+        out
+    })
+}
+
 /// Sentinel null JitCode for uninitialized PyreSym.
 ///
 /// Cannot be `static` because `Arc::new` is not const; use a thread_local
@@ -1782,8 +1874,6 @@ impl PyreSym {
         // becomes a no-op — the very reason `MIFrame::store_local_value`
         // cannot route through the standard vable path today.
         if let Some(base) = self.vable_array_base {
-            let info = crate::frame_layout::build_pyframe_virtualizable_info();
-            let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             // virtualizable.py:86-99 read_boxes iterates `len(lst)` — the
             // heap-side `locals_cells_stack_w` length, which is
             // `num_locals + num_cells + max_stack` (pyframe.py:107-110).
@@ -1791,32 +1881,24 @@ impl PyreSym {
             // tracing-time mirror. The live prefix [0, nlocals+stack_only_depth)
             // references the recorder's InputArg stream; reserved stack slots
             // beyond the current stack pointer are NULL on the PyFrame heap
-            // (FixedObjectArray::filled(..., PY_NULL)) and mirror to a shared
-            // const-NULL OpRef — interpreter paths never touch those slots
-            // during tracing, and the placeholder keeps set_virtualizable_box_at
-            // indexable across the full heap array.
+            // (FixedObjectArray::filled(..., PY_NULL)) and the helper pads
+            // them with a shared const-NULL OpRef.
+            let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             let live_prefix = nlocals + stack_only_depth;
             let array_len = concrete_frame_array_len(concrete_frame).unwrap_or(live_prefix);
-            let mut input_oprefs: Vec<OpRef> = Vec::with_capacity(num_scalars - 1 + array_len);
             // Static fields inputargs OpRef(1)..OpRef(NUM_SCALARS).
-            for i in 1..num_scalars {
-                input_oprefs.push(OpRef(i as u32));
-            }
+            let scalar_oprefs: Vec<OpRef> = (1..num_scalars).map(|i| OpRef(i as u32)).collect();
             // Array items inputargs OpRef(base..base + live_prefix).
-            for i in 0..live_prefix {
-                input_oprefs.push(OpRef(base + i as u32));
-            }
-            // Reserved-but-unused stack slots (beyond live prefix) mirror to
-            // a single const-NULL OpRef.
-            if array_len > live_prefix {
-                let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
-                for _ in live_prefix..array_len {
-                    input_oprefs.push(null_ref);
-                }
-            }
+            let array_items: Vec<OpRef> =
+                (0..live_prefix).map(|i| OpRef(base + i as u32)).collect();
             let vable_ref = OpRef(crate::virtualizable_gen::SYM_FRAME_IDX);
-            let array_lengths = vec![array_len];
-            ctx.init_virtualizable_boxes(&info, vable_ref, &input_oprefs, &array_lengths);
+            crate::state::seed_virtualizable_boxes(
+                ctx,
+                vable_ref,
+                &scalar_oprefs,
+                &array_items,
+                array_len,
+            );
         }
     }
 
@@ -2886,40 +2968,32 @@ impl JitState for PyreJitState {
         };
 
         let nlocals = sym.nlocals;
-        let mut bridge_locals = vec![OpRef::NONE; nlocals];
         // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
         // items are declared Ref (W_Root array). Bridge resume slots stay
         // Ref at the virtualizable contract; any Int/Float unboxing must
         // happen inside trace opcode handlers, not at the inputarg level.
         let bridge_local_types = vec![Type::Ref; nlocals];
 
-        // pyre adaptation (NOT a line-by-line port of
-        // rebuild_state_after_failure).
+        // rebuild_state_after_failure (pyjitpl.py:3400-3437) keeps three
+        // streams apart:
+        //   virtualizable_boxes ← consume_virtualizable_boxes (vable mirror)
+        //   registers_r/_i/_f    ← consume_boxes(f.get_current_position_info(),
+        //                                        f.registers_i/_r/_f)
+        //   virtualref_boxes     ← consume_virtualref_boxes
+        // The majit decoder already splits rd_numb into the same three
+        // streams (`resume_data.virtualizable_values`,
+        // `resume_data.frames[*].values`, `resume_data.virtualref_values`).
+        // This function consumes them in the same order and purpose.
         //
-        // RPython pyjitpl.py:3400 rebuild_state_after_failure returns
-        // `inputargs_and_holes` (frame state) and stores
-        // `virtualizable_boxes` separately, calling
-        // synchronize_virtualizable() to write the latter back. The
-        // frame livebox stream and the virtualizable payload are kept
-        // distinct all the way through, and virtualizable.py:139
-        // `load_list_of_boxes` reads them via typed next_box_of_type().
-        //
-        // pyre does not have that split. Bridge resume state is
-        // reconstructed from a single `virtualizable_values` list
-        // (canonical layout [frame_ptr, ni, code, vsd, ns, locals...,
-        // stack...]) that the rebuild path produces from rd_numb.
-        // This loop walks that flat list with one cursor, reusing
-        // `resolve` for constant-pool allocation and virtual
-        // materialization. Dead-at-PC locals (which liveness-driven
-        // `frame.values` omits but the parent loop's LABEL still
-        // expects as inputargs) are filled in as a side effect.
-        // resume.py:945-956 `getvirtual_ptr` is the one line-by-line
-        // parity point still visible: `RebuiltValue::Virtual` entries
-        // flow through `materialize_bridge_virtual` with a shared
-        // `virtuals_cache` so shared virtuals are emitted exactly
-        // once.
+        // Part 1 — virtualizable payload (consume_virtualizable_boxes):
+        // decode scalar header into sym.vable_* and capture the array-item
+        // prefix for init_virtualizable_boxes below. Matches
+        // virtualizable.py:86 `read_boxes` layout
+        //   [vable_ptr, static_fields..., array_items...].
         let vvals = &resume_data.virtualizable_values;
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let mut vable_array_items: Vec<OpRef> =
+            Vec::with_capacity(vvals.len().saturating_sub(num_scalars));
         for (i, v) in vvals.iter().enumerate() {
             let resolved = resolve(ctx, &mut virtuals_cache, v);
             match i {
@@ -2930,20 +3004,75 @@ impl JitState for PyreJitState {
                 4 => sym.vable_debugdata = resolved,
                 5 => sym.vable_lastblock = resolved,
                 6 => sym.vable_w_globals = resolved,
-                _ => {
-                    let off = i - num_scalars;
-                    if off < nlocals {
-                        bridge_locals[off] = resolved;
-                    }
-                    // Stack values beyond nlocals are intentionally dropped:
-                    // the target loop header has stack_only=0.
-                }
+                _ => vable_array_items.push(resolved),
             }
         }
+
+        // Part 2 — frame registers (consume_boxes): walk the frame section
+        // in liveness enumeration order ([int..., ref..., float...]), map
+        // each decoded value back to its frame slot via
+        // `frame_liveness_reg_indices_at`, and write it into symbolic_locals
+        // / symbolic_stack. This mirrors resume.py:1054 consume_boxes
+        // (`_callback_i/_r/_f(register_index)` writing to f.registers_i/_r/_f
+        // at the exact slot liveness declared, not at an enumerate-order
+        // position).
+        let frame0 = &resume_data.frames[0];
+        let reg_indices =
+            crate::state::frame_liveness_reg_indices_at(frame0.jitcode_index, frame0.pc);
+        let stack_only = sym.stack_only_depth();
+        let mut bridge_locals = vec![OpRef::NONE; nlocals];
+        let mut bridge_stack = vec![OpRef::NONE; stack_only];
+        // Falls back to the vable-mirror array items for slots not covered
+        // by liveness at the guard PC. pyre's optimizer sometimes keeps
+        // locals alive past the liveness analysis boundary (short-preamble
+        // import still references them), and RPython papers over this by
+        // always running `synchronize_virtualizable` before the guard, so
+        // the vable mirror is a complete frame image. Picking up dead
+        // slots from the mirror keeps the parent-loop LABEL arity contract
+        // satisfied until the tracer stops asking for dead locals.
+        let dead_slot_fallback = |idx: usize| -> OpRef {
+            if idx < nlocals {
+                vable_array_items.get(idx).copied().unwrap_or(OpRef::NONE)
+            } else {
+                OpRef::NONE
+            }
+        };
+        if !reg_indices.is_empty() && reg_indices.len() == frame0.values.len() {
+            for (value, &reg_idx) in frame0.values.iter().zip(reg_indices.iter()) {
+                let resolved = resolve(ctx, &mut virtuals_cache, value);
+                let idx = reg_idx as usize;
+                if idx < nlocals {
+                    bridge_locals[idx] = resolved;
+                } else {
+                    let stack_idx = idx - nlocals;
+                    if stack_idx < bridge_stack.len() {
+                        bridge_stack[stack_idx] = resolved;
+                    }
+                }
+            }
+            for (idx, slot) in bridge_locals.iter_mut().enumerate() {
+                if slot.is_none() {
+                    *slot = dead_slot_fallback(idx);
+                }
+            }
+        } else {
+            // Liveness unavailable (skeleton jitcode, truncated section):
+            // fall back fully to the vable mirror so the bridge still has a
+            // frame image. Follow-up: once every jitcode reaches this path
+            // with populated liveness, this branch can become an assert.
+            for (idx, slot) in bridge_locals.iter_mut().enumerate() {
+                *slot = dead_slot_fallback(idx);
+            }
+        }
+
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-sym] vable_values → bridge_locals={:?} types={:?}",
-                bridge_locals, bridge_local_types,
+                "[jit][bridge-sym] frames[0].values={} reg_indices={:?} \
+                 bridge_locals={:?} vable_array_items={:?}",
+                frame0.values.len(),
+                reg_indices,
+                bridge_locals,
+                vable_array_items,
             );
         }
         // Override sym.symbolic_locals so subsequent LOAD_FAST sees the
@@ -2998,31 +3127,28 @@ impl JitState for PyreJitState {
         // local prefix with a shared const-NULL OpRef so every
         // interpreter-visible slot has a tracing-time mirror (matches
         // the portal path above).
-        let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let bridge_array_len =
             concrete_frame_array_len(sym.concrete_vable_ptr as usize).unwrap_or(nlocals);
-        let mut bridge_input_oprefs: Vec<OpRef> =
-            Vec::with_capacity((num_scalars - 1) + bridge_array_len);
-        bridge_input_oprefs.push(sym.vable_last_instr);
-        bridge_input_oprefs.push(sym.vable_pycode);
-        bridge_input_oprefs.push(sym.vable_valuestackdepth);
-        bridge_input_oprefs.push(sym.vable_debugdata);
-        bridge_input_oprefs.push(sym.vable_lastblock);
-        bridge_input_oprefs.push(sym.vable_w_globals);
-        bridge_input_oprefs.extend_from_slice(&bridge_locals);
-        if bridge_array_len > nlocals {
-            let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
-            for _ in nlocals..bridge_array_len {
-                bridge_input_oprefs.push(null_ref);
-            }
-        }
-        let bridge_vable_ref = sym.frame;
-        let bridge_array_lengths = vec![bridge_array_len];
-        ctx.init_virtualizable_boxes(
-            &info,
-            bridge_vable_ref,
-            &bridge_input_oprefs,
-            &bridge_array_lengths,
+        let scalar_oprefs = [
+            sym.vable_last_instr,
+            sym.vable_pycode,
+            sym.vable_valuestackdepth,
+            sym.vable_debugdata,
+            sym.vable_lastblock,
+            sym.vable_w_globals,
+        ];
+        // virtualizable.py:86 `read_boxes`: the array items of the vable
+        // mirror come straight from `virtualizable_values`, matching the
+        // encoder's `build_virtualizable_boxes` (trace_opcode.rs:1854-1883)
+        // which writes one slot per `physical_array_len` entry. The seed
+        // helper pads with const-NULL if the decoded vable section is
+        // shorter than the runtime frame's locals_cells_stack_w length.
+        crate::state::seed_virtualizable_boxes(
+            ctx,
+            sym.frame,
+            &scalar_oprefs,
+            &vable_array_items,
+            bridge_array_len,
         );
         // Bridge stack: the target loop header has stack_only=0.
         sym.symbolic_stack = Vec::new();

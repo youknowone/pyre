@@ -1307,11 +1307,11 @@ impl CodeWriter {
                 // resolved `vable_values` — routing the super-inst reads
                 // through the heap exposes stale heap slots that the
                 // deadframe-level path did not refresh (nested_loop wrong
-                // output 2026-04-19). Keep move_r here until
-                // `rebuild_from_numbering` + `_prepare_next_section` fully
-                // populate `vable_values` for the snapshot at the outer
-                // loop's `POP_JUMP_IF_FALSE` guard; then flip this arm to
-                // the vable path for full parity with plain LoadFast.
+                // output 2026-04-19, nbody/fannkuch crash 2026-04-19 night
+                // after Priority 1 Step 1 + this flip). Keep move_r here
+                // until Priority 3 (seed helper) + Priority 4 (liveness
+                // pipeline) land; then the heap slots reach the compiled
+                // loop consistent with the symbolic state.
                 Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                 | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
