@@ -1321,12 +1321,21 @@ impl CodeWriter {
                 }
 
                 // CPython 3.13 super-instructions LOAD_FAST_LOAD_FAST /
-                // LOAD_FAST_BORROW_LOAD_FAST_BORROW read two locals.
-                // RPython has no super-instruction concept, so parity is
-                // "two plain LOAD_FAST reads": each half routes through
-                // jtransform.py:1877 do_fixed_list_getitem vable case
-                // (portal) or move_r (non-portal), exactly like the
-                // single-read `LoadFast` arm above.
+                // LOAD_FAST_BORROW_LOAD_FAST_BORROW decompose to two plain
+                // LOAD_FAST reads. Portal parity with plain LoadFast would
+                // route both halves through vable_getarrayitem_ref, but
+                // flipping this arm (attempted 2026-04-19 after P1 Step 1
+                // + P3 seed helper + unroll reserve_pos refactor
+                // `66d1f7212d`) still breaks spectral_norm/nbody/fannkuch
+                // on both backends. The heap-vs-symbolic-state gap
+                // persists — the compiled loop's vable reads still see
+                // stale slots that the bridge / blackhole resume path
+                // has not re-synchronized. Keep move_r here until the
+                // liveness pipeline rework (Priority 4) lands; the full
+                // `flatten → compute_liveness(ssarepr) → assemble`
+                // sequence should close the gap by ensuring the vable
+                // mirror is write-back-consistent before each compiled
+                // entry.
                 Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                 | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
