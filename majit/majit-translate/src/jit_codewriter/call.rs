@@ -1486,6 +1486,40 @@ impl CallControl {
         self.jitcodes.get(path).cloned()
     }
 
+    /// Reverse lookup: `JitCode.index → CallPath`. Mirrors `RPython
+    /// codewriter.py:80` `all_jitcodes[jitcode.index] is jitcode` invariant
+    /// — pyre stores the path-to-index mapping in `jitcode_alloc_order`.
+    pub fn path_for_jitcode_index(&self, index: usize) -> Option<&CallPath> {
+        self.jitcode_alloc_order.get(index)
+    }
+
+    /// RPython `call.py:182-187 get_jitcode_calldescr` source-of-truth for
+    /// `FUNC.RESULT`. Pyre derives the calldescr's result kind char from
+    /// the registered `return_types` string for the graph's CallPath. The
+    /// mapping mirrors `front/ast.rs::type_string_to_value_type`.
+    /// Returns `None` when no return type was registered for this path —
+    /// callers (`transform_graph_to_jitcode`) fall back to a CFG scan in
+    /// that case (e.g. unit-test graphs without a parsed signature).
+    pub fn declared_return_kind(&self, path: &CallPath) -> Option<char> {
+        let s = self.return_types.get(path)?.trim();
+        Some(return_type_string_to_kind(s))
+    }
+}
+
+/// Map a Rust return-type string to the BhCallDescr kind char used by
+/// blackhole / metainterp. `None`/`""`/`"()"` → `'v'`. The integer/float
+/// recognizer is the same set as `front/ast.rs::type_string_to_value_type`.
+fn return_type_string_to_kind(s: &str) -> char {
+    match s {
+        "" | "()" => 'v',
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+        | "bool" => 'i',
+        "f32" | "f64" => 'f',
+        _ => 'r',
+    }
+}
+
+impl CallControl {
     /// Collect every `Arc<JitCode>` shell whose body has been committed,
     /// in allocation order. Shells whose graph was never registered (and
     /// therefore never reached `transform_graph_to_jitcode`) are skipped.

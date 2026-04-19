@@ -19,7 +19,7 @@ use crate::call::CallControl;
 use crate::flatten::{RegKind, SSARepr, flatten_with_types};
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
-use crate::model::FunctionGraph;
+use crate::model::{FunctionGraph, Terminator, ValueId};
 
 /// RPython: `codewriter.py::CodeWriter`.
 ///
@@ -128,7 +128,16 @@ impl CodeWriter {
         let mut body = self.assembler.assemble(&mut ssarepr, &regallocs);
 
         // call.py:174-187 get_jitcode_calldescr:
-        // Compute calldescr from the function's argument and result types.
+        //   FUNC = lltype.typeOf(fnptr).TO
+        //   NON_VOID_ARGS = [ARG for ARG in FUNC.ARGS if ARG is not lltype.Void]
+        //   calldescr = self.cpu.calldescrof(FUNC, tuple(NON_VOID_ARGS),
+        //                                    FUNC.RESULT, EffectInfo.MOST_GENERAL)
+        // Source of truth for `result_type` is the declared return type
+        // registered on `CallControl` (mirrors RPython's `FUNC.RESULT`,
+        // which comes from `getfunctionptr(graph)._obj`'s lltype). The
+        // CFG terminator scan stays as a `debug_assert!` cross-check so
+        // graphs that disagree with their declared signature surface
+        // immediately.
         {
             let start_block = rewritten.graph.block(rewritten.graph.startblock);
             let mut arg_classes = String::new();
@@ -140,9 +149,24 @@ impl CodeWriter {
                     None => arg_classes.push('i'),
                 }
             }
+            let cfg_kind = graph_result_kind(&rewritten.graph, &ssarepr.value_kinds);
+            let declared_kind = callcontrol
+                .path_for_jitcode_index(jitcode.index)
+                .and_then(|p| callcontrol.declared_return_kind(p));
+            let result_type = declared_kind.unwrap_or(cfg_kind);
+            // Cross-check: when both sources are present they must agree.
+            // Synthesized graphs from tests / inline arms may legitimately
+            // omit the registration; ignore the assert in that case.
+            debug_assert!(
+                declared_kind.is_none_or(|d| d == cfg_kind || cfg_kind == 'v'),
+                "graph {} declared FUNC.RESULT={} but CFG return kind is {}",
+                rewritten.graph.name,
+                declared_kind.unwrap(),
+                cfg_kind,
+            );
             body.calldescr = crate::jitcode::BhCallDescr {
                 arg_classes,
-                result_type: 'v', // default; overridden by portal setup
+                result_type,
             };
         }
 
@@ -236,4 +260,38 @@ impl Default for CodeWriter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Mirror of `FUNC.RESULT` in `rpython/jit/codewriter/call.py:182-187`.
+///
+/// Walks every `Terminator::Return(Some(_))` in the graph and reports the
+/// kind char of the returned value. Returns `'v'` when every terminator is
+/// `Return(None)` (or there are no `Return` terminators at all). Panics
+/// when two `Return` terminators disagree — RPython's `FUNC.RESULT` is a
+/// single type per graph, so a conflict means an upstream pass produced a
+/// graph that no `BhCallDescr` can describe.
+fn graph_result_kind(
+    graph: &FunctionGraph,
+    value_kinds: &std::collections::HashMap<ValueId, RegKind>,
+) -> char {
+    let mut found: Option<char> = None;
+    for block in &graph.blocks {
+        if let Terminator::Return(Some(vid)) = &block.terminator {
+            let kind = match value_kinds.get(vid) {
+                Some(RegKind::Int) => 'i',
+                Some(RegKind::Ref) => 'r',
+                Some(RegKind::Float) => 'f',
+                None => 'i',
+            };
+            match found {
+                None => found = Some(kind),
+                Some(prev) if prev == kind => {}
+                Some(prev) => panic!(
+                    "graph {} has inconsistent return kinds: {prev} vs {kind}",
+                    graph.name
+                ),
+            }
+        }
+    }
+    found.unwrap_or('v')
 }

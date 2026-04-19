@@ -7816,7 +7816,7 @@ impl<M: Clone> MetaInterp<M> {
         exc: bool,
         pure: bool,
         dst: Option<(crate::jitcode::JitArgKind, usize)>,
-    ) -> Result<Option<(OpRef, i64)>, ChangeFrame> {
+    ) -> Result<Option<(OpRef, i64)>, FinishframeExceptionSignal> {
         // pyjitpl.py:1942: self.metainterp.clear_exception()
         self.clear_exception();
         // pyjitpl.py:1943: patch_pos = self.metainterp.history.get_trace_position()
@@ -8202,23 +8202,39 @@ impl<M: Clone> MetaInterp<M> {
     /// when an active trace is present; outside a trace this is a
     /// no-op so blackhole-side callers stay safe.
     ///
-    /// Returns `Err(ChangeFrame)` when the exception path triggered
-    /// `finishframe_exception` and the framestack still has a caller
-    /// — matches RPython's `raise ChangeFrame` shape.
-    pub fn handle_possible_exception(&mut self) -> Result<(), ChangeFrame> {
+    /// Returns `Err(FinishframeExceptionSignal::ChangeFrame)` when the
+    /// exception path triggered `finishframe_exception` and the
+    /// framestack still has a caller — matches RPython's `raise
+    /// ChangeFrame`.  When the framestack is fully drained, returns
+    /// `Err(FinishframeExceptionSignal::ExitFrameWithExceptionRef(_))`,
+    /// matching RPython's `raise jitexc.ExitFrameWithExceptionRef`.
+    pub fn handle_possible_exception(&mut self) -> Result<(), FinishframeExceptionSignal> {
         if self.last_exc_value != 0 {
             let typeptr = self.read_typeptr_from_exception(self.last_exc_value);
-            let exception_box = if let Some(ctx) = self.tracing.as_mut() {
-                let exc_box = ctx.const_int(typeptr);
-                ctx.record_guard(OpCode::GuardException, &[exc_box], 0)
+            let exception_value = self.last_exc_value;
+            let class_is_const = self.class_of_last_exc_is_const;
+            // pyjitpl.py:3382-3390:
+            //   op = generate_guard(GUARD_EXCEPTION, None, exception_box)
+            //   val = cast_opaque_ptr(GCREF, last_exc_value)
+            //   if class_of_last_exc_is_const:
+            //       last_exc_box = ConstPtr(val)
+            //   else:
+            //       last_exc_box = op           # op.setref_base(val)
+            // The guard is recorded in both arms; only the box stored as
+            // last_exc_box differs. Pyre's const_ref(val) is the orthodox
+            // ConstPtr equivalent (trace_ctx.rs:583).
+            let last_exc_box = if let Some(ctx) = self.tracing.as_mut() {
+                let exc_class_box = ctx.const_int(typeptr);
+                let guard_op = ctx.guard_exception(exc_class_box, 0);
+                if class_is_const {
+                    ctx.const_ref(exception_value)
+                } else {
+                    guard_op
+                }
             } else {
                 OpRef::NONE
             };
-            // pyjitpl.py:3386-3390: pick last_exc_box source based on
-            // whether the class is statically known.  Pyre treats both
-            // paths as "store the boxed value reference" because we do
-            // not synthesize ConstPtr separately from Ref OpRef.
-            self.last_exc_box = Some(exception_box);
+            self.last_exc_box = Some(last_exc_box);
             // pyjitpl.py:3392: self.class_of_last_exc_is_const = True
             self.class_of_last_exc_is_const = true;
             // pyjitpl.py:3393: self.finishframe_exception()
@@ -8231,14 +8247,17 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// pyjitpl.py:2506-2529 `MetaInterp.finishframe_exception()`.
+    /// pyjitpl.py:2506-2538 `MetaInterp.finishframe_exception()`.
     ///
     /// Walk the framestack looking for an immediately-following
     /// `catch_exception` bytecode, mirroring the upstream interpreter.
     /// Frames without a handler are popped. `rvmprof_code` is decoded
     /// in-place before the pop, matching the RPython side effect.
-    pub fn finishframe_exception(&mut self) -> Result<(), ChangeFrame> {
+    pub fn finishframe_exception(&mut self) -> Result<(), FinishframeExceptionSignal> {
         const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
+
+        // pyjitpl.py:2507: excvalue = self.last_exc_value
+        let excvalue = self.last_exc_value;
 
         while !self.framestack.is_empty() {
             let mut handled = false;
@@ -8284,11 +8303,25 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             if handled {
-                return Err(ChangeFrame);
+                // pyjitpl.py:2522: raise ChangeFrame
+                return Err(FinishframeExceptionSignal::ChangeFrame);
             }
             self.popframe(true);
         }
-        Ok(())
+        // pyjitpl.py:2533-2538: framestack drained.
+        //   try:
+        //       self.compile_exit_frame_with_exception(self.last_exc_box)
+        //   except SwitchToBlackhole as stb:
+        //       self.aborted_tracing(stb.reason)
+        //   raise jitexc.ExitFrameWithExceptionRef(
+        //       lltype.cast_opaque_ptr(GCREF, excvalue))
+        let valuebox = self.last_exc_box;
+        if let Err(stb) = self.compile_exit_frame_with_exception(valuebox) {
+            self.aborted_tracing(stb.reason);
+        }
+        Err(FinishframeExceptionSignal::ExitFrameWithExceptionRef(
+            majit_ir::GcRef(excvalue as usize),
+        ))
     }
 
     /// pyjitpl.py:1881-1890 `MIFrame.handle_possible_overflow_error(label, orgpc, resbox)`.
@@ -8761,6 +8794,48 @@ impl<M: Clone> MetaInterp<M> {
         // PRE-EXISTING-ADAPTATION: emitted at the TraceAction::Finish
         // dispatch (jitdriver.rs:956); see method docstring.
         let _ = exits;
+        Ok(())
+    }
+
+    /// pyjitpl.py:3238-3245 `MetaInterp.compile_exit_frame_with_exception(valuebox)`.
+    ///
+    /// ```python
+    /// def compile_exit_frame_with_exception(self, valuebox):
+    ///     self.store_token_in_vable()
+    ///     sd = self.staticdata
+    ///     token = sd.exit_frame_with_exception_descr_ref
+    ///     self.history.record1(rop.FINISH, valuebox, None, descr=token)
+    ///     target_token = compile.compile_trace(self, self.resumekey, [valuebox])
+    ///     if target_token is not token:
+    ///         compile.giveup()
+    /// ```
+    ///
+    /// Exception-flavored sibling of `compile_done_with_this_frame`.
+    /// PRE-EXISTING-ADAPTATION shared with that method: the FINISH op
+    /// emit + `compile.compile_trace` happen at the trace-dispatch
+    /// `TraceAction::Finish` site (jitdriver.rs:956), so this method
+    /// runs only the upstream skeleton — `store_token_in_vable` +
+    /// `make_fail_descr_typed` for the Ref result-type slot — and
+    /// surfaces `SwitchToBlackhole` to the caller exactly like
+    /// `compile_done_with_this_frame`.
+    pub fn compile_exit_frame_with_exception(
+        &mut self,
+        valuebox: Option<OpRef>,
+    ) -> Result<(), SwitchToBlackhole> {
+        // pyjitpl.py:3239 self.store_token_in_vable()
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.store_token_in_vable_setfield();
+        }
+        // pyjitpl.py:3241 token = sd.exit_frame_with_exception_descr_ref
+        // PRE-EXISTING-ADAPTATION: pyre's analog is the typed FINISH
+        // descr produced by `make_fail_descr_typed([Ref])`.
+        let _token = crate::make_fail_descr_typed(vec![majit_ir::Type::Ref]);
+        // pyjitpl.py:3242 self.history.record1(rop.FINISH, valuebox, None, descr=token)
+        // pyjitpl.py:3243 target_token = compile.compile_trace(...)
+        // PRE-EXISTING-ADAPTATION: emitted at the TraceAction::Finish
+        // dispatch (jitdriver.rs:956); see method docstring + the sibling
+        // `compile_done_with_this_frame`.
+        let _ = valuebox;
         Ok(())
     }
 
@@ -9853,7 +9928,7 @@ impl<M: Clone> MetaInterp<M> {
         _pc: usize,
         is_value: bool,
         dst: Option<(crate::jitcode::JitArgKind, usize)>,
-    ) -> Result<Option<(OpRef, i64)>, ChangeFrame> {
+    ) -> Result<Option<(OpRef, i64)>, FinishframeExceptionSignal> {
         // pyjitpl.py:2130: allboxes = _build_allboxes(funcbox, argboxes, descr, prepend_box=condbox)
         let allboxes = self._build_allboxes(funcbox, argboxes, descr_view, Some(condbox));
         // pyjitpl.py:2131: effectinfo = descr.get_extra_info()
@@ -10114,21 +10189,74 @@ impl std::fmt::Display for FinishFrameSignal {
 
 impl std::error::Error for FinishFrameSignal {}
 
+/// Result type for `MetaInterp::finishframe_exception` and
+/// `handle_possible_exception` — mirrors the two upstream `raise` sites
+/// in `pyjitpl.py:2506-2538`.
+///
+/// * `ChangeFrame` — a `catch_exception` opcode was found in some frame
+///   on the stack; control jumps there (`pyjitpl.py:2522`).
+/// * `ExitFrameWithExceptionRef(GcRef)` — no handler was found, the
+///   framestack was drained, and `compile_exit_frame_with_exception`
+///   ran (`pyjitpl.py:2533-2538`).  Mirrors
+///   `jitexc.py:45 ExitFrameWithExceptionRef`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishframeExceptionSignal {
+    ChangeFrame,
+    ExitFrameWithExceptionRef(majit_ir::GcRef),
+}
+
+impl From<ChangeFrame> for FinishframeExceptionSignal {
+    fn from(_: ChangeFrame) -> Self {
+        Self::ChangeFrame
+    }
+}
+
+impl std::fmt::Display for FinishframeExceptionSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChangeFrame => f.write_str("ChangeFrame"),
+            Self::ExitFrameWithExceptionRef(r) => {
+                write!(f, "ExitFrameWithExceptionRef({:#x})", r.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for FinishframeExceptionSignal {}
+
 /// Aggregate error for `do_residual_call`.  RPython's body raises
 /// either `ChangeFrame` (an exception path crossed a frame boundary
 /// via `handle_possible_exception` → `finishframe_exception`) or
 /// `SwitchToBlackhole(reason)` (compile/trace failure path);
 /// pyre returns both as `Err` variants of this enum so callers can
 /// route each to the existing pyre abort/restart paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `pyjitpl.py:2533-2538` also reports `ExitFrameWithExceptionRef`
+/// when the exception traverses every frame on the stack without a
+/// handler. Pyre carries that signal through `finishframe_exception`
+/// → `handle_possible_exception` and surfaces it here so callers can
+/// route it to the existing pyre exit-with-exception path.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoResidualCallAbort {
     ChangeFrame,
     SwitchToBlackhole(SwitchToBlackhole),
+    ExitFrameWithExceptionRef(majit_ir::GcRef),
 }
 
 impl From<ChangeFrame> for DoResidualCallAbort {
     fn from(_: ChangeFrame) -> Self {
         Self::ChangeFrame
+    }
+}
+
+impl From<FinishframeExceptionSignal> for DoResidualCallAbort {
+    fn from(sig: FinishframeExceptionSignal) -> Self {
+        match sig {
+            FinishframeExceptionSignal::ChangeFrame => Self::ChangeFrame,
+            FinishframeExceptionSignal::ExitFrameWithExceptionRef(r) => {
+                Self::ExitFrameWithExceptionRef(r)
+            }
+        }
     }
 }
 
@@ -10143,6 +10271,9 @@ impl std::fmt::Display for DoResidualCallAbort {
         match self {
             Self::ChangeFrame => f.write_str("ChangeFrame"),
             Self::SwitchToBlackhole(stb) => std::fmt::Display::fmt(stb, f),
+            Self::ExitFrameWithExceptionRef(r) => {
+                write!(f, "ExitFrameWithExceptionRef({:#x})", r.0)
+            }
         }
     }
 }
@@ -11770,26 +11901,77 @@ mod metainterp_static_data_tests {
 
         let action = meta.force_start_tracing(0, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
-        // Empty framestack → finishframe_exception returns Ok.
+        // pyjitpl.py:2533-2538: with an empty framestack the exception
+        // unwind drains immediately and surfaces
+        // `ExitFrameWithExceptionRef`. The GUARD_EXCEPTION op + the
+        // class-const branch must still be observable on the recorder
+        // before that signal returns.
         let result = meta.handle_possible_exception();
-        assert!(matches!(result, Ok(())));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ExitFrameWithExceptionRef(r)) if r.0 == 0xfeed
+        ));
 
-        let ctx = meta.trace_ctx().expect("active trace");
-        let mut matches = ctx
-            .recorder
-            .ops()
-            .iter()
-            .filter(|op| op.opcode == OpCode::GuardException);
-        let op = matches.next().expect("GuardException must be recorded");
-        assert_eq!(op.args.len(), 1);
-        let typeptr = ctx
-            .constants_get_value(op.args[0])
-            .expect("typeptr constant");
-        assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
+        let guard_pos = {
+            let ctx = meta.trace_ctx().expect("active trace");
+            let mut matches = ctx
+                .recorder
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == OpCode::GuardException);
+            let op = matches.next().expect("GuardException must be recorded");
+            assert_eq!(op.args.len(), 1);
+            let typeptr = ctx
+                .constants_get_value(op.args[0])
+                .expect("typeptr constant");
+            assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
+            op.pos
+        };
 
         // pyjitpl.py:3392: class_of_last_exc_is_const = True after.
         assert!(meta.class_of_last_exc_is_const);
-        assert!(meta.last_exc_box.is_some());
+        let last_exc_box = meta.last_exc_box.expect("last_exc_box");
+        // pyjitpl.py:3389: when class is NOT const, last_exc_box is the
+        // GUARD_EXCEPTION op itself (its trace position).
+        assert_eq!(last_exc_box, guard_pos);
+    }
+
+    #[test]
+    fn handle_possible_exception_uses_const_ref_when_class_is_const() {
+        // pyjitpl.py:3386-3387 — when class_of_last_exc_is_const is set
+        // before the call, last_exc_box is `ConstPtr(val)`, NOT the
+        // guard op's box. Pyre uses `const_ref(val)` as the orthodox
+        // ConstPtr equivalent (trace_ctx.rs:583).
+        use crate::BackEdgeAction;
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.cls_of_box = Some(|_| 0xc1a55);
+        meta.last_exc_value = 0xfeed;
+        meta.class_of_last_exc_is_const = true;
+
+        let action = meta.force_start_tracing(0, None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let result = meta.handle_possible_exception();
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ExitFrameWithExceptionRef(r)) if r.0 == 0xfeed
+        ));
+
+        let last_exc_box = meta.last_exc_box.expect("last_exc_box");
+        let ctx = meta.trace_ctx().expect("active trace");
+        // GUARD_EXCEPTION must still be recorded (pyjitpl.py:3383).
+        let guard_count = ctx
+            .recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == OpCode::GuardException)
+            .count();
+        assert_eq!(guard_count, 1);
+        // last_exc_box must be a Ref-typed constant carrying the
+        // exception value, not the guard op.
+        let typed = ctx
+            .constants_get_value(last_exc_box)
+            .expect("last_exc_box must be a constant");
+        assert_eq!(typed, majit_ir::Value::Ref(majit_ir::value::GcRef(0xfeed)));
     }
 
     fn make_catch_exception_jitcode() -> (std::sync::Arc<crate::jitcode::JitCode>, usize) {
@@ -11818,7 +12000,10 @@ mod metainterp_static_data_tests {
             .push(crate::pyjitpl::MIFrame::new(jitcode, 0));
         let result = meta.finishframe_exception();
 
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ChangeFrame)
+        ));
         assert_eq!(meta.framestack.len(), 1);
         assert_eq!(meta.framestack.current_mut().pc, target);
     }
@@ -11840,7 +12025,10 @@ mod metainterp_static_data_tests {
 
         let result = meta.finishframe_exception();
 
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ChangeFrame)
+        ));
         assert_eq!(meta.framestack.len(), 1);
         assert_eq!(meta.framestack.current_mut().pc, target);
     }
@@ -11855,7 +12043,10 @@ mod metainterp_static_data_tests {
         meta.framestack
             .push(crate::pyjitpl::MIFrame::new(jitcode, 0));
         let result = meta.finishframe_exception();
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ChangeFrame)
+        ));
         assert_eq!(meta.framestack.len(), 1, "handler frame must stay on stack");
         assert_eq!(meta.framestack.current_mut().pc, 3);
         assert_eq!(meta.framestack.current_mut().code_cursor, 3);
@@ -11880,20 +12071,33 @@ mod metainterp_static_data_tests {
         meta.framestack.push(frame);
 
         let result = meta.finishframe_exception();
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ChangeFrame)
+        ));
         assert_eq!(meta.framestack.current_mut().pc, 6);
         assert_eq!(meta.framestack.current_mut().code_cursor, 6);
     }
 
     #[test]
     fn finishframe_exception_pops_frames_without_handler() {
+        // pyjitpl.py:2533-2538: when the unwind drains every frame
+        // without finding a `catch_exception`, finishframe_exception runs
+        // `compile_exit_frame_with_exception(self.last_exc_box)` then
+        // raises `jitexc.ExitFrameWithExceptionRef(excvalue)`. Pyre
+        // surfaces the same shape via the `ExitFrameWithExceptionRef`
+        // signal variant.
         let mut meta = MetaInterp::<()>::new(0);
+        meta.last_exc_value = 0xfeed;
         let jitcode = std::sync::Arc::new(crate::jitcode::JitCodeBuilder::new().finish());
         meta.framestack
             .push(crate::pyjitpl::MIFrame::new(jitcode, 0));
 
         let result = meta.finishframe_exception();
-        assert!(matches!(result, Ok(())));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ExitFrameWithExceptionRef(r)) if r.0 == 0xfeed
+        ));
         assert!(meta.framestack.is_empty());
     }
 
@@ -11921,7 +12125,10 @@ mod metainterp_static_data_tests {
             .push(crate::pyjitpl::MIFrame::new(callee_jitcode, 0));
 
         let result = meta.finishframe_exception();
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ChangeFrame)
+        ));
         assert_eq!(
             meta.framestack.len(),
             1,
@@ -11965,7 +12172,10 @@ mod metainterp_static_data_tests {
             .push(crate::pyjitpl::MIFrame::new(callee_jitcode, 0));
 
         let result = meta.handle_possible_exception();
-        assert!(matches!(result, Err(ChangeFrame)));
+        assert!(matches!(
+            result,
+            Err(FinishframeExceptionSignal::ChangeFrame)
+        ));
         assert_eq!(
             meta.framestack.len(),
             1,

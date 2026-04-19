@@ -1360,8 +1360,8 @@ mod tests {
         use crate::call::CallControl;
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
-        use crate::translator::annotator::annrpython::annotate;
-        use crate::translator::rtyper::rtyper::resolve_types;
+        use crate::translate_legacy::annotator::annrpython::annotate;
+        use crate::translate_legacy::rtyper::rtyper::resolve_types;
 
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("caller");
@@ -1394,7 +1394,8 @@ mod tests {
             .with_type_state(&type_state);
         let rewritten = transformer.transform(&graph);
         let rewritten_types = resolve_types(&rewritten.graph, &annotations);
-        let value_kinds = crate::translator::rtyper::rtyper::build_value_kinds(&rewritten_types);
+        let value_kinds =
+            crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
         let mut flat = crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types);
 

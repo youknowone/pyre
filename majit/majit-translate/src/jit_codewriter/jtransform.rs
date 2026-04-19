@@ -2737,7 +2737,8 @@ mod tests {
         use crate::call::CallControl;
         use crate::model::FunctionGraph as CrateFG;
         use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls; use crate::translate_legacy::rtyper::rtyper::resolve_types;
+        use crate::translate_legacy::rtyper::rtyper::resolve_types;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
 
         let mut cc = CallControl::new();
         cc.register_trait_method("run", Some("Handler"), "A", CrateFG::new("A::run"));
@@ -2827,7 +2828,8 @@ mod tests {
         use crate::call::CallControl;
         use crate::model::FunctionGraph as CrateFG;
         use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translator::rtyper::rpbc::lower_indirect_calls; use crate::translate_legacy::rtyper::rtyper::resolve_types;
+        use crate::translate_legacy::rtyper::rtyper::resolve_types;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
 
         let mut cc = CallControl::new();
         cc.register_trait_method("run", Some("Handler"), "A", CrateFG::new("A::run"));
