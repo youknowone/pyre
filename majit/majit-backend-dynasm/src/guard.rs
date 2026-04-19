@@ -17,6 +17,10 @@ pub struct DynasmFailDescr {
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
+    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
+    /// True when this FINISH was emitted via
+    /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
+    pub is_exit_frame_with_exception: bool,
 
     /// regalloc parity: fail_locs — maps fail_args[i] to jitframe slot.
     /// None = virtual/unmapped (not in jitframe).
@@ -78,6 +82,7 @@ impl DynasmFailDescr {
             trace_id,
             fail_arg_types,
             is_finish,
+            is_exit_frame_with_exception: false,
             fail_arg_locs: Vec::new(),
             rd_locs: Vec::new(),
             source_op_index: None,
@@ -328,6 +333,16 @@ pub fn is_done_with_this_frame_descr(ptr: usize) -> bool {
         || ptr == done_with_this_frame_descr_float_ptr()
 }
 
+/// `compile.py:658-671` `ExitFrameWithExceptionDescrRef` parity.
+/// Check whether `ptr` matches the metainterp-attached
+/// `exit_frame_with_exception_descr_ref` singleton.  Used by
+/// `runner.rs::find_descr_by_ptr` to route a FINISH exit emitted by
+/// `pyjitpl.py:3238-3245 compile_exit_frame_with_exception` into
+/// `jitexc.ExitFrameWithExceptionRef` instead of `DoneWithThisFrame*`.
+pub fn is_exit_frame_with_exception_descr(ptr: usize) -> bool {
+    ptr != 0 && ptr == exit_frame_with_exception_descr_ref_ptr()
+}
+
 impl Descr for DynasmFailDescr {}
 
 impl FailDescr for DynasmFailDescr {
@@ -341,6 +356,10 @@ impl FailDescr for DynasmFailDescr {
 
     fn is_finish(&self) -> bool {
         self.is_finish
+    }
+
+    fn is_exit_frame_with_exception(&self) -> bool {
+        self.is_exit_frame_with_exception
     }
 
     fn trace_id(&self) -> u64 {

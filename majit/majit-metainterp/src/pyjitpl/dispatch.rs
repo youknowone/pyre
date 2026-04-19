@@ -388,6 +388,7 @@ where
             TraceAction::Finish {
                 finish_args: vec![exc_box],
                 finish_arg_types: vec![majit_ir::Type::Ref],
+                exit_with_exception: true,
             }
         } else {
             TraceAction::Abort

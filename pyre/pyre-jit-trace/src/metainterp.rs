@@ -303,6 +303,10 @@ impl PyreMetaInterp {
             super::state::InlineTraceStepAction::Trace(TraceAction::Finish {
                 finish_args,
                 finish_arg_types,
+                // pyjitpl.py:2489-2502 finishframe path: inline return/yield
+                // never raises through this branch (exception exits take the
+                // finishframe_exception route above), so the flag is ignored.
+                exit_with_exception: _,
             }) => {
                 self.finishframe_inline(ctx, &finish_args, &finish_arg_types);
                 LoopAction::Continue
@@ -719,6 +723,8 @@ impl PyreMetaInterp {
             return Some(LoopAction::Return(TraceAction::Finish {
                 finish_args: vec![exc_opref],
                 finish_arg_types: vec![Type::Ref],
+                // pyjitpl.py:3241 token = sd.exit_frame_with_exception_descr_ref
+                exit_with_exception: true,
             }));
         }
         None

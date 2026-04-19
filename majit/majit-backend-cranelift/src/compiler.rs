@@ -99,6 +99,27 @@ static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<CraneliftFailDesc
         )
     });
 
+/// compile.py:658-662 ExitFrameWithExceptionDescrRef singleton.
+/// Paired with the metainterp-side `exit_frame_with_exception_descr_ref`
+/// Arc for the runtime classifier: when `jf_descr_raw` matches the
+/// metainterp Arc address, `match_metainterp_finish_descr` returns
+/// this singleton so the existing `CraneliftFailDescr`-typed codepaths
+/// keep working while the exit is routed into
+/// `jitexc.ExitFrameWithExceptionRef`.
+static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
+    std::sync::LazyLock::new(|| {
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            u32::MAX,
+            0,
+            vec![Type::Ref],
+            true,
+            vec![],
+            None,
+        );
+        d.is_exit_frame_with_exception = true;
+        Arc::new(d)
+    });
+
 static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
         Arc::new(
@@ -201,6 +222,10 @@ fn match_metainterp_finish_descr(
         (&METAINTERP_DONE_FLOAT, &*DONE_WITH_THIS_FRAME_DESCR_FLOAT),
         (&METAINTERP_DONE_REF, &*DONE_WITH_THIS_FRAME_DESCR_REF),
         (&METAINTERP_DONE_VOID, &*DONE_WITH_THIS_FRAME_DESCR_VOID),
+        (
+            &METAINTERP_EXIT_EXC_REF,
+            &*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL,
+        ),
     ] {
         if let Some(arc) = slot.get() {
             if Arc::as_ptr(arc) as *const () as usize == ptr {
@@ -11907,6 +11932,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 fail_index: descr.fail_index(),
                 trace_id: descr.trace_id(),
                 is_finish: descr.is_finish(),
+                is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
                 status: descr.get_status(),
                 descr_addr: descr as *const dyn FailDescr as *const () as usize,
             };
@@ -11974,6 +12000,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 fail_index: descr.fail_descr.fail_index(),
                 trace_id: descr.fail_descr.trace_id(),
                 is_finish: descr.fail_descr.is_finish(),
+                is_exit_frame_with_exception: descr.fail_descr.is_exit_frame_with_exception(),
                 status: descr.fail_descr.get_status(),
                 descr_addr: Arc::as_ptr(&descr.fail_descr) as usize,
             };
@@ -12012,6 +12039,7 @@ impl majit_backend::Backend for CraneliftBackend {
             fail_index,
             trace_id: fail_descr.trace_id(),
             is_finish: fail_descr.is_finish(),
+            is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
             status: fail_descr.get_status(),
             descr_addr: Arc::as_ptr(&fail_descr_arc) as usize,
         }

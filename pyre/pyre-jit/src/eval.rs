@@ -1707,14 +1707,33 @@ fn execute_assembler(
         DetailedDriverRunOutcome::Finished {
             typed_values,
             raw_int_result,
+            is_exit_frame_with_exception,
             ..
         } => {
             let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][handle-outcome] finished key={} typed_values={:?}",
-                    green_key, typed_values
+                    "[jit][handle-outcome] finished key={} raw_flag={} exc_exit={} typed_values={:?}",
+                    green_key, raw_int_result, is_exit_frame_with_exception, typed_values
                 );
+            }
+            // compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
+            // warmspot.py:998 handle_jitexception:
+            //   ExitFrameWithExceptionRef.handle_fail raises the stored Ref
+            //   into the outer interpreter's exception machinery.
+            if is_exit_frame_with_exception {
+                let exc_ref = match typed_values.as_slice() {
+                    [majit_ir::Value::Ref(r)] => r.as_usize() as pyre_object::PyObjectRef,
+                    _ => {
+                        return Some(LoopResult::Done(Err(
+                            pyre_interpreter::PyError::type_error(
+                                "compiled exit_frame_with_exception did not produce a single Ref value",
+                            ),
+                        )));
+                    }
+                };
+                let err = unsafe { pyre_interpreter::PyError::from_exc_object(exc_ref) };
+                return Some(LoopResult::Done(Err(err)));
             }
             let [value] = typed_values.as_slice() else {
                 return Some(LoopResult::Done(Err(
@@ -2272,15 +2291,29 @@ fn handle_jit_outcome(
         DetailedDriverRunOutcome::Finished {
             typed_values,
             raw_int_result,
+            is_exit_frame_with_exception,
             ..
         } => {
             let (driver, _) = driver_pair();
             let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][handle-outcome] finished typed_values={:?}",
-                    typed_values
+                    "[jit][handle-outcome] finished key={} raw_flag={} exc_exit={} typed_values={:?}",
+                    green_key, raw_int_result, is_exit_frame_with_exception, typed_values
                 );
+            }
+            // compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
+            if is_exit_frame_with_exception {
+                let exc_ref = match typed_values.as_slice() {
+                    [majit_ir::Value::Ref(r)] => r.as_usize() as pyre_object::PyObjectRef,
+                    _ => {
+                        return JitAction::Return(Err(pyre_interpreter::PyError::type_error(
+                            "compiled exit_frame_with_exception did not produce a single Ref value",
+                        )));
+                    }
+                };
+                let err = unsafe { pyre_interpreter::PyError::from_exc_object(exc_ref) };
+                return JitAction::Return(Err(err));
             }
             let [value] = typed_values.as_slice() else {
                 return JitAction::Return(Err(pyre_interpreter::PyError::type_error(

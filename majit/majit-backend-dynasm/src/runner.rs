@@ -425,6 +425,15 @@ impl DynasmBackend {
             return Arc::new(DynasmFailDescr::new(u32::MAX, 0, types, true));
         }
 
+        // compile.py:658-662 ExitFrameWithExceptionDescrRef — route to
+        // jitexc.ExitFrameWithExceptionRef via is_exit_frame_with_exception.
+        // Result type is Ref (exc value at slot 0, jitexc.py:45).
+        if crate::guard::is_exit_frame_with_exception_descr(ptr) {
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
+            d.is_exit_frame_with_exception = true;
+            return Arc::new(d);
+        }
+
         // Search root loop
         let compiled = Self::get_compiled(token);
         if let Some(found) = compiled
@@ -943,6 +952,7 @@ impl Backend for DynasmBackend {
             fail_index: descr.fail_index,
             trace_id: descr.trace_id,
             is_finish: descr.is_finish,
+            is_exit_frame_with_exception: descr.is_exit_frame_with_exception,
             status: descr.get_status(),
             descr_addr: Arc::as_ptr(&descr) as usize,
         }

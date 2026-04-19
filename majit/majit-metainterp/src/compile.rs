@@ -101,6 +101,12 @@ pub struct CompileResult<'a, M> {
     pub fail_index: u32,
     pub trace_id: u64,
     pub is_finish: bool,
+    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity:
+    /// true when the FINISH descriptor was
+    /// `sd.exit_frame_with_exception_descr_ref` (emitted via
+    /// `pyjitpl.py:3238-3245 compile_exit_frame_with_exception`).
+    /// jitdriver routes this to `jitexc.ExitFrameWithExceptionRef`.
+    pub is_exit_frame_with_exception: bool,
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
@@ -119,6 +125,9 @@ pub struct RawCompileResult<'a, M> {
     pub fail_index: u32,
     pub trace_id: u64,
     pub is_finish: bool,
+    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity —
+    /// mirrors `CompileResult::is_exit_frame_with_exception`.
+    pub is_exit_frame_with_exception: bool,
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,

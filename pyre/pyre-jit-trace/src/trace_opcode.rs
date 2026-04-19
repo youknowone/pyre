@@ -4507,6 +4507,7 @@ impl MIFrame {
                 TraceAction::Finish {
                     finish_args: vec![finish_value],
                     finish_arg_types: vec![Type::Ref],
+                    exit_with_exception: false,
                 }
             }
             Err(_) => TraceAction::Abort,
@@ -4703,6 +4704,7 @@ pub(crate) fn trace_step_result_to_action(
             TraceAction::Finish {
                 finish_args: vec![finish_value],
                 finish_arg_types: vec![Type::Ref],
+                exit_with_exception: false,
             }
         }
         Ok(pyre_interpreter::StepResult::Yield(fop)) => {
@@ -4718,6 +4720,7 @@ pub(crate) fn trace_step_result_to_action(
             TraceAction::Finish {
                 finish_args: vec![finish_value],
                 finish_arg_types: vec![Type::Ref],
+                exit_with_exception: false,
             }
         }
         Err(err) => {

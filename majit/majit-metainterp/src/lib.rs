@@ -111,9 +111,18 @@ pub enum TraceAction {
         loop_header_pc: Option<usize>,
     },
     /// Finish the trace with terminal output values.
+    ///
+    /// `exit_with_exception = true` maps to
+    /// `pyjitpl.py:3238 MetaInterp.compile_exit_frame_with_exception` —
+    /// the FINISH uses `sd.exit_frame_with_exception_descr_ref` and the
+    /// classifier routes to `JitException::ExitFrameWithExceptionRef`.
+    /// `false` maps to
+    /// `pyjitpl.py:3198 MetaInterp.compile_done_with_this_frame` —
+    /// FINISH uses `sd.done_with_this_frame_descr_<kind>`.
     Finish {
         finish_args: Vec<OpRef>,
         finish_arg_types: Vec<Type>,
+        exit_with_exception: bool,
     },
     /// Close and compile a segmented loop (force_finish_trace).
     /// pyjitpl.py:1622 _create_segmented_trace_and_blackhole parity.

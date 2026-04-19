@@ -35,6 +35,10 @@ pub struct RawExecResult {
     pub trace_id: u64,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
+    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
+    /// True when this FINISH was emitted via
+    /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
+    pub is_exit_frame_with_exception: bool,
     /// compile.py:741-745: ResumeGuardDescr.status at guard failure time.
     pub status: u64,
     /// compile.py:780: current_object_addr_as_int(self) — descriptor pointer.
@@ -1362,6 +1366,7 @@ pub trait Backend: Send {
             fail_index: descr.fail_index(),
             trace_id: descr.trace_id(),
             is_finish: descr.is_finish(),
+            is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
             status: descr.get_status(),
             descr_addr: descr as *const dyn majit_ir::descr::FailDescr as *const () as usize,
         }

@@ -113,6 +113,10 @@ pub struct CraneliftFailDescr {
     pub fail_arg_types: Vec<Type>,
     pub gc_map: GcMap,
     pub is_finish: bool,
+    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
+    /// True when this FINISH was emitted via
+    /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
+    pub is_exit_frame_with_exception: bool,
     /// history.py:470-499 TargetToken parity for cross-loop JUMP.
     /// True for external JUMP exits (JUMP whose target TargetToken lives in
     /// a different compiled function). assembler.py:2456-2462 closing_jump
@@ -266,6 +270,7 @@ impl CraneliftFailDescr {
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish,
+            is_exit_frame_with_exception: false,
             is_external_jump: false,
             target_descr: None,
             force_token_slots,
@@ -307,6 +312,7 @@ impl CraneliftFailDescr {
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish: false,
+            is_exit_frame_with_exception: false,
             is_external_jump: true,
             target_descr: Some(target_descr),
             force_token_slots,
@@ -508,6 +514,10 @@ impl FailDescr for CraneliftFailDescr {
 
     fn is_finish(&self) -> bool {
         self.is_finish
+    }
+
+    fn is_exit_frame_with_exception(&self) -> bool {
+        self.is_exit_frame_with_exception
     }
 
     fn is_external_jump(&self) -> bool {

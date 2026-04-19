@@ -3975,6 +3975,12 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Finish the current trace with a terminal `FINISH`, then optimize and compile it.
     ///
+    /// `exit_with_exception` selects the FINISH descr per `pyjitpl.py`:
+    /// * `false` → `compile_done_with_this_frame` (pyjitpl.py:3198-3220) —
+    ///   descr = `sd.done_with_this_frame_descr_<kind>`.
+    /// * `true` → `compile_exit_frame_with_exception` (pyjitpl.py:3238-3245)
+    ///   — descr = `sd.exit_frame_with_exception_descr_ref`.
+    ///
     /// Returns `Err(SwitchToBlackhole::bad_loop())` on optimizer
     /// `InvalidLoop` or backend compile failure, matching
     /// pyjitpl.py:3220 `compile.giveup()` surfacing as
@@ -3987,6 +3993,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
         meta: M,
+        exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
@@ -4007,16 +4014,24 @@ impl<M: Clone> MetaInterp<M> {
         let green_key = ctx.green_key;
 
         let mut recorder = ctx.recorder;
-        // `pyjitpl.py:3216-3217` `token = sd.done_with_this_frame_descr_<type>;
-        // self.history.record(rop.FINISH, exits, None, descr=token)`.
+        // `pyjitpl.py:3216-3217` / `pyjitpl.py:3241`:
+        //   `token = sd.done_with_this_frame_descr_<type>` (normal) or
+        //   `token = sd.exit_frame_with_exception_descr_ref` (raising),
+        //   then `self.history.record(rop.FINISH, exits, None, descr=token)`.
         // Use the metainterp-attached singleton so FINISH identity is
         // shared with the backend (see `attach_descrs_to_cpu`).  Falls
         // back to `make_fail_descr_typed` only if the singleton was
         // never attached (tests that bypass `MetaInterp::new`).
-        let finish_descr = self
-            .staticdata
-            .done_with_this_frame_descr_from_types(&finish_arg_types)
-            .unwrap_or_else(|| crate::make_fail_descr_typed(finish_arg_types.clone()));
+        let finish_descr = if exit_with_exception {
+            self.staticdata
+                .exit_frame_with_exception_descr_ref
+                .clone()
+                .unwrap_or_else(|| crate::make_fail_descr_typed(finish_arg_types.clone()))
+        } else {
+            self.staticdata
+                .done_with_this_frame_descr_from_types(&finish_arg_types)
+                .unwrap_or_else(|| crate::make_fail_descr_typed(finish_arg_types.clone()))
+        };
         recorder.finish(finish_args, finish_descr);
         let trace = recorder.get_trace();
         let trace_snapshots = trace.snapshots.clone();
@@ -4912,6 +4927,7 @@ impl<M: Clone> MetaInterp<M> {
             fail_index,
             trace_id,
             is_finish: effective_is_finish,
+            is_exit_frame_with_exception: result.is_exit_frame_with_exception,
             exit_layout,
             savedata: result.savedata,
             exception,
@@ -5031,6 +5047,7 @@ impl<M: Clone> MetaInterp<M> {
             fail_index,
             trace_id,
             is_finish: effective_is_finish,
+            is_exit_frame_with_exception: result.is_exit_frame_with_exception,
             exit_layout,
             savedata: result.savedata,
             exception,
@@ -5060,6 +5077,7 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = descr.fail_index();
         let trace_id = Self::normalize_trace_id(compiled, descr.trace_id());
         let is_finish = descr.is_finish();
+        let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         let exit_types = descr.fail_arg_types().to_vec();
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
@@ -5149,6 +5167,7 @@ impl<M: Clone> MetaInterp<M> {
             fail_index,
             trace_id,
             is_finish,
+            is_exit_frame_with_exception,
             exit_layout,
             savedata,
             exception,
@@ -5174,6 +5193,7 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = descr.fail_index();
         let trace_id = Self::normalize_trace_id(compiled, descr.trace_id());
         let is_finish = descr.is_finish();
+        let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         let exit_types = descr.fail_arg_types().to_vec();
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
@@ -5266,6 +5286,7 @@ impl<M: Clone> MetaInterp<M> {
             fail_index,
             trace_id,
             is_finish,
+            is_exit_frame_with_exception,
             exit_layout,
             savedata,
             exception,
@@ -9098,7 +9119,9 @@ impl<M: Clone> MetaInterp<M> {
         // Dispatch through `compile_finish_from_active_session` so
         // root / bridge finish branches share the session-owned compile
         // helper — `ActiveTraceSession.bridge` picks between them.
-        self.compile_finish_from_active_session(&exits, finish_arg_types)
+        // `compile_done_with_this_frame` is the non-exception path; the
+        // `compile_exit_frame_with_exception` sibling passes `true`.
+        self.compile_finish_from_active_session(&exits, finish_arg_types, false)
     }
 
     /// pyjitpl.py:3238-3245 `MetaInterp.compile_exit_frame_with_exception(valuebox)`.
@@ -9160,7 +9183,7 @@ impl<M: Clone> MetaInterp<M> {
         // share a single compile path, matching upstream's single-owner
         // `compile.compile_trace` invocation for the FINISH.
         let exits: Vec<OpRef> = valuebox.into_iter().collect();
-        self.compile_finish_from_active_session(&exits, vec![majit_ir::Type::Ref])
+        self.compile_finish_from_active_session(&exits, vec![majit_ir::Type::Ref], true)
     }
 
     /// pyjitpl.py:3198-3220 + 3238-3245 shared compile-and-finish helper.
@@ -9194,6 +9217,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
+        exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
         // Idempotent no-op: session already consumed by the sibling
         // finish entry (e.g. `TraceAction::Finish` arm ran first).
@@ -9203,7 +9227,23 @@ impl<M: Clone> MetaInterp<M> {
         // bridge branch: `compile_trace_finish` records FINISH on the
         // existing tracer and dispatches to `compile_trace_inner`.
         if let Some(bridge) = self.bridge_info() {
-            let finish_descr = crate::make_fail_descr_typed(finish_arg_types);
+            // `pyjitpl.py:3216-3217` / `pyjitpl.py:3241`:
+            //   `token = sd.done_with_this_frame_descr_<type>` (normal) or
+            //   `token = sd.exit_frame_with_exception_descr_ref` (raising).
+            // Use the metainterp-attached singleton for pointer identity
+            // parity with the backend (`attach_descrs_to_cpu`).  Falls
+            // back to `make_fail_descr_typed` only when the singleton is
+            // unattached (tests bypassing `MetaInterp::new`).
+            let finish_descr = if exit_with_exception {
+                self.staticdata
+                    .exit_frame_with_exception_descr_ref
+                    .clone()
+                    .unwrap_or_else(|| crate::make_fail_descr_typed(finish_arg_types.clone()))
+            } else {
+                self.staticdata
+                    .done_with_this_frame_descr_from_types(&finish_arg_types)
+                    .unwrap_or_else(|| crate::make_fail_descr_typed(finish_arg_types.clone()))
+            };
             let outcome = self.compile_trace_finish(
                 bridge.green_key,
                 finish_args,
@@ -9247,7 +9287,7 @@ impl<M: Clone> MetaInterp<M> {
         let meta = self
             .take_trace_meta()
             .expect("compile_finish_from_active_session: session must be present");
-        self.finish_and_compile(finish_args, finish_arg_types, meta)
+        self.finish_and_compile(finish_args, finish_arg_types, meta, exit_with_exception)
     }
 
     /// pyjitpl.py:2174-2186 `MIFrame.do_residual_or_indirect_call`.
@@ -10523,6 +10563,13 @@ pub enum DetailedDriverRunOutcome {
         via_blackhole: bool,
         /// When true, Int-typed values are raw integers (not boxed pointers).
         raw_int_result: bool,
+        /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity:
+        /// the FINISH descr was `sd.exit_frame_with_exception_descr_ref`
+        /// (emitted by pyjitpl.py:3238-3245 compile_exit_frame_with_exception).
+        /// `typed_values[0]` is the `ExitFrameWithExceptionRef` exception
+        /// GcRef; callers must route this to `jitexc.ExitFrameWithExceptionRef`
+        /// (`jitexc.py:45`) instead of `jitexc.DoneWithThisFrame*`.
+        is_exit_frame_with_exception: bool,
     },
     Jump {
         via_blackhole: bool,

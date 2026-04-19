@@ -35,6 +35,7 @@ macro_rules! close_loop_with_increment_guard_failure {
         TraceAction::Finish {
             finish_args,
             finish_arg_types,
+            exit_with_exception: false,
         }
     }};
 }

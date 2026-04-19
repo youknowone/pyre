@@ -1090,6 +1090,7 @@ impl<S: JitState> JitDriver<S> {
             TraceAction::Finish {
                 finish_args,
                 finish_arg_types,
+                exit_with_exception,
             } => {
                 // pyjitpl.py:3198-3220 + 3238-3245 parity — upstream's
                 // `compile_done_with_this_frame` and
@@ -1098,16 +1099,18 @@ impl<S: JitState> JitDriver<S> {
                 // `compile.giveup()` on failure.  Both live on
                 // `MetaInterp` in upstream; the shared helper
                 // `compile_finish_from_active_session` dispatches bridge
-                // vs root based on the session's `bridge_info`.  The
+                // vs root based on the session's `bridge_info` and picks
+                // the FINISH descr per `exit_with_exception`.  The
                 // TraceAction::Finish arm stays as a thin wrapper that
                 // routes the pyre-dispatch-layer finish emission
                 // (dispatch.rs:298) into the same helper, matching the
                 // `except SwitchToBlackhole as stb: self.aborted_tracing`
                 // shape at pyjitpl.py:2491.
-                if let Err(stb) = self
-                    .meta
-                    .compile_finish_from_active_session(&finish_args, finish_arg_types)
-                {
+                if let Err(stb) = self.meta.compile_finish_from_active_session(
+                    &finish_args,
+                    finish_arg_types,
+                    exit_with_exception,
+                ) {
                     self.meta.aborted_tracing(stb.reason);
                 }
                 self.sym = None;
@@ -2209,10 +2212,14 @@ impl<S: JitState> JitDriver<S> {
         };
 
         if result.is_finish {
+            let typed_values = result.typed_values.clone();
+            let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
+            drop(result);
             return DetailedDriverRunOutcome::Finished {
-                typed_values: result.typed_values,
+                typed_values,
                 via_blackhole: false,
                 raw_int_result: self.meta.has_raw_int_finish(),
+                is_exit_frame_with_exception,
             };
         }
 
@@ -2342,6 +2349,7 @@ impl<S: JitState> JitDriver<S> {
         };
 
         let is_finish = result.is_finish;
+        let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
         let exit_meta = result.meta.clone();
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
@@ -2359,6 +2367,7 @@ impl<S: JitState> JitDriver<S> {
                 typed_values,
                 via_blackhole: false,
                 raw_int_result: self.meta.has_raw_int_finish(),
+                is_exit_frame_with_exception,
             };
         }
 

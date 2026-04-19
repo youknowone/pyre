@@ -695,6 +695,18 @@ pub trait FailDescr: Descr {
         false
     }
 
+    /// `compile.py:658-662` `ExitFrameWithExceptionDescrRef` parity:
+    /// whether this FINISH descr was emitted for
+    /// `pyjitpl.py:3238-3245 compile_exit_frame_with_exception` rather
+    /// than `pyjitpl.py:3198-3220 compile_done_with_this_frame`.  The
+    /// runtime classifier uses this flag to route the exit to
+    /// `jitexc.ExitFrameWithExceptionRef` (`jitexc.py:45`) instead of
+    /// `jitexc.DoneWithThisFrame*` — equivalent to dispatching on the
+    /// `handle_fail` method of the corresponding descr subclass.
+    fn is_exit_frame_with_exception(&self) -> bool {
+        false
+    }
+
     /// history.py:470-499 TargetToken parity: whether this exit corresponds
     /// to an external JUMP whose target lives in a different compiled
     /// function. Backends that can't emit raw inter-function JMPs (Cranelift)

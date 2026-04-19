@@ -243,12 +243,15 @@ fn handle_fail_dispatch(
         // (Void/Int/Ref/Float) — the four finish singletons.
         return handle_fail_done_with_this_frame(descr_raw, frame_ptr);
     }
-    // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`
-    // has no pyre singleton yet: the CALL_ASSEMBLER slow path does
-    // not currently observe this descr (the compiled epilogue raises
-    // via `jit_exc_value` instead). If/when the singleton is added
-    // to `guard.rs`, insert the matching branch here.
-    //
+    if guard::is_exit_frame_with_exception_descr(descr_raw) {
+        // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`:
+        //   value = cpu.get_ref_value(deadframe, 0)
+        //   raise jitexc.ExitFrameWithExceptionRef(value)
+        // pyre returns the raw slot-0 payload here; the caller stub
+        // observes `is_exit_frame_with_exception` on the synthesized
+        // FailDescr and re-raises through `jit_exc_value`.
+        return handle_fail_exit_frame_with_exception(frame_ptr);
+    }
     // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
     let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
     handle_fail_resume_guard(descr, descr_raw, frame_ptr, green_key)
@@ -293,6 +296,18 @@ fn handle_fail_done_with_this_frame(descr_raw: usize, frame_ptr: *mut jitframe::
     // Unreachable: `is_done_with_this_frame_descr` gate above already
     // narrowed `descr_raw` to one of the four singletons.
     0
+}
+
+/// compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`.
+///
+/// Upstream reads slot 0 as a gcref and raises
+/// `jitexc.ExitFrameWithExceptionRef(value)`.  Pyre hands the raw int
+/// payload back; the caller stub
+/// (`pyre/pyre-jit/src/eval.rs` handle_jit_outcome) routes the result
+/// into `PyError::from_exc_object` when the synthesized FailDescr
+/// carries `is_exit_frame_with_exception = true`.
+fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
+    unsafe { llmodel::get_int_value(frame_ptr, 0) as i64 }
 }
 
 /// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
