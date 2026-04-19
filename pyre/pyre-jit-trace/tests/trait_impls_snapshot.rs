@@ -5,7 +5,7 @@
 //!
 //!   1. `src/opcode_handler_impls_pre.template.rs` — variant
 //!      `SharedOpcodeHandler` impl + the file header. Hand-maintained.
-//!   2. `majit_codewriter::handler_spec::emit_simple_trait_impls()` — the 5
+//!   2. `majit_translate::handler_spec::emit_simple_trait_impls()` — the 5
 //!      simple traits (Constant/Stack/Truth/Iter/Local) emitted from a spec
 //!      table.
 //!   3. `src/opcode_handler_impls_post.template.rs` — variant
@@ -38,7 +38,7 @@ fn assembled_trait_impls_match_snapshot() {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", pre_path.display()));
     let post = std::fs::read_to_string(&post_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", post_path.display()));
-    let simple = majit_codewriter::handler_spec::emit_simple_trait_impls();
+    let simple = majit_translate::handler_spec::emit_simple_trait_impls();
     let assembled = format!("{pre}{simple}{post}");
 
     let mut settings = insta::Settings::clone_current();

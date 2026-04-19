@@ -113,7 +113,7 @@ pub enum SignatureItem<'a> {
     Kwargname(Option<&'a str>),
 }
 
-use crate::model::{Constant, Hlvalue};
+use super::model::{Constant, Hlvalue};
 use std::collections::HashMap;
 
 /// Shape key of a call site: `(shape_cnt, shape_keys, shape_star)`.
@@ -268,14 +268,14 @@ impl CallSpec {
     }
 }
 
-fn sequence_items(value: &crate::model::ConstValue) -> Option<&[crate::model::ConstValue]> {
+fn sequence_items(value: &super::model::ConstValue) -> Option<&[super::model::ConstValue]> {
     value.sequence_items()
 }
 
 #[cfg(test)]
 mod test {
+    use super::super::model::{ConstValue, Constant, Hlvalue};
     use super::*;
-    use crate::model::{ConstValue, Constant, Hlvalue};
 
     // RPython basis: no upstream test for Signature alone — `test_argument.py`
     // exercises `CallSpec`. These smoke tests pin the behaviours that

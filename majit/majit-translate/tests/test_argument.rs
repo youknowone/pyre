@@ -7,8 +7,8 @@
 //! `Signature.__repr__` is not tested (RPython uses `%r`-style string
 //! formatting; the Rust `Debug` impl differs).
 
-use majit_flowspace::argument::{CallSpec, Signature, SignatureItem};
-use majit_flowspace::model::{ConstValue, Constant, Hlvalue};
+use majit_translate::flowspace::argument::{CallSpec, Signature, SignatureItem};
+use majit_translate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use std::collections::HashMap;
 
 // ---- TestSignature ----

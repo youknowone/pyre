@@ -1,43 +1,39 @@
-//! majit-codewriter: JIT code generation pipeline.
+//! majit-translate: RPython translation pipeline.
 //!
-//! RPython equivalent: `rpython/jit/codewriter/`
+//! Upstream counterparts:
+//! - `jit_codewriter/` ← `rpython/jit/codewriter/`
+//! - `translate_legacy/` — pre-roadmap ad-hoc annotator+rtyper, deleted at P8.11
+//! - `flowspace/`, `annotator/`, `rtyper/`, `translator/` — future line-by-line
+//!   ports of `rpython/{flowspace,annotator,rtyper,translator}/`
 //!
-//! Given a bundled interpreter source file, it:
-//! 1. Parses the entire crate with `syn`
-//! 2. Extracts the opcode dispatch table (match arms)
-//! 3. Traces trait implementations to resolve handler methods
-//! 4. Classifies helper functions (elidable, residual, field access)
-//! 5. Collects type layouts (struct fields, offsets)
-//! 6. Generates tracing code that mirrors the interpreter's execution
+//! Everything under one crate because upstream has circular imports
+//! (flowspace/operation.py ↔ annotator, annotator/annrpython.py ↔
+//! rtyper/normalizecalls.py) that Cargo's DAG crate boundary cannot model.
 
-pub mod assembler;
-pub mod call;
+pub mod flowspace;
+pub mod jit_codewriter;
+pub use jit_codewriter::{
+    assembler, call, codewriter, flatten, format, jitcode, jtransform, liveness, policy, regalloc,
+    support,
+};
+
 mod codegen;
-pub mod codewriter;
-pub mod flatten;
-pub mod format;
 pub mod front;
 pub mod handler_spec;
 pub mod hints;
 pub mod inline;
-pub mod jitcode;
-pub mod jtransform;
 pub mod layout;
-pub mod liveness;
 pub mod model;
 mod parse;
-pub mod policy;
-pub mod regalloc;
-pub mod support;
 #[cfg(test)]
 mod test_support;
 // Phase 0 P1 (roadmap: line-by-line port of rpython/{flowspace,annotator,rtyper}):
-// `translator/` renamed to `translator_legacy/` because this tree is the
+// `translator/` renamed to `translate_legacy/` because this tree is the
 // pre-roadmap ad-hoc majit implementation, not a line-by-line port of
 // `rpython/translator/`. The identifier `translator` is reserved for that
-// future port; legacy consumers must spell `translator_legacy::…`
+// future port; legacy consumers must spell `translate_legacy::…`
 // explicitly. The legacy tree is deleted at roadmap commit P8.11.
-pub mod translator_legacy;
+pub mod translate_legacy;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
 pub use flatten::{FlatOp, Label, RegKind, SSARepr, flatten, flatten_with_types};
@@ -57,16 +53,16 @@ pub use model::{
 pub use parse::{
     CallPath, OpcodeDispatchSelector, ParsedInterpreter, find_opcode_dispatch_match, parse_source,
 };
-pub use translator_legacy::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
-pub use translator_legacy::pipeline::{
+pub use translate_legacy::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
+pub use translate_legacy::pipeline::{
     PipelineConfig, PipelineOpcodeArm, PipelineResult, PortalSpec, ProgramPipelineResult,
     analyze_function, analyze_program,
 };
-pub use translator_legacy::rtyper::rtyper::{ConcreteType, TypeResolutionState, resolve_types};
+pub use translate_legacy::rtyper::rtyper::{ConcreteType, TypeResolutionState, resolve_types};
 
 use serde::{Deserialize, Serialize};
 
-use crate::translator_legacy::{
+use crate::translate_legacy::{
     annotator::annrpython as annotate, pipeline, rtyper::rtyper as rtype,
 };
 

@@ -1348,7 +1348,7 @@ pub trait Backend: Send {
     fn bh_getfield_gc_i(
         &self,
         _struct_ptr: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
@@ -1356,7 +1356,7 @@ pub trait Backend: Send {
     fn bh_getfield_gc_r(
         &self,
         _struct_ptr: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
         GcRef::NULL
     }
@@ -1364,7 +1364,7 @@ pub trait Backend: Send {
     fn bh_getfield_gc_f(
         &self,
         _struct_ptr: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         0.0
     }
@@ -1373,7 +1373,7 @@ pub trait Backend: Send {
         &self,
         _struct_ptr: i64,
         _newvalue: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     /// model.py:223 bh_setfield_gc_r(struct, newvalue, fielddescr)
@@ -1381,7 +1381,7 @@ pub trait Backend: Send {
         &self,
         _struct_ptr: i64,
         _newvalue: GcRef,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     /// model.py:224 bh_setfield_gc_f(struct, newvalue, fielddescr)
@@ -1389,7 +1389,7 @@ pub trait Backend: Send {
         &self,
         _struct_ptr: i64,
         _newvalue: f64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
 
@@ -1399,7 +1399,7 @@ pub trait Backend: Send {
         &self,
         _array_ptr: i64,
         _index: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
@@ -1408,7 +1408,7 @@ pub trait Backend: Send {
         &self,
         _array_ptr: i64,
         _index: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
         GcRef::NULL
     }
@@ -1417,7 +1417,7 @@ pub trait Backend: Send {
         &self,
         _array_ptr: i64,
         _index: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         0.0
     }
@@ -1427,7 +1427,7 @@ pub trait Backend: Send {
         _array_ptr: i64,
         _index: i64,
         _newvalue: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     /// model.py:248 bh_setarrayitem_gc_r(array, index, newvalue, arraydescr)
@@ -1436,7 +1436,7 @@ pub trait Backend: Send {
         _array_ptr: i64,
         _index: i64,
         _newvalue: GcRef,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     /// model.py:249 bh_setarrayitem_gc_f(array, index, newvalue, arraydescr)
@@ -1445,7 +1445,7 @@ pub trait Backend: Send {
         _array_ptr: i64,
         _index: i64,
         _newvalue: f64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
 
@@ -1455,7 +1455,7 @@ pub trait Backend: Send {
         &self,
         _array: i64,
         _index: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
@@ -1464,7 +1464,7 @@ pub trait Backend: Send {
         &self,
         _array: i64,
         _index: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         0.0
     }
@@ -1474,7 +1474,7 @@ pub trait Backend: Send {
         _array: i64,
         _index: i64,
         _newvalue: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     /// model.py:252 bh_setarrayitem_raw_f(array, index, newvalue, arraydescr)
@@ -1483,7 +1483,7 @@ pub trait Backend: Send {
         _array: i64,
         _index: i64,
         _newvalue: f64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
 
@@ -1491,18 +1491,18 @@ pub trait Backend: Send {
     fn bh_arraylen_gc(
         &self,
         _array_ptr: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
 
     // ── model.py:230-236 allocation ──
     /// model.py:230 / llmodel.py:775 bh_new(sizedescr)
-    fn bh_new(&self, _sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         0
     }
     /// model.py:231 / llmodel.py:778 bh_new_with_vtable(sizedescr)
-    fn bh_new_with_vtable(&self, _sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         0
     }
 
@@ -1518,14 +1518,14 @@ pub trait Backend: Send {
         None
     }
     /// model.py:233 bh_new_array(length, arraydescr)
-    fn bh_new_array(&self, _length: i64, _arraydescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+    fn bh_new_array(&self, _length: i64, _arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
         0
     }
     /// model.py:234 bh_new_array_clear(length, arraydescr)
     fn bh_new_array_clear(
         &self,
         _length: i64,
-        _arraydescr: &majit_codewriter::jitcode::BhDescr,
+        _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
@@ -1550,7 +1550,7 @@ pub trait Backend: Send {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         0
     }
@@ -1561,7 +1561,7 @@ pub trait Backend: Send {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> GcRef {
         GcRef::NULL
     }
@@ -1572,7 +1572,7 @@ pub trait Backend: Send {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
         0.0
     }
@@ -1583,7 +1583,7 @@ pub trait Backend: Send {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        _calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
     }
 
@@ -1628,7 +1628,7 @@ pub trait Backend: Send {
         &self,
         _addr: i64,
         _offset: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
@@ -1638,7 +1638,7 @@ pub trait Backend: Send {
         _addr: i64,
         _offset: i64,
         _newvalue: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     // ── model.py: interior field access ──
@@ -1647,7 +1647,7 @@ pub trait Backend: Send {
         &self,
         _array: i64,
         _index: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
@@ -1656,7 +1656,7 @@ pub trait Backend: Send {
         &self,
         _array: i64,
         _index: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
         GcRef::NULL
     }
@@ -1665,7 +1665,7 @@ pub trait Backend: Send {
         &self,
         _array: i64,
         _index: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         0.0
     }
@@ -1675,7 +1675,7 @@ pub trait Backend: Send {
         _array: i64,
         _index: i64,
         _newvalue: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     /// model.py: bh_setinteriorfield_gc_r(array, index, newvalue, descr)
@@ -1684,7 +1684,7 @@ pub trait Backend: Send {
         _array: i64,
         _index: i64,
         _newvalue: GcRef,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     /// model.py: bh_setinteriorfield_gc_f(array, index, newvalue, descr)
@@ -1693,7 +1693,7 @@ pub trait Backend: Send {
         _array: i64,
         _index: i64,
         _newvalue: f64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     fn bh_gc_load_indexed_i(
@@ -1743,7 +1743,7 @@ pub trait Backend: Send {
         &self,
         _addr: i64,
         _offset: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         0.0
     }
@@ -1753,28 +1753,28 @@ pub trait Backend: Send {
         _addr: i64,
         _offset: i64,
         _newvalue: f64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     // ── model.py: raw field access ──
     fn bh_getfield_raw_i(
         &self,
         _struct_ptr: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         0
     }
     fn bh_getfield_raw_r(
         &self,
         _struct_ptr: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
         GcRef::NULL
     }
     fn bh_getfield_raw_f(
         &self,
         _struct_ptr: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         0.0
     }
@@ -1782,14 +1782,14 @@ pub trait Backend: Send {
         &self,
         _struct_ptr: i64,
         _newvalue: i64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
     fn bh_setfield_raw_f(
         &self,
         _struct_ptr: i64,
         _newvalue: f64,
-        _fielddescr: &majit_codewriter::jitcode::BhDescr,
+        _fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
     }
 

@@ -2221,7 +2221,7 @@ fn handle_jit_outcome(
 /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr).
 fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let size = typedescr.size();
-    let descr = majit_codewriter::jitcode::BhDescr::Size {
+    let descr = majit_translate::jitcode::BhDescr::Size {
         size,
         type_id: typedescr.type_id(),
         vtable: 0,
@@ -2235,7 +2235,7 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let size = descr.size();
     let vtable = descr.vtable();
-    let bh_descr = majit_codewriter::jitcode::BhDescr::Size {
+    let bh_descr = majit_translate::jitcode::BhDescr::Size {
         size,
         type_id: descr.type_id(),
         vtable,
@@ -2496,7 +2496,7 @@ fn materialize_virtual_from_rd(
             assert_eq!(offsets.len(), fieldnums.len());
             // resume.py:701-703: buffer = decoder.allocate_raw_buffer(func, size)
             let (driver, _) = driver_pair();
-            let calldescr = majit_codewriter::jitcode::BhCallDescr {
+            let calldescr = majit_translate::jitcode::BhCallDescr {
                 arg_classes: "i".into(),
                 result_type: 'i',
             };
@@ -2516,7 +2516,7 @@ fn materialize_virtual_from_rd(
             //     decoder.setrawbuffer_item(buffer, fieldnums[i], offset, descr)
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 let di = &descrs[i];
-                let bh_descr = majit_codewriter::jitcode::BhDescr::from_array_descr_info(di);
+                let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
                 // resume.py:1544: assert not descr.is_array_of_pointers()
                 assert!(
                     !bh_descr.is_array_of_pointers(),
@@ -4062,7 +4062,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 values,
             } => {
                 // resume.py:703: buffer = decoder.allocate_raw_buffer(func, size)
-                let calldescr = majit_codewriter::jitcode::BhCallDescr {
+                let calldescr = majit_translate::jitcode::BhCallDescr {
                     arg_classes: "i".into(),
                     result_type: 'i',
                 };
@@ -4072,8 +4072,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 for (i, src) in values.iter().enumerate() {
                     if let Some(val) = resolve_value(src, &materialized) {
                         let di = &descrs[i];
-                        let bh_descr =
-                            majit_codewriter::jitcode::BhDescr::from_array_descr_info(di);
+                        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
                         assert!(
                             !bh_descr.is_array_of_pointers(),
                             "raw buffer entry must not be pointer type"
@@ -4274,7 +4273,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
         let descr_size = typedescr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
         let type_id = typedescr.index();
-        let bh_descr = majit_codewriter::jitcode::BhDescr::Size {
+        let bh_descr = majit_translate::jitcode::BhDescr::Size {
             size: descr_size,
             type_id: type_id as u32,
             vtable: 0,
@@ -4315,7 +4314,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 Box::into_raw(obj) as i64
             }
             _ => {
-                let bh_descr = majit_codewriter::jitcode::BhDescr::Size {
+                let bh_descr = majit_translate::jitcode::BhDescr::Size {
                     size: descr_size,
                     type_id: descr_index,
                     vtable,
@@ -4409,7 +4408,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     /// Concrete reader: cpu.bh_call_i(func, [size], None, None, calldescr)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let (driver, _) = driver_pair();
-        let calldescr = majit_codewriter::jitcode::BhCallDescr {
+        let calldescr = majit_translate::jitcode::BhCallDescr {
             arg_classes: "i".into(),
             result_type: 'i',
         };
@@ -4428,7 +4427,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {
-        let bh_descr = majit_codewriter::jitcode::BhDescr::from_array_descr_info(descr);
+        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
         // resume.py:1544: assert not descr.is_array_of_pointers()
         assert!(
             !bh_descr.is_array_of_pointers(),

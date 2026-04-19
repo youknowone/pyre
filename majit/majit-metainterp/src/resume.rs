@@ -5477,7 +5477,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
     /// write_a_float` (resume.py:1590-1597).
     fn _prepare_next_section(&mut self, info: usize, bh: &mut BlackholeInterpreter) {
-        use majit_codewriter::liveness::LivenessIterator;
+        use majit_translate::liveness::LivenessIterator;
 
         // SAFETY: `bh.liveness_info` is read-only metadata
         // populated by the codewriter. The mutating operations we

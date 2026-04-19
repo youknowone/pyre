@@ -27,8 +27,8 @@
 //!   `FlowSignalTag` comparison — semantically identical for the
 //!   closed variant set.
 
-use crate::flowcontext::{FlowSignal, FrameBlock};
-use crate::model::{ConstValue, Constant, FSException, Hlvalue, Variable};
+use super::flowcontext::{FlowSignal, FrameBlock};
+use super::model::{ConstValue, Constant, FSException, Hlvalue, Variable};
 
 /// Per-cell payload in the flow-space value stack.
 ///
@@ -474,8 +474,8 @@ pub fn recursively_flatten(lst: &[StackElem]) -> Vec<Hlvalue> {
 
 #[cfg(test)]
 mod test {
+    use super::super::flowcontext::{FlowSignal, FlowSignalTag, FrameBlockKind};
     use super::*;
-    use crate::flowcontext::{FlowSignal, FlowSignalTag, FrameBlockKind};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // RPython basis: `test/test_framestate.py`. Upstream tests drive
@@ -690,7 +690,7 @@ mod test {
         // Ensure the FlowSignal import path used by tests resolves —
         // the tag check is exercised by union_stack in union(), not
         // by matches(), but pin the import so Phase 3 developers know
-        // the enum lives at crate::flowcontext::FlowSignal.
+        // the enum lives at super::flowcontext::FlowSignal.
         let tag = FlowSignal::Return {
             w_value: Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
         }

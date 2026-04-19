@@ -266,7 +266,7 @@ impl MetaInterpStaticData {
 /// `self.liveness_info = "".join(asm.all_liveness)` after each append.
 pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u16> {
     use crate::assembler::ASSEMBLER_STATE;
-    use majit_codewriter::liveness::encode_liveness;
+    use majit_translate::liveness::encode_liveness;
 
     ensure_finish_setup();
 
@@ -1107,7 +1107,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
 
 // Note: pyre does not currently route GetfieldGcF/GetfieldGcPureF through
 // state.rs. Float field unboxing goes via the codewriter-generated
-// `getfield_gc_f_pureornot` (majit-codewriter/src/codegen.rs),
+// `getfield_gc_f_pureornot` (majit-translate/src/codegen.rs),
 // which — matching RPython's pyjitpl.py opimpl_getfield_gc_f — records
 // the GC op without folding. The optimizer's `optimize_GETFIELD_GC_F`
 // (= `optimize_GETFIELD_GC_I` via RPython's alias) handles folding.
@@ -3592,7 +3592,7 @@ fn materialize_virtual_raw_buffer(
 
     // resume.py:703: buffer = decoder.allocate_raw_buffer(func, size)
     let (driver, _) = crate::driver::driver_pair();
-    let calldescr = majit_codewriter::jitcode::BhCallDescr {
+    let calldescr = majit_translate::jitcode::BhCallDescr {
         arg_classes: "i".into(),
         result_type: 'i',
     };
@@ -3612,7 +3612,7 @@ fn materialize_virtual_raw_buffer(
     for i in 0..offsets.len() {
         let concrete = values[i].resolve_with_refs(materialized_refs)?;
         let di = &descrs[i];
-        let bh_descr = majit_codewriter::jitcode::BhDescr::from_array_descr_info(di);
+        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
         // resume.py:1544: assert not descr.is_array_of_pointers()
         assert!(
             !bh_descr.is_array_of_pointers(),

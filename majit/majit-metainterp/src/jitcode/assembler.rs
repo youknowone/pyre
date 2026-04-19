@@ -2,7 +2,7 @@
 ///
 /// RPython codewriter/assembler.py: assembler that emits bytecodes into a
 /// JitCode object. This remains in metainterp only as transitional pyre ABI
-/// glue until callers consume `majit_codewriter::assembler::Assembler`.
+/// glue until callers consume `majit_translate::assembler::Assembler`.
 use std::cmp::max;
 
 use majit_backend::JitCellToken;
@@ -1289,7 +1289,7 @@ impl JitCodeBuilder {
             constants_f: self.constants_f,
             jitdriver_sd: None,
             fnaddr: 0,
-            calldescr: majit_codewriter::jitcode::BhCallDescr::default(),
+            calldescr: majit_translate::jitcode::BhCallDescr::default(),
             opcodes: self.opcodes,
             sub_jitcodes: self.sub_jitcodes,
             fn_ptrs: self.fn_ptrs,

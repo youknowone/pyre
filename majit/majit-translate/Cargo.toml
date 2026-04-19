@@ -1,0 +1,37 @@
+[package]
+name = "majit-translate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of RPython's translation pipeline (flowspace → annotator → rtyper → translator → jit/codewriter)"
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+quote = "1"
+proc-macro2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+majit-ir = { workspace = true }
+# PRE-EXISTING-ADAPTATION, parity rule #1.
+#
+# RPython's `rpython/flowspace/bytecode.py` does `from opcode import
+# EXTENDED_ARG, HAVE_ARGUMENT` + `from rpython.tool.stdlib_opcode import
+# host_bytecode_spec` — i.e. host-Python's stdlib `opcode` module IS the
+# opcode source of truth, RPython just wraps it. It does NOT ship its own
+# CPython opcode enum.
+#
+# Rust has no "host Python" the same way CPython does. rustpython-compiler-core
+# plays the role of the stdlib `opcode` module here: a neutral crate that
+# owns the CPython-3.14 opcode definitions (Instruction, CodeObject,
+# ConstantData, ...). majit-translate wraps it in
+# flowspace::bytecode::HostCode, exactly the way RPython wraps `opcode`.
+#
+# Critically this is NOT a dependency on pyre: rustpython-compiler-core is
+# external to both majit and pyre. The `rpython/` ⊥ `pypy/` boundary holds.
+rustpython-compiler-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+walkdir = "2"
+rustpython-compiler = { workspace = true }

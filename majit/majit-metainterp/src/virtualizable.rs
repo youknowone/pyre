@@ -191,7 +191,7 @@ impl Clone for VirtualizableInfo {
     }
 }
 
-impl majit_codewriter::call::VirtualizableInfoHandle for VirtualizableInfo {
+impl majit_translate::call::VirtualizableInfoHandle for VirtualizableInfo {
     /// virtualizable.py:306-307 `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
     ///
     /// Pyre identifies VTYPEPTR by the SizeDescr identity stored in

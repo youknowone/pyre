@@ -3,7 +3,7 @@
 //! The RPython flowspace tests rely on PyPy-2.7's single-byte bytecode
 //! (`HAVE_ARGUMENT`/`EXTENDED_ARG` raw-byte walk) and have no equivalent
 //! for CPython 3.14's wordcode format. This file pins the CPython 3.14
-//! side of `majit_flowspace::bytecode::HostCode::read` — every opcode
+//! side of `majit_translate::flowspace::bytecode::HostCode::read` — every opcode
 //! variant the RustPython compiler core emits must decode cleanly, the
 //! walker must traverse every code unit in order, and EXTENDED_ARG
 //! folding must not corrupt the `(next_offset, Instruction, oparg)`
@@ -19,11 +19,13 @@
 //! Phase 3 F3.5. A separate `tests/test_objspace.rs` will be added
 //! alongside the flowcontext port.
 
-use majit_flowspace::bytecode::{ConstantData, HostCode, Instruction};
-use pyre_interpreter::compile::{self, CodeObject, Mode};
+use majit_translate::flowspace::bytecode::{ConstantData, HostCode, Instruction};
+use rustpython_compiler::{Mode, compile as rp_compile};
+use rustpython_compiler_core::bytecode::CodeObject;
 
 fn compile_function_body(src: &str) -> CodeObject {
-    let module = compile::compile_source(src, Mode::Exec).expect("compile should succeed");
+    let module = rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
+        .expect("compile should succeed");
     module
         .constants
         .iter()

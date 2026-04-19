@@ -210,8 +210,8 @@ impl LivenessInfo {
 ///
 /// RPython places this function in `rpython/jit/codewriter/jitcode.py`,
 /// not in metainterp. majit follows the same module placement: the
-/// definition lives in `majit_codewriter::jitcode::enumerate_vars`.
-pub use majit_codewriter::jitcode::enumerate_vars;
+/// definition lives in `majit_translate::jitcode::enumerate_vars`.
+pub use majit_translate::jitcode::enumerate_vars;
 
 /// Serialized interpreter step description, mirroring RPython's `JitCode`
 /// at a much smaller subset for the current proc-macro tracing surface.
@@ -255,7 +255,7 @@ pub struct JitCode {
     pub fnaddr: i64,
     /// RPython `jitcode.py:17` `self.calldescr` — calling convention descriptor.
     /// Set by `call.py:get_jitcode_calldescr(graph)` from the function's type.
-    pub calldescr: majit_codewriter::jitcode::BhCallDescr,
+    pub calldescr: majit_translate::jitcode::BhCallDescr,
 
     // majit bytecode adapter extension.
     // These fields have no RPython JitCode counterpart. RPython's
@@ -276,7 +276,7 @@ pub struct JitCode {
     /// 'd'/'j' argcode resolution (blackhole.py:102-103 `setup_descrs`).
     /// pyre: stored per-jitcode. Loaded into `BlackholeInterpreter.descrs`
     /// by `setposition()`. Empty until the codewriter populates it.
-    pub descrs: Vec<majit_codewriter::jitcode::BhDescr>,
+    pub descrs: Vec<majit_translate::jitcode::BhDescr>,
 }
 
 // -- RPython jitcode.py parity methods --
@@ -324,7 +324,7 @@ impl JitCode {
     pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
         let mut pc = pc;
         if self.code.get(pc).copied() != Some(op_live) {
-            let step = majit_codewriter::liveness::OFFSET_SIZE + 1;
+            let step = majit_translate::liveness::OFFSET_SIZE + 1;
             if pc < step {
                 self._missing_liveness(pc);
             }
@@ -333,7 +333,7 @@ impl JitCode {
                 self._missing_liveness(pc);
             }
         }
-        majit_codewriter::liveness::decode_offset(&self.code, pc + 1)
+        majit_translate::liveness::decode_offset(&self.code, pc + 1)
     }
 
     /// RPython jitcode.py:95-100 `_missing_liveness(self, pc)`.

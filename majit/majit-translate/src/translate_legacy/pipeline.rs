@@ -20,8 +20,8 @@ use crate::OpcodeDispatchSelector;
 use crate::flatten::{self, SSARepr};
 use crate::front::SemanticFunction;
 use crate::jtransform::{GraphTransformConfig, rewrite_graph};
-use crate::translator_legacy::annotator::annrpython::annotate;
-use crate::translator_legacy::rtyper::rtyper::resolve_types;
+use crate::translate_legacy::annotator::annrpython::annotate;
+use crate::translate_legacy::rtyper::rtyper::resolve_types;
 
 /// JitDriver portal binding.
 ///

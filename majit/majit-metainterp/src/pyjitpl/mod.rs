@@ -8125,7 +8125,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Frames without a handler are popped. `rvmprof_code` is decoded
     /// in-place before the pop, matching the RPython side effect.
     pub fn finishframe_exception(&mut self) -> Result<(), ChangeFrame> {
-        const SIZE_LIVE_OP: usize = majit_codewriter::liveness::OFFSET_SIZE + 1;
+        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
 
         while !self.framestack.is_empty() {
             let mut handled = false;

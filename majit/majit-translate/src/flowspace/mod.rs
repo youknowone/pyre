@@ -1,12 +1,12 @@
-//! majit-flowspace — Rust port of `rpython/flowspace/`.
+//! `flowspace` — Rust port of `rpython/flowspace/`.
 //!
 //! Phase 1 of the five-year roadmap landing a line-by-line port of
-//! `rpython/{flowspace,annotator,rtyper}/` into majit. See
+//! `rpython/{flowspace,annotator,rtyper}/` into majit-translate. See
 //! `.claude/plans/majestic-forging-meteor.md` for the full plan.
 //!
 //! RPython upstream lives at
 //! `/Users/al03219714/Projects/pypy/rpython/flowspace/`. The
-//! corresponding `__init__.py` is empty, so this crate's `lib.rs`
+//! corresponding `__init__.py` is empty, so this module's `mod.rs`
 //! only declares the submodules that exist.
 //!
 //! Module → upstream file mapping (populated incrementally as each

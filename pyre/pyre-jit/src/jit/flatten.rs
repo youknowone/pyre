@@ -18,7 +18,7 @@
 
 use std::rc::Rc;
 
-use majit_codewriter::jitcode::BhDescr;
+use majit_translate::jitcode::BhDescr;
 
 /// `rpython/jit/codewriter/flatten.py:59` `KINDS = ['int', 'ref', 'float']`.
 ///

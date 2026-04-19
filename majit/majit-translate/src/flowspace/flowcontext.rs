@@ -44,19 +44,19 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use pyre_interpreter::bytecode::oparg::VarNums;
+use rustpython_compiler_core::bytecode::oparg::VarNums;
 
-use crate::argument::{CallShape, CallSpec};
-use crate::bytecode::{
+use super::argument::{CallShape, CallSpec};
+use super::bytecode::{
     BinaryOperator, BytecodeCorruption, ComparisonOperator, ConstantData, ExceptionTableEntry,
     HostCode, Instruction, MakeFunctionFlag,
 };
-use crate::framestate::{FrameState, StackElem};
-use crate::model::{
+use super::framestate::{FrameState, StackElem};
+use super::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FSException, FunctionGraph, GraphFunc,
     HOST_ENV, Hlvalue, HostObject, Link, SpaceOperation, Variable, c_last_exception,
 };
-use crate::specialcase::{SpecialCaseDispatch, lookup_builtin, lookup_special_case};
+use super::specialcase::{SpecialCaseDispatch, lookup_builtin, lookup_special_case};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowingError {
@@ -2138,7 +2138,7 @@ impl FlowContext {
                     Ok(None)
                 }
                 Instruction::LoadCommonConstant { .. } => {
-                    let value = match pyre_interpreter::bytecode::oparg::CommonConstant::try_from(
+                    let value = match rustpython_compiler_core::bytecode::oparg::CommonConstant::try_from(
                         oparg,
                     )
                     .map_err(|_| {
@@ -2146,25 +2146,25 @@ impl FlowContext {
                             "invalid LOAD_COMMON_CONSTANT oparg {oparg}"
                         )))
                     })? {
-                        pyre_interpreter::bytecode::oparg::CommonConstant::AssertionError => {
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::AssertionError => {
                             exception_class_value("AssertionError")
                         }
-                        pyre_interpreter::bytecode::oparg::CommonConstant::NotImplementedError => {
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::NotImplementedError => {
                             exception_class_value("NotImplementedError")
                         }
-                        pyre_interpreter::bytecode::oparg::CommonConstant::BuiltinTuple => {
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::BuiltinTuple => {
                             self.find_global("tuple")?
                         }
-                        pyre_interpreter::bytecode::oparg::CommonConstant::BuiltinAll => {
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::BuiltinAll => {
                             self.find_global("all")?
                         }
-                        pyre_interpreter::bytecode::oparg::CommonConstant::BuiltinAny => {
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::BuiltinAny => {
                             self.find_global("any")?
                         }
-                        pyre_interpreter::bytecode::oparg::CommonConstant::BuiltinList => {
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::BuiltinList => {
                             self.find_global("list")?
                         }
-                        pyre_interpreter::bytecode::oparg::CommonConstant::BuiltinSet => {
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::BuiltinSet => {
                             self.find_global("set")?
                         }
                     };
@@ -2352,17 +2352,19 @@ impl FlowContext {
                 Instruction::CallIntrinsic1 { .. } => {
                     let value = self.pop_hlvalue()?;
                     let intrinsic =
-                        pyre_interpreter::bytecode::oparg::IntrinsicFunction1::try_from(oparg)
-                            .map_err(|_| {
-                                FlowContextError::BytecodeCorruption(BytecodeCorruption::new(
-                                    format!("invalid CALL_INTRINSIC_1 func {oparg}"),
-                                ))
-                            })?;
+                        rustpython_compiler_core::bytecode::oparg::IntrinsicFunction1::try_from(
+                            oparg,
+                        )
+                        .map_err(|_| {
+                            FlowContextError::BytecodeCorruption(BytecodeCorruption::new(format!(
+                                "invalid CALL_INTRINSIC_1 func {oparg}"
+                            )))
+                        })?;
                     let result = match intrinsic {
-                        pyre_interpreter::bytecode::oparg::IntrinsicFunction1::UnaryPositive => {
+                        rustpython_compiler_core::bytecode::oparg::IntrinsicFunction1::UnaryPositive => {
                             self.record_pure_op("pos", vec![value])?
                         }
-                        pyre_interpreter::bytecode::oparg::IntrinsicFunction1::ListToTuple => {
+                        rustpython_compiler_core::bytecode::oparg::IntrinsicFunction1::ListToTuple => {
                             match value {
                                 Hlvalue::Constant(Constant {
                                     value: ConstValue::List(items),
@@ -2384,14 +2386,16 @@ impl FlowContext {
                     let right = self.pop_hlvalue()?;
                     let left = self.pop_hlvalue()?;
                     let intrinsic =
-                        pyre_interpreter::bytecode::oparg::IntrinsicFunction2::try_from(oparg)
-                            .map_err(|_| {
-                                FlowContextError::BytecodeCorruption(BytecodeCorruption::new(
-                                    format!("invalid CALL_INTRINSIC_2 func {oparg}"),
-                                ))
-                            })?;
+                        rustpython_compiler_core::bytecode::oparg::IntrinsicFunction2::try_from(
+                            oparg,
+                        )
+                        .map_err(|_| {
+                            FlowContextError::BytecodeCorruption(BytecodeCorruption::new(format!(
+                                "invalid CALL_INTRINSIC_2 func {oparg}"
+                            )))
+                        })?;
                     match intrinsic {
-                    pyre_interpreter::bytecode::oparg::IntrinsicFunction2::SetTypeparamDefault => {
+                    rustpython_compiler_core::bytecode::oparg::IntrinsicFunction2::SetTypeparamDefault => {
                         let result =
                             self.record_pure_op("set_typeparam_default", vec![left, right])?;
                         self.pushvalue(StackElem::Value(result));
@@ -2452,9 +2456,9 @@ impl FlowContext {
                     let container = self.pop_hlvalue()?;
                     let item = self.pop_hlvalue()?;
                     let opname = if matches!(
-                        pyre_interpreter::bytecode::Invert::try_from(oparg)
+                        rustpython_compiler_core::bytecode::Invert::try_from(oparg)
                             .expect("invalid ContainsOp invert"),
-                        pyre_interpreter::bytecode::Invert::Yes
+                        rustpython_compiler_core::bytecode::Invert::Yes
                     ) {
                         "not_contains"
                     } else {
@@ -2468,17 +2472,18 @@ impl FlowContext {
                     let right = self.pop_hlvalue()?;
                     let left = self.pop_hlvalue()?;
                     let result = self.record_pure_op("is_", vec![left, right])?;
-                    let invert =
-                        pyre_interpreter::bytecode::Invert::try_from(oparg).map_err(|_| {
+                    let invert = rustpython_compiler_core::bytecode::Invert::try_from(oparg)
+                        .map_err(|_| {
                             FlowContextError::BytecodeCorruption(BytecodeCorruption::new(format!(
                                 "invalid IS_OP invert {oparg}"
                             )))
                         })?;
-                    let result = if matches!(invert, pyre_interpreter::bytecode::Invert::Yes) {
-                        self.record_pure_op("not_", vec![result])?
-                    } else {
-                        result
-                    };
+                    let result =
+                        if matches!(invert, rustpython_compiler_core::bytecode::Invert::Yes) {
+                            self.record_pure_op("not_", vec![result])?
+                        } else {
+                            result
+                        };
                     self.pushvalue(StackElem::Value(result));
                     Ok(None)
                 }
@@ -2577,16 +2582,18 @@ impl FlowContext {
                 }
                 Instruction::BuildSlice { .. } => {
                     let w_step =
-                        match pyre_interpreter::bytecode::BuildSliceArgCount::try_from(oparg)
-                            .map_err(|_| {
-                                FlowContextError::BytecodeCorruption(BytecodeCorruption::new(
-                                    format!("invalid BUILD_SLICE argc {oparg}"),
-                                ))
-                            })? {
-                            pyre_interpreter::bytecode::BuildSliceArgCount::Two => {
+                        match rustpython_compiler_core::bytecode::BuildSliceArgCount::try_from(
+                            oparg,
+                        )
+                        .map_err(|_| {
+                            FlowContextError::BytecodeCorruption(BytecodeCorruption::new(format!(
+                                "invalid BUILD_SLICE argc {oparg}"
+                            )))
+                        })? {
+                            rustpython_compiler_core::bytecode::BuildSliceArgCount::Two => {
                                 Hlvalue::Constant(Constant::new(ConstValue::None))
                             }
-                            pyre_interpreter::bytecode::BuildSliceArgCount::Three => {
+                            rustpython_compiler_core::bytecode::BuildSliceArgCount::Three => {
                                 self.pop_hlvalue()?
                             }
                         };
@@ -2826,13 +2833,13 @@ impl FlowContext {
                     //   Raise              → upstream nbargs==1; exc_from_raise(w_type, None).
                     //   RaiseCause /       → upstream nbargs==1 + set __cause__ separately;
                     //   ReraiseFromStack     cause captured by surrounding except handler.
-                    let w_exc = match pyre_interpreter::bytecode::oparg::RaiseKind::try_from(oparg)
+                    let w_exc = match rustpython_compiler_core::bytecode::oparg::RaiseKind::try_from(oparg)
                         .map_err(|_| {
                             FlowContextError::BytecodeCorruption(BytecodeCorruption::new(format!(
                                 "invalid RAISE_VARARGS kind {oparg}"
                             )))
                         })? {
-                        pyre_interpreter::bytecode::oparg::RaiseKind::BareRaise => {
+                        rustpython_compiler_core::bytecode::oparg::RaiseKind::BareRaise => {
                             self.last_exception.clone().unwrap_or_else(|| {
                                 FSException::new(
                                     exception_class_value("TypeError"),
@@ -2843,15 +2850,15 @@ impl FlowContext {
                                 )
                             })
                         }
-                        pyre_interpreter::bytecode::oparg::RaiseKind::Raise => {
+                        rustpython_compiler_core::bytecode::oparg::RaiseKind::Raise => {
                             let w_arg1 = self.pop_hlvalue()?;
                             self.exc_from_raise(
                                 w_arg1,
                                 Hlvalue::Constant(Constant::new(ConstValue::None)),
                             )?
                         }
-                        pyre_interpreter::bytecode::oparg::RaiseKind::RaiseCause
-                        | pyre_interpreter::bytecode::oparg::RaiseKind::ReraiseFromStack => {
+                        rustpython_compiler_core::bytecode::oparg::RaiseKind::RaiseCause
+                        | rustpython_compiler_core::bytecode::oparg::RaiseKind::ReraiseFromStack => {
                             // CPython 3.14 `raise X from Y` — `Y` is
                             // X's `__cause__`, not a constructor
                             // argument. `exc_from_raise` covers the
@@ -3096,10 +3103,14 @@ impl FlowContext {
                 }
                 Instruction::LoadSpecial { method } => {
                     let name = match method.get(oparg.into()) {
-                        pyre_interpreter::bytecode::oparg::SpecialMethod::Enter => "__enter__",
-                        pyre_interpreter::bytecode::oparg::SpecialMethod::Exit => "__exit__",
-                        pyre_interpreter::bytecode::oparg::SpecialMethod::AEnter
-                        | pyre_interpreter::bytecode::oparg::SpecialMethod::AExit => {
+                        rustpython_compiler_core::bytecode::oparg::SpecialMethod::Enter => {
+                            "__enter__"
+                        }
+                        rustpython_compiler_core::bytecode::oparg::SpecialMethod::Exit => {
+                            "__exit__"
+                        }
+                        rustpython_compiler_core::bytecode::oparg::SpecialMethod::AEnter
+                        | rustpython_compiler_core::bytecode::oparg::SpecialMethod::AExit => {
                             return self.unsupported_rpython("async with is not RPython");
                         }
                     };
@@ -3407,7 +3418,8 @@ fn comparison_opname(op: ComparisonOperator) -> &'static str {
 #[cfg(test)]
 mod test {
     use super::*;
-    use pyre_interpreter::compile::{self, CodeObject, Mode};
+    use rustpython_compiler::{Mode, compile as rp_compile};
+    use rustpython_compiler_core::bytecode::CodeObject;
     use std::rc::Rc;
 
     fn var() -> Hlvalue {
@@ -3419,7 +3431,8 @@ mod test {
     }
 
     fn compile_function_body(src: &str) -> CodeObject {
-        let module = compile::compile_source(src, Mode::Exec).expect("compile should succeed");
+        let module = rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
+            .expect("compile should succeed");
         module
             .constants
             .iter()
@@ -4144,7 +4157,7 @@ mod test {
         // RPython basis: argument.py:113 — `const(x) for x in
         // w_stararg.value` over any iterable. A Str stararg yields
         // per-char Constants.
-        use crate::argument::CallSpec;
+        use super::super::argument::CallSpec;
         let star = Hlvalue::Constant(Constant::new(ConstValue::Str("ab".into())));
         let args = CallSpec::new(Vec::new(), None, Some(star));
         let expanded = args.as_list();

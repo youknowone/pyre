@@ -25,7 +25,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use majit_flowspace::model::{
+use majit_translate::flowspace::model::{
     Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc,
     HOST_ENV, Hlvalue, Link, LinkRef, SpaceOperation, Variable, c_last_exception, checkgraph,
     copygraph, mkentrymap,

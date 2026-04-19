@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 
-use majit_codewriter::jitcode::BhCallDescr;
+use majit_translate::jitcode::BhCallDescr;
 use pyre_interpreter::CodeObject;
 use pyre_jit_trace::PyJitCode;
 

@@ -364,7 +364,7 @@ fn decode_exception_catch_sites(
 
 // Note: the legacy `liveness_regs_to_u8_sorted` helper that returned
 // `Option<Vec<u8>>` to flag the 256-register cap is gone. The cap is
-// now enforced by `majit_codewriter::liveness::encode_liveness`'s
+// now enforced by `majit_translate::liveness::encode_liveness`'s
 // `assert!(char_ < 256)` (RPython `liveness.py:147-166` parity), and
 // the post-pass register allocator
 // (`super::regalloc::allocate_registers`) compresses the indices so
@@ -2311,4 +2311,4 @@ pub fn find_loop_header_pcs(
 
 // `liveness_regs_to_u8_sorted` tests removed alongside the helper.
 // The 256-register cap is now enforced inside `encode_liveness` and
-// covered by `majit_codewriter::liveness::encode_liveness*` tests.
+// covered by `majit_translate::liveness::encode_liveness*` tests.

@@ -296,7 +296,7 @@ where
     }
 
     fn unwind_to_exception_handler(&mut self, ctx: &mut TraceCtx) -> TraceAction {
-        const SIZE_LIVE_OP: usize = majit_codewriter::liveness::OFFSET_SIZE + 1;
+        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
 
         while !self.frames.is_empty() {
             let mut handled = false;

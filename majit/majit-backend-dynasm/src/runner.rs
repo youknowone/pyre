@@ -1045,7 +1045,7 @@ impl Backend for DynasmBackend {
         descr.done_compiling();
     }
 
-    fn bh_new(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let ptr = unsafe { libc::malloc(size) };
         if !ptr.is_null() {
@@ -1054,7 +1054,7 @@ impl Backend for DynasmBackend {
         ptr as i64
     }
 
-    fn bh_new_with_vtable(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
         let ptr = unsafe { libc::malloc(size) };
@@ -1085,7 +1085,7 @@ impl Backend for DynasmBackend {
         &self,
         addr: i64,
         offset: i64,
-        descr: &majit_codewriter::jitcode::BhDescr,
+        descr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         // llmodel.py:748-749: ofs, size, sign = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
@@ -1101,7 +1101,7 @@ impl Backend for DynasmBackend {
         addr: i64,
         offset: i64,
         newvalue: i64,
-        descr: &majit_codewriter::jitcode::BhDescr,
+        descr: &majit_translate::jitcode::BhDescr,
     ) {
         // llmodel.py:740-741: ofs, size, _ = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
@@ -1115,7 +1115,7 @@ impl Backend for DynasmBackend {
         &self,
         addr: i64,
         offset: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         // llmodel.py:753: return self.read_float_at_mem(addr, offset)
         self.read_float_at_mem(addr, offset)
@@ -1127,7 +1127,7 @@ impl Backend for DynasmBackend {
         addr: i64,
         offset: i64,
         newvalue: f64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
         // llmodel.py:745: self.write_float_at_mem(addr, offset, newvalue)
         self.write_float_at_mem(addr, offset, newvalue);
@@ -1136,7 +1136,7 @@ impl Backend for DynasmBackend {
     fn bh_getfield_gc_i(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_codewriter::jitcode::BhDescr,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
@@ -1145,7 +1145,7 @@ impl Backend for DynasmBackend {
     fn bh_getfield_gc_r(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_codewriter::jitcode::BhDescr,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
         let offset = fielddescr.as_offset();
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
@@ -1155,7 +1155,7 @@ impl Backend for DynasmBackend {
         &self,
         struct_ptr: i64,
         value: i64,
-        fielddescr: &majit_codewriter::jitcode::BhDescr,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut i64) = value };
@@ -1165,7 +1165,7 @@ impl Backend for DynasmBackend {
         &self,
         struct_ptr: i64,
         value: GcRef,
-        fielddescr: &majit_codewriter::jitcode::BhDescr,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };

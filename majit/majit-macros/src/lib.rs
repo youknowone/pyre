@@ -844,7 +844,7 @@ pub fn loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The proc-macro is a pass-through: it leaves the struct definition
 /// untouched and exists solely so `rustc` accepts the attribute. The
-/// codewriter front-end (`majit-codewriter::front::ast`) reads the
+/// codewriter front-end (`majit-translate::front::ast`) reads the
 /// attribute directly from the parsed source via `syn` and feeds the
 /// field list into the struct layout / descr pipeline.
 #[proc_macro_attribute]
@@ -867,7 +867,7 @@ pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStrea
 ///      resolution, which doesn't need the trampoline that free
 ///      functions get.
 ///
-/// The codewriter front-end (`majit-codewriter::front::ast::collect_jit_hints`)
+/// The codewriter front-end (`majit-translate::front::ast::collect_jit_hints`)
 /// already recognises the bare attribute name `jit_elidable` and
 /// flips the function hint to `"elidable"`, which `mark_elidable`
 /// consumes downstream.

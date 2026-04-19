@@ -29,8 +29,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::flowcontext::{FlowContext, FlowContextError, FlowingError};
-use crate::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
+use super::flowcontext::{FlowContext, FlowContextError, FlowingError};
+use super::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
 
 /// Registered SPECIAL_CASE callable. The variants mirror upstream's
 /// two handler shapes: direct `sc_*` handlers and redirected

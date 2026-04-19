@@ -10,8 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use majit_codewriter::jitcode::BhDescr;
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
+use majit_translate::jitcode::BhDescr;
 
 use super::flatten::{DescrOperand, Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
 
@@ -345,7 +345,7 @@ impl Assembler {
     /// on `pyre_jit`) sees the same bytes. PRE-EXISTING-ADAPTATION for
     /// the crate layering, not a relocation of the RPython state.
     fn encode_liveness_info(&mut self, live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> u16 {
-        use majit_codewriter::liveness::encode_liveness;
+        use majit_translate::liveness::encode_liveness;
 
         self.num_liveness_ops += 1;
         let key = (live_i.to_vec(), live_r.to_vec(), live_f.to_vec());

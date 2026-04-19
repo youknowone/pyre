@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
-use crate::translator_legacy::annotator::annrpython::AnnotationState;
+use crate::translate_legacy::annotator::annrpython::AnnotationState;
 
 /// Concrete low-level type (RPython Repr.lowleveltype).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +192,7 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
 mod tests {
     use super::*;
     use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
-    use crate::translator_legacy::annotator::annrpython as annotate;
+    use crate::translate_legacy::annotator::annrpython as annotate;
 
     #[test]
     fn resolves_int_types() {

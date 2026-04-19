@@ -42,7 +42,7 @@ pub struct GreenFieldInfo {
     pub green_field_descrs: Vec<u32>,
 }
 
-impl majit_codewriter::call::GreenFieldInfoHandle for GreenFieldInfo {
+impl majit_translate::call::GreenFieldInfoHandle for GreenFieldInfo {
     /// `(GTYPE, fieldname) in self.green_fields` (call.py:391).
     fn contains_green_field(&self, gtype: &str, fieldname: &str) -> bool {
         self.green_fields

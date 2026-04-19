@@ -10,7 +10,7 @@ use syn::{
     Local, Pat, Path, ReturnType, Stmt, Type, UnOp,
 };
 
-// Duplicated from majit-codewriter::hints — proc-macro crates cannot depend
+// Duplicated from majit-translate::hints — proc-macro crates cannot depend
 // on heavy library crates, so we inline the small enum + classifier here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VirtualizableHintKind {

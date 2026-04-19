@@ -833,7 +833,7 @@ pub enum BhReturnType {
 /// Re-export BhDescr from codewriter::jitcode — shared descriptor type
 /// between codewriter assembler and blackhole interpreter.
 /// RPython `history.py:AbstractDescr` parity.
-pub use majit_codewriter::jitcode::{BhCallDescr, BhDescr};
+pub use majit_translate::jitcode::{BhCallDescr, BhDescr};
 
 /// Per-jitdriver static data visible to the blackhole interpreter.
 ///
@@ -1474,7 +1474,7 @@ impl BlackholeInterpreter {
         if position < code.len() {
             let mut opcode = code[position];
             if opcode == self.op_live {
-                position += majit_codewriter::liveness::OFFSET_SIZE + 1;
+                position += majit_translate::liveness::OFFSET_SIZE + 1;
                 if position >= code.len() {
                     return false;
                 }
@@ -1508,7 +1508,7 @@ impl BlackholeInterpreter {
         let mut position = self.position;
         let mut opcode = code[position];
         if opcode == self.op_live {
-            position += majit_codewriter::liveness::OFFSET_SIZE + 1;
+            position += majit_translate::liveness::OFFSET_SIZE + 1;
             opcode = code[position];
         }
         if opcode == self.op_rvmprof_code {
@@ -1617,7 +1617,7 @@ impl BlackholeInterpreter {
         match opcode {
             jitcode::BC_LIVE => {
                 // blackhole.py:1605 bhimpl_live(pc): return pc + OFFSET_SIZE.
-                self.position += majit_codewriter::liveness::OFFSET_SIZE;
+                self.position += majit_translate::liveness::OFFSET_SIZE;
             }
             jitcode::BC_CATCH_EXCEPTION => {
                 // blackhole.py:969 bhimpl_catch_exception(target): no-op in
@@ -2416,7 +2416,7 @@ impl BlackholeInterpreter {
         &self,
         func: i64,
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(func, None, Some(args_r), None, calldescr)
@@ -2427,7 +2427,7 @@ impl BlackholeInterpreter {
         &self,
         func: i64,
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(func, None, Some(args_r), None, calldescr)
@@ -2438,7 +2438,7 @@ impl BlackholeInterpreter {
         &self,
         func: i64,
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(func, None, Some(args_r), None, calldescr);
@@ -2450,7 +2450,7 @@ impl BlackholeInterpreter {
         func: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), None, calldescr)
@@ -2462,7 +2462,7 @@ impl BlackholeInterpreter {
         func: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), None, calldescr)
@@ -2474,7 +2474,7 @@ impl BlackholeInterpreter {
         func: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), None, calldescr);
@@ -2487,7 +2487,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2500,7 +2500,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2513,7 +2513,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
         self.cpu()
             .bh_call_f(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2526,7 +2526,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
@@ -2543,7 +2543,7 @@ impl BlackholeInterpreter {
         &self,
         fnaddr: i64,
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         self.bhimpl_residual_call_r_i(fnaddr, args_r, calldescr)
     }
@@ -2552,7 +2552,7 @@ impl BlackholeInterpreter {
         &self,
         fnaddr: i64,
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.bhimpl_residual_call_r_r(fnaddr, args_r, calldescr)
     }
@@ -2561,7 +2561,7 @@ impl BlackholeInterpreter {
         &self,
         fnaddr: i64,
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         self.bhimpl_residual_call_r_v(fnaddr, args_r, calldescr);
     }
@@ -2571,7 +2571,7 @@ impl BlackholeInterpreter {
         fnaddr: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         self.bhimpl_residual_call_ir_i(fnaddr, args_i, args_r, calldescr)
     }
@@ -2581,7 +2581,7 @@ impl BlackholeInterpreter {
         fnaddr: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.bhimpl_residual_call_ir_r(fnaddr, args_i, args_r, calldescr)
     }
@@ -2591,7 +2591,7 @@ impl BlackholeInterpreter {
         fnaddr: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         self.bhimpl_residual_call_ir_v(fnaddr, args_i, args_r, calldescr);
     }
@@ -2602,7 +2602,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         self.bhimpl_residual_call_irf_i(fnaddr, args_i, args_r, args_f, calldescr)
     }
@@ -2613,7 +2613,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.bhimpl_residual_call_irf_r(fnaddr, args_i, args_r, args_f, calldescr)
     }
@@ -2624,7 +2624,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
         self.bhimpl_residual_call_irf_f(fnaddr, args_i, args_r, args_f, calldescr)
     }
@@ -2635,7 +2635,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         self.bhimpl_residual_call_irf_v(fnaddr, args_i, args_r, args_f, calldescr);
     }
@@ -5884,7 +5884,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         handler_record_quasiimmut_field,
     );
     // Synthetic op for Rust fat-pointer dispatch — see
-    // `majit/majit-codewriter/src/model.rs OpKind::FuncptrFromVtable`.
+    // `majit/majit-translate/src/model.rs OpKind::FuncptrFromVtable`.
     // No runtime consumer ships yet; the handler panics on dispatch so a
     // future regression that triggers this path in pyre fails loudly
     // instead of silently miscompiling.

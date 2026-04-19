@@ -6,8 +6,8 @@
 //! `rpython/jit/codewriter/effectinfo.py`, but in pyre this lives in
 //! `majit-ir` because `LLType::for_call` (descr.rs:46) holds
 //! `extraeffect`/`oopspecindex` indices and `EffectInfo` is constructed
-//! from RPython call analysis. Putting it in `majit-codewriter` would
-//! create a circular crate dependency (`majit-ir` ↔ `majit-codewriter`).
+//! from RPython call analysis. Putting it in `majit-translate` would
+//! create a circular crate dependency (`majit-ir` ↔ `majit-translate`).
 //! The name and contents otherwise mirror upstream line-by-line.
 
 use crate::descr::DescrRef;

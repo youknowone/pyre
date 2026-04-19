@@ -2,7 +2,7 @@
 //!
 //! The encoder/decoder helpers (`encode_offset`, `decode_offset`,
 //! `encode_liveness`, `LivenessIterator`, `OFFSET_SIZE`) already live in
-//! `majit_codewriter::liveness`; this module re-exports them and adds the
+//! `majit_translate::liveness`; this module re-exports them and adds the
 //! `compute_liveness` / `remove_repeated_live` passes operating on the
 //! pyre-local `SSARepr` from `super::flatten`.
 //!
@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::flatten::{DescrOperand, Insn, Operand, Register, SSARepr, TLabel};
 
-pub use majit_codewriter::liveness::{
+pub use majit_translate::liveness::{
     LivenessIterator, OFFSET_SIZE, decode_offset, encode_liveness, encode_offset,
 };
 

@@ -9,7 +9,7 @@
 //! commit P8.11.
 //!
 //! Until then, keep this tree consumer-accessible — it is what the
-//! majit-codewriter Rust-source analysis path (via `crate::front::`)
+//! majit-translate Rust-source analysis path (via `crate::front::`)
 //! uses for jitcode emission, and replacing it is gated on the new
 //! pipeline being end-to-end working under `PYRE_RTYPER=1`.
 

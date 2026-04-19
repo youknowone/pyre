@@ -17,7 +17,7 @@ pyre-interpreter = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
-majit-codewriter = { workspace = true }
+majit-translate = { workspace = true }
 majit-backend = { workspace = true }
 majit-trace = { workspace = true }
 majit-gc = { workspace = true }
@@ -29,7 +29,7 @@ majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 
 [build-dependencies]
-majit-codewriter = { workspace = true }
+majit-translate = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syn = { version = "2", features = ["full", "visit"] }

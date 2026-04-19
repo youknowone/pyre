@@ -9,28 +9,35 @@
 //! `next_bytecode_instruction` has no upstream symbol — the `read`
 //! method IS the instruction walker.
 //!
-//! ## Deviation from the plan (parity rule #1)
+//! ## PRE-EXISTING-ADAPTATION: bytecode enum source
 //!
-//! The roadmap asked for `pyre_interpreter::bytecode::{OpCode, Instruction,
-//! CodeObject}`. There is no standalone `OpCode` type in pyre-interpreter:
-//! RustPython's `Instruction` enum already carries the opcode tag inline
-//! (see `rustpython-compiler-core::bytecode::Instruction`). Splitting a
-//! parallel `OpCode` out would introduce a majit-local alias with no
-//! upstream basis, so we re-export `Instruction` on its own — each variant
-//! IS an opcode.
+//! Upstream `bytecode.py:6` does `from opcode import EXTENDED_ARG,
+//! HAVE_ARGUMENT` — the opcode definitions come from **host Python's
+//! stdlib `opcode` module**, not from RPython itself. RPython wraps
+//! the host table in `rpython/tool/stdlib_opcode.py`.
 //!
-//! Upstream `bytecode.py` solves the same problem by importing
-//! `HAVE_ARGUMENT` / `EXTENDED_ARG` from the stdlib `opcode` module and
-//! walking raw bytes; the CPython-3.14 equivalent is the `Instruction`
-//! enum's own `decode` path, already implemented inside the RustPython
-//! compiler core and driven through `pyre_interpreter::bytecode`.
+//! Rust has no equivalent host-language opcode module, so we reach for
+//! the externally-owned `rustpython-compiler-core` crate, which plays
+//! the same role: a neutral third-party source of CPython-3.14 opcode
+//! definitions (`Instruction`, `CodeObject`, `ConstantData`, ...).
+//! majit-translate wraps it here in `HostCode`, exactly as RPython
+//! wraps `opcode`.
+//!
+//! This is NOT a dependency on pyre: `rustpython-compiler-core` is
+//! external to both `majit/` and `pyre/`, preserving the `rpython/` ⊥
+//! `pypy/` boundary at the Rust-crate layer.
+//!
+//! There is no standalone `OpCode` type: RustPython's `Instruction`
+//! enum already carries the opcode tag inline (each variant IS an
+//! opcode), so we re-export `Instruction` on its own rather than
+//! inventing a parallel `OpCode` alias.
 
-pub use pyre_interpreter::bytecode::{
+pub use rustpython_compiler_core::bytecode::{
     BinaryOperator, CodeFlags, CodeObject, CodeUnit, ComparisonOperator, ConstantData,
     ExceptionTableEntry, Instruction, MakeFunctionFlag, OpArg, OpArgState,
 };
 
-use crate::argument::Signature;
+use super::argument::Signature;
 
 /// Error raised when the bytecode stream cannot be decoded.
 ///
@@ -107,7 +114,7 @@ pub struct HostCode {
     pub co_nlocals: u32,
     pub co_stacksize: u32,
     pub co_flags: u32,
-    pub co_code: pyre_interpreter::bytecode::CodeUnits,
+    pub co_code: rustpython_compiler_core::bytecode::CodeUnits,
     pub consts: Vec<ConstantData>,
     pub names: Vec<String>,
     pub co_varnames: Vec<String>,
@@ -155,7 +162,7 @@ impl HostCode {
         nlocals: u32,
         stacksize: u32,
         flags: u32,
-        code: pyre_interpreter::bytecode::CodeUnits,
+        code: rustpython_compiler_core::bytecode::CodeUnits,
         consts: Vec<ConstantData>,
         names: Vec<String>,
         varnames: Vec<String>,
@@ -242,20 +249,22 @@ impl HostCode {
             return None;
         }
         let unit_offset = offset / 2;
-        pyre_interpreter::bytecode::find_exception_handler(&self.exceptiontable, unit_offset).map(
-            |entry| ExceptionTableEntry {
-                start: entry.start * 2,
-                end: entry.end * 2,
-                target: entry.target * 2,
-                depth: entry.depth,
-                push_lasti: entry.push_lasti,
-            },
+        rustpython_compiler_core::bytecode::find_exception_handler(
+            &self.exceptiontable,
+            unit_offset,
         )
+        .map(|entry| ExceptionTableEntry {
+            start: entry.start * 2,
+            end: entry.end * 2,
+            target: entry.target * 2,
+            depth: entry.depth,
+            push_lasti: entry.push_lasti,
+        })
     }
 
     /// Decode the entire exception table into byte-offset entries.
     pub fn decode_exception_table(&self) -> Vec<ExceptionTableEntry> {
-        pyre_interpreter::bytecode::decode_exception_table(&self.exceptiontable)
+        rustpython_compiler_core::bytecode::decode_exception_table(&self.exceptiontable)
             .into_iter()
             .map(|entry| ExceptionTableEntry {
                 start: entry.start * 2,
@@ -344,10 +353,11 @@ fn absolutize_jump_target(offset_units: u32, op: &Instruction, arg: u32) -> Opti
 #[cfg(test)]
 mod test {
     use super::*;
-    use pyre_interpreter::compile::{self, Mode};
+    use rustpython_compiler::{Mode, compile as rp_compile};
 
     fn compile_source(src: &str) -> CodeObject {
-        compile::compile_source(src, Mode::Exec).expect("compile should succeed")
+        rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
+            .expect("compile should succeed")
     }
 
     // RPython basis: test_objspace.py shapes these round-trips by calling

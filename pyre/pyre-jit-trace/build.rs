@@ -5,7 +5,7 @@ mod virtualizable_spec;
 
 use walkdir::WalkDir;
 
-/// Build script for pyre-jit: runs majit-codewriter on the active pyre
+/// Build script for pyre-jit: runs majit-translate on the active pyre
 /// interpreter to auto-generate tracing code. This is the Rust
 /// equivalent of RPython's translation pipeline.
 ///
@@ -43,13 +43,13 @@ fn main() {
     // `locals_cells_stack_w[*]` as virtualizable accesses before legacy
     // TracePattern classification runs.
     let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
-    let analyze_config = majit_codewriter::AnalyzeConfig {
-        pipeline: majit_codewriter::PipelineConfig {
-            transform: majit_codewriter::GraphTransformConfig {
+    let analyze_config = majit_translate::AnalyzeConfig {
+        pipeline: majit_translate::PipelineConfig {
+            transform: majit_translate::GraphTransformConfig {
                 vable_fields: virtualizable_spec::PYFRAME_VABLE_FIELDS
                     .iter()
                     .map(|(name, idx)| {
-                        majit_codewriter::VirtualizableFieldDescriptor::new(
+                        majit_translate::VirtualizableFieldDescriptor::new(
                             *name,
                             Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
                             *idx,
@@ -62,7 +62,7 @@ fn main() {
                         // virtualizable.py:58 — VirtualizableInfo.array_descrs[i] =
                         // cpu.arraydescrof(getattr(VTYPE, name).TO). Python frame
                         // locals are PyObjectRef pointers: itemsize=8, is_signed=false.
-                        majit_codewriter::VirtualizableFieldDescriptor::new_with_arraydescr(
+                        majit_translate::VirtualizableFieldDescriptor::new_with_arraydescr(
                             *name,
                             Some(virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string()),
                             *idx,
@@ -87,8 +87,8 @@ fn main() {
     // here; the codewriter slot stays empty until the runtime metainterp
     // setter overrides it.  PRE-EXISTING-ADAPTATION documented at
     // `CallControl::make_virtualizable_infos`.
-    let vinfo_factory: &majit_codewriter::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
-    let pipeline = majit_codewriter::analyze_multiple_pipeline_with_vinfo_factory(
+    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
+    let pipeline = majit_translate::analyze_multiple_pipeline_with_vinfo_factory(
         &source_refs,
         &analyze_config,
         None,
@@ -96,7 +96,7 @@ fn main() {
     );
 
     // Generate tracing code from the canonical graph-first analysis result.
-    let code = majit_codewriter::generate_trace_code_from_pipeline(&pipeline);
+    let code = majit_translate::generate_trace_code_from_pipeline(&pipeline);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
@@ -109,9 +109,9 @@ fn main() {
     // Assembled from THREE pieces (Phase B of the eval-loop automation plan):
     //   1. `opcode_handler_impls_pre.template.rs` — header + variant
     //      `SharedOpcodeHandler` impl (transcription).
-    //   2. `majit_codewriter::handler_spec::emit_simple_trait_impls()` —
+    //   2. `majit_translate::handler_spec::emit_simple_trait_impls()` —
     //      the 5 simple traits (Constant/Stack/Truth/Iter/Local), emitted
-    //      from the spec table in majit-codewriter/src/handler_spec.rs.
+    //      from the spec table in majit-translate/src/handler_spec.rs.
     //   3. `opcode_handler_impls_post.template.rs` — remaining variant
     //      `ControlFlow/Branch/Namespace/Arithmetic` impls (transcription).
     //
@@ -125,7 +125,7 @@ fn main() {
     let post = std::fs::read_to_string(&post_path).unwrap_or_else(|e| {
         panic!("[pyre-jit-trace build.rs] cannot read {post_path}: {e}");
     });
-    let simple = majit_codewriter::handler_spec::emit_simple_trait_impls();
+    let simple = majit_translate::handler_spec::emit_simple_trait_impls();
     // pre ends with `}\n\n` (Shared close + blank), simple ends with `}\n`,
     // post starts with `\n` (blank). Concat = `...}\n\nimpl Constant...}\n\nimpl ControlFlow...`
     // which matches the original single-template structure byte-for-byte.
@@ -172,7 +172,7 @@ fn main() {
     println!("cargo::rerun-if-changed=src/call_spec.rs");
 }
 
-fn build_call_effect_overrides() -> Vec<majit_codewriter::CallEffectOverride> {
+fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
     call_spec::PYFRAME_CALL_EFFECTS
         .iter()
         .map(|spec| {
@@ -180,16 +180,16 @@ fn build_call_effect_overrides() -> Vec<majit_codewriter::CallEffectOverride> {
                 call_spec::CallTargetSpec::Method {
                     name,
                     receiver_root,
-                } => majit_codewriter::CallTarget::method(name, Some(receiver_root.to_string())),
+                } => majit_translate::CallTarget::method(name, Some(receiver_root.to_string())),
                 call_spec::CallTargetSpec::FunctionPath(segments) => {
-                    majit_codewriter::CallTarget::function_path(segments.iter().copied())
+                    majit_translate::CallTarget::function_path(segments.iter().copied())
                 }
             };
             let effect = match spec.effect {
-                call_spec::CallEffectKind::Elidable => majit_codewriter::CallEffectKind::Elidable,
-                call_spec::CallEffectKind::Residual => majit_codewriter::CallEffectKind::Residual,
+                call_spec::CallEffectKind::Elidable => majit_translate::CallEffectKind::Elidable,
+                call_spec::CallEffectKind::Residual => majit_translate::CallEffectKind::Residual,
             };
-            majit_codewriter::CallEffectOverride::new(target, effect)
+            majit_translate::CallEffectOverride::new(target, effect)
         })
         .collect()
 }

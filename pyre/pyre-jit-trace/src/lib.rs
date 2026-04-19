@@ -22,7 +22,7 @@ pub mod trace;
 pub mod virtualizable_gen;
 pub mod virtualizable_spec;
 
-/// Auto-generated trace functions from majit-codewriter.
+/// Auto-generated trace functions from majit-translate.
 #[allow(dead_code, unused_imports)]
 pub mod generated {
     use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};

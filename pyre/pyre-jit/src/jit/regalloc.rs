@@ -31,14 +31,14 @@
 //! `coalesce_variables` operates on `move_X` instructions (the
 //! SSARepr-level remnant of jump-edge `link.args ↔ inputargs`
 //! pairings). The chordal coloring algorithm itself is shared with
-//! `majit-codewriter`'s flow-graph regalloc through
-//! `majit_codewriter::regalloc::DependencyGraph::find_node_coloring`
+//! `majit-translate`'s flow-graph regalloc through
+//! `majit_translate::regalloc::DependencyGraph::find_node_coloring`
 //! (line-by-line port of `rpython/tool/algo/color.py:31-85`).
 
 use std::collections::{HashMap, HashSet};
 
-use majit_codewriter::model::ValueId;
-use majit_codewriter::regalloc::DependencyGraph;
+use majit_translate::model::ValueId;
+use majit_translate::regalloc::DependencyGraph;
 
 use super::flatten::{DescrOperand, Insn, Kind, Operand, Register, SSARepr, TLabel};
 

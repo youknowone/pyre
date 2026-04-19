@@ -10,9 +10,9 @@ expression: assembled
 //
 //   1. this file (`opcode_handler_impls_pre.template.rs`) — header +
 //      `SharedOpcodeHandler` impl. Variant trait, hand-maintained.
-//   2. `majit_codewriter::handler_spec::emit_simple_trait_impls()` — the 5
+//   2. `majit_translate::handler_spec::emit_simple_trait_impls()` — the 5
 //      simple traits (`Constant/Stack/Truth/Iter/Local`) emitted from the
-//      spec table in `majit-codewriter/src/handler_spec.rs`.
+//      spec table in `majit-translate/src/handler_spec.rs`.
 //   3. `opcode_handler_impls_post.template.rs` — the remaining variant
 //      traits (`ControlFlow/Branch/Namespace/Arithmetic`).
 //

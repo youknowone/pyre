@@ -82,7 +82,7 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 | compile.rs | compile.py | 1,163 | — | guard metadata, exit layouts, unboxing |
 | executor.rs | executor.py | 731 | — | execute_one (blackhole에서 분리) |
 | jitdriver.rs | jitdriver.py + warmspot.py | 2,527 | 70% | — |
-| jitcode.rs | jitcode.py | (module) | Different | Rust=interpreter+builder. NOTE: `majit-codewriter::jitcode::JitCode` (codewriter side, RPython orthodox encoding) is now separate from `majit-metainterp::jitcode::JitCode` (runtime side, BC_* opcodes). RPython has a single shared type; Phase D will unify these. |
+| jitcode.rs | jitcode.py | (module) | Different | Rust=interpreter+builder. NOTE: `majit-translate::jitcode::JitCode` (codewriter side, RPython orthodox encoding) is now separate from `majit-metainterp::jitcode::JitCode` (runtime side, BC_* opcodes). RPython has a single shared type; Phase D will unify these. |
 | jitexc.rs | jitexc.py | 58 | — | JIT exception enums |
 | greenfield.rs | greenfield.py | 38 | — | scaffold |
 | trace_ctx.rs | (majit-specific) | 2,714 | — | — |

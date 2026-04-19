@@ -28,7 +28,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::bytecode::HostCode;
+use super::bytecode::HostCode;
 
 /// Placeholder for `SomeValue` annotations attached by the annotator.
 ///

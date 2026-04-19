@@ -11834,7 +11834,7 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
-    fn bh_new(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let Some(runtime_id) = self.gc_runtime_id else {
             let layout = std::alloc::Layout::from_size_align(size, 8)
@@ -11848,7 +11848,7 @@ impl majit_backend::Backend for CraneliftBackend {
 
     /// llmodel.py:778-782 bh_new_with_vtable(sizedescr).
     /// gc_malloc(sizedescr) + write vtable at vtable_offset.
-    fn bh_new_with_vtable(&self, sizedescr: &majit_codewriter::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
         let ptr = if let Some(runtime_id) = self.gc_runtime_id {
@@ -11892,7 +11892,7 @@ impl majit_backend::Backend for CraneliftBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_codewriter::jitcode::BhCallDescr,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         if func == 0 {
             return 0;
@@ -11929,7 +11929,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         addr: i64,
         offset: i64,
-        descr: &majit_codewriter::jitcode::BhDescr,
+        descr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
         // llmodel.py:748-749: ofs, size, sign = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
@@ -11945,7 +11945,7 @@ impl majit_backend::Backend for CraneliftBackend {
         addr: i64,
         offset: i64,
         newvalue: i64,
-        descr: &majit_codewriter::jitcode::BhDescr,
+        descr: &majit_translate::jitcode::BhDescr,
     ) {
         // llmodel.py:740-741: ofs, size, _ = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
@@ -11959,7 +11959,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         addr: i64,
         offset: i64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         // llmodel.py:753: return self.read_float_at_mem(addr, offset)
         self.read_float_at_mem(addr, offset)
@@ -11971,7 +11971,7 @@ impl majit_backend::Backend for CraneliftBackend {
         addr: i64,
         offset: i64,
         newvalue: f64,
-        _descr: &majit_codewriter::jitcode::BhDescr,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
         // llmodel.py:745: self.write_float_at_mem(addr, offset, newvalue)
         self.write_float_at_mem(addr, offset, newvalue);

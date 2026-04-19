@@ -86,12 +86,30 @@ Only the crate-level roots need memorizing. Everything below is mechanical.
 | majit/pyre crate root | Upstream root |
 |---|---|
 | `majit/majit-metainterp/src/` | `rpython/jit/metainterp/` |
-| `majit/majit-codewriter/src/` | `rpython/jit/codewriter/` |
+| `majit/majit-translate/src/jit_codewriter/` | `rpython/jit/codewriter/` |
+| `majit/majit-translate/src/flowspace/` | `rpython/flowspace/` |
+| `majit/majit-translate/src/annotator/` (future) | `rpython/annotator/` |
+| `majit/majit-translate/src/rtyper/` (future) | `rpython/rtyper/` |
+| `majit/majit-translate/src/translator/` (future) | `rpython/translator/` |
+| `majit/majit-translate/src/translate_legacy/` | pre-roadmap ad-hoc — deleted at P8.11, no upstream |
 | `majit/majit-backend-dynasm/src/x86/` | `rpython/jit/backend/x86/` |
 | `majit/majit-backend-dynasm/src/aarch64/` | `rpython/jit/backend/aarch64/` |
 | `majit/majit-backend-cranelift/src/` | `rpython/jit/backend/llsupport/` (Cranelift plays the role of LLSupport) |
 | `pyre/pyre-interpreter/src/` | `pypy/interpreter/` + `pypy/objspace/std/` + `pypy/module/` |
 | `pyre/pyre-object/src/` | `pypy/objspace/std/` (object layouts) |
+
+The `majit-` / `pyre-` prefix is a Cargo workspace namespace, not a claim
+that the crate lives under `rpython/jit/` or `pypy/<anything>/`. Each row
+is an independent mapping; add new rows rather than deriving from the
+prefix. `rpython/` ↔ `majit/`, `pypy/` ↔ `pyre/` at the package-root
+level — crates under `majit/` can correspond to any `rpython/<package>/`,
+not only `rpython/jit/`.
+
+**Crate boundary invariant**: `majit/*` crates MUST NOT depend on any
+`pyre/*` crate, mirroring upstream's `rpython/` ⊥ `pypy/` separation.
+External third-party crates (e.g. `rustpython-compiler-core` for CPython
+3.14 bytecode tables) are allowed as they play the role of RPython's
+host-stdlib imports (e.g. `from opcode import ...`).
 
 The following crates carry architectural divergences from upstream and their roots are PRE-EXISTING-ADAPTATIONs by design. Audit individual files against RPython as if the root were `rpython/jit/metainterp/`, and classify mismatches per the rules below.
 

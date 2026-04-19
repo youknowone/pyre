@@ -238,7 +238,7 @@ pub struct JitDriverStaticData {
 /// from the portal graph, then for each `direct_call` operation it classifies
 /// the call as regular/residual/builtin/recursive.
 ///
-/// In majit-codewriter, we don't have RPython's function pointer linkage.
+/// In majit-translate, we don't have RPython's function pointer linkage.
 /// Instead, callee graphs are collected from parsed Rust source files
 /// (free functions via `collect_function_graphs` and trait impl methods
 /// via `extract_trait_impls`).
