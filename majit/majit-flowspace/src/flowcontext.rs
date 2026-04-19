@@ -53,11 +53,13 @@ use crate::bytecode::{
 };
 use crate::framestate::{FrameState, StackElem};
 use crate::model::{
-    Block, BlockRef, BlockRefExt, BuiltinFunction, BuiltinObject, ConstValue, Constant,
-    ExceptionClass, FSException, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation, Variable,
-    c_last_exception,
+    Block, BlockRef, BlockRefExt, BuiltinFunction, BuiltinObject, BuiltinType, ConstValue,
+    Constant, ExceptionClass, FSException, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation,
+    Variable, c_last_exception,
 };
-use crate::specialcase::{builtin_function, lookup_builtin};
+use crate::specialcase::{
+    SpecialCaseDispatch, builtin_function, lookup_builtin, lookup_special_case,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowingError {
@@ -1022,7 +1024,7 @@ impl FlowContext {
         Ok(())
     }
 
-    fn appcall(
+    pub(crate) fn appcall(
         &mut self,
         func: BuiltinFunction,
         args_w: Vec<Hlvalue>,
@@ -1030,6 +1032,281 @@ impl FlowContext {
         let mut args = vec![Hlvalue::Constant(Constant::new(builtin_function(func)))];
         args.extend(args_w);
         self.record_maybe_raise_op("direct_call", args, Self::common_exception_cases())
+    }
+
+    /// RPython `flowcontext.py:658-663` — `FlowContext.import_name`.
+    ///
+    /// ```python
+    /// def import_name(self, name, glob=None, loc=None, frm=None, level=-1):
+    ///     try:
+    ///         mod = __import__(name, glob, loc, frm, level)
+    ///     except ImportError as e:
+    ///         raise Raise(const(e))
+    ///     return const(mod)
+    /// ```
+    ///
+    /// Deviation from upstream (parity rule #1): the Rust port does
+    /// not execute Python's `__import__` at flow-graph-building time
+    /// because there is no Python runtime in-process. Instead the
+    /// result is recorded as a `direct_call(__import__, name, glob,
+    /// loc, frm, level)` SpaceOperation whose result Variable stands
+    /// in for `const(mod)`. The `except ImportError` unwind is modeled
+    /// by `record_maybe_raise_op`'s `Exception` exit case, which the
+    /// annotator later narrows.
+    pub(crate) fn import_name(&mut self, args: &[ConstValue]) -> Result<Hlvalue, FlowContextError> {
+        let hlargs: Vec<Hlvalue> = args
+            .iter()
+            .map(|value| Hlvalue::Constant(Constant::new(value.clone())))
+            .collect();
+        self.appcall(BuiltinFunction::Import, hlargs)
+    }
+
+    /// RPython `flowcontext.py:673-680` — `FlowContext.import_from`.
+    ///
+    /// ```python
+    /// def import_from(self, w_module, w_name):
+    ///     assert isinstance(w_module, Constant)
+    ///     assert isinstance(w_name, Constant)
+    ///     try:
+    ///         return op.getattr(w_module, w_name).eval(self)
+    ///     except FlowingError:
+    ///         exc = ImportError("cannot import name '%s'" % w_name.value)
+    ///         raise Raise(const(exc))
+    /// ```
+    ///
+    /// The Rust port records `op.getattr(w_module, w_name)` through
+    /// `record_maybe_raise_op`. The `FlowingError → ImportError`
+    /// conversion path collapses to the common `Exception` exit case
+    /// at this layer because we lack a proper `op.getattr` evaluator
+    /// yet; the richer ImportError wrapping lands with
+    /// `flowspace/operation.py` (F3.3).
+    pub(crate) fn import_from(
+        &mut self,
+        w_module: Hlvalue,
+        w_name: Hlvalue,
+    ) -> Result<Hlvalue, FlowContextError> {
+        assert!(
+            matches!(w_module, Hlvalue::Constant(_)),
+            "import_from: w_module must be a Constant"
+        );
+        assert!(
+            matches!(w_name, Hlvalue::Constant(_)),
+            "import_from: w_name must be a Constant"
+        );
+        self.record_maybe_raise_op(
+            "getattr",
+            vec![w_module, w_name],
+            Self::common_exception_cases(),
+        )
+    }
+
+    /// RPython `flowcontext.py:600-636` — `FlowContext.exc_from_raise`.
+    ///
+    /// ```python
+    /// def exc_from_raise(self, w_arg1, w_arg2):
+    ///     check_not_none = False
+    ///     w_is_type = op.isinstance(w_arg1, const(type)).eval(self)
+    ///     if self.guessbool(w_is_type):
+    ///         if self.guessbool(op.is_(w_arg2, w_None).eval(self)):
+    ///             w_value = op.simple_call(w_arg1).eval(self)
+    ///         else:
+    ///             w_valuetype = op.type(w_arg2).eval(self)
+    ///             if self.guessbool(op.issubtype(w_valuetype, w_arg1).eval(self)):
+    ///                 w_value = w_arg2
+    ///                 check_not_none = True
+    ///             else:
+    ///                 w_value = op.simple_call(w_arg1, w_arg2).eval(self)
+    ///     else:
+    ///         if not self.guessbool(op.is_(w_arg2, const(None)).eval(self)):
+    ///             exc = TypeError("instance exception may not have a "
+    ///                             "separate value")
+    ///             raise Raise(const(exc))
+    ///         w_value = w_arg1
+    ///         check_not_none = True
+    ///     if check_not_none:
+    ///         w_value = op.simple_call(const(ll_assert_not_none),
+    ///                                  w_value).eval(self)
+    ///     w_type = op.type(w_value).eval(self)
+    ///     return FSException(w_type, w_value)
+    /// ```
+    ///
+    /// The Rust port mirrors the branching structure. `op.isinstance`/
+    /// `op.is_`/`op.issubtype`/`op.type`/`op.simple_call` have no
+    /// dedicated `op` module yet (`flowspace/operation.py` arrives
+    /// with F3.3), so each upstream `op.*(...).eval(self)` is
+    /// transliterated here as `record_pure_op` / `record_maybe_raise_op`
+    /// with the matching opname. Constant-foldable branches (`w_arg1`
+    /// is a Constant class, `w_arg2` is Constant None) are short-
+    /// circuited to preserve upstream's exact shape where the runtime
+    /// choice is already known.
+    pub(crate) fn exc_from_raise(
+        &mut self,
+        w_arg1: Hlvalue,
+        w_arg2: Hlvalue,
+    ) -> Result<FSException, FlowContextError> {
+        let is_type_const = matches!(
+            &w_arg1,
+            Hlvalue::Constant(Constant { value, .. })
+                if matches!(
+                    value,
+                    ConstValue::Builtin(BuiltinObject::Type(_)) | ConstValue::ExceptionClass(_)
+                )
+        );
+        let arg2_is_none_const = matches!(
+            &w_arg2,
+            Hlvalue::Constant(Constant {
+                value: ConstValue::None,
+                ..
+            })
+        );
+
+        // upstream: w_is_type = op.isinstance(w_arg1, const(type)).eval(self)
+        //           if self.guessbool(w_is_type):
+        let is_type = if is_type_const {
+            true
+        } else if matches!(w_arg1, Hlvalue::Constant(_)) {
+            // Non-type constant (string, int, …) raise — not a type.
+            false
+        } else {
+            let w_is_type = self.record_pure_op(
+                "isinstance",
+                vec![
+                    w_arg1.clone(),
+                    Hlvalue::Constant(Constant::new(ConstValue::Builtin(BuiltinObject::Type(
+                        BuiltinType::Type,
+                    )))),
+                ],
+            )?;
+            self.guessbool(w_is_type)?
+        };
+
+        let mut check_not_none = false;
+        let w_value;
+        if is_type {
+            // (Class, something) branch.
+            // upstream: if self.guessbool(op.is_(w_arg2, w_None).eval(self)):
+            let arg2_is_none = if arg2_is_none_const {
+                true
+            } else if matches!(w_arg2, Hlvalue::Constant(_)) {
+                false
+            } else {
+                let w_is = self.record_pure_op(
+                    "is_",
+                    vec![
+                        w_arg2.clone(),
+                        Hlvalue::Constant(Constant::new(ConstValue::None)),
+                    ],
+                )?;
+                self.guessbool(w_is)?
+            };
+            if arg2_is_none {
+                // raise Type → op.simple_call(w_arg1)
+                w_value = self.record_maybe_raise_op(
+                    "simple_call",
+                    vec![w_arg1.clone()],
+                    Self::common_exception_cases(),
+                )?;
+            } else {
+                // raise Type, X — check whether X is an instance of Type.
+                let w_valuetype = self.record_pure_op("type", vec![w_arg2.clone()])?;
+                let issubtype_const = Self::const_issubtype(&w_valuetype, &w_arg1).unwrap_or(None);
+                let is_instance = match issubtype_const {
+                    Some(known) => known,
+                    None => {
+                        let w_sub = self.record_pure_op(
+                            "issubtype",
+                            vec![w_valuetype.clone(), w_arg1.clone()],
+                        )?;
+                        self.guessbool(w_sub)?
+                    }
+                };
+                if is_instance {
+                    // raise Type, Instance — use Instance directly.
+                    w_value = w_arg2.clone();
+                    check_not_none = true;
+                } else {
+                    // raise Type, X → op.simple_call(w_arg1, w_arg2) — Type
+                    // constructor called with X.
+                    w_value = self.record_maybe_raise_op(
+                        "simple_call",
+                        vec![w_arg1.clone(), w_arg2.clone()],
+                        Self::common_exception_cases(),
+                    )?;
+                }
+            }
+        } else {
+            // (inst, None) branch.
+            // upstream: if not self.guessbool(op.is_(w_arg2, const(None)).eval(self)):
+            //             exc = TypeError("instance exception may not have a "
+            //                             "separate value")
+            //             raise Raise(const(exc))
+            let arg2_is_none = if arg2_is_none_const {
+                true
+            } else if matches!(w_arg2, Hlvalue::Constant(_)) {
+                false
+            } else {
+                let w_is = self.record_pure_op(
+                    "is_",
+                    vec![
+                        w_arg2.clone(),
+                        Hlvalue::Constant(Constant::new(ConstValue::None)),
+                    ],
+                )?;
+                self.guessbool(w_is)?
+            };
+            if !arg2_is_none {
+                return Err(FlowContextError::Signal(FlowSignal::Raise {
+                    w_exc: FSException::new(
+                        exception_class_value("TypeError"),
+                        exception_instance_value(
+                            "TypeError",
+                            Some("instance exception may not have a separate value".to_owned()),
+                        ),
+                    ),
+                }));
+            }
+            w_value = w_arg1.clone();
+            check_not_none = true;
+        }
+
+        let w_value = if check_not_none {
+            // upstream: w_value = op.simple_call(const(ll_assert_not_none),
+            //                                    w_value).eval(self)
+            self.record_pure_op("ll_assert_not_none", vec![w_value])?
+        } else {
+            w_value
+        };
+        // upstream: w_type = op.type(w_value).eval(self)
+        let w_type = match &w_value {
+            Hlvalue::Constant(Constant {
+                value: ConstValue::ExceptionInstance { class, .. },
+                ..
+            }) => Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(class.clone()))),
+            _ => self.record_pure_op("type", vec![w_value.clone()])?,
+        };
+        Ok(FSException::new(w_type, w_value))
+    }
+
+    /// Constant-fold helper for `op.issubtype(w_valuetype, w_class)`
+    /// when both operands are known ExceptionClass constants.
+    fn const_issubtype(
+        w_valuetype: &Hlvalue,
+        w_class: &Hlvalue,
+    ) -> Result<Option<bool>, FlowContextError> {
+        if let (
+            Hlvalue::Constant(Constant {
+                value: ConstValue::ExceptionClass(actual),
+                ..
+            }),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::ExceptionClass(expected),
+                ..
+            }),
+        ) = (w_valuetype, w_class)
+        {
+            return Ok(Some(actual.is_subclass_of(expected)));
+        }
+        Ok(None)
     }
 
     fn newfunction(
@@ -1166,6 +1443,15 @@ impl FlowContext {
                 "Dict-unpacking is not RPython",
             )));
         }
+        // PYRE-ONLY (no direct RPython basis) — CPython 3.14 lowers
+        // `print(x)` to `LOAD_GLOBAL print; … ; CALL n`, so `print` hits
+        // `call_function` as a Constant builtin. Upstream instead routed
+        // print through a dedicated `PRINT_ITEM` opcode handler that
+        // called `ctx.appcall(rpython_print_item, …)`. The pyre port
+        // folds the same rpython_print_* expansion into call_function
+        // here. Keep this arm BEFORE the SPECIAL_CASES dispatch so the
+        // stararg/keyword validation in `handle_print_function` fires
+        // before the generic "call with keyword arguments" check.
         if matches!(
             &w_function,
             Hlvalue::Constant(Constant {
@@ -1175,7 +1461,44 @@ impl FlowContext {
         ) {
             return self.handle_print_function(arguments, keywords, w_star);
         }
+        // RPython `flowspace/operation.py:666-676` — `SimpleCall.eval`:
+        //
+        //     if isinstance(w_callable, Constant):
+        //         fn = w_callable.value
+        //         try:
+        //             sc = SPECIAL_CASES[fn]
+        //         except (KeyError, TypeError):
+        //             pass
+        //         else:
+        //             return sc(ctx, *args_w)
+        //
+        // SimpleCall is the positional-only path, so the SPECIAL_CASES
+        // lookup applies only when there are no keywords and no
+        // starargs. Upstream `CallArgs.eval` raises FlowingError on
+        // SPECIAL_CASES hit for the keyword path
+        // (`operation.py:690-696`).
         let args = CallSpec::new(arguments, Some(keywords), w_star);
+        let positional_only = args.keywords.is_empty() && args.w_stararg.is_none();
+        if positional_only {
+            if let Some(dispatch) = lookup_special_case(&w_function) {
+                let args_w = args.as_list();
+                return match dispatch {
+                    SpecialCaseDispatch::Handler(handler) => handler(self, &args_w),
+                    SpecialCaseDispatch::Redirect(target) => self.appcall(target, args_w),
+                };
+            }
+        } else if let Some(_dispatch) = lookup_special_case(&w_function) {
+            let fn_name = match &w_function {
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::Builtin(BuiltinObject::Function(func)),
+                    ..
+                }) => format!("{func:?}"),
+                _ => "<builtin>".to_owned(),
+            };
+            return Err(FlowContextError::Flowing(FlowingError::new(format!(
+                "should not call {fn_name} with keyword arguments"
+            ))));
+        }
         if args.keywords.is_empty() && !matches!(args.w_stararg, Some(Hlvalue::Variable(_))) {
             let mut flat = vec![w_function.clone()];
             flat.extend(args.as_list());
@@ -1274,6 +1597,7 @@ impl FlowContext {
                 })?;
                 Ok(ConstValue::Int(value))
             }
+            ConstantData::Float { value } => Ok(ConstValue::float(*value)),
             ConstantData::None => Ok(ConstValue::None),
             ConstantData::Str { value } => Ok(ConstValue::Str(value.to_string())),
             ConstantData::Tuple { elements } => {
@@ -1311,7 +1635,7 @@ impl FlowContext {
             })
     }
 
-    fn record_pure_op(
+    pub(crate) fn record_pure_op(
         &mut self,
         opname: impl Into<String>,
         args: Vec<Hlvalue>,
@@ -1322,7 +1646,7 @@ impl FlowContext {
         Ok(result)
     }
 
-    fn record_maybe_raise_op(
+    pub(crate) fn record_maybe_raise_op(
         &mut self,
         opname: impl Into<String>,
         args: Vec<Hlvalue>,
@@ -1445,7 +1769,7 @@ impl FlowContext {
         Ok(())
     }
 
-    fn common_exception_cases() -> Vec<Hlvalue> {
+    pub(crate) fn common_exception_cases() -> Vec<Hlvalue> {
         vec![exception_class_value("Exception")]
     }
 
@@ -2340,6 +2664,21 @@ impl FlowContext {
                     Ok(None)
                 }
                 Instruction::RaiseVarargs { .. } => {
+                    // RPython `flowcontext.py:638-656` — RAISE_VARARGS.
+                    // upstream:
+                    //   if nbargs == 0:    re-raise last_exception / TypeError
+                    //   if nbargs >= 3:    pop traceback (Py2-only, dropped)
+                    //   if nbargs >= 2:    w_value = pop; w_type = pop; exc_from_raise
+                    //   else:              w_type  = pop; exc_from_raise(w_type, w_None)
+                    //
+                    // CPython 3.14 carves the 1-arg and "raise X from Y"
+                    // cases into distinct RaiseKind variants (no
+                    // (type, value, tb) triple). The Rust port maps:
+                    //
+                    //   BareRaise          → upstream nbargs==0.
+                    //   Raise              → upstream nbargs==1; exc_from_raise(w_type, None).
+                    //   RaiseCause /       → upstream nbargs==1 + set __cause__ separately;
+                    //   ReraiseFromStack     cause captured by surrounding except handler.
                     let w_exc = match pyre_interpreter::bytecode::oparg::RaiseKind::try_from(oparg)
                         .map_err(|_| {
                             FlowContextError::BytecodeCorruption(BytecodeCorruption::new(format!(
@@ -2358,72 +2697,25 @@ impl FlowContext {
                             })
                         }
                         pyre_interpreter::bytecode::oparg::RaiseKind::Raise => {
-                            let raised = self.pop_hlvalue()?;
-                            match raised {
-                                Hlvalue::Constant(Constant {
-                                    value: ConstValue::ExceptionInstance { class, message },
-                                    ..
-                                }) => FSException::new(
-                                    Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(
-                                        class.clone(),
-                                    ))),
-                                    Hlvalue::Constant(Constant::new(
-                                        ConstValue::ExceptionInstance { class, message },
-                                    )),
-                                ),
-                                Hlvalue::Constant(Constant {
-                                    value: ConstValue::ExceptionClass(class),
-                                    ..
-                                }) => FSException::new(
-                                    Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(
-                                        class.clone(),
-                                    ))),
-                                    Hlvalue::Constant(Constant::new(
-                                        ConstValue::ExceptionInstance {
-                                            class,
-                                            message: None,
-                                        },
-                                    )),
-                                ),
-                                other => {
-                                    FSException::new(exception_class_value("Exception"), other)
-                                }
-                            }
+                            let w_arg1 = self.pop_hlvalue()?;
+                            self.exc_from_raise(
+                                w_arg1,
+                                Hlvalue::Constant(Constant::new(ConstValue::None)),
+                            )?
                         }
                         pyre_interpreter::bytecode::oparg::RaiseKind::RaiseCause
                         | pyre_interpreter::bytecode::oparg::RaiseKind::ReraiseFromStack => {
+                            // CPython 3.14 `raise X from Y` — `Y` is
+                            // X's `__cause__`, not a constructor
+                            // argument. `exc_from_raise` covers the
+                            // (type, None) path; cause wiring is the
+                            // handler's job on the re-raise side.
                             let _cause = self.pop_hlvalue()?;
-                            let raised = self.pop_hlvalue()?;
-                            match raised {
-                                Hlvalue::Constant(Constant {
-                                    value: ConstValue::ExceptionInstance { class, message },
-                                    ..
-                                }) => FSException::new(
-                                    Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(
-                                        class.clone(),
-                                    ))),
-                                    Hlvalue::Constant(Constant::new(
-                                        ConstValue::ExceptionInstance { class, message },
-                                    )),
-                                ),
-                                Hlvalue::Constant(Constant {
-                                    value: ConstValue::ExceptionClass(class),
-                                    ..
-                                }) => FSException::new(
-                                    Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(
-                                        class.clone(),
-                                    ))),
-                                    Hlvalue::Constant(Constant::new(
-                                        ConstValue::ExceptionInstance {
-                                            class,
-                                            message: None,
-                                        },
-                                    )),
-                                ),
-                                other => {
-                                    FSException::new(exception_class_value("Exception"), other)
-                                }
-                            }
+                            let w_arg1 = self.pop_hlvalue()?;
+                            self.exc_from_raise(
+                                w_arg1,
+                                Hlvalue::Constant(Constant::new(ConstValue::None)),
+                            )?
                         }
                     };
                     Err(FlowContextError::Signal(FlowSignal::Raise { w_exc }))
@@ -3383,5 +3675,239 @@ mod test {
                 >= 2,
             "expected __enter__/__exit__ calls in graph: {ops:?}"
         );
+    }
+
+    #[test]
+    fn exc_from_raise_lowers_raise_class_to_simple_call() {
+        // RPython basis: flowcontext.py:610-614 — `raise Type` path
+        // hits `op.simple_call(w_arg1)` which the Rust port records
+        // as `simple_call(Type)` through exc_from_raise.
+        let mut ctx = flow_context("def f():\n    raise ValueError\n");
+        ctx.recorder = None;
+        ctx.build_flow().expect("build_flow should succeed");
+        let ops: Vec<String> = ctx
+            .graph
+            .iterblockops()
+            .into_iter()
+            .map(|(_, op)| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| op == "simple_call"),
+            "expected simple_call(ValueError) from exc_from_raise; got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn exc_from_raise_uses_instance_directly_via_raise_stmt() {
+        // RPython basis: flowcontext.py:617-620 + 632-634 — `raise
+        // Type(msg)` lowers to simple_call(Type, msg) then exc_from_raise
+        // sees the Variable and routes through ll_assert_not_none +
+        // `type(w_value)`.
+        let mut ctx = flow_context("def f():\n    raise ValueError('msg')\n");
+        ctx.recorder = None;
+        ctx.build_flow().expect("build_flow should succeed");
+        let ops: Vec<String> = ctx
+            .graph
+            .iterblockops()
+            .into_iter()
+            .map(|(_, op)| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| op == "simple_call"),
+            "expected simple_call(Type, msg); got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn exc_from_raise_non_type_with_non_none_raises_typeerror() {
+        // RPython basis: flowcontext.py:625-629 — `(inst, not-None)`
+        // branch raises TypeError("instance exception may not have a
+        // separate value").
+        let mut ctx = flow_context("def f():\n    return 1\n");
+        let w_non_type = Hlvalue::Constant(Constant::new(ConstValue::Int(42)));
+        let w_value = Hlvalue::Constant(Constant::new(ConstValue::Str("junk".into())));
+        let err = ctx.exc_from_raise(w_non_type, w_value).unwrap_err();
+        match err {
+            FlowContextError::Signal(FlowSignal::Raise { w_exc }) => match &w_exc.w_type {
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::ExceptionClass(class),
+                    ..
+                }) => assert_eq!(class.name, "TypeError"),
+                other => panic!("expected TypeError class constant, got {other:?}"),
+            },
+            other => panic!("expected Raise(TypeError), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn special_cases_locals_rejects_with_flowing_error() {
+        // RPython basis: specialcase.py:33-41 — @register_flow_sc(locals).
+        let mut ctx = flow_context("def f():\n    return locals()\n");
+        ctx.recorder = None;
+        let err = ctx.build_flow().unwrap_err();
+        match err {
+            FlowContextError::Flowing(flowing) => {
+                assert!(
+                    flowing.message.contains("locals() is not RPython"),
+                    "expected sc_locals FlowingError, got: {}",
+                    flowing.message
+                );
+            }
+            other => panic!("expected FlowingError(sc_locals), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn special_cases_getattr_two_arg_records_getattr_op() {
+        // RPython basis: specialcase.py:43-49 — @register_flow_sc(getattr)
+        // two-arg path delegates to op.getattr(w_obj, w_index).eval(ctx),
+        // which in the Rust port records `getattr(obj, name)`.
+        let mut ctx = flow_context("def f(x):\n    return getattr(x, 'attr')\n");
+        let args = ctx.graph.startblock.borrow().inputargs.clone();
+        ctx.locals_w[0] = Some(args[0].clone());
+        ctx.recorder = None;
+        ctx.build_flow().expect("build_flow should succeed");
+        let ops: Vec<String> = ctx
+            .graph
+            .iterblockops()
+            .into_iter()
+            .map(|(_, op)| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| op == "getattr"),
+            "expected sc_getattr to record `getattr` op, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn special_cases_redirect_open_to_create_file() {
+        // RPython basis: specialcase.py:53 — redirect_function(open,
+        // 'rpython.rlib.rfile.create_file'). Rust port encodes the
+        // target as BuiltinFunction::CreateFile and SPECIAL_CASES
+        // dispatches through `appcall(target, args)` which records
+        // `direct_call(CreateFile, args...)`.
+        let mut ctx = flow_context("def f(path):\n    return open(path)\n");
+        let args = ctx.graph.startblock.borrow().inputargs.clone();
+        ctx.locals_w[0] = Some(args[0].clone());
+        ctx.recorder = None;
+        ctx.build_flow().expect("build_flow should succeed");
+        let direct_call_targets: Vec<_> = ctx
+            .graph
+            .iterblockops()
+            .into_iter()
+            .filter(|(_, op)| op.opname == "direct_call")
+            .map(|(_, op)| op.args.first().cloned())
+            .collect();
+        assert!(
+            direct_call_targets.iter().any(|arg| matches!(
+                arg,
+                Some(Hlvalue::Constant(Constant {
+                    value: ConstValue::Builtin(BuiltinObject::Function(
+                        BuiltinFunction::CreateFile
+                    )),
+                    ..
+                }))
+            )),
+            "expected redirect_function(open,…) to route through CreateFile, got {direct_call_targets:?}"
+        );
+    }
+
+    #[test]
+    fn call_spec_as_list_iterates_str_stararg() {
+        // RPython basis: argument.py:113 — `const(x) for x in
+        // w_stararg.value` over any iterable. A Str stararg yields
+        // per-char Constants.
+        use crate::argument::CallSpec;
+        let star = Hlvalue::Constant(Constant::new(ConstValue::Str("ab".into())));
+        let args = CallSpec::new(Vec::new(), None, Some(star));
+        let expanded = args.as_list();
+        assert_eq!(expanded.len(), 2);
+        assert!(matches!(
+            &expanded[0],
+            Hlvalue::Constant(Constant { value: ConstValue::Str(s), .. }) if s == "a"
+        ));
+        assert!(matches!(
+            &expanded[1],
+            Hlvalue::Constant(Constant { value: ConstValue::Str(s), .. }) if s == "b"
+        ));
+    }
+
+    #[test]
+    fn find_global_resolves_common_builtins() {
+        // Reviewer #1: `len`, `str`, `int` should be reachable through
+        // `find_global` against the `__builtin__` fallback.
+        let ctx = flow_context("def f():\n    return 1\n");
+        assert!(matches!(
+            ctx.find_global("len").unwrap(),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Builtin(BuiltinObject::Function(BuiltinFunction::Len)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            ctx.find_global("str").unwrap(),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Builtin(BuiltinObject::Type(BuiltinType::Str)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            ctx.find_global("int").unwrap(),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Builtin(BuiltinObject::Type(BuiltinType::Int)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            ctx.find_global("float").unwrap(),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Builtin(BuiltinObject::Type(BuiltinType::Float)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            ctx.find_global("isinstance").unwrap(),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Builtin(BuiltinObject::Function(BuiltinFunction::Isinstance)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn const_value_float_round_trips_and_folds() {
+        let original = 3.14_f64;
+        let cv = ConstValue::float(original);
+        assert_eq!(cv.as_float(), Some(original));
+        let c = Constant::new(cv);
+        // Float constants must be foldable — upstream treats any
+        // `__builtin__`-class value as foldable.
+        assert!(c.foldable());
+        // Python `bool(3.14) == True`.
+        assert_eq!(
+            Constant::new(ConstValue::float(3.14)).value.truthy(),
+            Some(true)
+        );
+        assert_eq!(
+            Constant::new(ConstValue::float(0.0)).value.truthy(),
+            Some(false)
+        );
+        // Hash + equality on bit-preserving representation.
+        assert_eq!(ConstValue::float(1.5), ConstValue::float(1.5));
+        assert_ne!(ConstValue::float(1.5), ConstValue::float(2.5));
+    }
+
+    #[test]
+    fn exception_class_user_defined_base_walk() {
+        // RPython basis: model.py — Constant(SomeClass) with
+        // SomeClass.__bases__ drives issubclass in exception_match.
+        // Rust port mirrors by storing bases explicitly.
+        let user_error =
+            ExceptionClass::new("MyError", vec![ExceptionClass::builtin("ValueError")]);
+        assert!(user_error.is_subclass_of_name("MyError"));
+        assert!(user_error.is_subclass_of_name("ValueError"));
+        assert!(user_error.is_subclass_of_name("Exception"));
+        assert!(user_error.is_subclass_of_name("BaseException"));
+        assert!(!user_error.is_subclass_of_name("RuntimeError"));
     }
 }

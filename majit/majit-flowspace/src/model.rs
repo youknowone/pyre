@@ -55,6 +55,94 @@ pub enum BuiltinFunction {
     RpythonPrintNewline,
     All,
     Any,
+    // --- Commonly-referenced Python `__builtin__` callables.
+    // These are not in upstream SPECIAL_CASES — they fall through to
+    // `direct_call(builtin, args)` and the annotator / rtyper lower
+    // them later. Carrying them as explicit variants lets
+    // `find_global` succeed instead of panicking with
+    // `global name '<foo>' is not defined`.
+    Len,
+    Iter,
+    Next,
+    Isinstance,
+    Issubclass,
+    Hasattr,
+    Callable,
+    Id,
+    Hash,
+    Repr,
+    Min,
+    Max,
+    Abs,
+    Sum,
+    Round,
+    Divmod,
+    Pow,
+    Chr,
+    Ord,
+    Hex,
+    Oct,
+    Bin,
+    Map,
+    Filter,
+    Zip,
+    Enumerate,
+    Reversed,
+    Sorted,
+    Format,
+    Vars,
+    Dir,
+    Compile,
+    Input,
+    Exec,
+    Eval,
+    Super,
+    Setattr,
+    Delattr,
+    // --- SPECIAL_CASES source callables registered in
+    // `rpython/flowspace/specialcase.py:53-67`.
+    /// Python builtin `open`.
+    Open,
+    /// `os.fdopen`.
+    OsFdopen,
+    /// `os.tmpfile`.
+    OsTmpfile,
+    /// `os.remove`.
+    OsRemove,
+    /// `os.path.isdir`.
+    OsPathIsdir,
+    /// `os.path.isabs`.
+    OsPathIsabs,
+    /// `os.path.normpath`.
+    OsPathNormpath,
+    /// `os.path.abspath`.
+    OsPathAbspath,
+    /// `os.path.join`.
+    OsPathJoin,
+    /// `os.path.splitdrive` (conditional upstream via
+    /// `if hasattr(os.path, 'splitdrive')`).
+    OsPathSplitdrive,
+    // --- redirect targets that `sc_redirected_function` resolves.
+    /// `os.unlink` (target of `os.remove` redirect).
+    OsUnlink,
+    /// `rpython.rlib.rfile.create_file`.
+    CreateFile,
+    /// `rpython.rlib.rfile.create_fdopen_rfile`.
+    CreateFdopenRfile,
+    /// `rpython.rlib.rfile.create_temp_rfile`.
+    CreateTempRfile,
+    /// `rpython.rlib.rpath.risdir`.
+    Risdir,
+    /// `rpython.rlib.rpath.risabs`.
+    Risabs,
+    /// `rpython.rlib.rpath.rnormpath`.
+    Rnormpath,
+    /// `rpython.rlib.rpath.rabspath`.
+    Rabspath,
+    /// `rpython.rlib.rpath.rjoin`.
+    Rjoin,
+    /// `rpython.rlib.rpath.rsplitdrive`.
+    Rsplitdrive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -63,6 +151,32 @@ pub enum BuiltinType {
     Tuple,
     List,
     Set,
+    // --- Additional builtin types reachable via `find_global` /
+    // `__builtin__` lookup. Upstream stores each as a Python class
+    // object; the Rust port enumerates them so
+    // `ConstValue::Builtin(BuiltinObject::Type(…))` carries the exact
+    // class identity at flow-graph-building time.
+    Str,
+    Int,
+    Float,
+    Bool,
+    Dict,
+    Bytes,
+    Bytearray,
+    Frozenset,
+    Range,
+    Slice,
+    Object,
+    Complex,
+    Memoryview,
+    Enumerate,
+    Zip,
+    Map,
+    Filter,
+    Reversed,
+    Property,
+    Classmethod,
+    Staticmethod,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -72,16 +186,50 @@ pub enum BuiltinObject {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Flow-space stand-in for a Python exception class object. Upstream's
+/// `const(SomeException)` stores the real class; the Rust port
+/// materialises the class identity by name plus its explicit base list,
+/// which mirrors Python's `cls.__bases__` tuple well enough for
+/// `issubclass`-based flow-space decisions.
+///
+/// Deviation from upstream (parity rule #1): Python uses C3 linearisation
+/// over `__mro__` for `issubclass`; the Rust port uses depth-first
+/// traversal over `bases`. For exception hierarchies (rarely multi-
+/// inherited) the two agree — `issubclass(A, B)` iff `B` lies on some
+/// path from `A` through `__bases__`. User-defined exception classes
+/// register through the caller-supplied `bases` vector; builtin classes
+/// use `ExceptionClass::builtin` which walks `builtin_exception_parent`
+/// to pre-materialise the parent chain.
 pub struct ExceptionClass {
+    /// RPython `class.__name__`.
     pub name: String,
-    pub base: Option<String>,
+    /// RPython `class.__bases__` tuple as an ordered list. Empty only
+    /// for the BaseException root.
+    pub bases: Vec<ExceptionClass>,
 }
 
 impl ExceptionClass {
+    /// Construct a builtin exception class whose base chain comes from
+    /// `builtin_exception_parent`. Each constructor call recursively
+    /// materialises the chain up to `BaseException`.
     pub fn builtin(name: &str) -> Self {
+        let bases = match builtin_exception_parent(name) {
+            Some(parent) => vec![ExceptionClass::builtin(parent)],
+            None => Vec::new(),
+        };
         ExceptionClass {
             name: name.to_owned(),
-            base: builtin_exception_parent(name).map(str::to_owned),
+            bases,
+        }
+    }
+
+    /// RPython-style user-defined class constructor. Callers supply
+    /// the explicit base list matching Python's `class X(bases): ...`
+    /// syntax.
+    pub fn new(name: impl Into<String>, bases: Vec<ExceptionClass>) -> Self {
+        ExceptionClass {
+            name: name.into(),
+            bases,
         }
     }
 
@@ -89,18 +237,15 @@ impl ExceptionClass {
         self.is_subclass_of_name(&expected.name)
     }
 
+    /// Python `issubclass(self, class_named_expected)` — depth-first
+    /// traversal over `bases`, terminating at the first match.
     pub fn is_subclass_of_name(&self, expected: &str) -> bool {
         if self.name == expected {
             return true;
         }
-        let mut cursor = self.base.as_deref();
-        while let Some(parent) = cursor {
-            if parent == expected {
-                return true;
-            }
-            cursor = builtin_exception_parent(parent);
-        }
-        false
+        self.bases
+            .iter()
+            .any(|parent| parent.is_subclass_of_name(expected))
     }
 }
 
@@ -139,6 +284,12 @@ pub enum ConstValue {
     /// `test_model.py`. Phase 3 generalises this to arbitrary
     /// Python values.
     Int(i64),
+    /// Python float constant. RPython stores the `f64` directly on
+    /// `Constant.value`; Rust carries it as `f64::to_bits()` so the
+    /// enum keeps its `Eq + Hash` derivation (IEEE 754 NaN violates
+    /// `Eq`). Use `ConstValue::float(value)` / `ConstValue::as_float()`
+    /// to convert.
+    Float(u64),
     /// Python dict constant. Used for `func.__globals__`.
     Dict(HashMap<String, ConstValue>),
     /// Python string constant. Used by `checkgraph()` to validate
@@ -193,6 +344,7 @@ impl Hash for ConstValue {
             ConstValue::Atom(atom) => atom.hash(state),
             ConstValue::Placeholder => {}
             ConstValue::Int(value) => value.hash(state),
+            ConstValue::Float(bits) => bits.hash(state),
             ConstValue::Dict(items) => {
                 let mut entries: Vec<_> = items.iter().collect();
                 entries.sort_by(|left, right| left.0.cmp(right.0));
@@ -543,6 +695,7 @@ impl Constant {
             // `to_check.__class__.__module__ == '__builtin__'` — all
             // Python built-in primitive and container types.
             ConstValue::Int(_)
+            | ConstValue::Float(_)
             | ConstValue::Bool(_)
             | ConstValue::Str(_)
             | ConstValue::None
@@ -570,12 +723,29 @@ impl Constant {
 }
 
 impl ConstValue {
+    /// Wrap an `f64` into the bit-preserving `Float` variant.
+    pub fn float(value: f64) -> Self {
+        ConstValue::Float(value.to_bits())
+    }
+
+    /// Unwrap a `Float` variant back to `f64`. Returns `None` for
+    /// other variants.
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            ConstValue::Float(bits) => Some(f64::from_bits(*bits)),
+            _ => None,
+        }
+    }
+
     /// Best-effort Python truthiness for the constant variants the
     /// current flow-space port constructs directly.
     pub fn truthy(&self) -> Option<bool> {
         match self {
             ConstValue::Placeholder => None,
             ConstValue::Int(n) => Some(*n != 0),
+            // Python `bool(float)` is `float != 0.0` (including -0.0
+            // which equals 0.0 under IEEE 754).
+            ConstValue::Float(bits) => Some(f64::from_bits(*bits) != 0.0),
             ConstValue::Dict(items) => Some(!items.is_empty()),
             ConstValue::Str(s) => Some(!s.is_empty()),
             ConstValue::Tuple(items) | ConstValue::List(items) => Some(!items.is_empty()),
@@ -601,6 +771,29 @@ impl ConstValue {
     pub fn sequence_items(&self) -> Option<&[ConstValue]> {
         match self {
             ConstValue::Tuple(items) | ConstValue::List(items) => Some(items.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// RPython `for x in self.w_stararg.value` iteration contract
+    /// (`argument.py:113`) — upstream consumes any Python iterable.
+    /// Line-by-line port for the `ConstValue` variants that can appear
+    /// as `w_stararg.value` in practice: tuple/list (flow-space's
+    /// BUILD_TUPLE/BUILD_LIST output), str (per-char iteration matches
+    /// Python semantics), dict (iteration over keys in insertion order;
+    /// HashMap iteration order is used in the Rust port — upstream's
+    /// dict is also unordered before the flow-graph builder sorts
+    /// explicitly, so this matches upstream's pre-sort state).
+    pub fn iter_items(&self) -> Option<Vec<ConstValue>> {
+        match self {
+            ConstValue::Tuple(items) | ConstValue::List(items) => Some(items.clone()),
+            ConstValue::Str(value) => Some(
+                value
+                    .chars()
+                    .map(|c| ConstValue::Str(c.to_string()))
+                    .collect(),
+            ),
+            ConstValue::Dict(items) => Some(items.keys().cloned().map(ConstValue::Str).collect()),
             _ => None,
         }
     }

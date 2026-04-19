@@ -168,11 +168,21 @@ impl CallSpec {
         (shape, data_w)
     }
 
-    /// RPython `CallSpec.as_list()`.
+    /// RPython `argument.py:108-113` — `CallSpec.as_list`.
     ///
-    /// Upstream asserts `not self.keywords` and, if `w_stararg` is
-    /// present, unpacks `w_stararg.value` into individual
-    /// `Constant(x)` cells via `const(x) for x in w_stararg.value`.
+    /// ```python
+    /// def as_list(self):
+    ///     assert not self.keywords
+    ///     if self.w_stararg is None:
+    ///         return self.arguments_w
+    ///     else:
+    ///         return self.arguments_w + [const(x) for x in self.w_stararg.value]
+    /// ```
+    ///
+    /// The `for x in self.w_stararg.value` iteration uses Python's
+    /// general iterator protocol. Rust port mirrors that contract via
+    /// `ConstValue::iter_items`, which covers tuple/list/str/dict for
+    /// the variants flow-space currently constructs.
     pub fn as_list(&self) -> Vec<Hlvalue> {
         assert!(
             self.keywords.is_empty(),
@@ -181,17 +191,16 @@ impl CallSpec {
         match &self.w_stararg {
             None => self.arguments_w.clone(),
             Some(Hlvalue::Constant(stararg)) => {
-                let items = sequence_items(&stararg.value).unwrap_or_else(|| {
+                let items = stararg.value.iter_items().unwrap_or_else(|| {
                     panic!(
-                        "CallSpec.as_list expected sequence Constant for w_stararg, got {:?}",
+                        "CallSpec.as_list expected iterable Constant for w_stararg, got {:?}",
                         stararg.value
                     )
                 });
                 let mut out = self.arguments_w.clone();
                 out.extend(
                     items
-                        .iter()
-                        .cloned()
+                        .into_iter()
                         .map(|value| Hlvalue::Constant(Constant::new(value))),
                 );
                 out
