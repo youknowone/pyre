@@ -952,6 +952,18 @@ pub struct PyreSym {
     pub(crate) pre_opcode_vsd: Option<usize>,
     pub(crate) pre_opcode_stack: Option<Vec<OpRef>>,
     pub(crate) pre_opcode_stack_types: Option<Vec<Type>>,
+    /// Stage 3.4 Phase B: full snapshot of `registers_r` at opcode
+    /// start. Encoder consumers (`get_list_of_active_boxes`,
+    /// `build_virtualizable_boxes`) read the unified abstract register
+    /// file through this snapshot so that locals (idx < nlocals) and
+    /// stack tail (idx >= nlocals) share a single indexing rule. When
+    /// `None` the consumer falls back to the live `registers_r`.
+    ///
+    /// Phase A dual-write invariant guarantees
+    /// `registers_r[nlocals + i] == symbolic_stack[i]` at opcode start,
+    /// so this snapshot carries the same data as `pre_opcode_stack`
+    /// for the stack portion while also fixing the locals portion.
+    pub(crate) pre_opcode_registers_r: Option<Vec<OpRef>>,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py:2745): concrete
     /// exception object pending during tracing. Set by execute_ll_raised
     /// (raise_varargs), consumed by handle_possible_exception.
@@ -1782,6 +1794,7 @@ impl PyreSym {
             pre_opcode_vsd: None,
             pre_opcode_stack: None,
             pre_opcode_stack_types: None,
+            pre_opcode_registers_r: None,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,

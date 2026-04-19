@@ -254,15 +254,53 @@ impl MIFrame {
                 let _ = MIFrame::load_local_value(self, ctx, idx);
             }
         }
-        let (nlocals, registers_r, stack_values, jitcode_ptr) = {
+        let (nlocals, registers_r_view, stack_values, jitcode_ptr) = {
             let s = self.sym();
+            // Stage 3.4 Phase B: unified abstract register file view.
+            // When a guard is being captured mid-opcode, read from
+            // `pre_opcode_registers_r` (the full snapshot of
+            // `registers_r` at opcode start). Otherwise read the live
+            // `registers_r`. Both variants share a single indexing rule
+            // so `live_{i,r,f}_regs` indices (which live in the
+            // stack_base=nlocals register space) can be resolved with
+            // one lookup instead of the legacy
+            // `idx < nlocals ? locals : stack` split.
+            //
+            // Phase A dual-writes grow `registers_r` monotonically on
+            // stack pushes; pop does not shrink it. Bound the view to
+            // the valid locals + live stack_only range so stale slots
+            // above the current (or pre-opcode) stack depth cannot
+            // surface as active OpRefs. This matches the OLD
+            // `stack_values.len()` bound on the
+            // `stack_values[idx - nlocals]` read path.
+            let (valid_stack_only, source_len) = if let Some(ref pre_stack) = s.pre_opcode_stack {
+                (
+                    pre_stack.len(),
+                    s.pre_opcode_registers_r
+                        .as_ref()
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                )
+            } else {
+                let stack_only = s.stack_only_depth();
+                (stack_only.min(s.symbolic_stack.len()), s.registers_r.len())
+            };
+            let valid_len = (s.nlocals + valid_stack_only).min(source_len);
+            let registers_r_view: Vec<OpRef> = if let Some(ref pre_r) = s.pre_opcode_registers_r {
+                pre_r[..valid_len.min(pre_r.len())].to_vec()
+            } else {
+                s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
+            };
+            // Skeleton path still uses the symbolic stack directly for
+            // `is_stack_live` queries keyed on per-slot kind; keep the
+            // pre_opcode_stack override for that branch.
             let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
                 pre_stack.clone()
             } else {
                 let stack_only = s.stack_only_depth();
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
-            (s.nlocals, s.registers_r.clone(), stack_values, s.jitcode)
+            (s.nlocals, registers_r_view, stack_values, s.jitcode)
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
         // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
@@ -285,14 +323,15 @@ impl MIFrame {
                 None
             };
             let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-            // Stage 3.4 Phase A: registers_r may carry a stack mirror
-            // beyond `nlocals` (dual-write from push/pop). The skeleton
-            // encoder's locals iteration must stop at `nlocals` so the
-            // `is_local_live(py_pc, idx)` query stays inside the local
-            // slot space. Phase B will switch this loop to the unified
-            // register-file view.
-            let locals_len = nlocals.min(registers_r.len());
-            for (idx, slot) in registers_r[..locals_len].iter().enumerate() {
+            // Skeleton encoder: the pyre-jit-trace LiveVars analysis
+            // distinguishes `is_local_live(pc, idx)` vs
+            // `is_stack_live(pc, idx)`, so keep the per-kind iteration
+            // here. The unified register-file view (Phase B) applies
+            // only to the primary `metadata.liveness` branch below,
+            // where `live_r_regs` indices already live in
+            // stack_base=nlocals register space.
+            let locals_len = nlocals.min(registers_r_view.len());
+            for (idx, slot) in registers_r_view[..locals_len].iter().enumerate() {
                 let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
                 if is_live {
                     boxes.push(*slot);
@@ -358,16 +397,12 @@ impl MIFrame {
             });
         let total = live_info.total_live();
         let mut boxes = Vec::with_capacity(total);
-        let snapshot = |idx: usize| -> OpRef {
-            if idx < nlocals {
-                registers_r.get(idx).copied().unwrap_or(OpRef::NONE)
-            } else {
-                stack_values
-                    .get(idx - nlocals)
-                    .copied()
-                    .unwrap_or(OpRef::NONE)
-            }
-        };
+        // Stage 3.4 Phase B: unified register-file lookup. `live_*_regs`
+        // indices live in stack_base=nlocals register space, so any
+        // `idx` in [0, nlocals+stack_depth) resolves to a single slot in
+        // `registers_r_view`. Out-of-range reads return NULL.
+        let snapshot =
+            |idx: usize| -> OpRef { registers_r_view.get(idx).copied().unwrap_or(OpRef::NONE) };
         // pyjitpl.py:216-233 — int / ref / float banks in this order.
         for &reg_idx in &live_info.live_i_regs {
             boxes.push(snapshot(reg_idx as usize));
@@ -1856,11 +1891,9 @@ impl MIFrame {
             ));
         }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
-        // pyjitpl.py:177 parity: use pre_opcode_stack (orgpc state) when
-        // available, matching get_list_of_active_boxes. The current
-        // symbolic_stack may reflect mid-operation state (values popped
-        // and intermediate results pushed), while the snapshot must
-        // capture the stack at orgpc (before the current operation).
+        // `stack_values` is kept for the `physical_array_len` fallback
+        // below (frame height calculation), where the symbolic stack
+        // depth still drives the target array length.
         let stack_values = if let Some(ref pre_stack) = sym.pre_opcode_stack {
             pre_stack.clone()
         } else {
@@ -2148,6 +2181,7 @@ impl MIFrame {
         let saved_pre_opcode_vsd = self.sym_mut().pre_opcode_vsd.take();
         let saved_pre_opcode_stack = self.sym_mut().pre_opcode_stack.take();
         let saved_pre_opcode_stack_types = self.sym_mut().pre_opcode_stack_types.take();
+        let saved_pre_opcode_registers_r = self.sym_mut().pre_opcode_registers_r.take();
 
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
@@ -2236,6 +2270,7 @@ impl MIFrame {
         s.pre_opcode_vsd = saved_pre_opcode_vsd;
         s.pre_opcode_stack = saved_pre_opcode_stack;
         s.pre_opcode_stack_types = saved_pre_opcode_stack_types;
+        s.pre_opcode_registers_r = saved_pre_opcode_registers_r;
     }
 
     /// pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity.
@@ -4029,6 +4064,13 @@ impl MIFrame {
             s.pre_opcode_stack_types = Some(
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
             );
+            // Stage 3.4 Phase B: freeze the full abstract register file at
+            // opcode start so encoders can use a single indexing rule for
+            // both locals and the stack tail. Phase A dual-writes keep the
+            // stack portion (`registers_r[nlocals..]`) equal to
+            // `symbolic_stack` at this point, so the snapshot agrees with
+            // `pre_opcode_stack` value-for-value.
+            s.pre_opcode_registers_r = Some(s.registers_r.clone());
         }
         // pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity: when
         // the CompareOp is followed by PopJumpIf* and operands form a
@@ -4054,6 +4096,7 @@ impl MIFrame {
                 s.pre_opcode_vsd = None;
                 s.pre_opcode_stack = None;
                 s.pre_opcode_stack_types = None;
+                s.pre_opcode_registers_r = None;
                 return action;
             }
             Some(Err(e)) => Err(e),
@@ -4068,6 +4111,7 @@ impl MIFrame {
             s.pre_opcode_vsd = None;
             s.pre_opcode_stack = None;
             s.pre_opcode_stack_types = None;
+            s.pre_opcode_registers_r = None;
         }
         // RPython execute_ll_raised parity: store exception in
         // last_exc_value before calling handle_possible_exception.
@@ -4380,6 +4424,7 @@ impl MIFrame {
                 s.pre_opcode_vsd = None;
                 s.pre_opcode_stack = None;
                 s.pre_opcode_stack_types = None;
+                s.pre_opcode_registers_r = None;
                 return InlineTraceStepAction::Trace(action);
             }
             Some(Err(e)) => Err(e),
