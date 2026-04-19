@@ -968,16 +968,34 @@ pub struct PyreSym {
     /// resume.py:1093 restores virtual references on guard failure.
     /// Pairs stored flat: [virt_sym, virt_ptr, real_sym, real_ptr, ...].
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
-    // ── RPython MIFrame.registers_{i,r,f} parity (pyjitpl.py:74-78) ──
+    // ── RPython MIFrame.registers_{i,r,f} port (pyjitpl.py:74-78) ──
     //
-    // Abstract register file disjoint from PyFrame slot indexing.
-    // Indexed by post-regalloc register color. Each entry is the OpRef
-    // currently held by that register (NONE sentinel for unused slots).
-    //
-    // RPython reference: `rpython/jit/metainterp/pyjitpl.py:74-78`
+    // RPython reference (target shape):
     //   self.registers_i = [history.CONST_NULL] * jitcode.num_regs_i()
     //   self.registers_r = [history.CONST_NULL] * jitcode.num_regs_r()
     //   self.registers_f = [history.CONST_NULL] * jitcode.num_regs_f()
+    //
+    // TRANSITIONAL STATE (Stage 3.1 landed, Stage 3.4 pending):
+    // `registers_r` is currently sized to `nlocals` and indexed by
+    // pre-regalloc PyFrame local slot — NOT yet the abstract-register-
+    // file shape that RPython describes. Stack slots still live in
+    // `symbolic_stack` indexed by depth; Int / Float register banks
+    // (`registers_i` / `registers_f`) are allocated-but-unused
+    // placeholders for the same Stage 3.4 refactor.
+    //
+    // Stage 3.4 will:
+    //   - resize `registers_r` to `num_regs_r()` (post-regalloc
+    //     coloring) so it holds BOTH locals and stack slots under a
+    //     single indexing scheme
+    //   - collapse `symbolic_stack` into the unified register file
+    //   - retire the `idx < nlocals` encoder decode in
+    //     `get_list_of_active_boxes` (trace_opcode.rs:354-363)
+    //
+    // Until Stage 3.4 lands, the pre-regalloc identity invariant
+    // enforced by `enforce_input_args` in `pyre-jit/src/jit/regalloc.rs`
+    // keeps local colors in `0..nlocals` — which is what lets the
+    // encoder's `idx < nlocals` split between locals and stack
+    // continue to work.
     pub(crate) registers_i: Vec<OpRef>,
     #[vable(locals)]
     pub(crate) registers_r: Vec<OpRef>,
