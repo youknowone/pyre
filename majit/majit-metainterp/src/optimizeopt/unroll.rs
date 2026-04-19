@@ -3208,7 +3208,7 @@ impl OptUnroll {
                         ctx.replace_op(source, result_opref);
                     }
                     // Register type for the new OpRef (RPython Box.type parity).
-                    ctx.value_types.insert(result_opref.0, opcode.result_type());
+                    ctx.register_value_type(result_opref, opcode.result_type());
                     let args = args
                         .iter()
                         .map(|arg| match arg {
@@ -3306,7 +3306,7 @@ impl OptUnroll {
                     );
                     let value = ctx.alloc_op_position();
                     // Register type for the new OpRef (RPython Box.type parity).
-                    ctx.value_types.insert(value.0, result_type);
+                    ctx.register_value_type(value, result_type);
                     ctx.replace_op(source, value);
                     // shortpreamble.py:75-78: fielddescr.get_index()
                     let descr_idx = descr.index();
@@ -3414,7 +3414,7 @@ impl OptUnroll {
                     );
                     let value = ctx.alloc_op_position();
                     // Register type for the new OpRef (RPython Box.type parity).
-                    ctx.value_types.insert(value.0, result_type);
+                    ctx.register_value_type(value, result_type);
                     ctx.replace_op(source, value);
                     // shortpreamble.py:72,84 parity: canonicalize obj through
                     // get_box_replacement so the key matches heap.py lookup

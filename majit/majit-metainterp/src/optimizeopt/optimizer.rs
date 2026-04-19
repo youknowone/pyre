@@ -648,7 +648,7 @@ impl Optimizer {
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
             op.pos = ctx.reserve_pos();
             let fresh = op.pos;
-            ctx.value_types.insert(fresh.0, tp);
+            ctx.register_value_type(fresh, tp);
             ctx.new_operations.push(op);
             // Update the field to reference the SameAs result.
             entries[*entry_idx].fields[*field_idx].1 = fresh;
@@ -1685,18 +1685,26 @@ impl Optimizer {
         for (&k, &v) in &self.prev_phase_value_types {
             ctx.value_types.insert(k, v);
         }
-        // 3. Transformed trace ops (optimizer input)
+        // 3. Inputarg types (from recorder — RPython InputArgInt/Ref/Float).
+        //    Seeded BEFORE the current trace ops so an op at a position
+        //    inside the inputarg range wins on result-type conflict. In
+        //    production inputargs live at `[inputarg_base, inputarg_base
+        //    + num_inputs)` and ops live strictly above that range, so
+        //    the order is immaterial; the swap only matters for the
+        //    unit-test harnesses that seed `trace_inputarg_types =
+        //    vec![Ref; 1024]` and then place trace ops at low positions.
+        //    With ops winning, OpRef(0)=Int (from IntGe.pos=0) instead of
+        //    the Ref stub, so the Box.type invariant at
+        //    `register_value_type` sees a single authoritative type.
+        for (i, &tp) in self.trace_inputarg_types.iter().enumerate() {
+            ctx.value_types.insert(inputarg_base + i as u32, tp);
+        }
+        // 4. Transformed trace ops (optimizer input). Each op's
+        //    `result_type()` is the authoritative Box.type at `op.pos`.
         for op in ops {
             if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
                 ctx.value_types.insert(op.pos.0, op.result_type());
             }
-        }
-        // 4. Inputarg types (from recorder — RPython InputArgInt/Ref/Float)
-        //    Highest priority — override all others. Inputargs occupy
-        //    `[inputarg_base, inputarg_base + num_inputs)` in the OpRef
-        //    namespace; for Phase 1 / standalone runs `inputarg_base = 0`.
-        for (i, &tp) in self.trace_inputarg_types.iter().enumerate() {
-            ctx.value_types.insert(inputarg_base + i as u32, tp);
         }
 
         // optimizer.py:293 patchguardop parity: propagate to Phase 2
@@ -1825,7 +1833,7 @@ impl Optimizer {
                     if target != source && source_set.contains(&target) {
                         let fresh = ctx.alloc_op_position();
                         if let Some(&tp) = ctx.value_types.get(&source.0) {
-                            ctx.value_types.insert(fresh.0, tp);
+                            ctx.register_value_type(fresh, tp);
                         }
                         ctx.replace_op(source, fresh);
                         fresh
@@ -2119,7 +2127,7 @@ impl Optimizer {
                     let mut op = Op::new(same_as, &[orig]);
                     op.pos = fresh;
                     ctx.emit(op);
-                    ctx.value_types.insert(fresh.0, arg_type);
+                    ctx.register_value_type(fresh, arg_type);
                     if let Some(val) = ctx.get_constant(orig).cloned() {
                         ctx.make_constant(fresh, val);
                     }
@@ -2132,7 +2140,7 @@ impl Optimizer {
                                     ctx.replace_op(ff, orig_field);
                                     // RPython Box type parity: copy type
                                     if let Some(&tp) = ctx.value_types.get(&orig_field.0) {
-                                        ctx.value_types.insert(ff.0, tp);
+                                        ctx.register_value_type(ff, tp);
                                     }
                                     if let Some(val) =
                                         ctx.get_constant(orig_field).cloned()
@@ -2896,6 +2904,18 @@ impl Optimizer {
         // different-typed op at the same reused OpRef number). RPython
         // has no equivalent stale-entry hazard because Box.type is stored
         // on the Box object itself.
+        // Refresh value_types with the current op's result type before
+        // running pass callbacks. Production emits each pos exactly once
+        // and the seeding priority (swapped above so ops override
+        // inputargs) keeps this a same-type no-op. The unit-test
+        // harnesses still trip a genuine retype here because unroll's
+        // `peel_iteration` computes peeled/body positions arithmetically
+        // from `new_operations.len()` (unroll.rs:4503-4555) without
+        // passing through `reserve_pos`, so peeled ops land inside the
+        // 1024-slot inputarg seeding. Keep `.insert()` at this refresh
+        // site until unroll routes peel allocations through
+        // `reserve_pos` (which honors the `inputarg_base + num_inputs`
+        // floor).
         if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
             ctx.value_types.insert(op.pos.0, op.result_type());
         }
@@ -2970,8 +2990,16 @@ impl Optimizer {
                     // op.pos changes with it. Keep value_types aligned so
                     // later passes and replace_op callers see the correct
                     // type instead of the pre-replace one.
+                    // Replace may change the opcode. RPython's equivalent
+                    // (OptimizationResult.replace) keeps the box identity
+                    // so the result type must stay constant — a legitimate
+                    // replace here should produce an op with the same
+                    // result type as whatever was previously registered
+                    // for `op.pos`. Upgrade to `register_value_type` so a
+                    // type-changing replacement panics at the source
+                    // instead of silently retyping the OpRef.
                     if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-                        ctx.value_types.insert(op.pos.0, op.result_type());
+                        ctx.register_value_type(op.pos, op.result_type());
                     }
                     current_op = op;
                 }
@@ -3096,11 +3124,13 @@ impl Optimizer {
                 op.args
             );
             // RPython parity: the current ResOp already carries type 'i'.
-            // majit's OpRef type cache can still hold stale None/Void/Float
-            // from an earlier position reuse until emit() commits the op.
-            // Stamp the current op's authoritative result type before the
-            // getintbound/with_intbound_mut path reads box.type.
-            ctx.value_types.insert(op.pos.0, majit_ir::Type::Int);
+            // The op has `result_type() == Int` (asserted above), so
+            // registering the type here is either a first-time record (fresh
+            // pos) or a same-type no-op (the op was visited before). A
+            // different cached type means a Phase 1 op left a stale
+            // value_types entry at this reused pos — precisely the cross-type
+            // mutation the invariant guard is designed to surface.
+            ctx.register_value_type(op.pos, majit_ir::Type::Int);
             ctx.with_intbound_mut(op.pos, |bound| bound.make_bool());
         }
         let emitted = ctx.emit(op.clone());

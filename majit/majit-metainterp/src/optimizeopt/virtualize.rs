@@ -1911,13 +1911,27 @@ mod tests {
     }
 
     fn run_pass(ops: &[Op]) -> Vec<Op> {
+        run_pass_typed(ops, &[])
+    }
+
+    /// Like `run_pass`, but declares specific OpRef slots as Int-typed.
+    /// Use for tests whose anonymous high-numbered Boxes feed int-typed
+    /// setfield values — otherwise the MUST_ALIAS replay through
+    /// `replace_op` would cross-type-forward an Int-typed `getfield_gc_i`
+    /// result into the Ref-seeded value slot and trip the Box.type
+    /// invariant guard on `replace_op`.
+    fn run_pass_typed(ops: &[Op], int_slots: &[u32]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptVirtualize::new()));
         // See `run_heap_opt` in heap.rs for the rationale behind the
         // 1024 Ref seed: tests use anonymous high-numbered OpRefs as
         // stand-in Box arguments, and the preamble exporter needs an
         // intrinsic type per renamed inputarg.
-        opt.trace_inputarg_types = vec![Type::Ref; 1024];
+        let mut types = vec![Type::Ref; 1024];
+        for &idx in int_slots {
+            types[idx as usize] = Type::Int;
+        }
+        opt.trace_inputarg_types = types;
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
@@ -2274,7 +2288,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        let result = run_pass_typed(&ops, &[100]);
         assert!(
             result.is_empty(),
             "all ops should be removed; got {} ops: {:?}",
@@ -2561,7 +2575,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        let result = run_pass_typed(&ops, &[100]);
         assert!(
             result.is_empty(),
             "all struct ops should be removed; got {} ops",
@@ -2617,7 +2631,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        let result = run_pass_typed(&ops, &[100, 200]);
         assert!(
             result.is_empty(),
             "all ops on virtual should be removed; got {} ops",

@@ -3549,10 +3549,26 @@ mod tests {
     /// `renamed_inputarg_types`, and Ref keeps heap/aliasing tests on
     /// the same path RPython exercises for pointer Boxes.
     fn run_heap_opt(ops: &mut [Op]) -> Vec<Op> {
+        run_heap_opt_typed(ops, &[])
+    }
+
+    /// Like `run_heap_opt`, but declares specific OpRef slots as Int-typed.
+    /// Use for tests whose anonymous high-numbered Boxes are bound to
+    /// int-typed fields (setfield_gc value, int_ args, etc.). Without this
+    /// the `trace_inputarg_types = vec![Ref; 1024]` default types every
+    /// anonymous slot as Ref and the heap cache's MUST_ALIAS replacement
+    /// `replace_op(getfield_gc_i.pos:Int, cached_value:Ref)` trips the
+    /// `replace_op` cross-type assertion introduced for the Box.type
+    /// invariant.
+    fn run_heap_opt_typed(ops: &mut [Op], int_slots: &[u32]) -> Vec<Op> {
         assign_positions(ops);
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptHeap::new()));
-        opt.trace_inputarg_types = vec![Type::Ref; 1024];
+        let mut types = vec![Type::Ref; 1024];
+        for &idx in int_slots {
+            types[idx as usize] = Type::Int;
+        }
+        opt.trace_inputarg_types = types;
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
@@ -3569,7 +3585,9 @@ mod tests {
             // Terminate trace so lazy set is forced.
             Op::new(OpCode::Jump, &[]),
         ];
-        let result = run_heap_opt(&mut ops);
+        // OpRef(101) is the Int value stored into the Int-typed field; the
+        // cache replays it as the GetfieldGcI result.
+        let result = run_heap_opt_typed(&mut ops, &[101]);
 
         // force_all_lazy_setfields emits the lazy SetfieldGc before Jump.
         // GetfieldGcI is eliminated (replaced by cached i1). SetfieldGc + Jump.
@@ -3738,7 +3756,7 @@ mod tests {
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(200)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
-        let result = run_heap_opt(&mut ops);
+        let result = run_heap_opt_typed(&mut ops, &[101, 201]);
 
         // RPython CachedField per-descr with aliasing analysis:
         // - setfield(p1) forces lazy_set(p0) → emit SETFIELD(p0), put_back p0
@@ -3890,7 +3908,10 @@ mod tests {
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
-        let result = run_heap_opt(&mut ops);
+        // OpRef(101) is the Int setfield value + guard condition OpRef(200)
+        // stays as Ref (guards accept Ref-typed "any non-null" predicates
+        // in this harness).
+        let result = run_heap_opt_typed(&mut ops, &[101]);
 
         // SETFIELD (forced by guard) + GUARD_TRUE + Jump.
         // GETFIELD is eliminated (cache survives guards).
@@ -4131,7 +4152,7 @@ mod tests {
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
-        let result = run_heap_opt(&mut ops);
+        let result = run_heap_opt_typed(&mut ops, &[101, 102]);
 
         // Both GETFIELDs eliminated (cached). Both lazy SetfieldGc emitted before Jump.
         assert_eq!(result.len(), 3);

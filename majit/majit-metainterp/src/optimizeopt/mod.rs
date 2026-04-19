@@ -839,6 +839,39 @@ impl OptContext {
         self.quasi_immutable_deps.insert(dep);
     }
 
+    /// RPython Box.type invariant: each OpRef's type is fixed at creation
+    /// (IntFrontendOp / RefFrontendOp / FloatFrontendOp are separate classes
+    /// and `box.type` is a class property, immutable for the box's lifetime).
+    /// pyre carries the type externally in `value_types`, so enforce the
+    /// invariant here: inserting an OpRef that already has a *different*
+    /// type is the only form of divergence from RPython. The assertion is
+    /// debug-only so release builds are unaffected; it flips on the
+    /// violation so we can locate the callsite and emit an explicit re-box
+    /// (wrapint / wrapfloat / unbox) instead of silently retyping.
+    ///
+    /// Void (no result) is rejected because value_types keeps only
+    /// producing ops; callers gate on `op.result_type() != Void` before
+    /// calling in.
+    pub fn register_value_type(&mut self, opref: majit_ir::OpRef, tp: majit_ir::Type) {
+        debug_assert_ne!(
+            tp,
+            majit_ir::Type::Void,
+            "register_value_type: Void has no box value (opref={:?})",
+            opref,
+        );
+        if let Some(&existing) = self.value_types.get(&opref.0) {
+            debug_assert_eq!(
+                existing, tp,
+                "register_value_type: OpRef {:?} retyped from {:?} to {:?} \
+                 (RPython Box.type invariant violation; emit explicit \
+                 wrapint/wrapfloat/unbox at the producer instead of \
+                 retyping in place)",
+                opref, existing, tp,
+            );
+        }
+        self.value_types.insert(opref.0, tp);
+    }
+
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
@@ -1276,6 +1309,14 @@ impl OptContext {
 
         // Track OpRef → Type for fail_arg_types inference
         // (compile.rs value_types parity).
+        // emit() may re-write an existing value_types entry when the same
+        // Register the op's result type. Production emits each pos
+        // exactly once, so this is either a first-time write or a
+        // same-type no-op. Keep `.insert()` until unroll's peel_iteration
+        // (unroll.rs:4503-4555) stops computing positions arithmetically
+        // from `new_operations.len()` — without that fix, peeled ops
+        // land inside the 1024-slot inputarg seeding and flip the
+        // Box.type invariant.
         if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
             self.value_types.insert(op.pos.0, op.result_type());
         }
@@ -1294,14 +1335,9 @@ impl OptContext {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
         let pos_ref = op.pos;
-        // Box.type parity: mirror emit() — register the result type at the
-        // moment the op is queued so any subsequent `opref_type` /
-        // `replace_op` lookup observes the correct type. Without this, a
-        // pos that was reserved on an earlier pass (or carried over from
-        // Phase 1) keeps a stale value_types entry, which `force_box` then
-        // reads back as cross-type forwarding. RPython has no equivalent
-        // stale-entry risk because Box.type is intrinsic to the Box object
-        // itself.
+        // Box.type parity: mirror emit() — register the result type at
+        // the moment the op is queued. Keep `.insert()` for the same
+        // unroll/peel_iteration caveat documented on `emit()`.
         if op.result_type() != majit_ir::Type::Void {
             self.value_types.insert(op.pos.0, op.result_type());
         }
@@ -2152,6 +2188,26 @@ impl OptContext {
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
         if old == new || old.is_constant() {
             return;
+        }
+        // RPython Box.type invariant: `make_equal_to(box, other)` only
+        // fires between boxes of matching type (IntFrontendOp only ever
+        // forwards to something with `.type == 'i'`). A cross-type
+        // forward would change `opref_type(old)`'s answer from its
+        // original kind to `new`'s kind — the exact retyping the
+        // `register_value_type` guard is designed to forbid. Assert here
+        // so the wrong-kind forward surfaces at the replace site rather
+        // than silently at the next downstream lookup.
+        if !new.is_none() {
+            if let (Some(old_tp), Some(new_tp)) = (self.opref_type(old), self.opref_type(new)) {
+                debug_assert_eq!(
+                    old_tp, new_tp,
+                    "replace_op: cross-type forward {:?}:{:?} -> {:?}:{:?} \
+                     (RPython Box.type invariant violation; emit explicit \
+                     wrapint/wrapfloat/unbox before forwarding instead of \
+                     retyping through replace_op)",
+                    old, old_tp, new, new_tp,
+                );
+            }
         }
         use crate::optimizeopt::info::Forwarded;
         let idx = old.0 as usize;
