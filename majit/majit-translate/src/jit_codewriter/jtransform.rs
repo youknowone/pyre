@@ -160,7 +160,19 @@ pub struct GraphTransformResult {
 ///
 /// Convenience wrapper that creates a `Transformer` and runs it.
 /// RPython equivalent: jtransform.py `transform_graph()`.
+///
+/// This wrapper does NOT run `lower_indirect_calls` (the
+/// rtyper-equivalent pass lives in
+/// `translator/rtyper/rpbc.rs`).  Callers that can produce
+/// `CallTarget::Indirect` must go through
+/// `codewriter::transform_graph_to_jitcode` instead, which threads
+/// `&CallControl` and runs the lowering pass before jtransform.
+/// This debug-assertion catches missed lowering sites at the
+/// last remaining entry (`translate_legacy/pipeline.rs::analyze_function`
+/// + lib/test helpers) — plan Rev 2 §Phase B3.
 pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
+    #[cfg(debug_assertions)]
+    crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
     let mut transformer = Transformer::new(config);
     transformer.transform(graph)
 }
