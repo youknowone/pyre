@@ -1040,34 +1040,40 @@ impl TraceCtx {
     }
 
     /// Update both halves of a standard virtualizable slot (OpRef + concrete).
-    /// RPython `virtualizable_boxes[index] = valuebox` parity.
     ///
-    /// When the incoming concrete's majit_ir::Type does not match the slot's
-    /// declared type, only the OpRef half is updated and the concrete side
-    /// keeps its previous (heap-seeded) entry.  This guards against pyre's
-    /// unboxed-optimization leaking into a Ref-typed slot
-    /// (`locals_cells_stack_w` is a `list[W_Object]` in PyPy); RPython
-    /// would have emitted a `NEW_W_*` boxing op before the write so
-    /// `virtualizable_boxes[i]` always carries a Ref for such slots.
-    /// Until pyre's codewriter mirrors that boxing at STORE_FAST, the
-    /// safest stance is to leave the typed concrete untouched — stale
-    /// but at least type-correct, so a later `BC_GETARRAYITEM_VABLE_R`
-    /// does not ship a null pointer to `set_ref_reg`.
+    /// pyjitpl.py:1237 parity:
+    ///
+    /// ```text
+    ///     self.metainterp.virtualizable_boxes[index] = valuebox
+    ///     self.metainterp.synchronize_virtualizable()
+    /// ```
+    ///
+    /// Writes the entire Box (SSA identity + concrete value) atomically so
+    /// the (OpRef, concrete) pair never diverges.  Callers must ensure
+    /// `value.get_type()` matches the slot's declared type
+    /// (`virtualizable_slot_type(index)`); RPython guarantees this at the
+    /// source level by emitting `NEW_W_INT` / `NEW_W_FLOAT` before any
+    /// STORE into a Ref-typed `locals_cells_stack_w` slot
+    /// (pypy/interpreter/pyframe.py:84 `list[W_Object]`).  Pyre's codewriter
+    /// does not yet mirror that boxing at STORE_FAST → vable (Phase 4-5 of
+    /// the portal-locals lowering plan); until it does, non-Phase-D paths
+    /// like `pyre::trace_opcode::store_local_value` may write a pyre-unboxed
+    /// `Value::Int`/`Value::Float` into a Ref slot and a later
+    /// `BC_GETARRAYITEM_VABLE_R` read will decode 0 via `value_as_ref_bits`.
+    /// That null is a pyre-upstream parity gap, not a shadow bug — the
+    /// shadow faithfully reflects the caller's Box.
     pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) -> bool {
-        let slot_type = self.virtualizable_slot_type(index);
-        let concrete_matches = slot_type.map(|ty| ty == value.get_type()).unwrap_or(true);
         let have_boxes = self
             .virtualizable_boxes
             .as_mut()
             .and_then(|boxes| boxes.get_mut(index).map(|slot| *slot = opref))
             .is_some();
-        if concrete_matches {
-            let _ = self
-                .virtualizable_values
-                .as_mut()
-                .and_then(|vals| vals.get_mut(index).map(|slot| *slot = value));
-        }
-        have_boxes
+        let have_values = self
+            .virtualizable_values
+            .as_mut()
+            .and_then(|vals| vals.get_mut(index).map(|slot| *slot = value))
+            .is_some();
+        have_boxes && have_values
     }
 
     /// Return the standard virtualizable identity (`virtualizable_boxes[-1]`).
@@ -3742,10 +3748,10 @@ mod tests {
         info
     }
 
-    // Test helper: concrete placeholder matching slot declared type.  The
-    // tests only care about OpRef plumbing; actual concrete values are
-    // never inspected but must type-check against the slot to avoid being
-    // silently dropped by `set_virtualizable_entry_at`'s type guard.
+    // Test helper: typed placeholder matching each slot's declared type so
+    // the Box's (OpRef, concrete) pair stays internally consistent — the
+    // RPython `virtualizable_boxes[index] = valuebox` invariant.  Tests
+    // only inspect OpRef plumbing; the concrete half is never read.
     fn ph(ty: Type) -> Value {
         match ty {
             Type::Int => Value::Int(0),

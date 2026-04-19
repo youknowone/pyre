@@ -545,6 +545,7 @@ pub(crate) fn seed_virtualizable_boxes(
     scalar_oprefs: &[OpRef],
     array_items: &[OpRef],
     array_len: usize,
+    vable_heap_ptr: *const u8,
 ) {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
@@ -565,19 +566,67 @@ pub(crate) fn seed_virtualizable_boxes(
         }
     }
     let array_lengths = vec![array_len];
-    // Bridge-entry seed: OpRefs come from resume-data reconstruction but no
-    // live concrete values are available here — pass an empty `input_values`
-    // to disable the concrete shadow (see `init_virtualizable_boxes`
-    // doc-comment).  Consumers of `virtualizable_entry_at` will fall back
-    // to the zero placeholder, matching the shadow's pre-concrete state.
+    // pyjitpl.py:3417 bridge-entry parity:
+    //     self.virtualizable_boxes = virtualizable_boxes
+    //     self.synchronize_virtualizable()
+    // RPython's `virtualizable_boxes` at bridge entry comes from
+    // `vinfo.read_boxes(cpu, virtualizable, 0)` — a heap read that
+    // yields one live Box per slot, typed per field_descr / array item
+    // type.  pyre mirrors that here: read the concrete halves straight
+    // from `vable_heap_ptr` and build a typed Value per slot so the
+    // shadow returned by `virtualizable_entry_at` is a complete Box.
+    // The trailing vable identity entry is pushed inside
+    // `init_virtualizable_boxes` with the heap-pointer encoded as
+    // Value::Ref(GcRef(vable_heap_ptr as usize)).
+    let (input_values, vable_ref_value) = if !vable_heap_ptr.is_null() {
+        let (static_boxes, array_boxes) =
+            unsafe { info.read_all_boxes(vable_heap_ptr, &array_lengths) };
+        let mut values = Vec::with_capacity(input_oprefs.len());
+        for (i, bits) in static_boxes.iter().enumerate() {
+            values.push(value_for_slot(info.static_fields[i].field_type, *bits));
+        }
+        for (a, items) in array_boxes.iter().enumerate() {
+            let item_ty = info.array_fields[a].item_type;
+            for bits in items {
+                values.push(value_for_slot(item_ty, *bits));
+            }
+        }
+        // Pad short array-box vectors to match the padded OpRef vector.
+        while values.len() < input_oprefs.len() {
+            values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
+        }
+        (
+            values,
+            majit_ir::Value::Ref(majit_ir::GcRef(vable_heap_ptr as usize)),
+        )
+    } else {
+        // No live heap pointer (unit-test / init-before-run path).  Fall
+        // back to the pre-shadow behaviour: empty slice disables the
+        // concrete shadow and `virtualizable_entry_at` returns None.
+        (Vec::new(), majit_ir::Value::Void)
+    };
     ctx.init_virtualizable_boxes(
         &info,
         vable_ref,
-        majit_ir::Value::Void,
+        vable_ref_value,
         &input_oprefs,
-        &[],
+        &input_values,
         &array_lengths,
     );
+}
+
+/// Decode a raw `vinfo.read_all_boxes` entry into the typed Value a
+/// virtualizable shadow slot expects.  Local helper that mirrors
+/// `majit-metainterp::pyjitpl::heap_value_for` so both seed sites (root
+/// portal in `initialize_virtualizable` and bridge entry here) use the
+/// same raw-bit → typed-Value rule.
+fn value_for_slot(ty: Type, bits: i64) -> majit_ir::Value {
+    match ty {
+        Type::Int => majit_ir::Value::Int(bits),
+        Type::Float => majit_ir::Value::Float(f64::from_bits(bits as u64)),
+        Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)),
+        Type::Void => majit_ir::Value::Void,
+    }
 }
 
 /// resume.py:1054 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
@@ -1904,6 +1953,7 @@ impl PyreSym {
                 &scalar_oprefs,
                 &array_items,
                 array_len,
+                concrete_frame as *const u8,
             );
         }
     }
@@ -3155,6 +3205,7 @@ impl JitState for PyreJitState {
             &scalar_oprefs,
             &vable_array_items,
             bridge_array_len,
+            sym.concrete_vable_ptr as *const u8,
         );
         // Bridge stack: the target loop header has stack_only=0.
         sym.symbolic_stack = Vec::new();
