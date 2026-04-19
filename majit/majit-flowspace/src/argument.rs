@@ -1,13 +1,12 @@
 //! Arguments objects.
 //!
-//! RPython basis: `rpython/flowspace/argument.py`.
+//! RPython basis: `rpython/flowspace/argument.py` (127 LOC).
 //!
-//! Partial port landed as part of Phase 2 F2.2 because
-//! `bytecode.HostCode::signature` requires `Signature`. The sibling
-//! `CallSpec` class, the `fromshape` classmethod, and the call-site
-//! helpers land in Phase 3 F3.2 when the flow-space operation layer
-//! needs them. Order matches upstream `argument.py`: `Signature` first,
-//! then `CallSpec`.
+//! Phase 2 F2.2 landed `Signature` first because
+//! `bytecode.HostCode::signature` required it. Phase 3 F3.2 (this
+//! extension) adds `CallSpec`, `_rawshape`, `flatten`, `as_list`, and
+//! `fromshape`. Order matches upstream `argument.py`: `Signature`
+//! first, then `CallSpec`.
 
 /// Descriptor for a function's formal parameter list.
 ///
@@ -80,9 +79,153 @@ impl Signature {
 // in Phase 5 handles this by pattern-matching on `Signature` directly
 // rather than `s[0] / s[1] / s[2]`, so no Rust equivalent is emitted.
 
+use crate::model::{Constant, Hlvalue};
+use std::collections::BTreeMap;
+
+/// Shape key of a call site: `(shape_cnt, shape_keys, shape_star)`.
+///
+/// RPython basis: `CallSpec._rawshape()` returns `(int, tuple-of-str,
+/// bool)`; we mirror the three fields explicitly. `shape_keys` is
+/// kept sorted (upstream uses `tuple(sorted(self.keywords))`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CallShape {
+    /// Number of positional arguments — RPython `shape_cnt`.
+    pub shape_cnt: usize,
+    /// Sorted keyword names — RPython `shape_keys` (`tuple(sorted(...))`).
+    pub shape_keys: Vec<String>,
+    /// Whether a `*args` slot is present — RPython `shape_star`.
+    pub shape_star: bool,
+}
+
+/// Arguments passed into a function call site: the `a, b, *c, **d`
+/// part in `return func(a, b, *c, **d)`.
+///
+/// RPython basis: `argument.py:76-125` — `class CallSpec`.
+///
+/// ### Deviation from upstream (parity rule #1)
+///
+/// RPython's `keywords` field is an arbitrary `dict` whose iteration
+/// order is unstable (relies on `sorted()` at shape time). Rust
+/// uses `BTreeMap<String, Hlvalue>` so the internal order is already
+/// sorted — `_rawshape()` reads keys directly without an explicit
+/// sort. Upstream semantics preserved: the `shape_keys` tuple is
+/// always the sorted key list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallSpec {
+    /// RPython `CallSpec.arguments_w`.
+    pub arguments_w: Vec<Hlvalue>,
+    /// RPython `CallSpec.keywords` — `BTreeMap` replaces upstream's
+    /// unordered `dict`; see deviation note above.
+    pub keywords: BTreeMap<String, Hlvalue>,
+    /// RPython `CallSpec.w_stararg`.
+    pub w_stararg: Option<Hlvalue>,
+}
+
+impl CallSpec {
+    /// RPython `CallSpec.__init__(args_w, keywords=None, w_stararg=None)`.
+    pub fn new(
+        arguments_w: Vec<Hlvalue>,
+        keywords: Option<BTreeMap<String, Hlvalue>>,
+        w_stararg: Option<Hlvalue>,
+    ) -> Self {
+        CallSpec {
+            arguments_w,
+            keywords: keywords.unwrap_or_default(),
+            w_stararg,
+        }
+    }
+
+    /// RPython `CallSpec._rawshape()`.
+    pub fn rawshape(&self) -> CallShape {
+        CallShape {
+            shape_cnt: self.arguments_w.len(),
+            shape_keys: self.keywords.keys().cloned().collect(),
+            shape_star: self.w_stararg.is_some(),
+        }
+    }
+
+    /// RPython `CallSpec.flatten()` — "Argument <-> list of w_objects
+    /// together with 'shape' information".
+    pub fn flatten(&self) -> (CallShape, Vec<Hlvalue>) {
+        let shape = self.rawshape();
+        let mut data_w: Vec<Hlvalue> = self.arguments_w.clone();
+        for key in &shape.shape_keys {
+            // BTreeMap key lookup is total since shape.shape_keys came
+            // from self.keywords.keys(); `unwrap` matches upstream's
+            // `self.keywords[key]` direct indexing.
+            data_w.push(self.keywords.get(key).unwrap().clone());
+        }
+        if shape.shape_star {
+            data_w.push(self.w_stararg.clone().unwrap());
+        }
+        (shape, data_w)
+    }
+
+    /// RPython `CallSpec.as_list()`.
+    ///
+    /// Upstream asserts `not self.keywords` and, if `w_stararg` is
+    /// present, unpacks `w_stararg.value` into individual
+    /// `Constant(x)` cells via `const(x) for x in w_stararg.value`.
+    pub fn as_list(&self) -> Vec<Hlvalue> {
+        assert!(
+            self.keywords.is_empty(),
+            "as_list() called with keywords present"
+        );
+        match &self.w_stararg {
+            None => self.arguments_w.clone(),
+            Some(Hlvalue::Constant(stararg)) => {
+                let items = match &stararg.value {
+                    crate::model::ConstValue::Tuple(items)
+                    | crate::model::ConstValue::List(items) => items,
+                    other => panic!(
+                        "CallSpec.as_list expected tuple/list Constant for w_stararg, got {other:?}"
+                    ),
+                };
+                let mut out = self.arguments_w.clone();
+                out.extend(
+                    items
+                        .iter()
+                        .cloned()
+                        .map(|value| Hlvalue::Constant(Constant::new(value))),
+                );
+                out
+            }
+            Some(other) => panic!("CallSpec.as_list expected Constant stararg, got {other:?}"),
+        }
+    }
+
+    /// RPython `CallSpec.fromshape(cls, (shape_cnt, shape_keys,
+    /// shape_star), data_w)`.
+    pub fn fromshape(shape: &CallShape, data_w: Vec<Hlvalue>) -> Self {
+        let shape_cnt = shape.shape_cnt;
+        let end_keys = shape_cnt + shape.shape_keys.len();
+        let mut p = end_keys;
+        let args_w: Vec<Hlvalue> = data_w[..shape_cnt].to_vec();
+        let keyword_slice = &data_w[shape_cnt..end_keys];
+        let mut keywords: BTreeMap<String, Hlvalue> = BTreeMap::new();
+        for (name, value) in shape.shape_keys.iter().zip(keyword_slice.iter()) {
+            keywords.insert(name.clone(), value.clone());
+        }
+        let w_stararg = if shape.shape_star {
+            let v = data_w[p].clone();
+            p += 1;
+            Some(v)
+        } else {
+            None
+        };
+        let _ = p; // `p` is post-increment upstream; assign-read-drop matches.
+        CallSpec {
+            arguments_w: args_w,
+            keywords,
+            w_stararg,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::model::{ConstValue, Constant, Hlvalue};
 
     // RPython basis: no upstream test for Signature alone — `test_argument.py`
     // exercises `CallSpec`. These smoke tests pin the behaviours that
@@ -107,5 +250,94 @@ mod test {
             sig.getallvarnames(),
             vec!["a".to_string(), "args".into(), "kw".into()]
         );
+    }
+
+    // ---- CallSpec ----
+
+    // Line-by-line port of `test_argument.py:test_flatten_CallSpec`.
+    // Upstream uses plain Python ints (e.g. `CallSpec([1, 2, 3])`).
+    // Rust wraps each int in `Hlvalue::Constant(Constant(Int(_)))` —
+    // `CallSpec` is type-neutral otherwise.
+
+    fn hi(n: i64) -> Hlvalue {
+        Hlvalue::Constant(Constant::new(ConstValue::Int(n)))
+    }
+
+    fn kw(pairs: &[(&str, i64)]) -> BTreeMap<String, Hlvalue> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), hi(*v)))
+            .collect()
+    }
+
+    #[test]
+    fn flatten_positional_only() {
+        let args = CallSpec::new(vec![hi(1), hi(2), hi(3)], None, None);
+        let (shape, data) = args.flatten();
+        assert_eq!(shape.shape_cnt, 3);
+        assert!(shape.shape_keys.is_empty());
+        assert!(!shape.shape_star);
+        assert_eq!(data, vec![hi(1), hi(2), hi(3)]);
+    }
+
+    #[test]
+    fn flatten_positional_and_keyword() {
+        let args = CallSpec::new(vec![hi(1)], Some(kw(&[("b", 2), ("c", 3)])), None);
+        let (shape, data) = args.flatten();
+        assert_eq!(shape.shape_cnt, 1);
+        assert_eq!(shape.shape_keys, vec!["b".to_string(), "c".into()]);
+        assert!(!shape.shape_star);
+        assert_eq!(data, vec![hi(1), hi(2), hi(3)]);
+    }
+
+    #[test]
+    fn flatten_sorts_keyword_order() {
+        // Upstream: `CallSpec([1, 2, 3, 4, 5], {'e': 5, 'd': 7})`
+        // flattens to `((5, ('d', 'e'), False), [1, 2, 3, 4, 5, 7, 5])`.
+        let args = CallSpec::new(
+            vec![hi(1), hi(2), hi(3), hi(4), hi(5)],
+            Some(kw(&[("e", 5), ("d", 7)])),
+            None,
+        );
+        let (shape, data) = args.flatten();
+        assert_eq!(shape.shape_cnt, 5);
+        assert_eq!(shape.shape_keys, vec!["d".to_string(), "e".into()]);
+        assert!(!shape.shape_star);
+        assert_eq!(data, vec![hi(1), hi(2), hi(3), hi(4), hi(5), hi(7), hi(5)]);
+    }
+
+    #[test]
+    fn fromshape_is_flatten_inverse() {
+        let args = CallSpec::new(
+            vec![hi(1), hi(2)],
+            Some(kw(&[("a", 10), ("b", 20)])),
+            Some(hi(99)),
+        );
+        let (shape, data) = args.flatten();
+        let round_trip = CallSpec::fromshape(&shape, data);
+        assert_eq!(round_trip, args);
+    }
+
+    #[test]
+    fn as_list_without_keywords_or_star_returns_positionals() {
+        let args = CallSpec::new(vec![hi(1), hi(2)], None, None);
+        assert_eq!(args.as_list(), vec![hi(1), hi(2)]);
+    }
+
+    #[test]
+    fn as_list_unpacks_star_tuple() {
+        let star = Hlvalue::Constant(Constant::new(ConstValue::Tuple(vec![
+            ConstValue::Int(2),
+            ConstValue::Int(3),
+        ])));
+        let args = CallSpec::new(vec![hi(1)], None, Some(star));
+        assert_eq!(args.as_list(), vec![hi(1), hi(2), hi(3)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "keywords present")]
+    fn as_list_rejects_keywords() {
+        let args = CallSpec::new(vec![hi(1)], Some(kw(&[("x", 1)])), None);
+        let _ = args.as_list();
     }
 }

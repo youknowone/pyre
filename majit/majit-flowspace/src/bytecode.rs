@@ -215,23 +215,13 @@ impl HostCode {
     ///
     /// ### Deviation from RPython (parity rule #1)
     ///
-    /// Two differences from the upstream walker:
-    ///
-    /// 1. RPython returns the opcode **name** as a string (`opname`); we
-    ///    return the typed `Instruction` enum because CPython 3.14's
-    ///    wordcode format is enum-typed at the RustPython layer. The
-    ///    string name was used upstream to drive attribute lookup
-    ///    (`self.opcode_<NAME>(oparg)`), which is not idiomatic in Rust
-    ///    — the Phase 3 `flowcontext.rs` port matches on the enum
-    ///    directly. No information is lost.
-    ///
-    /// 2. RPython folds relative-forward jumps (`HASJREL[opnum]`) into
-    ///    absolute offsets at decode time. We don't — the jump-type
-    ///    inference must inspect the `Instruction` variant anyway (3.14
-    ///    has `JumpBackward`, `JumpForward`, `PopJumpIf*` with
-    ///    different offset interpretations), and that decision is
-    ///    cleanly owned by `flowcontext` in Phase 3. `read` stays a
-    ///    pure mechanical decoder.
+    /// RPython returns the opcode **name** as a string (`opname`); we
+    /// return the typed `Instruction` enum because CPython 3.14's
+    /// wordcode format is enum-typed at the RustPython layer. The
+    /// string name was used upstream to drive attribute lookup
+    /// (`self.opcode_<NAME>(oparg)`), which is not idiomatic in Rust
+    /// — the Phase 3 `flowcontext.rs` port matches on the enum
+    /// directly. No information is lost.
     pub fn read(&self, offset: u32) -> Result<(u32, Instruction, u32), BytecodeCorruption> {
         let byte_offset = offset as usize;
         if !byte_offset.is_multiple_of(2) {
@@ -249,12 +239,15 @@ impl HostCode {
         }
         let mut arg_state = OpArgState::default();
         loop {
+            let instruction_index = idx as u32;
             let unit = units[idx];
             let (op, oparg) = arg_state.get(unit);
             idx += 1;
             if !matches!(op, Instruction::ExtendedArg) {
                 let next_offset = (idx * 2) as u32;
-                return Ok((next_offset, op, u32::from(oparg)));
+                let arg = absolutize_jump_target(instruction_index, &op, u32::from(oparg))
+                    .unwrap_or_else(|| u32::from(oparg));
+                return Ok((next_offset, op, arg));
             }
             if idx >= units.len() {
                 return Err(BytecodeCorruption::new(
@@ -263,6 +256,26 @@ impl HostCode {
             }
         }
     }
+}
+
+fn absolutize_jump_target(offset_units: u32, op: &Instruction, arg: u32) -> Option<u32> {
+    let after = offset_units
+        .checked_add(1)?
+        .checked_add(op.cache_entries() as u32)?;
+    let target_units = match op {
+        Instruction::JumpForward { .. }
+        | Instruction::PopJumpIfFalse { .. }
+        | Instruction::PopJumpIfTrue { .. }
+        | Instruction::PopJumpIfNone { .. }
+        | Instruction::PopJumpIfNotNone { .. }
+        | Instruction::ForIter { .. }
+        | Instruction::Send { .. } => after.checked_add(arg)?,
+        Instruction::JumpBackward { .. } | Instruction::JumpBackwardNoInterrupt { .. } => {
+            after.checked_sub(arg)?
+        }
+        _ => return None,
+    };
+    target_units.checked_mul(2)
 }
 
 #[cfg(test)]
@@ -407,5 +420,41 @@ mod test {
         let host = HostCode::from_code(inner);
         let past_end = (host.co_code.len() * 2) as u32;
         assert!(host.read(past_end).is_err());
+    }
+
+    #[test]
+    fn read_absolutizes_relative_conditional_jump_targets() {
+        let code = compile_source("def f(x):\n    if x:\n        return 1\n    return 0\n");
+        let inner = code
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some(&**code),
+                _ => None,
+            })
+            .expect("function body");
+        let host = HostCode::from_code(inner);
+        let total = (host.co_code.len() * 2) as u32;
+        let mut offset = 0u32;
+        let mut saw_branch = false;
+        while offset < total {
+            let (next, op, arg) = host.read(offset).expect("decoder");
+            if matches!(
+                op,
+                Instruction::PopJumpIfFalse { .. }
+                    | Instruction::PopJumpIfTrue { .. }
+                    | Instruction::PopJumpIfNone { .. }
+                    | Instruction::PopJumpIfNotNone { .. }
+            ) {
+                assert!(arg > next, "relative jump target should be absolutized");
+                saw_branch = true;
+                break;
+            }
+            offset = next;
+        }
+        assert!(
+            saw_branch,
+            "expected a conditional jump in the function body"
+        );
     }
 }

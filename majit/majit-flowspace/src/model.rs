@@ -61,6 +61,13 @@ pub enum ConstValue {
     /// `test_model.py`. Phase 3 generalises this to arbitrary
     /// Python values.
     Int(i64),
+    /// Python tuple constant. Used by `CallSpec.as_list()` to unpack
+    /// `*args` exactly like upstream's `w_stararg.value`.
+    Tuple(Vec<ConstValue>),
+    /// Python list constant. Flowspace treats tuple/list starred args
+    /// identically at this phase: each element is rewrapped into an
+    /// individual `Constant`.
+    List(Vec<ConstValue>),
     /// Boolean constant — used as `Link.exitcase` for if/else
     /// switches (`True` / `False`).
     Bool(bool),
@@ -1231,47 +1238,88 @@ pub fn summary(graph: &FunctionGraph) -> HashMap<String, usize> {
 /// Panics with an assertion failure on any violation, matching
 /// upstream semantics (RPython: `AssertionError`).
 pub fn checkgraph(graph: &FunctionGraph) {
+    for (block, nbargs) in [(&graph.returnblock, 1usize), (&graph.exceptblock, 2usize)] {
+        let b = block.borrow();
+        assert_eq!(b.inputargs.len(), nbargs);
+        assert!(
+            b.operations.is_empty(),
+            "exitblock must not contain operations"
+        );
+        assert!(b.exits.is_empty(), "exitblock must not contain exits");
+    }
+
     let mut vars_previous_blocks: Vec<Variable> = Vec::new();
 
     for block in graph.iterblocks() {
         let b = block.borrow();
         if b.exits.is_empty() {
-            // Must be either the returnblock or the exceptblock.
             let is_return = BlockKey::of(&block) == BlockKey::of(&graph.returnblock);
             let is_except = BlockKey::of(&block) == BlockKey::of(&graph.exceptblock);
             assert!(is_return || is_except, "exit block not in graph exitblocks");
         }
 
-        let mut vars: Vec<Variable> = Vec::new();
+        let mut vars: HashMap<Variable, Option<usize>> = HashMap::new();
 
-        let mut definevar = |v: &Variable, vars: &mut Vec<Variable>| {
-            assert!(!vars.contains(v), "duplicate variable {}", v.name());
+        let definevar = |v: &Variable,
+                         only_in_link: Option<usize>,
+                         vars: &mut HashMap<Variable, Option<usize>>,
+                         vars_previous_blocks: &[Variable]| {
+            assert!(!vars.contains_key(v), "duplicate variable {}", v.name());
             assert!(
                 !vars_previous_blocks.contains(v),
                 "variable {} used in more than one block",
                 v.name()
             );
-            vars.push(v.clone());
+            vars.insert(v.clone(), only_in_link);
         };
+
+        let usevar =
+            |v: &Variable, in_link: Option<usize>, vars: &HashMap<Variable, Option<usize>>| {
+                let only_in_link = vars
+                    .get(v)
+                    .unwrap_or_else(|| panic!("variable {} used before definition", v.name()));
+                if let Some(in_link) = in_link {
+                    assert!(
+                        only_in_link.is_none() || *only_in_link == Some(in_link),
+                        "variable {} used from the wrong exception link",
+                        v.name()
+                    );
+                }
+            };
 
         for w in &b.inputargs {
             if let Hlvalue::Variable(v) = w {
-                definevar(v, &mut vars);
+                definevar(v, None, &mut vars, &vars_previous_blocks);
             }
         }
 
         for op in &b.operations {
             for a in &op.args {
-                if let Hlvalue::Variable(v) = a {
-                    assert!(vars.contains(v), "op uses undefined variable {}", v.name());
+                match a {
+                    Hlvalue::Variable(v) => usevar(v, None, &vars),
+                    Hlvalue::Constant(c) => assert!(
+                        !matches!(&c.value, ConstValue::Atom(a) if a.name == LAST_EXCEPTION.name),
+                        "last_exception constant cannot appear as an operation argument"
+                    ),
                 }
             }
+            if op.opname == "direct_call" {
+                assert!(
+                    matches!(op.args.first(), Some(Hlvalue::Constant(_))),
+                    "direct_call expects a Constant function argument"
+                );
+            } else if op.opname == "indirect_call" {
+                assert!(
+                    matches!(op.args.first(), Some(Hlvalue::Variable(_))),
+                    "indirect_call expects a Variable function argument"
+                );
+            }
             if let Hlvalue::Variable(v) = &op.result {
-                definevar(v, &mut vars);
+                definevar(v, None, &mut vars, &vars_previous_blocks);
             }
         }
 
-        // exit structure checks.
+        let mut exc_links: Vec<usize> = Vec::new();
         match &b.exitswitch {
             None => {
                 assert!(b.exits.len() <= 1, "block without exitswitch has > 1 exits");
@@ -1284,21 +1332,73 @@ pub fn checkgraph(graph: &FunctionGraph) {
             }
             Some(Hlvalue::Constant(c)) if matches!(&c.value, ConstValue::Atom(a) if a.name == LAST_EXCEPTION.name) =>
             {
-                // canraise block — deferred: upstream checks raising_op.opname
-                // not in {"keepalive", "cast_pointer", "same_as"} and exit[0]
-                // exitcase is None. Those checks depend on `llexitcase`
-                // subclassing BaseException, which lives in Phase 6 rtyper.
+                assert!(
+                    !b.operations.is_empty(),
+                    "canraise block must end with a raising operation"
+                );
+                let raising_op = b.raising_op().expect("canraise block missing raising_op");
+                assert!(
+                    raising_op.opname != "keepalive"
+                        && raising_op.opname != "cast_pointer"
+                        && raising_op.opname != "same_as",
+                    "invalid raising_op for canraise block"
+                );
+                assert!(
+                    b.exits.len() >= 2,
+                    "canraise block requires exception exits"
+                );
+                assert!(b.exits[0].borrow().exitcase.is_none());
+                for link in b.exits.iter().skip(1) {
+                    assert!(link.borrow().exitcase.is_some());
+                    exc_links.push(Rc::as_ptr(link) as usize);
+                }
             }
             Some(Hlvalue::Variable(sw)) => {
-                assert!(vars.contains(sw), "exitswitch Variable not in block vars");
+                usevar(sw, None, &vars);
+                let is_boolean_switch = b.exits.len() == 2
+                    && matches!(
+                        (
+                            b.exits[0].borrow().exitcase.as_ref(),
+                            b.exits[1].borrow().exitcase.as_ref()
+                        ),
+                        (
+                            Some(Hlvalue::Constant(Constant {
+                                value: ConstValue::Bool(false),
+                                ..
+                            })),
+                            Some(Hlvalue::Constant(Constant {
+                                value: ConstValue::Bool(true),
+                                ..
+                            }))
+                        )
+                    );
+                if !is_boolean_switch {
+                    assert!(!b.exits.is_empty(), "switch block must have exits");
+                    for link in &b.exits {
+                        let exitcase = link
+                            .borrow()
+                            .exitcase
+                            .clone()
+                            .expect("switch exitcase cannot be None");
+                        match exitcase {
+                            Hlvalue::Constant(Constant {
+                                value: ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::None,
+                                ..
+                            }) => {}
+                            other => panic!("switch on a non-primitive value {other:?}"),
+                        }
+                    }
+                }
             }
             Some(Hlvalue::Constant(_)) => {
-                // Constant exitswitch other than last_exception is not a
-                // normal flowspace output; leave it permissible for now.
+                panic!("unexpected constant exitswitch outside canraise blocks");
             }
         }
 
+        let mut all_exitcases: Vec<Option<Hlvalue>> = Vec::new();
         for link_ref in &b.exits {
+            let link_id = Rc::as_ptr(link_ref) as usize;
+            let exc_link = exc_links.contains(&link_id);
             let link = link_ref.borrow();
             let target = link.target.as_ref().expect("link.target missing");
             assert_eq!(
@@ -1311,18 +1411,37 @@ pub fn checkgraph(graph: &FunctionGraph) {
                 prev.as_ref().map_or(false, |p| Rc::ptr_eq(p, &block)),
                 "link.prevblock does not point back to the owning block"
             );
-            for v in &link.args {
-                if let Hlvalue::Variable(v) = v {
-                    assert!(
-                        vars.contains(v),
-                        "link arg uses undefined variable {}",
-                        v.name()
-                    );
+            if exc_link {
+                for extra in [&link.last_exception, &link.last_exc_value] {
+                    let extra = extra.as_ref().expect("exception link missing extravar");
+                    if let Hlvalue::Variable(v) = extra {
+                        definevar(v, Some(link_id), &mut vars, &vars_previous_blocks);
+                    }
+                }
+            } else {
+                assert!(link.last_exception.is_none());
+                assert!(link.last_exc_value.is_none());
+            }
+            for arg in &link.args {
+                if let Hlvalue::Variable(v) = arg {
+                    usevar(v, Some(link_id), &vars);
+                    if exc_link {
+                        if let Some(last_op) = b.operations.last() {
+                            assert!(
+                                *arg != last_op.result,
+                                "raising operation result cannot flow into exception link"
+                            );
+                        }
+                    }
                 }
             }
+            assert!(
+                !all_exitcases.contains(&link.exitcase),
+                "duplicate exitcase in block exits"
+            );
+            all_exitcases.push(link.exitcase.clone());
         }
-        // move current block's vars into the cross-block set.
-        vars_previous_blocks.extend(vars);
+        vars_previous_blocks.extend(vars.into_keys());
     }
 }
 

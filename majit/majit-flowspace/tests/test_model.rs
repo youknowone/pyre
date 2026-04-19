@@ -31,7 +31,7 @@ use std::rc::Rc;
 
 use majit_flowspace::model::{
     Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link,
-    LinkRef, SpaceOperation, Variable, checkgraph, copygraph, mkentrymap,
+    LinkRef, SpaceOperation, Variable, c_last_exception, checkgraph, copygraph, mkentrymap,
 };
 
 /// Upstream `class pieces` — the manually-built graph pieces.
@@ -199,6 +199,37 @@ fn test_checkgraph() {
     // RPython test_model.py:48-49
     let pieces = Pieces::build_sample_graph();
     checkgraph(&pieces.graph);
+}
+
+#[test]
+fn test_checkgraph_accepts_canraise_exception_links() {
+    let startblock = Block::shared(vec![]);
+    let graph = FunctionGraph::new("canraise", startblock.clone());
+    let op_result = Hlvalue::Variable(Variable::named("res"));
+    startblock
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new("call", vec![], op_result.clone()));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+
+    let normal = Rc::new(RefCell::new(Link::new(
+        vec![op_result.clone()],
+        Some(graph.returnblock.clone()),
+        None,
+    )));
+    let last_exception = Hlvalue::Variable(Variable::named("last_exception"));
+    let last_exc_value = Hlvalue::Variable(Variable::named("last_exc_value"));
+    let exceptional = Rc::new(RefCell::new(Link::new(
+        vec![last_exception.clone(), last_exc_value.clone()],
+        Some(graph.exceptblock.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Int(1)))),
+    )));
+    exceptional
+        .borrow_mut()
+        .extravars(Some(last_exception.clone()), Some(last_exc_value.clone()));
+    startblock.closeblock(vec![normal, exceptional]);
+
+    checkgraph(&graph);
 }
 
 #[test]
