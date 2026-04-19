@@ -876,8 +876,6 @@ pub struct PyreSym {
     #[vable(frame)]
     pub frame: OpRef,
     // ── Persistent symbolic frame field tracking ──
-    #[vable(locals)]
-    pub(crate) symbolic_locals: Vec<OpRef>,
     #[vable(stack)]
     pub symbolic_stack: Vec<OpRef>,
     #[vable(local_types)]
@@ -890,7 +888,7 @@ pub struct PyreSym {
     pub(crate) valuestackdepth: usize,
     #[vable(nlocals)]
     pub(crate) nlocals: usize,
-    /// Bridge-specific override for symbolic_locals.
+    /// Bridge-specific override for the locals slice of registers_r.
     /// resume.py:1042 parity: when set, init_symbolic uses these OpRefs
     /// (mapped from RebuiltValue::Box(n) in rebuild_from_resumedata) instead
     /// of the vable_array_base-based layout. This ensures bridge traces see
@@ -929,7 +927,7 @@ pub struct PyreSym {
     pub(crate) vable_array_base: Option<u32>,
     // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
     // Concrete Python object values for locals and stack, tracked in
-    // parallel with symbolic_locals/symbolic_stack. Each opcode handler
+    // parallel with registers_r/symbolic_stack. Each opcode handler
     // updates these alongside the symbolic OpRefs so that guard decisions,
     // branch directions, and call results use internally tracked values
     // instead of reading from an external PyFrame snapshot.
@@ -973,21 +971,15 @@ pub struct PyreSym {
     // ── RPython MIFrame.registers_{i,r,f} parity (pyjitpl.py:74-78) ──
     //
     // Abstract register file disjoint from PyFrame slot indexing.
-    // Indexed by post-regalloc register color, NOT by Python local
-    // index. Each entry is the OpRef currently held by that register
-    // (NONE sentinel for unused slots).
-    //
-    // Stage 3.1: storage only, no consumers yet. Stages 3.2-3.4 will
-    // migrate LOAD_FAST / STORE_FAST / get_list_of_active_boxes /
-    // bridge resume to write/read these instead of `symbolic_locals` /
-    // `symbolic_stack`. After Stage 3.4 the PyFrame-slot-indexed
-    // `symbolic_locals` and `symbolic_stack` get retired.
+    // Indexed by post-regalloc register color. Each entry is the OpRef
+    // currently held by that register (NONE sentinel for unused slots).
     //
     // RPython reference: `rpython/jit/metainterp/pyjitpl.py:74-78`
     //   self.registers_i = [history.CONST_NULL] * jitcode.num_regs_i()
     //   self.registers_r = [history.CONST_NULL] * jitcode.num_regs_r()
     //   self.registers_f = [history.CONST_NULL] * jitcode.num_regs_f()
     pub(crate) registers_i: Vec<OpRef>,
+    #[vable(locals)]
     pub(crate) registers_r: Vec<OpRef>,
     pub(crate) registers_f: Vec<OpRef>,
 }
@@ -1743,7 +1735,6 @@ impl PyreSym {
     pub(crate) fn new_uninit(frame: OpRef) -> Self {
         Self {
             frame,
-            symbolic_locals: Vec::new(),
             symbolic_stack: Vec::new(),
             symbolic_local_types: Vec::new(),
             symbolic_stack_types: Vec::new(),
@@ -1811,7 +1802,11 @@ impl PyreSym {
         } else {
             frame_locals_cells_stack_array(ctx, self.frame)
         };
-        self.symbolic_locals = if let Some(ref overrides) = self.bridge_local_oprefs {
+        // RPython pyjitpl.py:74-78 init analogue for the local-slot view
+        // of registers_r. The bridge override / vable inputarg / NONE
+        // shape is the per-trace seed; subsequent load_local_value /
+        // store_local_value updates the per-color slot directly.
+        self.registers_r = if let Some(ref overrides) = self.bridge_local_oprefs {
             // resume.py:1042 parity: bridge trace uses OpRefs derived from
             // rebuild_from_resumedata (Box(n) → bridge InputArg OpRef(n)).
             let mut locals = overrides.clone();
@@ -1822,13 +1817,6 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; nlocals]
         };
-        // Step 1.5 of the regalloc-parity refactor (RPython MIFrame
-        // pyjitpl.py:74-78 init): mirror the initial local OpRefs into
-        // the abstract register file. Identity color (= local idx)
-        // for now — Step 1.1/1.2 dual-write keeps this in sync at
-        // every load/store; init seed is the same per-trace baseline
-        // (bridge override / virtualizable inputarg / NONE).
-        self.registers_r = self.symbolic_locals.clone();
         let inputarg_slot_types = self.vable_array_base.map(|base| {
             let inputarg_types = ctx.inputarg_types();
             let locals: Vec<Type> = (0..nlocals)
@@ -3167,7 +3155,7 @@ impl JitState for PyreJitState {
         // Part 2 — frame registers (consume_boxes): walk the frame section
         // in liveness enumeration order ([int..., ref..., float...]), map
         // each decoded value back to its frame slot via
-        // `frame_liveness_reg_indices_at`, and write it into symbolic_locals
+        // `frame_liveness_reg_indices_at`, and write it into registers_r
         // / symbolic_stack. This mirrors resume.py:1054 consume_boxes
         // (`_callback_i/_r/_f(register_index)` writing to f.registers_i/_r/_f
         // at the exact slot liveness declared, not at an enumerate-order
@@ -3231,7 +3219,7 @@ impl JitState for PyreJitState {
                 vable_array_items,
             );
         }
-        // Override sym.symbolic_locals so subsequent LOAD_FAST sees the
+        // Override sym.registers_r so subsequent LOAD_FAST sees the
         // bridge inputarg OpRefs, not the parent's vable_array_base+i
         // OpRefs that init_symbolic seeded before setup_bridge_sym ran.
         //
@@ -3241,7 +3229,7 @@ impl JitState for PyreJitState {
         // branch (init_vable_indices hard-codes vable_array_base = 7 for
         // pyre's 7-slot virtualizable header). That branch produces
         // OpRef(base+i) values from the PARENT trace's namespace, leaving
-        // stale parent OpRefs in symbolic_locals after we set
+        // stale parent OpRefs in registers_r after we set
         // bridge_local_oprefs here.
         //
         // virtualizable.py:44 + interp_jit.py:25-31: array item types are
@@ -3249,7 +3237,7 @@ impl JitState for PyreJitState {
         // `trace_guarded_int_payload` (guard_class + getfield_gc_pure_i),
         // matching the RPython unbox-at-consumer model. The slot-level
         // type override is NOT how RPython avoids the guarded path.
-        sym.symbolic_locals = {
+        sym.registers_r = {
             let mut locals = bridge_locals.clone();
             locals.resize(sym.nlocals, OpRef::NONE);
             locals
@@ -4151,7 +4139,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![obj];
+        sym.registers_r = vec![obj];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
 
@@ -4180,7 +4168,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(1);
         let int_obj = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![int_obj];
+        sym.registers_r = vec![int_obj];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
 
@@ -4525,7 +4513,7 @@ mod tests {
             let mut ctx = TraceCtx::for_test(1);
             let local = OpRef(0);
             let mut sym = PyreSym::new_uninit(OpRef::NONE);
-            sym.symbolic_locals = vec![local];
+            sym.registers_r = vec![local];
             sym.symbolic_local_types = vec![symbolic_type];
             sym.nlocals = 1;
 
@@ -4561,7 +4549,7 @@ mod tests {
         // (`push_typed_value` on the operand stack) is responsible for
         // wrapping Int/Float with `wrapint` / `wrapfloat` before the
         // value flows into the stack or local slot. Pin the contract
-        // here: storing a pre-wrapped Ref leaves `symbolic_locals[idx]`
+        // here: storing a pre-wrapped Ref leaves `registers_r[idx]`
         // pointing at the same OpRef with no additional op emitted.
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -4573,7 +4561,7 @@ mod tests {
         // Pre-wrapped Ref — this is the shape producers hand us.
         let ref_value = ctx.const_ref(pyre_object::PY_NULL as i64);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![OpRef::NONE];
+        sym.registers_r = vec![OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
 
@@ -4591,7 +4579,7 @@ mod tests {
             .with_ctx(|this, ctx| this.store_local_value(ctx, 0, ref_value))
             .expect("store of pre-wrapped Ref should succeed");
         assert_eq!(
-            state.sym().symbolic_locals[0],
+            state.sym().registers_r[0],
             ref_value,
             "Ref value must be stored as-is, not reboxed",
         );
@@ -4604,7 +4592,7 @@ mod tests {
         let key = OpRef(0);
         let len = OpRef(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![key];
+        sym.registers_r = vec![key];
         sym.symbolic_local_types = vec![Type::Int];
         sym.nlocals = 1;
 
@@ -4632,7 +4620,7 @@ mod tests {
         let lhs = OpRef(0);
         let rhs = OpRef(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![lhs, rhs];
+        sym.registers_r = vec![lhs, rhs];
         sym.symbolic_local_types = vec![Type::Float, Type::Int];
         sym.nlocals = 2;
 
@@ -4670,7 +4658,7 @@ mod tests {
         let callable = OpRef(0);
         let arg = OpRef(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![callable, arg];
+        sym.registers_r = vec![callable, arg];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
 
@@ -5085,7 +5073,7 @@ mod tests {
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_w_globals = ctx.const_ref(0);
-        sym.symbolic_locals = vec![local0];
+        sym.registers_r = vec![local0];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![stack0, stack1];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
@@ -5139,7 +5127,7 @@ mod tests {
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_w_globals = ctx.const_ref(0);
-        sym.symbolic_locals = vec![OpRef::NONE];
+        sym.registers_r = vec![OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![OpRef::NONE];
         sym.symbolic_stack_types = vec![Type::Int];
@@ -5194,7 +5182,7 @@ mod tests {
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_w_globals = namespace_ref;
-        sym.symbolic_locals = vec![local0];
+        sym.registers_r = vec![local0];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack = vec![stack0, stack1];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
@@ -5245,7 +5233,7 @@ mod tests {
         let value = OpRef(0);
         let callable = OpRef(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![value, callable];
+        sym.registers_r = vec![value, callable];
         sym.symbolic_local_types = vec![Type::Ref, Type::Ref];
         sym.nlocals = 2;
         sym.valuestackdepth = frame.stack_base();
@@ -5308,7 +5296,7 @@ mod tests {
         let list = OpRef(0);
         let key = OpRef(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_locals = vec![list, key];
+        sym.registers_r = vec![list, key];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
         sym.nlocals = 2;
 
@@ -5369,7 +5357,7 @@ mod tests {
             frame.fix_array_ptrs();
 
             let mut sym = PyreSym::new_uninit(OpRef::NONE);
-            sym.symbolic_locals = vec![list, value];
+            sym.registers_r = vec![list, value];
             sym.symbolic_local_types = vec![Type::Ref, symbolic_value_type];
             sym.nlocals = 2;
 

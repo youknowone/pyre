@@ -1616,7 +1616,7 @@ impl CodeWriter {
                 //
                 // Call reads stack slots DIRECTLY rather than copying through
                 // obj_tmp0/obj_tmp1 temps. This keeps the call's argument
-                // registers inside the trace-tracked range (`symbolic_locals`
+                // registers inside the trace-tracked range (`registers_r`
                 // + `symbolic_stack`), so guards fired across the op (e.g.
                 // `GUARD_NOT_FORCED_2` after a helper call) capture the
                 // lhs/rhs values in fail_args. See

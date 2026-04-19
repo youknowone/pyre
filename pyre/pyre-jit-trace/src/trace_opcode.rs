@@ -200,22 +200,18 @@ impl MIFrame {
         };
         // resume.py:1045 consume_one_section invariant: every register
         // reported as live must be reachable via a valid OpRef. RPython
-        // trivially satisfies this because `registers_r[i]` is populated
-        // on every read. pyre's `symbolic_locals[i]` is lazily created
-        // by `load_local_value` — a local that's live at this pc but
-        // never yet LOAD_FASTed in the trace (e.g. a forward-live local
-        // at the loop header whose first use is via a superinstruction
-        // liveness edge) keeps `OpRef::NONE`, poisoning the guard's
-        // fail_args. Mirror RPython's invariant by forcing lazy init
-        // for each live local via the same `load_local_value` path that
-        // LOAD_FAST uses, BEFORE snapshotting symbolic_locals below.
-        // Lazy-load any local that the LivenessInfo at `live_pc` says
-        // is alive but `symbolic_locals` hasn't materialised yet. Same
-        // RPython parity rationale as the loop below — a forward-live
-        // local that's never been LOAD_FASTed in this trace would
-        // otherwise leave OpRef::NONE in the snapshot. Source for the
-        // live indices is `PyJitCodeMetadata.liveness` (see Step A
-        // docstring on the main path below for the rationale).
+        // trivially satisfies this because every read populates
+        // `registers_r[i]`. pyre's locals slice of `registers_r` is
+        // lazily created by `load_local_value` — a local that's live at
+        // this pc but never yet LOAD_FASTed in the trace (e.g. a
+        // forward-live local at the loop header whose first use is via a
+        // superinstruction liveness edge) keeps `OpRef::NONE`, poisoning
+        // the guard's fail_args. Mirror RPython's invariant by forcing
+        // lazy init for each live local via the same `load_local_value`
+        // path that LOAD_FAST uses, BEFORE snapshotting registers_r
+        // below. Source for the live indices is
+        // `PyJitCodeMetadata.liveness` (see Step A docstring on the main
+        // path below for the rationale).
         let nlocals_pre = self.sym().nlocals;
         let jitcode_ptr_pre = self.sym().jitcode;
         let live_local_idxs: Vec<usize> = unsafe {
@@ -250,7 +246,7 @@ impl MIFrame {
         for idx in live_local_idxs {
             let cur = self
                 .sym()
-                .symbolic_locals
+                .registers_r
                 .get(idx)
                 .copied()
                 .unwrap_or(OpRef::NONE);
@@ -258,7 +254,7 @@ impl MIFrame {
                 let _ = MIFrame::load_local_value(self, ctx, idx);
             }
         }
-        let (nlocals, local_values, stack_values, jitcode_ptr, registers_r) = {
+        let (nlocals, registers_r, stack_values, jitcode_ptr) = {
             let s = self.sym();
             let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
                 pre_stack.clone()
@@ -266,22 +262,7 @@ impl MIFrame {
                 let stack_only = s.stack_only_depth();
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
-            // Step 1.3 of the regalloc-parity refactor: snapshot the
-            // register bank alongside the legacy symbolic_locals. The
-            // snapshot closure below reads from `registers_r` so the
-            // encoder follows the RPython MIFrame.registers_X model
-            // (pyjitpl.py:218-225 `add_box_to_storage(self.registers_r[index])`).
-            // `local_values` (= legacy symbolic_locals) stays available
-            // as a fallback for live indices that haven't been mirrored
-            // yet (e.g. bridge resume slots populated through other
-            // paths; later substeps cover those).
-            (
-                s.nlocals,
-                s.symbolic_locals.clone(),
-                stack_values,
-                s.jitcode,
-                s.registers_r.clone(),
-            )
+            (s.nlocals, s.registers_r.clone(), stack_values, s.jitcode)
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
         // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
@@ -304,7 +285,7 @@ impl MIFrame {
                 None
             };
             let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-            for (idx, slot) in local_values.iter().enumerate() {
+            for (idx, slot) in registers_r.iter().enumerate() {
                 let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
                 if is_live {
                     boxes.push(*slot);
@@ -352,7 +333,7 @@ impl MIFrame {
         // mismatch).
         //
         // pyjitpl.py:204-233 parity: iterate live_i, live_r, live_f
-        // banks and snapshot symbolic_locals/stack_values per register
+        // banks and snapshot registers_r/stack_values per register
         // index. Same body as before; only the source of the index list
         // changed.
         let _ = jit_pc; // jit_pc is unused; lookup uses live_pc directly
@@ -372,15 +353,7 @@ impl MIFrame {
         let mut boxes = Vec::with_capacity(total);
         let snapshot = |idx: usize| -> OpRef {
             if idx < nlocals {
-                // Step 1.3 register bank lookup. Falls back to the
-                // legacy symbolic_locals when registers_r is shorter
-                // than nlocals (lazy-init: `load_local_value`/
-                // `store_local_value` only resize on first touch).
-                registers_r
-                    .get(idx)
-                    .copied()
-                    .filter(|opref| !opref.is_none())
-                    .unwrap_or_else(|| local_values.get(idx).copied().unwrap_or(OpRef::NONE))
+                registers_r.get(idx).copied().unwrap_or(OpRef::NONE)
             } else {
                 stack_values
                     .get(idx - nlocals)
@@ -423,7 +396,7 @@ impl MIFrame {
         // inputarg/constant/op.result_type() when the OpRef is not on the
         // symbolic stack.
         let sym = self.sym();
-        if let Some(idx) = sym.symbolic_locals.iter().position(|&slot| slot == value) {
+        if let Some(idx) = sym.registers_r.iter().position(|&slot| slot == value) {
             if let Some(&tp) = sym.symbolic_local_types.get(idx) {
                 return tp;
             }
@@ -617,52 +590,41 @@ impl MIFrame {
         };
         if let Some(op) = vable_entry {
             let s = self.sym_mut();
-            if idx >= s.symbolic_locals.len() {
+            if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            // Sync symbolic_locals with the vable read so downstream
+            // Sync registers_r with the vable read so downstream
             // consumers that still consult the cache-field directly
             // (close_loop_args_at until Phase B migrates it) see the
             // same OpRef.
-            s.symbolic_locals[idx] = op;
+            s.registers_r[idx] = op;
             return Ok(op);
         }
         let s = self.sym_mut();
-        if idx >= s.symbolic_locals.len() {
+        if idx >= s.registers_r.len() {
             return Err(PyError::type_error("local index out of range in trace"));
         }
-        if s.symbolic_locals[idx] == OpRef::NONE {
+        if s.registers_r[idx] == OpRef::NONE {
             if s.bridge_local_oprefs.is_some() {
                 // Bridge trace: OpRef::NONE means this local is a constant
                 // or virtual from resume data, not a missing vable slot.
                 // Read from the concrete frame via array getitem.
                 let frame_ref = s.frame;
                 let idx_const = ctx.const_int(idx as i64);
-                s.symbolic_locals[idx] = trace_array_getitem_value(ctx, frame_ref, idx_const);
+                s.registers_r[idx] = trace_array_getitem_value(ctx, frame_ref, idx_const);
             } else if let Some(base) = s.vable_array_base {
                 // Virtualizable: locals[idx] was loaded in the preamble
                 // and carried as a JUMP arg. OpRef(base + idx) references it.
                 // Reached only when virtualizable_boxes has no entry (e.g.
                 // very early in setup, before initialize_virtualizable runs).
-                s.symbolic_locals[idx] = OpRef(base + idx as u32);
+                s.registers_r[idx] = OpRef(base + idx as u32);
             } else {
                 let idx_const = ctx.const_int(idx as i64);
-                s.symbolic_locals[idx] =
+                s.registers_r[idx] =
                     trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
             }
         }
-        let value = s.symbolic_locals[idx];
-        // Step 1.1 of the regalloc-parity refactor: mirror every
-        // load into the abstract register file (RPython MIFrame
-        // parity, pyjitpl.py:74-78). Color choice is identity
-        // (= Python local idx) for now — the abstract-color drift
-        // happens in later substeps once consumers (step 1.3+)
-        // start treating these indices as opaque.
-        if idx >= s.registers_r.len() {
-            s.registers_r.resize(idx + 1, OpRef::NONE);
-        }
-        s.registers_r[idx] = value;
-        Ok(value)
+        Ok(s.registers_r[idx])
     }
 
     pub(crate) fn store_local_value(
@@ -699,24 +661,16 @@ impl MIFrame {
         );
         let (has_vable, frame_ref, nlocals) = {
             let s = self.sym_mut();
-            if idx >= s.symbolic_locals.len() {
+            if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            s.symbolic_locals[idx] = value;
+            s.registers_r[idx] = value;
             if idx >= s.symbolic_local_types.len() {
                 s.symbolic_local_types.resize(idx + 1, Type::Ref);
             }
             // virtualizable.py:86-98 read_boxes() parity: every item of
             // locals_cells_stack_w is Ref.
             s.symbolic_local_types[idx] = Type::Ref;
-            // Step 1.2 of the regalloc-parity refactor: mirror every
-            // store into the abstract register file. Identity color
-            // (= Python local idx) for now; later substeps drift to
-            // fresh colors.
-            if idx >= s.registers_r.len() {
-                s.registers_r.resize(idx + 1, OpRef::NONE);
-            }
-            s.registers_r[idx] = ref_value;
             (s.vable_array_base.is_some(), s.frame, s.nlocals)
         };
         // RPython pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
@@ -725,7 +679,7 @@ impl MIFrame {
         //
         // `virtualizable_boxes` is the RPython tracing-time mirror of
         // the PyFrame's `locals_cells_stack_w` array. Keep it in sync
-        // with `symbolic_locals` so `close_loop_args_at`'s
+        // with `registers_r` so `close_loop_args_at`'s
         // `set_virtualizable_box_at` writes the current SSA opref (not
         // the preamble InputArg) into every slot.
         if has_vable && idx < nlocals {
@@ -1209,7 +1163,7 @@ impl MIFrame {
                 s.vable_lastblock,
                 s.vable_w_globals,
                 s.nlocals,
-                s.symbolic_locals.clone(),
+                s.registers_r.clone(),
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec(),
                 s.symbolic_local_types.clone(),
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
@@ -1384,7 +1338,7 @@ impl MIFrame {
                 } else {
                     let local_idx = idx - num_scalars;
                     if local_idx < nlocals {
-                        s.symbolic_locals[local_idx] = new_opref;
+                        s.registers_r[local_idx] = new_opref;
                     } else {
                         let stack_idx = local_idx - nlocals;
                         if stack_idx < s.symbolic_stack.len() {
@@ -1894,7 +1848,7 @@ impl MIFrame {
         // which is the single source of truth mirrored by every `_opimpl_setarrayitem_vable`
         // via `synchronize_virtualizable`. pyre's tracer mirrors stores into
         // `ctx.virtualizable_boxes[num_static + i]` for local slots, so prefer that
-        // shadow over the legacy `sym.symbolic_locals[i]` / `stack_values[stack_idx]`
+        // shadow over the legacy `sym.registers_r[i]` / `stack_values[stack_idx]`
         // pair. Fall back to the legacy path only when the shadow slot is OpRef::NONE
         // (stack temporaries that the tracer never mirrored into the shadow).
         let num_static = ctx
@@ -1914,8 +1868,8 @@ impl MIFrame {
                     // pyre stack temporaries live in `sym.symbolic_stack`,
                     // not the vable shadow — keep the legacy fallback for
                     // those slots.
-                    if i < sym.symbolic_locals.len() {
-                        sym.symbolic_locals[i]
+                    if i < sym.registers_r.len() {
+                        sym.registers_r[i]
                     } else {
                         let stack_idx = i - sym.nlocals;
                         if stack_idx < stack_values.len() {
@@ -3527,7 +3481,7 @@ impl MIFrame {
             let mut sym = PyreSym::new_uninit(frame);
             sym.nlocals = callee_nlocals;
             sym.valuestackdepth = callee_nlocals;
-            sym.symbolic_locals = args.to_vec();
+            sym.registers_r = args.to_vec();
             sym.symbolic_local_types = args.iter().map(|&arg| self.value_type(arg)).collect();
             sym.symbolic_stack = Vec::new();
             sym.symbolic_stack_types = Vec::new();
@@ -3597,14 +3551,14 @@ impl MIFrame {
             let mut sym = PyreSym::new_uninit(callee_frame_opref);
             sym.nlocals = callee_nlocals;
             sym.valuestackdepth = sym.nlocals;
-            sym.symbolic_locals = Vec::with_capacity(sym.nlocals);
+            sym.registers_r = Vec::with_capacity(sym.nlocals);
             sym.symbolic_local_types = Vec::with_capacity(sym.nlocals);
             for i in 0..sym.nlocals {
                 if i < args.len() {
-                    sym.symbolic_locals.push(args[i]);
+                    sym.registers_r.push(args[i]);
                     sym.symbolic_local_types.push(self.value_type(args[i]));
                 } else {
-                    sym.symbolic_locals.push(OpRef::NONE);
+                    sym.registers_r.push(OpRef::NONE);
                     sym.symbolic_local_types.push(Type::Ref);
                 }
             }
