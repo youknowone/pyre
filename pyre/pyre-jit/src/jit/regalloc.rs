@@ -67,6 +67,23 @@ pub(super) struct ExternalInputs {
     pub portal_frame_reg: u16,
     pub portal_ec_reg: u16,
     pub portal_inputs: bool,
+    /// Pre-rename stack base (== `nlocals` in the walker's layout).
+    ///
+    /// PRE-EXISTING-ADAPTATION. The trace-side decoder in
+    /// `pyre/pyre-jit-trace/src/trace_opcode.rs` reads
+    /// `register_idx >= nlocals` as "register holds stack slot
+    /// `register_idx - nlocals`", so post-regalloc stack colors must
+    /// equal `stack_base + slot_index`. Without pinning, the chordal
+    /// coloring is free to place stack regs at any color, which breaks
+    /// the tracer's `stack_values[idx - nlocals]` lookup — see
+    /// `memory/phase1_step_d1_regalloc_rename_finding.md`.
+    pub stack_base: u16,
+    /// Number of stack slots to pin (clamp of `depth_at_pc.iter().max()`).
+    ///
+    /// RPython has no analog: its FunctionGraph decode reads PyFrame
+    /// slots via `enumerate_vars` and never reuses Python-semantic
+    /// stack indices as register names.
+    pub max_stack_depth: u16,
 }
 
 /// Result of `allocate_registers`.
@@ -99,6 +116,14 @@ pub(super) fn allocate_registers(
         if kind == Kind::Ref {
             for i in 0..nlocals as u16 {
                 external.push(i);
+            }
+            // Pyre-only: stack regs are Python-semantic pinned slots
+            // (see `ExternalInputs::stack_base` docstring). Pin them
+            // before portal red args so `enforce_input_args` assigns
+            // them colors `nlocals..nlocals+max_stack_depth`, matching
+            // the trace-side `stack_values[idx - nlocals]` decode.
+            for d in 0..inputs.max_stack_depth {
+                external.push(inputs.stack_base + d);
             }
             if inputs.portal_inputs {
                 if inputs.portal_frame_reg != u16::MAX {
@@ -165,6 +190,9 @@ fn enforce_input_args(
         .get_mut(&Kind::Ref)
         .expect("Ref allocator must exist");
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
+    for d in 0..inputs.max_stack_depth {
+        input_indices.push(inputs.stack_base + d);
+    }
     if inputs.portal_inputs {
         if inputs.portal_frame_reg != u16::MAX {
             input_indices.push(inputs.portal_frame_reg);
@@ -672,6 +700,8 @@ mod tests {
             portal_frame_reg: 100,
             portal_ec_reg: 101,
             portal_inputs: true,
+            stack_base: 2,
+            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 2, inputs);
         let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
@@ -706,6 +736,8 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
+            stack_base: 1,
+            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 1, inputs);
         let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
@@ -746,6 +778,8 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
+            stack_base: 0,
+            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 0, inputs);
         assert_eq!(result.num_regs.get(&Kind::Ref).copied(), Some(3));
@@ -775,6 +809,8 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
+            stack_base: 0,
+            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 0, inputs);
         let new5 = result.rename.get(&(Kind::Ref, 5)).copied().unwrap_or(5);
@@ -819,6 +855,8 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
+            stack_base: 1,
+            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 1, inputs);
         let new50 = result.rename.get(&(Kind::Ref, 50)).copied().unwrap_or(50);

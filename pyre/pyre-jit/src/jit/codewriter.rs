@@ -2005,6 +2005,7 @@ impl CodeWriter {
         // The pyre-side post-pass scans the populated SSARepr to build
         // per-kind dependency graphs, runs chordal coloring on each,
         // and returns the rename map applied to the SSARepr in place.
+        let max_stack_depth_observed = depth_at_pc.iter().copied().max().unwrap_or(0);
         let inputs = super::regalloc::ExternalInputs {
             portal_frame_reg,
             portal_ec_reg,
@@ -2013,6 +2014,8 @@ impl CodeWriter {
             // args via the call assembler edge; the dispatch loop
             // does not pre-load them into Ref registers.
             portal_inputs: portal_frame_reg != u16::MAX,
+            stack_base,
+            max_stack_depth: max_stack_depth_observed,
         };
         let alloc_result =
             super::regalloc::allocate_registers(&assembler.ssarepr, code.varnames.len(), inputs);
