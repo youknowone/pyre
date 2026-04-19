@@ -53,13 +53,10 @@ use crate::bytecode::{
 };
 use crate::framestate::{FrameState, StackElem};
 use crate::model::{
-    Block, BlockRef, BlockRefExt, BuiltinFunction, BuiltinObject, BuiltinType, ConstValue,
-    Constant, ExceptionClass, FSException, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation,
-    Variable, c_last_exception,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FSException, FunctionGraph, GraphFunc,
+    HOST_ENV, Hlvalue, HostObject, Link, SpaceOperation, Variable, c_last_exception,
 };
-use crate::specialcase::{
-    SpecialCaseDispatch, builtin_function, lookup_builtin, lookup_special_case,
-};
+use crate::specialcase::{SpecialCaseDispatch, lookup_builtin, lookup_special_case};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowingError {
@@ -180,13 +177,7 @@ impl FlowSignal {
                 Err(FlowContextError::StopFlowing)
             }
             FlowSignal::Raise { w_exc } => {
-                if matches!(
-                    w_exc.w_type,
-                    Hlvalue::Constant(Constant {
-                        value: ConstValue::ExceptionClass(ref class),
-                        ..
-                    }) if class.name == "ImportError"
-                ) {
+                if is_host_class_named(&w_exc.w_type, "ImportError") {
                     let message = exception_message(&w_exc.w_value);
                     return Err(FlowContextError::Flowing(FlowingError::new(format!(
                         "ImportError is raised in RPython: {message}"
@@ -223,63 +214,94 @@ impl FlowSignal {
     }
 }
 
+/// upstream `const(SomeException)` — HostObject 로 감싸진 builtin
+/// exception class 를 `Hlvalue` 로 만든다. HOST_ENV 에 있어야 하며,
+/// 없으면 panic (개발 시 bootstrap 누락을 즉시 드러내기 위함).
 fn exception_class_value(name: &str) -> Hlvalue {
-    Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(
-        ExceptionClass::builtin(name),
-    )))
+    let cls = HOST_ENV
+        .lookup_builtin(name)
+        .unwrap_or_else(|| panic!("HOST_ENV missing exception class {name}"));
+    Hlvalue::Constant(Constant::new(ConstValue::HostObject(cls)))
 }
 
+/// upstream `const(SomeException("msg"))` — instance HostObject 를
+/// 만들어 `Hlvalue` 로 감싼다. `message` 가 Some 이면
+/// `HostObject.instance_args()` 의 0번째가 `ConstValue::Str(message)`.
 fn exception_instance_value(name: &str, message: Option<String>) -> Hlvalue {
-    Hlvalue::Constant(Constant::new(ConstValue::ExceptionInstance {
-        class: ExceptionClass::builtin(name),
-        message,
-    }))
+    let cls = HOST_ENV
+        .lookup_builtin(name)
+        .unwrap_or_else(|| panic!("HOST_ENV missing exception class {name}"));
+    let args = message
+        .map(|m| vec![ConstValue::Str(m)])
+        .unwrap_or_default();
+    let inst = HostObject::new_instance(cls, args);
+    Hlvalue::Constant(Constant::new(ConstValue::HostObject(inst)))
 }
 
+/// upstream `w_exc.w_value.value.args[0]` — `raise ValueError("msg")`
+/// 에서 message 문자열 추출. instance HostObject 의 `instance_args()`
+/// 첫 요소가 `Str` 이면 그 값, 아니면 directly-wrapped `Str` 상수인지
+/// 확인.
 fn exception_message(w_exc_value: &Hlvalue) -> String {
-    match w_exc_value {
-        Hlvalue::Constant(Constant {
-            value:
-                ConstValue::ExceptionInstance {
-                    message: Some(message),
-                    ..
-                },
-            ..
-        }) => message.clone(),
-        Hlvalue::Constant(Constant {
-            value: ConstValue::Str(message),
-            ..
-        }) => message.clone(),
-        _ => "<not a constant message>".to_owned(),
+    if let Hlvalue::Constant(Constant {
+        value: ConstValue::HostObject(obj),
+        ..
+    }) = w_exc_value
+    {
+        if let Some(args) = obj.instance_args() {
+            if let Some(ConstValue::Str(m)) = args.first() {
+                return m.clone();
+            }
+        }
     }
+    if let Hlvalue::Constant(Constant {
+        value: ConstValue::Str(message),
+        ..
+    }) = w_exc_value
+    {
+        return message.clone();
+    }
+    "<not a constant message>".to_owned()
 }
 
+/// HostObject qualname 을 돌려준다; class 이면 class 의 qualname,
+/// instance 면 그 `__class__` 의 qualname.
 fn exception_class_name(w_value: &Hlvalue) -> Option<&str> {
-    match w_value {
+    let obj = match w_value {
         Hlvalue::Constant(Constant {
-            value: ConstValue::ExceptionClass(class),
+            value: ConstValue::HostObject(obj),
             ..
-        }) => Some(class.name.as_str()),
-        Hlvalue::Constant(Constant {
-            value: ConstValue::ExceptionInstance { class, .. },
-            ..
-        }) => Some(class.name.as_str()),
-        _ => None,
+        }) => obj,
+        _ => return None,
+    };
+    if obj.is_class() {
+        Some(obj.qualname())
+    } else if let Some(class) = obj.instance_class() {
+        Some(class.qualname())
+    } else {
+        None
     }
 }
 
-fn exception_class_from_hlvalue(w_value: &Hlvalue) -> Option<ExceptionClass> {
-    match w_value {
+/// `w_value` 가 exception class/instance 를 담고 있으면 class HostObject
+/// 자체를 돌려준다 (class 이면 그 자신, instance 이면 `__class__`).
+fn exception_class_from_hlvalue(w_value: &Hlvalue) -> Option<HostObject> {
+    let obj = match w_value {
         Hlvalue::Constant(Constant {
-            value: ConstValue::ExceptionClass(class),
+            value: ConstValue::HostObject(obj),
             ..
-        }) => Some(class.clone()),
-        Hlvalue::Constant(Constant {
-            value: ConstValue::ExceptionInstance { class, .. },
-            ..
-        }) => Some(class.clone()),
-        _ => None,
+        }) => obj,
+        _ => return None,
+    };
+    if obj.is_class() {
+        Some(obj.clone())
+    } else {
+        obj.instance_class().cloned()
     }
+}
+
+fn is_host_class_named(w_value: &Hlvalue, name: &str) -> bool {
+    exception_class_name(w_value) == Some(name)
 }
 
 fn empty_globals_constant() -> Constant {
@@ -308,28 +330,27 @@ fn exception_restore_token(previous: Option<FSException>) -> StackElem {
 }
 
 fn exception_from_hlvalue(value: &Hlvalue) -> Option<FSException> {
-    match value {
+    let obj = match value {
         Hlvalue::Constant(Constant {
-            value: ConstValue::ExceptionInstance { class, message },
+            value: ConstValue::HostObject(obj),
             ..
-        }) => Some(FSException::new(
-            Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(class.clone()))),
-            Hlvalue::Constant(Constant::new(ConstValue::ExceptionInstance {
-                class: class.clone(),
-                message: message.clone(),
-            })),
-        )),
-        Hlvalue::Constant(Constant {
-            value: ConstValue::ExceptionClass(class),
-            ..
-        }) => Some(FSException::new(
-            Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(class.clone()))),
-            Hlvalue::Constant(Constant::new(ConstValue::ExceptionInstance {
-                class: class.clone(),
-                message: None,
-            })),
-        )),
-        _ => None,
+        }) => obj,
+        _ => return None,
+    };
+    if obj.is_class() {
+        // `value` is a class object; materialise an instance with no args.
+        let inst = HostObject::new_instance(obj.clone(), Vec::new());
+        Some(FSException::new(
+            Hlvalue::Constant(Constant::new(ConstValue::HostObject(obj.clone()))),
+            Hlvalue::Constant(Constant::new(ConstValue::HostObject(inst))),
+        ))
+    } else if let Some(class) = obj.instance_class() {
+        Some(FSException::new(
+            Hlvalue::Constant(Constant::new(ConstValue::HostObject(class.clone()))),
+            Hlvalue::Constant(Constant::new(ConstValue::HostObject(obj.clone()))),
+        ))
+    } else {
+        None
     }
 }
 
@@ -638,13 +659,7 @@ impl BlockRecorder {
         let mut links = Vec::new();
         for case in std::iter::once(None).chain(cases.iter().cloned().map(Some)) {
             let (vars, inputargs, last_exception) = if let Some(case_value) = case.clone() {
-                let last_exc = if matches!(
-                    case_value,
-                    Hlvalue::Constant(Constant {
-                        value: ConstValue::ExceptionClass(ref class),
-                        ..
-                    }) if class.name == "Exception"
-                ) {
+                let last_exc = if is_host_class_named(&case_value, "Exception") {
                     Hlvalue::Variable(Variable::named("last_exception"))
                 } else {
                     case_value.clone()
@@ -1024,14 +1039,31 @@ impl FlowContext {
         Ok(())
     }
 
+    /// upstream `ctx.appcall(func, *args_w)` — record a `direct_call`
+    /// whose callee is a Constant HostObject. Callers build the host
+    /// reference through `HOST_ENV.lookup_builtin` / `module_get`.
     pub(crate) fn appcall(
         &mut self,
-        func: BuiltinFunction,
+        callee: HostObject,
         args_w: Vec<Hlvalue>,
     ) -> Result<Hlvalue, FlowContextError> {
-        let mut args = vec![Hlvalue::Constant(Constant::new(builtin_function(func)))];
+        let mut args = vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+            callee,
+        )))];
         args.extend(args_w);
         self.record_maybe_raise_op("direct_call", args, Self::common_exception_cases())
+    }
+
+    /// 문자열 이름으로 `__builtin__` 항목을 가져와 appcall — 편의 메서드.
+    pub(crate) fn appcall_builtin(
+        &mut self,
+        name: &str,
+        args_w: Vec<Hlvalue>,
+    ) -> Result<Hlvalue, FlowContextError> {
+        let callee = HOST_ENV
+            .lookup_builtin(name)
+            .unwrap_or_else(|| panic!("HOST_ENV missing builtin {name}"));
+        self.appcall(callee, args_w)
     }
 
     /// RPython `flowcontext.py:658-663` — `FlowContext.import_name`.
@@ -1058,7 +1090,7 @@ impl FlowContext {
             .iter()
             .map(|value| Hlvalue::Constant(Constant::new(value.clone())))
             .collect();
-        self.appcall(BuiltinFunction::Import, hlargs)
+        self.appcall_builtin("__import__", hlargs)
     }
 
     /// RPython `flowcontext.py:673-680` — `FlowContext.import_from`.
@@ -1149,7 +1181,7 @@ impl FlowContext {
             Hlvalue::Constant(Constant { value, .. })
                 if matches!(
                     value,
-                    ConstValue::Builtin(BuiltinObject::Type(_)) | ConstValue::ExceptionClass(_)
+                    ConstValue::HostObject(obj) if obj.is_class()
                 )
         );
         let arg2_is_none_const = matches!(
@@ -1172,9 +1204,7 @@ impl FlowContext {
                 "isinstance",
                 vec![
                     w_arg1.clone(),
-                    Hlvalue::Constant(Constant::new(ConstValue::Builtin(BuiltinObject::Type(
-                        BuiltinType::Type,
-                    )))),
+                    Hlvalue::Constant(Constant::new(ConstValue::builtin("type"))),
                 ],
             )?;
             self.guessbool(w_is_type)?
@@ -1279,32 +1309,37 @@ impl FlowContext {
         // upstream: w_type = op.type(w_value).eval(self)
         let w_type = match &w_value {
             Hlvalue::Constant(Constant {
-                value: ConstValue::ExceptionInstance { class, .. },
+                value: ConstValue::HostObject(obj),
                 ..
-            }) => Hlvalue::Constant(Constant::new(ConstValue::ExceptionClass(class.clone()))),
+            }) if obj.is_instance() => {
+                let class_obj = obj.instance_class().cloned().unwrap();
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(class_obj)))
+            }
             _ => self.record_pure_op("type", vec![w_value.clone()])?,
         };
         Ok(FSException::new(w_type, w_value))
     }
 
     /// Constant-fold helper for `op.issubtype(w_valuetype, w_class)`
-    /// when both operands are known ExceptionClass constants.
+    /// when both operands are known HostObject class constants.
     fn const_issubtype(
         w_valuetype: &Hlvalue,
         w_class: &Hlvalue,
     ) -> Result<Option<bool>, FlowContextError> {
         if let (
             Hlvalue::Constant(Constant {
-                value: ConstValue::ExceptionClass(actual),
+                value: ConstValue::HostObject(actual),
                 ..
             }),
             Hlvalue::Constant(Constant {
-                value: ConstValue::ExceptionClass(expected),
+                value: ConstValue::HostObject(expected),
                 ..
             }),
         ) = (w_valuetype, w_class)
         {
-            return Ok(Some(actual.is_subclass_of(expected)));
+            if actual.is_class() && expected.is_class() {
+                return Ok(Some(actual.is_subclass_of(expected)));
+            }
         }
         Ok(None)
     }
@@ -1364,12 +1399,12 @@ impl FlowContext {
         }
         for w_arg in arguments {
             let w_s = self.record_pure_op("str", vec![w_arg])?;
-            let _ = self.appcall(BuiltinFunction::RpythonPrintItem, vec![w_s])?;
+            let _ = self.appcall_builtin("rpython_print_item", vec![w_s])?;
         }
         if let Some(w_end) = keywords.get("end") {
-            let _ = self.appcall(BuiltinFunction::RpythonPrintEnd, vec![w_end.clone()])?;
+            let _ = self.appcall_builtin("rpython_print_end", vec![w_end.clone()])?;
         } else {
-            let _ = self.appcall(BuiltinFunction::RpythonPrintNewline, Vec::new())?;
+            let _ = self.appcall_builtin("rpython_print_newline", Vec::new())?;
         }
         Ok(Hlvalue::Constant(Constant::new(ConstValue::None)))
     }
@@ -1452,12 +1487,13 @@ impl FlowContext {
         // here. Keep this arm BEFORE the SPECIAL_CASES dispatch so the
         // stararg/keyword validation in `handle_print_function` fires
         // before the generic "call with keyword arguments" check.
+        let print_obj = HOST_ENV.lookup_builtin("print").unwrap();
         if matches!(
             &w_function,
             Hlvalue::Constant(Constant {
-                value: ConstValue::Builtin(BuiltinObject::Function(BuiltinFunction::Print)),
+                value: ConstValue::HostObject(obj),
                 ..
-            })
+            }) if *obj == print_obj
         ) {
             return self.handle_print_function(arguments, keywords, w_star);
         }
@@ -1490,9 +1526,9 @@ impl FlowContext {
         } else if let Some(_dispatch) = lookup_special_case(&w_function) {
             let fn_name = match &w_function {
                 Hlvalue::Constant(Constant {
-                    value: ConstValue::Builtin(BuiltinObject::Function(func)),
+                    value: ConstValue::HostObject(obj),
                     ..
-                }) => format!("{func:?}"),
+                }) => obj.qualname().to_owned(),
                 _ => "<builtin>".to_owned(),
             };
             return Err(FlowContextError::Flowing(FlowingError::new(format!(
@@ -1924,11 +1960,34 @@ impl FlowContext {
         result
     }
 
+    /// upstream `rpython/flowspace/flowcontext.py:569-589` — line-by-line.
+    ///
+    /// ```python
+    /// def exception_match(self, w_exc_type, w_check_class):
+    ///     if not isinstance(w_check_class, Constant):
+    ///         raise FlowingError("Non-constant except guard.")
+    ///     check_class = w_check_class.value
+    ///     if not isinstance(check_class, tuple):
+    ///         # the simple case
+    ///         if issubclass(check_class, (NotImplementedError, AssertionError)):
+    ///             raise FlowingError(...)
+    ///         return self.guessbool(op.issubtype(w_exc_type, w_check_class).eval(self))
+    ///     # special case for StackOverflow (see rlib/rstackovf.py)
+    ///     if check_class == rstackovf.StackOverflow:
+    ///         w_real_class = const(rstackovf._StackOverflow)
+    ///         return self.guessbool(op.issubtype(w_exc_type, w_real_class).eval(self))
+    ///     # checking a tuple of classes
+    ///     for klass in w_check_class.value:
+    ///         if self.exception_match(w_exc_type, const(klass)):
+    ///             return True
+    ///     return False
+    /// ```
     pub fn exception_match(
         &mut self,
         w_exc_type: &Hlvalue,
         w_check_class: &Hlvalue,
     ) -> Result<bool, FlowContextError> {
+        // `if not isinstance(w_check_class, Constant): raise`
         let check_value = match w_check_class {
             Hlvalue::Constant(constant) => &constant.value,
             _ => {
@@ -1937,39 +1996,47 @@ impl FlowContext {
                 )));
             }
         };
-        match check_value {
-            ConstValue::ExceptionClass(class) => {
-                if class.name == "StackOverflow" {
-                    return self
-                        .exception_match(w_exc_type, &exception_class_value("_StackOverflow"));
-                }
-                if class.is_subclass_of_name("AssertionError")
-                    || class.is_subclass_of_name("NotImplementedError")
+        // `if not isinstance(check_class, tuple):` → simple class case.
+        if let ConstValue::HostObject(check_class) = check_value {
+            if check_class.is_class() {
+                // `issubclass(check_class, (NotImplementedError, AssertionError))`.
+                let not_impl = HOST_ENV.lookup_builtin("NotImplementedError").unwrap();
+                let assert_err = HOST_ENV.lookup_builtin("AssertionError").unwrap();
+                if check_class.is_subclass_of(&not_impl) || check_class.is_subclass_of(&assert_err)
                 {
                     return Err(FlowContextError::Flowing(FlowingError::new(format!(
-                        "Catching NotImplementedError, AssertionError, or a subclass is not valid in RPython ({class:?})"
+                        "Catching NotImplementedError, AssertionError, or a subclass is not valid in RPython ({check_class:?})"
                     ))));
                 }
+                // `return self.guessbool(op.issubtype(w_exc_type, w_check_class).eval(self))`.
                 if let Some(actual) = exception_class_from_hlvalue(w_exc_type) {
-                    return Ok(actual.is_subclass_of(class));
+                    return Ok(actual.is_subclass_of(check_class));
                 }
                 let w_match = self
                     .record_pure_op("issubtype", vec![w_exc_type.clone(), w_check_class.clone()])?;
-                self.guessbool(w_match)
+                return self.guessbool(w_match);
             }
-            ConstValue::Tuple(elements) => {
-                for klass in elements {
-                    let w_klass = Hlvalue::Constant(Constant::new(klass.clone()));
-                    if self.exception_match(w_exc_type, &w_klass)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            _ => Err(FlowContextError::Flowing(FlowingError::new(
-                "Non-constant except guard.",
-            ))),
         }
+        // `if not isinstance(check_class, tuple):` 가 위에서 True 이면
+        // 이미 리턴; 여기 도달했다는 건 check_class 가 tuple.
+        //
+        // upstream `if check_class == rstackovf.StackOverflow: ...` 의
+        // StackOverflow sentinel 튜플은 Rust 포트에 존재하지 않는다
+        // (HOST_ENV 는 StackOverflow 를 RuntimeError 의 subclass class
+        // 로 등록; 따라서 `except StackOverflow:` 는 위의 simple-class
+        // branch 에서 바로 처리된다). 대체 substitution 불필요.
+        if let ConstValue::Tuple(elements) = check_value {
+            for klass in elements {
+                let w_klass = Hlvalue::Constant(Constant::new(klass.clone()));
+                if self.exception_match(w_exc_type, &w_klass)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        Err(FlowContextError::Flowing(FlowingError::new(
+            "Non-constant except guard.",
+        )))
     }
 
     pub fn unroll(&mut self, signal: FlowSignal) -> Result<i64, FlowContextError> {
@@ -3210,14 +3277,26 @@ mod test {
         let exits = ctx.graph.startblock.borrow().exits.clone();
         assert_eq!(exits.len(), 1);
         let link = exits[0].borrow();
+        // Class HostObject 는 HOST_ENV singleton 이라 Arc::ptr_eq OK.
         assert_eq!(link.args[0], Some(exception_class_value("AssertionError")));
-        assert_eq!(
-            link.args[1],
-            Some(exception_instance_value(
-                "AssertionError",
-                Some("implicit ValueError shouldn't occur".to_owned())
-            ))
-        );
+        // Instance 는 each call 마다 fresh Arc — identity-eq 이 달라서
+        // 구조적으로 비교.
+        match &link.args[1] {
+            Some(Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(obj),
+                ..
+            })) => {
+                assert!(obj.is_instance());
+                assert_eq!(obj.instance_class().unwrap().qualname(), "AssertionError");
+                match obj.instance_args().unwrap().first() {
+                    Some(ConstValue::Str(s)) => {
+                        assert_eq!(s, "implicit ValueError shouldn't occur");
+                    }
+                    other => panic!("expected Str arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected AssertionError instance, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3262,12 +3341,13 @@ mod test {
         globals.insert("sentinel".to_owned(), ConstValue::Int(42));
         let ctx = flow_context_with_globals("def f():\n    return sentinel\n", globals);
         assert_eq!(ctx.find_global("sentinel").unwrap(), iconst(42));
+        let print_obj = HOST_ENV.lookup_builtin("print").unwrap();
         assert!(matches!(
             ctx.find_global("print").unwrap(),
             Hlvalue::Constant(Constant {
-                value: ConstValue::Builtin(BuiltinObject::Function(BuiltinFunction::Print)),
+                value: ConstValue::HostObject(obj),
                 ..
-            })
+            }) if obj == print_obj
         ));
     }
 
@@ -3292,8 +3372,8 @@ mod test {
             ctx.exception_match(
                 &exception_class_value("ValueError"),
                 &Hlvalue::Constant(Constant::new(ConstValue::Tuple(vec![
-                    ConstValue::ExceptionClass(ExceptionClass::builtin("ImportError")),
-                    ConstValue::ExceptionClass(ExceptionClass::builtin("ValueError")),
+                    ConstValue::HostObject(HOST_ENV.lookup_builtin("ImportError").unwrap()),
+                    ConstValue::HostObject(HOST_ENV.lookup_builtin("ValueError").unwrap()),
                 ]))),
             )
             .unwrap()
@@ -3730,9 +3810,9 @@ mod test {
         match err {
             FlowContextError::Signal(FlowSignal::Raise { w_exc }) => match &w_exc.w_type {
                 Hlvalue::Constant(Constant {
-                    value: ConstValue::ExceptionClass(class),
+                    value: ConstValue::HostObject(obj),
                     ..
-                }) => assert_eq!(class.name, "TypeError"),
+                }) if obj.is_class() => assert_eq!(obj.qualname(), "TypeError"),
                 other => panic!("expected TypeError class constant, got {other:?}"),
             },
             other => panic!("expected Raise(TypeError), got {other:?}"),
@@ -3798,15 +3878,18 @@ mod test {
             .filter(|(_, op)| op.opname == "direct_call")
             .map(|(_, op)| op.args.first().cloned())
             .collect();
+        let create_file = HOST_ENV
+            .import_module("rpython.rlib.rfile")
+            .unwrap()
+            .module_get("create_file")
+            .unwrap();
         assert!(
             direct_call_targets.iter().any(|arg| matches!(
                 arg,
                 Some(Hlvalue::Constant(Constant {
-                    value: ConstValue::Builtin(BuiltinObject::Function(
-                        BuiltinFunction::CreateFile
-                    )),
+                    value: ConstValue::HostObject(obj),
                     ..
-                }))
+                })) if *obj == create_file
             )),
             "expected redirect_function(open,…) to route through CreateFile, got {direct_call_targets:?}"
         );
@@ -3835,43 +3918,18 @@ mod test {
     #[test]
     fn find_global_resolves_common_builtins() {
         // Reviewer #1: `len`, `str`, `int` should be reachable through
-        // `find_global` against the `__builtin__` fallback.
+        // `find_global` against the `__builtin__` fallback (HOST_ENV).
         let ctx = flow_context("def f():\n    return 1\n");
-        assert!(matches!(
-            ctx.find_global("len").unwrap(),
-            Hlvalue::Constant(Constant {
-                value: ConstValue::Builtin(BuiltinObject::Function(BuiltinFunction::Len)),
-                ..
-            })
-        ));
-        assert!(matches!(
-            ctx.find_global("str").unwrap(),
-            Hlvalue::Constant(Constant {
-                value: ConstValue::Builtin(BuiltinObject::Type(BuiltinType::Str)),
-                ..
-            })
-        ));
-        assert!(matches!(
-            ctx.find_global("int").unwrap(),
-            Hlvalue::Constant(Constant {
-                value: ConstValue::Builtin(BuiltinObject::Type(BuiltinType::Int)),
-                ..
-            })
-        ));
-        assert!(matches!(
-            ctx.find_global("float").unwrap(),
-            Hlvalue::Constant(Constant {
-                value: ConstValue::Builtin(BuiltinObject::Type(BuiltinType::Float)),
-                ..
-            })
-        ));
-        assert!(matches!(
-            ctx.find_global("isinstance").unwrap(),
-            Hlvalue::Constant(Constant {
-                value: ConstValue::Builtin(BuiltinObject::Function(BuiltinFunction::Isinstance)),
-                ..
-            })
-        ));
+        for name in ["len", "str", "int", "float", "isinstance"] {
+            let expected = HOST_ENV.lookup_builtin(name).unwrap();
+            match ctx.find_global(name).unwrap() {
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(obj),
+                    ..
+                }) => assert_eq!(obj, expected, "find_global({name})"),
+                other => panic!("expected HostObject for {name}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -3899,15 +3957,18 @@ mod test {
 
     #[test]
     fn exception_class_user_defined_base_walk() {
-        // RPython basis: model.py — Constant(SomeClass) with
-        // SomeClass.__bases__ drives issubclass in exception_match.
-        // Rust port mirrors by storing bases explicitly.
-        let user_error =
-            ExceptionClass::new("MyError", vec![ExceptionClass::builtin("ValueError")]);
-        assert!(user_error.is_subclass_of_name("MyError"));
-        assert!(user_error.is_subclass_of_name("ValueError"));
-        assert!(user_error.is_subclass_of_name("Exception"));
-        assert!(user_error.is_subclass_of_name("BaseException"));
-        assert!(!user_error.is_subclass_of_name("RuntimeError"));
+        // upstream `model.py:354` Constant(SomeClass) + `SomeClass.__bases__`
+        // drives `issubclass` in exception_match. Rust port mirrors with
+        // `HostObject::new_class(name, bases)` + `is_subclass_of`.
+        let value_error = HOST_ENV.lookup_builtin("ValueError").unwrap();
+        let user_error = HostObject::new_class("MyError", vec![value_error.clone()]);
+        let exc = HOST_ENV.lookup_builtin("Exception").unwrap();
+        let base = HOST_ENV.lookup_builtin("BaseException").unwrap();
+        let runtime = HOST_ENV.lookup_builtin("RuntimeError").unwrap();
+        assert!(user_error.is_subclass_of(&user_error));
+        assert!(user_error.is_subclass_of(&value_error));
+        assert!(user_error.is_subclass_of(&exc));
+        assert!(user_error.is_subclass_of(&base));
+        assert!(!user_error.is_subclass_of(&runtime));
     }
 }

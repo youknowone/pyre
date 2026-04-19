@@ -26,8 +26,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use majit_flowspace::model::{
-    Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, ExceptionClass, FunctionGraph,
-    GraphFunc, Hlvalue, Link, LinkRef, SpaceOperation, Variable, c_last_exception, checkgraph,
+    Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc,
+    HOST_ENV, Hlvalue, Link, LinkRef, SpaceOperation, Variable, c_last_exception, checkgraph,
     copygraph, mkentrymap,
 };
 
@@ -219,9 +219,9 @@ fn test_checkgraph_accepts_canraise_exception_links() {
     let exceptional = Rc::new(RefCell::new(Link::new(
         vec![last_exception.clone(), last_exc_value.clone()],
         Some(graph.exceptblock.clone()),
-        Some(Hlvalue::Constant(Constant::new(
-            ConstValue::ExceptionClass(ExceptionClass::builtin("ValueError")),
-        ))),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+            HOST_ENV.lookup_builtin("ValueError").unwrap(),
+        )))),
     )));
     exceptional
         .borrow_mut()
