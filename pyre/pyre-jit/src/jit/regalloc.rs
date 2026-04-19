@@ -473,15 +473,7 @@ impl RegAllocator {
     /// instead of FunctionGraph-level link.args coalescing. The
     /// effect is a strict subset of RPython's because pyre never
     /// sees the cross-block link representation.
-    ///
-    /// Additionally skip coalescing across the inputarg / non-inputarg
-    /// boundary: the trace-side `idx < nlocals` decode requires
-    /// inputarg colors to remain disjoint from non-inputarg colors
-    /// after `enforce_input_args` shifts the latter. Collapsing the
-    /// two via coalesce would put a non-inputarg into the same
-    /// union as an inputarg, after which the shift would split the
-    /// union and corrupt the rename map.
-    fn coalesce_variables(&mut self, ssarepr: &SSARepr, kind: Kind, input_set: &HashSet<u16>) {
+    fn coalesce_variables(&mut self, ssarepr: &SSARepr, kind: Kind, _input_set: &HashSet<u16>) {
         let move_op = match kind {
             Kind::Int => "move_i",
             Kind::Ref => "move_r",
@@ -510,12 +502,6 @@ impl RegAllocator {
                     Some(Operand::Register(r)) if r.kind == kind => *r,
                     _ => continue,
                 };
-                let src_in = input_set.contains(&src.index);
-                let dst_in = input_set.contains(&dst.index);
-                if src_in != dst_in {
-                    // Skip the cross-boundary case (see fn docstring).
-                    continue;
-                }
                 self.try_coalesce(src.index, dst.index);
             }
         }
