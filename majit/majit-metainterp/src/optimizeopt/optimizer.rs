@@ -2904,6 +2904,17 @@ impl Optimizer {
         op: &Op,
         ctx: &mut OptContext,
     ) {
+        // Box.type parity: register the op's intrinsic result type on its
+        // OpRef BEFORE the pass chain runs. Without this, a pass that
+        // calls `replace_op(op.pos, other)` observes a stale `value_types`
+        // entry left over from Phase 1 (Phase 1 may have emitted a
+        // different-typed op at the same reused OpRef number). RPython
+        // has no equivalent stale-entry hazard because Box.type is stored
+        // on the Box object itself.
+        if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
+            ctx.value_types.insert(op.pos.0, op.result_type());
+        }
+
         // Resolve forwarded arguments
         let mut resolved_op = op.clone();
         for arg in &mut resolved_op.args {
@@ -2968,6 +2979,14 @@ impl Optimizer {
                     // with modified op). Collect if has postprocess.
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
+                    }
+                    // Box.type parity: if Replace changed the opcode to one
+                    // with a different result type, the intrinsic type on
+                    // op.pos changes with it. Keep value_types aligned so
+                    // later passes and replace_op callers see the correct
+                    // type instead of the pre-replace one.
+                    if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
+                        ctx.value_types.insert(op.pos.0, op.result_type());
                     }
                     current_op = op;
                 }

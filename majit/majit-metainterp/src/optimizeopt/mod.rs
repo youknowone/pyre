@@ -1294,6 +1294,17 @@ impl OptContext {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
         let pos_ref = op.pos;
+        // Box.type parity: mirror emit() — register the result type at the
+        // moment the op is queued so any subsequent `opref_type` /
+        // `replace_op` lookup observes the correct type. Without this, a
+        // pos that was reserved on an earlier pass (or carried over from
+        // Phase 1) keeps a stale value_types entry, which `force_box` then
+        // reads back as cross-type forwarding. RPython has no equivalent
+        // stale-entry risk because Box.type is intrinsic to the Box object
+        // itself.
+        if op.result_type() != majit_ir::Type::Void {
+            self.value_types.insert(op.pos.0, op.result_type());
+        }
         self.extra_operations_after
             .push_back((after_pass_idx + 1, op));
         pos_ref

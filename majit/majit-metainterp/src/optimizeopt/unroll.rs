@@ -60,6 +60,12 @@ pub struct UnrollOptimizer {
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
     pub imported_state: Option<ExportedState>,
+    /// Phase 1's finalized ExportedState, retained across the Phase 2 run
+    /// so the caller of `optimize_trace_*` can consult the renamed inputarg
+    /// types that the optimizer decided on. RPython does not need this
+    /// (Box.type is intrinsic), but majit's `InputArg.tp` side table is
+    /// otherwise disconnected from the optimizer's reduced LABEL.
+    pub final_exported_state: Option<ExportedState>,
     // RPython compile.py:278-284: Phase 1 results for retrace_needed.
     // In RPython, Phase 1 and Phase 2 are separate calls, so Phase 1
     // results are naturally accessible. In pyre, Phase 1 results are
@@ -131,6 +137,7 @@ impl UnrollOptimizer {
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
+            final_exported_state: None,
             snapshot_boxes: std::collections::HashMap::new(),
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
@@ -398,6 +405,26 @@ impl UnrollOptimizer {
                     }
                     state.patchguardop = opt_p1.patchguardop.clone();
                     self.all_descrs = std::mem::take(&mut opt_p1.all_descrs);
+                    // Box.type parity: retain Phase 1's renamed_inputarg_types
+                    // so the backend can see the reduced LABEL's declared
+                    // types. Clone only the field we need to avoid keeping
+                    // Phase 1 short preamble data alive longer than before.
+                    self.final_exported_state = Some(ExportedState {
+                        end_args: Vec::new(),
+                        next_iteration_args: Vec::new(),
+                        end_arg_types: Vec::new(),
+                        virtual_state: state.virtual_state.clone(),
+                        exported_infos: std::collections::HashMap::new(),
+                        exported_short_ops: Vec::new(),
+                        exported_short_boxes: Vec::new(),
+                        short_preamble: None,
+                        renamed_inputargs: state.renamed_inputargs.clone(),
+                        renamed_inputarg_types: state.renamed_inputarg_types.clone(),
+                        short_inputargs: Vec::new(),
+                        patchguardop: None,
+                        rooted_refs: Vec::new(),
+                        shadow_stack_base: 0,
+                    });
                     (state, consts_p1, p1_ops)
                 }
                 None => {

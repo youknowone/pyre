@@ -2610,7 +2610,32 @@ impl<M: Clone> MetaInterp<M> {
         // RPython compile.py keeps the root entry contract on the original
         // loop inputargs. Simple loops synthesize a LABEL from that contract;
         // they do not grow inputargs to match a rewritten JUMP arity.
-        let root_inputargs = root_loop_inputargs_from_optimizer(&trace.inputargs, final_num_inputs);
+        //
+        // Box.type parity: when unrolling reduces the trace inputargs
+        // (virtualstate + short preamble collapse vable slots down to the
+        // handful of live values), the reduced LABEL's ith slot is NOT
+        // `trace.inputargs[i]`. Using a prefix of `trace.inputargs` declares
+        // every reduced slot with the wrong type (e.g. the vable layout's
+        // `frame, next_instr, code, …` instead of the optimizer's actual
+        // `frame, s_value, i_value`). The optimizer already records the
+        // per-reduced-slot type in `ExportedState.renamed_inputarg_types`
+        // (derived from `opref_type` of each renamed inputarg). Consume it
+        // here so the backend sees declared types that match the reduced
+        // LABEL's args.
+        let root_inputargs = if let Some(types) = unroll_opt
+            .final_exported_state
+            .as_ref()
+            .map(|es| es.renamed_inputarg_types.as_slice())
+            .filter(|types| types.len() == final_num_inputs)
+        {
+            types
+                .iter()
+                .enumerate()
+                .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
+                .collect()
+        } else {
+            root_loop_inputargs_from_optimizer(&trace.inputargs, final_num_inputs)
+        };
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
             root_inputargs,
             optimized_ops,
