@@ -8813,11 +8813,25 @@ impl<M: Clone> MetaInterp<M> {
     /// Exception-flavored sibling of `compile_done_with_this_frame`.
     /// PRE-EXISTING-ADAPTATION shared with that method: the FINISH op
     /// emit + `compile.compile_trace` happen at the trace-dispatch
-    /// `TraceAction::Finish` site (jitdriver.rs:956), so this method
+    /// `TraceAction::Finish` site (jitdriver.rs:1031), so this method
     /// runs only the upstream skeleton — `store_token_in_vable` +
     /// `make_fail_descr_typed` for the Ref result-type slot — and
     /// surfaces `SwitchToBlackhole` to the caller exactly like
     /// `compile_done_with_this_frame`.
+    ///
+    /// The primary exception exit path in pyre is dispatch.rs's
+    /// `unwind_to_exception_handler` at BC_RAISE/BC_RERAISE: when the
+    /// framestack drains with no `catch_exception`, dispatch returns
+    /// `TraceAction::Finish { finish_args: [last_exc_box], finish_arg_types:
+    /// [Ref] }` directly (dispatch.rs:298), so the normal
+    /// `finish_and_compile` path records FINISH + compiles — matching
+    /// `pyjitpl.py:3238-3245`. This MetaInterp-side hook covers the
+    /// rarer path where an exception surfaces during residual-call
+    /// dispatch (miframe_execute_varargs / do_conditional_call); the
+    /// `FinishframeExceptionSignal::ExitFrameWithExceptionRef` return
+    /// from `handle_possible_exception` bubbles up, but the wiring
+    /// that converts it into a `TraceAction::Finish` dispatch at the
+    /// MetaInterp call chain is not yet complete (deferred epic).
     pub fn compile_exit_frame_with_exception(
         &mut self,
         valuebox: Option<OpRef>,
@@ -8832,9 +8846,10 @@ impl<M: Clone> MetaInterp<M> {
         let _token = crate::make_fail_descr_typed(vec![majit_ir::Type::Ref]);
         // pyjitpl.py:3242 self.history.record1(rop.FINISH, valuebox, None, descr=token)
         // pyjitpl.py:3243 target_token = compile.compile_trace(...)
-        // PRE-EXISTING-ADAPTATION: emitted at the TraceAction::Finish
-        // dispatch (jitdriver.rs:956); see method docstring + the sibling
-        // `compile_done_with_this_frame`.
+        // Covered by the dispatch-layer path (dispatch.rs:298
+        // `unwind_to_exception_handler`) for the BC_RAISE/BC_RERAISE
+        // exit. The MetaInterp-call-chain route is still deferred — see
+        // method docstring.
         let _ = valuebox;
         Ok(())
     }

@@ -373,7 +373,25 @@ where
             }
             self.pop_exception_frame(ctx);
         }
-        TraceAction::Abort
+        // RPython parity for `pyjitpl.py:2533-2538`: framestack drained
+        // without finding a `catch_exception`, so close the trace with
+        // a FINISH carrying `last_exc_box` and let the normal
+        // `TraceAction::Finish` dispatch path run `finish_and_compile`
+        // (mirrors `compile_exit_frame_with_exception` →
+        // `compile.compile_trace(...)`, `pyjitpl.py:3238-3245`).
+        // `Abort` is only correct when there is no pending exception —
+        // that happens when `BC_RERAISE` fires with no prior
+        // `last_exception_value` (dispatch.rs:1607-1609 already
+        // shortcuts to Abort for that case, so here the exception slot
+        // is guaranteed non-zero).
+        if let Some(exc_box) = self.last_exception_box {
+            TraceAction::Finish {
+                finish_args: vec![exc_box],
+                finish_arg_types: vec![majit_ir::Type::Ref],
+            }
+        } else {
+            TraceAction::Abort
+        }
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
@@ -2691,5 +2709,37 @@ mod tests {
                 .any(|op| op.opcode == OpCode::GuardValue),
             "handler must see last_exc_value and be able to promote it",
         );
+    }
+
+    #[test]
+    fn raise_without_handler_drains_stack_and_signals_finish_with_exception() {
+        // RPython parity for `pyjitpl.py:2533-2538`
+        // `compile_exit_frame_with_exception`: when the raise walks the
+        // entire framestack without finding a `catch_exception`, the
+        // trace closes with a FINISH carrying the exception value so
+        // the normal `TraceAction::Finish` path runs `finish_and_compile`
+        // (jitdriver.rs:1031). Previously this returned `TraceAction::Abort`,
+        // dropping the trace without closing / compiling.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0xfeed);
+        builder.emit_raise(0);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+
+        let (finish_args, finish_arg_types) = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+            } => (finish_args, finish_arg_types),
+            other => panic!(
+                "expected TraceAction::Finish for handler-less raise, got {:?}",
+                other
+            ),
+        };
+        assert_eq!(finish_arg_types, vec![majit_ir::Type::Ref]);
+        assert_eq!(finish_args.len(), 1);
     }
 }
