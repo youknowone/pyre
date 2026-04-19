@@ -1757,33 +1757,41 @@ impl<S: JitState> JitDriver<S> {
         meta: &S::Meta,
         descriptor: Option<&JitDriverStaticData>,
     ) -> bool {
-        let Some(descriptor) = descriptor else {
-            return true;
-        };
-        let Some(virtualizable) = descriptor.virtualizable() else {
-            return true;
-        };
-        let ok = state.sync_named_virtualizable_before_jit(
-            meta,
-            &virtualizable.name,
-            self.meta.virtualizable_info(),
-        );
-        if !ok {
-            return false;
+        // Descriptor-gated token-reset path — RPython
+        // compile.py::sync_before_jit calls `vinfo.reset_vable_token(virt)`
+        // when the JitDriver has a virtualizable declared.  Pyre routes
+        // this through the interpreter's `sync_named_virtualizable_before_jit`.
+        if let Some(descriptor) = descriptor {
+            if let Some(virtualizable) = descriptor.virtualizable() {
+                let ok = state.sync_named_virtualizable_before_jit(
+                    meta,
+                    &virtualizable.name,
+                    self.meta.virtualizable_info(),
+                );
+                if !ok {
+                    return false;
+                }
+            }
         }
+
+        // Always refresh the cached trace-entry vable layout when MetaInterp
+        // has a registered VirtualizableInfo.  Historically this block sat
+        // inside the `descriptor.virtualizable()` branch above, but pyre's
+        // `driver_descriptor` returns None until the CA-emission refactor
+        // lands (see `pyre-jit-trace/src/state.rs::driver_descriptor`).
+        // Without this fallback, `trace_entry_vable_lengths` is forced to
+        // return `[]`, `initialize_virtualizable` exits early, and
+        // `virtualizable_boxes` is never populated for the trace.
+        //
+        // `VirtualizableInfo.name` is the canonical identifier declared via
+        // `virtualizable!(name = "...")`, so we can feed it straight to the
+        // interpreter hooks without going through the descriptor.
         self.meta.set_vable_ptr(std::ptr::null());
         self.meta.set_vable_array_lengths(Vec::new());
-        // Cache the live virtualizable object for trace-entry box layout.
-        //
-        // Keep the long-term source-of-truth aligned with RPython compile.py:
-        // use the actual virtualizable object whenever its layout can provide
-        // lengths directly. Only fall back to interpreter-supplied lengths for
-        // layouts that cannot be read from the heap object alone.
-        let vable_name = virtualizable.name.clone();
         let info_clone = self.meta.virtualizable_info().cloned();
         if let Some(ref info) = info_clone {
-            let ptr = state.virtualizable_heap_ptr(meta, &vable_name, info);
-            if let Some(ptr) = ptr {
+            let vable_name = info.name.clone();
+            if let Some(ptr) = state.virtualizable_heap_ptr(meta, &vable_name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
             }
             let fallback_lengths = state
