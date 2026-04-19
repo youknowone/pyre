@@ -1417,26 +1417,100 @@ fn jit_attr_name(attr: &syn::Attribute) -> Option<String> {
 }
 
 /// Discovered helper entry: function name and its JIT attribute.
+///
+/// `impl_type_segments` is `Some(vec)` for inherent / trait-impl methods
+/// discovered inside an `impl` block, carrying the type-path segments
+/// exactly as written at the `impl` header (e.g. `[a, Foo]` for
+/// `impl a::Foo { ... }`). Segments are extracted from the type path
+/// (`syn::Type::Path`) so that downstream code can render the
+/// `impl_type` as a joined string matching the parser's
+/// `self_ty_root` canonicalization (parse.rs:702, front/ast.rs:106
+/// `qualify_type_name`). RPython parity: `getfunctionptr(graph)`
+/// (call.py:174-187) does not distinguish free fns from methods; pyre
+/// keys methods by the `[impl_type_joined, method]` 2-segment CallPath
+/// (lib.rs:406-433), so the macro emits exactly that.
 struct DiscoveredHelper {
     fn_name: Ident,
     attr_name: String,
+    /// `None` for free fns, `Some(segments)` for impl methods.
+    impl_type_segments: Option<Vec<Ident>>,
+}
+
+/// Extract the identifier sequence from a `syn::Type::Path`, e.g.
+/// `a::b::Foo` → `[a, b, Foo]`. Returns `None` for non-path types
+/// (trait objects, references, fn pointers, generics on the outer
+/// path, …) — those cases are not expressible as a canonical
+/// `self_ty_root` string in the parser either, so we skip them.
+fn impl_type_path_segments(ty: &syn::Type) -> Option<Vec<Ident>> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() {
+        return None;
+    }
+    // Parser's `type_root_ident` strips generic arguments from each
+    // segment and joins the identifiers. Match that shape here by
+    // taking `ident` only.
+    Some(
+        type_path
+            .path
+            .segments
+            .iter()
+            .map(|seg| seg.ident.clone())
+            .collect(),
+    )
 }
 
 /// Scan a module's items for functions annotated with JIT helper attributes.
+///
+/// Walks both top-level `Item::Fn` and inherent / trait-impl methods
+/// inside `Item::Impl` blocks. Instance methods are NOT skipped — Rust
+/// allows `S::f as fn(&S)`, `S::g as fn(&mut S)`, `S::h as fn(S)` to
+/// coerce to plain function pointers (verified with rustc), and RPython
+/// upstream treats `getfunctionptr(graph)` uniformly across free fns and
+/// methods (`call.py:174-187`).
 fn discover_helpers(items: &[syn::Item]) -> Vec<DiscoveredHelper> {
     let mut discovered = Vec::new();
     for item in items {
-        if let syn::Item::Fn(func) = item {
-            for attr in &func.attrs {
-                if let Some(attr_name) = jit_attr_name(attr) {
-                    discovered.push(DiscoveredHelper {
-                        fn_name: func.sig.ident.clone(),
-                        attr_name,
-                    });
-                    // Only record the first JIT attribute per function
-                    break;
+        match item {
+            syn::Item::Fn(func) => {
+                for attr in &func.attrs {
+                    if let Some(attr_name) = jit_attr_name(attr) {
+                        discovered.push(DiscoveredHelper {
+                            fn_name: func.sig.ident.clone(),
+                            attr_name,
+                            impl_type_segments: None,
+                        });
+                        // Only record the first JIT attribute per function
+                        break;
+                    }
                 }
             }
+            // RPython parity: `impl Type { fn helper(...) }` and
+            // `impl Trait for Type { fn helper(...) }` both lower to a
+            // `getfunctionptr(graph)` whose canonical CallPath is
+            // `[impl_type_joined, helper]`.
+            syn::Item::Impl(item_impl) => {
+                let Some(impl_segs) = impl_type_path_segments(&item_impl.self_ty) else {
+                    continue;
+                };
+                for impl_item in &item_impl.items {
+                    let syn::ImplItem::Fn(method) = impl_item else {
+                        continue;
+                    };
+                    for attr in &method.attrs {
+                        if let Some(attr_name) = jit_attr_name(attr) {
+                            discovered.push(DiscoveredHelper {
+                                fn_name: method.sig.ident.clone(),
+                                attr_name,
+                                impl_type_segments: Some(impl_segs.clone()),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     discovered
@@ -1492,11 +1566,106 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let discovered = discover_helpers(items);
 
-    let helper_names: Vec<&Ident> = discovered.iter().map(|h| &h.fn_name).collect();
-    let helper_attr_names: Vec<&str> = discovered.iter().map(|h| h.attr_name.as_str()).collect();
-    let helper_policy_fns: Vec<Ident> = discovered
+    // Per-helper tokens: free fns route through the existing
+    // `__majit_call_policy_*` trampoline indirection; impl methods take
+    // their direct `<Type>::method` address since the policy macro family
+    // does not yet decorate impl items.  Both shapes feed the same
+    // `__majit_helper_trace_fnaddrs()` table that the codewriter reads
+    // through `register_macro_helper_trace_fnaddr`.
+    // For impl methods we emit the `impl_type_joined` string by
+    // concat!-ing the individual `stringify!(ident)` tokens per segment;
+    // `stringify!` on individual idents produces clean
+    // whitespace-free identifier strings (unlike `stringify!(a::Foo)`
+    // which expands with spaces around `::`).  The resulting joined
+    // form matches the parser's `self_ty_root` canonicalization
+    // (parse.rs:400 → `type_root_ident` + `qualify_type_name`).
+    let helper_name_lits: Vec<proc_macro2::TokenStream> = discovered
         .iter()
-        .map(|h| format_ident!("__majit_call_policy_{}", h.fn_name))
+        .map(|h| {
+            let fn_name = &h.fn_name;
+            match &h.impl_type_segments {
+                None => quote! { stringify!(#fn_name) },
+                Some(segs) => {
+                    let parts = segs_joined_with_method(segs, fn_name);
+                    quote! { #parts }
+                }
+            }
+        })
+        .collect();
+    let helper_attr_lits: Vec<&str> = discovered.iter().map(|h| h.attr_name.as_str()).collect();
+    let helper_path_lits: Vec<proc_macro2::TokenStream> = discovered
+        .iter()
+        .map(|h| {
+            let fn_name = &h.fn_name;
+            match &h.impl_type_segments {
+                None => quote! {
+                    concat!(module_path!(), "::", stringify!(#fn_name))
+                },
+                Some(segs) => {
+                    let parts = segs_joined_with_method(segs, fn_name);
+                    quote! {
+                        concat!(module_path!(), "::", #parts)
+                    }
+                }
+            }
+        })
+        .collect();
+    let helper_addr_exprs: Vec<proc_macro2::TokenStream> = discovered
+        .iter()
+        .map(|h| {
+            let fn_name = &h.fn_name;
+            match &h.impl_type_segments {
+                // Free fn: route through the existing call-policy trampoline.
+                None => {
+                    let policy_fn = format_ident!("__majit_call_policy_{}", fn_name);
+                    quote! {
+                        {
+                            let (_, _inline_builder, __trace_target, __concrete_target) = #policy_fn();
+                            let __trace_target = if __trace_target.is_null() {
+                                if __concrete_target.is_null() {
+                                    #fn_name as *const ()
+                                } else {
+                                    __concrete_target
+                                }
+                            } else {
+                                __trace_target
+                            };
+                            __trace_target as usize as i64
+                        }
+                    }
+                }
+                // Impl method: direct associated-function pointer. Works
+                // for any signature Rust accepts as a `fn` pointer — free
+                // (no receiver), `&self`, `&mut self`, `self by value`.
+                Some(segs) => {
+                    let ty_path = path_tokens_from_segs(segs);
+                    quote! {
+                        <#ty_path>::#fn_name as *const () as usize as i64
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // Structured impl-method registry: `(impl_type_joined, method, fnaddr)`.
+    // Consumers bind this through `CallControl::register_macro_impl_helper_trace_fnaddr`
+    // as the 2-segment CallPath `[impl_type_joined, method]` that matches
+    // the parser's canonical `self_ty_root`-keyed path (lib.rs:406-433).
+    let impl_entries: Vec<proc_macro2::TokenStream> = discovered
+        .iter()
+        .filter_map(|h| {
+            let segs = h.impl_type_segments.as_ref()?;
+            let fn_name = &h.fn_name;
+            let ty_path = path_tokens_from_segs(segs);
+            let impl_type_joined = segs_joined(segs);
+            Some(quote! {
+                (
+                    #impl_type_joined,
+                    stringify!(#fn_name),
+                    <#ty_path>::#fn_name as *const () as usize as i64,
+                )
+            })
+        })
         .collect();
 
     let registry_names = quote! {
@@ -1504,7 +1673,7 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #[allow(dead_code)]
         pub const __MAJIT_DISCOVERED_HELPERS: &[&str] = &[
-            #(stringify!(#helper_names)),*
+            #(#helper_name_lits),*
         ];
     };
 
@@ -1513,7 +1682,7 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #[allow(dead_code)]
         pub const __MAJIT_HELPER_POLICIES: &[(&str, &str)] = &[
-            #((stringify!(#helper_names), #helper_attr_names)),*
+            #((#helper_name_lits, #helper_attr_lits)),*
         ];
     };
 
@@ -1525,22 +1694,25 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(dead_code)]
         pub fn __majit_helper_trace_fnaddrs() -> ::std::vec::Vec<(&'static str, i64)> {
             ::std::vec![
-                #({
-                    let (_, _inline_builder, __trace_target, __concrete_target) = #helper_policy_fns();
-                    let __trace_target = if __trace_target.is_null() {
-                        if __concrete_target.is_null() {
-                            #helper_names as *const ()
-                        } else {
-                            __concrete_target
-                        }
-                    } else {
-                        __trace_target
-                    };
-                    (
-                        concat!(module_path!(), "::", stringify!(#helper_names)),
-                        __trace_target as usize as i64,
-                    )
-                }),*
+                #((#helper_path_lits, #helper_addr_exprs)),*
+            ]
+        }
+    };
+
+    let registry_impl_trace_fnaddrs = quote! {
+        /// Hidden registry mapping each discovered impl-method helper to
+        /// its `(impl_type_joined, method_name, fnaddr)` triple. Consumers
+        /// feed this through `CallControl::register_macro_impl_helper_trace_fnaddr`
+        /// which stores the 2-segment canonical CallPath
+        /// `[impl_type_joined, method]` — same shape the parser uses for
+        /// `self_ty_root`-keyed methods (parse.rs:702, lib.rs:406-433).
+        #[doc(hidden)]
+        #[allow(dead_code)]
+        pub fn __majit_helper_impl_trace_fnaddrs()
+            -> ::std::vec::Vec<(&'static str, &'static str, i64)>
+        {
+            ::std::vec![
+                #(#impl_entries),*
             ]
         }
     };
@@ -1551,9 +1723,56 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     new_items.push(syn::parse2(registry_policies).expect("failed to parse registry_policies"));
     new_items
         .push(syn::parse2(registry_trace_fnaddrs).expect("failed to parse registry_trace_fnaddrs"));
+    new_items.push(
+        syn::parse2(registry_impl_trace_fnaddrs)
+            .expect("failed to parse registry_impl_trace_fnaddrs"),
+    );
     module.content = Some((brace, new_items));
 
     quote! { #module }.into()
+}
+
+/// Build a `concat!(stringify!(s1), "::", stringify!(s2), …)` token
+/// stream that renders the impl type's joined canonical form (e.g.
+/// `"a::Foo"`). Uses `stringify!` per ident to avoid the whitespace
+/// artefacts that `stringify!(a::Foo)` produces.
+fn segs_joined(segs: &[Ident]) -> proc_macro2::TokenStream {
+    let mut parts: Vec<proc_macro2::TokenStream> = Vec::new();
+    for (i, seg) in segs.iter().enumerate() {
+        if i > 0 {
+            parts.push(quote! { "::" });
+        }
+        parts.push(quote! { stringify!(#seg) });
+    }
+    quote! { concat!(#(#parts),*) }
+}
+
+/// `segs_joined` followed by `"::"` and the method name — used for the
+/// full `Type::method` rendering inside `__MAJIT_DISCOVERED_HELPERS` /
+/// `__MAJIT_HELPER_POLICIES` and the path slot of
+/// `__majit_helper_trace_fnaddrs`.
+fn segs_joined_with_method(segs: &[Ident], method: &Ident) -> proc_macro2::TokenStream {
+    let mut parts: Vec<proc_macro2::TokenStream> = Vec::new();
+    for seg in segs {
+        parts.push(quote! { stringify!(#seg) });
+        parts.push(quote! { "::" });
+    }
+    parts.push(quote! { stringify!(#method) });
+    quote! { concat!(#(#parts),*) }
+}
+
+/// Reconstruct the `syn::Path` tokens that `<#path>::method` can use as
+/// a generic-path context. Just re-emits the ident sequence
+/// `s1::s2::…::sN`.
+fn path_tokens_from_segs(segs: &[Ident]) -> proc_macro2::TokenStream {
+    let mut parts: Vec<proc_macro2::TokenStream> = Vec::new();
+    for (i, seg) in segs.iter().enumerate() {
+        if i > 0 {
+            parts.push(quote! { :: });
+        }
+        parts.push(quote! { #seg });
+    }
+    quote! { #(#parts)* }
 }
 
 /// Standalone virtualizable field declaration macro.

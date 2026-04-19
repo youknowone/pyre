@@ -137,3 +137,91 @@ fn test_multi_attr_functions_callable() {
     assert_eq!(multi_attr_module::gil_fn(5), 15);
     assert_eq!(multi_attr_module::invariant_fn(10), 5);
 }
+
+// `#[jit_module]` discovers JIT helpers inside `impl` blocks. Both
+// inherent (`impl Foo { fn ... }`) and trait-impl
+// (`impl Trait for Foo { fn ... }`) methods land in the same registry
+// via the structured `__majit_helper_impl_trace_fnaddrs()` registry,
+// keyed by `impl_type_joined / method` that matches the parser's
+// `self_ty_root` canonicalization (parse.rs:702, lib.rs:406-433) —
+// RPython `call.py:174-187 getfunctionptr(graph)` parity.
+//
+// `#[unroll_safe]` is used here because it is one of the JIT attribute
+// macros that does not generate out-of-scope trampolines; applying it
+// on an impl method simply re-emits the method body.  Instance methods
+// (`&self` / `&mut self` / `self`) are also exercised — Rust allows
+// `<Type>::method as fn(&Type)` coercion, and RPython upstream treats
+// `getfunctionptr(graph)` uniformly across free fns and methods.
+#[jit_module]
+mod impl_walk_module {
+    use majit_macros::unroll_safe;
+
+    pub struct Adder {
+        pub value: i64,
+    }
+
+    impl Adder {
+        #[unroll_safe]
+        pub fn add(a: i64, b: i64) -> i64 {
+            a + b
+        }
+
+        #[unroll_safe]
+        pub fn bump(&self, x: i64) -> i64 {
+            self.value + x
+        }
+
+        // No JIT attribute — must be skipped by discovery.
+        pub fn ignore_me(_x: i64) -> i64 {
+            0
+        }
+    }
+}
+
+#[test]
+fn test_jit_module_discovers_impl_methods_including_receivers() {
+    let helpers = impl_walk_module::__MAJIT_DISCOVERED_HELPERS;
+    // Both the associated fn and the `&self` method must land in the
+    // registry — discovery no longer excludes receiver methods.
+    assert!(
+        helpers.contains(&"Adder::add"),
+        "free-signature impl method must be discovered, got {helpers:?}"
+    );
+    assert!(
+        helpers.contains(&"Adder::bump"),
+        "&self instance method must be discovered, got {helpers:?}"
+    );
+    assert!(!helpers.contains(&"Adder::ignore_me"));
+    assert_eq!(helpers.len(), 2);
+
+    let policies = impl_walk_module::__MAJIT_HELPER_POLICIES;
+    assert!(policies.contains(&("Adder::add", "unroll_safe")));
+    assert!(policies.contains(&("Adder::bump", "unroll_safe")));
+}
+
+#[test]
+fn test_jit_module_emits_structured_impl_trace_fnaddrs() {
+    let entries = impl_walk_module::__majit_helper_impl_trace_fnaddrs();
+    // Entries are `(impl_type_joined, method, fnaddr)` triples.
+    assert_eq!(entries.len(), 2);
+
+    let add_entry = entries
+        .iter()
+        .find(|(ty, m, _)| *ty == "Adder" && *m == "add")
+        .expect("Adder::add entry");
+    assert_eq!(
+        add_entry.2,
+        impl_walk_module::Adder::add as *const () as usize as i64,
+    );
+
+    let bump_entry = entries
+        .iter()
+        .find(|(ty, m, _)| *ty == "Adder" && *m == "bump")
+        .expect("Adder::bump entry");
+    // Casting a `&self` associated fn to a plain `*const ()` works —
+    // confirms Rust allows the coercion the reviewer called out.
+    assert_eq!(
+        bump_entry.2,
+        impl_walk_module::Adder::bump as *const () as usize as i64,
+    );
+}

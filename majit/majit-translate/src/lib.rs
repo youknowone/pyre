@@ -147,7 +147,7 @@ pub fn analyze_multiple_pipeline_with_config(
     config: &AnalyzeConfig,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, None, &|_, _| None, &[])
+    analyze_pipeline_from_parsed(&parsed_files, config, None, &|_, _| None, &[], &[])
 }
 
 /// Multi-file analysis with explicit layout provider.
@@ -166,6 +166,7 @@ pub fn analyze_multiple_pipeline_with_layout(
         config,
         Some(layout_provider),
         &|_, _| None,
+        &[],
         &[],
     )
 }
@@ -186,6 +187,16 @@ pub type VirtualizableInfoFactory<'a> =
 /// `CallControl` before `get_jitcode()` / `jtransform` query fnaddrs.
 pub type FnAddrBindings<'a> = [(&'a str, i64)];
 
+/// Structured binding table for impl-method helpers.  Each entry is
+/// `(impl_type_joined, method_name, fnaddr)` — the same
+/// `[impl_type_joined, method]` 2-segment CallPath the parser stores
+/// for `self_ty_root`-keyed methods (lib.rs:406-433).
+///
+/// `#[jit_module]::__majit_helper_impl_trace_fnaddrs()` produces this
+/// shape and `analyze_pipeline_from_parsed` feeds it through
+/// `CallControl::register_macro_impl_helper_trace_fnaddr`.
+pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, i64)];
+
 /// Multi-file analysis with explicit layout provider AND a
 /// `VirtualizableInfo` factory wired into
 /// `CallControl::make_virtualizable_infos` (warmspot.py:516).  The
@@ -198,7 +209,14 @@ pub fn analyze_multiple_pipeline_with_vinfo_factory(
     vinfo_factory: &VirtualizableInfoFactory<'_>,
 ) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
-    analyze_pipeline_from_parsed(&parsed_files, config, layout_provider, vinfo_factory, &[])
+    analyze_pipeline_from_parsed(
+        &parsed_files,
+        config,
+        layout_provider,
+        vinfo_factory,
+        &[],
+        &[],
+    )
 }
 
 /// Multi-file analysis with explicit layout provider, optional
@@ -217,6 +235,30 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
     vinfo_factory: &VirtualizableInfoFactory<'_>,
     fnaddr_bindings: &FnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
+    analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
+        sources,
+        config,
+        layout_provider,
+        vinfo_factory,
+        fnaddr_bindings,
+        &[],
+    )
+}
+
+/// Like `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings` but
+/// additionally accepts an `impl_fnaddr_bindings` table produced by the
+/// macro's `__majit_helper_impl_trace_fnaddrs()` registry. Entries bind
+/// impl-method helpers via `register_macro_impl_helper_trace_fnaddr`,
+/// resolving the structural `[impl_type_joined, method]` CallPath that
+/// the string-split helper entry point cannot express.
+pub fn analyze_multiple_pipeline_with_vinfo_and_all_fnaddr_bindings(
+    sources: &[&str],
+    config: &AnalyzeConfig,
+    layout_provider: Option<&dyn layout::LayoutProvider>,
+    vinfo_factory: &VirtualizableInfoFactory<'_>,
+    fnaddr_bindings: &FnAddrBindings<'_>,
+    impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
+) -> pipeline::ProgramPipelineResult {
     let parsed_files: Vec<_> = sources.iter().map(|s| parse::parse_source(s)).collect();
     analyze_pipeline_from_parsed(
         &parsed_files,
@@ -224,6 +266,7 @@ pub fn analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings(
         layout_provider,
         vinfo_factory,
         fnaddr_bindings,
+        impl_fnaddr_bindings,
     )
 }
 
@@ -250,6 +293,7 @@ fn analyze_pipeline_from_parsed(
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
     fnaddr_bindings: &FnAddrBindings<'_>,
+    impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
     let program = front::build_semantic_program_from_parsed_files(parsed_files);
     let mut pipeline = pipeline::analyze_program(&program, &config.pipeline);
@@ -403,7 +447,7 @@ fn analyze_pipeline_from_parsed(
                 );
             }
             // RPython: op.result.concretetype for trait/default method calls.
-            let path = crate::parse::CallPath::from_segments([impl_type, method.name.as_str()]);
+            let path = crate::parse::CallPath::for_impl_method(impl_type, method.name.as_str());
             if let Some(ref ret_type) = method.return_type {
                 call_control
                     .return_types
@@ -430,7 +474,7 @@ fn analyze_pipeline_from_parsed(
             .self_ty_root
             .as_deref()
             .unwrap_or(&method_info.for_type);
-        let path = crate::parse::CallPath::from_segments([impl_type, method_info.name.as_str()]);
+        let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
         call_control.register_function_graph(path.clone(), method_info.graph.clone());
         if let Some(ref ret_type) = method_info.return_type {
             call_control
@@ -451,6 +495,9 @@ fn analyze_pipeline_from_parsed(
     }
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
+    }
+    for &(impl_type_joined, method, fnaddr) in impl_fnaddr_bindings {
+        call_control.register_macro_impl_helper_trace_fnaddr(impl_type_joined, method, fnaddr);
     }
     // RPython: GC transformer sets _gctransformer_hint_close_stack_,
     // _gctransformer_hint_cannot_collect_ on functions, and

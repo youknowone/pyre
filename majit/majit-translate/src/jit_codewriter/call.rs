@@ -827,6 +827,14 @@ impl CallControl {
     /// while codewriter canonical paths are stored both as
     /// `"helpers::foo"` and `"crate::helpers::foo"`. Bind both aliases so
     /// either spelling resolves to the real helper address.
+    ///
+    /// Impl methods are *not* registered through this entry point —
+    /// their canonical CallPath (`[impl_type_joined, method]`) carries
+    /// `impl_type_joined` as a single `::`-preserving segment
+    /// (parse.rs:702, lib.rs:406-433), which the simple `split("::")`
+    /// strip here cannot recover.  Use
+    /// `register_macro_impl_helper_trace_fnaddr` instead, fed from the
+    /// macro's sibling registry `__majit_helper_impl_trace_fnaddrs()`.
     pub fn register_macro_helper_trace_fnaddr(&mut self, full_path: &str, fnaddr: i64) {
         if fnaddr == 0 {
             return;
@@ -851,6 +859,30 @@ impl CallControl {
         crate_alias.push("crate");
         crate_alias.extend(canonical.iter().copied());
         self.register_function_fnaddr(CallPath::from_segments(crate_alias), fnaddr);
+    }
+
+    /// Structured binding for an impl-method helper. `impl_type_joined`
+    /// is the `::`-joined type path exactly as written at the `impl`
+    /// header (e.g. `"a::Foo"` for `impl a::Foo { fn bar() }`), matching
+    /// the parser's `self_ty_root` canonicalization (parse.rs:702 +
+    /// front/ast.rs:106 `qualify_type_name`).  Registers
+    /// `[impl_type_joined, method]` as a 2-segment CallPath where
+    /// `impl_type_joined` is stored verbatim as a single segment — same
+    /// shape `register_trait_method` / inherent method graphs use at
+    /// lib.rs:406-433, so `get_jitcode()` resolves through to this real
+    /// helper address instead of the symbolic hash fallback.  RPython
+    /// `call.py:174-187 getfunctionptr(graph)` parity for `<Type>::method`
+    /// and `<Type as Trait>::method`.
+    pub fn register_macro_impl_helper_trace_fnaddr(
+        &mut self,
+        impl_type_joined: &str,
+        method: &str,
+        fnaddr: i64,
+    ) {
+        if fnaddr == 0 || impl_type_joined.is_empty() || method.is_empty() {
+            return;
+        }
+        self.register_function_fnaddr(CallPath::for_impl_method(impl_type_joined, method), fnaddr);
     }
 
     /// Register a trait impl method graph.
@@ -883,10 +915,13 @@ impl CallControl {
         }
         // Register in function_graphs for BFS reachability.
         // RPython: each graph has its own identity via funcptr._obj.graph.
-        // We emulate this with CallPath([impl_type, method_name]) —
-        // each impl gets its own distinct path, preventing name collisions
-        // (e.g. PyFrame::push_value vs MIFrame::push_value).
-        let qualified_path = CallPath::from_segments([impl_type, method_name]);
+        // We emulate this with `CallPath::for_impl_method(impl_type,
+        // method_name)` which splits the impl_type across `::` so every
+        // segment has the same granularity as free-fn paths — each impl
+        // still gets a distinct path (PyFrame::push_value stays
+        // `["PyFrame", "push_value"]`, MIFrame::push_value stays
+        // `["MIFrame", "push_value"]`).
+        let qualified_path = CallPath::for_impl_method(impl_type, method_name);
         self.function_graphs.entry(qualified_path).or_insert(graph);
     }
 
@@ -1519,6 +1554,45 @@ fn return_type_string_to_kind(s: &str) -> char {
     }
 }
 
+/// RPython parity for `call.py:220-221` `FUNC.ARGS` — collect the non-void
+/// argument types of a graph.  Pyre's parser emits one `OpKind::Input`
+/// per function parameter in the startblock (`front/ast.rs:706-748`),
+/// so the parameter list is recovered by walking startblock ops in
+/// declaration order.  Unknown/ambiguous slots default to `Ref`,
+/// matching `resolve_non_void_arg_types`' fallback.
+fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
+    let start = graph.block(graph.startblock);
+    start
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            crate::model::OpKind::Input { ty, .. } => match ty {
+                crate::model::ValueType::Int => Some(Type::Int),
+                crate::model::ValueType::Ref => Some(Type::Ref),
+                crate::model::ValueType::Float => Some(Type::Float),
+                crate::model::ValueType::Void => None,
+                // Unknown / State — default to Ref.
+                _ => Some(Type::Ref),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// RPython parity for `call.py:222` `FUNC.RESULT`. Reads the declared
+/// return type string from `CallControl::return_types` and maps it to
+/// `Type`; `None` or unknown string → `Type::Void` (i.e. declared-void
+/// function). Matches `type_string_to_value_type` in `front/ast.rs`.
+fn return_type_string_to_value_type(s: Option<&String>) -> Type {
+    match s.map(String::as_str) {
+        None | Some("") | Some("()") => Type::Void,
+        Some("i8") | Some("i16") | Some("i32") | Some("i64") | Some("isize") | Some("u8")
+        | Some("u16") | Some("u32") | Some("u64") | Some("usize") | Some("bool") => Type::Int,
+        Some("f32") | Some("f64") => Type::Float,
+        _ => Type::Ref,
+    }
+}
+
 impl CallControl {
     /// Collect every `Arc<JitCode>` shell whose body has been committed,
     /// in allocation order. Shells whose graph was never registered (and
@@ -1701,14 +1775,14 @@ impl CallControl {
                 // RPython: direct_call → funcobj.graph. Try qualified path first
                 // so inherent methods resolve by direct graph linkage.
                 if let Some(receiver) = receiver_root.as_deref() {
-                    let qualified = CallPath::from_segments([receiver, name.as_str()]);
+                    let qualified = CallPath::for_impl_method(receiver, name.as_str());
                     if self.function_graphs.contains_key(&qualified) {
                         return Some(qualified);
                     }
                 }
                 // Fall back to trait method resolution for polymorphic calls.
                 let impl_type = self.resolve_method_impl_type(name, receiver_root.as_deref())?;
-                Some(CallPath::from_segments([impl_type, name.as_str()]))
+                Some(CallPath::for_impl_method(impl_type, name.as_str()))
             }
             // RPython: an `indirect_call` is a *family* of graphs — there is no
             // single CallPath to resolve to.  `graphs_from_indirect` returns
@@ -1853,7 +1927,7 @@ impl CallControl {
             .get(&(trait_root.to_string(), method_name.to_string()))?;
         let mut result = Vec::new();
         for impl_type in impls {
-            let path = CallPath::from_segments([impl_type.as_str(), method_name]);
+            let path = CallPath::for_impl_method(impl_type.as_str(), method_name);
             if self.candidate_graphs.contains(&path) {
                 result.push(path);
             }
@@ -1899,7 +1973,7 @@ impl CallControl {
             .get(&(trait_root.to_string(), method_name.to_string()))
             .into_iter()
             .flatten()
-            .map(|impl_type| CallPath::from_segments([impl_type.as_str(), method_name]))
+            .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
             .collect()
     }
 
@@ -2576,20 +2650,41 @@ impl CallControl {
             }
         }
 
-        if !arg_types.is_empty() {
-            if let Some(graph) = graphs
-                .into_iter()
-                .flatten()
-                .find_map(|path| self.function_graphs.get(path))
-            {
-                let expected_arity = graph.block(graph.startblock).inputargs.len();
-                if arg_types.len() != expected_arity {
-                    eprintln!(
-                        "[getcalldescr] WARNING: indirect family expects {expected_arity} args \
-                         but got {} (NON_VOID_ARGS mismatch)",
-                        arg_types.len()
-                    );
-                }
+        // RPython `call.py:220-234`:
+        //   NON_VOID_ARGS = [x.concretetype for x in op.args[1:]
+        //                                    if x.concretetype is not lltype.Void]
+        //   RESULT = op.result.concretetype
+        //   FUNC = op.args[0].concretetype.TO
+        //   if NON_VOID_ARGS != [T for T in FUNC.ARGS if T is not lltype.Void]:
+        //       raise Exception(...)
+        //   if RESULT != FUNC.RESULT:
+        //       raise Exception(...)
+        //
+        // Indirect calls: the family invariant says every candidate
+        // shares one signature, so validate against the first resolvable
+        // graph.  Mismatch is a programming error, not a runtime condition
+        // — panic like upstream's `raise Exception`.
+        if let Some((witness_path, witness_graph)) = graphs
+            .into_iter()
+            .flatten()
+            .find_map(|path| self.function_graphs.get(path).map(|g| (path, g)))
+        {
+            let expected_arg_types = graph_non_void_arg_types(witness_graph);
+            if arg_types != expected_arg_types {
+                panic!(
+                    "indirect_call in family including {witness_path:?}: \
+                     calling a function with non-void arg kinds {expected_arg_types:?}, \
+                     but passing actual arg kinds {arg_types:?}",
+                );
+            }
+            let expected_result =
+                return_type_string_to_value_type(self.return_types.get(witness_path));
+            if result_type != expected_result {
+                panic!(
+                    "indirect_call in family including {witness_path:?}: \
+                     calling a function with return type {expected_result:?}, \
+                     but the actual return type is {result_type:?}",
+                );
             }
         }
 
@@ -2630,6 +2725,13 @@ impl CallControl {
             can_collect,
         );
 
+        // result_type drove the signature validation above; the
+        // CallDescriptor extra_info is the sole surface the optimizer
+        // consumes, matching upstream where `calldescrof(FUNC, ...,
+        // FUNC.RESULT, EffectInfo.MOST_GENERAL)` returns a
+        // `LLDescr`-wrapped EffectInfo and the RESULT is stored on the
+        // descr itself (tracked via `descr.result_type()` downstream,
+        // not re-packed here).
         let _ = result_type;
         CallDescriptor {
             extra_info: effectinfo,
@@ -4185,6 +4287,55 @@ mod tests {
                 "opaque_call"
             ])),
             0x1234
+        );
+    }
+
+    #[test]
+    fn register_macro_impl_helper_binds_simple_type() {
+        // Pyre's canonical impl-method CallPath for
+        // `impl Adder { fn add() }` at module `impl_module` is
+        // `CallPath::for_impl_method("impl_module::Adder", "add")` —
+        // impl_type is split on `::` so every segment has the same
+        // granularity as free-fn paths.
+        let mut cc = CallControl::new();
+        cc.register_macro_impl_helper_trace_fnaddr("impl_module::Adder", "add", 0xfeed_beef);
+
+        assert_eq!(
+            cc.fnaddr_for_target(&CallTarget::function_path(["impl_module", "Adder", "add"])),
+            0xfeed_beef
+        );
+    }
+
+    #[test]
+    fn register_macro_impl_helper_binds_module_qualified_type() {
+        // `impl a::Foo { fn bar() }` — impl_type `"a::Foo"` splits into
+        // `[a, Foo]` and merges with the method to form `[a, Foo, bar]`.
+        let mut cc = CallControl::new();
+        cc.register_macro_impl_helper_trace_fnaddr("a::Foo", "bar", 0x1234);
+
+        assert_eq!(
+            cc.fnaddr_for_target(&CallTarget::function_path(["a", "Foo", "bar"])),
+            0x1234
+        );
+    }
+
+    #[test]
+    fn register_macro_helper_free_fn_path_is_unchanged_by_impl_alias_split() {
+        // Regression: the macro helper entry point no longer tries to
+        // heuristically collapse `module::sub::fn_name` into a 2-segment
+        // form, since that is indistinguishable from the qualified
+        // impl-type case.  Free-fn paths bind exactly the canonical
+        // strip-crate and `crate::...` aliases — nothing else.
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr("testcrate::helpers::sub::bar", 0x4242);
+
+        assert_eq!(
+            cc.fnaddr_for_target(&CallTarget::function_path(["helpers", "sub", "bar"])),
+            0x4242
+        );
+        assert_ne!(
+            cc.fnaddr_for_target(&CallTarget::function_path(["sub", "bar"])),
+            0x4242,
         );
     }
 

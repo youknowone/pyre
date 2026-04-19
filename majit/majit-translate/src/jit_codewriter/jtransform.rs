@@ -2732,17 +2732,46 @@ mod tests {
     /// `[VtableMethodPtr, Live, GuardValue{kind='i'},
     ///   CallResidual{funcptr=Value(_), indirect_targets=Some}, Live]`.
     /// RPython `jtransform.py:410-412 + 538-553` orthodox port parity.
+    /// Build an impl-method graph with a single `Input { ty: Ref }`
+    /// representing the receiver `self` — mirrors the one-arg signature
+    /// `fn run(&self)` that `FunctionReprBase.call` feeds into
+    /// `indirect_call(funcptr, self, c_graphs)` (rpbc.py:207-217).
+    fn build_handler_run_impl_graph(name: &str) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph
+    }
+
     #[test]
     fn lower_indirect_call_op_emit_order() {
         use crate::call::CallControl;
-        use crate::model::FunctionGraph as CrateFG;
         use crate::translate_legacy::annotator::annrpython::annotate;
         use crate::translate_legacy::rtyper::rtyper::resolve_types;
         use crate::translator::rtyper::rpbc::lower_indirect_calls;
 
         let mut cc = CallControl::new();
-        cc.register_trait_method("run", Some("Handler"), "A", CrateFG::new("A::run"));
-        cc.register_trait_method("run", Some("Handler"), "B", CrateFG::new("B::run"));
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "A",
+            build_handler_run_impl_graph("A::run"),
+        );
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "B",
+            build_handler_run_impl_graph("B::run"),
+        );
         cc.find_all_graphs_for_tests();
 
         // Build a graph: `receiver = input(); receiver.run()`.
@@ -2826,14 +2855,23 @@ mod tests {
     #[test]
     fn indirectcalltargets_reach_call_residual_payload() {
         use crate::call::CallControl;
-        use crate::model::FunctionGraph as CrateFG;
         use crate::translate_legacy::annotator::annrpython::annotate;
         use crate::translate_legacy::rtyper::rtyper::resolve_types;
         use crate::translator::rtyper::rpbc::lower_indirect_calls;
 
         let mut cc = CallControl::new();
-        cc.register_trait_method("run", Some("Handler"), "A", CrateFG::new("A::run"));
-        cc.register_trait_method("run", Some("Handler"), "B", CrateFG::new("B::run"));
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "A",
+            build_handler_run_impl_graph("A::run"),
+        );
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "B",
+            build_handler_run_impl_graph("B::run"),
+        );
         cc.find_all_graphs_for_tests();
 
         let mut graph = FunctionGraph::new("outer");

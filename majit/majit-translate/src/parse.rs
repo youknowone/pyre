@@ -40,6 +40,30 @@ impl CallPath {
         }
     }
 
+    /// Build the canonical CallPath for an inherent / trait-impl method.
+    ///
+    /// `impl_type_joined` may be a single segment (`"Foo"`) or a
+    /// `::`-joined type path (`"a::Foo"`, `"mod::Outer::Inner"`). The
+    /// impl_type is split into its individual segments and concatenated
+    /// with the method name so that the resulting CallPath is uniform
+    /// with free-fn paths (`["a", "b", "f"]`) — both the
+    /// type-qualified prefix and the method name live at the same
+    /// segment granularity. Previously impl methods were stored as
+    /// 2-segment `[impl_type_joined, method]`, which diverged from
+    /// free-fn shape and forced macro-side heuristics; this form
+    /// restores uniformity (RPython parity: `getfunctionptr(graph)` is
+    /// string-free and does not distinguish the two shapes
+    /// `rpython/jit/codewriter/call.py:174-187`).
+    pub fn for_impl_method(impl_type_joined: &str, method: &str) -> Self {
+        let mut segments: Vec<String> = impl_type_joined
+            .split("::")
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_string())
+            .collect();
+        segments.push(method.to_string());
+        Self { segments }
+    }
+
     pub fn last_segment(&self) -> Option<&str> {
         self.segments.last().map(String::as_str)
     }
