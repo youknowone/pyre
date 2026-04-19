@@ -4625,6 +4625,16 @@ result = fib(12)
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "cranelift",
+        ignore = "cranelift CALL_ASSEMBLER Rust trampoline \
+                  (call_assembler_guard_failure_inner / call_assembler_shim_inner) \
+                  adds a native frame per recursive compiled entry. At the low JIT \
+                  threshold used here, g(9)×2 runs enough compiled invocations to \
+                  overflow the 2 MiB default cargo-test thread stack. Dynasm is \
+                  unaffected (jmp trampoline). See \
+                  memory/fib_recursive_sigbus_2026_04_19.md."
+    )]
     fn test_recursive_global_reads_do_not_reuse_force_cache_across_global_mutation() {
         let _jit_params = TestJitParamsGuard::low_threshold();
         let source = "\
