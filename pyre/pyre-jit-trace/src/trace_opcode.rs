@@ -2152,20 +2152,19 @@ impl MIFrame {
         // Branch guards resume at `other_target` (the runtime jump destination,
         // not the POP_JUMP_IF_* opcode's orgpc). At `other_target` the Python
         // interpreter has already popped the comparison truth, so the snapshot
-        // must reflect the POST-POP stack state. `pre_opcode_stack` /
-        // `pre_opcode_vsd` were captured at the START of POP_JUMP_IF (PRE-POP)
-        // and still carry the Int truth — using them here would emit a
-        // `Box(truth_opref, Int)` at a Ref-declared `locals_cells_stack_w`
-        // slot and corrupt the PyFrame when the guard resumes (the decoder
-        // writes a raw i64 where a PyObjectRef is expected).
+        // must reflect the POST-POP register file. `pre_opcode_registers_r`
+        // and `pre_opcode_vsd` were captured at the START of POP_JUMP_IF
+        // (PRE-POP) and still carry the Int truth — using them here would
+        // emit a `Box(truth_opref, Int)` at a Ref-declared
+        // `locals_cells_stack_w` slot and corrupt the PyFrame when the
+        // guard resumes (the decoder writes a raw i64 where a PyObjectRef
+        // is expected).
         //
         // Temporarily suppress the pre-opcode snapshot for the duration of
         // the branch guard capture so `flush_to_frame_for_guard`,
         // `get_list_of_active_boxes`, and `build_virtualizable_boxes` all
-        // read the current (post-pop) symbolic_stack / valuestackdepth.
+        // read the current (post-pop) `registers_r` / valuestackdepth.
         let saved_pre_opcode_vsd = self.sym_mut().pre_opcode_vsd.take();
-        let saved_pre_opcode_stack = self.sym_mut().pre_opcode_stack.take();
-        let saved_pre_opcode_stack_types = self.sym_mut().pre_opcode_stack_types.take();
         let saved_pre_opcode_registers_r = self.sym_mut().pre_opcode_registers_r.take();
 
         self.flush_to_frame_for_guard(ctx);
@@ -2253,8 +2252,6 @@ impl MIFrame {
         s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
         s.pre_opcode_vsd = saved_pre_opcode_vsd;
-        s.pre_opcode_stack = saved_pre_opcode_stack;
-        s.pre_opcode_stack_types = saved_pre_opcode_stack_types;
         s.pre_opcode_registers_r = saved_pre_opcode_registers_r;
     }
 
@@ -4040,29 +4037,13 @@ impl MIFrame {
         // the opcode from orgpc.
         {
             let s = self.sym_mut();
-            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
             s.pre_opcode_vsd = Some(s.valuestackdepth);
             // Stage 3.4 Phase C: the unified register file snapshot is
             // the single source for guard fail_arg encoding. Locals
             // live in `[..nlocals]` and stack slots in
-            // `[nlocals..nlocals+stack_only]`. `pre_opcode_stack` now
-            // mirrors the stack tail slice for legacy encoder paths
-            // that still consume a stack-only view (build_virtualizable
-            // skeleton fallback).
-            let nlocals_snap = s.nlocals;
-            let stack_tail = {
-                let reg_len = s.registers_r.len();
-                if reg_len > nlocals_snap {
-                    let end = (nlocals_snap + stack_only).min(reg_len);
-                    s.registers_r[nlocals_snap..end].to_vec()
-                } else {
-                    Vec::new()
-                }
-            };
-            s.pre_opcode_stack = Some(stack_tail);
-            s.pre_opcode_stack_types = Some(
-                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
-            );
+            // `[nlocals..nlocals+stack_only]`; encoders read them via
+            // `pre_opcode_registers_r` with `pre_opcode_vsd` bounding
+            // the valid live window.
             s.pre_opcode_registers_r = Some(s.registers_r.clone());
         }
         // pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity: when
@@ -4087,8 +4068,6 @@ impl MIFrame {
                 // execute_opcode_step below).
                 let s = self.sym_mut();
                 s.pre_opcode_vsd = None;
-                s.pre_opcode_stack = None;
-                s.pre_opcode_stack_types = None;
                 s.pre_opcode_registers_r = None;
                 return action;
             }
@@ -4102,8 +4081,6 @@ impl MIFrame {
         {
             let s = self.sym_mut();
             s.pre_opcode_vsd = None;
-            s.pre_opcode_stack = None;
-            s.pre_opcode_stack_types = None;
             s.pre_opcode_registers_r = None;
         }
         // RPython execute_ll_raised parity: store exception in
@@ -4412,8 +4389,6 @@ impl MIFrame {
                 // clear below.
                 let s = self.sym_mut();
                 s.pre_opcode_vsd = None;
-                s.pre_opcode_stack = None;
-                s.pre_opcode_stack_types = None;
                 s.pre_opcode_registers_r = None;
                 return InlineTraceStepAction::Trace(action);
             }
