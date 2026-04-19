@@ -2404,7 +2404,14 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
-        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef::NULL),
+            &[],
+            &[],
+            &[],
+        );
 
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
@@ -2448,7 +2455,14 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
-        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef::NULL),
+            &[],
+            &[],
+            &[],
+        );
 
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
@@ -2486,7 +2500,14 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
-        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef::NULL),
+            &[],
+            &[],
+            &[],
+        );
 
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
@@ -2528,7 +2549,14 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
-        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef::NULL),
+            &[],
+            &[],
+            &[],
+        );
 
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
@@ -2570,7 +2598,14 @@ mod tests {
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
-        ctx.init_virtualizable_boxes(&info, vable_ref, &[], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable_ref,
+            Value::Ref(majit_ir::GcRef::NULL),
+            &[],
+            &[],
+            &[],
+        );
 
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);

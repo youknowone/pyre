@@ -3395,7 +3395,7 @@ mod tests {
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 // Write field 0 to heap
                 let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-                ctx.vable_setfield(self.vable_ref, fd, self.field_val);
+                ctx.vable_setfield(self.vable_ref, fd, self.field_val, Value::Int(0));
             }
 
             fn sync_virtualizable_after_residual_call(
@@ -3404,7 +3404,7 @@ mod tests {
             ) -> crate::jit_state::ResidualVirtualizableSync {
                 // Re-read field 0 from heap
                 let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-                let new_ref = ctx.vable_getfield_int(self.vable_ref, fd);
+                let (new_ref, _) = ctx.vable_getfield_int(self.vable_ref, fd);
                 crate::jit_state::ResidualVirtualizableSync {
                     updated_fields: vec![(0, new_ref)],
                     forced: false,
@@ -3532,7 +3532,12 @@ mod tests {
 
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer);
-                ctx.vable_setfield(self.vable_ref, fd, self.field_val);
+                ctx.vable_setfield(
+                    self.vable_ref,
+                    fd,
+                    self.field_val,
+                    Value::Ref(majit_ir::GcRef::NULL),
+                );
             }
 
             fn sync_virtualizable_after_residual_call(
@@ -3540,7 +3545,7 @@ mod tests {
                 ctx: &mut TraceCtx,
             ) -> crate::jit_state::ResidualVirtualizableSync {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer);
-                let new_ref = ctx.vable_getfield_ref(self.vable_ref, fd);
+                let (new_ref, _) = ctx.vable_getfield_ref(self.vable_ref, fd);
                 crate::jit_state::ResidualVirtualizableSync {
                     updated_fields: vec![(0, new_ref)],
                     forced: false,
@@ -3608,7 +3613,7 @@ mod tests {
 
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Float, majit_ir::ArrayFlag::Float);
-                ctx.vable_setfield(self.vable_ref, fd, self.field_val);
+                ctx.vable_setfield(self.vable_ref, fd, self.field_val, Value::Float(0.0));
             }
 
             fn sync_virtualizable_after_residual_call(
@@ -3616,7 +3621,7 @@ mod tests {
                 ctx: &mut TraceCtx,
             ) -> crate::jit_state::ResidualVirtualizableSync {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Float, majit_ir::ArrayFlag::Float);
-                let new_ref = ctx.vable_getfield_float(self.vable_ref, fd);
+                let (new_ref, _) = ctx.vable_getfield_float(self.vable_ref, fd);
                 crate::jit_state::ResidualVirtualizableSync {
                     updated_fields: vec![(0, new_ref)],
                     forced: false,
@@ -3737,6 +3742,19 @@ mod tests {
         info
     }
 
+    // Test helper: concrete placeholder matching slot declared type.  The
+    // tests only care about OpRef plumbing; actual concrete values are
+    // never inspected but must type-check against the slot to avoid being
+    // silently dropped by `set_virtualizable_entry_at`'s type guard.
+    fn ph(ty: Type) -> Value {
+        match ty {
+            Type::Int => Value::Int(0),
+            Type::Float => Value::Float(0.0),
+            Type::Ref => Value::Ref(majit_ir::GcRef::NULL),
+            Type::Void => Value::Void,
+        }
+    }
+
     #[test]
     fn standard_vable_getfield_reads_from_boxes() {
         let info = make_test_vable_info();
@@ -3748,13 +3766,20 @@ mod tests {
         let box1 = recorder.record_input_arg(Type::Int); // sp
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box0, box1],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[],
+        );
 
         // getfield with offset=8 → static field 0 → box0
-        let result = ctx.vable_getfield_int(vable, fd8);
+        let (result, _) = ctx.vable_getfield_int(vable, fd8);
         assert_eq!(result, box0);
         // getfield with offset=16 → static field 1 → box1
-        let result = ctx.vable_getfield_int(vable, fd16);
+        let (result, _) = ctx.vable_getfield_int(vable, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -3777,16 +3802,23 @@ mod tests {
         let new_val = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box0, box1],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[],
+        );
 
         // setfield offset=8 → updates box0
-        ctx.vable_setfield(vable, fd8.clone(), new_val);
+        ctx.vable_setfield(vable, fd8.clone(), new_val, ph(Type::Int));
 
         // Box 0 should now be new_val
-        let result = ctx.vable_getfield_int(vable, fd8);
+        let (result, _) = ctx.vable_getfield_int(vable, fd8);
         assert_eq!(result, new_val);
         // Box 1 unchanged
-        let result = ctx.vable_getfield_int(vable, fd16);
+        let (result, _) = ctx.vable_getfield_int(vable, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -3820,7 +3852,7 @@ mod tests {
         let mut ctx = TraceCtx::new(recorder, 0);
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        ctx.vable_setfield(vable, fd8, val);
+        ctx.vable_setfield(vable, fd8, val, ph(Type::Int));
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -3836,7 +3868,14 @@ mod tests {
         let box1 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box0, box1],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[],
+        );
 
         // Unknown offset (999) → fallback to heap op
         let fd999 = majit_ir::make_field_descr(999, 8, Type::Int, majit_ir::ArrayFlag::Signed);
@@ -3860,9 +3899,9 @@ mod tests {
         let box0 = recorder.record_input_arg(Type::Ref);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, vable, &[box0], &[]);
+        ctx.init_virtualizable_boxes(&info, vable, ph(Type::Ref), &[box0], &[ph(Type::Ref)], &[]);
 
-        let result = ctx.vable_getfield_ref(vable, fd8);
+        let (result, _) = ctx.vable_getfield_ref(vable, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);
@@ -3882,9 +3921,16 @@ mod tests {
         let box0 = recorder.record_input_arg(Type::Float);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, vable, &[box0], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box0],
+            &[ph(Type::Float)],
+            &[],
+        );
 
-        let result = ctx.vable_getfield_float(vable, fd8);
+        let (result, _) = ctx.vable_getfield_float(vable, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);
@@ -3907,18 +3953,20 @@ mod tests {
         ctx.init_virtualizable_boxes(
             &info,
             vable,
+            ph(Type::Ref),
             &[box_pc, box_arr0, box_arr1, box_arr2],
+            &[ph(Type::Int), ph(Type::Int), ph(Type::Int), ph(Type::Int)],
             &[3], // array has 3 elements
         );
 
         // Array field offset=24, item_index=0 → box_arr0
-        let r0 = ctx.vable_getarrayitem_int_vable(vable, &fd24, 0);
+        let (r0, _) = ctx.vable_getarrayitem_int_vable(vable, &fd24, 0);
         assert_eq!(r0, box_arr0);
         // item_index=1 → box_arr1
-        let r1 = ctx.vable_getarrayitem_int_vable(vable, &fd24, 1);
+        let (r1, _) = ctx.vable_getarrayitem_int_vable(vable, &fd24, 1);
         assert_eq!(r1, box_arr1);
         // item_index=2 → box_arr2
-        let r2 = ctx.vable_getarrayitem_int_vable(vable, &fd24, 2);
+        let (r2, _) = ctx.vable_getarrayitem_int_vable(vable, &fd24, 2);
         assert_eq!(r2, box_arr2);
 
         let ops = take_all_ops(ctx);
@@ -3943,17 +3991,19 @@ mod tests {
         ctx.init_virtualizable_boxes(
             &info,
             vable,
+            ph(Type::Ref),
             &[box_pc, box_arr0, box_arr1],
+            &[ph(Type::Int), ph(Type::Int), ph(Type::Int)],
             &[2], // array has 2 elements
         );
 
         // Write to array[1]
-        ctx.vable_setarrayitem_vable(vable, &fd24, 1, new_val);
+        ctx.vable_setarrayitem_vable(vable, &fd24, 1, new_val, ph(Type::Int));
 
         // Read back: array[0] unchanged, array[1] updated
-        let r0 = ctx.vable_getarrayitem_int_vable(vable, &fd24, 0);
+        let (r0, _) = ctx.vable_getarrayitem_int_vable(vable, &fd24, 0);
         assert_eq!(r0, box_arr0);
-        let r1 = ctx.vable_getarrayitem_int_vable(vable, &fd24, 1);
+        let (r1, _) = ctx.vable_getarrayitem_int_vable(vable, &fd24, 1);
         assert_eq!(r1, new_val);
 
         let ops = take_all_ops(ctx);
@@ -3969,7 +4019,14 @@ mod tests {
         let box_arr0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
 
-        ctx.init_virtualizable_boxes(&info, vable, &[box_pc, box_arr0], &[1]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
 
         // Unknown array field offset → fallback
         let fd999 = majit_ir::make_field_descr(999, 8, Type::Int, majit_ir::ArrayFlag::Signed);
@@ -3994,14 +4051,21 @@ mod tests {
         // Before init: None
         assert!(ctx.collect_virtualizable_boxes().is_none());
 
-        ctx.init_virtualizable_boxes(&info, vable, &[box0, box1], &[]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box0, box1],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[],
+        );
 
         // After init: has boxes (field0, field1, vable_ref sentinel)
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes, vec![box0, box1, vable]);
 
         // After mutation
-        ctx.vable_setfield(vable, fd8, new_val);
+        ctx.vable_setfield(vable, fd8, new_val, ph(Type::Int));
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes, vec![new_val, box1, vable]);
     }
@@ -4026,7 +4090,14 @@ mod tests {
         let box_arr0 = recorder.record_input_arg(Type::Ref);
         let box_arr1 = recorder.record_input_arg(Type::Ref);
         let mut ctx = TraceCtx::new(recorder, 0);
-        ctx.init_virtualizable_boxes(&info, vable, &[box_pc, box_arr0, box_arr1], &[2]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0, box_arr1],
+            &[ph(Type::Int), ph(Type::Ref), ph(Type::Ref)],
+            &[2],
+        );
 
         ctx.gen_store_back_in_vable(vable);
 
@@ -4068,7 +4139,14 @@ mod tests {
         let box_pc = recorder.record_input_arg(Type::Int);
         let box_arr0 = recorder.record_input_arg(Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0);
-        ctx.init_virtualizable_boxes(&info, vable, &[box_pc, box_arr0], &[1]);
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
 
         ctx.gen_store_back_in_vable(other_vable);
 

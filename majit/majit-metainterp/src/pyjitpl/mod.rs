@@ -12579,7 +12579,7 @@ mod tests {
             Vec::new(),
         );
 
-        let result = meta.opimpl_getfield_vable_int(OpRef(0), fd8);
+        let (result, _) = meta.opimpl_getfield_vable_int(OpRef(0), fd8);
         assert_eq!(result, OpRef(1));
 
         let ctx = meta.trace_ctx().unwrap();
@@ -12602,7 +12602,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(99)
         };
-        meta.opimpl_setfield_vable_int(OpRef(0), fd8, new_val);
+        meta.opimpl_setfield_vable_int(OpRef(0), fd8, new_val, Value::Int(99));
 
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
@@ -12632,7 +12632,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let result = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
+        let (result, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
         assert_eq!(result, OpRef(2));
 
         let ctx = meta.trace_ctx().unwrap();
@@ -12957,7 +12957,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let item = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
+        let (item, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
         if let Some(ctx) = meta.trace_ctx() {
             ctx.record_guard_with_fail_args(
                 OpCode::GuardTrue,
