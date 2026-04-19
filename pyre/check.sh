@@ -535,16 +535,19 @@ run_bench       "inline_helper"  "$BENCH/inline_helper.py"       5       ""     
 # Dynasm is already slower than CPython here; keep only a relaxed
 # CPython guard and do not add a PyPy criterion.
 #
-# Cranelift is skipped: CALL_ASSEMBLER is emitted as a Rust trampoline
-# (`call_assembler_guard_failure_inner`, `call_assembler_shim_inner`)
-# that accumulates a native stack frame per recursive call. fib(32)
-# overflows the shadow stack with `MAX_SHADOW_STACK_DEPTH=8192` (SIGBUS)
-# and raising that limit pushes the failure into `thread stack overflow`
-# once the Rust call chain exceeds ~8 MiB. RPython x86 uses a `jmp`
-# trampoline (assembler.py:2260-2310) that adds zero native frames;
-# pyre-cranelift needs a structural rework to match. Tracked in
-# memory/fib_recursive_sigbus_2026_04_19.md. Dynasm passes this bench.
-run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       1.5                  ""              1                       8       "cranelift"
+# fib_recursive used to be skipped on cranelift due to a self-recursive
+# CALL_ASSEMBLER runaway: the cranelift helper's force_fn fallback
+# created a fresh PyFrame with empty locals (PyFrame::new_for_call with
+# args=[]) when blackhole returned None, and portal_runner then
+# re-entered the JIT with a stale locals_w[0], driving fib into
+# unbounded self-recursion and blowing the shadow stack.
+# Fixed 2026-04-20 by dropping the force_fn fallback and the
+# rebuild_state_after_failure preprocessing in
+# call_assembler_guard_failure_inner, matching dynasm's
+# call_assembler_helper_trampoline (lib.rs:143) which is
+# RPython-orthodox: handle_fail does trace+attach OR blackhole, with
+# `assert 0, "unreachable"` after both branches (compile.py:717).
+run_bench       "fib_recursive" "$BENCH/fib_recursive.py"        5       1.5                  ""              1                       8
 run_bench       "nested_loop"    "$BENCH/nested_loop.py"         5       ""                   2               ""                      2
 run_bench       "raise_catch"   "$BENCH/raise_catch_loop.py"     6       ""                   ""              ""                      ""
 # Dynasm is slower than CPython on these; do not add a PyPy criterion.

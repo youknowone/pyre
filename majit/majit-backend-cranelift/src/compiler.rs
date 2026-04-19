@@ -2700,24 +2700,40 @@ fn call_assembler_guard_failure_inner(
 
     // resume.py:1312 blackhole_from_resumedata parity: materialize
     // virtuals before blackhole resume.
+    //
+    // RPython-orthodox (compile.py:701-716 handle_fail): when
+    // must_compile + !stack_almost_full, trace+attach a bridge;
+    // OTHERWISE resume_in_blackhole. There is NO force_fn fallback —
+    // handle_fail is declared `assert 0, "unreachable"` after both
+    // paths (bridge always raises via compile_trace's "raises in case
+    // it works", blackhole always raises via JitException). Dynasm's
+    // `call_assembler_helper_trampoline` mirrors this: blackhole result
+    // OR 0, no force_fn. The previous force_fn fallback created a new
+    // PyFrame with empty locals via PyFrame::new_for_call(code, &[], ...)
+    // in jit_force_callee_frame, which left locals_w[0] uninitialized;
+    // when portal_runner re-entered the JIT via try_function_entry_jit,
+    // the stale `n` value drove the self-recursive CA into an unbounded
+    // loop, blowing the shadow stack (see fib_recursive_plan_2026_04_20).
+    // Dynasm's call_assembler_helper_trampoline (majit-backend-dynasm/src/lib.rs
+    // :189-202) passes the raw deadframe values as BOTH fail_values AND
+    // raw_deadframe to bh_fn. blackhole_resume_via_rd_numb
+    // (pyre-jit/src/call_jit.rs:1351) only consumes `raw_deadframe`, so the
+    // rebuild_state_after_failure preprocessing step is functionally a
+    // no-op for the blackhole path — but when it empties `bh_outputs`
+    // (recovery.frames.slots order mismatched with raw_num), bh_fn sees
+    // `num_fail_values == 0` and returns None immediately
+    // (call_jit.rs:1293), which previously drove the force_fn fallback
+    // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let green_key = target.green_key;
         let trace_id = target.trace_id;
         let raw_num = fail_descr.fail_arg_types.len();
-        let mut bh_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) }.to_vec();
-        rebuild_state_after_failure(
-            &mut bh_outputs,
-            &fail_descr.fail_arg_types,
-            fail_descr.recovery_layout_ref().as_ref(),
-            raw_num,
-        );
-        let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
             green_key,
             trace_id,
             fail_index,
-            bh_outputs.as_ptr(),
-            num_outputs,
+            outputs_ptr,
+            raw_num,
             outputs_ptr,
             raw_num,
         ) {
@@ -2730,15 +2746,9 @@ fn call_assembler_guard_failure_inner(
             return result;
         }
     }
-    // Fallback: force_fn re-executes the callee from scratch.
-    // Read the first local (after the virtualizable header).
-    let first_local_idx = target.num_scalar_inputargs;
-    if !inputs_ptr.is_null() && target.inputarg_types.len() > first_local_idx {
-        let raw = unsafe { *inputs_ptr.add(first_local_idx) };
-        PENDING_FORCE_LOCAL0.with(|c| c.set(Some(raw)));
-    }
-    let result = CALL_ASSEMBLER_FORCE_FN.get().map_or(0, |f| f(frame_ptr));
-    result
+    let _ = inputs_ptr;
+    let _ = frame_ptr;
+    0
 }
 
 /// Fast path for call_assembler when a force callback is available.
