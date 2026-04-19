@@ -463,6 +463,12 @@ fn dispatch_op(
             let label_id = builder_label(state, &label.name);
             state.builder.goto_if_not_int_ne(lhs, rhs, label_id);
         }
+        "goto_if_not_int_is_zero" => {
+            let cond = expect_reg(&args[0], Kind::Int);
+            let label = expect_tlabel(&args[1]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_int_is_zero(cond, label_id);
+        }
         "catch_exception" => {
             let label = expect_tlabel(&args[0]);
             let label_id = builder_label(state, &label.name);

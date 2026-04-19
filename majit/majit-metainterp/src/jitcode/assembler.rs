@@ -498,6 +498,17 @@ impl JitCodeBuilder {
         self.push_label_ref(label);
     }
 
+    // blackhole.py:916-920 `bhimpl_goto_if_not_int_is_zero(a, target, pc)`:
+    // fall through iff `not a` (a == 0), else take the target. jtransform.py:1212
+    // `_rewrite_equality` rewrites `int_eq(x, 0)` → `int_is_zero(x)` so
+    // flatten.py:247 specialises the bool exitswitch into this unary form.
+    pub fn goto_if_not_int_is_zero(&mut self, a: u16, label: u16) {
+        self.touch_reg(a);
+        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_IS_ZERO);
+        self.push_u16(a);
+        self.push_label_ref(label);
+    }
+
     pub fn jump(&mut self, label: u16) {
         self.push_u8(jitcode::BC_JUMP);
         self.push_label_ref(label);

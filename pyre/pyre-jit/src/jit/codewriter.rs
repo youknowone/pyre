@@ -1002,40 +1002,38 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for integer comparison exitswitches.
-        // RPython parity: `jtransform.py:196` + `flatten.py:247` encode
-        // boolean branches as `goto_if_not_<opname>` rather than a
-        // generic `goto_if_not` over a temporary boolean result.
-        macro_rules! emit_goto_if_not_int_eq {
-            ($ssarepr:expr, $asm:expr, $labels:expr, $lhs:expr, $rhs:expr, $py_pc:expr) => {{
-                let lhs = $lhs;
-                let rhs = $rhs;
+        // flatten.py:240-260 boolean exitswitch emission. When the bool is a
+        // plain variable (truth_fn result), flatten emits `goto_if_not <v> L`
+        // (alias of bhimpl_goto_if_not_int_is_true per blackhole.py:913).
+        // PopJumpIfTrue inverts the polarity via jtransform.py:1212
+        // `_rewrite_equality` + flatten.py:247 specialisation
+        // `goto_if_not_int_is_zero <v> L` (blackhole.py:916-920).
+        macro_rules! emit_goto_if_not {
+            ($ssarepr:expr, $asm:expr, $labels:expr, $cond:expr, $py_pc:expr) => {{
+                let cond = $cond;
                 let py_pc = $py_pc;
                 $ssarepr.insns.push(Insn::op(
-                    "goto_if_not_int_eq",
+                    "goto_if_not",
                     vec![
-                        Operand::reg(Kind::Int, lhs),
-                        Operand::reg(Kind::Int, rhs),
+                        Operand::reg(Kind::Int, cond),
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 ));
-                $asm.goto_if_not_int_eq(lhs, rhs, $labels[py_pc]);
+                $asm.branch_reg_zero(cond, $labels[py_pc]);
             }};
         }
-        macro_rules! emit_goto_if_not_int_ne {
-            ($ssarepr:expr, $asm:expr, $labels:expr, $lhs:expr, $rhs:expr, $py_pc:expr) => {{
-                let lhs = $lhs;
-                let rhs = $rhs;
+        macro_rules! emit_goto_if_not_int_is_zero {
+            ($ssarepr:expr, $asm:expr, $labels:expr, $cond:expr, $py_pc:expr) => {{
+                let cond = $cond;
                 let py_pc = $py_pc;
                 $ssarepr.insns.push(Insn::op(
-                    "goto_if_not_int_ne",
+                    "goto_if_not_int_is_zero",
                     vec![
-                        Operand::reg(Kind::Int, lhs),
-                        Operand::reg(Kind::Int, rhs),
+                        Operand::reg(Kind::Int, cond),
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 ));
-                $asm.goto_if_not_int_ne(lhs, rhs, $labels[py_pc]);
+                $asm.goto_if_not_int_is_zero(cond, $labels[py_pc]);
             }};
         }
 
@@ -1493,7 +1491,11 @@ impl CodeWriter {
                     emit_vsd!(assembler, current_depth);
                 }
 
-                // jtransform.py: optimize_goto_if_not → goto_if_not_<opname>
+                // flatten.py:240-260 + blackhole.py:865-869. truth_fn returns
+                // a bool-as-int; emit plain `goto_if_not <bool> L` — the
+                // unfused form flatten.py takes when the exitswitch is a
+                // plain variable (not a tuple of a foldable comparison op).
+                // bhimpl_goto_if_not takes the target when `a == 0`.
                 Instruction::PopJumpIfFalse { delta } => {
                     let target_py_pc = jump_target_forward(
                         code,
@@ -1510,18 +1512,16 @@ impl CodeWriter {
                         int_tmp0,
                     );
                     if target_py_pc < num_instrs {
-                        emit_load_const_i!(ssarepr, assembler, int_tmp1, 0);
-                        emit_goto_if_not_int_ne!(
-                            ssarepr,
-                            assembler,
-                            labels,
-                            int_tmp0,
-                            int_tmp1,
-                            target_py_pc
-                        );
+                        emit_goto_if_not!(ssarepr, assembler, labels, int_tmp0, target_py_pc);
                     }
                 }
 
+                // jtransform.py:1212 `_rewrite_equality` rewrites
+                // `int_eq(x, 0)` → `int_is_zero(x)`; flatten.py:247
+                // specialises into `goto_if_not_int_is_zero <v> L`
+                // (blackhole.py:916-920). Polarity is inverted vs
+                // PopJumpIfFalse: target taken iff the truth-fn result
+                // is non-zero (truthy).
                 Instruction::PopJumpIfTrue { delta } => {
                     let target_py_pc = jump_target_forward(
                         code,
@@ -1538,13 +1538,11 @@ impl CodeWriter {
                         int_tmp0,
                     );
                     if target_py_pc < num_instrs {
-                        emit_load_const_i!(ssarepr, assembler, int_tmp1, 0);
-                        emit_goto_if_not_int_eq!(
+                        emit_goto_if_not_int_is_zero!(
                             ssarepr,
                             assembler,
                             labels,
                             int_tmp0,
-                            int_tmp1,
                             target_py_pc
                         );
                     }

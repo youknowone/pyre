@@ -871,6 +871,30 @@ where
                     self.frames.current_mut().code_cursor = target;
                 }
             }
+            // pyjitpl.py:537-539 opimpl_goto_if_not_int_is_zero(box, target):
+            //   condbox = execute(rop.INT_IS_ZERO, box)
+            //   self.opimpl_goto_if_not(condbox, target, ..., replace=False)
+            // i.e. record int_is_zero on the operand, then branch as if the
+            // result were a plain bool exitswitch.
+            jitcode::BC_GOTO_IF_NOT_INT_IS_ZERO => {
+                let (src_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                };
+                let (src, src_value) = self.read_int_reg(src_idx);
+                let cond_value = if src_value == 0 { 1 } else { 0 };
+                let cond = ctx.record_op(OpCode::IntIsZero, &[src]);
+                let guard = if cond_value == 0 {
+                    OpCode::GuardFalse
+                } else {
+                    OpCode::GuardTrue
+                };
+                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                if cond_value == 0 {
+                    self.frames.current_mut().code_cursor = target;
+                }
+            }
             jitcode::BC_GOTO_IF_NOT_INT_LT
             | jitcode::BC_GOTO_IF_NOT_INT_LE
             | jitcode::BC_GOTO_IF_NOT_INT_EQ

@@ -1802,6 +1802,17 @@ impl BlackholeInterpreter {
                     self.position = target;
                 }
             }
+            // blackhole.py:916-920 bhimpl_goto_if_not_int_is_zero:
+            //   if not a: return pc else return target
+            // i.e. take the target when `a != 0` (truthy).
+            jitcode::BC_GOTO_IF_NOT_INT_IS_ZERO => {
+                let a_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_i[a_idx];
+                if a != 0 {
+                    self.position = target;
+                }
+            }
             // blackhole.py:751-798 bhimpl_goto_if_not_float_*:
             //   a = longlong.getrealfloat(a); b = longlong.getrealfloat(b)
             //   if a <cmp> b: return pc else return target

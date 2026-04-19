@@ -354,6 +354,16 @@ impl SSAReprEmitter {
         );
     }
 
+    /// flatten.py:247 + blackhole.py:916-920 unary specialisation of
+    /// `goto_if_not` over `int_is_zero(a)`. Branches to `label` when
+    /// `a != 0` (truthy), falls through otherwise.
+    pub fn goto_if_not_int_is_zero(&mut self, cond: u16, label: u16) {
+        self.push_op(
+            "goto_if_not_int_is_zero",
+            vec![Operand::reg(Kind::Int, cond), self.tlabel(label)],
+        );
+    }
+
     pub fn catch_exception(&mut self, label: u16) {
         self.push_op("catch_exception", vec![self.tlabel(label)]);
     }

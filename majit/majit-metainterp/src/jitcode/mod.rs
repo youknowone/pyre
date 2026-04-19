@@ -117,6 +117,11 @@ pub(crate) const BC_GOTO_IF_NOT_FLOAT_GT: u8 = 102;
 pub(crate) const BC_GOTO_IF_NOT_FLOAT_GE: u8 = 103;
 pub(crate) const BC_GOTO_IF_NOT_PTR_EQ: u8 = 104;
 pub(crate) const BC_GOTO_IF_NOT_PTR_NE: u8 = 105;
+// blackhole.py:916-920 `bhimpl_goto_if_not_int_is_zero(a, target, pc)`:
+// take target iff `a != 0`. jtransform.py:1212 `_rewrite_equality`
+// folds `int_eq(x, 0)` into `int_is_zero(x)`; flatten.py:247 then
+// specialises the bool exitswitch into `goto_if_not_int_is_zero/iL`.
+pub(crate) const BC_GOTO_IF_NOT_INT_IS_ZERO: u8 = 106;
 
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
@@ -175,6 +180,7 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("goto_if_not_float_ge/ffL", BC_GOTO_IF_NOT_FLOAT_GE);
     m.insert("goto_if_not_ptr_eq/rrL", BC_GOTO_IF_NOT_PTR_EQ);
     m.insert("goto_if_not_ptr_ne/rrL", BC_GOTO_IF_NOT_PTR_NE);
+    m.insert("goto_if_not_int_is_zero/iL", BC_GOTO_IF_NOT_INT_IS_ZERO);
 
     m
 }
