@@ -233,6 +233,12 @@ impl Assembler {
     fn write_insn(&mut self, state: &mut AssemblyState, insn: &Insn) {
         match insn {
             Insn::Unreachable => {}
+            // PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor` docstring in
+            // `flatten.rs`). Anchors carry no bytecode; they exist only
+            // so the post-assemble byte-offset table (`ssarepr.insns_pos`)
+            // records the position of each Python PC for trace-time
+            // dispatch. No emit, no liveness side effect.
+            Insn::PcAnchor(_) => {}
             Insn::Label(label) => {
                 let label_id = builder_label(state, &label.name);
                 state

@@ -1342,6 +1342,11 @@ impl CodeWriter {
             }
             // RPython flatten.py: Label(block) at block entry
             emit_mark_label_pc!(ssarepr, py_pc);
+            // pyre PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor`
+            // docstring in `flatten.rs`): emit a stable anchor at every
+            // Python PC start so the post-compute_liveness / post-
+            // regalloc SSARepr position is recoverable.
+            ssarepr.insns.push(Insn::PcAnchor(py_pc));
             // Phase 3c Step 2: pc_map records walker-local SSARepr insn
             // indices. `insn_pos_to_byte_offset` translates them to byte
             // offsets after `Assembler::assemble` populates

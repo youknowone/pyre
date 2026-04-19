@@ -142,6 +142,14 @@ fn _compute_liveness_must_continue(
             continue;
         }
 
+        // PRE-EXISTING-ADAPTATION: `Insn::PcAnchor(py_pc)` carries no
+        // operands or liveness side effect (see `flatten.rs::Insn::PcAnchor`).
+        // Skip without affecting `alive` so the SSARepr-position marker
+        // is a no-op for the RPython `liveness.py:19-78` walk.
+        if let Insn::PcAnchor(_) = &insn {
+            continue;
+        }
+
         // Regular instruction (`liveness.py:59-78`).
         //
         // `liveness.py:59-65` pre-strips the `-> result` suffix: the

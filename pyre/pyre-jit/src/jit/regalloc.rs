@@ -371,6 +371,12 @@ impl RegAllocator {
 
             for insn in ssarepr.insns.iter().rev() {
                 match insn {
+                    // PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor` in
+                    // `flatten.rs`). Anchors carry no operand or
+                    // liveness — pure SSARepr-position markers for
+                    // post-assemble pc_map build. Skip in the
+                    // interference walk.
+                    Insn::PcAnchor(_) => {}
                     Insn::Label(label) => {
                         let alive_at_point = label2alive.entry(label.name.clone()).or_default();
                         let prevlength = alive_at_point.len();
@@ -659,7 +665,7 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), 
                     rename_operand(op, rename);
                 }
             }
-            Insn::Label(_) | Insn::Unreachable => {}
+            Insn::Label(_) | Insn::Unreachable | Insn::PcAnchor(_) => {}
         }
     }
 }

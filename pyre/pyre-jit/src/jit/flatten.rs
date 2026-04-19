@@ -446,7 +446,8 @@ impl Operand {
 
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
-/// The five RPython tuple shapes enumerated above.
+/// The five RPython tuple shapes enumerated above, plus one
+/// pyre-specific `PcAnchor` variant — see its docstring for rationale.
 #[derive(Debug, Clone)]
 pub enum Insn {
     /// `(Label(name),)` — block-entry marker.
@@ -469,6 +470,25 @@ pub enum Insn {
         args: Vec<Operand>,
         result: Option<Register>,
     },
+    /// PRE-EXISTING-ADAPTATION: pyre-only marker recording the SSARepr
+    /// position where a Python bytecode (py_pc) starts. RPython has no
+    /// equivalent because its jitcode is graph-derived (not Python-
+    /// bytecode-1:1) and Python PCs do not appear in jitcode space.
+    ///
+    /// pyre's dispatch loop emits one `PcAnchor` at every Python PC so
+    /// the trace-time dispatch can map `next_instr` to the JitCode byte
+    /// offset post-assemble. The `compute_liveness` and `regalloc`
+    /// passes ignore anchors entirely (no liveness, no interference, no
+    /// rename); `assembler.assemble` records each anchor's byte offset
+    /// without emitting any bytecode. This replaces the older
+    /// dispatch-time `pc_map[py_pc] = current_pos()` snapshot, which
+    /// became stale whenever `compute_liveness::remove_repeated_live`
+    /// merged consecutive `Insn::Live` markers and shifted insn indices.
+    ///
+    /// Closest RPython analog: `Label(block)` markers used to anchor
+    /// merge-point block entries (`flatten.py`); pyre's anchor is the
+    /// same idea applied per Python bytecode rather than per graph block.
+    PcAnchor(usize),
 }
 
 impl Insn {
