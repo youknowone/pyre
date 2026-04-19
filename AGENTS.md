@@ -56,8 +56,23 @@ Grep RPython:
 rg -t py 'lenbound|getlenbound|_x86_arglocs|_ll_loop_code' rpython/jit/
 ```
 
+
+### Workflow guideline
+
 If RPython stores it on an object attribute, store it on the equivalent
 Rust struct field. If RPython stores it on `box._forwarded`, route it
 through `OptContext::with_intbound_mut` / `set_ptr_info` / etc. Reach
 for `HashMap` only after you have proven that RPython itself uses a
 dict-like container in that exact spot.
+
+Add as a top-level section in CLAUDE.md, above any general coding guidelines.\n\n## RPython Parity Rules
+- When porting from RPython/PyPy, do STRICT line-by-line structural parity. Do NOT take shortcuts, reimplement from scratch, or declare phases 'complete' without the literal refactor.
+- If a parity fix causes regressions, investigate root cause before reverting. Do not declare success if structural alignment was skipped, even if benchmarks pass.
+- Always verify which worktree/repo you're in (`git rev-parse --show-toplevel`) before editing. Common worktrees: pypy/main, pypy-pyre, pypy-stdlib, pypy-side.
+Add under a ## Git Workflow or ## Testing section.\n\n## Before Committing
+- Run full benchmark suite (all 8 benchmarks) after JIT changes - do not commit if any regress.
+- Check `git status` and `git rev-parse --show-toplevel` before staging to confirm correct worktree.
+- When rebasing/cherry-picking, verify the fix isn't already on main first (`git log main --grep=...`).
+Add under a ## Debugging section.\n\n## Debugging Discipline
+- When adding trace/debug logs, verify the code path is actually reached (check gating, feature flags) before running the test.
+- For root-cause bugs, do NOT implement workarounds (e.g., builtin fallback modules) - fix the actual interpreter/JIT issue.
