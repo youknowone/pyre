@@ -1310,15 +1310,12 @@ impl OptContext {
         // Track OpRef → Type for fail_arg_types inference
         // (compile.rs value_types parity).
         // emit() may re-write an existing value_types entry when the same
-        // Register the op's result type. Production emits each pos
-        // exactly once, so this is either a first-time write or a
-        // same-type no-op. Keep `.insert()` until unroll's peel_iteration
-        // (unroll.rs:4503-4555) stops computing positions arithmetically
-        // from `new_operations.len()` — without that fix, peeled ops
-        // land inside the 1024-slot inputarg seeding and flip the
-        // Box.type invariant.
+        // Register the op's result type. RPython's Box.type is fixed,
+        // so this is either a first-time record or a same-type no-op;
+        // `register_value_type` surfaces any genuine cross-type reuse
+        // immediately.
         if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-            self.value_types.insert(op.pos.0, op.result_type());
+            self.register_value_type(op.pos, op.result_type());
         }
         self.new_operations.push(op);
         pos_ref
@@ -1336,10 +1333,10 @@ impl OptContext {
         }
         let pos_ref = op.pos;
         // Box.type parity: mirror emit() — register the result type at
-        // the moment the op is queued. Keep `.insert()` for the same
-        // unroll/peel_iteration caveat documented on `emit()`.
+        // the moment the op is queued so any subsequent `opref_type` /
+        // `replace_op` lookup observes the correct type.
         if op.result_type() != majit_ir::Type::Void {
-            self.value_types.insert(op.pos.0, op.result_type());
+            self.register_value_type(op.pos, op.result_type());
         }
         self.extra_operations_after
             .push_back((after_pass_idx + 1, op));

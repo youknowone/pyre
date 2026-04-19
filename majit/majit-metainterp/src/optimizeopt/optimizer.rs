@@ -2905,19 +2905,13 @@ impl Optimizer {
         // has no equivalent stale-entry hazard because Box.type is stored
         // on the Box object itself.
         // Refresh value_types with the current op's result type before
-        // running pass callbacks. Production emits each pos exactly once
-        // and the seeding priority (swapped above so ops override
-        // inputargs) keeps this a same-type no-op. The unit-test
-        // harnesses still trip a genuine retype here because unroll's
-        // `peel_iteration` computes peeled/body positions arithmetically
-        // from `new_operations.len()` (unroll.rs:4503-4555) without
-        // passing through `reserve_pos`, so peeled ops land inside the
-        // 1024-slot inputarg seeding. Keep `.insert()` at this refresh
-        // site until unroll routes peel allocations through
-        // `reserve_pos` (which honors the `inputarg_base + num_inputs`
-        // floor).
+        // running pass callbacks. RPython's Box.type is fixed at Box
+        // creation, so this is either a first-time record (fresh pos)
+        // or a same-type no-op; a type-changing refresh would be a
+        // cross-phase OpRef-reuse bug, and surfacing it is the point of
+        // the invariant.
         if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-            ctx.value_types.insert(op.pos.0, op.result_type());
+            ctx.register_value_type(op.pos, op.result_type());
         }
 
         // Resolve forwarded arguments

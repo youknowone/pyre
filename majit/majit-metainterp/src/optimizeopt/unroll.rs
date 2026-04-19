@@ -4491,30 +4491,32 @@ impl OptUnroll {
     /// 3. The original body ops
     ///
     /// The caller is responsible for emitting the final Jump.
-    fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) {
-        if self.buffer.is_empty() {
-            return;
-        }
-
-        // Build the OpRef remapping for peeled ops.
-        // Each op in the buffer gets a new position in the peeled iteration.
-        // The offset is: original positions map to new sequential positions
-        // starting from the current emission point.
-        let peel_base = ctx.new_operations.len() as u32;
+    /// Emit the peeled iteration, the loop Label, and the body iteration
+    /// in that order, returning the `original_pos -> body_pos` map the
+    /// caller uses to rewrite the back-edge Jump's args.
+    ///
+    /// Positions are allocated through `reserve_pos` (which honors the
+    /// `inputarg_base + num_inputs` floor) instead of being computed
+    /// arithmetically from `new_operations.len()`. The arithmetic form
+    /// is fine for production traces (inputargs occupy a disjoint low
+    /// range) but collides with the 1024-slot `trace_inputarg_types`
+    /// stubs that the unit-test harnesses seed. Using `reserve_pos`
+    /// closes that collision and lets the Box.type invariant enforce
+    /// itself uniformly at `emit()` / `emit_extra()` /
+    /// `propagate_from_pass_range`.
+    fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) -> HashMap<OpRef, OpRef> {
+        // First pass: reserve peeled-iteration positions.
+        let peeled_positions: Vec<OpRef> =
+            (0..self.buffer.len()).map(|_| ctx.reserve_pos()).collect();
         let mut ref_map: HashMap<OpRef, OpRef> = HashMap::new();
-
-        // First pass: assign new positions for peeled ops.
-        for (i, op) in self.buffer.iter().enumerate() {
-            let new_pos = OpRef(peel_base + i as u32);
+        for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             ref_map.insert(op.pos, new_pos);
         }
 
         // Emit peeled iteration with remapped refs.
-        for (i, op) in self.buffer.iter().enumerate() {
+        for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             let mut peeled = op.clone();
-            peeled.pos = OpRef(peel_base + i as u32);
-
-            // Remap argument references.
+            peeled.pos = new_pos;
             for arg in &mut peeled.args {
                 if let Some(&new_ref) = ref_map.get(arg) {
                     *arg = new_ref;
@@ -4522,8 +4524,6 @@ impl OptUnroll {
                 // Args referencing ops outside the buffer (e.g., input args)
                 // are kept as-is.
             }
-
-            // Remap fail_args references.
             if let Some(ref mut fa) = peeled.fail_args {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = ref_map.get(arg) {
@@ -4531,36 +4531,33 @@ impl OptUnroll {
                     }
                 }
             }
-
             ctx.emit(peeled);
         }
 
         // Emit Label between peeled and original body.
         // The Label's args match the Jump's args, forming the loop header.
-        let label_pos = OpRef(peel_base + self.buffer.len() as u32);
+        let label_pos = ctx.reserve_pos();
         let mut label_op = Op::new(OpCode::Label, &jump_op.args);
         label_op.pos = label_pos;
         ctx.emit(label_op);
 
-        // Emit original body ops with updated positions.
-        let body_base = peel_base + self.buffer.len() as u32 + 1; // +1 for Label
+        // Reserve body positions and build the body ref_map.
+        let body_positions: Vec<OpRef> =
+            (0..self.buffer.len()).map(|_| ctx.reserve_pos()).collect();
         let mut orig_ref_map: HashMap<OpRef, OpRef> = HashMap::new();
-
-        for (i, op) in self.buffer.iter().enumerate() {
-            orig_ref_map.insert(op.pos, OpRef(body_base + i as u32));
+        for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
+            orig_ref_map.insert(op.pos, new_pos);
         }
 
-        for (i, op) in self.buffer.iter().enumerate() {
+        // Emit original body ops with remapped positions and refs.
+        for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             let mut body_op = op.clone();
-            body_op.pos = OpRef(body_base + i as u32);
-
-            // Remap argument references within the body.
+            body_op.pos = new_pos;
             for arg in &mut body_op.args {
                 if let Some(&new_ref) = orig_ref_map.get(arg) {
                     *arg = new_ref;
                 }
             }
-
             if let Some(ref mut fa) = body_op.fail_args {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = orig_ref_map.get(arg) {
@@ -4568,9 +4565,9 @@ impl OptUnroll {
                     }
                 }
             }
-
             ctx.emit(body_op);
         }
+        orig_ref_map
     }
 }
 
@@ -4592,26 +4589,23 @@ impl Optimization for OptUnroll {
             }
 
             // Perform the peeling: emit peeled body + Label + original body.
-            self.peel_iteration(op, ctx);
+            // The returned map forwards original `buffer` positions to
+            // their freshly-allocated body positions so we can rewrite
+            // the back-edge Jump's args without re-deriving the layout.
+            let orig_ref_map = self.peel_iteration(op, ctx);
 
             // Emit the final Jump with remapped args pointing to the
-            // original body's ops.
-            let body_base = ctx.new_operations.len() as u32 - self.buffer.len() as u32;
+            // body iteration's ops.
             let mut jump = op.clone();
-
-            // Build ref map for Jump args (same as orig_ref_map).
-            let mut orig_ref_map: HashMap<OpRef, OpRef> = HashMap::new();
-            for (i, buffered_op) in self.buffer.iter().enumerate() {
-                orig_ref_map.insert(buffered_op.pos, OpRef(body_base + i as u32));
-            }
-
             for arg in &mut jump.args {
                 if let Some(&new_ref) = orig_ref_map.get(arg) {
                     *arg = new_ref;
                 }
             }
-
-            jump.pos = OpRef(ctx.new_operations.len() as u32);
+            // Reserve the Jump's own position so it lands above any
+            // inputarg range and above every body op allocated by
+            // peel_iteration.
+            jump.pos = ctx.reserve_pos();
             return OptimizationResult::Emit(jump);
         }
 
