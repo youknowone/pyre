@@ -3636,8 +3636,25 @@ impl<M: Clone> MetaInterp<M> {
             constants.entry(k).or_insert(v);
         }
 
-        let root_inputargs =
-            root_loop_inputargs_from_optimizer(&partial.inputargs, final_num_inputs);
+        // pyjitpl.rs:2846-2859 parity (retrace path): the optimizer's reduced
+        // Label has its own per-slot types in `ExportedState.renamed_inputarg_types`.
+        // Using `trace.inputargs` first N is wrong (those are raw frame slots,
+        // not the optimizer's reduced-label slots). Derive InputArg.tp from the
+        // ExportedState instead.
+        let root_inputargs = if let Some(types) = unroll_opt
+            .final_exported_state
+            .as_ref()
+            .map(|es| es.renamed_inputarg_types.as_slice())
+            .filter(|types| types.len() == final_num_inputs)
+        {
+            types
+                .iter()
+                .enumerate()
+                .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
+                .collect()
+        } else {
+            root_loop_inputargs_from_optimizer(&partial.inputargs, final_num_inputs)
+        };
         let (mut inputargs, combined_ops) =
             match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
                 Ok(normalized) => normalized,
