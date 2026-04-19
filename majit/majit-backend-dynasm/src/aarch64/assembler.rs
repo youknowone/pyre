@@ -1783,21 +1783,23 @@ impl AssemblerARM64 {
                 }
             }
             // ── aarch64/opassembler.py:365 emit_op_gc_store ──
-            // arglocs = [value_loc, base_loc, ofs_loc, size_loc]
+            // `value_loc, base_loc, ofs_loc, size_loc = arglocs`.
+            // regalloc.rs:3042 `consider_gc_store` (mirroring RPython
+            // aarch64/regalloc.py:520 prepare_op_gc_store) always emits a
+            // 4-tuple `[Reg|Immed(value), Reg(base), Reg|Immed(ofs),
+            // Immed(size)]`; value_loc may be Immed when the source is a
+            // Const (llsupport/regalloc.py:625 `return_constant`), and
+            // the emitter moves it to x16 before the store. Everything
+            // else is tight and panics now so regalloc regressions can't
+            // hide behind silent defaults.
             OpCode::GcStore | OpCode::RawStore => {
-                debug_assert!(
-                    arglocs.len() >= 3,
-                    "GcStore dispatch requires at least [value, base, ofs]",
-                );
-                let value_loc = &arglocs[0];
-                let base = match arglocs.get(1) {
-                    Some(Loc::Reg(base)) => base,
-                    other => {
-                        debug_assert!(false, "GcStore base must be Loc::Reg, got {other:?}");
-                        return;
-                    }
+                let (value_loc, base_loc, ofs_loc, size_loc) = match arglocs {
+                    [v, b, o, s] => (v, b, o, s),
+                    _ => panic!(
+                        "GcStore arglocs must be [value, base, ofs, size] (got {} locs)",
+                        arglocs.len(),
+                    ),
                 };
-                // aarch64/opassembler.py:366
                 let val_reg = match value_loc {
                     Loc::Reg(r) => *r,
                     Loc::Immed(i) => {
@@ -1805,20 +1807,24 @@ impl AssemblerARM64 {
                         crate::regloc::RegLoc::new(16, false)
                     }
                     other => {
-                        debug_assert!(
-                            false,
-                            "GcStore value_loc must be Reg/Immed (regalloc contract), got {other:?}",
-                        );
-                        return;
+                        panic!("GcStore value_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
                     }
                 };
+                let base = match base_loc {
+                    Loc::Reg(r) => r,
+                    other => panic!(
+                        "GcStore base_loc must be Loc::Reg (regalloc contract), got {other:?}",
+                    ),
+                };
                 // aarch64/opassembler.py:367: scale = get_scale(size_loc.value)
-                let size = match arglocs.get(3) {
-                    Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
-                    _ => 8,
+                let size = match size_loc {
+                    Loc::Immed(i) => i.value.unsigned_abs() as usize,
+                    other => panic!(
+                        "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
+                    ),
                 };
                 // aarch64/opassembler.py:368: self._write_to_mem(value_loc, base_loc, ofs_loc, scale)
-                self.emit_op_gcstore_regalloc(base, &arglocs[2], &val_reg, size);
+                self.emit_op_gcstore_regalloc(base, ofs_loc, &val_reg, size);
             }
             // ── Control flow ──
             OpCode::Jump => {
