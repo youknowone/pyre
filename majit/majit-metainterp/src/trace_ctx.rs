@@ -989,6 +989,40 @@ impl TraceCtx {
         Some((opref, value))
     }
 
+    /// Declared majit_ir::Type for a flat virtualizable slot.
+    ///
+    /// Mirrors the layout used by `initialize_virtualizable`: the first
+    /// `num_static_extra_boxes` slots take their types from
+    /// `VirtualizableInfo.static_fields[i].field_type`, subsequent array
+    /// slots take `array_fields[a].item_type`, and the trailing identity
+    /// slot (`virtualizable_boxes[-1]`) is always `Ref`.  Returns `None`
+    /// when no VirtualizableInfo is registered or the index falls outside
+    /// the active layout.
+    pub fn virtualizable_slot_type(&self, flat_idx: usize) -> Option<Type> {
+        let info = self.virtualizable_info.as_ref()?;
+        let lengths = self.virtualizable_array_lengths.as_deref().unwrap_or(&[]);
+        let total_array: usize = lengths.iter().sum();
+        let static_count = info.num_static_extra_boxes;
+        if flat_idx < static_count {
+            return Some(info.static_fields[flat_idx].field_type);
+        }
+        let array_local_idx = flat_idx - static_count;
+        if array_local_idx < total_array {
+            let mut remaining = array_local_idx;
+            for (a, &len) in lengths.iter().enumerate() {
+                if remaining < len {
+                    return Some(info.array_fields[a].item_type);
+                }
+                remaining -= len;
+            }
+        }
+        if flat_idx == static_count + total_array {
+            // virtualizable_boxes[-1] — the identity slot.
+            return Some(Type::Ref);
+        }
+        None
+    }
+
     /// Update a standard virtualizable box (OpRef) by flat index.
     ///
     /// Used by SameAs dedup / `replace_box` walks — SSA-rename operations that
@@ -1007,18 +1041,33 @@ impl TraceCtx {
 
     /// Update both halves of a standard virtualizable slot (OpRef + concrete).
     /// RPython `virtualizable_boxes[index] = valuebox` parity.
+    ///
+    /// When the incoming concrete's majit_ir::Type does not match the slot's
+    /// declared type, only the OpRef half is updated and the concrete side
+    /// keeps its previous (heap-seeded) entry.  This guards against pyre's
+    /// unboxed-optimization leaking into a Ref-typed slot
+    /// (`locals_cells_stack_w` is a `list[W_Object]` in PyPy); RPython
+    /// would have emitted a `NEW_W_*` boxing op before the write so
+    /// `virtualizable_boxes[i]` always carries a Ref for such slots.
+    /// Until pyre's codewriter mirrors that boxing at STORE_FAST, the
+    /// safest stance is to leave the typed concrete untouched — stale
+    /// but at least type-correct, so a later `BC_GETARRAYITEM_VABLE_R`
+    /// does not ship a null pointer to `set_ref_reg`.
     pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) -> bool {
+        let slot_type = self.virtualizable_slot_type(index);
+        let concrete_matches = slot_type.map(|ty| ty == value.get_type()).unwrap_or(true);
         let have_boxes = self
             .virtualizable_boxes
             .as_mut()
             .and_then(|boxes| boxes.get_mut(index).map(|slot| *slot = opref))
             .is_some();
-        let have_values = self
-            .virtualizable_values
-            .as_mut()
-            .and_then(|vals| vals.get_mut(index).map(|slot| *slot = value))
-            .is_some();
-        have_boxes && have_values
+        if concrete_matches {
+            let _ = self
+                .virtualizable_values
+                .as_mut()
+                .and_then(|vals| vals.get_mut(index).map(|slot| *slot = value));
+        }
+        have_boxes
     }
 
     /// Return the standard virtualizable identity (`virtualizable_boxes[-1]`).

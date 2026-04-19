@@ -218,6 +218,19 @@ impl StoredExitLayout {
 /// opencoder.py:603 _encode: Const boxes are registered in the constant pool
 /// and returned as pool OpRefs so the optimizer's BoxEnv can resolve them
 /// via is_const/get_const (resume.py:157 getconst parity).
+/// Decode a raw virtualizable-slot `i64` from `VirtualizableInfo::read_all_boxes`
+/// into the typed `majit_ir::Value` the parallel virtualizable concrete
+/// shadow expects.  Mirrors `value_from_backend_constant_bits_typed` so the
+/// shadow never disagrees with the register-shadow encoding.
+fn heap_value_for(ty: Type, bits: i64) -> Value {
+    match ty {
+        Type::Int => Value::Int(bits),
+        Type::Float => Value::Float(f64::from_bits(bits as u64)),
+        Type::Ref => Value::Ref(GcRef(bits as usize)),
+        Type::Void => Value::Void,
+    }
+}
+
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[majit_trace::recorder::Snapshot],
     constants: &mut std::collections::HashMap<u32, i64>,
@@ -1160,13 +1173,32 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable input arg, mirroring how `read_boxes` returns one
         // box per static field followed by one box per array element.
         let vable_oprefs: Vec<OpRef> = (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
-        // pyjitpl.py:3302 parity: seed the concrete shadow from the
-        // `original_boxes` slice — RPython's `read_boxes(cpu, virtualizable,
-        // startindex)` returns boxes each of which carries both SSA identity
-        // and the live int/ref/float value read straight from the
-        // virtualizable object.  pyre threads that same live slice through
-        // `live_values`.
-        let vable_values: Vec<Value> = live_values[1..=total_vable].to_vec();
+        // pyjitpl.py:3302 parity: seed the concrete shadow from
+        // `vinfo.read_boxes(cpu, virtualizable, startindex)` — RPython reads
+        // the heap-authoritative value for every slot, typed per the
+        // declared field/array-item type.  Falling back to `live_values`
+        // would leak pyre's unboxed-optimization view into what must be a
+        // Ref-typed slot for pypyjit's `locals_cells_stack_w`
+        // (pypy/interpreter/pyframe.py:84: `list[W_Object]`); a later
+        // `BC_GETARRAYITEM_VABLE_R` read would then return `Value::Int(...)`
+        // and `set_ref_reg` would squash it to a null pointer.
+        let vable_values: Vec<Value> = if !self.vable_ptr.is_null() {
+            let (static_boxes, array_boxes) =
+                unsafe { info.read_all_boxes(self.vable_ptr, &array_lengths) };
+            let mut out = Vec::with_capacity(total_vable);
+            for (i, bits) in static_boxes.iter().enumerate() {
+                out.push(heap_value_for(info.static_fields[i].field_type, *bits));
+            }
+            for (a, items) in array_boxes.iter().enumerate() {
+                let item_ty = info.array_fields[a].item_type;
+                for bits in items {
+                    out.push(heap_value_for(item_ty, *bits));
+                }
+            }
+            out
+        } else {
+            live_values[1..=total_vable].to_vec()
+        };
         // pyjitpl.py:3306: virtualizable_boxes.append(virtualizable_box)
         // is folded inside init_virtualizable_boxes (it pushes vable_ref
         // at the end of the list).
