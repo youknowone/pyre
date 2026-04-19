@@ -542,10 +542,11 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 pub(crate) fn seed_virtualizable_boxes(
     ctx: &mut TraceCtx,
     vable_ref: OpRef,
+    vable_ref_value: majit_ir::Value,
     scalar_oprefs: &[OpRef],
     array_items: &[OpRef],
     array_len: usize,
-    vable_heap_ptr: *const u8,
+    input_values: &[majit_ir::Value],
 ) {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
@@ -566,51 +567,17 @@ pub(crate) fn seed_virtualizable_boxes(
         }
     }
     let array_lengths = vec![array_len];
-    // pyjitpl.py:3417 bridge-entry parity:
-    //     self.virtualizable_boxes = virtualizable_boxes
-    //     self.synchronize_virtualizable()
-    // RPython's `virtualizable_boxes` at bridge entry comes from
-    // `vinfo.read_boxes(cpu, virtualizable, 0)` — a heap read that
-    // yields one live Box per slot, typed per field_descr / array item
-    // type.  pyre mirrors that here: read the concrete halves straight
-    // from `vable_heap_ptr` and build a typed Value per slot so the
-    // shadow returned by `virtualizable_entry_at` is a complete Box.
-    // The trailing vable identity entry is pushed inside
-    // `init_virtualizable_boxes` with the heap-pointer encoded as
-    // Value::Ref(GcRef(vable_heap_ptr as usize)).
-    let (input_values, vable_ref_value) = if !vable_heap_ptr.is_null() {
-        let (static_boxes, array_boxes) =
-            unsafe { info.read_all_boxes(vable_heap_ptr, &array_lengths) };
-        let mut values = Vec::with_capacity(input_oprefs.len());
-        for (i, bits) in static_boxes.iter().enumerate() {
-            values.push(value_for_slot(info.static_fields[i].field_type, *bits));
-        }
-        for (a, items) in array_boxes.iter().enumerate() {
-            let item_ty = info.array_fields[a].item_type;
-            for bits in items {
-                values.push(value_for_slot(item_ty, *bits));
-            }
-        }
-        // Pad short array-box vectors to match the padded OpRef vector.
-        while values.len() < input_oprefs.len() {
-            values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
-        }
-        (
-            values,
-            majit_ir::Value::Ref(majit_ir::GcRef(vable_heap_ptr as usize)),
-        )
-    } else {
-        // No live heap pointer (unit-test / init-before-run path).  Fall
-        // back to the pre-shadow behaviour: empty slice disables the
-        // concrete shadow and `virtualizable_entry_at` returns None.
-        (Vec::new(), majit_ir::Value::Void)
-    };
+    // virtualizable.py:139 load_list_of_boxes parity: the concrete half of
+    // virtualizable_boxes is sourced from the caller (heap read for portal
+    // entry / resume-data stream for bridge entry), never synthesized here.
+    // Callers pass an empty slice to disable the concrete shadow
+    // (unit-test / init-before-run path).
     ctx.init_virtualizable_boxes(
         &info,
         vable_ref,
         vable_ref_value,
         &input_oprefs,
-        &input_values,
+        input_values,
         &array_lengths,
     );
 }
@@ -1947,13 +1914,43 @@ impl PyreSym {
             let array_items: Vec<OpRef> =
                 (0..live_prefix).map(|i| OpRef(base + i as u32)).collect();
             let vable_ref = OpRef(crate::virtualizable_gen::SYM_FRAME_IDX);
+            // pyjitpl.py:3302 initialize_virtualizable parity: the concrete
+            // half of virtualizable_boxes at portal entry comes from a live
+            // heap read (vinfo.read_boxes(cpu, virtualizable, 0)). There is
+            // no resume-data stream at root-trace start.
+            let info = crate::frame_layout::build_pyframe_virtualizable_info();
+            let array_lengths = [array_len];
+            let (input_values, vable_ref_value) = if concrete_frame != 0 {
+                let (static_boxes, array_boxes) =
+                    unsafe { info.read_all_boxes(concrete_frame as *const u8, &array_lengths) };
+                let mut values = Vec::with_capacity(num_scalars - 1 + array_len);
+                for (i, bits) in static_boxes.iter().enumerate() {
+                    values.push(value_for_slot(info.static_fields[i].field_type, *bits));
+                }
+                for (a, items) in array_boxes.iter().enumerate() {
+                    let item_ty = info.array_fields[a].item_type;
+                    for bits in items {
+                        values.push(value_for_slot(item_ty, *bits));
+                    }
+                }
+                while values.len() < (num_scalars - 1) + array_len {
+                    values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
+                }
+                (
+                    values,
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame)),
+                )
+            } else {
+                (Vec::new(), majit_ir::Value::Void)
+            };
             crate::state::seed_virtualizable_boxes(
                 ctx,
                 vable_ref,
+                vable_ref_value,
                 &scalar_oprefs,
                 &array_items,
                 array_len,
-                concrete_frame as *const u8,
+                &input_values,
             );
         }
     }
@@ -2979,12 +2976,35 @@ impl JitState for PyreJitState {
         ctx: &mut majit_metainterp::TraceCtx,
         resume_data: &majit_metainterp::ResumeDataResult,
         rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        fail_values: &[i64],
+        fail_types: &[Type],
     ) {
         use majit_ir::resumedata::RebuiltValue;
 
         if resume_data.frames.is_empty() {
             return;
         }
+
+        // virtualizable.py:139 load_list_of_boxes parity: decode each
+        // RebuiltValue in the resume stream into a typed Value. The type
+        // is the fixed Box kind the encoder recorded at numbering time
+        // (fail_arg_types[idx] for Box variants), matching RPython's
+        // immutable Box.type invariant. No heap read.
+        let decode_concrete = |v: &RebuiltValue| -> majit_ir::Value {
+            match v {
+                RebuiltValue::Box(n, tp) => {
+                    let bits = fail_values.get(*n).copied().unwrap_or(0);
+                    let effective_tp = fail_types.get(*n).copied().unwrap_or(*tp);
+                    value_for_slot(effective_tp, bits)
+                }
+                RebuiltValue::Int(v) => majit_ir::Value::Int(*v as i64),
+                RebuiltValue::Const(raw, tp) => value_for_slot(*tp, *raw),
+                // Virtuals and Unassigned do not have an obvious concrete
+                // value yet — the shadow receives Void and the optimizer's
+                // materialization path fills the actual pointer later.
+                RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => majit_ir::Value::Void,
+            }
+        };
 
         // resume.py:874-899 VirtualCache parity: per-bridge cache so shared
         // / recursive virtuals materialize exactly once.
@@ -3050,17 +3070,44 @@ impl JitState for PyreJitState {
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let mut vable_array_items: Vec<OpRef> =
             Vec::with_capacity(vvals.len().saturating_sub(num_scalars));
+        let mut vable_scalar_values: Vec<majit_ir::Value> =
+            Vec::with_capacity(num_scalars.saturating_sub(1));
+        let mut vable_array_values: Vec<majit_ir::Value> =
+            Vec::with_capacity(vvals.len().saturating_sub(num_scalars));
+        let mut vable_ref_value = majit_ir::Value::Void;
         for (i, v) in vvals.iter().enumerate() {
             let resolved = resolve(ctx, &mut virtuals_cache, v);
+            let concrete = decode_concrete(v);
             match i {
-                0 => {} // frame_ptr — implicit, no slot
-                1 => sym.vable_last_instr = resolved,
-                2 => sym.vable_pycode = resolved,
-                3 => sym.vable_valuestackdepth = resolved,
-                4 => sym.vable_debugdata = resolved,
-                5 => sym.vable_lastblock = resolved,
-                6 => sym.vable_w_globals = resolved,
-                _ => vable_array_items.push(resolved),
+                0 => vable_ref_value = concrete, // frame_ptr — implicit OpRef, explicit concrete
+                1 => {
+                    sym.vable_last_instr = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                2 => {
+                    sym.vable_pycode = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                3 => {
+                    sym.vable_valuestackdepth = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                4 => {
+                    sym.vable_debugdata = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                5 => {
+                    sym.vable_lastblock = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                6 => {
+                    sym.vable_w_globals = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                _ => {
+                    vable_array_items.push(resolved);
+                    vable_array_values.push(concrete);
+                }
             }
         }
 
@@ -3193,19 +3240,27 @@ impl JitState for PyreJitState {
             sym.vable_lastblock,
             sym.vable_w_globals,
         ];
-        // virtualizable.py:86 `read_boxes`: the array items of the vable
-        // mirror come straight from `virtualizable_values`, matching the
-        // encoder's `build_virtualizable_boxes` (trace_opcode.rs:1854-1883)
-        // which writes one slot per `physical_array_len` entry. The seed
-        // helper pads with const-NULL if the decoded vable section is
-        // shorter than the runtime frame's locals_cells_stack_w length.
+        // virtualizable.py:139 load_list_of_boxes parity: both halves of
+        // virtualizable_boxes come from the resume-data stream — OpRefs via
+        // the resolve() closure above, concrete Values via decode_concrete().
+        // No heap read. The seed helper pads short arrays with const-NULL
+        // OpRef; match that here by padding concrete values with
+        // Value::Ref(GcRef::NULL) to the same length.
+        let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
+        concrete_values.extend_from_slice(&vable_scalar_values);
+        let taken_concrete = vable_array_values.len().min(bridge_array_len);
+        concrete_values.extend_from_slice(&vable_array_values[..taken_concrete]);
+        while concrete_values.len() < vable_scalar_values.len() + bridge_array_len {
+            concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
+        }
         crate::state::seed_virtualizable_boxes(
             ctx,
             sym.frame,
+            vable_ref_value,
             &scalar_oprefs,
             &vable_array_items,
             bridge_array_len,
-            sym.concrete_vable_ptr as *const u8,
+            &concrete_values,
         );
         // Bridge stack: the target loop header has stack_only=0.
         sym.symbolic_stack = Vec::new();

@@ -2794,7 +2794,14 @@ impl<S: JitState> JitDriver<S> {
             if let (Some(ref mut sym), Some(ref mut ctx)) =
                 (self.sym.as_mut(), self.meta.tracing.as_mut())
             {
-                S::setup_bridge_sym(sym, ctx, bfm, retrace.rd_virtuals.as_deref());
+                S::setup_bridge_sym(
+                    sym,
+                    ctx,
+                    bfm,
+                    retrace.rd_virtuals.as_deref(),
+                    &live_values,
+                    &retrace.fail_types,
+                );
             }
         }
         self.meta.begin_trace_session(trace_meta);
