@@ -899,11 +899,6 @@ pub struct PyreSym {
     /// of the vable_array_base-based layout. This ensures bridge traces see
     /// frame locals as symbolic InputArgs, not concrete values.
     pub(crate) bridge_local_oprefs: Option<Vec<OpRef>>,
-    /// Bridge-specific override for the stack tail of registers_r.
-    /// resume.py:1042 parity: `consume_boxes` fills both the local and
-    /// stack register windows for the resumed frame; this holds the
-    /// stack portion (`registers_r[nlocals..]`).
-    pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
     /// virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
     /// is a W_Root array → all items are Type::Ref. setup_bridge_sym
@@ -1778,7 +1773,6 @@ impl PyreSym {
             valuestackdepth: 0,
             nlocals: 0,
             bridge_local_oprefs: None,
-            bridge_stack_oprefs: None,
             bridge_local_types: None,
             bridge_stack_types: None,
             vable_last_instr: OpRef::NONE,
@@ -1898,11 +1892,7 @@ impl PyreSym {
         // file — locals occupy `[..nlocals]` and stack slots occupy
         // `[nlocals..nlocals + stack_only_depth]` (RPython
         // `pyjitpl.py:70-78` MIFrame parity).
-        let stack_seed: Vec<OpRef> = if let Some(ref overrides) = self.bridge_stack_oprefs {
-            let mut stack = overrides.clone();
-            stack.resize(stack_only_depth, OpRef::NONE);
-            stack
-        } else if let Some(base) = self.vable_array_base {
+        let stack_seed: Vec<OpRef> = if let Some(base) = self.vable_array_base {
             let stack_base = base + nlocals as u32;
             (0..stack_only_depth)
                 .map(|i| OpRef(stack_base + i as u32))
@@ -3340,7 +3330,6 @@ impl JitState for PyreJitState {
         sym.symbolic_stack_types = Vec::new();
         sym.valuestackdepth = sym.nlocals;
         sym.bridge_local_oprefs = Some(bridge_locals);
-        sym.bridge_stack_oprefs = None;
         sym.bridge_local_types = Some(bridge_local_types);
         sym.bridge_stack_types = None;
     }
