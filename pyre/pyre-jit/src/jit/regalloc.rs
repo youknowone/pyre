@@ -232,8 +232,7 @@ fn perform_register_allocation(
 ) -> RegAllocator {
     let mut alloc = RegAllocator::new();
     alloc.make_dependencies(ssarepr, kind, external_inputs);
-    let input_set: HashSet<u16> = external_inputs.iter().copied().collect();
-    alloc.coalesce_variables(ssarepr, kind, &input_set);
+    alloc.coalesce_variables(ssarepr, kind);
     alloc.find_node_coloring();
     alloc
 }
@@ -473,7 +472,7 @@ impl RegAllocator {
     /// instead of FunctionGraph-level link.args coalescing. The
     /// effect is a strict subset of RPython's because pyre never
     /// sees the cross-block link representation.
-    fn coalesce_variables(&mut self, ssarepr: &SSARepr, kind: Kind, _input_set: &HashSet<u16>) {
+    fn coalesce_variables(&mut self, ssarepr: &SSARepr, kind: Kind) {
         let move_op = match kind {
             Kind::Int => "move_i",
             Kind::Ref => "move_r",
