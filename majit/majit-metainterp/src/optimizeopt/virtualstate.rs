@@ -91,6 +91,20 @@ use crate::optimizeopt::OptContext;
 use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::intutils::IntBound;
 
+/// Strict-mode gate for the NotVirtualStateInfo leaf-store type check.
+///
+/// When `MAJIT_STRICT_LABEL_TYPE=1` is set, `enum_forced_boxes_for_entry`
+/// treats a source/slot type mismatch at the leaf store as a
+/// `VirtualStatesCantMatch` (returns `Err(())`), so
+/// `make_inputargs_and_virtuals` fails and the unrolled trace falls back to
+/// `jump_to_preamble`. Off by default because the fallback drops peeled-loop
+/// perf; intended for measurement and eventual always-on parity with
+/// RPython Box.type immutability (virtualstate.py:412-425 /
+/// pyjitpl.py:1237).
+fn label_type_strict_enabled() -> bool {
+    std::env::var_os("MAJIT_STRICT_LABEL_TYPE").is_some()
+}
+
 /// virtualstate.py: GenerateGuardState — context for guard generation
 /// during virtual state comparison.
 ///
@@ -1070,8 +1084,35 @@ impl VirtualState {
                     .get(*slot_cursor)
                     .copied()
                     .unwrap_or(*next_slot);
+                let resolved_for_store = ctx.get_box_replacement(forced);
+                // RPython Box.type immutability parity
+                // (virtualstate.py:412-425 / pyjitpl.py:1237): the slot's
+                // declared type (from `NotVirtualStateInfo{Int,Ptr}` in
+                // RPython, here `info.info_type()`) must agree with the
+                // source Box's type. Flat-OpRef forwarding via
+                // `get_box_replacement` can cross types (e.g. a Ref
+                // inputarg aliased onto a post-unbox Int OpRef), which in
+                // RPython is impossible because a Box has a fixed type.
+                // Log each mismatch under MAJIT_LOG; under
+                // MAJIT_STRICT_LABEL_TYPE treat it as VirtualStatesCantMatch.
+                if let (Some(expected), Some(actual)) =
+                    (info.info_type(), ctx.opref_type(resolved_for_store))
+                {
+                    if expected != actual {
+                        if std::env::var_os("MAJIT_LOG").is_some() {
+                            eprintln!(
+                                "[label-type-mismatch] slot={} expected={:?} actual={:?} \
+                                 source={:?} resolved={:?}",
+                                slot, expected, actual, opref, resolved_for_store
+                            );
+                        }
+                        if label_type_strict_enabled() {
+                            return Err(());
+                        }
+                    }
+                }
                 if let Some(dst) = boxes.get_mut(slot) {
-                    *dst = ctx.get_box_replacement(forced);
+                    *dst = resolved_for_store;
                 }
                 *slot_cursor += 1;
                 *next_slot += 1;
