@@ -1888,15 +1888,41 @@ impl MIFrame {
             .virtualizable_info()
             .and_then(|info| info.array_fields.first().map(|a| a.item_type))
             .unwrap_or(majit_ir::Type::Ref);
+        // virtualizable.py:86 read_boxes / opencoder.py:718 _list_of_boxes_virtualizable
+        // parity: RPython snapshot reads directly from `self.virtualizable_boxes`,
+        // which is the single source of truth mirrored by every `_opimpl_setarrayitem_vable`
+        // via `synchronize_virtualizable`. pyre's tracer mirrors stores into
+        // `ctx.virtualizable_boxes[num_static + i]` for local slots, so prefer that
+        // shadow over the legacy `sym.symbolic_locals[i]` / `stack_values[stack_idx]`
+        // pair. Fall back to the legacy path only when the shadow slot is OpRef::NONE
+        // (stack temporaries that the tracer never mirrored into the shadow).
+        let num_static = ctx
+            .virtualizable_info()
+            .map(|info| info.num_static_extra_boxes)
+            .unwrap_or(0);
         for i in 0..full_array_len {
-            let opref = if i < sym.symbolic_locals.len() {
-                sym.symbolic_locals[i]
-            } else {
-                let stack_idx = i - sym.nlocals;
-                if stack_idx < stack_values.len() {
-                    stack_values[stack_idx]
-                } else {
-                    OpRef::NONE
+            // virtualizable_boxes layout:
+            //   [field0, ..., fieldN, arr[0..M], vable_ref]
+            // so array slot `i` lives at `num_static + i`. The trailing
+            // `vable_ref` is at `virtualizable_boxes[-1]` and NEVER covers
+            // an array slot — skip it via `.get()`.
+            let shadow_entry = ctx.virtualizable_box_at(num_static + i);
+            let opref = match shadow_entry {
+                Some(op) if !op.is_none() => op,
+                _ => {
+                    // pyre stack temporaries live in `sym.symbolic_stack`,
+                    // not the vable shadow — keep the legacy fallback for
+                    // those slots.
+                    if i < sym.symbolic_locals.len() {
+                        sym.symbolic_locals[i]
+                    } else {
+                        let stack_idx = i - sym.nlocals;
+                        if stack_idx < stack_values.len() {
+                            stack_values[stack_idx]
+                        } else {
+                            OpRef::NONE
+                        }
+                    }
                 }
             };
             if !opref.is_none() {
