@@ -906,9 +906,6 @@ pub struct PyreSym {
     /// opcode handlers via guard_class + getfield_gc_pure_i/_f, not at
     /// the virtualizable slot level.
     pub(crate) bridge_local_types: Option<Vec<Type>>,
-    /// Bridge-specific override for symbolic_stack_types. Same
-    /// all-Ref contract as bridge_local_types.
-    pub(crate) bridge_stack_types: Option<Vec<Type>>,
     // virtualizable.py:86-93: ALL static fields in declared order.
     // RPython's unroll_static_fields includes every field from
     // _virtualizable_; ALL must be inputarg (not info_only).
@@ -1774,7 +1771,6 @@ impl PyreSym {
             nlocals: 0,
             bridge_local_oprefs: None,
             bridge_local_types: None,
-            bridge_stack_types: None,
             vable_last_instr: OpRef::NONE,
             vable_pycode: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
@@ -1901,11 +1897,7 @@ impl PyreSym {
             vec![OpRef::NONE; stack_only_depth]
         };
         self.registers_r.extend(stack_seed.iter().copied());
-        if let Some(ref overrides) = self.bridge_stack_types {
-            let mut types = overrides.clone();
-            types.resize(stack_only_depth, Type::Ref);
-            self.symbolic_stack_types = types;
-        } else if let Some((_, ref stack_types)) = inputarg_slot_types {
+        if let Some((_, ref stack_types)) = inputarg_slot_types {
             self.symbolic_stack_types = stack_types.clone();
         } else if self.symbolic_stack_types.len() != stack_only_depth {
             self.symbolic_stack_types =
@@ -3331,7 +3323,6 @@ impl JitState for PyreJitState {
         sym.valuestackdepth = sym.nlocals;
         sym.bridge_local_oprefs = Some(bridge_locals);
         sym.bridge_local_types = Some(bridge_local_types);
-        sym.bridge_stack_types = None;
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
