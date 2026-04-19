@@ -3195,18 +3195,21 @@ impl JitState for PyreJitState {
 
         // Part 2 — frame registers (consume_boxes): walk the frame section
         // in liveness enumeration order ([int..., ref..., float...]), map
-        // each decoded value back to its frame slot via
-        // `frame_liveness_reg_indices_at`, and write it into registers_r
-        // / symbolic_stack. This mirrors resume.py:1054 consume_boxes
-        // (`_callback_i/_r/_f(register_index)` writing to f.registers_i/_r/_f
-        // at the exact slot liveness declared, not at an enumerate-order
-        // position).
+        // each decoded value back to its register slot via
+        // `frame_liveness_reg_indices_at`, and write it into the unified
+        // abstract register file (`registers_r`). This mirrors
+        // resume.py:1054 `consume_boxes`
+        // (`_callback_i/_r/_f(register_index)` writing to
+        // `f.registers_i/_r/_f[index]` at the exact slot liveness
+        // declared, not at an enumerate-order position). RPython indexes
+        // a single `registers_X` vector by abstract register color —
+        // there is no `idx < nlocals` decode.
         let frame0 = &resume_data.frames[0];
         let reg_indices =
             crate::state::frame_liveness_reg_indices_at(frame0.jitcode_index, frame0.pc);
         let stack_only = sym.stack_only_depth();
-        let mut bridge_locals = vec![OpRef::NONE; nlocals];
-        let mut bridge_stack = vec![OpRef::NONE; stack_only];
+        let bridge_reg_len = nlocals + stack_only;
+        let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
         // Falls back to the vable-mirror array items for slots not covered
         // by liveness at the guard PC. pyre's optimizer sometimes keeps
         // locals alive past the liveness analysis boundary (short-preamble
@@ -3215,27 +3218,17 @@ impl JitState for PyreJitState {
         // the vable mirror is a complete frame image. Picking up dead
         // slots from the mirror keeps the parent-loop LABEL arity contract
         // satisfied until the tracer stops asking for dead locals.
-        let dead_slot_fallback = |idx: usize| -> OpRef {
-            if idx < nlocals {
-                vable_array_items.get(idx).copied().unwrap_or(OpRef::NONE)
-            } else {
-                OpRef::NONE
-            }
-        };
+        let dead_slot_fallback =
+            |idx: usize| -> OpRef { vable_array_items.get(idx).copied().unwrap_or(OpRef::NONE) };
         if !reg_indices.is_empty() && reg_indices.len() == frame0.values.len() {
             for (value, &reg_idx) in frame0.values.iter().zip(reg_indices.iter()) {
                 let resolved = resolve(ctx, &mut virtuals_cache, value);
                 let idx = reg_idx as usize;
-                if idx < nlocals {
-                    bridge_locals[idx] = resolved;
-                } else {
-                    let stack_idx = idx - nlocals;
-                    if stack_idx < bridge_stack.len() {
-                        bridge_stack[stack_idx] = resolved;
-                    }
+                if idx < bridge_registers_r.len() {
+                    bridge_registers_r[idx] = resolved;
                 }
             }
-            for (idx, slot) in bridge_locals.iter_mut().enumerate() {
+            for (idx, slot) in bridge_registers_r.iter_mut().enumerate() {
                 if slot.is_none() {
                     *slot = dead_slot_fallback(idx);
                 }
@@ -3245,10 +3238,11 @@ impl JitState for PyreJitState {
             // fall back fully to the vable mirror so the bridge still has a
             // frame image. Follow-up: once every jitcode reaches this path
             // with populated liveness, this branch can become an assert.
-            for (idx, slot) in bridge_locals.iter_mut().enumerate() {
+            for (idx, slot) in bridge_registers_r.iter_mut().enumerate() {
                 *slot = dead_slot_fallback(idx);
             }
         }
+        let bridge_locals: Vec<OpRef> = bridge_registers_r.iter().take(nlocals).copied().collect();
 
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -3278,11 +3272,7 @@ impl JitState for PyreJitState {
         // `trace_guarded_int_payload` (guard_class + getfield_gc_pure_i),
         // matching the RPython unbox-at-consumer model. The slot-level
         // type override is NOT how RPython avoids the guarded path.
-        sym.registers_r = {
-            let mut locals = bridge_locals.clone();
-            locals.resize(sym.nlocals, OpRef::NONE);
-            locals
-        };
+        sym.registers_r = bridge_registers_r.clone();
         sym.symbolic_local_types = {
             let mut types = bridge_local_types.clone();
             types.resize(sym.nlocals, Type::Ref);
