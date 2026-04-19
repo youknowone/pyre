@@ -547,6 +547,7 @@ pub(crate) fn seed_virtualizable_boxes(
     array_items: &[OpRef],
     array_len: usize,
     input_values: &[majit_ir::Value],
+    heap_ptr: *const u8,
 ) {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
@@ -580,6 +581,11 @@ pub(crate) fn seed_virtualizable_boxes(
         input_values,
         &array_lengths,
     );
+    // pyjitpl.py:3446 synchronize_virtualizable parity: cache the live heap
+    // pointer on TraceCtx so subsequent vable setfield / setarrayitem calls
+    // can mirror their shadow updates into the live virtualizable.  Pass
+    // a null pointer to disable (unit-test / init-before-run path).
+    ctx.set_virtualizable_heap_ptr(heap_ptr);
 }
 
 /// Decode a raw `vinfo.read_all_boxes` entry into the typed Value a
@@ -1951,6 +1957,7 @@ impl PyreSym {
                 &array_items,
                 array_len,
                 &input_values,
+                concrete_frame as *const u8,
             );
         }
     }
@@ -2993,16 +3000,33 @@ impl JitState for PyreJitState {
         let decode_concrete = |v: &RebuiltValue| -> majit_ir::Value {
             match v {
                 RebuiltValue::Box(n, tp) => {
-                    let bits = fail_values.get(*n).copied().unwrap_or(0);
+                    // resume.py:1260 decode_box Box branch: liveboxes[num]
+                    // is authoritative. The encoder guarantees num in range.
+                    // Silent unwrap_or(0) would mask encoder/decoder drift
+                    // and write null into Ref slots / zero into Int slots.
+                    let bits = *fail_values.get(*n).unwrap_or_else(|| {
+                        panic!(
+                            "decode_concrete: fail_values[{n}] out of range \
+                             (len={}) — encoder/decoder liveboxes mismatch",
+                            fail_values.len()
+                        )
+                    });
                     let effective_tp = fail_types.get(*n).copied().unwrap_or(*tp);
                     value_for_slot(effective_tp, bits)
                 }
                 RebuiltValue::Int(v) => majit_ir::Value::Int(*v as i64),
                 RebuiltValue::Const(raw, tp) => value_for_slot(*tp, *raw),
-                // Virtuals and Unassigned do not have an obvious concrete
-                // value yet — the shadow receives Void and the optimizer's
-                // materialization path fills the actual pointer later.
-                RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => majit_ir::Value::Void,
+                // resume.py:1245 TAGVIRTUAL → getvirtual_ptr: RPython returns
+                // a Ref-typed Box pointing at the virtual's materialized
+                // allocation. pyre delays materialization to bridge runtime
+                // (NEW_WITH_VTABLE inside the trace), so the concrete
+                // pointer is not observable at trace time. Seed the shadow
+                // with a Ref-typed null placeholder to preserve Box.type
+                // immutability at the label (virtualstate.py:417) — the
+                // real pointer reaches the live heap when the bridge
+                // executes its NEW_WITH_VTABLE + SETFIELD sequence.
+                RebuiltValue::Virtual(_) => majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+                RebuiltValue::Unassigned => majit_ir::Value::Void,
             }
         };
 
@@ -3261,6 +3285,7 @@ impl JitState for PyreJitState {
             &vable_array_items,
             bridge_array_len,
             &concrete_values,
+            sym.concrete_vable_ptr as *const u8,
         );
         // Bridge stack: the target loop header has stack_only=0.
         sym.symbolic_stack = Vec::new();

@@ -1326,6 +1326,11 @@ impl<M: Clone> MetaInterp<M> {
             &vable_values,
             &array_lengths,
         );
+        // pyjitpl.py:3446 synchronize_virtualizable parity: TraceCtx needs
+        // the live heap pointer to mirror shadow writes. Mirror here — the
+        // MetaInterp `vable_ptr` was cached before `tracing` existed, so
+        // `set_vable_ptr` could not plumb it through.
+        ctx.set_virtualizable_heap_ptr(self.vable_ptr);
         // pyjitpl.py:3307: check_synchronized_virtualizable() — debug-only
         // assertion. pyre's analog is `check_synchronized_virtualizable`
         // on MetaInterp, but it requires &self which we don't have here.

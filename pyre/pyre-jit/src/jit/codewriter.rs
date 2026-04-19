@@ -1321,19 +1321,12 @@ impl CodeWriter {
                 }
 
                 // CPython 3.13 super-instructions LOAD_FAST_LOAD_FAST /
-                // LOAD_FAST_BORROW_LOAD_FAST_BORROW decompose to two plain
-                // LOAD_FAST reads. Portal parity with plain LoadFast would
-                // route both halves through vable_getarrayitem_ref, but the
-                // blackhole resume chain currently feeds the compiled
-                // deadframe through `write_all_boxes` with a partially
-                // resolved `vable_values` — routing the super-inst reads
-                // through the heap exposes stale heap slots that the
-                // deadframe-level path did not refresh (nested_loop wrong
-                // output 2026-04-19, nbody/fannkuch crash 2026-04-19 night
-                // after Priority 1 Step 1 + this flip). Keep move_r here
-                // until Priority 3 (seed helper) + Priority 4 (liveness
-                // pipeline) land; then the heap slots reach the compiled
-                // loop consistent with the symbolic state.
+                // LOAD_FAST_BORROW_LOAD_FAST_BORROW read two locals.
+                // RPython has no super-instruction concept, so parity is
+                // "two plain LOAD_FAST reads": each half routes through
+                // jtransform.py:1877 do_fixed_list_getitem vable case
+                // (portal) or move_r (non-portal), exactly like the
+                // single-read `LoadFast` arm above.
                 Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                 | Instruction::LoadFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);

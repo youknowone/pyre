@@ -126,18 +126,26 @@ impl LiveVars {
                             live[word] |= 1u64 << (i % 64);
                         }
                     }
-                    // Super-instructions LOAD_FAST_LOAD_FAST and
+                    // Super-instructions LOAD_FAST_LOAD_FAST /
                     // LOAD_FAST_BORROW_LOAD_FAST_BORROW read two locals in
-                    // one opcode. Parity with RPython (single-read
-                    // opcodes only) would require decomposing the
-                    // super-inst at the PyJitCode level so backward
-                    // liveness sees each read separately. Until that
-                    // decomposition lands, manually GENing both indices
-                    // here causes live-register explosions near super-inst
-                    // PCs (fannkuch timeout 2026-04-19). Backward
-                    // propagation from downstream `LoadFast` reads
-                    // already marks these locals live for the common
-                    // case; leave the super-inst itself as a no-op.
+                    // one opcode. RPython parity would require GENing both
+                    // indices (liveness.py does one GEN per read), but
+                    // because pyre's codewriter currently routes the
+                    // super-inst portal emit through `move_r` (stale
+                    // ref_regs path — super_inst_parity_blocker memo),
+                    // that path already makes the SSA liveness track
+                    // reg_a/reg_b via `read_ref_reg` side of move_r.
+                    // Enabling GEN here on top of move_r adds no new
+                    // parity — SSA already covers it — and causes the
+                    // live set to linger backward past natural KILLs
+                    // into earlier merge points (fannkuch timeout
+                    // 2026-04-19). Once super-inst portal emit is
+                    // decomposed into two plain `getarrayitem_vable_r`
+                    // ops (Option D), the vable path no longer touches
+                    // ref_regs; GEN must be re-enabled at that point so
+                    // symbolic_locals survives downstream guard
+                    // fail_args.  Tracked in
+                    // phase4_fannkuch_blackhole_stuck_2026_04_20.
                     Instruction::StoreFast { var_num } | Instruction::DeleteFast { var_num } => {
                         let i = var_num.get(op_arg).as_usize();
                         let word = i / 64;
