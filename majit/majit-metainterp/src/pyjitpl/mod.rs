@@ -344,18 +344,15 @@ fn normalize_root_loop_entry_contract(
         }
     });
 
+    // RPython compile.py:359/373 parity: the optimizer pipeline is the only
+    // source of the LABEL/JUMP contract. A trace missing its LABEL — or one
+    // whose LABEL/JUMP arities disagree — is a broken optimizer output, not
+    // something to auto-recover. Report both shapes as an arity mismatch so
+    // the caller aborts compilation.
     if label_arg_count == 0 && jump_arg_count > 0 {
-        if inputargs.len() > jump_arg_count {
-            inputargs.truncate(jump_arg_count);
-        }
-        while inputargs.len() < jump_arg_count {
-            inputargs.push(InputArg::from_type(Type::Int, inputargs.len() as u32));
-        }
-        let label_args: Vec<OpRef> = (0..inputargs.len() as u32).map(OpRef).collect();
-        let mut label_op = Op::new(OpCode::Label, &label_args);
-        label_op.pos = OpRef::NONE;
-        optimized_ops.insert(0, label_op);
-    } else if jump_targets_current_loop && label_arg_count != jump_arg_count {
+        return Err((0, jump_arg_count));
+    }
+    if jump_targets_current_loop && label_arg_count != jump_arg_count {
         // RPython compile.py:334: assert jump.numargs() == label.numargs().
         return Err((label_arg_count, jump_arg_count));
     }
@@ -12815,7 +12812,10 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_root_loop_entry_contract_inserts_label_from_inputargs() {
+    fn test_normalize_root_loop_entry_contract_rejects_missing_label() {
+        // compile.py:359 parity: an optimized trace that arrives without a
+        // LABEL is a broken contract; the helper must report the missing
+        // LABEL as an arity mismatch instead of synthesizing one.
         let inputargs = vec![
             InputArg::new_int(0),
             InputArg::new_int(1),
@@ -12826,20 +12826,13 @@ mod tests {
             mk_op(OpCode::Jump, &[OpRef(3), OpRef(2), OpRef(1)], OpRef::NONE.0),
         ];
 
-        let (normalized_inputargs, normalized_ops) =
-            normalize_root_loop_entry_contract(inputargs.clone(), ops).expect("should normalize");
-
-        assert_eq!(normalized_inputargs.len(), inputargs.len());
-        assert_eq!(normalized_ops[0].opcode, OpCode::Label);
-        assert_eq!(
-            normalized_ops[0].args.as_slice(),
-            &[OpRef(0), OpRef(1), OpRef(2)],
-            "synthetic root label must follow original inputargs contract"
-        );
+        let err =
+            normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
+        assert_eq!(err, (0, 3));
     }
 
     #[test]
-    fn test_normalize_root_loop_entry_contract_uses_simple_loop_jump_contract() {
+    fn test_normalize_root_loop_entry_contract_rejects_arity_mismatch() {
         let inputargs = vec![
             InputArg::new_int(0),
             InputArg::new_int(1),
@@ -12847,11 +12840,9 @@ mod tests {
         ];
         let ops = vec![mk_op(OpCode::Jump, &[OpRef(0), OpRef(1)], OpRef::NONE.0)];
 
-        let (normalized_inputargs, normalized_ops) =
-            normalize_root_loop_entry_contract(inputargs, ops).expect("should normalize");
-        assert_eq!(normalized_inputargs.len(), 2);
-        assert_eq!(normalized_ops[0].opcode, OpCode::Label);
-        assert_eq!(normalized_ops[0].args.as_slice(), &[OpRef(0), OpRef(1)]);
+        let err =
+            normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
+        assert_eq!(err, (0, 2));
     }
 
     #[derive(Debug)]
