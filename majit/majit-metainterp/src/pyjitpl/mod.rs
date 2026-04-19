@@ -441,6 +441,46 @@ fn default_cls_of_box(raw_ref: i64) -> i64 {
     unsafe { *(raw_ref as *const usize) as i64 }
 }
 
+/// pyjitpl.py:2908-2920 `MetaInterp._prepare_bridge_resumption` context.
+///
+/// Bridge-origin descriptor carried from `start_retrace_from_guard`
+/// through `compile_trace_finish`.  RPython stores the equivalent on
+/// `self.resumekey` + the active `MetaInterp` history; pyre aggregates
+/// the four identifying fields into one value so the finish-compile
+/// helpers can dispatch to the bridge branch without cross-component
+/// tuple plumbing.
+///
+/// `code_ptr` is the code address for the bridge's green key, enabling
+/// any PC to map back to a green key via the same hash function used by
+/// `make_green_key`.
+#[derive(Debug, Clone, Copy)]
+pub struct BridgeTraceInfo {
+    pub green_key: u64,
+    pub trace_id: u64,
+    pub fail_index: u32,
+    pub code_ptr: usize,
+}
+
+/// pyjitpl.py `MetaInterp` tracing-session context.
+///
+/// Owns the per-session state that RPython carries through
+/// `self.history`, `self.resumekey`, and the callbacks on `self`: the
+/// frontend `M` metadata snapshot taken at trace start, and — when
+/// tracing a bridge — the origin descriptor needed to thread
+/// `compile_trace(self, self.resumekey, ...)` through the bridge
+/// branch.  `clear_trace_session` takes this field back out on
+/// abort / finish so the next trace starts from `None`.
+pub struct ActiveTraceSession<M: Clone> {
+    /// Frontend state snapshot captured at `force_start_tracing` /
+    /// `bound_reached` / `on_back_edge_typed` / bridge resume.  Held
+    /// by MetaInterp so the finish-compile helpers can consume it
+    /// without requiring the JitDriver to mediate.
+    pub trace_meta: M,
+    /// `Some(BridgeTraceInfo)` when the session is a bridge retrace
+    /// (populated by `set_bridge_trace_info`).  `None` for root traces.
+    pub bridge: Option<BridgeTraceInfo>,
+}
+
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
@@ -661,6 +701,17 @@ pub struct MetaInterp<M: Clone> {
     /// post-pop trace length matches this value the next TCO emits a
     /// SAME_AS_I so the trace-length limit eventually fires.
     pub trace_length_at_last_tco: i32,
+
+    /// pyjitpl.py `MetaInterp.history` + `self.resumekey` owner.
+    ///
+    /// Centralises the trace-session state that used to live on
+    /// `JitDriver<S>.trace_meta` / `bridge_info` so `finishframe` /
+    /// `finishframe_exception` can drive the finish compile without a
+    /// `TraceAction::Finish` roundtrip — upstream places
+    /// `compile_done_with_this_frame` / `compile_exit_frame_with_exception`
+    /// directly on `MetaInterp`.  Single source of truth; the JitDriver
+    /// reads this via accessors and never duplicates it.
+    pub(crate) active_trace_session: Option<ActiveTraceSession<M>>,
 }
 
 /// Internal mutable counters for JIT compilation statistics.
@@ -1064,7 +1115,74 @@ impl<M: Clone> MetaInterp<M> {
             ovf_flag: false,
             box_names_memo: std::collections::HashMap::new(),
             trace_length_at_last_tco: -1,
+            active_trace_session: None,
         }
+    }
+
+    /// Install a fresh [`ActiveTraceSession`] seeded with the frontend
+    /// trace metadata.  Called from `force_start_tracing` /
+    /// `bound_reached` / `on_back_edge_typed` and the bridge-resume
+    /// path.  Panics if a prior session was not cleared — mirrors
+    /// RPython's invariant that `self.history` has a single owner per
+    /// trace.
+    pub fn begin_trace_session(&mut self, trace_meta: M) {
+        debug_assert!(
+            self.active_trace_session.is_none(),
+            "begin_trace_session called while a trace session is already active",
+        );
+        self.active_trace_session = Some(ActiveTraceSession {
+            trace_meta,
+            bridge: None,
+        });
+    }
+
+    /// Attach bridge-origin metadata to the active session.  Called
+    /// once during `start_retrace_from_guard` after
+    /// `begin_trace_session` has installed the frontend meta.
+    pub fn set_bridge_trace_info(&mut self, bridge: BridgeTraceInfo) {
+        let slot = self
+            .active_trace_session
+            .as_mut()
+            .expect("set_bridge_trace_info called with no active trace session");
+        slot.bridge = Some(bridge);
+    }
+
+    /// Bridge-origin descriptor for the active session, if any.
+    /// Returns `None` for root traces and when no session is active.
+    pub fn bridge_info(&self) -> Option<BridgeTraceInfo> {
+        self.active_trace_session.as_ref().and_then(|s| s.bridge)
+    }
+
+    /// Consume the bridge-origin descriptor while keeping the active
+    /// session's frontend meta in place.  Used by `CloseLoop` /
+    /// `CloseLoopWithArgs` branches that drive `compile_trace_finish`
+    /// from the bridge identity yet fall through to run `compile_loop`
+    /// on the remainder of the trace.  Returns `None` for root traces.
+    pub fn take_bridge_info(&mut self) -> Option<BridgeTraceInfo> {
+        self.active_trace_session
+            .as_mut()
+            .and_then(|s| s.bridge.take())
+    }
+
+    /// Read-only access to the frontend trace metadata for callers
+    /// (e.g. `compile_trace_entry_data`) that must peek without
+    /// consuming the session.
+    pub fn trace_meta(&self) -> Option<&M> {
+        self.active_trace_session.as_ref().map(|s| &s.trace_meta)
+    }
+
+    /// Take ownership of the frontend trace metadata and end the
+    /// session.  Used by the finish-compile helpers that consume `M`
+    /// before calling `recorder.finish()` + backend compile.
+    pub fn take_trace_meta(&mut self) -> Option<M> {
+        self.active_trace_session.take().map(|s| s.trace_meta)
+    }
+
+    /// Drop the active session without consuming the meta, matching
+    /// the abort / cleanup path used when tracing aborts before
+    /// finish.
+    pub fn clear_trace_session(&mut self) {
+        self.active_trace_session = None;
     }
 
     /// warmspot.py:449 — set the per-driver result_type from the portal
@@ -3755,12 +3873,20 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Finish the current trace with a terminal `FINISH`, then optimize and compile it.
+    ///
+    /// Returns `Err(SwitchToBlackhole::bad_loop())` on optimizer
+    /// `InvalidLoop` or backend compile failure, matching
+    /// pyjitpl.py:3220 `compile.giveup()` surfacing as
+    /// `SwitchToBlackhole(ABORT_BAD_LOOP)`.  The caller (typically
+    /// `compile_finish_from_active_session`) propagates the error so
+    /// `finishframe`/`finishframe_exception` can translate it into
+    /// `aborted_tracing(reason)` per pyjitpl.py:2491.
     pub fn finish_and_compile(
         &mut self,
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
         meta: M,
-    ) {
+    ) -> Result<(), SwitchToBlackhole> {
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
         // Cache driver descriptor before ctx is partially consumed below.
@@ -3867,7 +3993,14 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("[jit] abort finish: InvalidLoop at key={}", green_key);
                     }
                     self.warm_state.abort_tracing(green_key, true);
-                    return;
+                    // pyjitpl.py:2760 aborted_tracing() reads greenkey from
+                    // `current_merge_points`; pyre's analog reads it from
+                    // pending_abort_{green_key,permanent} staged here so the
+                    // caller-side `aborted_tracing(stb.reason)` hook payload
+                    // carries the real trace key instead of 0.
+                    self.pending_abort_green_key = Some(green_key);
+                    self.pending_abort_permanent = true;
+                    return Err(SwitchToBlackhole::giveup());
                 }
                 std::panic::resume_unwind(payload);
             }
@@ -4093,7 +4226,6 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             Err(e) => {
-                self.stats.loops_aborted += 1;
                 let msg = format!("finish_and_compile: compile_loop FAILED key={green_key}: {e:?}");
                 if crate::majit_log_enabled() {
                     eprintln!("[jit] {msg}");
@@ -4103,8 +4235,18 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.abort_tracing(green_key, false);
                 self.warm_state.reset_function_counts();
+                // pyjitpl.py:2761/:2786 `aborted_tracing` is the single
+                // bump site for `stats.aborted()`; keep the increment
+                // there so the caller-side `aborted_tracing(stb.reason)`
+                // catch counts exactly once.  pyjitpl.py:2760 reads
+                // greenkey from the current merge-point state — pyre's
+                // analog is pending_abort_* staged here for the catch.
+                self.pending_abort_green_key = Some(green_key);
+                self.pending_abort_permanent = false;
+                return Err(SwitchToBlackhole::giveup());
             }
         }
+        Ok(())
     }
 
     /// compile.py:216-249 compile_simple_loop parity.
@@ -8767,34 +8909,27 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.store_token_in_vable_setfield();
         }
-        // pyjitpl.py:3200-3216: select exits / token from result_type.
-        // (Upstream reads `self.jitdriver_sd.result_type` directly; pyre
-        // resolves it in `finishframe` and passes it through here.)
-        let exits: Vec<OpRef> = match result_type {
+        // pyjitpl.py:3200-3216: select exits / result-type from result_type.
+        let (exits, finish_arg_types): (Vec<OpRef>, Vec<majit_ir::Type>) = match result_type {
             // pyjitpl.py:3204-3206: VOID → exits = [], assert exitbox is None.
             majit_ir::Type::Void => {
                 debug_assert!(
                     exitbox.is_none(),
                     "compile_done_with_this_frame: VOID with non-None exitbox",
                 );
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
             // pyjitpl.py:3207-3215: INT/REF/FLOAT → exits = [exitbox].
-            _ => exitbox.into_iter().collect(),
-        };
-        // pyjitpl.py:3216 token = sd.done_with_this_frame_descr_<kind>
-        // PRE-EXISTING-ADAPTATION: pyre's analog is the typed FINISH
-        // descr produced by `make_fail_descr_typed([result_type])`.
-        let _token = match result_type {
-            majit_ir::Type::Void => crate::make_fail_descr_typed(vec![]),
-            tp => crate::make_fail_descr_typed(vec![tp]),
+            tp => (exitbox.into_iter().collect(), vec![tp]),
         };
         // pyjitpl.py:3217 self.history.record(rop.FINISH, exits, None, descr=token)
         // pyjitpl.py:3218 target_token = compile.compile_trace(self, self.resumekey, exits)
-        // PRE-EXISTING-ADAPTATION: emitted at the TraceAction::Finish
-        // dispatch (jitdriver.rs:956); see method docstring.
-        let _ = exits;
-        Ok(())
+        // pyjitpl.py:3219-3220 if target_token is not token: compile.giveup()
+        //
+        // Dispatch through `compile_finish_from_active_session` so
+        // root / bridge finish branches share the session-owned compile
+        // helper — `ActiveTraceSession.bridge` picks between them.
+        self.compile_finish_from_active_session(&exits, finish_arg_types)
     }
 
     /// pyjitpl.py:3238-3245 `MetaInterp.compile_exit_frame_with_exception(valuebox)`.
@@ -8840,18 +8975,105 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.store_token_in_vable_setfield();
         }
-        // pyjitpl.py:3241 token = sd.exit_frame_with_exception_descr_ref
-        // PRE-EXISTING-ADAPTATION: pyre's analog is the typed FINISH
-        // descr produced by `make_fail_descr_typed([Ref])`.
-        let _token = crate::make_fail_descr_typed(vec![majit_ir::Type::Ref]);
         // pyjitpl.py:3242 self.history.record1(rop.FINISH, valuebox, None, descr=token)
-        // pyjitpl.py:3243 target_token = compile.compile_trace(...)
-        // Covered by the dispatch-layer path (dispatch.rs:298
-        // `unwind_to_exception_handler`) for the BC_RAISE/BC_RERAISE
-        // exit. The MetaInterp-call-chain route is still deferred — see
-        // method docstring.
-        let _ = valuebox;
-        Ok(())
+        // pyjitpl.py:3243 target_token = compile.compile_trace(self, self.resumekey, [valuebox])
+        // pyjitpl.py:3244-3245 if target_token is not token: compile.giveup()
+        //
+        // Routes through the session-owned `compile_finish_from_active_session`
+        // so both the MetaInterp-call-chain exception exit (this method)
+        // and the pyre-dispatch-layer `unwind_to_exception_handler`
+        // (dispatch.rs:298, emits `TraceAction::Finish` with [Ref])
+        // share a single compile path, matching upstream's single-owner
+        // `compile.compile_trace` invocation for the FINISH.
+        let exits: Vec<OpRef> = valuebox.into_iter().collect();
+        self.compile_finish_from_active_session(&exits, vec![majit_ir::Type::Ref])
+    }
+
+    /// pyjitpl.py:3198-3220 + 3238-3245 shared compile-and-finish helper.
+    ///
+    /// Consumes the [`ActiveTraceSession`] installed by
+    /// `begin_trace_session` and drives `compile.compile_trace(self,
+    /// self.resumekey, exits)` — the exact RPython call that
+    /// `compile_done_with_this_frame` and
+    /// `compile_exit_frame_with_exception` each make.  Dispatch:
+    ///
+    /// - `bridge.is_some()` → `compile_trace_finish(bridge_key, ...,
+    ///   bridge_origin, finish_descr)` records the trailing FINISH via
+    ///   `recorder.finish()` and drives the bridge compile.
+    /// - `bridge.is_none()` → `finish_and_compile(..., trace_meta)` —
+    ///   the root-trace equivalent.
+    ///
+    /// Returns `Err(SwitchToBlackhole::bad_loop())` if the compile
+    /// gave up (matching `compile.giveup()`).  The caller
+    /// (`compile_done_with_this_frame` / `compile_exit_frame_with_exception`)
+    /// propagates the error so `finishframe` / `finishframe_exception`
+    /// can translate it into `aborted_tracing(stb.reason)` per
+    /// pyjitpl.py:2491.
+    ///
+    /// Idempotent when no session is active — a second call after the
+    /// first one already consumed the session returns `Ok(())` without
+    /// touching the tracer.  This matches the dual-entry shape in pyre
+    /// where `TraceAction::Finish` (dispatch-layer) and
+    /// `MetaInterp.finishframe` (residual-call chain) can both fire
+    /// along the same trace; only one actually runs the compile.
+    pub fn compile_finish_from_active_session(
+        &mut self,
+        finish_args: &[OpRef],
+        finish_arg_types: Vec<Type>,
+    ) -> Result<(), SwitchToBlackhole> {
+        // Idempotent no-op: session already consumed by the sibling
+        // finish entry (e.g. `TraceAction::Finish` arm ran first).
+        if self.active_trace_session.is_none() {
+            return Ok(());
+        }
+        // bridge branch: `compile_trace_finish` records FINISH on the
+        // existing tracer and dispatches to `compile_trace_inner`.
+        if let Some(bridge) = self.bridge_info() {
+            let finish_descr = crate::make_fail_descr_typed(finish_arg_types);
+            let outcome = self.compile_trace_finish(
+                bridge.green_key,
+                finish_args,
+                Some((bridge.trace_id, bridge.fail_index)),
+                finish_descr,
+            );
+            // pyjitpl.py:3095-3099 raise_if_successful(): successful
+            // bridge closure terminates tracing.  Consume the whole
+            // session (bridge + trace_meta) and unwind the tracer via
+            // `abort_trace_live` (live cleanup + `pending_abort_*`
+            // staging) — NOT `abort_trace`, because that also fires
+            // `aborted_tracing(Generic)` which would double-count the
+            // upstream abort hook (pyjitpl.py:2491 fires it once with
+            // `stb.reason` via the caller-side catch).  On success no
+            // catch fires, so we clear the staged `pending_abort_*`
+            // below to keep the next aborted_tracing clean.
+            self.clear_trace_session();
+            self.abort_trace_live(false);
+            return match outcome {
+                CompileOutcome::Compiled { .. } | CompileOutcome::Cancelled => {
+                    // Drop the `pending_abort_*` staged by
+                    // `abort_trace_live` — on success no abort hook
+                    // fires, so letting stale greenkey linger would
+                    // attach this successfully-compiled bridge's key
+                    // to a later, unrelated abort.
+                    self.pending_abort_green_key = None;
+                    self.pending_abort_permanent = false;
+                    Ok(())
+                }
+                // pyjitpl.py:3220/:3245 `compile.giveup()` per
+                // `rpython/jit/metainterp/compile.py:27` →
+                // `SwitchToBlackhole(Counters.ABORT_BRIDGE)`.  The
+                // bridge FINISH path shares the same giveup reason as
+                // the root FINISH path.
+                CompileOutcome::Aborted => Err(SwitchToBlackhole::giveup()),
+            };
+        }
+        // Root branch: drain `trace_meta`, drive `finish_and_compile`.
+        // `finish_and_compile` takes the tracer (`self.tracing`) so no
+        // separate `abort_trace` is needed.
+        let meta = self
+            .take_trace_meta()
+            .expect("compile_finish_from_active_session: session must be present");
+        self.finish_and_compile(finish_args, finish_arg_types, meta)
     }
 
     /// pyjitpl.py:2174-2186 `MIFrame.do_residual_or_indirect_call`.
@@ -10325,9 +10547,24 @@ pub struct SwitchToBlackhole {
 /// history.py `Counters.*` constants for `SwitchToBlackhole.reason`.
 /// Pyre carries them as raw `i32`s so the eventual hook payload stays
 /// stable; only the variants pyre currently signals are populated.
+///
+/// Values follow `rpython/rlib/jit.py` `class Counters` declaration
+/// order (ABORT_TOO_LONG=12, ABORT_BRIDGE=13, ABORT_BAD_LOOP=14).
 pub mod counters {
     /// `Counters.ABORT_ESCAPE` — an `OS_NOT_IN_TRACE` call raised.
     pub const ABORT_ESCAPE: i32 = 0;
+    /// `Counters.ABORT_BRIDGE` — `compile.giveup()` per
+    /// `rpython/jit/metainterp/compile.py:27`.  Raised from the
+    /// `compile_trace` FINISH path when the optimizer / backend refuses
+    /// the trace (InvalidLoop, compile_loop Err).  pyjitpl.py:3218 and
+    /// pyjitpl.py:3243 call `compile.compile_trace` which in turn
+    /// dispatches to `compile.giveup()` on failure.
+    pub const ABORT_BRIDGE: i32 = 13;
+    /// `Counters.ABORT_BAD_LOOP` — `compile.compile_loop` failure at
+    /// the JUMP-terminated loop path (pyjitpl.py:3028).  Distinct from
+    /// `ABORT_BRIDGE` which covers the FINISH-terminated compile_trace
+    /// path.
+    pub const ABORT_BAD_LOOP: i32 = 14;
 }
 
 impl SwitchToBlackhole {
@@ -10336,6 +10573,33 @@ impl SwitchToBlackhole {
     pub fn abort_escape() -> Self {
         Self {
             reason: counters::ABORT_ESCAPE,
+            raising_exception: false,
+        }
+    }
+
+    /// Construct a `SwitchToBlackhole(Counters.ABORT_BRIDGE)` — the
+    /// direct analog of `compile.giveup()` at
+    /// `rpython/jit/metainterp/compile.py:27`.  Used from the
+    /// `compile_trace` FINISH path (pyjitpl.py:3218, :3243 →
+    /// `compile.compile_trace` → `giveup()`) on InvalidLoop or
+    /// backend-compile failure, so both compile_done_with_this_frame
+    /// and compile_exit_frame_with_exception surface the same abort
+    /// reason upstream does.
+    pub fn giveup() -> Self {
+        Self {
+            reason: counters::ABORT_BRIDGE,
+            raising_exception: false,
+        }
+    }
+
+    /// Construct a `SwitchToBlackhole(Counters.ABORT_BAD_LOOP)` —
+    /// `compile.compile_loop` gave up at the JUMP-terminated loop path
+    /// (pyjitpl.py:3028).  Reserved for callers distinguishing the
+    /// loop-compile failure from the trace-compile (FINISH) failure,
+    /// which is `giveup()` above.
+    pub fn bad_loop() -> Self {
+        Self {
+            reason: counters::ABORT_BAD_LOOP,
             raising_exception: false,
         }
     }

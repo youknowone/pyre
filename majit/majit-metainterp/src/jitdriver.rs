@@ -263,17 +263,11 @@ pub struct EntryPoint {
 pub struct JitDriver<S: JitState> {
     meta: MetaInterp<S::Meta>,
     sym: Option<S::Sym>,
-    trace_meta: Option<S::Meta>,
     /// pyjitpl.py:2978-2983 reached_loop_header direct compile_trace parity.
     /// The frontend decides whether to call compile_trace(); the driver only
     /// consumes the successful result and switches back to compiled code.
     compile_trace_success: bool,
     descriptor: Option<JitDriverStaticData>,
-    /// Bridge tracing state: (green_key, trace_id, fail_index).
-    /// (green_key, trace_id, fail_index, code_ptr_for_green_key)
-    /// code_ptr enables computing green_key for any PC via
-    /// the same hash function used by make_green_key.
-    bridge_info: Option<(u64, u64, u32, usize)>,
     /// resume.py:1042: result of rebuild_from_resumedata for bridge tracing.
     /// RPython stores this in MIFrame registers; pyre stores it here
     /// for the caller to initialize PyreSym slot-to-OpRef mapping.
@@ -348,10 +342,8 @@ impl<S: JitState> JitDriver<S> {
         JitDriver {
             meta,
             sym: None,
-            trace_meta: None,
             compile_trace_success: false,
             descriptor: None,
-            bridge_info: None,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
             entry_points: Vec::new(),
@@ -627,13 +619,13 @@ impl<S: JitState> JitDriver<S> {
     /// Whether the driver is currently tracing a bridge.
     #[inline]
     pub fn is_bridge_tracing(&self) -> bool {
-        self.bridge_info.is_some()
+        self.meta.bridge_info().is_some()
     }
 
     /// Bridge origin (trace_id, fail_index) for compile_trace bridge_origin arg.
     #[inline]
     pub fn bridge_origin(&self) -> Option<(u64, u32)> {
-        self.bridge_info.map(|(_, tid, fi, _)| (tid, fi))
+        self.meta.bridge_info().map(|b| (b.trace_id, b.fail_index))
     }
 
     /// The green key of the active trace, if any.
@@ -645,7 +637,7 @@ impl<S: JitState> JitDriver<S> {
     /// from the currently active trace.
     pub fn compile_trace_entry_data(&mut self) -> Option<(u64, S::Meta)> {
         let original_green_key = self.meta.trace_ctx().map(|ctx| ctx.root_green_key())?;
-        let trace_meta = self.trace_meta.as_ref()?.clone();
+        let trace_meta = self.meta.trace_meta()?.clone();
         Some((original_green_key, trace_meta))
     }
 
@@ -663,8 +655,7 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             self.meta.abort_trace(permanent);
             self.sym = None;
-            self.trace_meta = None;
-            self.bridge_info = None;
+            self.meta.clear_trace_session();
             self.compile_trace_success = false;
         }
     }
@@ -713,14 +704,13 @@ impl<S: JitState> JitDriver<S> {
         if !self.meta.is_tracing() {
             return;
         }
-        if self.sym.is_none() || self.trace_meta.is_none() {
+        if self.sym.is_none() || self.meta.trace_meta().is_none() {
             if crate::majit_log_enabled() {
                 eprintln!("[mp] abort:sym_none");
             }
             self.meta.abort_trace(false);
             self.sym = None;
-            self.trace_meta = None;
-            self.bridge_info = None;
+            self.meta.clear_trace_session();
             return;
         }
 
@@ -731,7 +721,7 @@ impl<S: JitState> JitDriver<S> {
                     eprintln!("[mp] abort:ctx_none");
                 }
                 self.sym = None;
-                self.trace_meta = None;
+                self.meta.clear_trace_session();
                 return;
             };
             let Some(sym) = self.sym.as_mut() else {
@@ -739,7 +729,7 @@ impl<S: JitState> JitDriver<S> {
                     eprintln!("[mp] abort:sym_none2");
                 }
                 self.meta.abort_trace(false);
-                self.trace_meta = None;
+                self.meta.clear_trace_session();
                 return;
             };
             trace_fn(ctx, sym)
@@ -806,17 +796,17 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.abort_trace(false);
                 self.meta.warm_state.reset_function_counts();
                 self.sym = None;
-                self.trace_meta = None;
-                self.bridge_info = None;
+                self.meta.clear_trace_session();
                 self.compile_trace_success = true;
                 return;
             }
             TraceAction::CloseLoop => {
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
-                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index, _bridge_code)) =
-                    self.bridge_info.as_ref()
-                {
+                if let Some(bridge) = self.meta.bridge_info() {
+                    let bridge_key = bridge.green_key;
+                    let bridge_trace_id = bridge.trace_id;
+                    let bridge_fail_index = bridge.fail_index;
                     let has_targets = self.meta.has_compiled_targets(bridge_key);
                     if has_targets {
                         if crate::majit_log_enabled() {
@@ -835,9 +825,8 @@ impl<S: JitState> JitDriver<S> {
                             );
                             match result {
                                 crate::pyjitpl::BridgeCompileResult::Compiled => {
-                                    self.bridge_info.take();
                                     self.sym = None;
-                                    self.trace_meta = None;
+                                    self.meta.clear_trace_session();
                                     // pyjitpl.py:3095-3099 raise_if_successful():
                                     // successful bridge closure terminates tracing.
                                     self.meta.abort_trace(false);
@@ -847,43 +836,42 @@ impl<S: JitState> JitDriver<S> {
                                 // partial_trace is set on MetaInterp. Fall through
                                 // to compile_loop → compile_retrace in same call.
                                 crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                    self.bridge_info.take();
+                                    self.meta.take_bridge_info();
                                     // Fall through — do NOT return.
                                 }
                                 crate::pyjitpl::BridgeCompileResult::Failed => {
-                                    self.bridge_info.take();
                                     self.meta.abort_trace(false);
                                     self.sym = None;
-                                    self.trace_meta = None;
+                                    self.meta.clear_trace_session();
                                     return;
                                 }
                             }
                         } else {
-                            self.bridge_info.take();
                             self.meta.abort_trace(false);
                             self.sym = None;
-                            self.trace_meta = None;
+                            self.meta.clear_trace_session();
                             return;
                         }
+                    } else {
+                        // No targets: consume bridge_info, fall through to
+                        // compile_loop (pyjitpl.py:3014-3017).
+                        self.meta.take_bridge_info();
                     }
-                    // No targets: consume bridge_info, fall through to
-                    // compile_loop (pyjitpl.py:3014-3017).
-                    self.bridge_info = None;
                 }
-                let Some(trace_meta) = self.trace_meta.as_ref() else {
+                let Some(trace_meta) = self.meta.trace_meta().cloned() else {
                     self.meta.abort_trace(false);
                     self.sym = None;
-                    self.trace_meta = None;
+                    self.meta.clear_trace_session();
                     return;
                 };
                 let Some(sym) = self.sym.as_ref() else {
                     self.meta.abort_trace(false);
-                    self.trace_meta = None;
+                    self.meta.clear_trace_session();
                     return;
                 };
-                if S::validate_close(sym, trace_meta) {
+                if S::validate_close(sym, &trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
-                    let provisional_meta = self.trace_meta.take().unwrap();
+                    let provisional_meta = self.meta.take_trace_meta().unwrap();
                     // When cross-loop cut redirects to a different header_pc,
                     // rebuild meta from merge point to get the inner header's
                     // frame layout (vsd, slot_types).
@@ -905,7 +893,7 @@ impl<S: JitState> JitDriver<S> {
                             // pyjitpl.py:3018-3019 cancel_count incremented inside
                             // compile_loop. Tracing continues — next loop header
                             // will retry compile_loop with accumulated cancel_count.
-                            self.trace_meta = Some(meta_backup);
+                            self.meta.begin_trace_session(meta_backup);
                             return;
                         }
                         crate::CompileOutcome::Aborted => {
@@ -918,7 +906,7 @@ impl<S: JitState> JitDriver<S> {
                         eprintln!("[mp] abort:validate_close");
                     }
                     self.meta.abort_trace(false);
-                    self.trace_meta = None;
+                    self.meta.clear_trace_session();
                 }
                 self.sym = None;
             }
@@ -927,9 +915,11 @@ impl<S: JitState> JitDriver<S> {
                 loop_header_pc,
             } => {
                 // pyjitpl.py:2979-2990 reached_loop_header parity.
-                if let Some(&(bridge_key, bridge_trace_id, bridge_fail_index, bridge_code_ptr)) =
-                    self.bridge_info.as_ref()
-                {
+                if let Some(bridge) = self.meta.bridge_info() {
+                    let bridge_key = bridge.green_key;
+                    let bridge_trace_id = bridge.trace_id;
+                    let bridge_fail_index = bridge.fail_index;
+                    let bridge_code_ptr = bridge.code_ptr;
                     // pyjitpl.py:2982: ptoken = self.get_procedure_token(greenboxes)
                     // Use the TARGET loop header's green key, not the bridge origin.
                     let target_key = loop_header_pc
@@ -945,9 +935,8 @@ impl<S: JitState> JitDriver<S> {
                         );
                         match result {
                             crate::pyjitpl::BridgeCompileResult::Compiled => {
-                                self.bridge_info.take();
                                 self.sym = None;
-                                self.trace_meta = None;
+                                self.meta.clear_trace_session();
                                 // pyjitpl.py:3095-3099 raise_if_successful():
                                 // successful bridge closure terminates tracing.
                                 self.meta.abort_trace(false);
@@ -957,41 +946,41 @@ impl<S: JitState> JitDriver<S> {
                             // partial_trace is set on MetaInterp. Fall through
                             // to compile_loop → compile_retrace in same call.
                             crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                self.bridge_info.take();
+                                self.meta.take_bridge_info();
                                 // Fall through — do NOT return.
                             }
                             crate::pyjitpl::BridgeCompileResult::Failed => {
-                                self.bridge_info.take();
                                 self.meta.abort_trace(false);
                                 self.sym = None;
-                                self.trace_meta = None;
+                                self.meta.clear_trace_session();
                                 return;
                             }
                         }
+                    } else {
+                        // No targets: consume bridge_info, fall through.
+                        self.meta.take_bridge_info();
                     }
-                    // No targets: consume bridge_info, fall through.
-                    self.bridge_info = None;
                 }
                 // pyjitpl.py:2983: compile_trace already compiled a bridge
                 // to the existing loop. Don't call compile_loop again.
                 if self.compile_trace_success_pending() {
                     self.sym = None;
-                    self.trace_meta = None;
+                    self.meta.clear_trace_session();
                     return;
                 }
-                let Some(trace_meta) = self.trace_meta.as_ref() else {
+                let Some(trace_meta) = self.meta.trace_meta().cloned() else {
                     self.meta.abort_trace(false);
                     self.sym = None;
-                    self.trace_meta = None;
+                    self.meta.clear_trace_session();
                     return;
                 };
                 let Some(sym) = self.sym.as_ref() else {
                     self.meta.abort_trace(false);
-                    self.trace_meta = None;
+                    self.meta.clear_trace_session();
                     return;
                 };
-                if S::validate_close_with_jump_args(sym, trace_meta, &jump_args) {
-                    let provisional_meta = self.trace_meta.take().unwrap();
+                if S::validate_close_with_jump_args(sym, &trace_meta, &jump_args) {
+                    let provisional_meta = self.meta.take_trace_meta().unwrap();
                     let meta = {
                         if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
                             S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
@@ -1008,7 +997,7 @@ impl<S: JitState> JitDriver<S> {
                         }
                         crate::CompileOutcome::Cancelled => {
                             // pyjitpl.py:3018-3019 tracing continues.
-                            self.trace_meta = Some(meta_backup);
+                            self.meta.begin_trace_session(meta_backup);
                             return;
                         }
                         crate::CompileOutcome::Aborted => {
@@ -1024,7 +1013,7 @@ impl<S: JitState> JitDriver<S> {
                         );
                     }
                     self.meta.abort_trace(false);
-                    self.trace_meta = None;
+                    self.meta.clear_trace_session();
                 }
                 self.sym = None;
             }
@@ -1032,36 +1021,25 @@ impl<S: JitState> JitDriver<S> {
                 finish_args,
                 finish_arg_types,
             } => {
-                // pyjitpl.py:3198-3220 compile_done_with_this_frame parity:
-                // RPython records FINISH into the live trace history and calls
-                // compile_trace(self, self.resumekey, exits) — the same
-                // function used for bridge compilation. compile_trace_finish
-                // appends FINISH to the full trace and compiles it as a bridge.
-                if let Some((bridge_key, bridge_trace_id, bridge_fail_index, _bridge_code)) =
-                    self.bridge_info.take()
+                // pyjitpl.py:3198-3220 + 3238-3245 parity — upstream's
+                // `compile_done_with_this_frame` and
+                // `compile_exit_frame_with_exception` both call
+                // `compile.compile_trace(self, self.resumekey, exits)` →
+                // `compile.giveup()` on failure.  Both live on
+                // `MetaInterp` in upstream; the shared helper
+                // `compile_finish_from_active_session` dispatches bridge
+                // vs root based on the session's `bridge_info`.  The
+                // TraceAction::Finish arm stays as a thin wrapper that
+                // routes the pyre-dispatch-layer finish emission
+                // (dispatch.rs:298) into the same helper, matching the
+                // `except SwitchToBlackhole as stb: self.aborted_tracing`
+                // shape at pyjitpl.py:2491.
+                if let Err(stb) = self
+                    .meta
+                    .compile_finish_from_active_session(&finish_args, finish_arg_types)
                 {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit][bridge-finish] compile_trace_finish key={} trace={} fail={} args={:?}",
-                            bridge_key, bridge_trace_id, bridge_fail_index, finish_args
-                        );
-                    }
-                    // pyjitpl.py:3217: record FINISH + compile via compile_trace.
-                    let finish_descr = crate::make_fail_descr_typed(finish_arg_types.clone());
-                    self.meta.compile_trace_finish(
-                        bridge_key,
-                        &finish_args,
-                        Some((bridge_trace_id, bridge_fail_index)),
-                        finish_descr,
-                    );
-                    self.sym = None;
-                    self.trace_meta = None;
-                    self.meta.abort_trace(false);
-                    return;
+                    self.meta.aborted_tracing(stb.reason);
                 }
-                let meta = self.trace_meta.take().unwrap();
-                self.meta
-                    .finish_and_compile(&finish_args, finish_arg_types, meta);
                 self.sym = None;
             }
             TraceAction::SegmentedLoop => {
@@ -1069,7 +1047,7 @@ impl<S: JitState> JitDriver<S> {
                 //   target_token = compile.compile_simple_loop(...)
                 //   warmstate.attach_procedure_to_interp(greenkey, token)
                 // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-                let meta = self.trace_meta.take().unwrap();
+                let meta = self.meta.take_trace_meta().unwrap();
                 if let Some(green_key) = self.meta.compile_simple_loop(meta) {
                     // pyjitpl.py:1662-1663
                     let install_num = self.meta.warm_state.alloc_token_number();
@@ -1081,11 +1059,10 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.warm_state.reset_function_counts();
                 // Blackhole transition: clear all driver tracing state.
                 self.sym = None;
-                self.trace_meta = None;
-                self.bridge_info = None;
+                self.meta.clear_trace_session();
             }
             TraceAction::Abort => {
-                if crate::majit_log_enabled() && self.bridge_info.is_some() {
+                if crate::majit_log_enabled() && self.meta.bridge_info().is_some() {
                     eprintln!("[bridge] Abort during bridge tracing");
                 }
                 // pyjitpl.py:2788-2807 blackhole_if_trace_too_long runs the
@@ -1100,17 +1077,15 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.abort_trace_live(false);
                 self.meta.aborted_tracing(reason.as_int());
                 self.sym = None;
-                self.trace_meta = None;
-                self.bridge_info = None;
+                self.meta.clear_trace_session();
             }
             TraceAction::AbortPermanent => {
-                if crate::majit_log_enabled() && self.bridge_info.is_some() {
+                if crate::majit_log_enabled() && self.meta.bridge_info().is_some() {
                     eprintln!("[bridge] AbortPermanent during bridge tracing");
                 }
                 self.meta.abort_trace(true);
                 self.sym = None;
-                self.trace_meta = None;
-                self.bridge_info = None;
+                self.meta.clear_trace_session();
             }
         }
     }
@@ -1138,8 +1113,7 @@ impl<S: JitState> JitDriver<S> {
     #[inline(never)]
     fn clear_tracing_session_state(&mut self) {
         self.sym = None;
-        self.trace_meta = None;
-        self.bridge_info = None;
+        self.meta.clear_trace_session();
     }
 
     /// Back-edge handler — call when a backward jump is detected.
@@ -1260,8 +1234,7 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.abort_trace(false);
                 self.meta.warm_state.reset_function_counts();
                 self.sym = None;
-                self.trace_meta = None;
-                self.bridge_info = None;
+                self.meta.clear_trace_session();
                 return Some(DetailedDriverRunOutcome::Jump {
                     via_blackhole: false,
                 });
@@ -1585,7 +1558,7 @@ impl<S: JitState> JitDriver<S> {
                 let mut sym = S::create_sym(&meta, target_pc);
                 state.initialize_sym(&mut sym, &meta);
                 self.sym = Some(sym);
-                self.trace_meta = Some(meta);
+                self.meta.begin_trace_session(meta);
             }
             _ => {}
         }
@@ -1623,7 +1596,7 @@ impl<S: JitState> JitDriver<S> {
                 let mut sym = S::create_sym(&meta, target_pc);
                 state.initialize_sym(&mut sym, &meta);
                 self.sym = Some(sym);
-                self.trace_meta = Some(meta);
+                self.meta.begin_trace_session(meta);
             }
             _ => {}
         }
@@ -1661,7 +1634,7 @@ impl<S: JitState> JitDriver<S> {
                 let mut sym = S::create_sym(&meta, target_pc);
                 state.initialize_sym(&mut sym, &meta);
                 self.sym = Some(sym);
-                self.trace_meta = Some(meta);
+                self.meta.begin_trace_session(meta);
             }
             BackEdgeAction::AlreadyTracing | BackEdgeAction::RunCompiled => {}
         }
@@ -2824,7 +2797,7 @@ impl<S: JitState> JitDriver<S> {
                 S::setup_bridge_sym(sym, ctx, bfm, retrace.rd_virtuals.as_deref());
             }
         }
-        self.trace_meta = Some(trace_meta);
+        self.meta.begin_trace_session(trace_meta);
         // resume.py:1047-1055 parity:
         //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,
         //   and bridge tracing continues from that restored interpreter
@@ -2850,7 +2823,13 @@ impl<S: JitState> JitDriver<S> {
         // `materialize_bridge_virtual`'s `decode_fieldnum`.
         self.resume_data_result = resume_data_result;
         let code_ptr = state.code_ptr();
-        self.bridge_info = Some((green_key, trace_id, fail_index, code_ptr));
+        self.meta
+            .set_bridge_trace_info(crate::pyjitpl::BridgeTraceInfo {
+                green_key,
+                trace_id,
+                fail_index,
+                code_ptr,
+            });
         // RPython pyjitpl.py:2908 — bridge traces start with empty
         // current_merge_points (no loop header to match against).
         if let Some(ref mut ctx) = self.meta.tracing {
