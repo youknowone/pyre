@@ -258,7 +258,7 @@ impl MIFrame {
                 let _ = MIFrame::load_local_value(self, ctx, idx);
             }
         }
-        let (nlocals, local_values, stack_values, jitcode_ptr) = {
+        let (nlocals, local_values, stack_values, jitcode_ptr, registers_r) = {
             let s = self.sym();
             let stack_values = if let Some(ref pre_stack) = s.pre_opcode_stack {
                 pre_stack.clone()
@@ -266,11 +266,21 @@ impl MIFrame {
                 let stack_only = s.stack_only_depth();
                 s.symbolic_stack[..stack_only.min(s.symbolic_stack.len())].to_vec()
             };
+            // Step 1.3 of the regalloc-parity refactor: snapshot the
+            // register bank alongside the legacy symbolic_locals. The
+            // snapshot closure below reads from `registers_r` so the
+            // encoder follows the RPython MIFrame.registers_X model
+            // (pyjitpl.py:218-225 `add_box_to_storage(self.registers_r[index])`).
+            // `local_values` (= legacy symbolic_locals) stays available
+            // as a fallback for live indices that haven't been mirrored
+            // yet (e.g. bridge resume slots populated through other
+            // paths; later substeps cover those).
             (
                 s.nlocals,
                 s.symbolic_locals.clone(),
                 stack_values,
                 s.jitcode,
+                s.registers_r.clone(),
             )
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
@@ -362,7 +372,15 @@ impl MIFrame {
         let mut boxes = Vec::with_capacity(total);
         let snapshot = |idx: usize| -> OpRef {
             if idx < nlocals {
-                local_values.get(idx).copied().unwrap_or(OpRef::NONE)
+                // Step 1.3 register bank lookup. Falls back to the
+                // legacy symbolic_locals when registers_r is shorter
+                // than nlocals (lazy-init: `load_local_value`/
+                // `store_local_value` only resize on first touch).
+                registers_r
+                    .get(idx)
+                    .copied()
+                    .filter(|opref| !opref.is_none())
+                    .unwrap_or_else(|| local_values.get(idx).copied().unwrap_or(OpRef::NONE))
             } else {
                 stack_values
                     .get(idx - nlocals)
