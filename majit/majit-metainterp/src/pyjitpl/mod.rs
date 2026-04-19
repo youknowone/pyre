@@ -13502,10 +13502,18 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
+        // live_values[0] is the vable identity — must be Ref-typed per
+        // virtualstate.py:417 NotVirtualStateInfoPtr contract. A bare
+        // Value::Int here makes `enum_forced_boxes_for_entry` reject the
+        // label via the Box.type strict check.
         start_tracing_with_virtualizable(
             &mut meta,
             info,
-            &[Value::Int(0x1234), Value::Int(10), Value::Int(20)],
+            &[
+                Value::Ref(majit_ir::GcRef(0x1234)),
+                Value::Int(10),
+                Value::Int(20),
+            ],
             vec![2],
         );
 
