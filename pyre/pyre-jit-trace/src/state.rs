@@ -970,6 +970,26 @@ pub struct PyreSym {
     /// resume.py:1093 restores virtual references on guard failure.
     /// Pairs stored flat: [virt_sym, virt_ptr, real_sym, real_ptr, ...].
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
+    // ── RPython MIFrame.registers_{i,r,f} parity (pyjitpl.py:74-78) ──
+    //
+    // Abstract register file disjoint from PyFrame slot indexing.
+    // Indexed by post-regalloc register color, NOT by Python local
+    // index. Each entry is the OpRef currently held by that register
+    // (NONE sentinel for unused slots).
+    //
+    // Stage 3.1: storage only, no consumers yet. Stages 3.2-3.4 will
+    // migrate LOAD_FAST / STORE_FAST / get_list_of_active_boxes /
+    // bridge resume to write/read these instead of `symbolic_locals` /
+    // `symbolic_stack`. After Stage 3.4 the PyFrame-slot-indexed
+    // `symbolic_locals` and `symbolic_stack` get retired.
+    //
+    // RPython reference: `rpython/jit/metainterp/pyjitpl.py:74-78`
+    //   self.registers_i = [history.CONST_NULL] * jitcode.num_regs_i()
+    //   self.registers_r = [history.CONST_NULL] * jitcode.num_regs_r()
+    //   self.registers_f = [history.CONST_NULL] * jitcode.num_regs_f()
+    pub(crate) registers_i: Vec<OpRef>,
+    pub(crate) registers_r: Vec<OpRef>,
+    pub(crate) registers_f: Vec<OpRef>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1757,6 +1777,12 @@ impl PyreSym {
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
             virtualref_boxes: Vec::new(),
+            // RPython pyjitpl.py:74-78 init: registers_X[i] = CONST_NULL for
+            // i in num_regs. Sized lazily here — Stage 3.2 will resize each
+            // register file when the owning JitCode's num_regs is known.
+            registers_i: Vec::new(),
+            registers_r: Vec::new(),
+            registers_f: Vec::new(),
         }
     }
 
