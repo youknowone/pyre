@@ -1539,8 +1539,12 @@ fn resume_in_blackhole_from_exit_layout(
         );
     }
     // Save frame state before consume_vable_info modifies it.
-    // RPython's blackhole always completes; pyre's may fail and fall
-    // back to the interpreter, which needs the original frame state.
+    // RPython's blackhole always completes; pyre currently keeps a
+    // partial rollback path for the `BlackholeResult::Failed` escape
+    // (defensive null/bounds checks inside `resume_in_blackhole`
+    // fall back here). The full removal of `Failed` depends on
+    // auditing those remaining sites separately — see
+    // memory/rd_numb_audit_2026_04_19.md step 5.
     let saved_ni = frame.next_instr();
     let saved_code = frame.pycode;
     let saved_vsd = frame.valuestackdepth;
@@ -1548,24 +1552,25 @@ fn resume_in_blackhole_from_exit_layout(
     let saved_array: Vec<pyre_object::PyObjectRef> = frame.locals_w().as_slice().to_vec();
 
     build_blackhole_frames_from_deadframe(raw_values, exit_layout);
-    let guard_frames = take_last_guard_frames();
-    if let Some(ref frames) = guard_frames {
-        let result = crate::call_jit::resume_in_blackhole(frame, frames);
-        if matches!(result, BlackholeResult::Failed) {
-            // Restore frame to pre-consume state so the fallback
-            // interpreter can continue from the original frame.
-            frame.set_last_instr_from_next_instr(saved_ni);
-            frame.pycode = saved_code;
-            frame.valuestackdepth = saved_vsd;
-            frame.w_globals = saved_ns;
-            let dest = frame.locals_w_mut().as_mut_slice();
-            let n = dest.len().min(saved_array.len());
-            dest[..n].copy_from_slice(&saved_array[..n]);
-        }
-        result
-    } else {
-        BlackholeResult::Failed
+    // `build_blackhole_frames_from_deadframe` asserts that rd_numb is
+    // present and non-empty (commit c7ea7cb58b + the fallback removal
+    // above), so `LAST_GUARD_FRAMES` is always populated by the time we
+    // read it back here. `take_last_guard_frames` must return Some.
+    let frames = take_last_guard_frames()
+        .expect("LAST_GUARD_FRAMES must be set by build_blackhole_frames_from_deadframe");
+    let result = crate::call_jit::resume_in_blackhole(frame, &frames);
+    if matches!(result, BlackholeResult::Failed) {
+        // Restore frame to pre-consume state so the fallback
+        // interpreter can continue from the original frame.
+        frame.set_last_instr_from_next_instr(saved_ni);
+        frame.pycode = saved_code;
+        frame.valuestackdepth = saved_vsd;
+        frame.w_globals = saved_ns;
+        let dest = frame.locals_w_mut().as_mut_slice();
+        let n = dest.len().min(saved_array.len());
+        dest[..n].copy_from_slice(&saved_array[..n]);
     }
+    result
 }
 
 /// RPython warmstate.py:387-423 execute_assembler.
@@ -2958,15 +2963,26 @@ pub(crate) fn decode_and_restore_guard_failure(
     // resume.py:1312 blackhole_from_resumedata parity:
     // Build per-frame ResumedFrame chain from rd_numb decoded frames.
     // consume_vable=false: guard-failure recovery, JIT may re-enter trace.
+    //
+    // RPython parity: every guard reaching this path MUST carry rd_numb.
+    // `store_final_boxes_in_guard` (optimizeopt/mod.rs:2936) populates
+    // it for tracer-origin guards; backend-origin layouts propagate it
+    // via `FailDescrLayout.rd_numb` (commit c7ea7cb58b). An empty
+    // `rd_numb` here indicates an unported guard-emission site — hard
+    // assert so the gap surfaces rather than silently degrade via a
+    // pyre-only single-frame synthesis.
     let resumed_frames = {
-        let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
+        let rd_numb = exit_layout
+            .rd_numb
+            .as_deref()
+            .expect("rebuild_guard_fail_state: exit_layout.rd_numb missing");
         let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-        if !rd_numb.is_empty() {
-            build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, false)
-        } else {
-            // Fallback for guards with empty rd_numb: single frame from typed.
-            build_blackhole_frames_fallback(&typed)
-        }
+        assert!(
+            !rd_numb.is_empty(),
+            "rebuild_guard_fail_state: exit_layout.rd_numb is empty (fail_index={})",
+            exit_layout.fail_index
+        );
+        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, false)
     };
     LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
 
@@ -2997,8 +3013,21 @@ pub(crate) fn build_blackhole_frames_from_deadframe(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) {
-    let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
+    // resume.py:1312-1343 blackhole_from_resumedata: rd_numb is mandatory.
+    // RPython dereferences `storage.rd_numb_list` inside `ResumeDataDirectReader._prepare`
+    // (resume.py:1369-1372); there is no fallback for a missing numbering.
+    // Pyre propagates `rd_numb` through `FailDescrLayout` (commit c7ea7cb58b)
+    // so post-eviction backend-origin layouts still carry it.
+    let rd_numb = exit_layout
+        .rd_numb
+        .as_deref()
+        .expect("build_blackhole_frames_from_deadframe: exit_layout.rd_numb missing");
     let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+    assert!(
+        !rd_numb.is_empty(),
+        "build_blackhole_frames_from_deadframe: exit_layout.rd_numb is empty (fail_index={})",
+        exit_layout.fail_index
+    );
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][deadframe] fail_index={} rd_numb_len={} exit_types={}",
@@ -3007,61 +3036,9 @@ pub(crate) fn build_blackhole_frames_from_deadframe(
             exit_layout.exit_types.len(),
         );
     }
-    let resumed_frames = if !rd_numb.is_empty() {
-        // consume_vable=true: blackhole path, write vable fields to frame.
-        build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, true)
-    } else {
-        let typed = decode_exit_layout_values(raw_values, exit_layout);
-        build_blackhole_frames_fallback(&typed)
-    };
+    // consume_vable=true: blackhole path, write vable fields to frame.
+    let resumed_frames = build_resumed_frames(raw_values, rd_numb, rd_consts, exit_layout, true);
     LAST_GUARD_FRAMES.with(|c| *c.borrow_mut() = Some(resumed_frames));
-}
-
-fn build_blackhole_frames_fallback(typed: &[Value]) -> Vec<crate::call_jit::ResumedFrame> {
-    let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_LAST_INSTR_IDX as usize;
-    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_PYCODE_IDX as usize;
-    let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
-    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_W_GLOBALS_IDX as usize;
-    let frame_ptr = match typed.first() {
-        Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-        Some(Value::Int(v)) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-        _ => std::ptr::null_mut(),
-    };
-    // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
-    // typed = [frame(0), ni(1), code(2), vsd(3), ns(4), array...]
-    let py_pc = match typed.get(ni_idx) {
-        Some(Value::Int(v)) => (*v + 1) as usize,
-        _ => 0,
-    };
-    let code = match typed.get(code_idx) {
-        Some(Value::Ref(r)) => r.as_usize() as *const (),
-        Some(Value::Int(v)) => *v as *const (),
-        _ => std::ptr::null(),
-    };
-    let vsd = match typed.get(vsd_idx) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let namespace = match typed.get(ns_idx) {
-        Some(Value::Ref(r)) => r.as_usize() as *const (),
-        Some(Value::Int(v)) => *v as *const (),
-        _ => std::ptr::null(),
-    };
-    let slot_values = if typed.len() > num_scalars {
-        typed[num_scalars..].to_vec()
-    } else {
-        Vec::new()
-    };
-    vec![crate::call_jit::ResumedFrame {
-        code,
-        py_pc,
-        rd_numb_pc: None,
-        frame_ptr,
-        vsd,
-        namespace,
-        values: slot_values,
-    }]
 }
 
 /// Decode rd_numb to produce typed values via
