@@ -13,7 +13,7 @@ use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
 use crate::front::ast::SemanticFunction;
-use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator};
+use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, Terminator};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 
@@ -1680,86 +1680,105 @@ impl CallControl {
         Some((path, arc))
     }
 
-    /// Classify a call target.
+    /// Classify a call.
     ///
-    /// RPython: `CallControl.guess_call_kind(op, is_candidate)` (call.py:116-139).
-    ///
-    /// Exact RPython decision logic (call.py:117-139):
-    /// 1. Is portal runner → 'recursive'
-    /// 2. `_gctransformer_hint_close_stack_` → 'residual'
-    /// 3. Has oopspec → 'builtin'
-    /// 4. `graphs_from(target) is None` → 'residual'
-    /// 5. Otherwise → 'regular'
-    pub fn guess_call_kind(&self, target: &CallTarget) -> CallKind {
-        // RPython `call.py:116-139` direct_call branch resolves op.args[0]'s
-        // funcobj.graph to a single CallPath; the indirect_call branch
-        // uses `graphs_from(op)` to test if any candidate is inlinable.
-        // We route `CallTarget::Indirect` here, since it has no single
-        // path and close_stack/builtin flags don't apply family-wide.
-        if let CallTarget::Indirect {
-            trait_root,
-            method_name,
-        } = target
-        {
-            return match self.graphs_from_indirect(trait_root, method_name) {
-                Some(_) => CallKind::Regular,
-                None => CallKind::Residual,
-            };
-        }
-
-        // Step 1: recursive (RPython call.py:119-120)
-        let path = self.target_to_path(target);
-        if let Some(ref p) = path {
-            if self.portal_targets.contains(p) {
-                return CallKind::Recursive;
+    /// RPython `call.py:116-139 CallControl.guess_call_kind(op, is_candidate)`
+    /// — line-by-line port.  The `op.opname == 'direct_call'` branch
+    /// (call.py:117-136) maps to `OpKind::Call`; the implicit
+    /// `indirect_call` branch (RPython falls through to the final
+    /// `graphs_from(op) is None` test at line 137) maps to
+    /// `OpKind::IndirectCall`.  Closestack / oopspec / recursive
+    /// checks only apply to the direct branch because the corresponding
+    /// flags are attached to a single `funcobj`; for indirect calls the
+    /// same restrictions are enforced family-wide in `getcalldescr`
+    /// (`call.py:259-280`).
+    pub fn guess_call_kind(&self, op: &SpaceOperation) -> CallKind {
+        if let OpKind::Call { target, .. } = &op.kind {
+            // RPython `call.py:117-136` direct_call branch.
+            let path = self.target_to_path(target);
+            if let Some(ref p) = path {
+                // call.py:119-120 jitdriver_sd_from_portal_runner_ptr(funcptr)
+                if self.portal_targets.contains(p) {
+                    return CallKind::Recursive;
+                }
+                // call.py:129-134 _gctransformer_hint_close_stack_ → 'residual'
+                if self.close_stack_targets.contains(p) {
+                    return CallKind::Residual;
+                }
+                // call.py:135-136 oopspec → 'builtin'
+                if self.builtin_targets.contains(p) {
+                    return CallKind::Builtin;
+                }
             }
         }
-        // RPython call.py:129-134: _gctransformer_hint_close_stack_ → 'residual'.
-        // Must never produce JitCode for close_stack functions.
-        // Checked BEFORE builtin (RPython checks close_stack first at line 132).
-        if let Some(ref p) = path {
-            if self.close_stack_targets.contains(p) {
-                return CallKind::Residual;
-            }
-        }
-        // RPython call.py:135-136: has oopspec → 'builtin'
-        if let Some(ref p) = path {
-            if self.builtin_targets.contains(p) {
-                return CallKind::Builtin;
-            }
-        }
-        // Step 3+4: graphs_from check (RPython call.py:137-139)
-        // graphs_from returns the graph ONLY if it's a candidate.
-        if self.graphs_from(target).is_none() {
+        // RPython `call.py:137-139` — both direct_call (fall-through)
+        // and indirect_call reach this final classification.
+        if self.graphs_from(op).is_none() {
             CallKind::Residual
         } else {
             CallKind::Regular
         }
     }
 
-    /// Get the callee graph for a call target, but only if it is a candidate.
+    /// Collect every candidate callee graph reachable through this op.
     ///
-    /// RPython: `CallControl.graphs_from(op, is_candidate)` (call.py:94-114).
+    /// RPython `call.py:94-114 CallControl.graphs_from(op, is_candidate)`
+    /// — line-by-line port.  The `op.opname == 'direct_call'` branch
+    /// (call.py:97-101) returns `[graph]` for a direct call whose target
+    /// is a candidate; the `op.opname == 'indirect_call'` branch
+    /// (call.py:103-112) filters the family attached to the op by
+    /// `is_candidate` and returns the non-empty subset.  Both branches
+    /// collapse to `None` when no candidate is reachable — the residual
+    /// call path.
     ///
-    /// Returns the graph only if:
-    /// 1. The graph exists (via function_graphs or resolve_method)
-    /// 2. The graph is a candidate (in candidate_graphs)
+    /// The `is_candidate` argument from RPython `call.py:94-96` is
+    /// omitted here because majit's `find_all_graphs_for_tests` /
+    /// `find_all_graphs` populates `self.candidate_graphs` in bulk
+    /// before any caller invokes `graphs_from`; the RPython
+    /// incremental-discovery shape (where `find_all_graphs` passes its
+    /// own local `is_candidate`) is not needed.
+    pub fn graphs_from(&self, op: &SpaceOperation) -> Option<Vec<CallPath>> {
+        match &op.kind {
+            OpKind::Call { target, .. } => {
+                // call.py:97-101 direct_call branch.
+                let path = self.target_to_path(target)?;
+                if self.candidate_graphs.contains(&path) {
+                    Some(vec![path])
+                } else {
+                    None
+                }
+            }
+            OpKind::IndirectCall { graphs, .. } => {
+                // call.py:103-112 indirect_call branch.
+                // `graphs is None` (call.py:105) → residual.
+                let graphs = graphs.as_ref()?;
+                let result: Vec<CallPath> = graphs
+                    .iter()
+                    .filter(|p| self.candidate_graphs.contains(p))
+                    .cloned()
+                    .collect();
+                if result.is_empty() {
+                    None
+                } else {
+                    Some(result)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Look up the single callee `FunctionGraph` for a direct call.
     ///
-    /// This is the gatekeeper: if graphs_from returns None, the call
-    /// becomes residual. If it returns Some, the call is regular.
-    pub fn graphs_from(&self, target: &CallTarget) -> Option<&FunctionGraph> {
+    /// Convenience accessor for call sites (majit `inline.rs`) that
+    /// still work with one `&FunctionGraph` at a time.  RPython
+    /// `call.py:97-101` returns the graph value inside the list, but
+    /// majit callers want a borrow against `function_graphs` so we keep
+    /// this lookup separate from the op-based `graphs_from`.
+    pub fn direct_graph_for(&self, target: &CallTarget) -> Option<&FunctionGraph> {
         let path = self.target_to_path(target)?;
-        // RPython call.py:100: is_candidate(graph)
         if !self.candidate_graphs.contains(&path) {
             return None;
         }
-        // RPython call.py:94-101: returns the actual target graph.
-        // For FunctionPath: direct lookup in function_graphs.
-        // For Method: if target_to_path resolved to a qualified
-        // `[impl_type, method_name]` that already exists in
-        // function_graphs (inherent impl, or direct graph linkage for a
-        // trait impl), return that.  Only fall through to
-        // resolve_method when the qualified path isn't registered.
         match target {
             CallTarget::Method {
                 name,
@@ -1928,58 +1947,6 @@ impl CallControl {
             .collect()
     }
 
-    /// RPython `call.py:94-114` indirect branch: given a
-    /// `(trait_root, method_name)` key, return every `CallPath` that is
-    /// (a) registered as an impl of that trait method and (b) present
-    /// in `candidate_graphs` (`is_candidate(graph)`).  `None` if no
-    /// candidate is a regular-candidate graph — meaning the caller
-    /// should fall through to the residual path.
-    pub fn graphs_from_indirect(
-        &self,
-        trait_root: &str,
-        method_name: &str,
-    ) -> Option<Vec<CallPath>> {
-        let impls = self
-            .trait_method_impls
-            .get(&(trait_root.to_string(), method_name.to_string()))?;
-        let mut result = Vec::new();
-        for impl_type in impls {
-            let path = CallPath::for_impl_method(impl_type.as_str(), method_name);
-            if self.candidate_graphs.contains(&path) {
-                result.push(path);
-            }
-        }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-
-    /// RPython `call.py:94-114` indirect branch after `rpbc.py` has already
-    /// attached the full family to the op: filter that family by
-    /// `is_candidate(graph)` and return only the regular-candidate subset.
-    ///
-    /// `graphs=None` means an unknown family (`graphanalyze.py:117-121`), so
-    /// there is no candidate subset to inline.
-    pub fn graphs_from_indirect_family(
-        &self,
-        graphs: Option<&[CallPath]>,
-    ) -> Option<Vec<CallPath>> {
-        let graphs = graphs?;
-        let mut result = Vec::new();
-        for path in graphs {
-            if self.candidate_graphs.contains(path) {
-                result.push(path.clone());
-            }
-        }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-
     /// Collect every registered impl `CallPath` for a
     /// `(trait_root, method_name)` family, regardless of whether each
     /// one is a regular candidate.  Used by family-wide validation
@@ -2021,17 +1988,6 @@ impl CallControl {
             }
         }
         Ok(())
-    }
-
-    /// RPython `call.py:116-139` indirect branch over an already-materialized
-    /// family: regular only when at least one family member is a candidate
-    /// graph, residual otherwise. Unknown families stay residual.
-    pub fn guess_indirect_call_kind(&self, graphs: Option<&[CallPath]>) -> CallKind {
-        if self.graphs_from_indirect_family(graphs).is_some() {
-            CallKind::Regular
-        } else {
-            CallKind::Residual
-        }
     }
 
     /// Access the function graphs map (for inline pass).
@@ -4248,7 +4204,35 @@ pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::FunctionGraph;
+    use crate::model::{FunctionGraph, ValueId, ValueType};
+
+    /// Synthetic `OpKind::Call` wrapper — mirrors RPython test_jtransform
+    /// helpers that pass a pre-built `SpaceOperation('direct_call', ...)`
+    /// into `guess_call_kind` / `graphs_from`.
+    fn direct_call_op(target: CallTarget) -> SpaceOperation {
+        SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target,
+                args: vec![],
+                result_ty: ValueType::Void,
+            },
+        }
+    }
+
+    /// Synthetic `OpKind::IndirectCall` wrapper — mirrors RPython test
+    /// construction of `SpaceOperation('indirect_call', [..., c_graphs])`.
+    fn indirect_call_op(graphs: Option<Vec<CallPath>>) -> SpaceOperation {
+        SpaceOperation {
+            result: None,
+            kind: OpKind::IndirectCall {
+                funcptr: ValueId(0),
+                args: vec![],
+                graphs,
+                result_ty: ValueType::Void,
+            },
+        }
+    }
 
     #[test]
     fn guess_call_kind_function_path() {
@@ -4259,10 +4243,16 @@ mod tests {
         cc.find_all_graphs_for_tests();
 
         let target = CallTarget::function_path(["opcode_load_fast"]);
-        assert_eq!(cc.guess_call_kind(&target), CallKind::Regular);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target)),
+            CallKind::Regular
+        );
 
         let unknown = CallTarget::function_path(["unknown_function"]);
-        assert_eq!(cc.guess_call_kind(&unknown), CallKind::Residual);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(unknown)),
+            CallKind::Residual
+        );
     }
 
     #[test]
@@ -4402,7 +4392,10 @@ mod tests {
         cc.mark_portal(path);
 
         let target = CallTarget::function_path(["portal_runner"]);
-        assert_eq!(cc.guess_call_kind(&target), CallKind::Recursive);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target)),
+            CallKind::Recursive
+        );
     }
 
     #[test]
@@ -4412,7 +4405,10 @@ mod tests {
         cc.mark_builtin(path);
 
         let target = CallTarget::function_path(["w_int_add"]);
-        assert_eq!(cc.guess_call_kind(&target), CallKind::Builtin);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target)),
+            CallKind::Builtin
+        );
     }
 
     #[test]
@@ -4472,7 +4468,7 @@ mod tests {
 
     // ── getcalldescr tests ───────────────────────────���──────────────
 
-    use crate::model::{Terminator, ValueType};
+    use crate::model::Terminator;
 
     /// Helper: create a FunctionGraph with just a return.
     fn simple_graph(name: &str) -> FunctionGraph {
@@ -5245,10 +5241,12 @@ mod tests {
 
     // ── RPython indirect_call family tests — plan §Tests ────────────
 
-    /// `guess_call_kind` for `CallTarget::Indirect`:
+    /// `guess_call_kind` for `OpKind::IndirectCall`:
     ///   ≥1 candidate impl is a regular candidate → `Regular`
-    ///   no candidate registered                 → `Residual`
-    /// RPython `call.py:116-139`.
+    ///   graphs `None` (unknown family)          → `Residual`
+    /// RPython `call.py:116-139`.  Mirrors the
+    /// `op.opname == 'indirect_call'` fall-through to the final
+    /// `graphs_from(op) is None` test.
     #[test]
     fn guess_call_kind_indirect() {
         let mut cc = CallControl::new();
@@ -5256,16 +5254,24 @@ mod tests {
         cc.register_trait_method("run", Some("Handler"), "B", FunctionGraph::new("B::run"));
         cc.find_all_graphs_for_tests();
 
-        let target = CallTarget::indirect("Handler", "run");
-        assert_eq!(cc.guess_call_kind(&target), CallKind::Regular);
+        let handler_family = cc.all_impls_for_indirect("Handler", "run");
+        assert_eq!(handler_family.len(), 2);
+        assert_eq!(
+            cc.guess_call_kind(&indirect_call_op(Some(handler_family))),
+            CallKind::Regular
+        );
 
-        let bogus = CallTarget::indirect("Unknown", "run");
-        assert_eq!(cc.guess_call_kind(&bogus), CallKind::Residual);
+        // `graphs = None` → unknown family → residual path per
+        // `rpython/translator/backendopt/graphanalyze.py:117`.
+        assert_eq!(
+            cc.guess_call_kind(&indirect_call_op(None)),
+            CallKind::Residual
+        );
     }
 
-    /// `graphs_from_indirect` must not mix impls across traits that
-    /// share a method name.  Regression test for Issue 2.
-    /// RPython `call.py:94-114` indirect branch.
+    /// `graphs_from(op)` for an `OpKind::IndirectCall` must filter by
+    /// the family attached to the op, not mix impls across traits that
+    /// share a method name.  RPython `call.py:103-112` indirect branch.
     #[test]
     fn graphs_from_indirect_filters_by_trait() {
         let mut cc = CallControl::new();
@@ -5283,11 +5289,14 @@ mod tests {
         );
         cc.find_all_graphs_for_tests();
 
+        let foo_family = cc.all_impls_for_indirect("Foo", "bar");
+        let baz_family = cc.all_impls_for_indirect("Baz", "bar");
+
         let foo_candidates = cc
-            .graphs_from_indirect("Foo", "bar")
+            .graphs_from(&indirect_call_op(Some(foo_family)))
             .expect("Foo::bar family is non-empty");
         let baz_candidates = cc
-            .graphs_from_indirect("Baz", "bar")
+            .graphs_from(&indirect_call_op(Some(baz_family)))
             .expect("Baz::bar family is non-empty");
 
         assert_eq!(foo_candidates.len(), 1);
@@ -5349,10 +5358,13 @@ mod tests {
         // Inherent impl: front-end emits `CallTarget::Method` with a
         // concrete receiver_root.  No `trait_method_impls` entry.
         let target = CallTarget::method("bar", Some("Foo".to_string()));
-        assert_eq!(cc.guess_call_kind(&target), CallKind::Regular);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target)),
+            CallKind::Regular
+        );
         assert!(
-            cc.graphs_from_indirect("Foo", "bar").is_none(),
-            "inherent impls must not appear as indirect candidates"
+            cc.all_impls_for_indirect("Foo", "bar").is_empty(),
+            "inherent impls must not appear in any indirect-call family"
         );
     }
 

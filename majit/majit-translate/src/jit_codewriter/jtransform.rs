@@ -781,7 +781,7 @@ impl<'a> Transformer<'a> {
         );
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
-            let kind = cc.guess_call_kind(target);
+            let kind = cc.guess_call_kind(op);
             return match kind {
                 crate::call::CallKind::Regular => {
                     self.handle_regular_call(op, target, args, result_ty, graph_name)
@@ -1625,10 +1625,10 @@ impl<'a> Transformer<'a> {
             None,
             &mut self.analysis_cache,
         );
-        match cc_mut.guess_indirect_call_kind(graphs) {
+        match cc_mut.guess_call_kind(op) {
             crate::call::CallKind::Regular => {
                 let candidates = cc_mut
-                    .graphs_from_indirect_family(graphs)
+                    .graphs_from(op)
                     .expect("regular indirect call must have candidate graphs");
                 let lst: Vec<crate::jitcode::JitCodeHandle> = candidates
                     .iter()

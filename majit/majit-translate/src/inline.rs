@@ -62,14 +62,17 @@ fn find_inline_sites(graph: &FunctionGraph, call_control: &CallControl) -> Vec<I
     let mut sites = Vec::new();
     for block in &graph.blocks {
         for (op_idx, op) in block.operations.iter().enumerate() {
+            // Inline only direct calls — RPython's inline pass skips
+            // indirect family dispatch (each callee is resolved
+            // dynamically at runtime, not statically at inline time).
             let target = match &op.kind {
                 OpKind::Call { target, .. } => target,
                 _ => continue,
             };
-            if call_control.guess_call_kind(target) != CallKind::Regular {
+            if call_control.guess_call_kind(op) != CallKind::Regular {
                 continue;
             }
-            let callee = match call_control.graphs_from(target) {
+            let callee = match call_control.direct_graph_for(target) {
                 Some(g) => g.clone(),
                 None => continue,
             };
