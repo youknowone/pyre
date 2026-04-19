@@ -435,10 +435,15 @@ impl PyreMetaInterp {
         let parent_sym = unsafe { &mut *parent.sym };
 
         if let Some(result_idx) = popped.caller_result_stack_idx {
-            // Update symbolic stack
-            if let Some(slot) = parent_sym.symbolic_stack.get_mut(result_idx) {
-                *slot = result_opref;
+            // Update the unified register file. Stack slots live at
+            // `registers_r[nlocals + stack_idx]`; re-derive the abs
+            // index and write the call result there.
+            let parent_nlocals = parent_sym.nlocals;
+            let abs_idx = parent_nlocals + result_idx;
+            if abs_idx >= parent_sym.registers_r.len() {
+                parent_sym.registers_r.resize(abs_idx + 1, OpRef::NONE);
             }
+            parent_sym.registers_r[abs_idx] = result_opref;
             if result_idx >= parent_sym.symbolic_stack_types.len() {
                 parent_sym
                     .symbolic_stack_types
@@ -584,24 +589,22 @@ impl PyreMetaInterp {
                 let nlocals = sym.nlocals;
                 let target_stack_len = ncells + handler_depth;
 
-                sym.symbolic_stack.truncate(target_stack_len);
                 sym.symbolic_stack_types.truncate(target_stack_len);
                 sym.concrete_stack.truncate(target_stack_len);
                 sym.valuestackdepth = nlocals + target_stack_len;
-                // Stage 3.4 Phase A dual-write: mirror the stack
-                // truncation in the registers_r stack region.
+                // Unified register file: truncate the stack tail of
+                // `registers_r` in lockstep with the types / concrete
+                // mirrors.
                 if sym.registers_r.len() > nlocals + target_stack_len {
                     sym.registers_r.truncate(nlocals + target_stack_len);
                 }
                 if entry.push_lasti {
-                    sym.symbolic_stack.push(OpRef::NONE);
                     sym.symbolic_stack_types.push(Type::Ref);
                     sym.concrete_stack
                         .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
                     sym.valuestackdepth += 1;
                     sym.registers_r.push(OpRef::NONE);
                 }
-                sym.symbolic_stack.push(exc_opref);
                 sym.symbolic_stack_types.push(Type::Ref);
                 sym.concrete_stack.push(ConcreteValue::Ref(exc_obj));
                 sym.valuestackdepth += 1;

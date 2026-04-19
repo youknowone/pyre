@@ -187,10 +187,10 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .iter()
         .find(|f| f.role == VableRole::Locals)
         .map(|f| &f.ident);
-    let stack_field = vable_fields
-        .iter()
-        .find(|f| f.role == VableRole::Stack)
-        .map(|f| &f.ident);
+    // Stage 3.4 Phase C: `VableRole::Stack` is retired — the stack
+    // now lives in the tail of `locals_field` (registers_r). The enum
+    // variant is kept for attribute-parsing backward compatibility but
+    // produces no extra binding here.
     let local_types_field = vable_fields
         .iter()
         .find(|f| f.role == VableRole::LocalTypes)
@@ -272,13 +272,12 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .map(|f| quote! { __args.push((self.#f, majit_ir::Type::Ref)); })
         .unwrap_or_default();
 
-    // Stage 3.4 Phase A: when a `#[vable(nlocals)]` companion field is
-    // declared, slice `locals_field` to the first `nlocals` entries so
-    // `collect_locals` only emits the locals view even if the vec was
-    // sized beyond `nlocals` to carry a dual-write stack mirror. The
-    // adjacent `collect_stack` handler continues to produce the stack
-    // slice from `stack_field`. Once Stage 3.4 Phase C retires
-    // `stack_field`, this slice becomes a no-op (full registers_r).
+    // Stage 3.4 Phase C: `locals_field` (registers_r) is the abstract
+    // register file and carries both the locals [..nlocals] and the
+    // stack tail [nlocals..nlocals+stack_only]. `collect_locals` emits
+    // the locals window; `collect_stack` emits the stack window of the
+    // same field. The RPython MIFrame equivalent is `registers_r` —
+    // one contiguous vector indexed by abstract register color.
     let collect_locals = locals_field
         .map(|f| {
             if let Some(nl) = nlocals_field {
@@ -290,20 +289,24 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .unwrap_or_default();
 
     let collect_stack =
-        if let (Some(sf), Some(_vsd), Some(_nl)) = (stack_field, vsd_field, nlocals_field) {
+        if let (Some(lf), Some(_vsd), Some(nl)) = (locals_field, vsd_field, nlocals_field) {
             quote! {
                 let __stack_only = self.__vable_stack_only_depth();
-                let __stack_len = __stack_only.min(self.#sf.len());
-                __args.extend_from_slice(&self.#sf[..__stack_len]);
+                let __nlocals = self.#nl;
+                let __avail = self.#lf.len().saturating_sub(__nlocals);
+                let __stack_len = __stack_only.min(__avail);
+                __args.extend_from_slice(&self.#lf[__nlocals..__nlocals + __stack_len]);
             }
         } else {
             quote! {}
         };
 
-    // Stage 3.4 Phase A: mirror the `collect_locals` slice in the typed
-    // path so stack-mirror entries stored beyond `nlocals` in `lf`
-    // are not emitted twice (once via collect_typed_locals, once via
-    // collect_typed_stack).
+    // Stage 3.4 Phase C: typed emission mirrors the locals+stack
+    // window of `locals_field`. The `stack_types_field` side table
+    // still provides per-stack-slot types (parallel to
+    // `local_types_field` for locals); this layout matches RPython's
+    // per-register type tagging (`history.py:262`) while keeping the
+    // register storage unified.
     let collect_typed_locals = if let (Some(lf), Some(ltf)) = (locals_field, local_types_field) {
         if let Some(nl) = nlocals_field {
             quote! {
@@ -325,13 +328,15 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         quote! {}
     };
 
-    let collect_typed_stack = if let (Some(sf), Some(stf), Some(_vsd), Some(_nl)) =
-        (stack_field, stack_types_field, vsd_field, nlocals_field)
+    let collect_typed_stack = if let (Some(lf), Some(stf), Some(_vsd), Some(nl)) =
+        (locals_field, stack_types_field, vsd_field, nlocals_field)
     {
         quote! {
             let __stack_only = self.__vable_stack_only_depth();
-            let __stack_len = __stack_only.min(self.#sf.len());
-            for (__i, &__opref) in self.#sf[..__stack_len].iter().enumerate() {
+            let __nlocals = self.#nl;
+            let __avail = self.#lf.len().saturating_sub(__nlocals);
+            let __stack_len = __stack_only.min(__avail);
+            for (__i, &__opref) in self.#lf[__nlocals..__nlocals + __stack_len].iter().enumerate() {
                 let __tp = self.#stf.get(__i).copied().unwrap_or(majit_ir::Type::Ref);
                 __args.push((__opref, __tp));
             }

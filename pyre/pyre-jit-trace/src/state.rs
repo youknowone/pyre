@@ -876,8 +876,13 @@ pub struct PyreSym {
     #[vable(frame)]
     pub frame: OpRef,
     // ── Persistent symbolic frame field tracking ──
-    #[vable(stack)]
-    pub symbolic_stack: Vec<OpRef>,
+    // Stage 3.4 Phase C: the Python stack (`locals_cells_stack_w[nlocals..]`)
+    // lives in the tail of `registers_r`. The macro's `collect_stack`
+    // emits `registers_r[nlocals..nlocals + stack_only_depth]` so JUMP /
+    // GUARD args carry locals followed by stack in one contiguous window.
+    // This matches RPython's MIFrame register file (`pyjitpl.py:70-78`),
+    // which treats locals and the stack as a single abstract register
+    // vector.
     #[vable(local_types)]
     pub(crate) symbolic_local_types: Vec<Type>,
     #[vable(stack_types)]
@@ -894,9 +899,10 @@ pub struct PyreSym {
     /// of the vable_array_base-based layout. This ensures bridge traces see
     /// frame locals as symbolic InputArgs, not concrete values.
     pub(crate) bridge_local_oprefs: Option<Vec<OpRef>>,
-    /// Bridge-specific override for symbolic_stack.
-    /// resume.py:1042 parity: consume_boxes fills both local and stack
-    /// registers for the resumed frame.
+    /// Bridge-specific override for the stack tail of registers_r.
+    /// resume.py:1042 parity: `consume_boxes` fills both the local and
+    /// stack register windows for the resumed frame; this holds the
+    /// stack portion (`registers_r[nlocals..]`).
     pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
     /// Bridge-specific override for symbolic_local_types.
     /// virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
@@ -1765,7 +1771,6 @@ impl PyreSym {
     pub(crate) fn new_uninit(frame: OpRef) -> Self {
         Self {
             frame,
-            symbolic_stack: Vec::new(),
             symbolic_local_types: Vec::new(),
             symbolic_stack_types: Vec::new(),
             pending_next_instr: None,
@@ -1888,7 +1893,12 @@ impl PyreSym {
         } else if self.symbolic_local_types.len() != nlocals {
             self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
         }
-        self.symbolic_stack = if let Some(ref overrides) = self.bridge_stack_oprefs {
+        // Stage 3.4 Phase C: seed the stack portion of `registers_r`
+        // directly. `registers_r` is the unified abstract register
+        // file — locals occupy `[..nlocals]` and stack slots occupy
+        // `[nlocals..nlocals + stack_only_depth]` (RPython
+        // `pyjitpl.py:70-78` MIFrame parity).
+        let stack_seed: Vec<OpRef> = if let Some(ref overrides) = self.bridge_stack_oprefs {
             let mut stack = overrides.clone();
             stack.resize(stack_only_depth, OpRef::NONE);
             stack
@@ -1900,16 +1910,7 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; stack_only_depth]
         };
-        // Stage 3.4 Phase A dual-write: mirror the per-trace stack seed
-        // into `registers_r[nlocals..nlocals+stack_only_depth]` so every
-        // stack register has a register-file shadow. Readers still hit
-        // `symbolic_stack`; Phase B switches them to `registers_r` under
-        // the unified address space (abs_idx = nlocals + depth) and
-        // Phase C retires `symbolic_stack`. The macro's `collect_locals`
-        // path slices to `self.nlocals` to keep the stack mirror out of
-        // `collect_locals`; `collect_stack` still sources from
-        // `symbolic_stack`.
-        self.registers_r.extend(self.symbolic_stack.iter().copied());
+        self.registers_r.extend(stack_seed.iter().copied());
         if let Some(ref overrides) = self.bridge_stack_types {
             let mut types = overrides.clone();
             types.resize(stack_only_depth, Type::Ref);
@@ -2999,7 +3000,6 @@ impl JitState for PyreJitState {
         sym.symbolic_stack_types =
             vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
         let stack_only = _meta.vable_stack_only_depth();
-        sym.symbolic_stack = vec![OpRef::NONE; stack_only];
         sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
         sym
     }
@@ -3345,8 +3345,8 @@ impl JitState for PyreJitState {
             &concrete_values,
             sym.concrete_vable_ptr as *const u8,
         );
-        // Bridge stack: the target loop header has stack_only=0.
-        sym.symbolic_stack = Vec::new();
+        // Bridge stack: the target loop header has stack_only=0, so no
+        // stack tail needs to be appended to registers_r.
         sym.symbolic_stack_types = Vec::new();
         sym.valuestackdepth = sym.nlocals;
         sym.bridge_local_oprefs = Some(bridge_locals);
@@ -4982,7 +4982,9 @@ mod tests {
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.nlocals() + 1;
-        sym.symbolic_stack = vec![lower_stack];
+        sym.registers_r = vec![OpRef::NONE; sym.nlocals];
+        sym.registers_r.push(lower_stack);
+        sym.symbolic_local_types = vec![Type::Ref; sym.nlocals];
         sym.symbolic_stack_types = vec![Type::Ref];
 
         let mut state = MIFrame {
@@ -5013,7 +5015,7 @@ mod tests {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         assert!(fail_args.len() >= n + 1);
         assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[n], lower_stack);
+        assert_eq!(fail_args[n + sym.nlocals], lower_stack);
 
         let mut frame = Box::new(PyFrame::new(code));
         frame.set_last_instr_from_next_instr(456);
@@ -5026,7 +5028,9 @@ mod tests {
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.nlocals() + 1;
-        sym.symbolic_stack = vec![lower_stack];
+        sym.registers_r = vec![OpRef::NONE; sym.nlocals];
+        sym.registers_r.push(lower_stack);
+        sym.symbolic_local_types = vec![Type::Ref; sym.nlocals];
         sym.symbolic_stack_types = vec![Type::Ref];
 
         let mut state = MIFrame {
@@ -5071,7 +5075,9 @@ mod tests {
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.nlocals = frame.nlocals();
         sym.valuestackdepth = frame.valuestackdepth;
-        sym.symbolic_stack = vec![truth];
+        sym.registers_r = vec![OpRef::NONE; sym.nlocals];
+        sym.registers_r.push(truth);
+        sym.symbolic_local_types = vec![Type::Ref; sym.nlocals];
         sym.symbolic_stack_types = vec![Type::Int];
 
         let mut state = MIFrame {
@@ -5114,9 +5120,8 @@ mod tests {
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_w_globals = ctx.const_ref(0);
-        sym.registers_r = vec![local0];
+        sym.registers_r = vec![local0, stack0, stack1];
         sym.symbolic_local_types = vec![Type::Ref];
-        sym.symbolic_stack = vec![stack0, stack1];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
 
         let mut state = MIFrame {
@@ -5168,9 +5173,8 @@ mod tests {
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_w_globals = ctx.const_ref(0);
-        sym.registers_r = vec![OpRef::NONE];
+        sym.registers_r = vec![OpRef::NONE, OpRef::NONE];
         sym.symbolic_local_types = vec![Type::Ref];
-        sym.symbolic_stack = vec![OpRef::NONE];
         sym.symbolic_stack_types = vec![Type::Int];
         sym.jitcode = jitcode_for(code_ref);
 
@@ -5223,9 +5227,8 @@ mod tests {
         sym.vable_debugdata = ctx.const_ref(0);
         sym.vable_lastblock = ctx.const_ref(0);
         sym.vable_w_globals = namespace_ref;
-        sym.registers_r = vec![local0];
+        sym.registers_r = vec![local0, stack0, stack1];
         sym.symbolic_local_types = vec![Type::Ref];
-        sym.symbolic_stack = vec![stack0, stack1];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
 
@@ -5247,11 +5250,11 @@ mod tests {
             "JUMP carries local and stack slots from the virtualizable array"
         );
         assert_eq!(state.sym().valuestackdepth, 3);
-        assert_eq!(state.sym().symbolic_stack.len(), 2);
+        let nlocals = state.sym().nlocals;
+        let stack_only = state.sym().valuestackdepth - nlocals;
+        assert_eq!(state.sym().registers_r.len(), nlocals + stack_only);
         assert!(
-            state
-                .sym()
-                .symbolic_stack
+            state.sym().registers_r[nlocals..]
                 .iter()
                 .all(|opref| !opref.is_none())
         );
@@ -5517,7 +5520,8 @@ mod tests {
         let mut ctx = TraceCtx::for_test(1);
         let iter = OpRef(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.symbolic_stack = vec![iter];
+        // nlocals == 0 for this test; stack-only tail starts at registers_r[0].
+        sym.registers_r = vec![iter];
         sym.symbolic_stack_types = vec![Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Ref(range_iter)];
         sym.valuestackdepth = 1;
