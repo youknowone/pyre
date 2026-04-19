@@ -349,32 +349,6 @@ fn generate_layout_helpers(
         v
     };
 
-    // ── collect_jump_args parameter names ──
-    let sym_scalar_params: Vec<TokenStream> = inputargs
-        .iter()
-        .map(|f| {
-            let sym_name = format_ident!("sym_{}", f.name);
-            quote! { #sym_name: majit_ir::OpRef }
-        })
-        .collect();
-    let sym_scalar_pushes: Vec<TokenStream> = inputargs
-        .iter()
-        .map(|f| {
-            let sym_name = format_ident!("sym_{}", f.name);
-            quote! { __args.push(#sym_name); }
-        })
-        .collect();
-
-    // ── collect_typed_jump_args ──
-    let sym_typed_scalar_pushes: Vec<TokenStream> = inputargs
-        .iter()
-        .map(|f| {
-            let sym_name = format_ident!("sym_{}", f.name);
-            let tp = ir_type_token(&f.ir_type);
-            quote! { __args.push((#sym_name, #tp)); }
-        })
-        .collect();
-
     // ── OpRef index constants for create_sym ──
     let sym_idx_consts: Vec<TokenStream> = inputargs
         .iter()
@@ -493,50 +467,6 @@ fn generate_layout_helpers(
             #(#scalar_type_pushes)*
             __types.extend(std::iter::repeat_n(#arr_type_token, num_slots));
             __types
-        }
-
-        // ── collect_jump_args ──
-
-        /// Collect symbolic OpRefs for JUMP in layout order.
-        pub fn virt_collect_jump_args(
-            sym_frame: majit_ir::OpRef,
-            #(#sym_scalar_params,)*
-            symbolic_locals: &[majit_ir::OpRef],
-            symbolic_stack: &[majit_ir::OpRef],
-            stack_only: usize,
-        ) -> Vec<majit_ir::OpRef> {
-            let stack_len = stack_only.min(symbolic_stack.len());
-            let mut __args = Vec::with_capacity(#num_scalars + symbolic_locals.len() + stack_len);
-            __args.push(sym_frame);
-            #(#sym_scalar_pushes)*
-            __args.extend_from_slice(symbolic_locals);
-            __args.extend_from_slice(&symbolic_stack[..stack_len]);
-            __args
-        }
-
-        /// Collect typed symbolic OpRefs for JUMP in layout order.
-        pub fn virt_collect_typed_jump_args(
-            sym_frame: majit_ir::OpRef,
-            #(#sym_scalar_params,)*
-            symbolic_locals: &[majit_ir::OpRef],
-            symbolic_local_types: &[majit_ir::Type],
-            symbolic_stack: &[majit_ir::OpRef],
-            symbolic_stack_types: &[majit_ir::Type],
-            stack_only: usize,
-        ) -> Vec<(majit_ir::OpRef, majit_ir::Type)> {
-            let stack_len = stack_only.min(symbolic_stack.len());
-            let mut __args = Vec::with_capacity(#num_scalars + symbolic_locals.len() + stack_len);
-            __args.push((sym_frame, majit_ir::Type::Ref));
-            #(#sym_typed_scalar_pushes)*
-            for (__i, &__opref) in symbolic_locals.iter().enumerate() {
-                let __tp = symbolic_local_types.get(__i).copied().unwrap_or(#arr_type_token);
-                __args.push((__opref, __tp));
-            }
-            for (__i, &__opref) in symbolic_stack[..stack_len].iter().enumerate() {
-                let __tp = symbolic_stack_types.get(__i).copied().unwrap_or(#arr_type_token);
-                __args.push((__opref, __tp));
-            }
-            __args
         }
 
         // ── is_compatible ──
