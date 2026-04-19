@@ -197,6 +197,11 @@ struct RewriteState {
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
     _constant_additions: HashMap<u32, (OpRef, i64)>,
+    /// Next constant index for `OpRef::from_const`. Shares the
+    /// constant-namespace with the tracer's ConstantPool; initialized in
+    /// `with_constants` from the passed-in map so newly emitted constants
+    /// do not collide with tracer entries.
+    next_const_idx: u32,
     // ── Pending vtable initializations ──
 }
 
@@ -218,12 +223,20 @@ impl RewriteState {
             pending_zeros: Vec::new(),
             initialized_indices: HashMap::new(),
             _constant_additions: HashMap::new(),
+            next_const_idx: 0,
         }
     }
 
     fn with_constants(hint: usize, next_pos: u32, constants: HashMap<u32, i64>) -> Self {
+        let next_const_idx = constants
+            .keys()
+            .filter(|&&k| OpRef(k).is_constant())
+            .map(|&k| OpRef(k).const_index())
+            .max()
+            .map_or(0, |m| m + 1);
         let mut s = Self::new(hint, next_pos);
         s.constants = constants;
+        s.next_const_idx = next_const_idx;
         s
     }
 
@@ -232,37 +245,17 @@ impl RewriteState {
         self.constants.get(&key).copied()
     }
 
-    /// Create or reuse a constant OpRef in the constants pool.
-    /// Returns an OpRef key that resolves to `value` at compile time.
+    /// Emit a fresh constant OpRef for `value`.
     ///
-    /// `OpRef` has two namespaces:
-    /// - high-bit keys (>= 2^31): tracer-owned constant OpRefs. Their
-    ///   values are stored in this same HashMap under the raw key.
-    /// - low-bit keys (starting at 10_000): rewriter-added constants.
-    ///
-    /// Backends (majit-backend-dynasm/src/regalloc.rs const_value,
-    /// majit-backend-cranelift/src/compiler.rs resolve_constant*) look up
-    /// `constants.get(&opref.0)` (raw key) first, so a returned high-bit
-    /// OpRef would resolve correctly. The scan below still restricts
-    /// reuse to low-bit keys to keep rewriter-emitted ops within the
-    /// rewriter's own namespace (reusing a tracer OpRef would make the
-    /// emitted op's provenance depend on tracer state in a way that's
-    /// easy to get wrong if the backend resolution rule ever changes).
+    /// rewrite.py:149/671/682 parity: RPython constructs a new
+    /// `ConstInt(value)` at each call site without caching. Mirrors that
+    /// — every call grows the constant pool by one entry in the shared
+    /// high-bit constant namespace (same as the tracer's ConstantPool).
     fn const_int(&mut self, value: i64) -> OpRef {
-        for (&key, &val) in &self.constants {
-            if val == value && (key & (1u32 << 31)) == 0 {
-                return OpRef(key);
-            }
-        }
-        // Allocate a new constant key (use high range to avoid collision)
-        let key = 10_000 + self.constants.len() as u32;
-        // Skip keys already in use
-        let mut key = key;
-        while self.constants.contains_key(&key) {
-            key += 1;
-        }
-        self.constants.insert(key, value);
-        OpRef(key)
+        let opref = OpRef::from_const(self.next_const_idx);
+        self.next_const_idx += 1;
+        self.constants.insert(opref.0, value);
+        opref
     }
 
     /// Emit an op. Void ops do not consume a result id.
