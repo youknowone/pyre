@@ -19,6 +19,187 @@ pub const SHOW_ANNOTATIONS: bool = true;
 /// Upstream `SHOW_DEFAULT_LINES_OF_CODE = 0` (error.py:15).
 pub const SHOW_DEFAULT_LINES_OF_CODE: usize = 0;
 
+fn py_bool(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
+}
+
+fn render_classdef_repr(classdef: &Rc<RefCell<crate::annotator::classdesc::ClassDef>>) -> String {
+    format!("<ClassDef '{}'>", classdef.borrow().name)
+}
+
+fn render_classdef_key_repr(
+    bookkeeper: &crate::annotator::bookkeeper::Bookkeeper,
+    key: crate::annotator::description::ClassDefKey,
+) -> String {
+    for classdef in bookkeeper.classdefs.borrow().iter() {
+        if crate::annotator::description::ClassDefKey::from_classdef(classdef) == key {
+            return render_classdef_repr(classdef);
+        }
+    }
+    format!("<ClassDefKey 0x{:x}>", key.0)
+}
+
+fn render_desc_repr(desc: &crate::annotator::description::DescEntry) -> String {
+    use crate::annotator::description::DescEntry;
+    match desc {
+        DescEntry::Function(fd) => {
+            let fd = fd.borrow();
+            match &fd.base.pyobj {
+                Some(pyobj) => format!("<FunctionDesc for {:?}>", pyobj),
+                None => "<FunctionDesc>".into(),
+            }
+        }
+        DescEntry::Frozen(fd) => {
+            let fd = fd.borrow();
+            match &fd.base.pyobj {
+                Some(pyobj) => format!("<FrozenDesc for {:?}>", pyobj),
+                None => "<FrozenDesc>".into(),
+            }
+        }
+        DescEntry::Class(cd) => {
+            let cd = cd.borrow();
+            format!("<ClassDesc for {:?}>", cd.pyobj)
+        }
+        DescEntry::Method(md) => {
+            let md = md.borrow();
+            let origin = render_classdef_key_repr(&md.base.bookkeeper, md.originclassdef);
+            match md.selfclassdef {
+                None => format!("<unbound MethodDesc {:?} of {}>", md.name, origin),
+                Some(selfclassdef) => format!(
+                    "<MethodDesc {:?} of {} bound to {} {:?}>",
+                    md.name,
+                    origin,
+                    render_classdef_key_repr(&md.base.bookkeeper, selfclassdef),
+                    md.flags
+                ),
+            }
+        }
+        DescEntry::MethodOfFrozen(mfd) => {
+            let mfd = mfd.borrow();
+            let funcdesc = crate::annotator::description::DescEntry::Function(mfd.funcdesc.clone());
+            let frozendesc =
+                crate::annotator::description::DescEntry::Frozen(mfd.frozendesc.clone());
+            format!(
+                "<MethodOfFrozenDesc {} of {}>",
+                render_desc_repr(&funcdesc),
+                render_desc_repr(&frozendesc)
+            )
+        }
+    }
+}
+
+fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
+    use crate::annotator::model::SomeValue;
+    match value {
+        SomeValue::Impossible => "SomeImpossibleValue()".into(),
+        SomeValue::Object(_) => "SomeObject()".into(),
+        SomeValue::Type(_) => "SomeType()".into(),
+        SomeValue::Float(_) => "SomeFloat()".into(),
+        SomeValue::SingleFloat(_) => "SomeSingleFloat()".into(),
+        SomeValue::LongFloat(_) => "SomeLongFloat()".into(),
+        SomeValue::Integer(i) => {
+            let mut args = Vec::new();
+            if i.nonneg {
+                args.push("nonneg=True".to_string());
+            }
+            if i.unsigned {
+                args.push("unsigned=True".to_string());
+            }
+            format!("SomeInteger({})", args.join(", "))
+        }
+        SomeValue::Bool(_) => "SomeBool()".into(),
+        SomeValue::String(s) => {
+            let mut args = Vec::new();
+            if s.inner.can_be_none {
+                args.push("can_be_None=True".to_string());
+            }
+            if s.inner.no_nul {
+                args.push("no_nul=True".to_string());
+            }
+            format!("SomeString({})", args.join(", "))
+        }
+        SomeValue::UnicodeString(s) => {
+            let mut args = Vec::new();
+            if s.inner.can_be_none {
+                args.push("can_be_None=True".to_string());
+            }
+            if s.inner.no_nul {
+                args.push("no_nul=True".to_string());
+            }
+            format!("SomeUnicodeString({})", args.join(", "))
+        }
+        SomeValue::ByteArray(s) => {
+            let mut args = Vec::new();
+            if s.inner.can_be_none {
+                args.push("can_be_None=True".to_string());
+            }
+            format!("SomeByteArray({})", args.join(", "))
+        }
+        SomeValue::Char(s) => {
+            let mut args = Vec::new();
+            if s.inner.no_nul {
+                args.push("no_nul=True".to_string());
+            }
+            format!("SomeChar({})", args.join(", "))
+        }
+        SomeValue::UnicodeCodePoint(s) => {
+            let mut args = Vec::new();
+            if s.inner.no_nul {
+                args.push("no_nul=True".to_string());
+            }
+            format!("SomeUnicodeCodePoint({})", args.join(", "))
+        }
+        SomeValue::List(_) => "SomeList(...)".into(),
+        SomeValue::Tuple(t) => format!("SomeTuple(items=[{}])", t.items.len()),
+        SomeValue::Dict(_) => "SomeDict(...)".into(),
+        SomeValue::Iterator(_) => "SomeIterator(...)".into(),
+        SomeValue::Instance(inst) => {
+            let classdef = inst
+                .classdef
+                .as_ref()
+                .map(render_classdef_repr)
+                .unwrap_or_else(|| "None".into());
+            format!(
+                "SomeInstance(classdef={}, can_be_None={}, flags={:?})",
+                classdef,
+                py_bool(inst.can_be_none),
+                inst.flags
+            )
+        }
+        SomeValue::Exception(exc) => format!(
+            "SomeException(classdefs=[{}])",
+            exc.classdefs
+                .iter()
+                .map(render_classdef_repr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        SomeValue::PBC(pbc) => format!(
+            "SomePBC(descriptions={{{}}}, can_be_None={})",
+            pbc.descriptions
+                .values()
+                .map(render_desc_repr)
+                .collect::<Vec<_>>()
+                .join(", "),
+            py_bool(pbc.can_be_none)
+        ),
+        SomeValue::None_(_) => "SomeNone()".into(),
+        SomeValue::Builtin(_) => "SomeBuiltin()".into(),
+        SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod()".into(),
+        SomeValue::WeakRef(_) => "SomeWeakRef()".into(),
+        SomeValue::TypeOf(_) => "SomeTypeOf(...)".into(),
+    }
+}
+
+fn graph_repr(graph: &GraphRef) -> String {
+    let g = graph.borrow();
+    format!(
+        "<FunctionGraph of {} at 0x{:x}>",
+        &*g,
+        Rc::as_ptr(graph) as usize
+    )
+}
+
 /// RPython `offset2lineno(c, stopat)` (error.py:160-171).
 ///
 /// ```python
@@ -112,20 +293,26 @@ pub fn source_lines1(
         }
     }
     // upstream: `source = graph.source`; attribute absent → ['no source!'].
+    let source = match g.source() {
+        Ok(s) => s,
+        Err(_) => return vec!["no source!".into()],
+    };
+    let filename = match g.filename() {
+        Ok(s) => s,
+        Err(_) => return vec!["no source!".into()],
+    };
+    let startline = match g.startline() {
+        Ok(n) => n,
+        Err(_) => return vec!["no source!".into()],
+    };
     let func = match &g.func {
         Some(f) => f,
-        None => return vec!["no source!".into()],
-    };
-    let source = match func.source.as_deref() {
-        Some(s) => s,
         None => return vec!["no source!".into()],
     };
     let code = match func.code.as_deref() {
         Some(c) => c,
         None => return vec!["no source!".into()],
     };
-    let startline: u32 = func.firstlineno.unwrap_or(1);
-    let filename = func.filename.as_deref().unwrap_or("<unknown>");
     let graph_lines: Vec<&str> = source.split('\n').collect();
 
     // linerange computation branches on offset / operindex / block.
@@ -203,7 +390,7 @@ pub fn source_lines(
     long: bool,
     show_lines_of_code: usize,
 ) -> Vec<String> {
-    let mut out = vec![format!("In {:?}:", graph.borrow().name)];
+    let mut out = vec![format!("In {}:", graph_repr(graph))];
     out.extend(source_lines1(
         graph,
         block,
@@ -238,8 +425,9 @@ pub fn format_annotations(
     args_and_result.push(oper.result.clone());
     for arg in &args_and_result {
         if let Hlvalue::Variable(v) = arg {
-            if let Some(s) = annotator.annotation(arg) {
-                msg.push(format!(" {} = {:?}", v.name(), s));
+            if annotator.annotation(arg).is_some() {
+                let s = annotator.binding(arg);
+                msg.push(format!(" {} = {}", v, render_somevalue(&s)));
             }
         }
     }
@@ -277,10 +465,11 @@ pub fn gather_error(
     let oper = match operindex {
         Some(i) => {
             let b = block.borrow();
-            let Some(op) = b.operations.get(i).cloned() else {
-                msg.push(format!("    None  (operindex {} out of range)", i));
-                return msg.join("\n");
-            };
+            let op = b
+                .operations
+                .get(i)
+                .cloned()
+                .expect("gather_error: operindex out of range");
             // upstream: `if oper.opname == 'simple_call': format_simple_call(...)`.
             if op.opname == "simple_call" {
                 format_simple_call(annotator, &op, &mut msg);
@@ -291,7 +480,7 @@ pub fn gather_error(
     };
     // upstream: `msg.append("    %s\n" % str(oper))`.
     match &oper {
-        Some(op) => msg.push(format!("    {:?}\n", op)),
+        Some(op) => msg.push(format!("    {}\n", op)),
         None => msg.push("    None\n".into()),
     }
     // upstream: `msg += source_lines(graph, block, operindex, long=True)`.
@@ -327,11 +516,6 @@ pub fn gather_error(
 ///     for desc in list(descs):
 ///         ...
 /// ```
-///
-/// The Rust port only surfaces the header + `(no callee descriptions)`
-/// tail when the binding isn't a SomePBC — the full description-dump
-/// (desc.pyobj / desc.name) requires HostObject introspection that the
-/// callers haven't wired up yet.
 pub fn format_simple_call(
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     oper: &crate::flowspace::model::SpaceOperation,
@@ -342,19 +526,54 @@ pub fn format_simple_call(
         msg.push("      (simple_call with no arguments!)".into());
         return;
     };
-    let Some(binding) = annotator.annotation(first) else {
+    if annotator.annotation(first).is_none() {
         msg.push("      (KeyError getting at the binding!)".into());
         return;
+    }
+    let crate::annotator::model::SomeValue::PBC(pbc) = annotator.binding(first) else {
+        msg.push("      (AttributeError getting at the binding!)".into());
+        return;
     };
-    match binding {
-        crate::annotator::model::SomeValue::PBC(pbc) => {
-            for desc in pbc.descriptions.values() {
-                msg.push(format!("      {:?}", desc));
+    for desc in pbc.descriptions.values() {
+        let rendered = match desc.pyobj() {
+            Some(pyobj) if pyobj.is_class() => {
+                let class_name = pyobj
+                    .qualname()
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(pyobj.qualname());
+                match pyobj.class_get("__init__") {
+                    Some(crate::flowspace::model::ConstValue::HostObject(init_host)) => {
+                        if let Some(func) = init_host.user_function() {
+                            match (func.filename.as_deref(), func.firstlineno) {
+                                (Some(filename), Some(firstlineno)) => Some(format!(
+                                    "function {}.__init__ <{}, line {}>",
+                                    class_name, filename, firstlineno
+                                )),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
             }
-        }
-        other => {
-            msg.push(format!("      (callee not a PBC: {:?})", other));
-        }
+            Some(pyobj) => match pyobj.user_function() {
+                Some(func) => match (func.filename.as_deref(), func.firstlineno) {
+                    (Some(filename), Some(firstlineno)) => Some(format!(
+                        "function {} <{}, line {}>",
+                        func.name, filename, firstlineno
+                    )),
+                    _ => None,
+                },
+                None => None,
+            },
+            None => None,
+        };
+        let rendered = rendered.unwrap_or_else(|| render_desc_repr(desc));
+        msg.push(format!("  {} returning", rendered));
+        msg.push(String::new());
     }
 }
 
@@ -371,10 +590,13 @@ pub fn format_simple_call(
 /// ```
 pub fn format_blocked_annotation_error(
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
-    blocked_blocks: &[(GraphRef, BlockRef, Option<usize>)],
+    blocked_blocks: &std::collections::HashMap<
+        crate::flowspace::model::BlockKey,
+        (BlockRef, GraphRef, Option<usize>),
+    >,
 ) -> String {
     let mut text: Vec<String> = Vec::new();
-    for (graph, block, index) in blocked_blocks {
+    for (block, graph, index) in blocked_blocks.values() {
         text.push("Blocked block -- operation cannot succeed".into());
         text.push(gather_error(annotator, graph, block, *index));
     }
@@ -395,6 +617,7 @@ fn _refs_hold(
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomePBC, SomeValue};
     use crate::flowspace::bytecode::HostCode;
     use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Variable};
 
@@ -418,6 +641,27 @@ mod tests {
             exceptiontable: Vec::new().into_boxed_slice(),
             signature: Signature::new(Vec::new(), None, None),
         }
+    }
+
+    fn mk_func_host(
+        name: &str,
+        filename: &str,
+        firstlineno: u32,
+    ) -> crate::flowspace::model::HostObject {
+        let mut func = GraphFunc::new(
+            name,
+            crate::flowspace::model::Constant::new(crate::flowspace::model::ConstValue::Dict(
+                Default::default(),
+            )),
+        );
+        let mut code = mk_code();
+        code.co_name = name.into();
+        code.co_filename = filename.into();
+        code.co_firstlineno = firstlineno;
+        func.code = Some(Box::new(code));
+        func.filename = Some(filename.into());
+        func.firstlineno = Some(firstlineno);
+        crate::flowspace::model::HostObject::new_user_function(func)
     }
 
     #[test]
@@ -486,6 +730,62 @@ mod tests {
         }
         let text = gather_error(&ann, &graph_ref, &startblock, Some(0));
         assert!(text.contains("Happened at file <test.py>"));
-        assert!(text.contains("In \"f\":"));
+        assert!(text.contains("In <FunctionGraph of f at 0x"));
+    }
+
+    #[test]
+    fn format_simple_call_renders_function_filename_and_line() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let func_host = mk_func_host("callee", "<callee.py>", 42);
+        let desc = ann.bookkeeper.getdesc(&func_host).unwrap();
+        let pbc = SomeValue::PBC(SomePBC::new(vec![desc], false));
+        let mut v_func = Variable::named("v_func");
+        v_func.annotation = Some(Rc::new(pbc));
+        let oper = crate::flowspace::model::SpaceOperation::new(
+            "simple_call",
+            vec![Hlvalue::Variable(v_func)],
+            Hlvalue::Variable(Variable::new()),
+        );
+        let mut msg = Vec::new();
+
+        format_simple_call(&ann, &oper, &mut msg);
+
+        assert!(
+            msg.iter()
+                .any(|line| line.contains("Occurred processing the following simple_call:"))
+        );
+        assert!(
+            msg.iter()
+                .any(|line| line.contains("function callee <<callee.py>, line 42> returning"))
+        );
+    }
+
+    #[test]
+    fn format_annotations_uses_upstream_style_somevalue_rendering() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let mut v = Variable::named("v0");
+        v.annotation = Some(Rc::new(SomeValue::Integer(
+            crate::annotator::model::SomeInteger::new(true, false),
+        )));
+        let oper = crate::flowspace::model::SpaceOperation::new(
+            "same_as",
+            vec![Hlvalue::Variable(v.clone())],
+            Hlvalue::Variable(v),
+        );
+
+        let lines = format_annotations(&ann, &oper);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("SomeInteger(nonneg=True)")),
+            "got {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Integer(SomeInteger")),
+            "got {lines:?}"
+        );
     }
 }

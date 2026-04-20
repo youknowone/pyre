@@ -852,17 +852,15 @@ impl RPythonAnnotator {
         if got_blocked {
             // Upstream: flip every blocked graph's flag and construct
             // the multi-line error string via
-            // `format_blocked_annotation_error`. Rust defers the
-            // formatting helper — panic with a concise message.
+            // `format_blocked_annotation_error`.
             let mut bg = self.blocked_graphs.borrow_mut();
             for (_k, (_g, flag)) in bg.iter_mut() {
                 *flag = true;
             }
             drop(bg);
-            panic!(
-                "AnnotatorError: {} blocked block(s) remain after complete()",
-                self.blocked_blocks.borrow().len()
-            );
+            let blocked_blocks = self.blocked_blocks.borrow();
+            let text = crate::tool::error::format_blocked_annotation_error(self, &blocked_blocks);
+            panic!("AnnotatorError: {}", text);
         }
 
         // Force every return-var annotation to exist.
@@ -2496,16 +2494,25 @@ mod tests {
     #[test]
     fn gather_error_returns_location_string() {
         // gather_error formats graph/block/op provenance per upstream
-        // error.py:67-82. Empty-block / out-of-range index path is a
-        // valid call shape (matches upstream's operindex=None default
-        // when the block carries no operations) and surfaces the
-        // "None" breadcrumb before the source_lines body.
+        // error.py:67-82. The Rust wrapper now follows upstream's
+        // valid-index contract; when the graph has no source metadata,
+        // the formatter must still include the graph provenance and
+        // the `no source!` marker.
+        use super::super::super::flowspace::model::SpaceOperation;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let graph = mk_graph("gather", 0);
         let startblock = graph.borrow().startblock.clone();
-        let msg = gather_error(&ann, &graph, &startblock, 3);
-        // Out-of-range index surfaces the explicit marker.
-        assert!(msg.contains("operindex 3 out of range"), "got {msg:?}");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "newtuple",
+            Vec::new(),
+            Hlvalue::Variable(Variable::new()),
+        ));
+        let msg = gather_error(&ann, &graph, &startblock, 0);
+        assert!(
+            msg.contains("In <FunctionGraph of gather at 0x"),
+            "got {msg:?}"
+        );
+        assert!(msg.contains("no source!"), "got {msg:?}");
     }
 
     #[test]
