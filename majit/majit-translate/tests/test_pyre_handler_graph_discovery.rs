@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use majit_translate::front::ast::build_function_graph_pub;
-use majit_translate::model::{ExitCase, ExitSwitch};
+use majit_translate::model::ExitSwitch;
 use syn::{File, Item};
 
 fn pyopcode_rs_path() -> PathBuf {
@@ -79,7 +79,7 @@ fn lower_handler(func: &syn::ItemFn) -> HandlerGraphStats {
         .filter(|b| {
             b.exits.len() == 2
                 && b.exits[0].exitcase.is_none()
-                && b.exits[1].exitcase == Some(ExitCase::Exception)
+                && b.exits[1].catches_all_exceptions()
                 && b.exits[1].last_exception.is_some()
                 && b.exits[1].last_exc_value.is_some()
         })

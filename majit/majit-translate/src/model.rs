@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::flowspace::model::ConstValue;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub usize);
 
@@ -599,11 +601,28 @@ pub enum ExitSwitch {
 }
 
 /// RPython `Link.exitcase`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// RPython stores the full Python value here (a bool, a builtin
+/// Exception class, a user exception class, or an integer for switch
+/// arms) and identity-checks it with `link.exitcase is Exception`
+/// (`flowspace/flowcontext.py:141`, `jit/codewriter/flatten.py:224`).
+/// pyre's codewriter never does value-level arithmetic on `exitcase`;
+/// it only distinguishes the three states flatten consumes — bool
+/// branch, catch-all exception, and typed exception subclass — so we
+/// carry them as discrete variants and keep the host class Constant
+/// on `TypedException` for `llexitcase` lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitCase {
     Bool(bool),
-    TypedException,
+    /// RPython `link.exitcase is Exception` — the Python `Exception`
+    /// class object itself, used as the catch-all marker in can-raise
+    /// blocks (`flowspace/flowcontext.py:129-132` + `flatten.py:224`).
     Exception,
+    /// RPython `link.exitcase = <specific ExceptionSubclass>` — an
+    /// exception subclass match, matched at runtime by
+    /// `goto_if_exception_mismatch`.  The low-level class identity is
+    /// stored in `Link.llexitcase`.
+    TypedException(ConstValue),
 }
 
 /// RPython `flowspace/model.py:109-168` `Link`.
@@ -611,13 +630,18 @@ pub enum ExitCase {
 pub struct Link {
     pub args: Vec<ValueId>,
     pub target: BlockId,
+    #[serde(skip, default)]
     pub exitcase: Option<ExitCase>,
     /// RPython `Link.prevblock` — the block this Link exits from.
     pub prevblock: Option<BlockId>,
     /// RPython `Link.llexitcase` — the low-level value matched by
-    /// `goto_if_exception_mismatch`.  For exception links this is the
-    /// integer/pointer payload the blackhole reads as an `i` argument.
-    pub llexitcase: Option<i64>,
+    /// `goto_if_exception_mismatch` (`flatten.py:228-231`).  For
+    /// typed exception links this is the rtyper-produced class
+    /// identity constant; pyre carries it as a full `ConstValue` so
+    /// non-Int llexitcase shapes (`lltype.Ptr`, host class objects)
+    /// round-trip to the backend intact.
+    #[serde(skip, default)]
+    pub llexitcase: Option<ConstValue>,
     pub last_exception: Option<ValueId>,
     pub last_exc_value: Option<ValueId>,
 }
@@ -640,7 +664,7 @@ impl Link {
         self
     }
 
-    pub fn with_llexitcase(mut self, llexitcase: i64) -> Self {
+    pub fn with_llexitcase(mut self, llexitcase: ConstValue) -> Self {
         self.llexitcase = Some(llexitcase);
         self
     }
@@ -653,6 +677,11 @@ impl Link {
         self.last_exception = last_exception;
         self.last_exc_value = last_exc_value;
         self
+    }
+
+    /// RPython `flatten.py:224` `if link.exitcase is Exception`.
+    pub fn catches_all_exceptions(&self) -> bool {
+        matches!(self.exitcase, Some(ExitCase::Exception))
     }
 }
 
@@ -753,7 +782,7 @@ where
             target: remap_block(link.target),
             exitcase: link.exitcase.clone(),
             prevblock: link.prevblock.map(&remap_block),
-            llexitcase: link.llexitcase,
+            llexitcase: link.llexitcase.clone(),
             last_exception: link.last_exception.map(&remap_value),
             last_exc_value: link.last_exc_value.map(&remap_value),
         })
@@ -939,24 +968,23 @@ impl FunctionGraph {
             .collect();
     }
 
-    /// Route a return through the graph's canonical `returnblock` when
-    /// a value is available; declared-void returns still use
-    /// `Terminator::Return(None)` until the front-end carries an
-    /// explicit Void-typed return value.
+    /// Route a return through the graph's canonical `returnblock`.
+    ///
+    /// The codewriter graph has no first-class Void constant yet, so a
+    /// declared-void return reuses the returnblock's own inputarg as the
+    /// link arg. Downstream `insert_renamings()` recognizes the identity
+    /// mapping and emits no move, leaving the graph in the same
+    /// single-returnblock shape as upstream.
     pub fn set_return(&mut self, block: BlockId, value: Option<ValueId>) {
-        match value {
-            Some(value) => {
-                let (returnblock, _) = self.returnblock_arg();
-                self.set_terminator(
-                    block,
-                    Terminator::Goto {
-                        target: returnblock,
-                        args: vec![value],
-                    },
-                );
-            }
-            None => self.set_terminator(block, Terminator::Return(None)),
-        }
+        let (returnblock, return_value) = self.returnblock_arg();
+        let value = value.unwrap_or(return_value);
+        self.set_terminator(
+            block,
+            Terminator::Goto {
+                target: returnblock,
+                args: vec![value],
+            },
+        );
     }
 
     pub fn block(&self, block: BlockId) -> &Block {

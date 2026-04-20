@@ -38,7 +38,15 @@ pub enum FlatOp {
     /// Exception setup for a can-raise block.
     /// RPython: `('catch_exception', TLabel(normal_link))`.
     CatchException { target: Label },
-    /// RPython: `('goto_if_exception_mismatch', Constant(llexitcase), TLabel(next))`.
+    /// RPython `flatten.py:228-231`
+    /// `('goto_if_exception_mismatch', Constant(link.llexitcase, lltype.typeOf(link.llexitcase)), TLabel(link))`.
+    /// The link-side `llexitcase` is an arbitrary `Constant` in RPython
+    /// (`Link.llexitcase: Option<ConstValue>` here); the flatten pass
+    /// narrows it per `lltype.typeOf` to the backend's encoded kind —
+    /// today only `lltype.Signed` (`ConstValue::Int`) lands here, so
+    /// the serialized payload stays `i64`.  When class-pointer
+    /// llexitcases start reaching flatten, widen this variant to a
+    /// kind + payload pair.
     GotoIfExceptionMismatch { llexitcase: i64, target: Label },
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
     ///
@@ -179,17 +187,29 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                 ops.push(FlatOp::Label(normal_landing));
                 let mut catches_all = false;
                 for link in &block.exits[1..] {
-                    if link.exitcase == Some(ExitCase::Exception) {
+                    if link.catches_all_exceptions() {
                         emit_exception_link(graph, &mut ops, &block_labels, link, regallocs);
                         catches_all = true;
                         break;
                     }
                     let mismatch_landing = Label(next_label);
                     next_label += 1;
+                    // RPython `flatten.py:228-231` mints
+                    // `Constant(link.llexitcase, lltype.typeOf(link.llexitcase))`
+                    // directly from the link's low-level exitcase value;
+                    // here we narrow per `lltype.typeOf` to the payload
+                    // shape `FlatOp::GotoIfExceptionMismatch` carries today.
+                    let llexitcase = match link.llexitcase.as_ref() {
+                        Some(crate::flowspace::model::ConstValue::Int(value)) => *value,
+                        Some(other) => panic!(
+                            "goto_if_exception_mismatch: lltype.typeOf({other:?}) \
+                             not yet bridged — widen `FlatOp::GotoIfExceptionMismatch` \
+                             to carry the matching kind before exercising this link"
+                        ),
+                        None => panic!("typed exception links need llexitcase for parity"),
+                    };
                     ops.push(FlatOp::GotoIfExceptionMismatch {
-                        llexitcase: link
-                            .llexitcase
-                            .expect("typed exception links need llexitcase for parity"),
+                        llexitcase,
                         target: mismatch_landing,
                     });
                     emit_exception_link(graph, &mut ops, &block_labels, link, regallocs);
@@ -635,7 +655,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FunctionGraph, OpKind, Terminator};
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FunctionGraph, OpKind, Terminator};
 
     /// Test helper — build a `regallocs` map that assigns each
     /// `ValueId(n)` the color `n` in `RegKind::Int`. This turns the
@@ -829,7 +850,7 @@ mod tests {
                 crate::model::Link::new(
                     vec![last_exception, last_exc_value],
                     exc_block,
-                    Some(crate::model::ExitCase::Exception),
+                    Some(ExitCase::Exception),
                 )
                 .extravars(Some(last_exception), Some(last_exc_value)),
             ],
@@ -883,14 +904,14 @@ mod tests {
                 crate::model::Link::new(
                     vec![typed_exc_value],
                     handler,
-                    Some(crate::model::ExitCase::TypedException),
+                    Some(ExitCase::TypedException(ConstValue::builtin("ValueError"))),
                 )
-                .with_llexitcase(123)
+                .with_llexitcase(ConstValue::Int(123))
                 .extravars(Some(last_exception), Some(typed_exc_value)),
                 crate::model::Link::new(
                     vec![last_exception, last_exc_value],
                     exc_block,
-                    Some(crate::model::ExitCase::Exception),
+                    Some(ExitCase::Exception),
                 )
                 .extravars(Some(last_exception), Some(last_exc_value)),
             ],

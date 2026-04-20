@@ -273,6 +273,14 @@ impl Assembler {
             }
 
             FlatOp::GotoIfExceptionMismatch { llexitcase, target } => {
+                // RPython `flatten.py:228-231`:
+                //   emitline('goto_if_exception_mismatch',
+                //            Constant(link.llexitcase,
+                //                     lltype.typeOf(link.llexitcase)),
+                //            TLabel(link))
+                // Flatten already narrowed per `lltype.typeOf` to `i64`
+                // (`lltype.Signed`); the opname suffix encodes the
+                // matching kind.
                 let opnum = self.get_opnum("goto_if_exception_mismatch/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);

@@ -1535,22 +1535,18 @@ fn lower_expr(
 
         // ── try expr? ──
         //
-        // RPython parity (`rpython/flowspace/model.py:214 Block.canraise`
-        // + `rpython/translator/exceptiontransform.py`): a call that
-        // propagates exceptions leaves its containing block with
-        // `exitswitch = c_last_exception` and `exits = [normal_link,
-        // exception_link]`. The block's plain terminator stays a normal
-        // fallthrough `Goto`; the raising edge lives in `Block.exits`.
-        // The `?`-checked expression lowers as follows:
-        //   1. lower inner expression in the current block (this appends
-        //      the raising call op at the tail);
-        //   2. create a continuation block whose single inputarg carries
-        //      the call result forward on the normal path;
-        //   3. route the exception path to the function's canonical
-        //      `exceptblock`, whose two inputargs mirror RPython's
-        //      `(etype, evalue)` shape in `flowspace/model.py:21-25`;
-        //   4. switch the caller's cursor to the continuation block so
-        //      subsequent statements lower after the call.
+        // RPython `flowspace/flowcontext.py:127-148 guessexception` port.
+        // A can-raise op closes its containing block with
+        // `block.exitswitch = c_last_exception` and two Links: the
+        // normal fall-through Link and the exception Link whose
+        // `args`/`extravars` both reference fresh prevblock-side
+        // `Variable('last_exception')` / `Variable('last_exc_value')`
+        // (`flowcontext.py:130-134`).  These fresh variables flow into
+        // the exceptblock's own inputargs via `insert_renamings` — the
+        // target side has its own distinct Variables
+        // (`flowcontext.py:135 vars2`), matching upstream's "Link.args
+        // are prevblock-side values" invariant at
+        // `flowspace/model.py:114`.
         syn::Expr::Try(t) => {
             let inner = lower_expr(graph, block, &t.expr, options, ctx)?;
             let continuation = graph.create_block();
@@ -1559,7 +1555,11 @@ fn lower_expr(
                 .block_mut(continuation)
                 .inputargs
                 .push(continuation_arg);
-            let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
+            // RPython `flowcontext.py:130-133` — fresh prevblock-side
+            // `Variable('last_exception')` + `Variable('last_exc_value')`.
+            let last_exception = graph.alloc_value();
+            let last_exc_value = graph.alloc_value();
+            let exc_block = graph.exceptblock;
             graph.set_terminator(
                 *block,
                 Terminator::Goto {
@@ -1571,7 +1571,12 @@ fn lower_expr(
                 *block,
                 Some(ExitSwitch::LastException),
                 vec![
+                    // RPython `flowcontext.py:141` `Link(vars=[], egg, case=None)`
+                    // for the normal fall-through.
                     Link::new(vec![inner], continuation, None),
+                    // RPython `flowcontext.py:141-143` `link = Link(vars, egg, case)`
+                    // + `link.extravars(last_exception=..., last_exc_value=...)`
+                    // with `case is Exception`.
                     Link::new(
                         vec![last_exception, last_exc_value],
                         exc_block,
@@ -2819,6 +2824,33 @@ mod tests {
             Terminator::Goto {
                 target: func.graph.returnblock,
                 args: vec![entry.operations[0].result.expect("const result")],
+            }
+        );
+        assert_eq!(entry.exits.len(), 1);
+        assert_eq!(entry.exits[0].prevblock, Some(func.graph.startblock));
+        assert_eq!(entry.exits[0].target, func.graph.returnblock);
+    }
+
+    #[test]
+    fn void_return_routes_through_canonical_returnblock() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn returns_unit() { return; }
+            "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let func = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "returns_unit")
+            .expect("returns_unit present");
+        let entry = func.graph.block(func.graph.startblock);
+        let return_arg = func.graph.block(func.graph.returnblock).inputargs[0];
+        assert_eq!(
+            entry.terminator,
+            Terminator::Goto {
+                target: func.graph.returnblock,
+                args: vec![return_arg],
             }
         );
         assert_eq!(entry.exits.len(), 1);

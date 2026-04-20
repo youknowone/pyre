@@ -35,7 +35,7 @@ use majit_translate::{
     front::{StructFieldRegistry, ast::build_function_graph_pub},
     jitcode::JitCode,
     jtransform::GraphTransformConfig,
-    model::{ExitCase, ExitSwitch},
+    model::ExitSwitch,
     parse_source,
 };
 use syn::{Item, ItemFn};
@@ -91,7 +91,7 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
         assert_eq!(block.exitswitch, Some(ExitSwitch::LastException));
         assert_eq!(block.exits.len(), 2);
         assert_eq!(block.exits[0].exitcase, None);
-        assert_eq!(block.exits[1].exitcase, Some(ExitCase::Exception));
+        assert!(block.exits[1].catches_all_exceptions());
         assert!(block.exits[1].last_exception.is_some());
         assert!(block.exits[1].last_exc_value.is_some());
     }

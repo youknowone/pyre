@@ -296,7 +296,7 @@ fn graph_result_kind(
                 Some(RegKind::Int) => 'i',
                 Some(RegKind::Ref) => 'r',
                 Some(RegKind::Float) => 'f',
-                None => 'i',
+                None => 'v',
             };
             match found {
                 None => found = Some(kind),
