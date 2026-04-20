@@ -1305,7 +1305,6 @@ impl JitCodeBuilder {
             sub_jitcodes: self.sub_jitcodes,
             fn_ptrs: self.fn_ptrs,
             assembler_targets: self.assembler_targets,
-            descrs: Vec::new(),
         }
     }
 

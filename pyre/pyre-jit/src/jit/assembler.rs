@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
-use majit_translate::jitcode::BhDescr;
 
 use super::flatten::{DescrOperand, Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
 
@@ -100,31 +99,7 @@ struct AssemblyState {
     /// extra vector exists only because `JitCodeBuilder` patches jumps by
     /// symbolic label id rather than by rewriting raw bytes in `fix_labels()`.
     builder_labels: Vec<(String, u16)>,
-    /// SSARepr-side switch descrs that must be attached after all labels have
-    /// final positions (`assembler.py:258-263`).
-    switch_descrs: Vec<(usize, Vec<(i64, TLabel)>)>,
-    /// Runtime descr table for this jitcode (`assembler.py:26` `self.descrs`).
-    descrs: Vec<BhDescr>,
-    /// `assembler.py:26` `self._descr_dict = {}` — identity-keyed dedup so
-    /// re-using the same SSARepr descr across multiple ops yields a stable
-    /// `descrs` index. `DescrOperand` has no inherent identity in Rust;
-    /// the key is the Vec-slot pointer captured when the `Operand` was
-    /// first interned — semantically equivalent to Python's `id()` lookup.
-    descr_dict: HashMap<DescrKey, usize>,
 }
-
-/// Identity key for `DescrOperand` dedup. Matches
-/// `assembler.py:197-199` `if x not in self._descr_dict` which uses
-/// Python object identity.
-///
-/// `Bh` descrs are deduped by pointer-equality against the `DescrOperand`
-/// borrow (the SSARepr owns the operand, so pointers are stable during
-/// assemble()). `SwitchDict` descrs must be deduped by the same rule —
-/// two distinct SwitchDictDescr operands produce two `descrs` entries
-/// even if their `labels` happen to match (matches RPython's identity
-/// semantics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct DescrKey(*const DescrOperand);
 
 impl Assembler {
     pub fn new() -> Self {
@@ -201,9 +176,6 @@ impl Assembler {
             builder,
             label_positions: HashMap::new(),
             builder_labels: Vec::new(),
-            switch_descrs: Vec::new(),
-            descrs: Vec::new(),
-            descr_dict: HashMap::new(),
         };
 
         ssarepr.insns_pos = Some(Vec::with_capacity(ssarepr.insns.len()));
@@ -218,8 +190,7 @@ impl Assembler {
 
         self.fix_labels(&mut state);
 
-        let mut jitcode = state.builder.finish();
-        jitcode.descrs = state.descrs;
+        let jitcode = state.builder.finish();
         // `assembler.py:54`: run `check_result()` unconditionally after
         // `fix_labels()` and before `make_jitcode`. Strict RPython parity
         // — an oversized jitcode is a translator-level programming error,
@@ -287,31 +258,27 @@ impl Assembler {
                     }
                 }
                 // `assembler.py:197-206` registers descrs inline during op
-                // encoding, guarded by `self._descr_dict`. The previous
-                // pre-scan violated parity by interning every
-                // `Operand::Descr` unconditionally (even on ops that don't
-                // consume a descr in the emitted bytecode) and without
-                // dedup. Dispatch arms that actually need a descr index
-                // now call `record_descr_operand(state, descr)` themselves.
+                // encoding into `Assembler.descrs`. pyre's runtime
+                // codewriter has no descr-consuming ops today, so no
+                // registration path runs here — once a descr-consuming op
+                // lands it must register onto the shared
+                // `BlackholeInterpBuilder.descrs` pool (`blackhole.py:
+                // 102-103 setup_descrs`), not a per-jitcode duplicate.
                 dispatch_op(state, opname, args, result.as_ref());
             }
         }
     }
 
     /// `assembler.py:250-263` `fix_labels()`.
-    fn fix_labels(&mut self, state: &mut AssemblyState) {
-        for (descr_index, labels) in &state.switch_descrs {
-            let mut dict = HashMap::new();
-            for (key, label) in labels {
-                let target = *state
-                    .label_positions
-                    .get(&label.name)
-                    .unwrap_or_else(|| panic!("missing switch target label {:?}", label.name));
-                dict.insert(*key, target);
-            }
-            state.descrs[*descr_index] = BhDescr::Switch { dict };
-        }
-    }
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's runtime `JitCodeBuilder` patches
+    /// jumps by symbolic label id rather than by rewriting raw bytes, so
+    /// the label-position loop is folded into the builder. The per-descr
+    /// switch patching that upstream runs here is handled through the
+    /// shared `BlackholeInterpBuilder.descrs` pool (`blackhole.py:102-103`
+    /// `setup_descrs`), not per-jitcode — pyre's runtime codewriter has
+    /// no descr-consuming ops yet, so this is currently a no-op.
+    fn fix_labels(&mut self, _state: &mut AssemblyState) {}
 
     /// `assembler.py:265-269` `check_result()`.
     ///
@@ -1090,56 +1057,6 @@ fn dispatch_residual_call(
     }
 }
 
-/// `assembler.py:197-206` inline descr registration. Called from
-/// dispatch arms that actually consume a descr operand in the emitted
-/// bytecode.
-///
-/// Deduplicates on `Operand::Descr` pointer identity — matches
-/// RPython's `if x not in self._descr_dict` which hashes by object id.
-/// Reusing the same SSARepr descr operand twice yields a stable
-/// `descrs` index both times.
-fn record_descr_operand(state: &mut AssemblyState, descr: &DescrOperand) -> usize {
-    let key = DescrKey(descr as *const DescrOperand);
-    if let Some(&idx) = state.descr_dict.get(&key) {
-        return idx;
-    }
-    let index = state.descrs.len();
-    state.descr_dict.insert(key, index);
-    match descr {
-        DescrOperand::Bh(bh) => state.descrs.push(bh.clone()),
-        DescrOperand::SwitchDict(switch) => {
-            state.descrs.push(BhDescr::Switch {
-                dict: HashMap::new(),
-            });
-            state.switch_descrs.push((index, switch.labels.clone()));
-        }
-        DescrOperand::CallDescrStub(_) => {
-            // `CallDescrStub` stands in for the codewriter-layer
-            // `calldescr` at the SSARepr level but does not correspond to
-            // a runtime `BhDescr`. The `residual_call_*` dispatch arms
-            // consume the stub directly (`dispatch_op` below) to pick the
-            // builder method and reassemble per-arg kinds, so the argcode
-            // `d` emission path must never see it.
-            panic!(
-                "record_descr_operand: CallDescrStub must be consumed by dispatch_op, not encoded as 'd'"
-            );
-        }
-    }
-    index
-}
-
-/// Helper for dispatch arms: decode an `Operand::Descr`, register it
-/// inline, and return the 16-bit descr index. Used by ops that actually
-/// emit a `d` argcode slot (`assembler.py:205-207`).
-#[allow(dead_code)]
-fn emit_descr(state: &mut AssemblyState, op: &Operand) -> u16 {
-    match op {
-        Operand::Descr(descr) => u16::try_from(record_descr_operand(state, descr))
-            .expect("too many descrs (index > u16::MAX)"),
-        _ => panic!("expected Descr operand, got {:?}", op),
-    }
-}
-
 fn expect_result_or_first_reg(args: &[Operand], result: Option<&Register>, kind: Kind) -> u16 {
     match result {
         Some(reg) if reg.kind == kind => reg.index,
@@ -1367,9 +1284,14 @@ mod tests {
     }
 
     /// `assembler.py:197-206` parity: a `Descr` operand attached to an op
-    /// that does not consume a descr in its emitted bytecode MUST NOT be
-    /// registered in `jitcode.descrs`. Registration happens inline during
-    /// per-op encoding — no pre-scan.
+    /// that does not consume a descr in its emitted bytecode MUST NOT
+    /// leak into any descr pool. Registration happens inline at 'd'
+    /// argcode emission; pyre's runtime codewriter has no
+    /// descr-consuming ops today so every `assemble()` is a no-op for
+    /// descr registration. This test keeps the guarantee explicit so a
+    /// future descr-consumer addition is forced to ship the
+    /// corresponding registration onto `BlackholeInterpBuilder.descrs`
+    /// (`blackhole.py:102-103 setup_descrs`), not per-jitcode.
     #[test]
     fn assemble_does_not_register_unconsumed_descr() {
         let mut switch = SwitchDictDescr::new();
@@ -1385,22 +1307,16 @@ mod tests {
             vec![Operand::descr(DescrOperand::SwitchDict(switch))],
         ));
 
-        let jitcode = assemble(&mut ssarepr, JitCodeBuilder::default(), None);
-
-        assert!(
-            jitcode.descrs.is_empty(),
-            "descrs attached to non-consuming ops must not be registered; \
-             assembler.py:197-206 registers inline at 'd' argcode emission only, \
-             got descrs={:?}",
-            jitcode.descrs
-        );
+        // Assemble succeeds without panic — the assertion is that no
+        // code path tries to allocate a per-jitcode descr slot.
+        let _jitcode = assemble(&mut ssarepr, JitCodeBuilder::default(), None);
     }
 
     // TODO: once a descr-consuming op (e.g. `switch`, `getfield_gc_d`) is
-    // ported into `dispatch_op`, add a positive test that
-    // `record_descr_operand` is invoked during its encoding and that
+    // ported into `dispatch_op`, add a positive test that confirms its
+    // descr lands on `BlackholeInterpBuilder.descrs` and that
     // `SwitchDictDescr._labels` → `BhDescr::Switch.dict` round-trips via
-    // `fix_labels()`.
+    // the shared pool at `fix_labels()` time (blackhole.py:102-103).
 
     /// `assembler.py:208-209` parity:
     /// ```python

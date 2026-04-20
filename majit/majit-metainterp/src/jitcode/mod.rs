@@ -278,11 +278,6 @@ pub struct JitCode {
     pub fn_ptrs: Vec<JitCallTarget>,
     /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.
     assembler_targets: Vec<JitCallAssemblerTarget>,
-    /// RPython: `BlackholeInterpBuilder.descrs` — shared descriptor table for
-    /// 'd'/'j' argcode resolution (blackhole.py:102-103 `setup_descrs`).
-    /// pyre: stored per-jitcode. Loaded into `BlackholeInterpreter.descrs`
-    /// by `setposition()`. Empty until the codewriter populates it.
-    pub descrs: Vec<majit_translate::jitcode::BhDescr>,
 }
 
 // -- RPython jitcode.py parity methods --
@@ -392,12 +387,12 @@ impl std::fmt::Display for JitCode {
 ///     `jitcode.py:34`; `f64::to_bits` yields the same raw pattern).
 ///
 /// Runtime-only fields (`opcodes`, `sub_jitcodes`, `fn_ptrs`,
-/// `assembler_targets`, `descrs`) default-initialize to empty — they
-/// are populated by the runtime codewriter (`pyre-jit/src/jit/`) for
-/// function-level jitcodes, not by `build.rs`. Phase D-2's shadow
-/// dispatch is intentionally limited to opcode arms whose decomposed
-/// bytecode does not reach `inline_call` / `residual_call` until these
-/// pools are wired too.
+/// `assembler_targets`) default-initialize to empty — they are populated
+/// by the runtime codewriter (`pyre-jit/src/jit/`) for function-level
+/// jitcodes, not by `build.rs`. Phase D-2's shadow dispatch is
+/// intentionally limited to opcode arms whose decomposed bytecode does
+/// not reach `inline_call` / `residual_call` until these pools are
+/// wired too.
 ///
 /// Panics if the build-time jitcode body has not been set
 /// (`set_body()` not called). Build artifacts that were fully assembled
@@ -425,7 +420,6 @@ impl From<&majit_translate::jitcode::JitCode> for JitCode {
             sub_jitcodes: Vec::new(),
             fn_ptrs: Vec::new(),
             assembler_targets: Vec::new(),
-            descrs: Vec::new(),
         }
     }
 }
@@ -583,7 +577,6 @@ mod tests {
         assert!(rt.sub_jitcodes.is_empty());
         assert!(rt.fn_ptrs.is_empty());
         assert!(rt.assembler_targets.is_empty());
-        assert!(rt.descrs.is_empty());
     }
 
     #[test]
