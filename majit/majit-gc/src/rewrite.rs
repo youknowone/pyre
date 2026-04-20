@@ -1319,6 +1319,24 @@ impl GcRewriter for GcRewriterImpl {
                     st.emit_rewritten_from(op, rewritten);
                 }
 
+                // ── GUARD_ALWAYS_FAILS lowering (rewrite.py:419-426) ──
+                // Upstream turns an always-failing guard into
+                //   SAME_AS_I(0)
+                //   GUARD_VALUE(same_as, ConstInt(1))
+                // so the backend can share its GUARD_VALUE emission path.
+                // failargs are carried over via copy_and_change.
+                OpCode::GuardAlwaysFails => {
+                    let zero = st.const_int(0);
+                    let one = st.const_int(1);
+                    let same = Op::new(OpCode::SameAsI, &[zero]);
+                    let same_pos = st.emit_result(same, OpRef::NONE);
+                    st.result_types.insert(same_pos.0, Type::Int);
+                    let newop =
+                        op.copy_and_change(OpCode::GuardValue, Some(&[same_pos, one]), None);
+                    let rewritten = st.rewrite_op(&newop);
+                    st.emit(rewritten);
+                }
+
                 // ── Guards: emit_pending_zeros was already called at the
                 // top of the iteration per rewrite.py:376-378; here we only
                 // need to emit the (forwarded) guard op itself. Guards do
@@ -2028,6 +2046,43 @@ mod tests {
             consts[&const_ref.0], 1,
             "GUARD_FALSE hoists SAME_AS_I(1) per rewrite.py:463",
         );
+    }
+
+    #[test]
+    fn test_guard_always_fails_lowers_to_same_as_guard_value() {
+        // rewrite.py:419-425: GUARD_ALWAYS_FAILS ⇒ SAME_AS_I(0) +
+        // GUARD_VALUE(same_as, 1). Failargs are propagated via
+        // copy_and_change.
+        let rw = make_rewriter();
+        let mut guard = Op::new(OpCode::GuardAlwaysFails, &[]);
+        guard.store_final_boxes(vec![OpRef(10), OpRef(11)]);
+        let ops = vec![guard, Op::new(OpCode::Finish, &[])];
+
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        assert!(
+            result.iter().all(|o| o.opcode != OpCode::GuardAlwaysFails),
+            "GUARD_ALWAYS_FAILS is lowered"
+        );
+        let same = result
+            .iter()
+            .find(|o| o.opcode == OpCode::SameAsI)
+            .expect("SAME_AS_I is emitted");
+        let gv = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardValue)
+            .expect("GuardValue replaces GuardAlwaysFails");
+        assert_eq!(gv.args[0], same.pos);
+        assert_eq!(
+            consts[&gv.args[1].0], 1,
+            "GuardValue checks against ConstInt(1)",
+        );
+        assert_eq!(
+            consts[&same.args[0].0], 0,
+            "SAME_AS_I uses ConstInt(0) per rewrite.py:421",
+        );
+        let gv_fa = gv.fail_args.as_ref().expect("GuardValue inherits failargs");
+        assert_eq!(gv_fa.as_slice(), &[OpRef(10), OpRef(11)]);
     }
 
     #[test]
