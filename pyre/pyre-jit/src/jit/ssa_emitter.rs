@@ -638,6 +638,26 @@ impl SSAReprEmitter {
         (jitcode, byte_positions)
     }
 
+    /// Phase 3c Step 2: feed the walker-local `SSARepr` into
+    /// `Assembler::assemble` instead of the emitter's internal one. The
+    /// emitter is consumed for its builder side (fn_ptrs / consts /
+    /// register-file sizing) but its internal `ssarepr` is dropped.
+    ///
+    /// Once Step 3 removes the internal accumulator entirely,
+    /// `finish_with_positions` can collapse into this signature.
+    pub fn finish_with_positions_from(
+        self,
+        assembler: &mut Assembler,
+        mut ssarepr: SSARepr,
+        insn_positions: &[usize],
+        num_regs: NumRegs,
+    ) -> (JitCode, Vec<usize>) {
+        let jitcode = assembler.assemble(&mut ssarepr, self.builder, Some(num_regs));
+        let byte_positions =
+            Self::insn_pos_to_byte_offset(&ssarepr, insn_positions.iter().copied());
+        (jitcode, byte_positions)
+    }
+
     /// **Test-only** twin of `finish_with_positions` that creates a
     /// throw-away `Assembler`. Production callers must supply the
     /// CodeWriter-owned `Assembler` — see the note on `finish()`.

@@ -237,17 +237,34 @@ fn register_helper_fn_pointers(
 /// RPython-orthodox behavior (panic on overflow) by deleting the
 /// fallback path.
 fn fill_assembler_liveness(
-    assembler: &mut SSAReprEmitter,
+    ssarepr: &mut super::flatten::SSARepr,
     liveness: &[LivenessInfo],
     live_patches: &[(usize, usize)],
 ) {
-    for (entry, &(_, patch_offset)) in liveness.iter().zip(live_patches.iter()) {
-        assembler.fill_live_args(
-            patch_offset,
-            &entry.live_i_regs,
-            &entry.live_r_regs,
-            &entry.live_f_regs,
+    use super::flatten::{Insn, Operand};
+    for (entry, &(_, insn_idx)) in liveness.iter().zip(live_patches.iter()) {
+        let mut args: Vec<Operand> = Vec::with_capacity(
+            entry.live_i_regs.len() + entry.live_r_regs.len() + entry.live_f_regs.len(),
         );
+        for &r in &entry.live_i_regs {
+            args.push(Operand::reg(Kind::Int, r));
+        }
+        for &r in &entry.live_r_regs {
+            args.push(Operand::reg(Kind::Ref, r));
+        }
+        for &r in &entry.live_f_regs {
+            args.push(Operand::reg(Kind::Float, r));
+        }
+        match ssarepr.insns.get_mut(insn_idx) {
+            Some(Insn::Live(existing)) => *existing = args,
+            Some(other) => panic!(
+                "fill_assembler_liveness: expected Insn::Live at index {insn_idx}, got {other:?}"
+            ),
+            None => panic!(
+                "fill_assembler_liveness: insn index {insn_idx} out of range (len {})",
+                ssarepr.insns.len()
+            ),
+        }
     }
 }
 
@@ -290,7 +307,7 @@ fn fill_assembler_liveness(
 /// downstream `liveness.zip(live_patches)` alignment in dispatch
 /// finalisation stays one-to-one.
 fn compute_liveness_table(
-    assembler: &mut SSAReprEmitter,
+    ssarepr: &mut super::flatten::SSARepr,
     live_patches: &[(usize, usize)],
     code: &CodeObject,
     num_instrs: usize,
@@ -300,7 +317,7 @@ fn compute_liveness_table(
     pc_map: &[usize],
 ) -> Vec<LivenessInfo> {
     use super::flatten::{Insn, Kind as SsaKind, Operand as SsaOperand};
-    super::liveness::compute_liveness_preserve_positions(&mut assembler.ssarepr);
+    super::liveness::compute_liveness_preserve_positions(ssarepr);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let mut liveness = Vec::with_capacity(num_instrs);
     for &(py_pc, insn_idx) in live_patches.iter() {
@@ -318,7 +335,7 @@ fn compute_liveness_table(
         let stack_limit = stack_base as usize + depth as usize;
         let mut seen: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
         let mut live_r: Vec<u16> = Vec::new();
-        if let Some(Insn::Live(args)) = assembler.ssarepr.insns.get(insn_idx) {
+        if let Some(Insn::Live(args)) = ssarepr.insns.get(insn_idx) {
             for op in args {
                 if let SsaOperand::Register(reg) = op {
                     if reg.kind != SsaKind::Ref {
@@ -1043,6 +1060,10 @@ impl CodeWriter {
                 $ssarepr
                     .insns
                     .push(Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]));
+                // `rpython/jit/codewriter/flatten.py:144-146`: terminators
+                // emit `('---',)` so the backward liveness pass clears its
+                // alive set. Mirrors `SSAReprEmitter::ref_return`.
+                $ssarepr.insns.push(Insn::Unreachable);
                 $asm.ref_return(src);
             }};
         }
@@ -1061,6 +1082,11 @@ impl CodeWriter {
                     "goto",
                     vec![Operand::TLabel(TLabel::new(format!("pc{}", target_py_pc)))],
                 ));
+                // `rpython/jit/codewriter/flatten.py:111-112`: an
+                // unconditional goto implicitly ends a block so the
+                // liveness pass (`liveness.py:68-69`) can reset the alive
+                // set. Matches `SSAReprEmitter::jump`'s internal push.
+                $ssarepr.insns.push(Insn::Unreachable);
                 $asm.jump($labels[target_py_pc]);
             }};
         }
@@ -2219,7 +2245,7 @@ impl CodeWriter {
         // SSARepr, with a LiveVars intersection at each pc to match
         // the runtime contract. See `compute_liveness_table`.
         let liveness = compute_liveness_table(
-            &mut assembler,
+            &mut ssarepr,
             &live_patches,
             code,
             num_instrs,
@@ -2236,7 +2262,7 @@ impl CodeWriter {
         // pyre-only `has_abort` fallback for `register index ≥ 256`
         // is gone (RPython parity: `liveness.py:147-166` panics if a
         // post-regalloc register exceeds 256, and so do we).
-        fill_assembler_liveness(&mut assembler, &liveness, &live_patches);
+        fill_assembler_liveness(&mut ssarepr, &liveness, &live_patches);
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, assembler, site.landing_label);
@@ -2277,9 +2303,8 @@ impl CodeWriter {
             max_stack_depth: max_stack_depth_observed,
         };
         let alloc_result =
-            super::regalloc::allocate_registers(&assembler.ssarepr, code.varnames.len(), inputs);
-        let mut assembler = assembler;
-        super::regalloc::apply_rename(&mut assembler.ssarepr, &alloc_result.rename);
+            super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs);
+        super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
         // (or 0 if coloring is empty). Pass through to the Assembler
@@ -2308,6 +2333,7 @@ impl CodeWriter {
         // and stamp the per-graph metadata. See `Self::finalize_jitcode`.
         self.finalize_jitcode(
             assembler,
+            ssarepr,
             code,
             pc_map,
             depth_at_pc,
@@ -2343,6 +2369,7 @@ impl CodeWriter {
     fn finalize_jitcode(
         &self,
         assembler: SSAReprEmitter,
+        ssarepr: SSARepr,
         code: &CodeObject,
         pc_map: Vec<usize>,
         depth_at_pc: Vec<u16>,
@@ -2365,7 +2392,7 @@ impl CodeWriter {
         // across every jitcode compiled on this thread.
         let (mut jitcode, pc_map_bytes) = {
             let mut asm = self.assembler.borrow_mut();
-            assembler.finish_with_positions(&mut *asm, &pc_map, num_regs)
+            assembler.finish_with_positions_from(&mut *asm, ssarepr, &pc_map, num_regs)
         };
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` is assigned by
