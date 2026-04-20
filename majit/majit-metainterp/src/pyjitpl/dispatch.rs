@@ -807,6 +807,7 @@ where
                     let rhs_idx = frame.next_u16() as usize;
                     let opcode = *frame
                         .jitcode
+                        .exec
                         .opcodes
                         .get(opcode_idx)
                         .expect("jitcode opcode index out of bounds");
@@ -844,6 +845,7 @@ where
                     let src_idx = frame.next_u16() as usize;
                     let opcode = *frame
                         .jitcode
+                        .exec
                         .opcodes
                         .get(opcode_idx)
                         .expect("jitcode opcode index out of bounds");
@@ -1072,7 +1074,8 @@ where
                     (sub_idx, arg_triples, return_i, return_r, return_f)
                 };
                 let pc = self.frames.current_mut().pc;
-                let sub_jitcode = self.frames.current_mut().jitcode.sub_jitcodes[sub_idx].clone();
+                let sub_jitcode =
+                    self.frames.current_mut().jitcode.exec.sub_jitcodes[sub_idx].clone();
                 let mut sub_frame = MIFrame::new(sub_jitcode, pc);
                 // dispatch.rs sub-jitcode inline frame (RPython pyjitpl
                 // perform_call for non-portal jitcodes). The structured
@@ -1140,7 +1143,7 @@ where
                     ctx.call_assembler_void_typed(&token, &args, &arg_types);
                     call_void_function(concrete_ptr, &concrete_args);
                 } else {
-                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {
@@ -1218,7 +1221,7 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
                 let trace_ptr = if target.trace_ptr.is_null() {
                     target.concrete_ptr
                 } else {
@@ -1338,7 +1341,7 @@ where
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                 } else {
-                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {
@@ -1462,7 +1465,7 @@ where
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                 } else {
-                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {
@@ -1584,7 +1587,7 @@ where
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 } else {
-                    let target = self.frames.current_mut().jitcode.fn_ptrs[fn_ptr_idx];
+                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {
@@ -1657,6 +1660,7 @@ where
                     let rhs_idx = frame.next_u16() as usize;
                     let opcode = *frame
                         .jitcode
+                        .exec
                         .opcodes
                         .get(opcode_idx)
                         .expect("jitcode opcode index out of bounds");
@@ -1675,6 +1679,7 @@ where
                     let src_idx = frame.next_u16() as usize;
                     let opcode = *frame
                         .jitcode
+                        .exec
                         .opcodes
                         .get(opcode_idx)
                         .expect("jitcode opcode index out of bounds");
@@ -1810,8 +1815,8 @@ where
 {
     let runtime = ClosureRuntime::new(label_at);
     let jitcode_arc = Arc::new(jitcode.clone());
-    let sub_jitcodes = jitcode_arc.sub_jitcodes.clone();
-    let fn_ptrs = jitcode_arc.fn_ptrs.clone();
+    let sub_jitcodes = jitcode_arc.exec.sub_jitcodes.clone();
+    let fn_ptrs = jitcode_arc.exec.fn_ptrs.clone();
     let mut standalone = StandaloneFrameStack::new();
     standalone.frames.push(MIFrame::new(jitcode_arc, pc));
     let mut machine =

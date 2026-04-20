@@ -1301,10 +1301,12 @@ impl JitCodeBuilder {
             jitdriver_sd: None,
             fnaddr: 0,
             calldescr: majit_translate::jitcode::BhCallDescr::default(),
-            opcodes: self.opcodes,
-            sub_jitcodes: self.sub_jitcodes,
-            fn_ptrs: self.fn_ptrs,
-            assembler_targets: self.assembler_targets,
+            exec: super::JitCodeExecState {
+                opcodes: self.opcodes,
+                fn_ptrs: self.fn_ptrs,
+                sub_jitcodes: self.sub_jitcodes,
+                assembler_targets: self.assembler_targets,
+            },
         }
     }
 

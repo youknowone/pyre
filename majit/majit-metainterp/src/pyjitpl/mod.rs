@@ -8602,8 +8602,8 @@ impl<M: Clone> MetaInterp<M> {
         S: crate::pyjitpl::JitCodeSym,
         R: crate::pyjitpl::JitCodeRuntime,
     {
-        let sub_jitcodes = jitcode.sub_jitcodes.clone();
-        let fn_ptrs = jitcode.fn_ptrs.clone();
+        let sub_jitcodes = jitcode.exec.sub_jitcodes.clone();
+        let fn_ptrs = jitcode.exec.fn_ptrs.clone();
         // pyjitpl.py:2451: self.framestack.append(f) — push the root.
         self.framestack
             .push(crate::pyjitpl::MIFrame::new(jitcode, pc));

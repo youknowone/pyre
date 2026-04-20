@@ -219,6 +219,51 @@ impl LivenessInfo {
 /// definition lives in `majit_translate::jitcode::enumerate_vars`.
 pub use majit_translate::jitcode::enumerate_vars;
 
+/// Runtime adapter state — pyre-only fields not present on canonical
+/// RPython `JitCode`. This container holds lookup pools that pyre's
+/// hardcoded `BC_*` dispatch resolves at runtime. RPython replaces the
+/// equivalent pools with a single shared `BlackholeInterpBuilder.descrs`
+/// list keyed by the `d`/`j` argcodes (blackhole.py:59, 154); pyre's
+/// runtime jitcodes are generated per-Python-frame and cannot index into
+/// that shared pool because they lack a global allocation index.
+///
+/// Phase I2 Step 2 progressively moves each pyre-only adapter field
+/// (`sub_jitcodes`, `fn_ptrs`, `assembler_targets`, `opcodes`) off the
+/// canonical `JitCode` into this container so the canonical struct
+/// remains byte-for-byte aligned with `rpython/jit/codewriter/jitcode.py`.
+/// Eventually the whole struct disappears when pyre's runtime dispatch
+/// migrates to insns-table + shared descrs pool.
+#[derive(Clone, Debug, Default)]
+pub struct JitCodeExecState {
+    /// IR opcode pool consulted by `BC_RECORD_BINOP_I/F`, `BC_RECORD_UNARY_I/F`
+    /// during blackhole replay / trace recording. RPython has no equivalent:
+    /// its blackhole reads the concrete primitive directly (e.g. `bhimpl_int_add`
+    /// is one handler per opname); pyre's single-handler + OpCode-lookup design
+    /// is a pyre-only shortcut awaiting migration to per-opname insns entries.
+    /// Placed first because it's the hottest adapter pool in tight arithmetic
+    /// loops; other fields follow in frequency order.
+    pub opcodes: Vec<OpCode>,
+    /// Function pointers resolved by 18 `BC_CALL_*` / `BC_RESIDUAL_CALL_*`
+    /// variants. RPython stores the same information in `BhDescr::Call`
+    /// + `CallDescr.fnaddr` (call.py:get_jitcode_calldescr) threaded
+    /// through `BlackholeInterpBuilder.descrs`; pyre's runtime resolves
+    /// via a per-JitCode pool until the dispatch path migrates to
+    /// insns-table + `d` argcode decode.
+    pub fn_ptrs: Vec<JitCallTarget>,
+    /// Sub-JitCodes resolved by `BC_INLINE_CALL`. RPython reads the same
+    /// information via `j` argcode → `descrs[index] → JitCode`
+    /// (blackhole.py:154). pyre's runtime jitcodes hold the `Arc` inline
+    /// because they are built per-frame and have no global index.
+    pub sub_jitcodes: Vec<std::sync::Arc<JitCode>>,
+    /// CALL_ASSEMBLER target metadata keyed by loop token number. Cold
+    /// field: only consulted when a portal re-enters an assembled loop
+    /// via `bh_call_assembler_*`. Placed last so hotter adapter pools
+    /// occupy the earlier cache lines. RPython stores this on
+    /// `CompiledLoopToken` (compile.py); pyre keeps it per-JitCode
+    /// because the builder-side token pool is separate.
+    pub(crate) assembler_targets: Vec<JitCallAssemblerTarget>,
+}
+
 /// Serialized interpreter step description, mirroring RPython's `JitCode`
 /// at a much smaller subset for the current proc-macro tracing surface.
 ///
@@ -270,14 +315,11 @@ pub struct JitCode {
     // runtime JitCodeBuilder inlines the equivalent pools directly
     // on each JitCode for straight-line dispatch. Future parity work
     // is to lift these back out to a separate per-adapter structure.
-    /// Pool of majit IR opcodes referenced from the bytecode stream.
-    pub opcodes: Vec<OpCode>,
-    /// Sub-JitCodes for `inline_call` targets (compound methods).
-    pub sub_jitcodes: Vec<std::sync::Arc<JitCode>>,
-    /// Function pointers for `residual_call` targets (I/O shims, external calls).
-    pub fn_ptrs: Vec<JitCallTarget>,
-    /// CALL_ASSEMBLER targets keyed by loop token number plus a concrete hook.
-    assembler_targets: Vec<JitCallAssemblerTarget>,
+    /// Runtime adapter pools not present on canonical `JitCode`
+    /// (Phase I2 Step 2). Holds `opcodes`, `fn_ptrs`, `sub_jitcodes`,
+    /// `assembler_targets` ordered by access frequency (hottest first)
+    /// so the tight-loop benchmarks keep their cache locality.
+    pub exec: JitCodeExecState,
 }
 
 // -- RPython jitcode.py parity methods --
@@ -302,7 +344,7 @@ impl JitCode {
     /// JitCodeBuilder bytecode. RPython stores the callee loop token in
     /// descriptor data; this keeps the private compat table encapsulated.
     pub(crate) fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
-        let target = self.assembler_targets[index];
+        let target = self.exec.assembler_targets[index];
         (target.token_number, target.concrete_ptr)
     }
 
@@ -416,10 +458,7 @@ impl From<&majit_translate::jitcode::JitCode> for JitCode {
             jitdriver_sd: bt.jitdriver_sd.get().copied(),
             fnaddr: bt.fnaddr,
             calldescr: body.calldescr.clone(),
-            opcodes: Vec::new(),
-            sub_jitcodes: Vec::new(),
-            fn_ptrs: Vec::new(),
-            assembler_targets: Vec::new(),
+            exec: JitCodeExecState::default(),
         }
     }
 }
@@ -573,10 +612,10 @@ mod tests {
         assert_eq!(rt.constants_f[0], f64::to_bits(1.5_f64) as i64);
         assert_eq!(rt.constants_f[1], f64::to_bits(-0.25_f64) as i64);
         // Runtime-only fields default-init empty.
-        assert!(rt.opcodes.is_empty());
-        assert!(rt.sub_jitcodes.is_empty());
-        assert!(rt.fn_ptrs.is_empty());
-        assert!(rt.assembler_targets.is_empty());
+        assert!(rt.exec.opcodes.is_empty());
+        assert!(rt.exec.sub_jitcodes.is_empty());
+        assert!(rt.exec.fn_ptrs.is_empty());
+        assert!(rt.exec.assembler_targets.is_empty());
     }
 
     #[test]
