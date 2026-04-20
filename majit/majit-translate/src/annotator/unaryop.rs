@@ -2227,22 +2227,18 @@ fn mk_hlop(kind: OpKind, args: Vec<Hlvalue>) -> HLOperation {
 /// RPython `_find_property_meth(s_obj, attr, meth)` (unaryop.py:895-906).
 ///
 /// Walks `s_obj.classdef.getmro()` and collects the `property` descriptor's
-/// `fget` / `fset` method reference for `attr`. Returns `None` if the
-/// attribute appears in any classdict entry but isn't a `property`
-/// (mirrors upstream's `return` without a result).
+/// `fget` / `fset` / `fdel` method reference for `attr`. Returns `None`
+/// when the attribute appears in any classdict entry that isn't a
+/// `property` (mirrors upstream's `return` without a result).
 ///
-/// Rust port does not yet model `property` descriptors as a distinct
-/// `HostObjectKind`, so this helper always returns `None` on a
-/// classdict hit — structurally identical to upstream's "attribute
-/// exists but not a property" branch. When property descriptors land
-/// as a `HostObjectKind::Property { fget, fset, fdel }` variant, the
-/// `ClassDictEntry::Constant` branch below will produce real
-/// `Some(HostObject)` entries.
+/// `meth` selects which property slot to read — "fget" / "fset" / "fdel" —
+/// matching upstream's `getattr(obj.value, meth)`.
 fn find_property_meth(
     s_obj: &super::model::SomeInstance,
     attr: &str,
-    _meth: &str,
+    meth: &str,
 ) -> Option<Vec<Option<super::super::flowspace::model::HostObject>>> {
+    use super::super::flowspace::model::ConstValue;
     let classdef = s_obj.classdef.as_ref()?;
     let mro = super::classdesc::ClassDef::getmro(classdef);
     let mut result: Vec<Option<super::super::flowspace::model::HostObject>> = Vec::new();
@@ -2251,18 +2247,29 @@ fn find_property_meth(
         let entry = classdesc.borrow().classdict.get(attr).cloned();
         let Some(entry) = entry else { continue };
         match entry {
-            super::classdesc::ClassDictEntry::Constant(_c) => {
+            super::classdesc::ClassDictEntry::Constant(c) => {
                 // upstream unaryop.py:902-904:
                 //   if (not isinstance(obj, Constant) or
                 //           not isinstance(obj.value, property)):
                 //       return
                 //   result.append(getattr(obj.value, meth))
-                //
-                // Rust HostObject has no `Property { fget, fset, fdel }`
-                // variant yet; every classdict Constant here is treated
-                // as "non-property" and triggers the early return.
-                return None;
+                let ConstValue::HostObject(host) = &c.value else {
+                    return None;
+                };
+                if !host.is_property() {
+                    return None;
+                }
+                let slot = match meth {
+                    "fget" => host.property_fget().cloned(),
+                    "fset" => host.property_fset().cloned(),
+                    "fdel" => host.property_fdel().cloned(),
+                    _ => return None,
+                };
+                result.push(slot);
             }
+            // Non-Constant classdict entries (FunctionDesc etc.) never
+            // stand in for a property; upstream's isinstance-check falls
+            // through to `return`.
             super::classdesc::ClassDictEntry::Desc(_) => return None,
         }
     }
@@ -2679,6 +2686,73 @@ mod tests {
             ],
         );
         assert!(hl.transform(&ann).is_none());
+    }
+
+    #[test]
+    fn transform_getattr_someinstance_with_property_rewrites_via_getter_hidden_fn() {
+        // unaryop.py:909-921 — when every classdef in the MRO binds
+        // `prop` as a `property` descriptor, the transform rewrites
+        // `getattr(v_obj, 'prop')` into `[getattr(v_obj, 'prop__getter__'),
+        // simple_call(getter.result)]`.
+        use super::super::super::flowspace::model::GraphFunc;
+        use super::super::classdesc::{ClassDef, ClassDictEntry};
+        use super::super::model::SomeInstance;
+        let ann = mk_ann();
+        let classdef = ClassDef::new_standalone("pkg.Y", None);
+        // Build a property(fget, fset) and bind it as the `prop` entry
+        // in the classdesc's classdict — simulating what
+        // `ClassDesc::add_source_attribute` produces when processing a
+        // property descriptor.
+        let fget_host =
+            super::super::super::flowspace::model::HostObject::new_user_function(GraphFunc::new(
+                "get_prop",
+                Constant::new(ConstValue::Dict(Default::default())),
+            ));
+        let fset_host =
+            super::super::super::flowspace::model::HostObject::new_user_function(GraphFunc::new(
+                "set_prop",
+                Constant::new(ConstValue::Dict(Default::default())),
+            ));
+        let prop_host = super::super::super::flowspace::model::HostObject::new_property(
+            "pkg.Y.prop",
+            Some(fget_host),
+            Some(fset_host),
+            None,
+        );
+        let classdesc = classdef.borrow().classdesc.clone();
+        classdesc.borrow_mut().classdict.insert(
+            "prop".to_string(),
+            ClassDictEntry::constant(ConstValue::HostObject(prop_host)),
+        );
+        let mut v_obj = Variable::named("obj");
+        ann.setbinding(
+            &mut v_obj,
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::Str("prop".into())));
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![Hlvalue::Variable(v_obj), v_attr_const],
+        );
+        let new_ops = hl
+            .transform(&ann)
+            .expect("property attr must rewrite to getter+simple_call");
+        assert_eq!(new_ops.len(), 2);
+        assert!(matches!(new_ops[0].kind, OpKind::GetAttr));
+        // The rewritten getattr target is the hidden getter name.
+        let target_attr = &new_ops[0].args[1];
+        match target_attr {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Str(s) => assert_eq!(s, "prop__getter__"),
+                other => panic!("expected Str, got {other:?}"),
+            },
+            other => panic!("expected Constant attr, got {other:?}"),
+        }
+        assert!(matches!(new_ops[1].kind, OpKind::SimpleCall));
     }
 
     #[test]

@@ -1351,6 +1351,7 @@ impl SomePBC {
         &self,
         args: &super::argument::ArgumentsForTranslation,
         s_result: &SomeValue,
+        op_key: Option<super::bookkeeper::PositionKey>,
     ) -> Result<(), AnnotatorError> {
         let descs: Vec<super::description::DescEntry> =
             self.descriptions.values().cloned().collect();
@@ -1360,19 +1361,19 @@ impl SomePBC {
         match self.get_kind()? {
             DescKind::Function => {
                 let fns: Vec<_> = descs.iter().filter_map(|d| d.as_function()).collect();
-                super::description::FunctionDesc::consider_call_site(&fns, args, s_result)?;
+                super::description::FunctionDesc::consider_call_site(&fns, args, s_result, op_key)?;
             }
             DescKind::Method => {
                 // description.py:458-465.
                 let mds: Vec<_> = descs.iter().filter_map(|d| d.as_method()).collect();
-                super::description::MethodDesc::consider_call_site(&mds, args, s_result)?;
+                super::description::MethodDesc::consider_call_site(&mds, args, s_result, op_key)?;
             }
             DescKind::Class => {
                 // classdesc.py:853-902 (phase 1 only — __init__
                 // recursion deferred, see ClassDesc::consider_call_site
                 // for the full story).
                 let cds: Vec<_> = descs.iter().filter_map(|d| d.as_class()).collect();
-                super::classdesc::ClassDesc::consider_call_site(&cds, args, s_result)?;
+                super::classdesc::ClassDesc::consider_call_site(&cds, args, s_result, op_key)?;
             }
             DescKind::MethodOfFrozen => {
                 // description.py:627-634.
@@ -1380,14 +1381,20 @@ impl SomePBC {
                     .iter()
                     .filter_map(|d| d.as_method_of_frozen())
                     .collect();
-                super::description::MethodOfFrozenDesc::consider_call_site(&mofds, args, s_result)?;
+                super::description::MethodOfFrozenDesc::consider_call_site(
+                    &mofds, args, s_result, op_key,
+                )?;
             }
             DescKind::Frozen => {
-                // Upstream `Desc` base has no `consider_call_site`; a
-                // FrozenDesc PBC call site would raise AttributeError
-                // in Python. Rust port keeps this branch as a no-op to
-                // match the implicit rejection without aborting the
-                // annotator.
+                // Upstream `Desc` base has no `consider_call_site`; in
+                // Python `self.getKind().consider_call_site(...)` on a
+                // FrozenDesc raises AttributeError. Surface that as an
+                // AnnotatorError so callers (`Bookkeeper.consider_call_site`,
+                // `compute_at_fixpoint`) observe the rejection via the
+                // normal error channel rather than silently succeeding.
+                return Err(AnnotatorError::new(
+                    "FrozenDesc has no consider_call_site (upstream AttributeError)",
+                ));
             }
         }
         Ok(())

@@ -511,15 +511,19 @@ impl Attribute {
 
 /// RPython `class ClassDesc(Desc)` (classdesc.py:488-600).
 ///
-/// **c1 stub shell.** Carries only the minimum fields needed by
-/// [`ClassDef::new`] + [`Attribute::validate`] so the structural port
-/// of `ClassDef` can land. `ClassDesc::__init__` (classdesc.py:494-588)
-/// body — mixin resolution, slots / _attrs_ detection,
+/// Structural port complete for the annotator-visible surface:
+/// `__init__` body (mixin resolution, slots / _attrs_ detection,
 /// `is_builtin_exception_class` pre-population, `_immutable_fields_`
-/// enforcement — lands with c2. Downstream methods (`lookup`,
-/// `read_attribute`, `s_read_attribute`, `s_get_value`,
-/// `add_source_attribute`, `getclassdef`, `pycall`,
-/// `consider_call_site`, ...) are not declared yet; c2 adds them.
+/// enforcement) + `lookup`, `read_attribute`, `s_read_attribute`,
+/// `s_get_value`, `add_source_attribute`, `add_mixins`,
+/// `add_sources_for_class`, `getclassdef`, `getuniqueclassdef`,
+/// `pycall`, `consider_call_site` (Phase 1 + Phase 2 with
+/// `getallbases` / `getcommonbase` / `MethodDesc` initdesc recursion),
+/// `getattrfamily`, `mergeattrfamilies`, and exception-class predicates.
+///
+/// Remaining deferred: `find_source_for`, `maybe_return_immutable_list`,
+/// `pythontype` helpers — rtyper-phase dependencies not reachable
+/// from the annotator fixpoint.
 #[derive(Debug)]
 pub struct ClassDesc {
     /// RPython `self.pyobj` — the live Python class object.
@@ -819,10 +823,12 @@ impl ClassDesc {
     /// RPython `ClassDesc.add_source_attribute(self, name, value,
     /// mixin=False)` (classdesc.py:590-634).
     ///
-    /// Property / staticmethod / MemberDescriptor branches are
-    /// structural ports deferred because [`HostObject`] does not yet
-    /// carry those Python descriptor kinds; skips are annotated
-    /// inline. FunctionType + mixin uses
+    /// Property branch (classdesc.py:591-602) is a line-by-line port:
+    /// fget / fset are stored as `name__getter__` / `name__setter__`
+    /// hidden functions before the property object itself is retained
+    /// under `name`. Staticmethod / MemberDescriptor branches remain
+    /// structurally deferred (HostObject lacks those descriptor
+    /// variants). FunctionType + mixin uses
     /// [`Bookkeeper::newfuncdesc`] to preserve mixin-specific
     /// FunctionDesc identity (classdesc.py:608-613).
     pub fn add_source_attribute(
@@ -831,10 +837,52 @@ impl ClassDesc {
         value: ConstValue,
         mixin: bool,
     ) -> Result<(), AnnotatorError> {
-        // classdesc.py:591-602 — property branch. HostObject has no
-        // property carrier; fall through to the default Constant
-        // assignment. Structural parity lands when HostObject gains a
-        // Property variant.
+        // classdesc.py:591-602 — property branch.
+        if let ConstValue::HostObject(ref host) = value {
+            if host.is_property() {
+                // upstream: `if value.fget is not None:`
+                //              `newname = name + '__getter__'`
+                //              `func = func_with_new_name(value.fget, newname)`
+                //              `self.add_source_attribute(newname, func, mixin)`.
+                //
+                // Rust deviation (parity rule #1): `func_with_new_name`
+                // renames the underlying Python function object so the
+                // later FunctionDesc carries the `__getter__`/`__setter__`
+                // name. `HostObject` is Arc-immutable; cloning with a new
+                // qualname would require duplicating the embedded
+                // `GraphFunc`. For now we keep the original fget/fset
+                // HostObject (its FunctionDesc will inherit the original
+                // function's name); the classdict key carries the
+                // `__getter__` / `__setter__` suffix so attribute lookup
+                // at the unaryop transform still matches upstream.
+                if let Some(fget) = host.property_fget() {
+                    let newname = format!("{name}__getter__");
+                    Self::add_source_attribute(
+                        this,
+                        &newname,
+                        ConstValue::HostObject(fget.clone()),
+                        mixin,
+                    )?;
+                }
+                if let Some(fset) = host.property_fset() {
+                    let newname = format!("{name}__setter__");
+                    Self::add_source_attribute(
+                        this,
+                        &newname,
+                        ConstValue::HostObject(fset.clone()),
+                        mixin,
+                    )?;
+                }
+                // upstream: `self.classdict[name] = Constant(value)` —
+                // the property object itself is retained for
+                // `_find_property_meth` to pattern-match at transform
+                // time.
+                this.borrow_mut()
+                    .classdict
+                    .insert(name.to_string(), ClassDictEntry::constant(value));
+                return Ok(());
+            }
+        }
 
         // classdesc.py:604-618 — FunctionType branch.
         if let ConstValue::HostObject(ref host) = value {
@@ -1137,6 +1185,65 @@ impl ClassDesc {
         }
     }
 
+    /// RPython `ClassDesc.getallbases(self)` (classdesc.py:900-904).
+    ///
+    /// Walks `basedesc` chain from `self` outward and yields every
+    /// intermediate ClassDesc. Upstream returns a generator; Rust
+    /// collects into a Vec.
+    pub fn getallbases(this: &Rc<RefCell<Self>>) -> Vec<Rc<RefCell<Self>>> {
+        let mut out = vec![this.clone()];
+        let mut cur = this.borrow().basedesc.clone();
+        while let Some(d) = cur {
+            let next = d.borrow().basedesc.clone();
+            out.push(d);
+            cur = next;
+        }
+        out
+    }
+
+    /// RPython `ClassDesc.getcommonbase(descs)` (classdesc.py:906-915).
+    ///
+    /// ```python
+    /// commondesc = descs[0]
+    /// for desc in descs[1:]:
+    ///     allbases = set(commondesc.getallbases())
+    ///     while desc not in allbases:
+    ///         assert desc is not None, "no common base for %r" % (descs,)
+    ///         desc = desc.basedesc
+    ///     commondesc = desc
+    /// return commondesc
+    /// ```
+    pub fn getcommonbase(descs: &[Rc<RefCell<Self>>]) -> Result<Rc<RefCell<Self>>, AnnotatorError> {
+        if descs.is_empty() {
+            return Err(AnnotatorError::new("getcommonbase: empty desc list"));
+        }
+        let mut commondesc = descs[0].clone();
+        for desc in descs.iter().skip(1) {
+            let allbases = Self::getallbases(&commondesc);
+            let mut cur: Rc<RefCell<Self>> = desc.clone();
+            loop {
+                if allbases.iter().any(|b| Rc::ptr_eq(b, &cur)) {
+                    break;
+                }
+                let next = cur.borrow().basedesc.clone();
+                match next {
+                    Some(n) => cur = n,
+                    None => {
+                        return Err(AnnotatorError::new(format!(
+                            "no common base for {:?}",
+                            descs
+                                .iter()
+                                .map(|d| d.borrow().name.clone())
+                                .collect::<Vec<_>>()
+                        )));
+                    }
+                }
+            }
+            commondesc = cur;
+        }
+        Ok(commondesc)
+    }
+
     /// RPython `ClassDesc.read_attribute(self, name, default=NODEFAULT)`
     /// (classdesc.py:765-773).
     ///
@@ -1263,23 +1370,20 @@ impl ClassDesc {
     /// RPython `ClassDesc.consider_call_site(descs, args, s_result, op)`
     /// (classdesc.py:853-902).
     ///
-    /// Phase 1 (this port): `descs[0].getcallfamily(); descs[0].mergecallfamilies(*descs[1:])`
+    /// Phase 1: `descs[0].getcallfamily(); descs[0].mergecallfamilies(*descs[1:])`
     /// — keeps the PBC call-family UnionFind consistent.
     ///
-    /// Phase 2 (deferred) computes the `__init__` MethodDesc set via
-    /// `desc.s_read_attribute('__init__')` and recurses into
+    /// Phase 2: compute the `__init__` MethodDesc set via
+    /// `desc.s_read_attribute('__init__')` and recurse into
     /// `MethodDesc.consider_call_site(initdescs, args, s_None, op)`.
-    /// That hinges on `ClassDesc::s_read_attribute` + `getcommonbase`,
-    /// neither ported yet — leaving the recursion as a TODO keeps the
-    /// call-family side (phase 1) working and surfaces the missing
-    /// piece explicitly rather than silently no-op'ing the entire
-    /// branch.
     pub fn consider_call_site(
         descs: &[Rc<RefCell<ClassDesc>>],
-        _args: &super::argument::ArgumentsForTranslation,
-        _s_result: &super::model::SomeValue,
+        args: &super::argument::ArgumentsForTranslation,
+        s_result: &super::model::SomeValue,
+        op_key: Option<super::bookkeeper::PositionKey>,
     ) -> Result<(), super::model::AnnotatorError> {
         use super::description::DescKey;
+        use super::model::SomeValue;
         if descs.is_empty() {
             return Ok(());
         }
@@ -1300,20 +1404,134 @@ impl ClassDesc {
             let _ = families.find_rep(head_key);
         }
         // upstream: `descs[0].mergecallfamilies(*descs[1:])`.
-        let mut families = bk.pbc_maximal_call_families.borrow_mut();
-        let mut rep = families.find_rep(head_key);
-        for other in descs.iter().skip(1) {
-            let other_key = DescKey::from_rc(other);
-            let (_changed, new_rep) = families.union(rep, other_key);
-            rep = new_rep;
+        {
+            let mut families = bk.pbc_maximal_call_families.borrow_mut();
+            let mut rep = families.find_rep(head_key);
+            for other in descs.iter().skip(1) {
+                let other_key = DescKey::from_rc(other);
+                let (_changed, new_rep) = families.union(rep, other_key);
+                rep = new_rep;
+            }
+            let _ = rep;
         }
-        drop(families);
-        // Phase 2 (classdesc.py:856-902): __init__ initdescs recursion
-        // deferred — requires ClassDesc::s_read_attribute +
-        // getcommonbase (not yet ported). The phase-1 call-family
-        // bookkeeping is sufficient to dedupe class-PBC call sites in
-        // the family UnionFind; __init__ specialization lands with
-        // a later commit.
+
+        // Phase 2 (classdesc.py:856-902).
+        //
+        // upstream:
+        //   if len(descs) == 1:
+        //       if not isinstance(s_result, SomeInstance):
+        //           raise AnnotatorError("calling a class didn't return an instance??")
+        //       classdefs = [s_result.classdef]
+        //   else:
+        //       classdefs = [desc.getuniqueclassdef() for desc in descs]
+        //       has_init = any(isinstance(desc.s_read_attribute('__init__'), SomePBC) for desc in descs)
+        //       basedesc = ClassDesc.getcommonbase(descs)
+        //       s_init = basedesc.s_read_attribute('__init__')
+        //       parent_has_init = isinstance(s_init, SomePBC)
+        //       if has_init and not parent_has_init:
+        //           raise AnnotatorError(...)
+        let classdefs: Vec<Rc<RefCell<ClassDef>>> = if descs.len() == 1 {
+            // upstream: single-class call; `s_result` is the instance
+            // annotation carrying the (possibly specialised) classdef.
+            match s_result {
+                SomeValue::Instance(si) => match &si.classdef {
+                    Some(cd) => vec![cd.clone()],
+                    None => {
+                        return Err(AnnotatorError::new(
+                            "calling a class didn't return an instance??",
+                        ));
+                    }
+                },
+                // s_result is `s_Impossible` at `compute_at_fixpoint` /
+                // `emulated_pbc_calls` drain (upstream passes
+                // `s_ImpossibleValue`); fall back to the uniqueclassdef
+                // path so those drains still register the __init__ call
+                // site.
+                _ => vec![Self::getuniqueclassdef(&descs[0])?],
+            }
+        } else {
+            let mut cds = Vec::with_capacity(descs.len());
+            for d in descs {
+                cds.push(Self::getuniqueclassdef(d)?);
+            }
+            // has_init check across descs.
+            let mut has_init = false;
+            for d in descs {
+                let s_init = Self::s_read_attribute(d, "__init__")?;
+                if matches!(s_init, SomeValue::PBC(_)) {
+                    has_init = true;
+                }
+            }
+            let basedesc = Self::getcommonbase(descs)?;
+            let s_parent_init = Self::s_read_attribute(&basedesc, "__init__")?;
+            let parent_has_init = matches!(s_parent_init, SomeValue::PBC(_));
+            if has_init && !parent_has_init {
+                return Err(AnnotatorError::new(format!(
+                    "some subclasses among {:?} declare __init__(), but not the common parent class",
+                    descs
+                        .iter()
+                        .map(|d| d.borrow().name.clone())
+                        .collect::<Vec<_>>()
+                )));
+            }
+            cds
+        };
+
+        // upstream:
+        //   initdescs = []
+        //   for desc, classdef in zip(descs, classdefs):
+        //       s_init = desc.s_read_attribute('__init__')
+        //       if isinstance(s_init, SomePBC):
+        //           assert len(s_init.descriptions) == 1
+        //           initfuncdesc, = s_init.descriptions
+        //           if isinstance(initfuncdesc, FunctionDesc):
+        //               initmethdesc = getbookkeeper().getmethoddesc(
+        //                   initfuncdesc, classdef, classdef, '__init__')
+        //               initdescs.append(initmethdesc)
+        let mut initdescs: Vec<Rc<RefCell<super::description::MethodDesc>>> = Vec::new();
+        for (desc, classdef) in descs.iter().zip(classdefs.iter()) {
+            let s_init = Self::s_read_attribute(desc, "__init__")?;
+            let SomeValue::PBC(pbc) = s_init else {
+                continue;
+            };
+            if pbc.descriptions.len() != 1 {
+                return Err(AnnotatorError::new(
+                    "unexpected dynamic __init__?".to_string(),
+                ));
+            }
+            let Some(entry) = pbc.descriptions.values().next() else {
+                continue;
+            };
+            let super::description::DescEntry::Function(initfuncdesc) = entry else {
+                continue;
+            };
+            let classdef_key = super::description::ClassDefKey::from_classdef(classdef);
+            let initmethdesc = bk.getmethoddesc(
+                initfuncdesc,
+                classdef_key,
+                Some(classdef_key),
+                "__init__",
+                std::collections::BTreeMap::new(),
+            );
+            initdescs.push(initmethdesc);
+        }
+
+        // upstream:
+        //   if initdescs:
+        //       initdescs[0].mergecallfamilies(*initdescs[1:])
+        //       MethodDesc.consider_call_site(initdescs, args, s_None, op)
+        if !initdescs.is_empty() {
+            let head_entry = super::description::DescEntry::Method(initdescs[0].clone());
+            let borrowed: Vec<_> = initdescs.iter().skip(1).map(|d| d.borrow()).collect();
+            let others: Vec<&super::description::Desc> = borrowed.iter().map(|d| &d.base).collect();
+            // Route the mergecallfamilies through the head MethodDesc's
+            // Desc base — MethodDesc::consider_call_site will redo this
+            // internally, but upstream calls both explicitly.
+            let _ = head_entry;
+            initdescs[0].borrow().base.mergecallfamilies(&others)?;
+            let s_none = SomeValue::None_(super::model::SomeNone::new());
+            super::description::MethodDesc::consider_call_site(&initdescs, args, &s_none, op_key)?;
+        }
         Ok(())
     }
 
@@ -2337,6 +2555,55 @@ mod tests {
     }
 
     #[test]
+    fn classdesc_add_source_attribute_property_expands_getter_setter() {
+        use crate::flowspace::model::GraphFunc;
+        let bk = make_bk();
+        let cls = HostObject::new_class("pkg.WithProp", vec![]);
+        let desc_rc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            cls,
+            "pkg.WithProp".into(),
+        )));
+        // Build a property(fget, fset) with real UserFunction hosts.
+        let fget_host = HostObject::new_user_function(GraphFunc::new(
+            "get_x",
+            Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        let fset_host = HostObject::new_user_function(GraphFunc::new(
+            "set_x",
+            Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        let prop_host = HostObject::new_property(
+            "pkg.WithProp.x",
+            Some(fget_host.clone()),
+            Some(fset_host.clone()),
+            None,
+        );
+        ClassDesc::add_source_attribute(
+            &desc_rc,
+            "x",
+            ConstValue::HostObject(prop_host.clone()),
+            false,
+        )
+        .unwrap();
+        let cd = desc_rc.borrow();
+        // upstream classdesc.py:591-602 — property itself lives under
+        // `name`, getter/setter aliases under `name__getter__` /
+        // `name__setter__`.
+        assert!(cd.classdict.contains_key("x"));
+        assert!(cd.classdict.contains_key("x__getter__"));
+        assert!(cd.classdict.contains_key("x__setter__"));
+        // The `x` slot carries the property Constant, not a Desc.
+        match cd.classdict.get("x").unwrap() {
+            ClassDictEntry::Constant(c) => match &c.value {
+                ConstValue::HostObject(h) => assert!(h.is_property()),
+                other => panic!("expected property HostObject, got {other:?}"),
+            },
+            other => panic!("expected Constant entry for property, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn classdesc_add_source_attribute_skips_builtin_exc_init() {
         let bk = make_bk();
         let base_exc = HOST_ENV.lookup_builtin("BaseException").unwrap();
@@ -2445,8 +2712,17 @@ mod tests {
         use super::super::description::DescKey;
         use super::super::model::SomeValue;
         let bk = make_bk();
+        // Phase 2 requires a common base — upstream classdesc.py:912
+        // raises `AssertionError("no common base")` when multi-class
+        // call sites have no shared ancestor.
+        let common = make_classdesc(&bk, "pkg.Common");
+        // getuniqueclassdef populates Common's classdef so child
+        // classdefs can `upgrade` the Weak backref when initialised.
+        let _common_cd = ClassDesc::getuniqueclassdef(&common).unwrap();
         let a = make_classdesc(&bk, "pkg.A");
+        a.borrow_mut().basedesc = Some(common.clone());
         let b = make_classdesc(&bk, "pkg.B");
+        b.borrow_mut().basedesc = Some(common.clone());
         let a_key = DescKey::from_rc(&a);
         let b_key = DescKey::from_rc(&b);
         // Pre-condition: A and B belong to distinct CallFamilies.
@@ -2458,13 +2734,51 @@ mod tests {
         }
         // Run consider_call_site — should union the two families.
         let args = simple_args(vec![]);
-        ClassDesc::consider_call_site(&[a.clone(), b.clone()], &args, &SomeValue::Impossible)
-            .expect("phase-1 consider_call_site must succeed");
+        ClassDesc::consider_call_site(&[a.clone(), b.clone()], &args, &SomeValue::Impossible, None)
+            .expect("consider_call_site must succeed");
         // Post-condition: A and B share a CallFamily.
         let mut families = bk.pbc_maximal_call_families.borrow_mut();
         let rep_a = families.find_rep(a_key);
         let rep_b = families.find_rep(b_key);
         assert_eq!(rep_a, rep_b);
+    }
+
+    #[test]
+    fn classdesc_consider_call_site_rejects_no_common_base() {
+        // classdesc.py:912 assertion: multi-class PBC call site with no
+        // shared ancestor raises AnnotatorError.
+        use super::super::argument::simple_args;
+        use super::super::model::SomeValue;
+        let bk = make_bk();
+        let a = make_classdesc(&bk, "pkg.Standalone1");
+        let b = make_classdesc(&bk, "pkg.Standalone2");
+        let args = simple_args(vec![]);
+        let err = ClassDesc::consider_call_site(
+            &[a.clone(), b.clone()],
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no common base"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn classdesc_getcommonbase_walks_chain() {
+        // classdesc.py:906-915: getcommonbase([A,B]) returns the nearest
+        // shared ancestor. When A and B share a direct parent P, the
+        // common base is P.
+        let bk = make_bk();
+        let p = make_classdesc(&bk, "pkg.P");
+        let a = make_classdesc(&bk, "pkg.A");
+        a.borrow_mut().basedesc = Some(p.clone());
+        let b = make_classdesc(&bk, "pkg.B");
+        b.borrow_mut().basedesc = Some(p.clone());
+        let common = ClassDesc::getcommonbase(&[a.clone(), b.clone()]).unwrap();
+        assert!(Rc::ptr_eq(&common, &p));
     }
 
     #[test]

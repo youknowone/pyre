@@ -509,7 +509,7 @@ impl Bookkeeper {
             // upstream: `args = simple_args(args_s)`;
             //            `pbc.consider_call_site(args, s_ImpossibleValue, None)`.
             let args = simple_args(args_s);
-            let _ = pbc.consider_call_site(&args, &SomeValue::Impossible);
+            let _ = pbc.consider_call_site(&args, &SomeValue::Impossible, None);
         }
         // upstream: `self.emulated_pbc_calls = {}`.
         self.emulated_pbc_calls.borrow_mut().clear();
@@ -566,7 +566,15 @@ impl Bookkeeper {
             // args_s[1:])`.
             let args = build_args_for_op(&call_op.opname, &args_s)?;
             // upstream: `s_callable.consider_call_site(args, s_result, call_op)`.
-            pbc.consider_call_site(&args, &s_result)?;
+            // `call_op` 은 upstream 에서 FunctionDesc.get_graph / specializer
+            // 에게 재전달된다. Rust 쪽은 op → PositionKey 로 축약하는데,
+            // 현재 `call_sites()` 는 `SpaceOperation` 만 반환하고 속한
+            // block/graph 식별자를 함께 돌려주지 않는다. 따라서 여기서는
+            // bookkeeper 의 current position (at_position(None) 가드에 의해
+            // 현재 None) 을 사용한다. `call_sites()` 반환 타입을 `(op,
+            // PositionKey)` 로 확장하는 것은 후속 커밋.
+            let op_key = self.current_position_key();
+            pbc.consider_call_site(&args, &s_result, op_key)?;
         }
         Ok(())
     }

@@ -1406,6 +1406,7 @@ impl FunctionDesc {
         descs: &[Rc<RefCell<FunctionDesc>>],
         args: &ArgumentsForTranslation,
         _s_result: &SomeValue,
+        op_key: Option<PositionKey>,
     ) -> Result<(), AnnotatorError> {
         if descs.is_empty() {
             return Ok(());
@@ -1414,9 +1415,7 @@ impl FunctionDesc {
         let shape = args.rawshape();
         let mut row = CallTableRow::new();
         for desc in descs {
-            // op_key threading = annrpython.py dep (Phase 5 P5.2+).
-            // CallLocation specialisation falls back to shared key.
-            let graph = desc.borrow().get_graph(args, None)?;
+            let graph = desc.borrow().get_graph(args, op_key.clone())?;
             row.insert(FunctionDesc::rowkey(desc), graph);
         }
         family.borrow_mut().calltable_add_row(shape, row);
@@ -1787,6 +1786,7 @@ impl MethodDesc {
         descs: &[Rc<RefCell<MethodDesc>>],
         args: &ArgumentsForTranslation,
         _s_result: &SomeValue,
+        op_key: Option<PositionKey>,
     ) -> Result<(), AnnotatorError> {
         if descs.is_empty() {
             return Ok(());
@@ -1797,12 +1797,12 @@ impl MethodDesc {
         let mut row = CallTableRow::new();
         for desc in descs {
             // upstream: `build_calltable_row(descs, args, op)` iterates
-            // `desc.get_graph(args, None)` per-desc; MethodDesc.get_graph
+            // `desc.get_graph(args, op)` per-desc; MethodDesc.get_graph
             // delegates to funcdesc.get_graph after func_args prepends
             // `self`. `rowkey` returns funcdesc.identity so the family
             // is keyed by the underlying FunctionDesc (description.py:
             // 467-471).
-            let graph = desc.borrow().get_graph(args, None)?;
+            let graph = desc.borrow().get_graph(args, op_key.clone())?;
             row.insert(DescKey::from_rc(&desc.borrow().funcdesc), graph);
         }
         family.borrow_mut().calltable_add_row(shape, row);
@@ -2157,6 +2157,7 @@ impl MethodOfFrozenDesc {
         descs: &[Rc<RefCell<MethodOfFrozenDesc>>],
         args: &ArgumentsForTranslation,
         _s_result: &SomeValue,
+        op_key: Option<PositionKey>,
     ) -> Result<(), AnnotatorError> {
         if descs.is_empty() {
             return Ok(());
@@ -2166,7 +2167,7 @@ impl MethodOfFrozenDesc {
         shape.shape_cnt += 1;
         let mut row = CallTableRow::new();
         for desc in descs {
-            let graph = desc.borrow().get_graph(args, None)?;
+            let graph = desc.borrow().get_graph(args, op_key.clone())?;
             row.insert(DescKey::from_rc(&desc.borrow().funcdesc), graph);
         }
         family.borrow_mut().calltable_add_row(shape, row);

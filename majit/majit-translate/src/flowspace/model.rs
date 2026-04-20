@@ -116,6 +116,17 @@ enum HostObjectKind {
     /// 키는 upstream 의 `Constant.value = <anonymous object>` 경로에
     /// 대응한다.
     Opaque,
+    /// Python `property` descriptor (upstream classdesc.py:591-602). fget
+    /// / fset / fdel 은 upstream `property(fget, fset, fdel, doc)` 의
+    /// 각 슬롯에 대응하며, `Option<HostObject>` 로 담는다 (None =
+    /// 미정의). unaryop.py:895 `_find_property_meth` 는 classdict 의
+    /// `Constant(property_value)` 에서 `getattr(obj.value, meth)` 로 이
+    /// 슬롯을 추출한다.
+    Property {
+        fget: Option<HostObject>,
+        fset: Option<HostObject>,
+        fdel: Option<HostObject>,
+    },
 }
 
 impl PartialEq for HostObject {
@@ -410,6 +421,52 @@ impl HostObject {
 
     pub fn is_opaque(&self) -> bool {
         matches!(self.inner.kind, HostObjectKind::Opaque)
+    }
+
+    /// Python `property(fget, fset, fdel, doc)` constructor — upstream
+    /// classdesc.py:591-602 synthesises getter / setter hidden functions
+    /// and stores the property object itself in classdict.
+    pub fn new_property(
+        qualname: impl Into<String>,
+        fget: Option<HostObject>,
+        fset: Option<HostObject>,
+        fdel: Option<HostObject>,
+    ) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::Property { fget, fset, fdel },
+            }),
+        }
+    }
+
+    pub fn is_property(&self) -> bool {
+        matches!(self.inner.kind, HostObjectKind::Property { .. })
+    }
+
+    /// Upstream `property.fget` — `None` if not provided at property
+    /// construction time.
+    pub fn property_fget(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::Property { fget, .. } => fget.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Upstream `property.fset`.
+    pub fn property_fset(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::Property { fset, .. } => fset.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Upstream `property.fdel`.
+    pub fn property_fdel(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::Property { fdel, .. } => fdel.as_ref(),
+            _ => None,
+        }
     }
 }
 
