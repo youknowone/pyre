@@ -32,10 +32,12 @@
 pub mod argument;
 pub mod bookkeeper;
 pub mod classdesc;
+pub mod context;
 pub mod description;
 pub mod dictdef;
 pub mod exception;
 pub mod listdef;
 pub mod model;
+pub mod operations;
 pub mod policy;
 pub mod signature;
