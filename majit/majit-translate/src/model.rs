@@ -646,6 +646,18 @@ pub struct FunctionGraph {
     /// Variable names for debugging (RPython Variable._name).
     #[serde(default)]
     pub value_names: std::collections::HashMap<ValueId, String>,
+    /// Result `ValueId`s produced by a Rust `?` operator lowering.
+    ///
+    /// RPython analogue: `Block.exitswitch = c_last_exception` signals that
+    /// the block's last op may raise. Pyre records the same information at
+    /// the value level: every entry here is a value whose producing op
+    /// should be treated as a raising call by the codewriter
+    /// (`jtransform.rs::rewrite_op_direct_call` emits `-live-` when the
+    /// descriptor has `ExtraEffect::CanRaise`, see
+    /// `rpython/jit/codewriter/jtransform.py:456`). Downstream consumers
+    /// seed the call descriptor's effect from this set.
+    #[serde(default)]
+    pub try_sites: std::collections::HashSet<ValueId>,
 }
 
 impl FunctionGraph {
@@ -663,6 +675,7 @@ impl FunctionGraph {
             notes: Vec::new(),
             next_value: 0,
             value_names: std::collections::HashMap::new(),
+            try_sites: std::collections::HashSet::new(),
         }
     }
 

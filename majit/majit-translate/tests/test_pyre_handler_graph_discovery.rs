@@ -54,16 +54,19 @@ struct HandlerGraphStats {
     name: String,
     blocks: usize,
     ops: usize,
+    try_sites: usize,
 }
 
 fn lower_handler(func: &syn::ItemFn) -> HandlerGraphStats {
     let sf = build_function_graph_pub(func);
     let blocks = sf.graph.blocks.len();
     let ops: usize = sf.graph.blocks.iter().map(|b| b.operations.len()).sum();
+    let try_sites = sf.graph.try_sites.len();
     HandlerGraphStats {
         name: sf.name,
         blocks,
         ops,
+        try_sites,
     }
 }
 
@@ -84,11 +87,14 @@ fn discover_pyre_opcode_handler_graphs() {
 
     // Emit the matrix so the phase reviewer can scan it from `cargo test --nocapture`.
     eprintln!("[phase-a.1] pyre-interpreter opcode handler lowering matrix:");
-    eprintln!("[phase-a.1]   {:<40} {:>7} {:>7}", "name", "blocks", "ops");
+    eprintln!(
+        "[phase-a.1]   {:<40} {:>7} {:>7} {:>10}",
+        "name", "blocks", "ops", "try_sites"
+    );
     for entry in &matrix {
         eprintln!(
-            "[phase-a.1]   {:<40} {:>7} {:>7}",
-            entry.name, entry.blocks, entry.ops
+            "[phase-a.1]   {:<40} {:>7} {:>7} {:>10}",
+            entry.name, entry.blocks, entry.ops, entry.try_sites
         );
     }
 
@@ -110,12 +116,27 @@ fn discover_pyre_opcode_handler_graphs() {
         "opcode_store_fast_store_fast",
     ];
     for required in required_super_inst_helpers {
-        let found = matrix.iter().any(|m| m.name == required);
+        let entry = matrix
+            .iter()
+            .find(|m| m.name == required)
+            .unwrap_or_else(|| {
+                panic!(
+                    "super-instruction helper `{}` missing from pyopcode.rs — the \
+                     epic's premise (each super-inst expressed as an atomic-op chain) \
+                     no longer holds",
+                    required
+                )
+            });
+        // Every super-instruction helper uses `?` on each trait method call
+        // (load_local_value / push_value / pop_value / store_local_value),
+        // so the try-site set must be non-empty. A regression here means
+        // `front::ast`'s Expr::Try lowering is silently discarding the
+        // exception edge again, which would force downstream jtransform to
+        // emit `residual_call_*` without `-live-` (violating RPython parity
+        // in `jtransform.py:456`).
         assert!(
-            found,
-            "super-instruction helper `{}` missing from pyopcode.rs — the \
-             epic's premise (each super-inst expressed as an atomic-op chain) \
-             no longer holds",
+            entry.try_sites > 0,
+            "{} has zero try_sites — `?` lowering lost the exception edge",
             required
         );
     }

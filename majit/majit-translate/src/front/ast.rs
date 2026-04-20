@@ -1525,7 +1525,26 @@ fn lower_expr(
         }
 
         // ── try expr? ──
-        syn::Expr::Try(t) => lower_expr(graph, block, &t.expr, options, ctx),
+        //
+        // RPython analogue: in a graph produced by the translator, a call
+        // that propagates exceptions leaves its containing `Block` with
+        // `exitswitch = c_last_exception`. The codewriter then reads this
+        // bit (via `EffectInfo::EF_CAN_RAISE` attached to the calldescr)
+        // and emits `residual_call_*` + `-live-`. pyre records the same
+        // information at the value level: the result of a `?`-checked
+        // expression is tagged in `FunctionGraph::try_sites` so later
+        // passes can seed the descriptor with `ExtraEffect::CanRaise`.
+        //
+        // See `rpython/jit/codewriter/jtransform.py:456 rewrite_op_direct_call`
+        // and `rpython/translator/exceptiontransform.py` for the upstream
+        // parity points.
+        syn::Expr::Try(t) => {
+            let inner = lower_expr(graph, block, &t.expr, options, ctx);
+            if let Some(value) = inner {
+                graph.try_sites.insert(value);
+            }
+            inner
+        }
 
         // ── fallback ──
         _ => graph.push_op(
