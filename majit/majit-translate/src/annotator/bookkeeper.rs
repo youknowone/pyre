@@ -27,17 +27,23 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use super::argument::simple_args;
 use super::classdesc::{ClassDef, ClassDesc};
-use super::description::{ClassDefKey, DescEntry, DescKey, FrozenDesc, FunctionDesc, MethodDesc};
+use super::description::{
+    CallFamily, ClassDefKey, DescEntry, DescKey, FrozenAttrFamily, FrozenDesc, FunctionDesc,
+    MethodDesc,
+};
 use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, Desc, DescKind, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat,
     SomeInteger, SomeList, SomePBC, SomeString, SomeTuple, SomeValue, s_none,
 };
+use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
 use crate::flowspace::model::{ConstValue, Constant, HostObject};
+use crate::tool::algo::unionfind::UnionFind;
 
 /// RPython `bookkeeper.position_key` (bookkeeper.py:147) — the tuple
 /// identifying "where in the flow graph the annotator is currently
@@ -79,8 +85,9 @@ impl PositionKey {
 }
 
 /// RPython `class Bookkeeper` (bookkeeper.py:53).
-#[derive(Debug)]
 pub struct Bookkeeper {
+    /// RPython `self.policy = annotator.policy` (bookkeeper.py:55).
+    pub policy: AnnotatorPolicy,
     /// RPython `self.position_key = None` initial (bookkeeper.py:147).
     /// The annotator driver (`RPythonAnnotator.reflow`) writes into
     /// this slot around each reflow block so `read_item` / `agree`
@@ -116,6 +123,27 @@ pub struct Bookkeeper {
     /// so repeated `getmethoddesc(...)` calls with the same inputs
     /// share identity, per bookkeeper.py:431-442.
     pub methoddescs: RefCell<HashMap<MethodDescKey, Rc<RefCell<MethodDesc>>>>,
+    /// RPython `self.frozenpbc_attr_families = UnionFind(FrozenAttrFamily)`
+    /// (bookkeeper.py:63).
+    pub frozenpbc_attr_families: RefCell<UnionFind<DescKey, Rc<RefCell<FrozenAttrFamily>>>>,
+    /// RPython `self.pbc_maximal_call_families = UnionFind(CallFamily)`
+    /// (bookkeeper.py:64).
+    pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
+    /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
+    pub emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
+}
+
+impl std::fmt::Debug for Bookkeeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bookkeeper")
+            .field("position_key", &self.position_key.borrow())
+            .field("listdefs_len", &self.listdefs.borrow().len())
+            .field("dictdefs_len", &self.dictdefs.borrow().len())
+            .field("descs_len", &self.descs.borrow().len())
+            .field("classdefs_len", &self.classdefs.borrow().len())
+            .field("methoddescs_len", &self.methoddescs.borrow().len())
+            .finish()
+    }
 }
 
 /// Key for the `Bookkeeper.methoddescs` cache. Upstream uses a tuple
@@ -140,19 +168,43 @@ pub struct MethodDescKey {
     pub flags: Vec<(String, bool)>,
 }
 
+/// Hashable identity for `Bookkeeper.emulated_pbc_calls`.
+///
+/// Upstream accepts any hashable Python object. The currently-ported
+/// callers need a stable position key plus the r_dict eq/hash
+/// pseudo-call identities.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EmulatedPbcCallKey {
+    Position(PositionKey),
+    RDictCall { item_id: usize, role: &'static str },
+    Text(String),
+}
+
 impl Bookkeeper {
     /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py:52-76).
     /// Once the annotator driver lands, this constructor takes an
     /// `annotator` backlink; for now it just initialises the bare
     /// storage slots.
     pub fn new() -> Self {
+        Self::new_with_policy(AnnotatorPolicy::new())
+    }
+
+    pub fn new_with_policy(policy: AnnotatorPolicy) -> Self {
         Bookkeeper {
+            policy,
             position_key: RefCell::new(None),
             listdefs: RefCell::new(HashMap::new()),
             dictdefs: RefCell::new(HashMap::new()),
             descs: RefCell::new(HashMap::new()),
             classdefs: RefCell::new(Vec::new()),
             methoddescs: RefCell::new(HashMap::new()),
+            frozenpbc_attr_families: RefCell::new(UnionFind::new(|desc: &DescKey| {
+                Rc::new(RefCell::new(FrozenAttrFamily::new(*desc)))
+            })),
+            pbc_maximal_call_families: RefCell::new(UnionFind::new(|desc: &DescKey| {
+                Rc::new(RefCell::new(CallFamily::new(*desc)))
+            })),
+            emulated_pbc_calls: RefCell::new(HashMap::new()),
         }
     }
 
@@ -340,13 +392,17 @@ impl Bookkeeper {
         } else {
             Some(gf.defaults.clone())
         };
+        let specializer = self
+            .policy
+            .get_specializer(gf.annspecialcase.as_deref())
+            .map_err(|e| AnnotatorError::new(e.to_string()))?;
         let fd = FunctionDesc::new(
             self.clone(),
             Some(pyfunc.clone()),
             name,
             signature,
             defaults,
-            None, // specializer wired with annrpython.py policy callback
+            Some(specializer),
         );
         Ok(Rc::new(RefCell::new(fd)))
     }
@@ -406,10 +462,217 @@ impl Bookkeeper {
         self.classdefs.borrow_mut().push(classdef);
     }
 
+    pub fn lookup_classdef(&self, key: ClassDefKey) -> Option<Rc<RefCell<ClassDef>>> {
+        self.classdefs
+            .borrow()
+            .iter()
+            .find(|classdef| ClassDefKey::from_raw(Rc::as_ptr(classdef) as usize) == key)
+            .cloned()
+    }
+
     /// Snapshot of every registered classdef — test helper + upstream
     /// `bookkeeper.classdefs` read access.
     pub fn classdef_snapshot(&self) -> Vec<Rc<RefCell<ClassDef>>> {
         self.classdefs.borrow().clone()
+    }
+
+    /// RPython `Bookkeeper.getuniqueclassdef(cls)` (bookkeeper.py:282-287):
+    ///
+    /// ```python
+    /// def getuniqueclassdef(self, cls):
+    ///     assert not isinstance(cls, type(Exception)) or cls is type(Exception)
+    ///     desc = self.getdesc(cls)
+    ///     return desc.getuniqueclassdef()
+    /// ```
+    ///
+    /// The `type(Exception)` assertion guards against PyPy's old-style
+    /// exception metaclass trap; the Rust port doesn't model old-style
+    /// classes so the assertion is omitted.
+    pub fn getuniqueclassdef(
+        self: &Rc<Self>,
+        cls: &HostObject,
+    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        let entry = self.getdesc(cls)?;
+        match entry {
+            DescEntry::Class(cd_rc) => ClassDesc::getuniqueclassdef(&cd_rc),
+            _ => Err(AnnotatorError::new(format!(
+                "Bookkeeper.getuniqueclassdef({:?}): not a class",
+                cls.qualname()
+            ))),
+        }
+    }
+
+    fn resolve_stub_desc(&self, desc: &Desc) -> Option<DescEntry> {
+        self.descs
+            .borrow()
+            .values()
+            .find(|entry| match (desc.kind, entry) {
+                (DescKind::Function, DescEntry::Function(fd)) => {
+                    fd.borrow().base.pyobj.as_ref().map(|obj| obj.qualname())
+                        == Some(desc.name.as_str())
+                }
+                (DescKind::Class, DescEntry::Class(cd)) => cd.borrow().name == desc.name,
+                (DescKind::Frozen, DescEntry::Frozen(fd)) => {
+                    fd.borrow().base.pyobj.as_ref().map(|obj| obj.qualname())
+                        == Some(desc.name.as_str())
+                }
+                _ => false,
+            })
+            .cloned()
+    }
+
+    fn pbc_call_result_from_entry(
+        self: &Rc<Self>,
+        entry: &DescEntry,
+        args_s: &[SomeValue],
+    ) -> Result<SomeValue, AnnotatorError> {
+        let args = simple_args(args_s.to_vec());
+        // `op_key = None` — threading the flow-space op through the
+        // bookkeeper.pbc_call shim requires the annrpython.py driver.
+        // CallLocation specialisation over-merges until that lands.
+        match entry {
+            DescEntry::Function(fd) => {
+                let graph = fd.borrow().get_graph(&args, None)?;
+                self.infer_graph_result(&graph.graph, args_s)
+            }
+            DescEntry::Method(md) => {
+                let graph = md.borrow().get_graph(&args, None)?;
+                self.infer_graph_result(&graph.graph, args_s)
+            }
+            DescEntry::MethodOfFrozen(mfd) => {
+                let graph = mfd.borrow().get_graph(&args, None)?;
+                self.infer_graph_result(&graph.graph, args_s)
+            }
+            DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(
+                "Bookkeeper.pbc_call: non-callable PBC entry",
+            )),
+        }
+    }
+
+    fn infer_graph_result(
+        self: &Rc<Self>,
+        graph: &crate::flowspace::model::FunctionGraph,
+        inputcells: &[SomeValue],
+    ) -> Result<SomeValue, AnnotatorError> {
+        use crate::flowspace::model::{BlockKey, Hlvalue};
+
+        let mut defined: HashMap<(BlockKey, crate::flowspace::model::Variable), SomeValue> =
+            HashMap::new();
+        for (index, arg) in graph.getargs().into_iter().enumerate() {
+            if let (Hlvalue::Variable(v), Some(s_value)) = (arg, inputcells.get(index)) {
+                defined.insert((BlockKey::of(&graph.startblock), v), s_value.clone());
+            }
+        }
+
+        for block in graph.iterblocks() {
+            let block_key = BlockKey::of(&block);
+            for op in &block.borrow().operations {
+                let inferred = match op.opname.as_str() {
+                    "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "is_" | "contains" | "bool" => {
+                        SomeValue::Bool(SomeBool::new())
+                    }
+                    "hash" | "len" | "ord" | "int" | "add" | "sub" | "mul" | "floordiv" | "mod"
+                    | "lshift" | "rshift" | "and_" | "or_" | "xor" => {
+                        SomeValue::Integer(SomeInteger::default())
+                    }
+                    "type" => SomeValue::Impossible,
+                    _ => continue,
+                };
+                let crate::flowspace::model::Hlvalue::Variable(v) = &op.result else {
+                    continue;
+                };
+                defined.insert((block_key.clone(), v.clone()), inferred);
+            }
+        }
+
+        let mut results = Vec::new();
+        for link_ref in graph.iterlinks() {
+            let link = link_ref.borrow();
+            let Some(target) = &link.target else {
+                continue;
+            };
+            if BlockKey::of(target) != BlockKey::of(&graph.returnblock) {
+                continue;
+            }
+            let Some(arg) = link.args.first().and_then(|arg| arg.clone()) else {
+                continue;
+            };
+            match arg {
+                crate::flowspace::model::Hlvalue::Constant(c) => {
+                    results.push(self.immutablevalue(&c.value)?);
+                }
+                crate::flowspace::model::Hlvalue::Variable(v) => {
+                    let prevblock = link
+                        .prevblock
+                        .as_ref()
+                        .and_then(|prev| prev.upgrade())
+                        .ok_or_else(|| AnnotatorError::new("return link missing prevblock"))?;
+                    let prev_key = BlockKey::of(&prevblock);
+                    if let Some(s_value) = defined.get(&(prev_key, v.clone())) {
+                        results.push(s_value.clone());
+                    } else {
+                        return Ok(SomeValue::Impossible);
+                    }
+                }
+            }
+        }
+
+        let mut iter = results.into_iter();
+        let Some(mut acc) = iter.next() else {
+            return Ok(SomeValue::Impossible);
+        };
+        for s_value in iter {
+            acc = super::model::union(&acc, &s_value).map_err(|e| AnnotatorError::new(e.msg))?;
+        }
+        Ok(acc)
+    }
+
+    pub fn pbc_call(
+        self: &Rc<Self>,
+        pbc: &SomePBC,
+        args_s: &[SomeValue],
+    ) -> Result<SomeValue, AnnotatorError> {
+        let mut results = Vec::new();
+        for desc in &pbc.descriptions {
+            let entry = self.resolve_stub_desc(desc).ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "Bookkeeper.pbc_call: unresolved PBC description {:?}",
+                    desc
+                ))
+            })?;
+            results.push(self.pbc_call_result_from_entry(&entry, args_s)?);
+        }
+        let mut iter = results.into_iter();
+        let Some(mut acc) = iter.next() else {
+            return Ok(SomeValue::Impossible);
+        };
+        for s_value in iter {
+            acc = super::model::union(&acc, &s_value).map_err(|e| AnnotatorError::new(e.msg))?;
+        }
+        Ok(acc)
+    }
+
+    pub fn emulate_pbc_call(
+        self: &Rc<Self>,
+        unique_key: EmulatedPbcCallKey,
+        pbc: &SomeValue,
+        args_s: &[SomeValue],
+        replace: &[EmulatedPbcCallKey],
+    ) -> Result<SomeValue, AnnotatorError> {
+        let SomeValue::PBC(pbc) = pbc else {
+            return Err(AnnotatorError::new(format!(
+                "Bookkeeper.emulate_pbc_call expects SomePBC, got {pbc:?}"
+            )));
+        };
+        {
+            let mut emulated = self.emulated_pbc_calls.borrow_mut();
+            emulated.remove(&unique_key);
+            for key in replace {
+                emulated.remove(key);
+            }
+            emulated.insert(unique_key, (pbc.clone(), args_s.to_vec()));
+        }
+        self.pbc_call(pbc, args_s)
     }
 
     /// RPython `Bookkeeper.immutablevalue(x)` (bookkeeper.py:214-325).

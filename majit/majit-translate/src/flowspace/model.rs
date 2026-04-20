@@ -951,6 +951,12 @@ impl Variable {
         self._name != DUMMYNAME
     }
 
+    /// Generator flowspace needs the pre-numbered name prefix that
+    /// upstream reads as `v._name`.
+    pub fn name_prefix(&self) -> &str {
+        &self._name
+    }
+
     /// RPython `Variable.rename(name)`.
     ///
     /// Only renames once: subsequent calls are no-ops. The RPython
@@ -1804,6 +1810,9 @@ pub struct GraphFunc {
     pub name: String,
     /// Optional method owner, mirroring upstream `func.class_`.
     pub class_: Option<HostObject>,
+    /// Upstream `func._annspecialcase_` decorator tag consulted by
+    /// `Bookkeeper.newfuncdesc()` when selecting a specializer.
+    pub annspecialcase: Option<String>,
     /// Upstream generator helper attribute populated by
     /// `attach_next_method()`.
     pub _generator_next_method_of_: Option<HostObject>,
@@ -1833,6 +1842,7 @@ impl GraphFunc {
         GraphFunc {
             name: name.into(),
             class_: None,
+            annspecialcase: None,
             _generator_next_method_of_: None,
             globals,
             closure: Vec::new(),

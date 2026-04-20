@@ -39,9 +39,10 @@ use super::bookkeeper::Bookkeeper;
 use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
-    AnnotatorError, SomeBool, SomeDict, SomeFloat, SomeInteger, SomeList, SomeString, SomeTuple,
-    SomeType, SomeUnicodeString, SomeValue, s_none, union,
+    AnnotatorError, SomeBool, SomeDict, SomeFloat, SomeInstance, SomeInteger, SomeList, SomeString,
+    SomeTuple, SomeType, SomeUnicodeString, SomeValue, s_none, union,
 };
+use crate::flowspace::model::HostObject;
 
 /// Polymorphic input to [`annotation`] / [`annotationoftype`].
 ///
@@ -70,10 +71,12 @@ pub enum AnnotationSpec {
     NoneType,
     /// `type` type object — upstream `t is type`.
     Type,
-    /// User class referenced by qualified name. Upstream path:
-    /// `bookkeeper.getuniqueclassdef(t)` (signature.py:103-104) —
-    /// Phase 5 P5.2 blocker.
-    UserClass(String),
+    /// User class passed as a host class object. Upstream
+    /// `elif bookkeeper and not hasattr(t, '_freeze_'): return
+    /// SomeInstance(bookkeeper.getuniqueclassdef(t))`
+    /// (signature.py:103-104). The qualified name is preserved by the
+    /// carried [`HostObject`] (`.qualname()`).
+    UserClass(HostObject),
     /// `[X]` — list-of-X annotation (signature.py:61-64).
     List(Box<AnnotationSpec>),
     /// `{K: V}` — dict-with-K-keys-and-V-values annotation
@@ -202,20 +205,34 @@ pub fn annotationoftype(
         AnnotationSpec::Unicode => Ok(SomeValue::UnicodeString(SomeUnicodeString::default())),
         AnnotationSpec::NoneType => Ok(s_none()),
         AnnotationSpec::Type => Ok(SomeValue::Type(SomeType::new())),
-        AnnotationSpec::UserClass(name) => {
-            if bookkeeper.is_some() {
-                // upstream: `bookkeeper.getuniqueclassdef(t)` →
-                // `SomeInstance(classdef)`. Requires classdef registry
-                // from bookkeeper.py + classdesc.py (Phase 5 P5.2 dep).
-                Err(SignatureError(format!(
-                    "Annotation of user class {name:?} requires bookkeeper.getuniqueclassdef \
-                     (Phase 5 P5.2 dep — see rpython/annotator/signature.py:103-104)"
+        AnnotationSpec::UserClass(cls) => {
+            // upstream signature.py:103-104:
+            //     elif bookkeeper and not hasattr(t, '_freeze_'):
+            //         return SomeInstance(bookkeeper.getuniqueclassdef(t))
+            // The `hasattr(t, '_freeze_')` guard is the Frozen-PBC branch
+            // (handled elsewhere via `getfrozen`); here we assume the
+            // caller already dispatched frozen types through the
+            // dedicated path.
+            if let Some(bk) = bookkeeper {
+                let classdef = bk.getuniqueclassdef(cls).map_err(|e| {
+                    SignatureError::new(format!(
+                        "Annotation of user class {:?}: {}",
+                        cls.qualname(),
+                        e
+                    ))
+                })?;
+                Ok(SomeValue::Instance(SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
                 )))
             } else {
+                // upstream signature.py:106 — `raise TypeError("Annotation
+                // of type %r not supported" % (t,))`.
                 Err(SignatureError(format!(
-                    "Annotation of user class {name:?} without bookkeeper — upstream \
-                     `raise TypeError(\"Annotation of type %r not supported\")` \
-                     (signature.py:106)"
+                    "Annotation of type {:?} not supported \
+                     (no bookkeeper — signature.py:106)",
+                    cls.qualname()
                 )))
             }
         }
@@ -499,19 +516,30 @@ mod tests {
 
     #[test]
     fn user_class_without_bookkeeper_errors() {
-        let err = annotationoftype(&AnnotationSpec::UserClass("Foo".into()), None)
+        let cls = HostObject::new_class("Foo", vec![]);
+        let err = annotationoftype(&AnnotationSpec::UserClass(cls), None)
             .expect_err("user class without bookkeeper must error");
-        assert!(err.0.contains("Annotation of user class"));
+        assert!(err.0.contains("not supported"));
     }
 
     #[test]
-    fn user_class_with_bookkeeper_still_deferred() {
-        // Bookkeeper is present but `getuniqueclassdef` hasn't been
-        // ported yet — surfaced as a SignatureError citing the Phase
-        // 5 P5.2 blocker.
-        let err = annotationoftype(&AnnotationSpec::UserClass("Foo".into()), Some(&bk()))
-            .expect_err("user class with bookkeeper also deferred");
-        assert!(err.0.contains("getuniqueclassdef"));
+    fn user_class_with_bookkeeper_returns_someinstance() {
+        // upstream signature.py:103-104 — `SomeInstance(
+        // bookkeeper.getuniqueclassdef(t))`.
+        let cls = HostObject::new_class("Foo", vec![]);
+        let bk = bk();
+        let s = annotation(&AnnotationSpec::UserClass(cls), Some(&bk))
+            .expect("user class annotation must resolve");
+        match s {
+            SomeValue::Instance(inst) => {
+                assert!(
+                    inst.classdef.is_some(),
+                    "SomeInstance must carry a classdef"
+                );
+                assert!(!inst.can_be_none);
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
     }
 
     #[test]

@@ -26,15 +26,21 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::argument::{ArgErr, ArgumentsForTranslation};
-use super::bookkeeper::Bookkeeper;
-use super::model::{AnnotatorError, SomeValue, s_impossible_value, union};
+use super::bookkeeper::{Bookkeeper, PositionKey};
+use super::model::{
+    AnnotatorError, Desc as ModelDesc, DescKind as ModelDescKind, SomeInstance, SomeObjectTrait,
+    SomePBC, SomeValue, s_impossible_value, union,
+};
 use super::policy::Specializer;
 use super::signature::ParamType;
 use crate::flowspace::argument::{CallShape, Signature};
-use crate::flowspace::model::{ConstValue, Constant, FunctionGraph, HostObject};
+use crate::flowspace::model::{ConstValue, Constant, HostObject};
+use crate::flowspace::objspace::build_flow;
 use crate::flowspace::pygraph::PyGraph;
+use crate::tool::algo::unionfind::UnionFindInfo;
 
 /// Opaque identity handle for a `Desc` instance.
 ///
@@ -58,6 +64,11 @@ impl DescKey {
     }
 }
 
+fn alloc_desc_key() -> DescKey {
+    static NEXT_DESC_KEY: AtomicUsize = AtomicUsize::new(1);
+    DescKey(NEXT_DESC_KEY.fetch_add(1, Ordering::Relaxed))
+}
+
 /// RPython `class NoStandardGraph(Exception)` (description.py:185-186).
 ///
 /// "The function doesn't have a single standard non-specialized
@@ -77,7 +88,7 @@ impl std::error::Error for NoStandardGraph {}
 /// `desc.rowkey()` (description.py:67). Once FunctionDesc lands,
 /// `rowkey()` returns the Desc itself (identity); for now we carry
 /// the identity via [`DescKey`].
-pub type CallTableRow = HashMap<DescKey, Rc<FunctionGraph>>;
+pub type CallTableRow = HashMap<DescKey, Rc<PyGraph>>;
 
 /// Identity-based equality for two [`CallTableRow`]s. Upstream's
 /// dict-`__eq__` falls back to per-pair equality on `FunctionGraph`
@@ -194,6 +205,12 @@ impl CallFamily {
     // description.py commits 2/3 alongside the FunctionDesc port.
 }
 
+impl UnionFindInfo for Rc<RefCell<CallFamily>> {
+    fn absorb(&mut self, other: Self) {
+        self.borrow_mut().absorb(&other.borrow());
+    }
+}
+
 /// RPython `class FrozenAttrFamily(object)` (description.py:71-96).
 #[derive(Debug)]
 pub struct FrozenAttrFamily {
@@ -248,6 +265,12 @@ impl FrozenAttrFamily {
     /// (description.py:95-96).
     pub fn set_s_value(&mut self, attrname: impl Into<String>, s_value: SomeValue) {
         self.attrs.insert(attrname.into(), s_value);
+    }
+}
+
+impl UnionFindInfo for Rc<RefCell<FrozenAttrFamily>> {
+    fn absorb(&mut self, other: Self) {
+        self.borrow_mut().absorb(&other.borrow());
     }
 }
 
@@ -330,6 +353,11 @@ impl ClassAttrFamily {
 /// dispatches them on every `Desc` instance.
 #[derive(Debug)]
 pub struct Desc {
+    /// Upstream identity key used by the bookkeeper's UnionFind
+    /// tables. Python uses the Desc object itself; Rust assigns a
+    /// stable key at construction time so `&self` methods can still
+    /// address the same partition.
+    pub identity: DescKey,
     /// RPython `self.bookkeeper` (description.py:136).
     pub bookkeeper: Rc<Bookkeeper>,
     /// RPython `self.pyobj` (description.py:138). `None` matches
@@ -341,39 +369,49 @@ impl Desc {
     /// RPython `Desc.__init__(bookkeeper, pyobj=None)`
     /// (description.py:135-138).
     pub fn new(bookkeeper: Rc<Bookkeeper>, pyobj: Option<HostObject>) -> Self {
-        Desc { bookkeeper, pyobj }
+        Desc {
+            identity: alloc_desc_key(),
+            bookkeeper,
+            pyobj,
+        }
     }
 
     /// RPython `Desc.querycallfamily()` (description.py:146-153).
     ///
-    /// **Not ported.** Requires `Bookkeeper.pbc_maximal_call_families`
-    /// (a UnionFind over `CallFamily`) which is Phase 5 P5.2+ dep on
-    /// `rpython/tool/algo/unionfind.py`. Returns `None` matching
-    /// upstream's "no call family yet" reading.
     pub fn querycallfamily(&self) -> Option<Rc<RefCell<CallFamily>>> {
-        None
+        self.bookkeeper
+            .pbc_maximal_call_families
+            .borrow_mut()
+            .get(&self.identity)
+            .cloned()
     }
 
     /// RPython `Desc.getcallfamily()` (description.py:155-159).
     ///
-    /// **Not ported.** Requires bookkeeper-side UnionFind — see
-    /// [`Self::querycallfamily`].
     pub fn getcallfamily(&self) -> Result<Rc<RefCell<CallFamily>>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "Desc.getcallfamily() requires Bookkeeper.pbc_maximal_call_families UnionFind \
-             (Phase 5 P5.2+ dep — see rpython/annotator/description.py:155-159 + \
-             rpython/tool/algo/unionfind.py)",
-        ))
+        let mut families = self.bookkeeper.pbc_maximal_call_families.borrow_mut();
+        let rep = families.find_rep(self.identity);
+        Ok(families
+            .get(&rep)
+            .cloned()
+            .expect("UnionFind.find_rep() must materialize a CallFamily"))
     }
 
     /// RPython `Desc.mergecallfamilies(*others)` (description.py:161-170).
     ///
-    /// **Not ported.** Requires bookkeeper-side UnionFind.
-    pub fn mergecallfamilies(&self, _others: &[&Desc]) -> Result<bool, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "Desc.mergecallfamilies() requires Bookkeeper.pbc_maximal_call_families UnionFind \
-             (Phase 5 P5.2+ dep)",
-        ))
+    pub fn mergecallfamilies(&self, others: &[&Desc]) -> Result<bool, AnnotatorError> {
+        if others.is_empty() {
+            return Ok(false);
+        }
+        let mut changed = false;
+        let mut families = self.bookkeeper.pbc_maximal_call_families.borrow_mut();
+        let mut rep = families.find_rep(self.identity);
+        for desc in others {
+            let (changed1, new_rep) = families.union(rep, desc.identity);
+            changed |= changed1;
+            rep = new_rep;
+        }
+        Ok(changed)
     }
 
     /// RPython `Desc.queryattrfamily()` (description.py:172-175).
@@ -644,7 +682,35 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.rowkey()` (description.py:365-366).
     /// Returns self's identity — upstream `return self`.
     pub fn rowkey(self_rc: &Rc<RefCell<FunctionDesc>>) -> DescKey {
-        DescKey::from_rc(self_rc)
+        self_rc.borrow().base.identity
+    }
+
+    fn key_to_cache_name(key: &str) -> String {
+        let mut out = String::with_capacity(key.len());
+        for ch in key.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                out.push(ch);
+            } else {
+                out.push('_');
+            }
+        }
+        out
+    }
+
+    fn cachedgraph(
+        &self,
+        key: &str,
+        alt_name: Option<&str>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        if let Some(existing) = self.cache.borrow().get(key) {
+            return Ok(existing.clone());
+        }
+        let computed_alt_name = alt_name.or_else(|| if key.is_empty() { None } else { Some(key) });
+        let graph = self.buildgraph(computed_alt_name)?;
+        self.cache
+            .borrow_mut()
+            .insert(key.to_string(), graph.clone());
+        Ok(graph)
     }
 
     /// RPython `FunctionDesc.parse_arguments(args, graph=None)`
@@ -734,13 +800,38 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.buildgraph(alt_name=None, builder=None)`
     /// (description.py:205-213).
     ///
-    /// **Not ported.** Requires `self.bookkeeper.annotator.translator
-    /// .buildflowgraph(self.pyobj)` — annrpython.py dep.
-    pub fn buildgraph(&self, _alt_name: Option<&str>) -> Result<Rc<PyGraph>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FunctionDesc.buildgraph requires annrpython.py \
-             (Phase 5 P5.2+ dep — see description.py:205-213)",
-        ))
+    pub fn buildgraph(&self, alt_name: Option<&str>) -> Result<Rc<PyGraph>, AnnotatorError> {
+        let pyobj = self
+            .base
+            .pyobj
+            .clone()
+            .ok_or_else(|| AnnotatorError::new("FunctionDesc.buildgraph: missing pyobj"))?;
+        let graph_func = pyobj.user_function().cloned().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "FunctionDesc.buildgraph({}): pyobj is not a user function",
+                self.name
+            ))
+        })?;
+        let flow_graph = build_flow(graph_func.clone()).map_err(|err| {
+            AnnotatorError::new(format!("FunctionDesc.buildgraph({}): {:?}", self.name, err))
+        })?;
+        let code = graph_func.code.as_ref().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "FunctionDesc.buildgraph({}): missing code object",
+                self.name
+            ))
+        })?;
+        let signature = code.signature.clone();
+        let mut pygraph = PyGraph {
+            graph: flow_graph,
+            func: graph_func,
+            signature,
+            defaults: self.defaults.clone(),
+        };
+        if let Some(alt_name) = alt_name {
+            pygraph.graph.name = alt_name.to_string();
+        }
+        Ok(Rc::new(pygraph))
     }
 
     /// RPython `FunctionDesc.getuniquegraph()` (description.py:218-226).
@@ -785,13 +876,181 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.specialize(inputcells, op=None)`
     /// (description.py:272-281).
     ///
-    /// **Not ported.** Requires the specializer bodies from
-    /// `rpython/annotator/specialize.py` (not yet ported).
-    pub fn specialize(&self, _inputcells: &mut [SomeValue]) -> Result<Rc<PyGraph>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FunctionDesc.specialize requires specialize.py (Phase 5 P5.2+ dep — \
-             see description.py:272-281)",
-        ))
+    /// The optional `op_key` parameter threads the call-site position
+    /// from the flow-space operation through the annotator driver so
+    /// [`Specializer::CallLocation`] can cache graphs per call site
+    /// (upstream `specialize_call_location(funcdesc, args_s, op)` keys
+    /// on `(op,)` — specialize.py:368-370). When `None`, CallLocation
+    /// falls back to a shared key — acceptable because the annrpython
+    /// driver isn't wired yet (Phase 5 P5.2+ dep).
+    pub fn specialize(
+        &self,
+        inputcells: &mut [SomeValue],
+        op_key: Option<PositionKey>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        self.normalize_args(inputcells)?;
+        match self.specializer.as_ref().unwrap_or(&Specializer::Default) {
+            Specializer::Default => {
+                // upstream `default_specialize(funcdesc, args_s)`
+                // (specialize.py:60-85). Scan args_s for
+                // `SomeInstance` carrying `access_directly`; when
+                // `_jit_look_inside_` (default True) is set, fork the
+                // cached graph into an access-directly variant. When
+                // `_jit_look_inside_=False`, strip the flag from the
+                // instance annotation so the regular graph is used.
+                //
+                // `flatten_star_args` (specialize.py:14-58) — the
+                // *arg builder/key pair — is deferred; it needs
+                // `translator.buildflowgraph` which isn't in this
+                // port yet. Functions without varargs (the common
+                // case) take the `args_s, None, None` fallback.
+                let jit_look_inside = self
+                    .base
+                    .pyobj
+                    .as_ref()
+                    .and_then(|pyobj| pyobj.class_get("_jit_look_inside_"))
+                    .map(|v| !matches!(v, ConstValue::Bool(false)))
+                    .unwrap_or(true);
+                let mut access_directly = false;
+                for s_obj in inputcells.iter_mut() {
+                    if let SomeValue::Instance(inst) = s_obj {
+                        let has_flag = inst.flags.get("access_directly").copied().unwrap_or(false);
+                        if has_flag {
+                            if jit_look_inside {
+                                access_directly = true;
+                                break;
+                            } else {
+                                inst.flags.remove("access_directly");
+                            }
+                        }
+                    }
+                }
+                if access_directly {
+                    // upstream `key = (AccessDirect, key)` — tuple key.
+                    // Rust encodes as prefix on the cache-name string.
+                    self.cachedgraph(
+                        "access_directly",
+                        Some(&format!("{}_access_directly", self.name)),
+                    )
+                } else {
+                    self.cachedgraph("", None)
+                }
+            }
+            Specializer::Arg { parms } => {
+                let mut parts = Vec::with_capacity(parms.len());
+                for parm in parms {
+                    let idx: usize = parm.parse().map_err(|_| {
+                        AnnotatorError::new(format!(
+                            "specialize:arg expects integer indices, got {parm:?}"
+                        ))
+                    })?;
+                    let s = inputcells.get(idx).ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "specialize:arg index {idx} out of range for {}",
+                            self.name
+                        ))
+                    })?;
+                    if !s.is_constant() {
+                        return Err(AnnotatorError::new(format!(
+                            "specialize:arg({idx}): argument not constant: {s:?}"
+                        )));
+                    }
+                    parts.push(format!("arg{idx}_{s:?}"));
+                }
+                let key = Self::key_to_cache_name(&parts.join("__"));
+                self.cachedgraph(&key, Some(&format!("{}_{}", self.name, key)))
+            }
+            Specializer::ArgOrVar { parms } => {
+                let mut all_constant = true;
+                for parm in parms {
+                    let idx: usize = parm.parse().map_err(|_| {
+                        AnnotatorError::new(format!(
+                            "specialize:arg_or_var expects integer indices, got {parm:?}"
+                        ))
+                    })?;
+                    let s = inputcells.get(idx).ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "specialize:arg_or_var index {idx} out of range for {}",
+                            self.name
+                        ))
+                    })?;
+                    if !s.is_constant() {
+                        all_constant = false;
+                        break;
+                    }
+                }
+                if all_constant {
+                    let key = Self::key_to_cache_name(&format!("arg_or_var_{parms:?}"));
+                    self.cachedgraph(&key, Some(&format!("{}_{}", self.name, key)))
+                } else {
+                    self.cachedgraph("", None)
+                }
+            }
+            Specializer::Argtype { parms } => {
+                let mut parts = Vec::with_capacity(parms.len());
+                for parm in parms {
+                    let idx: usize = parm.parse().map_err(|_| {
+                        AnnotatorError::new(format!(
+                            "specialize:argtype expects integer indices, got {parm:?}"
+                        ))
+                    })?;
+                    let s = inputcells.get(idx).ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "specialize:argtype index {idx} out of range for {}",
+                            self.name
+                        ))
+                    })?;
+                    parts.push(format!("{:?}", s.knowntype()));
+                }
+                let key = Self::key_to_cache_name(&parts.join("__"));
+                self.cachedgraph(&key, Some(&format!("{}_{}", self.name, key)))
+            }
+            Specializer::Arglistitemtype { parms } => {
+                let idx: usize = parms
+                    .first()
+                    .ok_or_else(|| {
+                        AnnotatorError::new("specialize:arglistitemtype requires one index")
+                    })?
+                    .parse()
+                    .map_err(|_| {
+                        AnnotatorError::new(format!(
+                            "specialize:arglistitemtype expects integer indices, got {parms:?}"
+                        ))
+                    })?;
+                let key = match inputcells.get(idx) {
+                    Some(SomeValue::List(list)) => {
+                        format!("{:?}", list.listdef.s_value().knowntype())
+                    }
+                    _ => "none".to_string(),
+                };
+                let key = Self::key_to_cache_name(&key);
+                self.cachedgraph(&key, Some(&format!("{}_{}", self.name, key)))
+            }
+            Specializer::CallLocation => {
+                // upstream `specialize_call_location(funcdesc,
+                // args_s, op)` (specialize.py:368-370) — key is
+                // `(op,)`, one specialisation per call site. When the
+                // caller hasn't threaded the position (annrpython
+                // driver not yet wired), fall back to a shared
+                // `"call_location"` bucket — over-merges but is
+                // conservative (no wrong specialisation).
+                let key = match op_key {
+                    Some(pk) => format!(
+                        "call_location_g{:x}_b{:x}_i{}",
+                        pk.graph_id, pk.block_id, pk.op_index
+                    ),
+                    None => "call_location".to_string(),
+                };
+                self.cachedgraph(&key, None)
+            }
+            Specializer::Memo => Err(AnnotatorError::new(
+                "FunctionDesc.specialize: memo specializer still requires \
+                 rpython/annotator/specialize.py MemoTable support",
+            )),
+            Specializer::Ll { .. } | Specializer::LlAndArg { .. } => Err(AnnotatorError::new(
+                "FunctionDesc.specialize: low-level specializers require annlowlevel.py",
+            )),
+        }
     }
 
     /// RPython `FunctionDesc.pycall(whence, args, s_previous_result, op=None)`
@@ -811,9 +1070,13 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.get_graph(args, op)` (description.py:328-330).
-    pub fn get_graph(&self, args: &ArgumentsForTranslation) -> Result<Rc<PyGraph>, AnnotatorError> {
+    pub fn get_graph(
+        &self,
+        args: &ArgumentsForTranslation,
+        op_key: Option<PositionKey>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let mut inputs_s = self.parse_arguments(args, None, None)?;
-        self.specialize(&mut inputs_s)
+        self.specialize(&mut inputs_s, op_key)
     }
 
     /// RPython `FunctionDesc.bind_under(classdef, name)`
@@ -836,17 +1099,28 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.consider_call_site(descs, args, s_result, op)`
     /// (description.py:357-363).
     ///
-    /// **Not ported.** Requires `getcallfamily` + `mergecallfamilies`
-    /// (bookkeeper UnionFind dep).
     pub fn consider_call_site(
-        _descs: &[Rc<RefCell<FunctionDesc>>],
-        _args: &ArgumentsForTranslation,
+        descs: &[Rc<RefCell<FunctionDesc>>],
+        args: &ArgumentsForTranslation,
         _s_result: &SomeValue,
     ) -> Result<(), AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FunctionDesc.consider_call_site requires Bookkeeper.pbc_maximal_call_families \
-             UnionFind (Phase 5 P5.2+ dep — see description.py:357-363)",
-        ))
+        if descs.is_empty() {
+            return Ok(());
+        }
+        let family = descs[0].borrow().base.getcallfamily()?;
+        let shape = args.rawshape();
+        let mut row = CallTableRow::new();
+        for desc in descs {
+            // op_key threading = annrpython.py dep (Phase 5 P5.2+).
+            // CallLocation specialisation falls back to shared key.
+            let graph = desc.borrow().get_graph(args, None)?;
+            row.insert(FunctionDesc::rowkey(desc), graph);
+        }
+        family.borrow_mut().calltable_add_row(shape, row);
+        let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
+        let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
+        descs[0].borrow().base.mergecallfamilies(&others)?;
+        Ok(())
     }
 
     /// RPython `FunctionDesc.get_s_signatures(shape)`
@@ -896,6 +1170,10 @@ pub struct ClassDefKey(pub usize);
 impl ClassDefKey {
     pub fn from_raw(id: usize) -> Self {
         ClassDefKey(id)
+    }
+
+    pub fn from_classdef(classdef: &Rc<RefCell<super::classdesc::ClassDef>>) -> Self {
+        ClassDefKey(Rc::as_ptr(classdef) as usize)
     }
 }
 
@@ -954,18 +1232,27 @@ impl MethodDesc {
     /// dep cleanly.
     pub fn func_args(
         &self,
-        _args: &ArgumentsForTranslation,
+        args: &ArgumentsForTranslation,
     ) -> Result<ArgumentsForTranslation, AnnotatorError> {
-        if self.selfclassdef.is_none() {
+        let Some(selfclassdef) = self.selfclassdef else {
             return Err(AnnotatorError::new(format!(
                 "calling unbound MethodDesc {:?}",
                 self.name
             )));
-        }
-        Err(AnnotatorError::new(
-            "MethodDesc.func_args requires SomeInstance(classdef, flags) \
-             — blocked on classdesc.py (Phase 5 P5.2+ dep, description.py:432-437)",
-        ))
+        };
+        let classdef = self
+            .base
+            .bookkeeper
+            .lookup_classdef(selfclassdef)
+            .ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "MethodDesc.func_args: unknown ClassDefKey {:?}",
+                    selfclassdef
+                ))
+            })?;
+        let s_instance =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, self.flags.clone()));
+        Ok(args.prepend(s_instance))
     }
 
     /// RPython `MethodDesc.pycall(whence, args, s_previous_result, op)`
@@ -983,9 +1270,13 @@ impl MethodDesc {
     }
 
     /// RPython `MethodDesc.get_graph(args, op)` (description.py:443-445).
-    pub fn get_graph(&self, args: &ArgumentsForTranslation) -> Result<Rc<PyGraph>, AnnotatorError> {
+    pub fn get_graph(
+        &self,
+        args: &ArgumentsForTranslation,
+        op_key: Option<PositionKey>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let func_args = self.func_args(args)?;
-        self.funcdesc.borrow().get_graph(&func_args)
+        self.funcdesc.borrow().get_graph(&func_args, op_key)
     }
 
     /// RPython `MethodDesc.bind_under(classdef, name)` (description.py:447-449).
@@ -1008,12 +1299,15 @@ impl MethodDesc {
     /// 5 P5.2 dep on description.py commit 4 / classdesc.py.
     pub fn bind_self(
         &self,
-        _newselfclassdef: ClassDefKey,
-        _flags: std::collections::BTreeMap<String, bool>,
+        newselfclassdef: ClassDefKey,
+        flags: std::collections::BTreeMap<String, bool>,
     ) -> Result<Rc<RefCell<MethodDesc>>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "MethodDesc.bind_self requires bookkeeper.getmethoddesc \
-             (Phase 5 P5.2 dep — see description.py:451-456)",
+        Ok(self.base.bookkeeper.getmethoddesc(
+            &self.funcdesc,
+            self.originclassdef,
+            Some(newselfclassdef),
+            &self.name,
+            flags,
         ))
     }
 
@@ -1023,7 +1317,7 @@ impl MethodDesc {
     /// contain FunctionDescs, not MethodDescs. The present method
     /// returns the FunctionDesc to use as a key in that family."
     pub fn rowkey(&self) -> DescKey {
-        DescKey::from_rc(&self.funcdesc)
+        self.funcdesc.borrow().base.identity
     }
 
     // `MethodDesc.consider_call_site` (description.py:458-465) is
@@ -1047,6 +1341,23 @@ impl MethodDesc {
 /// fallback becomes a real `type(pyobj)` lookup.
 pub fn new_or_old_class(pyobj: &HostObject) -> Option<HostObject> {
     pyobj.instance_class().cloned()
+}
+
+/// Walk the MRO of `cls` and return the first class-dict entry for
+/// `attr`. Mirror of Python's `getattr(cls, attr)` when `cls` has no
+/// per-object shadow: check `cls.__dict__[attr]`, then walk base
+/// classes via `cls.__mro__`.
+fn class_mro_get(cls: &HostObject, attr: &str) -> Option<ConstValue> {
+    if let Some(v) = cls.class_get(attr) {
+        return Some(v);
+    }
+    let mro = cls.mro()?;
+    for base in mro.iter().skip(1) {
+        if let Some(v) = base.class_get(attr) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// RPython `read_attribute` callback type for [`FrozenDesc`]
@@ -1119,17 +1430,37 @@ impl FrozenDesc {
         })
     }
 
-    /// Default `read_attribute` closure — module attributes via
-    /// [`HostObject::module_get`], `None` for everything else.
-    /// Non-module HostObject attribute access waits for the full
-    /// HostObject attribute surface (see the class-attribute bullet
-    /// in the inherited-divergence list: `HostObject` currently
-    /// models module / class / builtin / userfunction / instance /
-    /// opaque only).
+    /// Default `read_attribute` closure — Rust equivalent of upstream
+    /// `lambda attr: getattr(pyobj, attr)` (description.py:534).
+    ///
+    /// Python's `getattr(obj, attr)` does a type-dispatched lookup:
+    ///
+    /// * On **modules** — `obj.__dict__[attr]`.
+    /// * On **classes** — `obj.__dict__[attr]`, else walk `__mro__` of
+    ///   `obj` (class-of-class).
+    /// * On **instances** — `obj.__dict__[attr]`, else walk the MRO of
+    ///   `obj.__class__`.
+    ///
+    /// The Rust port covers all three by reflecting through the
+    /// available `HostObject` surfaces. Instance `__dict__` isn't
+    /// modelled yet, so instance-level frozen attributes fall through
+    /// to the class-hierarchy lookup — matching upstream's behaviour
+    /// for PBCs that expose immutable class-level attributes.
     pub fn default_read_attribute(pyobj: HostObject) -> FrozenReadAttr {
         Box::new(move |attr: &str| -> Option<ConstValue> {
             if pyobj.is_module() {
                 pyobj.module_get(attr).map(ConstValue::HostObject)
+            } else if pyobj.is_class() {
+                // upstream `getattr(cls, attr)` — walk MRO starting at
+                // self.
+                class_mro_get(&pyobj, attr)
+            } else if pyobj.is_instance() {
+                // upstream `getattr(instance, attr)` — Rust port can
+                // only resolve class-hierarchy attributes since
+                // HostObject::Instance has no per-instance dict.
+                pyobj
+                    .instance_class()
+                    .and_then(|cls| class_mro_get(cls, attr))
             } else {
                 None
             }
@@ -1203,27 +1534,40 @@ impl FrozenDesc {
     /// RPython `FrozenDesc.getattrfamily(attrname=None)`
     /// (description.py:577-581).
     ///
-    /// **Not ported.** Requires
-    /// `Bookkeeper.frozenpbc_attr_families` (UnionFind).
     pub fn getattrfamily(&self) -> Result<Rc<RefCell<FrozenAttrFamily>>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FrozenDesc.getattrfamily requires Bookkeeper.frozenpbc_attr_families UnionFind \
-             (Phase 5 P5.2+ dep)",
-        ))
+        let mut families = self.base.bookkeeper.frozenpbc_attr_families.borrow_mut();
+        let rep = families.find_rep(self.base.identity);
+        Ok(families
+            .get(&rep)
+            .cloned()
+            .expect("UnionFind.find_rep() must materialize a FrozenAttrFamily"))
     }
 
     /// RPython `FrozenDesc.queryattrfamily(attrname=None)` (description.py:583-590).
     pub fn queryattrfamily(&self) -> Option<Rc<RefCell<FrozenAttrFamily>>> {
-        None
+        self.base
+            .bookkeeper
+            .frozenpbc_attr_families
+            .borrow_mut()
+            .get(&self.base.identity)
+            .cloned()
     }
 
     /// RPython `FrozenDesc.mergeattrfamilies(others, attrname=None)`
     /// (description.py:592-599).
-    pub fn mergeattrfamilies(&self, _others: &[&FrozenDesc]) -> Result<bool, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FrozenDesc.mergeattrfamilies requires Bookkeeper.frozenpbc_attr_families UnionFind \
-             (Phase 5 P5.2+ dep)",
-        ))
+    pub fn mergeattrfamilies(&self, others: &[&FrozenDesc]) -> Result<bool, AnnotatorError> {
+        if others.is_empty() {
+            return Ok(false);
+        }
+        let mut changed = false;
+        let mut families = self.base.bookkeeper.frozenpbc_attr_families.borrow_mut();
+        let mut rep = families.find_rep(self.base.identity);
+        for desc in others {
+            let (changed1, new_rep) = families.union(rep, desc.base.identity);
+            changed |= changed1;
+            rep = new_rep;
+        }
+        Ok(changed)
     }
 }
 
@@ -1250,21 +1594,44 @@ impl MethodOfFrozenDesc {
         }
     }
 
-    /// RPython `MethodOfFrozenDesc.func_args(args)` (description.py:614-617).
+    /// RPython `MethodOfFrozenDesc.func_args(args)` (description.py:614-617):
     ///
-    /// **Not ported.** Requires `SomePBC([self.frozendesc])` — needs
-    /// the real Desc → SomePBC bridge (SomePBC.descriptions is typed
-    /// `HashSet<super::model::Desc>`, not FrozenDesc). Blocked on
-    /// description.py → model.rs Desc-hierarchy unification (Phase 5
-    /// P5.2+).
+    /// ```python
+    /// def func_args(self, args):
+    ///     from rpython.annotator.model import SomePBC
+    ///     s_self = SomePBC([self.frozendesc])
+    ///     return args.prepend(s_self)
+    /// ```
+    ///
+    /// ## PRE-EXISTING-ADAPTATION
+    ///
+    /// Upstream builds `SomePBC([self.frozendesc])` — a set containing
+    /// exactly the real `FrozenDesc` the method belongs to. The Rust
+    /// port's `SomePBC.descriptions` is typed `HashSet<model::Desc>`
+    /// (a stub `{kind, name}` pair) rather than
+    /// `HashSet<Rc<RefCell<FrozenDesc>>>`, so we can't embed the
+    /// frozendesc identity directly. The identity is preserved via
+    /// `const_box = Some(Constant::new(ConstValue::HostObject(pyobj)))`
+    /// — the HostObject is Arc-based with pointer equality, so downstream
+    /// `resolve_stub_desc` / `bookkeeper.getdesc` round-trips the
+    /// stub back to the real frozendesc via `pyobj` identity.
+    ///
+    /// Blocker: full parity needs the `model::Desc` → real-Desc
+    /// migration (parity finding #3). When that lands, this body
+    /// collapses to the one-liner `args.prepend(SomePBC([self.frozendesc]))`.
     pub fn func_args(
         &self,
-        _args: &ArgumentsForTranslation,
+        args: &ArgumentsForTranslation,
     ) -> Result<ArgumentsForTranslation, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "MethodOfFrozenDesc.func_args requires SomePBC([frozendesc]) bridge \
-             (Phase 5 P5.2+ dep — see description.py:614-617)",
-        ))
+        let pyobj = self.frozendesc.borrow().base.pyobj.clone().ok_or_else(|| {
+            AnnotatorError::new("MethodOfFrozenDesc.func_args: missing frozendesc.pyobj")
+        })?;
+        let mut s_self = SomePBC::new(
+            vec![ModelDesc::new(ModelDescKind::Frozen, pyobj.qualname())],
+            false,
+        );
+        s_self.base.const_box = Some(Constant::new(ConstValue::HostObject(pyobj)));
+        Ok(args.prepend(SomeValue::PBC(s_self)))
     }
 
     /// RPython `MethodOfFrozenDesc.pycall(whence, args,
@@ -1279,14 +1646,18 @@ impl MethodOfFrozenDesc {
     }
 
     /// RPython `MethodOfFrozenDesc.get_graph(args, op)` (description.py:623-625).
-    pub fn get_graph(&self, args: &ArgumentsForTranslation) -> Result<Rc<PyGraph>, AnnotatorError> {
+    pub fn get_graph(
+        &self,
+        args: &ArgumentsForTranslation,
+        op_key: Option<PositionKey>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let func_args = self.func_args(args)?;
-        self.funcdesc.borrow().get_graph(&func_args)
+        self.funcdesc.borrow().get_graph(&func_args, op_key)
     }
 
     /// RPython `MethodOfFrozenDesc.rowkey()` (description.py:636-637).
     pub fn rowkey(&self) -> DescKey {
-        DescKey::from_rc(&self.funcdesc)
+        self.funcdesc.borrow().base.identity
     }
 
     // `consider_call_site` (description.py:627-634) is deferred
@@ -1438,10 +1809,12 @@ mod tests {
     }
 
     #[test]
-    fn desc_getcallfamily_errors_with_dep_citation() {
+    fn desc_getcallfamily_materializes_unionfind_entry() {
         let desc = Desc::new(bk(), None);
-        let err = desc.getcallfamily().unwrap_err();
-        assert!(err.msg.unwrap_or_default().contains("UnionFind"));
+        assert!(desc.querycallfamily().is_none());
+        let family = desc.getcallfamily().expect("callfamily must be created");
+        assert!(family.borrow().descs.contains_key(&desc.identity));
+        assert!(desc.querycallfamily().is_some());
     }
 
     #[test]
@@ -1571,10 +1944,36 @@ mod tests {
     }
 
     #[test]
-    fn function_desc_buildgraph_deferred() {
-        let fd = FunctionDesc::new(bk(), None, "f", int_sig(&[]), None, None);
+    fn function_desc_buildgraph_surfaces_flow_error_from_objspace() {
+        use crate::flowspace::bytecode::HostCode;
+        use crate::flowspace::objspace::CO_NEWLOCALS;
+
+        let mut func = crate::flowspace::model::GraphFunc::new(
+            "f",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func.code = Some(Box::new(HostCode {
+            co_name: "f".to_string(),
+            co_filename: "<test>".to_string(),
+            co_firstlineno: 1,
+            co_nlocals: 0,
+            co_argcount: 0,
+            co_stacksize: 0,
+            co_flags: CO_NEWLOCALS,
+            co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            co_varnames: Vec::new(),
+            co_freevars: Vec::new(),
+            co_cellvars: Vec::new(),
+            consts: Vec::new(),
+            names: Vec::new(),
+            co_lnotab: Vec::new(),
+            exceptiontable: Vec::new().into_boxed_slice(),
+            signature: Signature::new(Vec::new(), None, None),
+        }));
+        let host = HostObject::new_user_function(func);
+        let fd = FunctionDesc::new(bk(), Some(host), "f", int_sig(&[]), None, None);
         let err = fd.buildgraph(None).unwrap_err();
-        assert!(err.msg.unwrap_or_default().contains("annrpython.py"));
+        assert!(err.msg.unwrap_or_default().contains("BytecodeCorruption"));
     }
 
     #[test]
@@ -1653,7 +2052,7 @@ mod tests {
             "m",
             std::collections::BTreeMap::new(),
         );
-        assert_eq!(md.rowkey(), DescKey::from_rc(&fd));
+        assert_eq!(md.rowkey(), FunctionDesc::rowkey(&fd));
     }
 
     #[test]
@@ -1674,20 +2073,22 @@ mod tests {
     }
 
     #[test]
-    fn method_desc_func_args_deferred_when_bound() {
+    fn method_desc_func_args_prepends_someinstance_when_bound() {
         let bk = bk();
+        let classdef = crate::annotator::classdesc::ClassDef::new_standalone("pkg.C", None);
+        bk.register_classdef(classdef.clone());
         let fd = wrap_fd(&bk, "m");
         let md = MethodDesc::new(
             bk,
             fd,
             ClassDefKey::from_raw(1),
-            Some(ClassDefKey::from_raw(2)),
+            Some(ClassDefKey::from_classdef(&classdef)),
             "m",
             std::collections::BTreeMap::new(),
         );
         let args = ArgumentsForTranslation::new(vec![], None, None);
-        let err = md.func_args(&args).unwrap_err();
-        assert!(err.msg.unwrap_or_default().contains("SomeInstance"));
+        let out = md.func_args(&args).expect("bound method args");
+        assert!(matches!(out.arguments_w[0], SomeValue::Instance(_)));
     }
 
     #[test]
@@ -1803,13 +2204,46 @@ mod tests {
     }
 
     #[test]
-    fn frozen_desc_family_methods_deferred() {
+    fn frozen_desc_default_reader_walks_class_mro() {
+        // upstream description.py:534 — default reader is
+        // `lambda attr: getattr(pyobj, attr)`. `getattr(cls, name)` on
+        // a class walks `__mro__` after checking `cls.__dict__`, so an
+        // attribute defined only on a base must still resolve when the
+        // FrozenDesc wraps the subclass.
+        let bk = bk();
+        let base = HostObject::new_class("Base", vec![]);
+        base.class_set("CONST", ConstValue::Int(99));
+        let sub = HostObject::new_class("Sub", vec![base]);
+        let fd = FrozenDesc::new(bk, sub).unwrap();
+        let v = fd.read_attribute("CONST").unwrap();
+        assert!(matches!(v, ConstValue::Int(99)));
+    }
+
+    #[test]
+    fn frozen_desc_default_reader_routes_instance_through_class() {
+        // upstream default reader: `getattr(instance, name)` falls
+        // through to the class hierarchy when the instance has no
+        // per-object dict. Rust HostObject::Instance models no per-
+        // instance dict, so the class-hierarchy lookup is the
+        // authoritative path.
+        let bk = bk();
+        let cls = HostObject::new_class("Cls", vec![]);
+        cls.class_set("TAG", ConstValue::Str("tag".into()));
+        let instance = HostObject::new_instance(cls, vec![]);
+        let fd = FrozenDesc::new(bk, instance).unwrap();
+        let v = fd.read_attribute("TAG").unwrap();
+        assert!(matches!(v, ConstValue::Str(ref s) if s == "tag"));
+    }
+
+    #[test]
+    fn frozen_desc_family_methods_use_unionfind() {
         let bk = bk();
         let pyobj = HostObject::new_module("mod");
         let fd = FrozenDesc::new(bk, pyobj).unwrap();
         assert!(fd.queryattrfamily().is_none());
-        assert!(fd.getattrfamily().is_err());
-        assert!(fd.mergeattrfamilies(&[]).is_err());
+        let family = fd.getattrfamily().expect("family");
+        assert!(family.borrow().descs.contains_key(&fd.base.identity));
+        assert!(!fd.mergeattrfamilies(&[]).unwrap());
     }
 
     #[test]
@@ -1820,11 +2254,11 @@ mod tests {
             FrozenDesc::new(bk.clone(), HostObject::new_module("mod")).unwrap(),
         ));
         let mfd = MethodOfFrozenDesc::new(bk, fd.clone(), frozen);
-        assert_eq!(mfd.rowkey(), DescKey::from_rc(&fd));
+        assert_eq!(mfd.rowkey(), FunctionDesc::rowkey(&fd));
     }
 
     #[test]
-    fn method_of_frozen_desc_func_args_deferred() {
+    fn method_of_frozen_desc_func_args_prepends_frozen_pbc() {
         let bk = bk();
         let fd = wrap_fd(&bk, "m");
         let frozen = Rc::new(RefCell::new(
@@ -1832,7 +2266,7 @@ mod tests {
         ));
         let mfd = MethodOfFrozenDesc::new(bk, fd, frozen);
         let args = ArgumentsForTranslation::new(vec![], None, None);
-        let err = mfd.func_args(&args).unwrap_err();
-        assert!(err.msg.unwrap_or_default().contains("SomePBC"));
+        let out = mfd.func_args(&args).expect("method-of-frozen args");
+        assert!(matches!(out.arguments_w[0], SomeValue::PBC(_)));
     }
 }

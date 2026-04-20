@@ -233,19 +233,17 @@ mod tests {
     }
 
     #[test]
-    fn build_flow_reports_generator_gap_as_flowing_error() {
+    fn build_flow_bootstraps_generator_entry_graph() {
         let mut func = GraphFunc::new("gen", empty_globals());
         let mut code = make_empty_host_code();
         code.co_flags = CO_NEWLOCALS | CO_GENERATOR;
         func.code = Some(Box::new(code));
 
-        let err = build_flow(func).unwrap_err();
-        match err {
-            FlowContextError::Flowing(err) => {
-                assert!(err.message.contains("generator flowspace requires"));
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+        let graph = build_flow(func).expect("generator bootstrap graph");
+        let ops = &graph.startblock.borrow().operations;
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opname, "simple_call");
+        assert_eq!(ops[1].opname, "simple_call");
     }
 
     fn make_empty_host_code() -> HostCode {

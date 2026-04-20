@@ -30,9 +30,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::bookkeeper::{Bookkeeper, PositionKey};
+use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::listdef::{ItemOwner, ListItem};
-use super::model::{SomeValue, UnionError, union};
+use super::model::{SomeBool, SomeInteger, SomeValue, UnionError, union};
 
 /// RPython `class DictKey(ListItem)` (dictdef.py:7-66). Zero-sized
 /// namespace for the subclass constructor + `merge` override. The
@@ -159,20 +159,67 @@ impl DictKey {
 
     /// RPython `DictKey.emulate_rdict_calls(other=None)` (dictdef.py:43-66).
     ///
-    /// **Not ported.** Requires `Bookkeeper.emulate_pbc_call` which is
-    /// Phase 5 P5.2 territory (bookkeeper.py:358). Raises a
-    /// distinctive `UnionError` rather than silently succeeding so that
-    /// r_dict annotation bugs surface at merge time instead of
-    /// propagating bad eq/hash annotations through the rest of the
-    /// pipeline.
-    fn emulate_rdict_calls(_self_li: &Rc<RefCell<ListItem>>) -> Result<(), UnionError> {
-        Err(UnionError {
-            lhs: SomeValue::Impossible,
-            rhs: SomeValue::Impossible,
-            msg: "r_dict eq/hash validation requires bookkeeper.emulate_pbc_call \
-                  (Phase 5 P5.2). See rpython/annotator/dictdef.py:43-66."
-                .into(),
-        })
+    fn emulate_rdict_calls(self_li: &Rc<RefCell<ListItem>>) -> Result<(), UnionError> {
+        let (bookkeeper, s_key, s_eqfn, s_hashfn) = {
+            let b = self_li.borrow();
+            (
+                b.bookkeeper.clone().ok_or_else(|| UnionError {
+                    lhs: b.s_value.clone(),
+                    rhs: b.s_value.clone(),
+                    msg: "r_dict key has no bookkeeper".into(),
+                })?,
+                b.s_value.clone(),
+                b.s_rdict_eqfn.clone(),
+                b.s_rdict_hashfn.clone(),
+            )
+        };
+        let item_id = Rc::as_ptr(self_li) as usize;
+        let s_eq = bookkeeper
+            .emulate_pbc_call(
+                EmulatedPbcCallKey::RDictCall {
+                    item_id,
+                    role: "eq",
+                },
+                &s_eqfn,
+                &[s_key.clone(), s_key.clone()],
+                &[],
+            )
+            .map_err(|e| UnionError {
+                lhs: s_eqfn.clone(),
+                rhs: s_key.clone(),
+                msg: e.msg.unwrap_or_else(|| "emulate_pbc_call failed".into()),
+            })?;
+        if !SomeValue::Bool(SomeBool::new()).contains(&s_eq) {
+            return Err(UnionError {
+                lhs: s_eq,
+                rhs: s_key.clone(),
+                msg: "the custom eq function of an r_dict must return a boolean".into(),
+            });
+        }
+
+        let s_hash = bookkeeper
+            .emulate_pbc_call(
+                EmulatedPbcCallKey::RDictCall {
+                    item_id,
+                    role: "hash",
+                },
+                &s_hashfn,
+                &[s_key.clone()],
+                &[],
+            )
+            .map_err(|e| UnionError {
+                lhs: s_hashfn.clone(),
+                rhs: s_key.clone(),
+                msg: e.msg.unwrap_or_else(|| "emulate_pbc_call failed".into()),
+            })?;
+        if !SomeValue::Integer(SomeInteger::default()).contains(&s_hash) {
+            return Err(UnionError {
+                lhs: s_hash,
+                rhs: s_key,
+                msg: "the custom hash function of an r_dict must return an integer".into(),
+            });
+        }
+        Ok(())
     }
 }
 

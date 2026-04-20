@@ -997,43 +997,64 @@ impl HLOperation {
     }
 
     fn constfold_getattr(&self) -> Result<Option<Hlvalue>, FlowingError> {
-        match self.args.as_slice() {
-            [_, _, _] => Err(FlowingError::new(format!(
+        // upstream operation.py:624-646:
+        //
+        //     def constfold(self):
+        //         if len(self.args) == 3:
+        //             raise FlowingError("getattr() with three arguments not supported: %s" % (self,))
+        //         w_obj, w_name = self.args
+        //         # handling special things like sys
+        //         if (w_obj in NOT_REALLY_CONST and
+        //                 w_name not in NOT_REALLY_CONST[w_obj]):
+        //             return
+        //         if w_obj.foldable() and w_name.foldable():
+        //             obj, name = w_obj.value, w_name.value
+        //             try:
+        //                 result = getattr(obj, name)
+        //             except Exception as e:
+        //                 raise FlowingError("getattr(%s, %s) always raises %s: %s" % ...)
+        //             try:
+        //                 return const(result)
+        //             except WrapException:
+        //                 pass
+        if self.args.len() == 3 {
+            return Err(FlowingError::new(format!(
                 "getattr() with three arguments not supported: {self:?}"
-            ))),
-            [Hlvalue::Constant(w_obj), Hlvalue::Constant(w_name)] => {
-                let ConstValue::Str(name) = &w_name.value else {
-                    return Ok(None);
-                };
-                let name_str = name.to_string();
-                match &w_obj.value {
-                    ConstValue::HostObject(obj) if obj.is_module() => {
-                        // upstream operation.py:631-633 — the
-                        // NOT_REALLY_CONST guard. Listed modules hold
-                        // mostly-variable attributes; only the
-                        // explicitly-declared names (`sys.maxint`,
-                        // `sys.exit`, …) are real constants that flow
-                        // space may fold. Anything else declines the
-                        // fold so the annotator sees a runtime-read op.
-                        if not_really_const_declines(obj.qualname(), &name_str) {
-                            return Ok(None);
-                        }
-                        if let Some(value) = obj.module_get(&name_str) {
-                            Ok(Some(Hlvalue::Constant(Constant::new(
-                                ConstValue::HostObject(value),
-                            ))))
-                        } else {
-                            Err(FlowingError::new(format!(
-                                "getattr({}, {:?}) always raises AttributeError",
-                                obj.qualname(),
-                                name_str
-                            )))
-                        }
-                    }
-                    _ => Ok(None),
-                }
+            )));
+        }
+        let [w_obj_hl, w_name_hl] = self.args.as_slice() else {
+            return Ok(None);
+        };
+        let (Hlvalue::Constant(w_obj), Hlvalue::Constant(w_name)) = (w_obj_hl, w_name_hl) else {
+            return Ok(None);
+        };
+        let ConstValue::Str(name) = &w_name.value else {
+            return Ok(None);
+        };
+        let name_str = name.to_string();
+
+        // upstream operation.py:631-633 — NOT_REALLY_CONST guard. In
+        // the Rust port the table is keyed on module qualname; the
+        // guard only fires for module objects.
+        if let ConstValue::HostObject(h) = &w_obj.value {
+            if h.is_module() && not_really_const_declines(h.qualname(), &name_str) {
+                return Ok(None);
             }
-            _ => Ok(None),
+        }
+
+        // upstream operation.py:634 — `if w_obj.foldable() and w_name.foldable()`.
+        // Constant-str for `w_name` already satisfies foldable().
+        if !w_obj.foldable() {
+            return Ok(None);
+        }
+
+        match host_const_getattr(&w_obj.value, &name_str) {
+            Ok(Some(value)) => Ok(Some(Hlvalue::Constant(Constant::new(value)))),
+            // upstream WrapException path — flowspace couldn't wrap the
+            // result, so fold declines silently. We report this as "no
+            // surface for this attribute" by returning None.
+            Ok(None) => Ok(None),
+            Err(msg) => Err(FlowingError::new(msg)),
         }
     }
 
@@ -1060,6 +1081,42 @@ impl HLOperation {
             Hlvalue::Variable(self.result),
             self.offset,
         )
+    }
+}
+
+/// Rust equivalent of upstream `getattr(obj, name)` applied to a
+/// flow-space constant. Returns:
+///
+/// * `Ok(Some(value))` — the attribute lookup succeeded; wrap the
+///   result as a `Constant` in the fold.
+/// * `Ok(None)` — no attribute surface on this host type; upstream's
+///   `const(result)` / `WrapException` path declines the fold silently.
+/// * `Err(msg)` — upstream's `except Exception as e` branch in
+///   `GetAttr.constfold` (operation.py:637-642) — the lookup raised,
+///   so the call surfaces as a `FlowingError`.
+fn host_const_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>, String> {
+    match obj {
+        ConstValue::HostObject(h) if h.is_module() => match h.module_get(name) {
+            Some(value) => Ok(Some(ConstValue::HostObject(value))),
+            None => Err(format!(
+                "getattr({}, {:?}) always raises AttributeError",
+                h.qualname(),
+                name
+            )),
+        },
+        ConstValue::HostObject(h) if h.is_class() => match h.class_get(name) {
+            Some(value) => Ok(Some(value)),
+            None => Err(format!(
+                "getattr({}, {:?}) always raises AttributeError",
+                h.qualname(),
+                name
+            )),
+        },
+        // Primitive foldable constants (Int / Float / Str / …) in
+        // upstream would hit `getattr(1, '__class__')` etc.; the Rust
+        // port models no dunder-attribute surface on primitives, so
+        // fold declines — upstream's `WrapException` silent-pass.
+        _ => Ok(None),
     }
 }
 
@@ -1585,6 +1642,59 @@ mod tests {
             vec![c(ConstValue::HostObject(sys)), cs("maxint")],
         );
         assert!(op.constfold().unwrap().is_some());
+    }
+
+    #[test]
+    fn getattr_constfold_folds_class_attribute() {
+        // upstream operation.py:634-644 — `getattr(cls, 'method')`
+        // folds when the class exposes the attribute via its __dict__.
+        use crate::flowspace::model::HostObject;
+        let cls = HostObject::new_class("Foo", vec![]);
+        cls.class_set("CONST".to_string(), ConstValue::Int(42));
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![c(ConstValue::HostObject(cls)), cs("CONST")],
+        );
+        let folded = op
+            .constfold()
+            .expect("class getattr should not error")
+            .expect("class getattr should fold");
+        let Hlvalue::Constant(constant) = folded else {
+            panic!("expected Constant result");
+        };
+        assert_eq!(constant.value, ConstValue::Int(42));
+    }
+
+    #[test]
+    fn getattr_constfold_raises_flowing_error_on_missing_class_attribute() {
+        // upstream operation.py:637-642 — `getattr(cls, 'missing')`
+        // raises `AttributeError`, which flowspace escalates to
+        // `FlowingError("… always raises AttributeError")`.
+        use crate::flowspace::model::HostObject;
+        let cls = HostObject::new_class("Foo", vec![]);
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![c(ConstValue::HostObject(cls)), cs("missing")],
+        );
+        let err = op
+            .constfold()
+            .expect_err("missing class attribute must escalate to FlowingError");
+        assert!(err.message.contains("always raises AttributeError"));
+    }
+
+    #[test]
+    fn getattr_constfold_declines_on_non_foldable_obj() {
+        // upstream operation.py:634 — `w_obj.foldable()` gate. A user
+        // function (non-foldable) declines the fold silently.
+        use crate::flowspace::model::{GraphFunc, HostObject};
+        let globals = Constant::new(ConstValue::None);
+        let gf = GraphFunc::new("user_fn".to_string(), globals);
+        let func = HostObject::new_user_function(gf);
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![c(ConstValue::HostObject(func)), cs("whatever")],
+        );
+        assert!(op.constfold().unwrap().is_none());
     }
 
     #[test]
