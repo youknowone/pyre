@@ -64,50 +64,21 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
                 }
             }
 
-            // Cross-block propagation: Link args → target inputargs (RPython)
-            // Terminator carries values to successor block's inputargs.
-            match &block.terminator {
-                Terminator::Goto { target, args } => {
-                    let target_block = graph.block(*target);
-                    for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
-                        let src_ty = state.get(*src).clone();
-                        let current = state.get(*dst).clone();
-                        let merged = union_type(&current, &src_ty);
-                        if merged != current {
-                            state.set(*dst, merged);
-                            changed = true;
-                        }
+            // Cross-block propagation: Link args → target inputargs, per
+            // upstream `rpython/annotator/annrpython.rs` fold pass which
+            // iterates `for link in block.exits` and unions each
+            // `link.args[i]` annotation into `link.target.inputargs[i]`.
+            for link in &block.exits {
+                let target_block = graph.block(link.target);
+                for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                    let src_ty = state.get(*src).clone();
+                    let current = state.get(*dst).clone();
+                    let merged = union_type(&current, &src_ty);
+                    if merged != current {
+                        state.set(*dst, merged);
+                        changed = true;
                     }
                 }
-                Terminator::Branch {
-                    if_true,
-                    true_args,
-                    if_false,
-                    false_args,
-                    ..
-                } => {
-                    let true_block = graph.block(*if_true);
-                    for (dst, src) in true_block.inputargs.iter().zip(true_args.iter()) {
-                        let src_ty = state.get(*src).clone();
-                        let current = state.get(*dst).clone();
-                        let merged = union_type(&current, &src_ty);
-                        if merged != current {
-                            state.set(*dst, merged);
-                            changed = true;
-                        }
-                    }
-                    let false_block = graph.block(*if_false);
-                    for (dst, src) in false_block.inputargs.iter().zip(false_args.iter()) {
-                        let src_ty = state.get(*src).clone();
-                        let current = state.get(*dst).clone();
-                        let merged = union_type(&current, &src_ty);
-                        if merged != current {
-                            state.set(*dst, merged);
-                            changed = true;
-                        }
-                    }
-                }
-                _ => {}
             }
         }
     }

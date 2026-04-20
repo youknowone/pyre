@@ -728,6 +728,24 @@ impl Block {
     pub fn canraise(&self) -> bool {
         matches!(self.exitswitch, Some(ExitSwitch::LastException))
     }
+
+    /// RPython `flowspace/model.py:247 closeblock` / `:250 recloseblock`
+    /// mark a block's exits tuple as populated.  Pyre mirrors the
+    /// "has this block been closed?" predicate by checking that either
+    /// `exits` has at least one `Link` or `exitswitch` is set.
+    /// During graph construction, an unclosed block has
+    /// `exits=[]`, `exitswitch=None` — the upstream equivalent of
+    /// `type(block.exits) is list` pre-`closeblock`.
+    pub fn is_closed(&self) -> bool {
+        !self.exits.is_empty() || self.exitswitch.is_some()
+    }
+
+    /// Complement of `is_closed` — true if the front-end has not yet
+    /// stamped a terminator / exits onto the block.  Used to gate
+    /// fall-through code that adds the block's own exit.
+    pub fn is_open(&self) -> bool {
+        !self.is_closed()
+    }
 }
 
 /// PRE-EXISTING-ADAPTATION — pyre's codewriter graph carries a
@@ -1131,7 +1149,17 @@ impl FunctionGraph {
                     .unwrap_or_default();
                 out.push_str(&format!("    {}{:?}\n", result, op.kind));
             }
-            out.push_str(&format!("    → {:?}\n", block.terminator));
+            // Upstream `flowspace/model.py:199 __repr__` prints the block
+            // shape as "block@N with K exits[(exitswitch)]".  Mirror the
+            // same summary from pyre's canonical exitswitch/exits pair.
+            match &block.exitswitch {
+                Some(switch) => out.push_str(&format!(
+                    "    → {} exits ({:?})\n",
+                    block.exits.len(),
+                    switch
+                )),
+                None => out.push_str(&format!("    → {} exits\n", block.exits.len())),
+            }
         }
         out
     }
@@ -1204,13 +1232,14 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(value));
-        assert_eq!(
-            graph.block(entry).terminator,
-            Terminator::Goto {
-                target: graph.returnblock,
-                args: vec![value],
-            }
-        );
-        assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
+        // Upstream `flowspace/model.py:171-180` identifies the routed
+        // return by Block.exits carrying a single Link(value, returnblock)
+        // with exitswitch=None.
+        let entry_block = graph.block(entry);
+        assert!(entry_block.exitswitch.is_none());
+        assert_eq!(entry_block.exits.len(), 1);
+        assert_eq!(entry_block.exits[0].prevblock, Some(entry));
+        assert_eq!(entry_block.exits[0].target, graph.returnblock);
+        assert_eq!(entry_block.exits[0].args, vec![value]);
     }
 }

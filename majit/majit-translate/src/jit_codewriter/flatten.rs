@@ -272,22 +272,18 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             //   if block.exits == (): self.make_return(block.inputargs)
             // Final block — emit the matching return from the block's
             // own inputargs.
-            make_return(
-                graph,
-                &mut ops,
-                regallocs,
-                &block.inputargs,
-                &block.terminator,
-            );
+            make_return(graph, &mut ops, regallocs, &block.inputargs);
         } else {
-            match &block.terminator {
-                Terminator::Unreachable => {
-                    // Terminal — no jump
-                }
-                Terminator::Goto { .. } | Terminator::Branch { .. } => {
-                    panic!("block has control-flow terminator without synchronized exits metadata");
-                }
-            }
+            // Upstream `flatten.py:177-278 insert_exits` only handles the
+            // four Block.exits shapes above (single goto, can-raise
+            // multi-exit, 2-way bool branch, empty final block).  A block
+            // whose exits don't match any of those has been produced by
+            // an unsupported front-end construct.
+            panic!(
+                "unsupported block.exits shape: {} exits, exitswitch = {:?}",
+                block.exits.len(),
+                block.exitswitch,
+            );
         }
     }
 
@@ -420,7 +416,8 @@ fn make_link(
         let carries_exception_args = link.last_exception.is_some_and(|v| link.args.contains(&v))
             || link.last_exc_value.is_some_and(|v| link.args.contains(&v));
         if !carries_exception_args {
-            make_return(graph, ops, regallocs, &link.args, &target_block.terminator);
+            let _ = target_block;
+            make_return(graph, ops, regallocs, &link.args);
             return;
         }
     }
@@ -457,11 +454,10 @@ fn generate_last_exc(link: &Link, target_inputargs: &[ValueId], ops: &mut Vec<Fl
 /// (`Unreachable`) pair from the final-block inputargs (or, when called
 /// from the `make_link` optimization, directly from the link's args).
 fn make_return(
-    graph: &FunctionGraph,
+    _graph: &FunctionGraph,
     ops: &mut Vec<FlatOp>,
     regallocs: &HashMap<RegKind, RegAllocResult>,
     args: &[ValueId],
-    terminator: &Terminator,
 ) {
     match args.len() {
         1 => {
@@ -495,9 +491,7 @@ fn make_return(
             // and drops the redundant argument.
             ops.push(FlatOp::VoidReturn);
         }
-        other => panic!(
-            "make_return: unexpected final-block inputarg count {other} (terminator = {terminator:?})"
-        ),
+        other => panic!("make_return: unexpected final-block inputarg count {other}"),
     }
     // RPython `flatten.py:146` `emitline('---')`.
     ops.push(FlatOp::Unreachable);

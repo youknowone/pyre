@@ -242,27 +242,16 @@ impl RegAllocator {
             }
         }
         // Variables used in exit links stay alive until block end.
-        match &block.terminator {
-            Terminator::Goto { args, .. } => {
-                for &v in args {
-                    die_at.remove(&v);
-                }
+        // RPython `rpython/jit/codewriter/regalloc.py:71-78 compute_liveness`:
+        // iterate `block.exits` for `link.args` + `block.exitswitch` for the
+        // branch condition.
+        for link in &block.exits {
+            for &v in &link.args {
+                die_at.remove(&v);
             }
-            Terminator::Branch {
-                cond,
-                true_args,
-                false_args,
-                ..
-            } => {
-                die_at.remove(cond);
-                for &v in true_args {
-                    die_at.remove(&v);
-                }
-                for &v in false_args {
-                    die_at.remove(&v);
-                }
-            }
-            _ => {}
+        }
+        if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
+            die_at.remove(cond);
         }
         let mut die_list: Vec<(usize, ValueId)> = die_at.into_iter().map(|(v, t)| (t, v)).collect();
         die_list.sort();
@@ -305,33 +294,15 @@ impl RegAllocator {
     }
 
     /// RPython: `RegAllocator.coalesce_variables()` — regalloc.py:79-96.
-    /// Coalesce link.args[i] with target.inputargs[i].
+    /// Coalesce link.args[i] with target.inputargs[i] for every exit
+    /// link, matching upstream's `for link in block.exits: ...` loop.
     fn coalesce_variables(&mut self, graph: &FunctionGraph, consider: &dyn Fn(ValueId) -> bool) {
         for block in &graph.blocks {
-            match &block.terminator {
-                Terminator::Goto { target, args } => {
-                    let target_block = graph.block(*target);
-                    for (&v, &w) in args.iter().zip(target_block.inputargs.iter()) {
-                        self.try_coalesce(v, w, consider);
-                    }
+            for link in &block.exits {
+                let target_block = graph.block(link.target);
+                for (&v, &w) in link.args.iter().zip(target_block.inputargs.iter()) {
+                    self.try_coalesce(v, w, consider);
                 }
-                Terminator::Branch {
-                    if_true,
-                    true_args,
-                    if_false,
-                    false_args,
-                    ..
-                } => {
-                    let tb = graph.block(*if_true);
-                    for (&v, &w) in true_args.iter().zip(tb.inputargs.iter()) {
-                        self.try_coalesce(v, w, consider);
-                    }
-                    let fb = graph.block(*if_false);
-                    for (&v, &w) in false_args.iter().zip(fb.inputargs.iter()) {
-                        self.try_coalesce(v, w, consider);
-                    }
-                }
-                _ => {}
             }
         }
     }

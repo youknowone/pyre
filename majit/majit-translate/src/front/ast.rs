@@ -773,7 +773,7 @@ fn build_function_graph(
     }
 
     // Default terminator if none was set
-    if graph.block(entry).terminator == Terminator::Unreachable {
+    if graph.block(entry).is_open() {
         graph.set_return(entry, None);
     }
 
@@ -1192,7 +1192,7 @@ fn lower_expr(
             let (merge_block, phi_result) = if then_result.is_some() && else_result.is_some() {
                 let (merge, phi_args) = graph.create_block_with_args(1);
                 // Link args: then → merge(then_result), else → merge(else_result)
-                if graph.block(then_block).terminator == Terminator::Unreachable {
+                if graph.block(then_block).is_open() {
                     graph.set_terminator(
                         then_block,
                         Terminator::Goto {
@@ -1201,7 +1201,7 @@ fn lower_expr(
                         },
                     );
                 }
-                if graph.block(else_block).terminator == Terminator::Unreachable {
+                if graph.block(else_block).is_open() {
                     graph.set_terminator(
                         else_block,
                         Terminator::Goto {
@@ -1213,7 +1213,7 @@ fn lower_expr(
                 (merge, Some(phi_args[0]))
             } else {
                 let merge = graph.create_block();
-                if graph.block(then_block).terminator == Terminator::Unreachable {
+                if graph.block(then_block).is_open() {
                     graph.set_terminator(
                         then_block,
                         Terminator::Goto {
@@ -1222,7 +1222,7 @@ fn lower_expr(
                         },
                     );
                 }
-                if graph.block(else_block).terminator == Terminator::Unreachable {
+                if graph.block(else_block).is_open() {
                     graph.set_terminator(
                         else_block,
                         Terminator::Goto {
@@ -1354,7 +1354,7 @@ fn lower_expr(
                 // Each arm gets its own block (simplified: no pattern matching guards)
                 let result = lower_expr(graph, &mut arm_block, &arm.body, options, ctx);
                 arm_results.push((arm_block, result));
-                if graph.block(arm_block).terminator == Terminator::Unreachable {
+                if graph.block(arm_block).is_open() {
                     let goto_args = result.map_or(vec![], |v| vec![v]);
                     graph.set_terminator(
                         arm_block,
@@ -1428,7 +1428,7 @@ fn lower_expr(
             for stmt in &w.body.stmts {
                 lower_stmt(graph, &mut body, stmt, options, ctx);
             }
-            if graph.block(body).terminator == Terminator::Unreachable {
+            if graph.block(body).is_open() {
                 graph.set_terminator(
                     body,
                     Terminator::Goto {
@@ -1456,7 +1456,7 @@ fn lower_expr(
             for stmt in &l.body.stmts {
                 lower_stmt(graph, &mut body, stmt, options, ctx);
             }
-            if graph.block(body).terminator == Terminator::Unreachable {
+            if graph.block(body).is_open() {
                 graph.set_terminator(
                     body,
                     Terminator::Goto {
@@ -1498,7 +1498,7 @@ fn lower_expr(
             for stmt in &f.body.stmts {
                 lower_stmt(graph, &mut body, stmt, options, ctx);
             }
-            if graph.block(body).terminator == Terminator::Unreachable {
+            if graph.block(body).is_open() {
                 graph.set_terminator(
                     body,
                     Terminator::Goto {
@@ -2414,15 +2414,16 @@ mod tests {
             "if/else should create >=4 blocks, got {}",
             graph.blocks.len()
         );
-        // Entry block should have a Branch terminator
+        // Upstream `flowspace/model.py:175-180` tags a bool branch by
+        // `block.exitswitch == Variable` with two exits whose
+        // `exitcase` values are True / False respectively.
+        let entry = graph.block(graph.startblock);
         assert!(
-            matches!(
-                &graph.block(graph.startblock).terminator,
-                Terminator::Branch { .. }
-            ),
-            "entry should end with Branch, got {:?}",
-            graph.block(graph.startblock).terminator
+            matches!(entry.exitswitch, Some(crate::model::ExitSwitch::Value(_))),
+            "entry exitswitch should name the branch condition, got {:?}",
+            entry.exitswitch,
         );
+        assert_eq!(entry.exits.len(), 2, "bool branch has two exits");
     }
 
     #[test]
@@ -2819,16 +2820,17 @@ mod tests {
             .find(|f| f.graph.name == "returns_one")
             .expect("returns_one present");
         let entry = func.graph.block(func.graph.startblock);
-        assert_eq!(
-            entry.terminator,
-            Terminator::Goto {
-                target: func.graph.returnblock,
-                args: vec![entry.operations[0].result.expect("const result")],
-            }
-        );
+        // rpython/flowspace/model.py:171-180 Block is characterized by
+        // exits + exitswitch; a non-void return is Link(
+        // [return_value], graph.returnblock) with exitswitch=None.
+        assert!(entry.exitswitch.is_none());
         assert_eq!(entry.exits.len(), 1);
         assert_eq!(entry.exits[0].prevblock, Some(func.graph.startblock));
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
+        assert_eq!(
+            entry.exits[0].args,
+            vec![entry.operations[0].result.expect("const result")],
+        );
     }
 
     #[test]
@@ -2849,18 +2851,18 @@ mod tests {
         // prevblock side for `return None`; the returnblock's own
         // inputarg stays distinct.
         let returnblock_arg = func.graph.block(func.graph.returnblock).inputargs[0];
-        let Terminator::Goto { target, args } = &entry.terminator else {
-            panic!("expected Goto, got {:?}", entry.terminator);
-        };
-        assert_eq!(*target, func.graph.returnblock);
-        assert_eq!(args.len(), 1);
-        assert_ne!(
-            args[0], returnblock_arg,
-            "void return must allocate a fresh prevblock-side ValueId (`flowspace/model.py:114`), \
-             not reuse the returnblock's own inputarg"
-        );
+        // Upstream `flowspace/model.py:171-180` keeps the void return shape
+        // in Block.exits: a single Link([fresh_void], graph.returnblock)
+        // with exitswitch=None.
+        assert!(entry.exitswitch.is_none());
         assert_eq!(entry.exits.len(), 1);
         assert_eq!(entry.exits[0].prevblock, Some(func.graph.startblock));
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
+        assert_eq!(entry.exits[0].args.len(), 1);
+        assert_ne!(
+            entry.exits[0].args[0], returnblock_arg,
+            "void return must allocate a fresh prevblock-side ValueId (`flowspace/model.py:114`), \
+             not reuse the returnblock's own inputarg"
+        );
     }
 }

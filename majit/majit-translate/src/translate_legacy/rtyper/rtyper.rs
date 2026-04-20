@@ -80,40 +80,21 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
         }
     }
 
-    // Cross-block: propagate through Link args → target inputargs
+    // Cross-block: propagate through Link args → target inputargs.
+    // Upstream `flowspace/model.py:244 renamevariables` iterates
+    // `for link in self.exits: link.args` to rename across block
+    // boundaries, so walk the same Block.exits list here.
     for block in &graph.blocks {
-        match &block.terminator {
-            crate::model::Terminator::Goto { target, args } => {
-                let target_block = graph.block(*target);
-                for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
-                    if state.get(*dst) == &ConcreteType::Unknown {
-                        let src_ty = state.get(*src).clone();
-                        if src_ty != ConcreteType::Unknown {
-                            state.concrete_types.insert(*dst, src_ty);
-                        }
+        for link in &block.exits {
+            let target_block = graph.block(link.target);
+            for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                if state.get(*dst) == &ConcreteType::Unknown {
+                    let src_ty = state.get(*src).clone();
+                    if src_ty != ConcreteType::Unknown {
+                        state.concrete_types.insert(*dst, src_ty);
                     }
                 }
             }
-            crate::model::Terminator::Branch {
-                if_true,
-                true_args,
-                if_false,
-                false_args,
-                ..
-            } => {
-                for (target, args) in [(*if_true, true_args), (*if_false, false_args)] {
-                    let target_block = graph.block(target);
-                    for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
-                        if state.get(*dst) == &ConcreteType::Unknown {
-                            let src_ty = state.get(*src).clone();
-                            if src_ty != ConcreteType::Unknown {
-                                state.concrete_types.insert(*dst, src_ty);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
 

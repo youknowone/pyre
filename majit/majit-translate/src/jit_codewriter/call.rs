@@ -3307,37 +3307,18 @@ fn collect_readwrite_effects(
         .collect();
 
     // RPython: phi/link args carry concretetype through block boundaries.
-    // Build inputarg → source value mapping from Goto/Cond terminators so
-    // resolve_array_identity can trace through control-flow merges.
+    // Build inputarg → source value mapping from every exit link (upstream
+    // `flowspace/model.py:244 renamevariables` walks `for link in
+    // self.exits: link.args`), so resolve_array_identity can trace through
+    // control-flow merges of any exit fan-out.
     let mut phi_sources: HashMap<crate::model::ValueId, crate::model::ValueId> = HashMap::new();
     for block in &graph.blocks {
-        match &block.terminator {
-            crate::model::Terminator::Goto { target, args } => {
-                if let Some(target_block) = graph.blocks.get(target.0) {
-                    for (ia, src) in target_block.inputargs.iter().zip(args.iter()) {
-                        phi_sources.insert(*ia, *src);
-                    }
+        for link in &block.exits {
+            if let Some(target_block) = graph.blocks.get(link.target.0) {
+                for (ia, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                    phi_sources.insert(*ia, *src);
                 }
             }
-            crate::model::Terminator::Branch {
-                if_true,
-                true_args,
-                if_false,
-                false_args,
-                ..
-            } => {
-                if let Some(tb) = graph.blocks.get(if_true.0) {
-                    for (ia, src) in tb.inputargs.iter().zip(true_args.iter()) {
-                        phi_sources.insert(*ia, *src);
-                    }
-                }
-                if let Some(fb) = graph.blocks.get(if_false.0) {
-                    for (ia, src) in fb.inputargs.iter().zip(false_args.iter()) {
-                        phi_sources.insert(*ia, *src);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
