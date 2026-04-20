@@ -819,6 +819,25 @@ use crate::pyjitpl::{
 pub(crate) type BhOpcodeHandler =
     fn(bh: &mut BlackholeInterpreter, code: &[u8], position: usize) -> Result<usize, DispatchError>;
 
+/// Default handler installed by `setup_insns` for opcodes whose
+/// `bhimpl_*` has not been ported to `wire_bhimpl_handlers` yet.
+///
+/// RPython `blackhole.py:76-80` `setup_insns` immediately resolves every
+/// entry via `_get_method` and would raise `AttributeError` right there
+/// if a `bhimpl_*` is missing. pyre defers the crash to dispatch time so
+/// the runtime can construct a partial builder and `unwired_opnames()`
+/// can survey gaps without terminating the process.
+///
+/// Named (not a closure) so `unwired_opnames()` can compare fn pointers
+/// reliably — closures get a fresh anonymous type per call site.
+fn unwired_handler_placeholder(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _position: usize,
+) -> Result<usize, DispatchError> {
+    panic!("missing bhimpl for opcode (use wire_handler to register)")
+}
+
 /// Return type of a blackhole frame.
 ///
 /// RPython: `BlackholeInterpreter._return_type`
@@ -2831,21 +2850,36 @@ impl BlackholeInterpBuilder {
         // We match that behavior: the default handler panics with the
         // opname so missing bhimpl_* methods surface at dispatch time
         // instead of being silently swallowed.
-        self.dispatch_table = self
-            ._insns
+        self.dispatch_table =
+            vec![unwired_handler_placeholder as BhOpcodeHandler; self._insns.len()];
+    }
+
+    /// List of opnames whose dispatch table entry is still the
+    /// `setup_insns` placeholder — i.e. no `bhimpl_*` handler has been
+    /// wired for them yet. The caller uses this to report which ops are
+    /// still unported before flipping the production dispatch path to
+    /// table-driven.
+    ///
+    /// RPython has no analogue: `setup_insns` resolves every entry via
+    /// `_get_method` and would raise `AttributeError` immediately for a
+    /// missing `bhimpl_*`. pyre defers resolution so Phase D migration
+    /// can report gaps without panicking the whole runtime.
+    pub fn unwired_opnames(&self) -> Vec<&str> {
+        let placeholder = unwired_handler_placeholder as BhOpcodeHandler;
+        self._insns
             .iter()
-            .map(|_key| {
-                // Default: panic identifying the unimplemented opcode.
-                // RPython would raise AttributeError at setup time; we
-                // defer to dispatch time but with the same crash semantics.
-                (|_bh: &mut BlackholeInterpreter,
-                  _code: &[u8],
-                  _position: usize|
-                 -> Result<usize, DispatchError> {
-                    panic!("missing bhimpl for opcode (use wire_handler to register)")
-                }) as BhOpcodeHandler
+            .enumerate()
+            .filter_map(|(i, key)| {
+                if key.is_empty() {
+                    return None;
+                }
+                if self.dispatch_table[i] as usize == placeholder as usize {
+                    Some(key.as_str())
+                } else {
+                    None
+                }
             })
-            .collect();
+            .collect()
     }
 
     /// RPython `blackhole.py:102-103` `setup_descrs(descrs)`.
@@ -4254,6 +4288,57 @@ macro_rules! bhhandler_ii_i {
     };
 }
 
+/// Decode pattern `@arguments("r", "i", returns="i")` — argcodes `"ri>i"`.
+///
+/// Not an RPython-canonical argcode pattern. pyre's build-time codewriter
+/// emits this form when a binary int primitive's lhs operand lands in a
+/// Ref register due to the tagged-int representation pyre still uses
+/// for some untyped integer paths (majit-translate/src/jit_codewriter/
+/// assembler.rs OpKind::BinOp selects the register's kind at assembly
+/// time). The runtime storage is still `i64` — `registers_r` and
+/// `registers_i` are both `Vec<i64>` in majit — so treating the ref
+/// slot's raw bits as an i64 value matches whatever value pyre emitted
+/// into the register without any tag decoding.
+///
+/// When pyre migrates away from storing unboxed ints in Ref registers
+/// (or introduces an explicit unbox op), this `/ri>i` argcode pattern
+/// disappears from the build-time insns table and this macro becomes
+/// dead code.
+macro_rules! bhhandler_ri_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            let b = bh.registers_i[code[position + 1] as usize];
+            bh.registers_i[code[position + 2] as usize] = $bhimpl(a, b);
+            Ok(position + 3)
+        }
+    };
+}
+
+/// Decode pattern `@arguments("r", returns="i")` — argcodes `"r>i"`.
+///
+/// pyre-specific companion of bhhandler_ri_i: the unary int primitive's
+/// operand sits in a Ref register (tagged-int-in-ref-slot deviation,
+/// same root as `/ri>i`). `registers_r`/`registers_i` are both `Vec<i64>`
+/// so reading the raw bits works without tag decoding.
+macro_rules! bhhandler_r_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_r[code[position] as usize];
+            bh.registers_i[code[position + 1] as usize] = $bhimpl(a);
+            Ok(position + 2)
+        }
+    };
+}
+
 /// Decode pattern `@arguments("i", returns="i")` — argcodes `"i>i"`.
 macro_rules! bhhandler_i_i {
     ($name:ident, $bhimpl:ident) => {
@@ -4381,6 +4466,9 @@ fn bhimpl_int_force_ge_zero(a: i64) -> i64 {
 bhhandler_i_i!(handler_int_same_as, bhimpl_int_same_as);
 bhhandler_i_i!(handler_int_neg, bhimpl_int_neg);
 bhhandler_i_i!(handler_int_invert, bhimpl_int_invert);
+// pyre-specific r>i variant for Rust `!x` on i64 (bitwise NOT) when
+// the operand lands in a Ref register. Same primitive as int_invert.
+bhhandler_r_i!(handler_int_not_r, bhimpl_int_invert);
 bhhandler_i_i!(handler_int_is_true, bhimpl_int_is_true);
 bhhandler_i_i!(handler_int_is_zero, bhimpl_int_is_zero);
 bhhandler_i_i!(handler_int_force_ge_zero, bhimpl_int_force_ge_zero);
@@ -4388,6 +4476,54 @@ bhhandler_i_i!(handler_int_force_ge_zero, bhimpl_int_force_ge_zero);
 // @arguments("i", "i", returns="i") → argcodes "ii>i" → 2 src regs + 1 dst reg = 3 bytes
 bhhandler_ii_i!(handler_int_add, bhimpl_int_add);
 bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
+// pyre-specific ri>i argcode variants — see bhhandler_ri_i macro docs.
+bhhandler_ri_i!(handler_int_add_ri, bhimpl_int_add);
+bhhandler_ri_i!(handler_int_sub_ri, bhimpl_int_sub);
+
+/// Handler for the pyre-emitted `const_int/c>i` opcode.
+///
+/// RPython uses `c` as a small signed-byte immediate (blackhole.py:121-
+/// 123 `signedord`). pyre's build-time assembler overloads `c` to mean
+/// "register index inside the constants region" (assembler.rs:522-534
+/// `emit_const_i` returns `num_regs_i + pool_pos`, which `setposition`
+/// later fills with the actual constant value at `blackhole.py:327`).
+///
+/// The net effect is a copy from `registers_i[const_slot]` to
+/// `registers_i[dst]`. When pyre's assembler is retrofitted to match
+/// RPython's signed-byte `c` semantics this handler becomes dead and
+/// the shared `bhimpl_int_copy` path can take over.
+fn handler_const_int_c_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = bh.registers_i[code[position] as usize];
+    bh.registers_i[code[position + 1] as usize] = src;
+    Ok(position + 2)
+}
+/// Handler for pyre-only `input_v/>i` — a graph-input marker emitted by
+/// `Assembler::encode_op` default branch (`assembler.rs:842-859`) whenever
+/// `OpKind::Input { ty: Void }` has no specialized arm. The bytecode
+/// layout: empty argcodes before `>`, 1 result-register byte after.
+///
+/// RPython has no `bhimpl_input_*` — function arguments are written to
+/// registers by the caller before `dispatch_loop()` runs
+/// (`blackhole.py:316-331` `setposition`, the inline_call / recursive_call
+/// handlers), so input opcodes never enter the byte stream. pyre emits
+/// them anyway as graph-position markers.  At dispatch time the target
+/// register has already been pre-populated, so the marker is a no-op:
+/// advance past the 1 destination byte and leave the register untouched.
+///
+/// The `unknown/>i` opname (emitted for `OpKind::Unknown { .. }`) shares
+/// the exact same byte layout and semantics; wire that to the same
+/// handler rather than introducing a clone.
+fn handler_input_marker_v_i(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 1)
+}
 bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
 bhhandler_ii_i!(handler_int_and, bhimpl_int_and);
 bhhandler_ii_i!(handler_int_or, bhimpl_int_or);
@@ -5176,6 +5312,67 @@ fn handler_getarrayitem_gc_r(
     Ok(pos + 1)
 }
 
+// Pyre tagged-int variants of getfield_gc / getarrayitem_gc.
+//
+// The canonical RPython opnames (getfield_gc_i/rd>i, getarrayitem_gc_i/rid>i)
+// always carry the base pointer in a Ref register — upstream's rtyper
+// places every GC pointer in Ref storage. pyre's build-time graph
+// lowering sometimes colours a GC pointer as Int (tagged-int path
+// referenced by `bhhandler_ri_i` docs); the assembler's `OpKind::FieldRead`
+// arm (assembler.rs:541-564) and the default-branch `OpKind::ArrayRead`
+// path both derive the base's argcode from `lookup_reg_with_kind`, so the
+// emitted key becomes `getfield_gc_v/id>i` (field-type v, base in i
+// register) etc. instead of the RPython `getfield_gc_i/rd>i`.
+//
+// The bhimpl is the exact same `cpu.bh_getfield_gc_i` / `bh_getarrayitem_gc_i`
+// call — only the register-file read at operand-decode time differs.
+// Wiring these under the pyre-specific keys lets table-driven dispatch
+// consume both canonical and tagged-int encodings from the same jitcode
+// table.
+
+// pyre: `getfield_gc_v/id>i` — void-typed FieldRead (graph-level Unknown/Void
+// result) whose base sits in an Int register.
+fn handler_getfield_gc_v_id_i_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getfield_gc_i(struct_ptr, descr);
+    Ok(pos + 1)
+}
+
+// pyre: `getarrayitem_gc_v/iid>i` — array base + index both in Int registers.
+fn handler_getarrayitem_gc_v_iid_i_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_i[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
+    Ok(pos + 1)
+}
+
+// pyre: `getarrayitem_gc_v/ird>i` — array base in Int register, index in Ref
+// register (another tagged-int/tagged-ref-swap case).
+fn handler_getarrayitem_gc_v_ird_i_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_i[code[position] as usize];
+    let index = bh.registers_r[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
+    Ok(pos + 1)
+}
+
 // ── setarrayitem_gc (blackhole.py:1350-1358) ────────────────────────
 // @arguments("cpu", "r", "i", "X", "d")
 
@@ -5635,6 +5832,47 @@ fn handler_residual_call_r_v(
     Ok(p)
 }
 
+// Pyre descr-first variants of residual_call_ir_r and residual_call_r_r.
+//
+// RPython's rewrite_call (rpython/jit/codewriter/jtransform.py:422-431)
+// emits argument lists first and the calldescr last — the resulting
+// blackhole key is `/iIRd>r`. pyre's `Assembler::encode_op` for
+// `OpKind::CallResidual` (assembler.rs:481-505) pushes the `d` byte
+// immediately after the funcptr register and before the argument lists,
+// yielding keys `/idIR>r` and `/idR>r`. The underlying
+// `bhimpl_residual_call_*` is unchanged; only the byte order differs,
+// so this handler just reorders the decode steps.
+
+// `residual_call_ir_r/idIR>r` — pyre order: funcptr, descr, I-list, R-list, >r.
+fn handler_residual_call_ir_r_pyre_idir(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (calldescr, p) = read_descr(bh, code, position + 1);
+    let calldescr = calldescr.as_calldescr().clone();
+    let (ai, p) = read_list_i(bh, code, p);
+    let (ar, p) = read_list_r(bh, code, p);
+    bh.registers_r[code[p] as usize] =
+        bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr).0 as i64;
+    Ok(p + 1)
+}
+
+// `residual_call_r_r/idR>r` — pyre order: funcptr, descr, R-list, >r.
+fn handler_residual_call_r_r_pyre_idr(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let func = bh.registers_i[code[position] as usize];
+    let (calldescr, p) = read_descr(bh, code, position + 1);
+    let calldescr = calldescr.as_calldescr().clone();
+    let (ar, p) = read_list_r(bh, code, p);
+    bh.registers_r[code[p] as usize] = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr).0 as i64;
+    Ok(p + 1)
+}
+
 /// Wire all currently-ported bhimpl methods into a `BlackholeInterpBuilder`'s
 /// dispatch table. Called once after `setup_insns`.
 ///
@@ -5645,6 +5883,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_same_as/i>i", handler_int_same_as);
     builder.wire_handler("int_neg/i>i", handler_int_neg);
     builder.wire_handler("int_invert/i>i", handler_int_invert);
+    // pyre emits `int_not/r>i` for Rust-source `!x` on an i64 that
+    // landed in a Ref register. Bitwise NOT (RPython int_invert), not
+    // logical not — `!` on integers in Rust is ~, same semantics.
+    builder.wire_handler("int_not/r>i", handler_int_not_r);
     builder.wire_handler("int_is_true/i>i", handler_int_is_true);
     builder.wire_handler("int_is_zero/i>i", handler_int_is_zero);
     builder.wire_handler("int_force_ge_zero/i>i", handler_int_force_ge_zero);
@@ -5652,8 +5894,19 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // @arguments("i", "i", returns="i") pattern
     builder.wire_handler("int_add/ii>i", handler_int_add);
     builder.wire_handler("int_sub/ii>i", handler_int_sub);
+    // pyre-specific ri>i variants: lhs sits in a Ref register due to
+    // the tagged-int representation pyre uses for some untyped int
+    // paths (assembler.rs OpKind::BinOp). Same primitive, different
+    // register source.
+    builder.wire_handler("int_add/ri>i", handler_int_add_ri);
+    builder.wire_handler("int_sub/ri>i", handler_int_sub_ri);
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
     builder.wire_handler("int_and/ii>i", handler_int_and);
+    // RPython's canonical opname is `int_and` (blackhole.py:500); pyre's
+    // build-time codewriter also emits `int_bitand` because the pyre
+    // source uses the fn name `int_bitand` (call.rs:3919
+    // INT_ARITH_TARGETS). Both resolve to `a & b` — same bhimpl.
+    builder.wire_handler("int_bitand/ii>i", handler_int_and);
     builder.wire_handler("int_or/ii>i", handler_int_or);
     builder.wire_handler("int_xor/ii>i", handler_int_xor);
     builder.wire_handler("int_rshift/ii>i", handler_int_rshift);
@@ -5668,6 +5921,19 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Copy operations
     builder.wire_handler("int_copy/i>i", handler_int_copy);
+    // pyre's const_int/c>i is structurally a register copy — see
+    // handler_const_int_c_i docs for the emit_const_i deviation.
+    builder.wire_handler("const_int/c>i", handler_const_int_c_i);
+    // pyre-only graph-position markers emitted by `Assembler::encode_op`'s
+    // default branch for `OpKind::Input { ty: Void }` and
+    // `OpKind::Unknown { .. }` (assembler.rs:842-859). RPython has no
+    // bhimpl counterpart — function arguments are wired into registers
+    // before dispatch_loop runs (blackhole.py:316-331 `setposition`, the
+    // inline_call / recursive_call callers). At dispatch time the
+    // destination register is already populated, so the marker is a
+    // no-op that just advances past the 1 result byte.
+    builder.wire_handler("input_v/>i", handler_input_marker_v_i);
+    builder.wire_handler("unknown/>i", handler_input_marker_v_i);
 
     // Control flow
     builder.wire_handler("live/", handler_live);
@@ -5773,6 +6039,9 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_gc_i_pure/rd>i", handler_getfield_gc_i); // alias
     builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
+    // pyre tagged-int path: base pointer colored into Int register, so
+    // argcodes become `id>i` (not the RPython `rd>i`). Same bhimpl.
+    builder.wire_handler("getfield_gc_v/id>i", handler_getfield_gc_v_id_i_pyre);
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
@@ -5783,6 +6052,17 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getarrayitem_gc_r/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("getarrayitem_gc_i_pure/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r_pure/rid>r", handler_getarrayitem_gc_r);
+    // pyre tagged-int path variants: base pointer in Int register, index
+    // in either Int or Ref register. Same bhimpl as the canonical i
+    // variant — only register-file reads differ.
+    builder.wire_handler(
+        "getarrayitem_gc_v/iid>i",
+        handler_getarrayitem_gc_v_iid_i_pyre,
+    );
+    builder.wire_handler(
+        "getarrayitem_gc_v/ird>i",
+        handler_getarrayitem_gc_v_ird_i_pyre,
+    );
     builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);
     builder.wire_handler("setarrayitem_gc_r/rird", handler_setarrayitem_gc_r);
 
@@ -5832,6 +6112,18 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("residual_call_r_i/iRd>i", handler_residual_call_r_i);
     builder.wire_handler("residual_call_r_r/iRd>r", handler_residual_call_r_r);
     builder.wire_handler("residual_call_r_v/iRd", handler_residual_call_r_v);
+    // pyre descr-first variants: Assembler::encode_op's OpKind::CallResidual
+    // arm (assembler.rs:481-505) emits `d` before the I/R lists, yielding
+    // keys `idIR>r` / `idR>r` instead of the RPython `iIRd>r` / `iRd>r`.
+    // Same bhimpl_residual_call_* call, only the byte order differs.
+    builder.wire_handler(
+        "residual_call_ir_r/idIR>r",
+        handler_residual_call_ir_r_pyre_idir,
+    );
+    builder.wire_handler(
+        "residual_call_r_r/idR>r",
+        handler_residual_call_r_r_pyre_idr,
+    );
 
     // Misc no-ops (blackhole.py:1017-1049)
     builder.wire_handler("jit_debug/riiii", handler_jit_debug);

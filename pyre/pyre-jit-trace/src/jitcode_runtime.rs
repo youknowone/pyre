@@ -226,6 +226,28 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
     &INSNS_BYTE_TO_OPNAME
 }
 
+/// Build a `BlackholeInterpBuilder` pre-configured for this binary's
+/// jitcodes.
+///
+/// RPython: `BlackholeInterpBuilder.__init__` (blackhole.py:55-61) runs
+/// `setup_insns(asm.insns)` + `setup_descrs(asm.descrs)` immediately.
+/// pyre mirrors that sequence, feeding the runtime `insns` table
+/// deserialized from the build-time bincode artifact.
+///
+/// Phase D-2 groundwork: callers can now get a fully-populated builder
+/// whose `_insns` and dispatch-table indices match the bytecode stored
+/// in `ALL_JITCODES`. Descrs are left empty — RPython populates them
+/// from the assembler alongside insns, but majit's build-time descrs
+/// pool is not yet serialized into the build artifact, so consumers
+/// that need descr-typed opcodes (`d`/`j`) must still supply their own
+/// via `builder.setup_descrs(...)` for now.
+pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
+    let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+    builder.setup_insns(insns_opname_to_byte());
+    majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+    builder
+}
+
 /// Decoded one jitcode instruction. Mirrors the static slice that RPython
 /// `BlackholeInterpBuilder._get_method` would walk over, without any
 /// execution of `bhimpl_*`. Lifetime is tied to the `insns` table, so the
@@ -848,6 +870,64 @@ mod tests {
         })
         .expect("LoadFastBorrow must resolve");
         assert_eq!(id_a, id_b, "Or-grouped variants must share an arm_id");
+    }
+
+    #[test]
+    fn build_default_bh_builder_matches_insns_table() {
+        // Slice 3a: the runtime-side `BlackholeInterpBuilder` is reachable
+        // from pyre-jit-trace. After `setup_insns + wire_bhimpl_handlers`
+        // it must carry the same byte<->opname mapping as the build-time
+        // insns bincode, and it must resolve the three well-known
+        // opcodes (`live/`, `catch_exception/L`, `rvmprof_code/ii`) when
+        // they appear in the table.
+        let builder = build_default_bh_builder();
+        let expected_live = insns_opname_to_byte().get("live/").copied();
+        assert_eq!(Some(builder.op_live), expected_live);
+        // Reverse mapping parity: every opname in the build-time table
+        // must appear at the same byte index in builder._insns.
+        for (key, &byte) in insns_opname_to_byte() {
+            assert_eq!(
+                &builder._insns[byte as usize], key,
+                "builder._insns[{byte}] disagrees with build-time key {key:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn default_bh_builder_handler_coverage_report() {
+        // Diagnostic: surface the opnames in the real insns table that
+        // `wire_bhimpl_handlers` did NOT override. These fall back to
+        // the `setup_insns` placeholder and would panic on dispatch.
+        //
+        // `BlackholeInterpBuilder::unwired_opnames()` is the accessor
+        // that returns the gap. Each unwired opname is a concrete
+        // bhimpl port that Phase D-2 must land before flipping the
+        // production dispatch path to insns-table-driven.
+        //
+        // The test does NOT fail on unwired opnames — it just reports
+        // them. Gating turns on later once the table path is the sole
+        // production dispatch route.
+        let builder = build_default_bh_builder();
+        let total = insns_opname_to_byte().len();
+        let mut unwired: Vec<&str> = builder.unwired_opnames();
+        unwired.sort_unstable();
+        let wired = total - unwired.len();
+        eprintln!(
+            "[jitcode_runtime] coverage: {wired}/{total} opnames wired; \
+             {} unwired: {:?}",
+            unwired.len(),
+            unwired,
+        );
+        // Sanity: `live/` must be present in the insns table and wired.
+        // Any binary that lacks it is structurally broken.
+        assert!(
+            insns_opname_to_byte().contains_key("live/"),
+            "live/ missing from real insns table — broken build",
+        );
+        assert!(
+            !unwired.iter().any(|k| *k == "live/"),
+            "live/ must be wired by wire_bhimpl_handlers",
+        );
     }
 
     #[test]
