@@ -1266,14 +1266,13 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `ref_copy`. RPython parity:
-        // `flatten.py:334` `self.emitline('%s_copy' % kind, v, "->", w)`
-        // emits the register-to-register move as `ref_copy` when
-        // `kind == 'ref'`; `assembler.py:220` turns it into `ref_copy/r>r`.
-        // pyre's `move_r(dst, src)` is the single ref-move primitive.
-        // The SSARepr arg list follows the RPython `(src, '->', dst)`
-        // shape via `op_with_result`.
-        macro_rules! emit_move_r {
+        // RPython parity: `flatten.py:333`
+        // `self.emitline('%s_copy' % kind, v, "->", w)` emits the
+        // register-to-register move as `ref_copy` when `kind == 'ref'`;
+        // `assembler.py:220` turns it into the bytecode key
+        // `ref_copy/r>r`. The SSARepr arg list follows the upstream
+        // `(src, '->', dst)` shape via `op_with_result`.
+        macro_rules! emit_ref_copy {
             ($ssarepr:expr, $dst:expr, $src:expr) => {{
                 let dst = $dst;
                 let src = $src;
@@ -1399,7 +1398,7 @@ impl CodeWriter {
                 // vable_getarrayitem_ref so the optimizer folds the read
                 // against virtualizable_boxes and the blackhole pulls the
                 // live frame value into stack_base+current_depth on
-                // resume. Non-portal frames keep move_r (no virtualizable
+                // resume. Non-portal frames keep ref_copy (no virtualizable
                 // in scope).
                 Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
@@ -1416,7 +1415,7 @@ impl CodeWriter {
                             int_tmp0
                         );
                     } else {
-                        emit_move_r!(ssarepr, stack_base + current_depth, reg);
+                        emit_ref_copy!(ssarepr, stack_base + current_depth, reg);
                     }
                     current_depth += 1;
                     emit_vsd!(current_depth);
@@ -1426,7 +1425,7 @@ impl CodeWriter {
                 // Portal frames treat `locals_cells_stack_w` as the sole
                 // storage for locals — setarrayitem_vable_r writes from
                 // the value-stack slot directly, so no register-per-local
-                // shadow exists. Non-portal frames keep move_r (no vable
+                // shadow exists. Non-portal frames keep ref_copy (no vable
                 // in scope).
                 Instruction::StoreFast { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
@@ -1445,7 +1444,7 @@ impl CodeWriter {
                             stack_base + current_depth
                         );
                     } else {
-                        emit_move_r!(ssarepr, reg, stack_base + current_depth);
+                        emit_ref_copy!(ssarepr, reg, stack_base + current_depth);
                     }
                 }
 
@@ -1460,7 +1459,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1481,7 +1480,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1496,7 +1495,7 @@ impl CodeWriter {
                 // on both backends. The heap-vs-symbolic-state gap
                 // persists — the compiled loop's vable reads still see
                 // stale slots that the bridge / blackhole resume path
-                // has not re-synchronized. Keep move_r here until the
+                // has not re-synchronized. Keep ref_copy here until the
                 // liveness pipeline rework (Priority 4) lands; the full
                 // `flatten → compute_liveness(ssarepr) → assemble`
                 // sequence should close the gap by ensuring the vable
@@ -1507,10 +1506,10 @@ impl CodeWriter {
                     let pair = var_nums.get(op_arg);
                     let reg_a = u32::from(pair.idx_1()) as u16;
                     let reg_b = u32::from(pair.idx_2()) as u16;
-                    emit_move_r!(ssarepr, stack_base + current_depth, reg_a);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, reg_a);
                     current_depth += 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, stack_base + current_depth, reg_b);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, reg_b);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1518,7 +1517,7 @@ impl CodeWriter {
                 // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
                 // idx_1 (store), then push idx_2 (load). Net depth 0.
                 // Portal: store via setarrayitem_vable_r, load via
-                // getarrayitem_vable_r. Non-portal: move_r for both halves.
+                // getarrayitem_vable_r. Non-portal: ref_copy for both halves.
                 Instruction::StoreFastLoadFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
                     let store_reg = u32::from(pair.idx_1()) as u16;
@@ -1549,8 +1548,8 @@ impl CodeWriter {
                             int_tmp0
                         );
                     } else {
-                        emit_move_r!(ssarepr, store_reg, stack_base + current_depth);
-                        emit_move_r!(ssarepr, stack_base + current_depth, load_reg);
+                        emit_ref_copy!(ssarepr, store_reg, stack_base + current_depth);
+                        emit_ref_copy!(ssarepr, stack_base + current_depth, load_reg);
                     }
                     current_depth += 1;
                     emit_vsd!(current_depth);
@@ -1560,13 +1559,13 @@ impl CodeWriter {
                 Instruction::StoreSubscr => {
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp1, stack_base + current_depth); // key
+                    emit_ref_copy!(ssarepr, obj_tmp1, stack_base + current_depth); // key
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth); // obj
+                    emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth); // obj
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, arg_regs_start, stack_base + current_depth); // value
+                    emit_ref_copy!(ssarepr, arg_regs_start, stack_base + current_depth); // value
                     emit_residual_call(
                         &mut ssarepr,
                         CallFlavor::MayForce,
@@ -1588,7 +1587,7 @@ impl CodeWriter {
                 }
 
                 Instruction::PushNull => {
-                    emit_move_r!(ssarepr, stack_base + current_depth, null_ref_reg);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, null_ref_reg);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1627,7 +1626,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1655,7 +1654,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1674,7 +1673,7 @@ impl CodeWriter {
                     );
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                    emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_residual_call(
                         &mut ssarepr,
                         CallFlavor::Plain,
@@ -1703,7 +1702,7 @@ impl CodeWriter {
                     );
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                    emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_residual_call(
                         &mut ssarepr,
                         CallFlavor::Plain,
@@ -1742,7 +1741,7 @@ impl CodeWriter {
                 Instruction::ReturnValue => {
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                    emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_ref_return!(ssarepr, obj_tmp0);
                 }
 
@@ -1768,11 +1767,11 @@ impl CodeWriter {
                     );
                     // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
                     if raw_namei & 1 != 0 {
-                        emit_move_r!(ssarepr, stack_base + current_depth, null_ref_reg);
+                        emit_ref_copy!(ssarepr, stack_base + current_depth, null_ref_reg);
                         current_depth += 1;
                         emit_vsd!(current_depth);
                     }
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1793,7 +1792,7 @@ impl CodeWriter {
                     for i in (0..nargs).rev() {
                         current_depth -= 1;
                         emit_vsd!(current_depth);
-                        emit_move_r!(
+                        emit_ref_copy!(
                             ssarepr,
                             arg_regs_start + i as u16,
                             stack_base + current_depth
@@ -1801,7 +1800,7 @@ impl CodeWriter {
                     }
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp1, stack_base + current_depth); // callable
+                    emit_ref_copy!(ssarepr, obj_tmp1, stack_base + current_depth); // callable
                     current_depth -= 1;
                     emit_vsd!(current_depth); // NULL (discard)
 
@@ -1843,7 +1842,7 @@ impl CodeWriter {
                             Some(obj_tmp0),
                         );
                     }
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1857,7 +1856,7 @@ impl CodeWriter {
                 Instruction::UnaryNegative => {
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                    emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_load_const_i!(ssarepr, int_tmp0, 0);
                     emit_residual_call(
                         &mut ssarepr,
@@ -1885,7 +1884,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1909,7 +1908,7 @@ impl CodeWriter {
                     for i in (0..argc.min(2)).rev() {
                         current_depth -= 1;
                         emit_vsd!(current_depth);
-                        emit_move_r!(
+                        emit_ref_copy!(
                             ssarepr,
                             arg_regs_start + i as u16,
                             stack_base + current_depth
@@ -1944,7 +1943,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1958,7 +1957,7 @@ impl CodeWriter {
                     if n >= 1 {
                         current_depth -= 1;
                         emit_vsd!(current_depth);
-                        emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                        emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
                         emit_raise!(ssarepr, obj_tmp0);
                     } else {
                         // reraise: re-raise exception_last_value
@@ -1968,7 +1967,7 @@ impl CodeWriter {
 
                 Instruction::PushExcInfo => {
                     // flatten.py: dup = ref_copy TOS → TOS+1
-                    emit_move_r!(
+                    emit_ref_copy!(
                         ssarepr,
                         stack_base + current_depth,
                         stack_base + current_depth - 1
@@ -1980,10 +1979,10 @@ impl CodeWriter {
                 Instruction::CheckExcMatch => {
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp1, stack_base + current_depth); // match type
+                    emit_ref_copy!(ssarepr, obj_tmp1, stack_base + current_depth); // match type
                     current_depth -= 1;
                     emit_vsd!(current_depth);
-                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth); // exception
+                    emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth); // exception
                     // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
                     emit_load_const_i!(ssarepr, int_tmp0, 10); // isinstance op
                     emit_residual_call(
@@ -1998,7 +1997,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -2016,7 +2015,7 @@ impl CodeWriter {
                 Instruction::Copy { i } => {
                     let d = i.get(op_arg) as usize;
                     if d == 1 {
-                        emit_move_r!(
+                        emit_ref_copy!(
                             ssarepr,
                             stack_base + current_depth,
                             stack_base + current_depth - 1
@@ -2040,7 +2039,7 @@ impl CodeWriter {
 
                 // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
                 // jtransform.py:1898 — each local write → setarrayitem_vable_r
-                // in portal, move_r in non-portal. Mirrors plain StoreFast.
+                // in portal, ref_copy in non-portal. Mirrors plain StoreFast.
                 Instruction::StoreFastStoreFast { var_nums } => {
                     let pair = var_nums.get(op_arg);
                     let reg_a = u32::from(pair.idx_1()) as u16;
@@ -2061,7 +2060,7 @@ impl CodeWriter {
                                 stack_base + current_depth
                             );
                         } else {
-                            emit_move_r!(ssarepr, reg, stack_base + current_depth);
+                            emit_ref_copy!(ssarepr, reg, stack_base + current_depth);
                         }
                     }
                 }
@@ -2153,7 +2152,7 @@ impl CodeWriter {
                     ResKind::Ref,
                     Some(obj_tmp0),
                 );
-                emit_move_r!(ssarepr, exc_slot, obj_tmp0);
+                emit_ref_copy!(ssarepr, exc_slot, obj_tmp0);
                 exc_slot += 1;
             }
             emit_last_exc_value!(ssarepr, exc_slot);
