@@ -1823,7 +1823,7 @@ impl CallControl {
     /// RPython: graph identity is by object pointer, not name.
     /// We emulate this with qualified paths that include the impl type,
     /// so different impls of the same method get distinct paths.
-    fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
+    pub(crate) fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
             CallTarget::FunctionPath { segments } => {
                 Some(CallPath::from_segments(segments.iter().map(String::as_str)))

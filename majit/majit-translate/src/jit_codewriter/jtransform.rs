@@ -976,8 +976,19 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         // RPython jtransform.py:477-478: get_jitcode(targetgraph)
+        //
+        // Route through the CallControl-aware qualified path so inherent
+        // methods like `PyFrame::pop_top` resolve to their
+        // `function_graphs[["PyFrame", "pop_top"]]` entry. The stateless
+        // `target_to_call_path` fallback only yields the bare method name,
+        // which never matches `CallControl::register_inherent_method`'s
+        // qualified key (`call.rs:941`) and leaves the shell body-less in
+        // `drain_pending_graphs`. Phase I3 of the eval-loop automation
+        // plan (`producer_side_jitcode_shell_leaks_2026_04_20.md`).
         let jitcode_index = if let Some(cc) = self.callcontrol.as_mut() {
-            let path = target_to_call_path(target);
+            let path = cc
+                .target_to_path(target)
+                .unwrap_or_else(|| target_to_call_path(target));
             cc.get_jitcode(&path).index
         } else {
             0

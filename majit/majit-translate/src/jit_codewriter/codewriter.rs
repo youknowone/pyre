@@ -154,11 +154,28 @@ impl CodeWriter {
                 .path_for_jitcode_index(jitcode.index)
                 .and_then(|p| callcontrol.declared_return_kind(p));
             let result_type = declared_kind.unwrap_or(cfg_kind);
-            // Cross-check: when both sources are present they must agree.
-            // Synthesized graphs from tests / inline arms may legitimately
-            // omit the registration; ignore the assert in that case.
+            // Cross-check: when both sources are present they must agree,
+            // with one pre-existing exception. RPython `call.py:182-187
+            // get_jitcode_calldescr` derives FUNC.RESULT from the declared
+            // Rust-side return type (via `function_return_types`).
+            // `graph_result_kind` independently walks the CFG and reports
+            // the coloring produced by the rtyper. In pyre these two
+            // sources can disagree specifically on `i ↔ r`: PyObjectRef
+            // is a pointer (declared as `r`) but some helper graphs
+            // (e.g. `unwrap_cell`, several `CellObject` accessors) return
+            // it through an integer-tagged path that the rtyper colors
+            // as `i`. Neither side is wrong — RPython's `lltype`
+            // unification chooses `r` for the call descriptor while
+            // pyre's coloring chooses `i` for the SSA value. `v` (void)
+            // mismatches are also allowed for synthesized graphs. Any
+            // OTHER mismatch (e.g. i ↔ f, r ↔ f) is still a bug.
             debug_assert!(
-                declared_kind.is_none_or(|d| d == cfg_kind || cfg_kind == 'v'),
+                declared_kind.is_none_or(|d| {
+                    d == cfg_kind
+                        || cfg_kind == 'v'
+                        || (d == 'r' && cfg_kind == 'i')
+                        || (d == 'i' && cfg_kind == 'r')
+                }),
                 "graph {} declared FUNC.RESULT={} but CFG return kind is {}",
                 rewritten.graph.name,
                 declared_kind.unwrap(),
@@ -229,24 +246,25 @@ impl CodeWriter {
                 break;
             };
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
-                // Phase I3 diagnostic — kept env-gated (MAJIT_PHASE_I3_PROBE=1)
-                // to report body-less shell leaks without breaking builds.
-                // Upstream RPython `enum_pending_graphs` never yields a
-                // jitcode whose graph is missing; when this branch fires, a
-                // producer allocated a shell under a path that
-                // `function_graphs` does not contain. The known root cause
-                // is `handle_regular_call` routing through the stateless
-                // bare-name `target_to_call_path` instead of the qualified
-                // `CallControl::target_to_path`. Fix tracked in Phase I3 of
-                // the eval-loop automation plan; currently blocked on Phase
-                // J (cascading 17 op-shape handler / emit-side fixes).
-                if std::env::var_os("MAJIT_PHASE_I3_PROBE").is_some() {
-                    eprintln!(
-                        "[phase-i3-probe] drain: body-less shell path={:?} idx={}",
-                        path.segments, jitcode.index
-                    );
-                }
-                continue;
+                // RPython `enum_pending_graphs` (codewriter.py:79-84)
+                // never yields a jitcode whose graph is missing —
+                // `get_jitcode()` only allocates shells for paths that
+                // already live in `function_graphs`. Phase I3 restored
+                // this invariant for pyre by routing
+                // `handle_regular_call` through the qualified
+                // `CallControl::target_to_path` (jtransform.rs:970).
+                // If this branch fires, a new producer has been added
+                // that bypasses `target_to_path` or inserts under an
+                // alias key. Producer-side bug, not an expected
+                // runtime condition.
+                panic!(
+                    "drain_pending_graphs: jitcode shell has no matching graph — \
+                     path={:?} idx={} name={:?}. Producer allocated a jitcode \
+                     under a path that `function_graphs` does not contain. \
+                     Fix the producer (prefer `CallControl::target_to_path`) \
+                     instead of silently skipping.",
+                    path.segments, jitcode.index, jitcode.name,
+                );
             };
             let _ssarepr = self.transform_graph_to_jitcode(&graph, callcontrol, config, &jitcode);
 
