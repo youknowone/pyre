@@ -589,10 +589,16 @@ impl OpKind {
             | OpKind::Get
             | OpKind::Buffer
             | OpKind::NewTuple
-            | OpKind::Pow
-            | OpKind::GetAttr => true,
+            | OpKind::Pow => true,
 
-            OpKind::Id
+            // upstream `class GetAttr(SingleDispatchMixin, HLOperation)`
+            // (operation.py:617-646) is NOT a PureOperation — only its
+            // `constfold()` override is wired to fold constant
+            // attribute lookups. The Rust port surfaces that via the
+            // "custom constfold" eligibility gate in
+            // `HLOperation::constfold`, not through `pure()`.
+            OpKind::GetAttr
+            | OpKind::Id
             | OpKind::Format
             | OpKind::Hash
             | OpKind::SetAttr
@@ -1015,18 +1021,58 @@ fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }
         // RPython `GetAttr.constfold()` (operation.py:624-646).
         //
-        // `getattr(w_obj, w_name)` folds when both args are foldable
-        // AND the receiver is NOT flagged by `NOT_REALLY_CONST`
-        // (e.g. `sys.maxint`). The Rust port carries no
-        // NOT_REALLY_CONST table at this phase; we restrict the fold
-        // to `HostObject::Module::module_get` / class attribute
-        // lookup, which the bootstrap HOST_ENV exposes directly.
+        // upstream shape:
+        //   if len(self.args) == 3:
+        //       raise FlowingError(...)
+        //   w_obj, w_name = self.args
+        //   if w_obj in NOT_REALLY_CONST and w_name not in NOT_REALLY_CONST[w_obj]:
+        //       return                       # decline fold
+        //   if w_obj.foldable() and w_name.foldable():
+        //       try:
+        //           result = getattr(obj, name)
+        //       except Exception as e:
+        //           raise FlowingError("%s always raises %s" % …)
+        //       return const(result)
+        //
+        // Phase 3 F3.3 gaps documented per CLAUDE.md parity rule #1:
+        //
+        //  1. 3-arg `getattr(x, name, default)` support — upstream
+        //     raises `FlowingError` at flow time, surfacing a hard
+        //     error. The Rust port declines the fold here (falls
+        //     through to SpaceOperation emission); `flowcontext.rs`
+        //     does not yet surface a FlowingError at this site. The
+        //     stricter check lands once `HLOperation::constfold`
+        //     returns `Result<Option, FlowingError>` — scheduled
+        //     alongside the Phase 5 annotator wiring.
+        //  2. `NOT_REALLY_CONST` table (operation.py:22-35) blocks
+        //     folds of `sys.maxint`, `sys.exc_info`, etc. — the Rust
+        //     port has no equivalent table yet; the HostObject
+        //     matcher below only succeeds for module members and
+        //     class attributes that `HOST_ENV` actively exposes, so
+        //     the set of foldable attributes is a strict subset of
+        //     upstream's.
+        //  3. The generic `getattr(obj, name)` fall-through that
+        //     upstream wraps in `try/except Exception` covers class
+        //     methods / instance attributes that flowspace may see on
+        //     real Python inputs; the Rust port only folds
+        //     `HostObject::Module::module_get`. Extending to class
+        //     attribute lookup requires a `HostObject::class_get`
+        //     helper that resolves bound methods via
+        //     `HOST_ENV.lookup_builtin`.
         (OpKind::GetAttr, 2) => {
             if let [ConstValue::HostObject(obj), ConstValue::Str(name)] = args {
                 if let Some(value) = obj.module_get(name) {
                     return Some(ConstValue::HostObject(value));
                 }
             }
+        }
+        (OpKind::GetAttr, 3) => {
+            // upstream raises FlowingError at flow time. Without an
+            // error channel on constfold() we decline the fold and
+            // let the runtime emit a 3-arg `getattr` SpaceOperation;
+            // Phase 5's annotator will surface the error when it
+            // consumes the op.
+            return None;
         }
         _ => {}
     }

@@ -10,6 +10,7 @@
 //! (flowspace/operation.py ↔ annotator, annotator/annrpython.py ↔
 //! rtyper/normalizecalls.py) that Cargo's DAG crate boundary cannot model.
 
+pub mod annotator;
 pub mod flowspace;
 pub mod jit_codewriter;
 pub use jit_codewriter::{
