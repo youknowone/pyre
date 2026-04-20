@@ -348,6 +348,23 @@ impl Bookkeeper {
             .expect("Bookkeeper.annotator backlink is absent or dropped")
     }
 
+    /// RPython `Bookkeeper.warning(self, msg)` (bookkeeper.py:580-581).
+    ///
+    /// ```python
+    /// def warning(self, msg):
+    ///     return self.annotator.warning(msg)
+    /// ```
+    pub fn warning(&self, msg: impl Into<String>) {
+        if let Some(ann) = self.annotator.borrow().upgrade() {
+            ann.warning(&msg.into());
+        } else {
+            // No annotator backlink — fall back to stderr so the
+            // message is not lost. Matches the spirit of upstream,
+            // which asserts annotator is always live.
+            eprintln!("[bookkeeper warning, no annotator] {}", msg.into());
+        }
+    }
+
     /// RPython `bookkeeper.position_key = ...` assignment. Returns the
     /// previous value so callers can restore it around a nested reflow
     /// (matches upstream bookkeeper.py:278 `@contextmanager
@@ -1009,15 +1026,15 @@ impl Bookkeeper {
         match entry {
             DescEntry::Function(fd) => {
                 let graph = fd.borrow().get_graph(&args, None)?;
-                self.infer_graph_result(&graph.graph, args_s)
+                self.infer_graph_result(&graph.graph.borrow(), args_s)
             }
             DescEntry::Method(md) => {
                 let graph = md.borrow().get_graph(&args, None)?;
-                self.infer_graph_result(&graph.graph, args_s)
+                self.infer_graph_result(&graph.graph.borrow(), args_s)
             }
             DescEntry::MethodOfFrozen(mfd) => {
                 let graph = mfd.borrow().get_graph(&args, None)?;
-                self.infer_graph_result(&graph.graph, args_s)
+                self.infer_graph_result(&graph.graph.borrow(), args_s)
             }
             DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(
                 "Bookkeeper.pbc_call: non-callable PBC entry",
@@ -1103,6 +1120,109 @@ impl Bookkeeper {
         Ok(acc)
     }
 
+    /// RPython `Bookkeeper.pbc_call(self, pbc, args, emulated=None)`
+    /// (bookkeeper.py:512-537).
+    ///
+    /// ```python
+    /// def pbc_call(self, pbc, args, emulated=None):
+    ///     if emulated is None:
+    ///         whence = self.position_key
+    ///         fn, block, i = self.position_key
+    ///         op = block.operations[i]
+    ///         s_previous_result = self.annotator.annotation(op.result)
+    ///         if s_previous_result is None:
+    ///             s_previous_result = s_ImpossibleValue
+    ///     else:
+    ///         if emulated is True:
+    ///             whence = None
+    ///         else:
+    ///             whence = emulated
+    ///         op = None
+    ///         s_previous_result = s_ImpossibleValue
+    ///     results = []
+    ///     for desc in pbc.descriptions:
+    ///         results.append(desc.pycall(whence, args, s_previous_result, op))
+    ///     s_result = unionof(*results)
+    ///     return s_result
+    /// ```
+    pub fn pbc_call_args(
+        self: &Rc<Self>,
+        pbc: &SomePBC,
+        args: &super::argument::ArgumentsForTranslation,
+    ) -> Result<SomeValue, AnnotatorError> {
+        use super::model::s_impossible_value;
+        // upstream: `whence = self.position_key; s_previous_result = ...`.
+        let pk = self.current_position_key();
+        let whence: Option<(
+            crate::flowspace::model::GraphRef,
+            crate::flowspace::model::BlockRef,
+            usize,
+        )> = pk.as_ref().and_then(|p| {
+            // PositionKey carries Weak refs; upgrade to Rc for whence.
+            // If either ref has been dropped, fall back to whence=None
+            // (still correct — matches emulated=True path).
+            match (p.graph(), p.block()) {
+                (Some(g), Some(b)) => Some((g, b, p.op_index)),
+                _ => None,
+            }
+        });
+        // upstream: `op = block.operations[i]; s_previous_result = annotation(op.result)`.
+        let s_previous_result = if let Some(pk) = pk.as_ref() {
+            if let (Some(block), Some(ann)) = (pk.block(), self.annotator.borrow().upgrade()) {
+                let i = pk.op_index;
+                let block_borrow = block.borrow();
+                if i < block_borrow.operations.len() {
+                    let result_var = block_borrow.operations[i].result.clone();
+                    ann.annotation(&result_var)
+                        .unwrap_or_else(s_impossible_value)
+                } else {
+                    s_impossible_value()
+                }
+            } else {
+                s_impossible_value()
+            }
+        } else {
+            s_impossible_value()
+        };
+        // upstream: `for desc in pbc.descriptions: results.append(desc.pycall(...))`.
+        let op_key = pk.clone();
+        let mut results: Vec<SomeValue> = Vec::with_capacity(pbc.descriptions.len());
+        for entry in pbc.descriptions.values() {
+            let r = match entry {
+                super::description::DescEntry::Function(fd) => {
+                    fd.borrow()
+                        .pycall(whence.clone(), args, &s_previous_result, op_key.clone())?
+                }
+                super::description::DescEntry::Method(md) => {
+                    md.borrow()
+                        .pycall(whence.clone(), args, &s_previous_result, op_key.clone())?
+                }
+                super::description::DescEntry::MethodOfFrozen(mfd) => {
+                    mfd.borrow()
+                        .pycall(whence.clone(), args, &s_previous_result, op_key.clone())?
+                }
+                super::description::DescEntry::Class(cd) => super::classdesc::ClassDesc::pycall(
+                    cd,
+                    whence.clone(),
+                    args,
+                    &s_previous_result,
+                    op_key.clone(),
+                )?,
+                super::description::DescEntry::Frozen(_) => {
+                    return Err(AnnotatorError::new("pbc_call: FrozenDesc is not callable"));
+                }
+            };
+            results.push(r);
+        }
+        // upstream: `s_result = unionof(*results)`.
+        super::model::unionof(results.iter())
+            .map_err(|e| AnnotatorError::new(format!("pbc_call unionof: {}", e)))
+    }
+
+    /// Legacy entry used by the in-progress infer_graph_result path —
+    /// takes positional args only and routes through the Rust-only
+    /// shim that collapses args to a synthetic ArgumentsForTranslation.
+    /// Prefer [`Self::pbc_call_args`] for upstream parity.
     pub fn pbc_call(
         self: &Rc<Self>,
         pbc: &SomePBC,

@@ -554,12 +554,23 @@ pub fn make_generator_entry_graph(func: GraphFunc) -> Result<FunctionGraph, Flow
             "generator function is missing a code object",
         ))
     })?;
-    let mut pygraph = PyGraph::new(func.clone(), code);
-    let var_names = get_variable_names_from_hlvalues(&pygraph.graph.startblock.borrow().inputargs)?;
+    let pygraph = PyGraph::new(func.clone(), code);
+    // pygraph.graph is shared via Rc for annotator compatibility; we
+    // hold the only reference here, so all mutations happen behind
+    // `.borrow_mut()` and we unwrap back to an owned FunctionGraph for
+    // the return value.
+    let var_names =
+        get_variable_names_from_hlvalues(&pygraph.graph.borrow().startblock.borrow().inputargs)?;
     let generator_iterator = make_generatoriterator_class(&func, &var_names);
-    replace_graph_with_bootstrap(&generator_iterator, &mut pygraph.graph, &var_names)?;
-    attach_next_method(&generator_iterator, &pygraph.graph)?;
-    Ok(pygraph.graph)
+    replace_graph_with_bootstrap(
+        &generator_iterator,
+        &mut *pygraph.graph.borrow_mut(),
+        &var_names,
+    )?;
+    attach_next_method(&generator_iterator, &pygraph.graph.borrow())?;
+    Ok(std::rc::Rc::try_unwrap(pygraph.graph)
+        .expect("make_generator_entry_graph: PyGraph.graph should be unique")
+        .into_inner())
 }
 
 /// RPython `generator.py:36-39` — `tweak_generator_graph(graph)`.

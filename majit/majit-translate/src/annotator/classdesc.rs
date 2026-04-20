@@ -249,24 +249,22 @@ impl AttrSource {
 
     /// Dispatch to `ClassDesc.s_get_value` / `InstanceSource.s_get_value`.
     ///
-    /// Class-level sources require the ClassDesc to be live (strong
-    /// `upgrade`) and the `s_get_value` body which lives in c2. This
-    /// returns [`AnnotatorError`] citing Phase 5 P5.2+ until c2 lands.
+    /// Class-level sources delegate to [`ClassDesc::s_get_value`]
+    /// (classdesc.py:784-802). Instance-level sources still require
+    /// live instance reflection that isn't available in the Rust port.
     pub fn s_get_value(
         &self,
-        _classdef: Option<&Rc<RefCell<ClassDef>>>,
-        _name: &str,
+        classdef: Option<&Rc<RefCell<ClassDef>>>,
+        name: &str,
     ) -> Result<SomeValue, AnnotatorError> {
         match self {
-            AttrSource::Class(_) => Err(AnnotatorError::new(
-                "AttrSource::Class::s_get_value requires ClassDesc.s_get_value \
-                 (Phase 5 P5.2 classdesc c2 dep — see classdesc.py:784-802)",
-            )),
-            AttrSource::Instance(_) => Err(AnnotatorError::new(
-                "AttrSource::Instance::s_get_value requires live instance \
-                 attribute reflection (Phase 5 P5.2+ dep — see \
-                 classdesc.py:442-451)",
-            )),
+            AttrSource::Class(w) => {
+                let cdesc = w.upgrade().ok_or_else(|| {
+                    AnnotatorError::new("AttrSource::Class: ClassDesc backlink dropped")
+                })?;
+                ClassDesc::s_get_value(&cdesc, classdef, name)
+            }
+            AttrSource::Instance(inst) => inst.s_get_value(classdef, name),
         }
     }
 }
@@ -1026,6 +1024,231 @@ impl ClassDesc {
         match existing {
             Some(cd) => Ok(cd),
             None => Self::_init_classdef(this),
+        }
+    }
+
+    /// RPython `ClassDesc.pycall(self, whence, args, s_previous_result, op=None)`
+    /// (classdesc.py:704-733).
+    ///
+    /// ```python
+    /// def pycall(self, whence, args, s_previous_result, op=None):
+    ///     classdef = self.getuniqueclassdef()
+    ///     s_instance = SomeInstance(classdef)
+    ///     s_init = self.s_read_attribute('__init__')
+    ///     if isinstance(s_init, SomeImpossibleValue):
+    ///         if not self.is_exception_class():
+    ///             try:
+    ///                 args.fixedunpack(0)
+    ///             except ValueError:
+    ///                 raise AnnotatorError("default __init__ takes no argument"
+    ///                                      " (class %s)" % (self.name,))
+    ///         elif self.pyobj is Exception:
+    ///             try:
+    ///                 [s_arg] = args.fixedunpack(1)
+    ///             except ValueError:
+    ///                 pass
+    ///             else:
+    ///                 from rpython.rtyper.llannotation import SomePtr
+    ///                 assert not isinstance(s_arg, SomePtr)
+    ///     else:
+    ///         args = args.prepend(s_instance)
+    ///         s_init.call(args)
+    ///     return s_instance
+    /// ```
+    pub fn pycall(
+        this: &Rc<RefCell<Self>>,
+        _whence: Option<(
+            crate::flowspace::model::GraphRef,
+            crate::flowspace::model::BlockRef,
+            usize,
+        )>,
+        args: &super::argument::ArgumentsForTranslation,
+        _s_previous_result: &SomeValue,
+        _op_key: Option<super::bookkeeper::PositionKey>,
+    ) -> Result<SomeValue, AnnotatorError> {
+        use super::model::{SomeInstance, SomeValue, s_impossible_value};
+        // upstream: `classdef = self.getuniqueclassdef()`.
+        let classdef = Self::getuniqueclassdef(this)?;
+        // upstream: `s_instance = SomeInstance(classdef)`.
+        let s_instance = SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        // upstream: `s_init = self.s_read_attribute('__init__')`.
+        let s_init = Self::s_read_attribute(this, "__init__")?;
+        let is_impossible = matches!(s_init, SomeValue::Impossible);
+        let _ = s_impossible_value; // suppress unused warning if paths shift
+        if is_impossible {
+            // upstream: `if not self.is_exception_class(): args.fixedunpack(0)`.
+            let is_exc = this.borrow().is_exception_class();
+            let name = this.borrow().name.clone();
+            if !is_exc {
+                args.fixedunpack(0).map_err(|_e| {
+                    AnnotatorError::new(format!(
+                        "default __init__ takes no argument (class {})",
+                        name
+                    ))
+                })?;
+            }
+            // upstream: `elif self.pyobj is Exception: try: [s_arg] = args.fixedunpack(1)
+            //                 except ValueError: pass else: assert not isinstance(s_arg, SomePtr)`.
+            // The Rust port has no SomePtr yet; the assert collapses to a no-op.
+        } else {
+            // upstream: `args = args.prepend(s_instance); s_init.call(args)`.
+            let bound_args = args.prepend(s_instance.clone());
+            // upstream: `s_init.call(args)` — SomePBC routes to bookkeeper.pbc_call.
+            if let SomeValue::PBC(ref pbc) = s_init {
+                let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+                    AnnotatorError::new("ClassDesc.pycall: Bookkeeper backlink dropped")
+                })?;
+                bk.pbc_call_args(pbc, &bound_args)?;
+            }
+            // Other SomeValue.call paths (SomeObject default = error) — the
+            // annotator would see an AnnotatorError; when __init__ resolves
+            // to something other than PBC we defer the `.call(args)` port
+            // to the SomeValue.call dispatcher commit.
+        }
+        Ok(s_instance)
+    }
+
+    /// RPython `ClassDesc.lookup(self, name)` (classdesc.py:749-756).
+    ///
+    /// ```python
+    /// def lookup(self, name):
+    ///     cdesc = self
+    ///     while name not in cdesc.classdict:
+    ///         cdesc = cdesc.basedesc
+    ///         if cdesc is None:
+    ///             return None
+    ///     return cdesc
+    /// ```
+    pub fn lookup(this: &Rc<RefCell<Self>>, name: &str) -> Option<Rc<RefCell<Self>>> {
+        let mut cdesc: Rc<RefCell<Self>> = this.clone();
+        loop {
+            if cdesc.borrow().classdict.contains_key(name) {
+                return Some(cdesc);
+            }
+            let next = cdesc.borrow().basedesc.clone();
+            match next {
+                Some(base) => cdesc = base,
+                None => return None,
+            }
+        }
+    }
+
+    /// RPython `ClassDesc.read_attribute(self, name, default=NODEFAULT)`
+    /// (classdesc.py:765-773).
+    ///
+    /// ```python
+    /// def read_attribute(self, name, default=NODEFAULT):
+    ///     cdesc = self.lookup(name)
+    ///     if cdesc is None:
+    ///         if default is NODEFAULT:
+    ///             raise AttributeError
+    ///         return default
+    ///     return cdesc.classdict[name]
+    /// ```
+    ///
+    /// Rust port returns `Option<ClassDictEntry>`; upstream's
+    /// AttributeError/NODEFAULT/default triad collapses to `None` +
+    /// caller-supplied default via `Option::or`.
+    pub fn read_attribute(this: &Rc<RefCell<Self>>, name: &str) -> Option<ClassDictEntry> {
+        let cdesc = Self::lookup(this, name)?;
+        let entry = cdesc.borrow().classdict.get(name).cloned();
+        entry
+    }
+
+    /// RPython `ClassDesc.s_read_attribute(self, name)` (classdesc.py:775-782).
+    ///
+    /// ```python
+    /// def s_read_attribute(self, name):
+    ///     cdesc = self.lookup(name)
+    ///     if cdesc is None:
+    ///         return s_ImpossibleValue
+    ///     return cdesc.s_get_value(None, name)
+    /// ```
+    pub fn s_read_attribute(
+        this: &Rc<RefCell<Self>>,
+        name: &str,
+    ) -> Result<SomeValue, AnnotatorError> {
+        match Self::lookup(this, name) {
+            None => Ok(super::model::s_impossible_value()),
+            Some(cdesc) => Self::s_get_value(&cdesc, None, name),
+        }
+    }
+
+    /// RPython `ClassDesc.s_get_value(self, classdef, name)`
+    /// (classdesc.py:784-802).
+    ///
+    /// ```python
+    /// def s_get_value(self, classdef, name):
+    ///     obj = self.classdict[name]
+    ///     if isinstance(obj, Constant):
+    ///         value = obj.value
+    ///         if isinstance(value, staticmethod):
+    ///             value = value.__get__(42)
+    ///             classdef = None
+    ///         elif isinstance(value, classmethod):
+    ///             raise AnnotatorError("classmethods are not supported")
+    ///         s_value = self.bookkeeper.immutablevalue(value)
+    ///         if classdef is not None:
+    ///             s_value = s_value.bind_callables_under(classdef, name)
+    ///     elif isinstance(obj, Desc):
+    ///         if classdef is not None:
+    ///             obj = obj.bind_under(classdef, name)
+    ///         s_value = SomePBC([obj])
+    ///     else:
+    ///         raise TypeError("classdict should not contain %r" % (obj,))
+    ///     return s_value
+    /// ```
+    ///
+    /// Note: `isinstance(value, staticmethod)` / `classmethod` runtime
+    /// checks require Python value introspection — the Rust port does
+    /// not carry these wrappers yet and returns the value unwrapped.
+    /// classmethod guard lives here as a [`HostObject::class_is`] check
+    /// once those wrappers are modelled.
+    pub fn s_get_value(
+        this: &Rc<RefCell<Self>>,
+        classdef: Option<&Rc<RefCell<ClassDef>>>,
+        name: &str,
+    ) -> Result<SomeValue, AnnotatorError> {
+        // upstream: `obj = self.classdict[name]`.
+        let entry = this.borrow().classdict.get(name).cloned().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "ClassDesc.s_get_value({}): no classdict entry {:?}",
+                this.borrow().name,
+                name
+            ))
+        })?;
+        let bookkeeper = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+            AnnotatorError::new("ClassDesc.s_get_value: Bookkeeper backlink dropped")
+        })?;
+        match entry {
+            ClassDictEntry::Constant(c) => {
+                // upstream: staticmethod / classmethod wrappers not modelled
+                // in the Rust ConstValue carrier yet. Route straight through
+                // immutablevalue; bind_callables_under when classdef given.
+                let s_value = bookkeeper.immutablevalue(&c.value)?;
+                if let Some(cd) = classdef {
+                    Ok(super::model::bind_callables_under(&s_value, cd, name))
+                } else {
+                    Ok(s_value)
+                }
+            }
+            ClassDictEntry::Desc(desc_entry) => {
+                // upstream: `if classdef is not None: obj = obj.bind_under(classdef, name)`.
+                let bound_entry = if let Some(cd) = classdef {
+                    desc_entry.bind_under(cd, name)
+                } else {
+                    desc_entry
+                };
+                // upstream: `s_value = SomePBC([obj])`.
+                Ok(SomeValue::PBC(super::model::SomePBC::new(
+                    [bound_entry],
+                    false,
+                )))
+            }
         }
     }
 
@@ -2242,5 +2465,59 @@ mod tests {
         let rep_a = families.find_rep(a_key);
         let rep_b = families.find_rep(b_key);
         assert_eq!(rep_a, rep_b);
+    }
+
+    #[test]
+    fn classdesc_lookup_walks_basedesc_chain() {
+        use super::super::super::flowspace::model::ConstValue;
+        let bk = make_bk();
+        let parent = make_classdesc(&bk, "pkg.Parent");
+        parent
+            .borrow_mut()
+            .classdict
+            .insert("x".into(), ClassDictEntry::constant(ConstValue::Int(7)));
+        let child = make_classdesc(&bk, "pkg.Child");
+        child.borrow_mut().basedesc = Some(parent.clone());
+
+        // Direct hit on parent — child lookup walks the chain.
+        let found = ClassDesc::lookup(&child, "x").expect("x should be found on parent");
+        assert!(Rc::ptr_eq(&found, &parent));
+
+        // Missing name — None.
+        assert!(ClassDesc::lookup(&child, "nonexistent").is_none());
+
+        // read_attribute returns the same constant entry.
+        let entry = ClassDesc::read_attribute(&child, "x").expect("x should be readable");
+        match entry {
+            ClassDictEntry::Constant(c) => assert_eq!(c.value, ConstValue::Int(7)),
+            _ => panic!("expected Constant entry"),
+        }
+    }
+
+    #[test]
+    fn classdesc_s_read_attribute_returns_impossible_for_missing() {
+        let bk = make_bk();
+        let cdesc = make_classdesc(&bk, "pkg.Empty");
+        let sv = ClassDesc::s_read_attribute(&cdesc, "missing")
+            .expect("s_read_attribute must succeed with Impossible");
+        assert!(matches!(sv, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn classdesc_s_get_value_unwraps_constants() {
+        use super::super::super::flowspace::model::ConstValue;
+        use super::super::model::SomeValue;
+        let bk = make_bk();
+        let cdesc = make_classdesc(&bk, "pkg.Holder");
+        cdesc
+            .borrow_mut()
+            .classdict
+            .insert("n".into(), ClassDictEntry::constant(ConstValue::Int(42)));
+        let sv = ClassDesc::s_read_attribute(&cdesc, "n").expect("immutablevalue path");
+        // immutablevalue(Int(42)) is a constant-bound SomeInteger.
+        match sv {
+            SomeValue::Integer(_) => {}
+            other => panic!("expected SomeInteger from immutablevalue, got {:?}", other),
+        }
     }
 }

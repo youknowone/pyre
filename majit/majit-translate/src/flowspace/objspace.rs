@@ -126,7 +126,12 @@ pub fn build_flow(func: GraphFunc) -> Result<FunctionGraph, FlowContextError> {
     }
 
     let pygraph = PyGraph::new(func, &code);
-    let graph = pygraph.graph;
+    // pygraph.graph is an `Rc<RefCell<FunctionGraph>>` for annotator
+    // sharing; here we own the only reference, so unwrap back to the
+    // value-form FlowContext expects.
+    let graph = std::rc::Rc::try_unwrap(pygraph.graph)
+        .expect("objspace.build_flow: PyGraph.graph should be unique")
+        .into_inner();
     let mut ctx = FlowContext::new(graph, code);
     ctx.build_flow()?;
     fixeggblocks(&mut ctx.graph);

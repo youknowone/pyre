@@ -8,14 +8,20 @@
 //!   inheritance to add three fields (`func`, `signature`, `defaults`)
 //!   and override `__init__`. Rust has no inheritance; the port
 //!   composes `FunctionGraph` into `PyGraph` and exposes the fields
-//!   directly. Every `FunctionGraph` method remains reachable via
-//!   `pygraph.graph`.
+//!   directly. `PyGraph.graph` is an [`Rc<RefCell<FunctionGraph>>`] so
+//!   the annotator can share ownership of the callee graph with
+//!   `FunctionDesc.cache` when `recursivecall` is driven — the same
+//!   Python-object-identity semantic `PyGraph(FunctionGraph)`
+//!   inheritance provides upstream.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::argument::Signature;
 use super::bytecode::HostCode;
 use super::flowcontext::SpamBlock;
 use super::framestate::FrameState;
-use super::model::{Constant, FunctionGraph, GraphFunc, Hlvalue, Variable};
+use super::model::{Constant, FunctionGraph, GraphFunc, GraphRef, Hlvalue, Variable};
 
 /// RPython `rpython/flowspace/pygraph.py:7-33` — `class PyGraph(FunctionGraph)`.
 ///
@@ -25,9 +31,12 @@ use super::model::{Constant, FunctionGraph, GraphFunc, Hlvalue, Variable};
 /// fields.
 #[derive(Debug)]
 pub struct PyGraph {
-    /// Ported `FunctionGraph` base instance. Accessible fields:
-    /// `name`, `startblock`, `returnblock`, `exceptblock`, etc.
-    pub graph: FunctionGraph,
+    /// Ported `FunctionGraph` base instance. Wrapped in
+    /// [`Rc<RefCell<_>>`] so the annotator (`FunctionDesc.cache` +
+    /// `RPythonAnnotator.recursivecall`) can share ownership. Upstream
+    /// Python gets this for free through `PyGraph(FunctionGraph)`
+    /// inheritance + reference-counted object identity.
+    pub graph: GraphRef,
     /// RPython `PyGraph.func`.
     pub func: GraphFunc,
     /// RPython `PyGraph.signature = code.signature`.
@@ -61,7 +70,7 @@ impl PyGraph {
 
         // upstream: `self.signature = code.signature` / `self.defaults = ...`.
         PyGraph {
-            graph,
+            graph: Rc::new(RefCell::new(graph)),
             signature: code.signature.clone(),
             defaults: func.defaults.clone(),
             func,
@@ -129,12 +138,12 @@ mod tests {
         let func = GraphFunc::new("f", empty_globals());
         let pygraph = PyGraph::new(func, &code);
 
-        assert_eq!(pygraph.graph.name, "f");
+        assert_eq!(pygraph.graph.borrow().name, "f");
         assert_eq!(pygraph.defaults.len(), 0);
         assert_eq!(pygraph.signature.num_argnames(), 2);
         // startblock.inputargs carries a Variable per formal arg
         // (no None slots leak through).
-        let inputargs = pygraph.graph.startblock.borrow().inputargs.clone();
+        let inputargs = pygraph.graph.borrow().startblock.borrow().inputargs.clone();
         assert_eq!(inputargs.len(), 2);
         for arg in inputargs {
             assert!(matches!(arg, Hlvalue::Variable(_)));

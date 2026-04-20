@@ -2110,6 +2110,42 @@ impl SomeObjectTrait for SomeValue {
     }
 }
 
+/// RPython `bind_callables_under(s_value, classdef, name)` — the
+/// method defined on `SomeObject` / `SomePBC` / `SomeNone` via the
+/// `__extend__(...)` decorator in `rpython/annotator/unaryop.py:234-235`,
+/// 989-991, 1001-1002.
+///
+/// ```python
+/// # SomeObject default:
+/// def bind_callables_under(self, classdef, name):
+///     return self
+/// # SomePBC:
+/// def bind_callables_under(self, classdef, name):
+///     d = [desc.bind_under(classdef, name) for desc in self.descriptions]
+///     return SomePBC(d, can_be_None=self.can_be_None)
+/// # SomeNone:
+/// def bind_callables_under(self, classdef, name):
+///     return self
+/// ```
+pub fn bind_callables_under(
+    s_value: &SomeValue,
+    classdef: &Rc<std::cell::RefCell<super::classdesc::ClassDef>>,
+    name: &str,
+) -> SomeValue {
+    match s_value {
+        SomeValue::PBC(pbc) => {
+            let bound: Vec<_> = pbc
+                .descriptions
+                .values()
+                .map(|desc| desc.bind_under(classdef, name))
+                .collect();
+            SomeValue::PBC(SomePBC::new(bound, pbc.can_be_none))
+        }
+        // Default SomeObject and SomeNone — both return self.
+        _ => s_value.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UnionError — raised by A4.6's union dispatch.
 // ---------------------------------------------------------------------------

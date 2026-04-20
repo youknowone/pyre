@@ -512,6 +512,29 @@ impl DescEntry {
         }
     }
 
+    /// RPython `Desc.bind_under(classdef, name)` (description.py:177-178,
+    /// 350-355, 447-449).
+    ///
+    /// Default: return self (Desc.bind_under on Frozen/Class/MethodOfFrozen).
+    /// Function: delegate to `FunctionDesc.bind_under` → `MethodDesc`.
+    /// Method: warn + re-bind via `funcdesc.bind_under`.
+    pub fn bind_under(
+        &self,
+        classdef: &Rc<RefCell<super::classdesc::ClassDef>>,
+        name: &str,
+    ) -> DescEntry {
+        match self {
+            DescEntry::Function(fd) => {
+                DescEntry::Method(FunctionDesc::bind_under(fd, classdef, name))
+            }
+            DescEntry::Method(md) => DescEntry::Method(md.borrow().bind_under(classdef, name)),
+            // upstream: `Desc.bind_under` default = `return self`.
+            DescEntry::Frozen(_) | DescEntry::MethodOfFrozen(_) | DescEntry::Class(_) => {
+                self.clone()
+            }
+        }
+    }
+
     /// Shorthand predicates matching upstream `isinstance(desc, ...)`
     /// dispatch at bookkeeper callsites.
     pub fn is_function(&self) -> bool {
@@ -714,11 +737,28 @@ impl FunctionDesc {
         key: &str,
         alt_name: Option<&str>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        self.cachedgraph_with_builder(key, alt_name, |_| Ok(()))
+    }
+
+    /// `cachedgraph` variant that runs `post_build` on freshly-built
+    /// graphs before caching. Upstream `funcdesc.cachedgraph(key,
+    /// builder=builder)` (specialize.py:327) passes a `builder` callable
+    /// that rebuilds the graph with extra structure (stararg flattening,
+    /// etc.). The Rust port splits this: `buildgraph` constructs the
+    /// PyGraph via `build_flow`, and `post_build` then mutates it in
+    /// place.
+    fn cachedgraph_with_builder(
+        &self,
+        key: &str,
+        alt_name: Option<&str>,
+        post_build: impl FnOnce(&Rc<PyGraph>) -> Result<(), AnnotatorError>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
         if let Some(existing) = self.cache.borrow().get(key) {
             return Ok(existing.clone());
         }
         let computed_alt_name = alt_name.or_else(|| if key.is_empty() { None } else { Some(key) });
         let graph = self.buildgraph(computed_alt_name)?;
+        post_build(&graph)?;
         self.cache
             .borrow_mut()
             .insert(key.to_string(), graph.clone());
@@ -834,14 +874,14 @@ impl FunctionDesc {
             ))
         })?;
         let signature = code.signature.clone();
-        let mut pygraph = PyGraph {
-            graph: flow_graph,
+        let pygraph = PyGraph {
+            graph: Rc::new(RefCell::new(flow_graph)),
             func: graph_func,
             signature,
             defaults: self.defaults.clone(),
         };
         if let Some(alt_name) = alt_name {
-            pygraph.graph.name = alt_name.to_string();
+            pygraph.graph.borrow_mut().name = alt_name.to_string();
         }
         Ok(Rc::new(pygraph))
     }
@@ -885,6 +925,148 @@ impl FunctionDesc {
         Ok(graph.clone())
     }
 
+    /// RPython `flatten_star_args(funcdesc, args_s)`
+    /// (specialize.py:14-58).
+    ///
+    /// Flattens the trailing `SomeTuple` for a `*arg` signature into
+    /// individual argument annotations, returning the new args_s and
+    /// an optional cache-key suffix (`"star_N"` where `N` is the
+    /// flattened tuple length). For signatures without a `*arg` this
+    /// is the identity: `(args_s, None)`.
+    ///
+    /// The graph-mutation half of the upstream builder closure
+    /// (specialize.py:29-52) — rewriting `startblock` so the graph
+    /// sees individual parameters instead of a `*arg` tuple — runs
+    /// once per cache miss via [`Self::cachedgraph_with_builder`] in
+    /// the vararg path.
+    pub fn flatten_star_args(
+        &self,
+        args_s: &[SomeValue],
+    ) -> Result<(Vec<SomeValue>, Option<String>), AnnotatorError> {
+        // upstream: `argnames, vararg, kwarg = funcdesc.signature`.
+        let vararg = self.signature.varargname.clone();
+        let kwarg = self.signature.kwargname.clone();
+        // upstream: `assert not kwarg`.
+        if kwarg.is_some() {
+            return Err(AnnotatorError::new(format!(
+                "{}: functions with ** arguments are not supported",
+                self.name
+            )));
+        }
+        if vararg.is_none() {
+            // upstream: `return args_s, None, None`.
+            return Ok((args_s.to_vec(), None));
+        }
+        let _vararg = vararg;
+        // upstream: `assert len(args_s) == len(argnames) + 1`.
+        let argnames_len = self.signature.argnames.len();
+        if args_s.len() != argnames_len + 1 {
+            return Err(AnnotatorError::new(format!(
+                "{}.flatten_star_args: expected {} args, got {}",
+                self.name,
+                argnames_len + 1,
+                args_s.len()
+            )));
+        }
+        // upstream: `s_tuple = args_s[-1]; assert isinstance(s_tuple, SomeTuple)`.
+        let s_tuple = &args_s[args_s.len() - 1];
+        let tuple = match s_tuple {
+            SomeValue::Tuple(t) => t,
+            other => {
+                return Err(AnnotatorError::new(format!(
+                    "{}.flatten_star_args: *arg is {:?}, expected SomeTuple",
+                    self.name, other
+                )));
+            }
+        };
+        // upstream: `s_len = s_tuple.len(); assert s_len.is_constant();
+        //             nb_extra_args = s_len.const`.
+        let nb_extra_args = tuple.items.len();
+        // upstream: `flattened_s = list(args_s[:-1]); flattened_s.extend(s_tuple.items)`.
+        let mut flattened_s: Vec<SomeValue> = args_s[..args_s.len() - 1].to_vec();
+        flattened_s.extend(tuple.items.iter().cloned());
+        // upstream: `key = ('star', nb_extra_args)`.
+        let key_suffix = format!("star_{}", nb_extra_args);
+        Ok((flattened_s, Some(key_suffix)))
+    }
+
+    /// Graph-mutation hook invoked when [`Self::cachedgraph_with_builder`]
+    /// builds a fresh `*arg` graph. Matches the body of upstream's
+    /// `builder(translator, func)` closure (specialize.py:29-52): swap
+    /// out the startblock so the graph sees `nb_extra_args` individual
+    /// parameters instead of a `*arg` tuple, and emit a `newtuple` op
+    /// in the new startblock to reconstruct the expected tuple for the
+    /// original code.
+    fn apply_star_args_builder(
+        pygraph: &Rc<PyGraph>,
+        nb_extra_args: usize,
+    ) -> Result<(), AnnotatorError> {
+        use crate::flowspace::model::{Block, Hlvalue, Link, Variable};
+        use crate::flowspace::operation::{HLOperation, OpKind};
+
+        let mut graph = pygraph.graph.borrow_mut();
+        // upstream: `argnames, vararg, kwarg = graph.signature; assert vararg`.
+        let old_sig = pygraph.signature.clone();
+        if old_sig.varargname.is_none() {
+            return Err(AnnotatorError::new(format!(
+                "apply_star_args_builder({}): graph signature missing *arg",
+                graph.name
+            )));
+        }
+        // upstream: `argscopy = [Variable(v) for v in graph.getargs()]`.
+        let old_args = graph.getargs();
+        let argscopy: Vec<Variable> = old_args
+            .iter()
+            .map(|hl| match hl {
+                Hlvalue::Variable(v) => Variable::named(&v.name()),
+                _ => Variable::new(),
+            })
+            .collect();
+        // upstream: `starargs = [Variable('stararg%d'%i) for i in range(nb_extra_args)]`.
+        let starargs: Vec<Variable> = (0..nb_extra_args)
+            .map(|i| Variable::named(format!("stararg{}", i)))
+            .collect();
+        // upstream: `newstartblock = Block(argscopy[:-1] + starargs)`.
+        let mut new_inputargs: Vec<Hlvalue> = argscopy[..argscopy.len() - 1]
+            .iter()
+            .map(|v| Hlvalue::Variable(v.clone()))
+            .collect();
+        new_inputargs.extend(starargs.iter().map(|v| Hlvalue::Variable(v.clone())));
+        let newstartblock = Block::shared(new_inputargs);
+        // upstream: `newtup = op.newtuple(*starargs); newtup.result = argscopy[-1]`.
+        //
+        // `HLOperation` is the flow-time handler object; the persisted
+        // form is `SpaceOperation(opname, args, result)`. The annotator
+        // consumes `operations: Vec<SpaceOperation>`, so emit the
+        // SpaceOperation form directly.
+        let star_args_hl: Vec<Hlvalue> = starargs
+            .iter()
+            .map(|v| Hlvalue::Variable(v.clone()))
+            .collect();
+        let newtup_result = Hlvalue::Variable(argscopy[argscopy.len() - 1].clone());
+        let newtup_sp = crate::flowspace::model::SpaceOperation::new(
+            OpKind::NewTuple.opname(),
+            star_args_hl,
+            newtup_result,
+        );
+        let _ = HLOperation::new(OpKind::NewTuple, Vec::new()); // keep import alive
+        newstartblock.borrow_mut().operations.push(newtup_sp);
+        // upstream: `newstartblock.closeblock(Link(argscopy, graph.startblock))`.
+        let link_args: Vec<Hlvalue> = argscopy
+            .iter()
+            .map(|v| Hlvalue::Variable(v.clone()))
+            .collect();
+        let link = Rc::new(std::cell::RefCell::new(Link::new(
+            link_args,
+            Some(graph.startblock.clone()),
+            None,
+        )));
+        newstartblock.borrow_mut().closeblock(vec![link]);
+        // upstream: `graph.startblock = newstartblock`.
+        graph.startblock = newstartblock;
+        Ok(())
+    }
+
     /// RPython `FunctionDesc.specialize(inputcells, op=None)`
     /// (description.py:272-281).
     ///
@@ -904,18 +1086,17 @@ impl FunctionDesc {
         match self.specializer.as_ref().unwrap_or(&Specializer::Default) {
             Specializer::Default => {
                 // upstream `default_specialize(funcdesc, args_s)`
-                // (specialize.py:60-85). Scan args_s for
-                // `SomeInstance` carrying `access_directly`; when
-                // `_jit_look_inside_` (default True) is set, fork the
-                // cached graph into an access-directly variant. When
-                // `_jit_look_inside_=False`, strip the flag from the
-                // instance annotation so the regular graph is used.
+                // (specialize.py:60-85).
                 //
-                // `flatten_star_args` (specialize.py:14-58) — the
-                // *arg builder/key pair — is deferred; it needs
-                // `translator.buildflowgraph` which isn't in this
-                // port yet. Functions without varargs (the common
-                // case) take the `args_s, None, None` fallback.
+                // `flatten_star_args` (specialize.py:14-58) runs first
+                // on the raw args_s. For signatures without a *arg it
+                // is the pass-through identity; [`Self::flatten_star_args`]
+                // handles the flattening + key-suffix + graph-mutation
+                // builder for the vararg case.
+                let (flattened_cells, star_key) = self.flatten_star_args(inputcells)?;
+                let mut inputcells_vec = flattened_cells;
+                let inputcells = inputcells_vec.as_mut_slice();
+
                 let jit_look_inside = self
                     .base
                     .pyobj
@@ -937,15 +1118,39 @@ impl FunctionDesc {
                         }
                     }
                 }
+                // Parse the nb_extra_args out of the star_key for the
+                // builder hook. Upstream carries this as
+                // `key = ('star', nb_extra_args)`; the Rust port
+                // serialises as `"star_N"` so recover N back here.
+                let nb_extra_args: Option<usize> = star_key
+                    .as_deref()
+                    .and_then(|sk| sk.strip_prefix("star_").and_then(|n| n.parse().ok()));
+                // upstream builder path: freshly-built graphs get
+                // `apply_star_args_builder(nb_extra_args)` to rewrite
+                // `startblock` + flatten the *arg tuple. Cached hits
+                // bypass — already rewritten.
+                let post_build = |pg: &Rc<PyGraph>| -> Result<(), AnnotatorError> {
+                    if let Some(n) = nb_extra_args {
+                        Self::apply_star_args_builder(pg, n)?;
+                    }
+                    Ok(())
+                };
+
                 if access_directly {
                     // upstream `key = (AccessDirect, key)` — tuple key.
                     // Rust encodes as prefix on the cache-name string.
-                    self.cachedgraph(
-                        "access_directly",
-                        Some(&format!("{}_access_directly", self.name)),
-                    )
+                    let cache_key = match &star_key {
+                        Some(sk) => format!("access_directly_{}", sk),
+                        None => "access_directly".to_string(),
+                    };
+                    let alt = format!("{}_{}", self.name, cache_key);
+                    self.cachedgraph_with_builder(&cache_key, Some(&alt), post_build)
                 } else {
-                    self.cachedgraph("", None)
+                    let key = star_key.as_deref().unwrap_or("");
+                    let alt_owned = star_key
+                        .as_deref()
+                        .map(|sk| format!("{}_{}", self.name, sk));
+                    self.cachedgraph_with_builder(key, alt_owned.as_deref(), post_build)
                 }
             }
             Specializer::Arg { parms } => {
@@ -1068,17 +1273,93 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.pycall(whence, args, s_previous_result, op=None)`
     /// (description.py:283-305).
     ///
-    /// **Not ported.** Requires annrpython.py (`recursivecall`,
-    /// `addpendingblock`) + specialize.py.
+    /// ```python
+    /// def pycall(self, whence, args, s_previous_result, op=None):
+    ///     inputcells = self.parse_arguments(args)
+    ///     graph = self.specialize(inputcells, op)
+    ///     assert isinstance(graph, FunctionGraph)
+    ///     new_args = args.unmatch_signature(self.signature, inputcells)
+    ///     inputcells = self.parse_arguments(new_args, graph)
+    ///     annotator = self.bookkeeper.annotator
+    ///     result = annotator.recursivecall(graph, whence, inputcells)
+    ///     signature = getattr(self.pyobj, '_signature_', None)
+    ///     if signature:
+    ///         sigresult = enforce_signature_return(self, signature[1], result)
+    ///         if sigresult is not None:
+    ///             annotator.addpendingblock(graph, graph.returnblock, [sigresult])
+    ///             result = sigresult
+    ///     result = unionof(result, s_previous_result)
+    ///     return result
+    /// ```
     pub fn pycall(
         &self,
-        _args: &ArgumentsForTranslation,
-        _s_previous_result: &SomeValue,
+        whence: Option<(
+            crate::flowspace::model::GraphRef,
+            crate::flowspace::model::BlockRef,
+            usize,
+        )>,
+        args: &ArgumentsForTranslation,
+        s_previous_result: &SomeValue,
+        op_key: Option<PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FunctionDesc.pycall requires annrpython.py + specialize.py \
-             (Phase 5 P5.2+ dep — see description.py:283-305)",
-        ))
+        // upstream: `inputcells = self.parse_arguments(args)`.
+        let mut inputcells = self.parse_arguments(args, None, None)?;
+        // upstream: `graph = self.specialize(inputcells, op)`.
+        let graph = self.specialize(&mut inputcells, op_key.clone())?;
+        // upstream: `assert isinstance(graph, FunctionGraph)` — Rust
+        // specialize() statically returns `Rc<PyGraph>` (PyGraph is the
+        // FunctionGraph subclass upstream), so the assertion collapses.
+
+        // upstream: `new_args = args.unmatch_signature(self.signature, inputcells)`.
+        let new_args = args
+            .unmatch_signature(&self.signature, &inputcells)
+            .map_err(|e| {
+                AnnotatorError::new(format!("{}.unmatch_signature: {}", self.name, e.getmsg()))
+            })?;
+        // upstream: `inputcells = self.parse_arguments(new_args, graph)`.
+        let graph_sig = graph.signature.clone();
+        let graph_defaults: Vec<ConstValue> =
+            graph.defaults.iter().map(|c| c.value.clone()).collect();
+        let inputcells =
+            self.parse_arguments(&new_args, Some(&graph_sig), Some(&graph_defaults))?;
+
+        // upstream: `annotator = self.bookkeeper.annotator`.
+        let annotator = self
+            .base
+            .bookkeeper
+            .annotator
+            .borrow()
+            .upgrade()
+            .ok_or_else(|| {
+                AnnotatorError::new(
+                    "FunctionDesc.pycall: bookkeeper.annotator backlink not installed",
+                )
+            })?;
+
+        // upstream: `result = annotator.recursivecall(graph, whence, inputcells)`.
+        let mut result = annotator.recursivecall(&graph.graph, whence, &inputcells);
+
+        // upstream: `signature = getattr(self.pyobj, '_signature_', None)`
+        //   `if signature: sigresult = enforce_signature_return(...)`.
+        if let Some(annsig) = &self.annsignature {
+            let sigresult = super::signature::enforce_signature_return(
+                &self.name,
+                &self.base.bookkeeper,
+                &annsig.result,
+                &result,
+            )?;
+            // upstream: `if sigresult is not None:`.
+            if let Some(sigresult) = sigresult {
+                // upstream: `annotator.addpendingblock(graph, graph.returnblock, [sigresult])`.
+                let returnblock = graph.graph.borrow().returnblock.clone();
+                annotator.addpendingblock(&graph.graph, &returnblock, &[sigresult.clone()]);
+                result = sigresult;
+            }
+        }
+
+        // upstream: `result = unionof(result, s_previous_result)`.
+        super::model::unionof([&result, s_previous_result])
+            .map_err(|e| AnnotatorError::new(format!("{}.pycall unionof: {}", self.name, e)))
     }
 
     /// RPython `FunctionDesc.get_graph(args, op)` (description.py:328-330).
@@ -1094,18 +1375,28 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.bind_under(classdef, name)`
     /// (description.py:350-355).
     ///
-    /// **Not ported.** Requires `bookkeeper.getmethoddesc` +
-    /// `MethodDesc` which land in description.py commit 3 and
-    /// classdesc.py.
+    /// ```python
+    /// def bind_under(self, classdef, name):
+    ///     # XXX static methods
+    ///     return self.bookkeeper.getmethoddesc(self,
+    ///                                          classdef,   # originclassdef,
+    ///                                          None,       # selfclassdef
+    ///                                          name)
+    /// ```
     pub fn bind_under(
-        &self,
-        _classdef_name: &str,
-        _name: &str,
-    ) -> Result<Rc<RefCell<Desc>>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FunctionDesc.bind_under requires bookkeeper.getmethoddesc + MethodDesc \
-             (description.py commit 3+ dep)",
-        ))
+        self_rc: &Rc<RefCell<FunctionDesc>>,
+        originclassdef: &Rc<RefCell<super::classdesc::ClassDef>>,
+        name: &str,
+    ) -> Rc<RefCell<MethodDesc>> {
+        let bk = self_rc.borrow().base.bookkeeper.clone();
+        // upstream defaults: `selfclassdef=None`, `flags={}`.
+        bk.getmethoddesc(
+            self_rc,
+            ClassDefKey::from_classdef(originclassdef),
+            None,
+            name,
+            std::collections::BTreeMap::new(),
+        )
     }
 
     /// RPython `FunctionDesc.consider_call_site(descs, args, s_result, op)`
@@ -1138,25 +1429,97 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.get_s_signatures(shape)`
     /// (description.py:368-393).
     ///
-    /// **Not ported.** Requires `getcallfamily` + annrpython
-    /// `binding(v)` accessor.
+    /// ```python
+    /// def get_s_signatures(self, shape):
+    ///     family = self.getcallfamily()
+    ///     table = family.calltables.get(shape)
+    ///     if table is None:
+    ///         return []
+    ///     else:
+    ///         graph_seen = {}
+    ///         s_sigs = []
+    ///         binding = self.bookkeeper.annotator.binding
+    ///         def enlist(graph):
+    ///             if graph in graph_seen: return
+    ///             graph_seen[graph] = True
+    ///             s_sig = ([binding(v) for v in graph.getargs()],
+    ///                      binding(graph.getreturnvar()))
+    ///             if s_sig in s_sigs: return
+    ///             s_sigs.append(s_sig)
+    ///         for row in table:
+    ///             for graph in row.itervalues():
+    ///                 enlist(graph)
+    ///         return s_sigs
+    /// ```
     pub fn get_s_signatures(
         &self,
-        _shape: &CallShape,
+        shape: &CallShape,
     ) -> Result<Vec<(Vec<SomeValue>, SomeValue)>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "FunctionDesc.get_s_signatures requires annrpython.py + \
-             Bookkeeper.pbc_maximal_call_families (Phase 5 P5.2+ dep — \
-             see description.py:368-393)",
-        ))
+        let family = self.base.getcallfamily()?;
+        // upstream: `table = family.calltables.get(shape)`.
+        let rows: Vec<CallTableRow> = {
+            let family_ref = family.borrow();
+            match family_ref.calltables.get(shape) {
+                Some(table) => table.clone(),
+                None => return Ok(Vec::new()),
+            }
+        };
+
+        // upstream: `binding = self.bookkeeper.annotator.binding`.
+        let annotator = self
+            .base
+            .bookkeeper
+            .annotator
+            .borrow()
+            .upgrade()
+            .ok_or_else(|| {
+                AnnotatorError::new(
+                    "FunctionDesc.get_s_signatures: bookkeeper.annotator backlink not installed",
+                )
+            })?;
+
+        // upstream: `graph_seen = {}; s_sigs = []`.
+        // Graph identity dedup via `Rc::as_ptr` on Rc<RefCell<FunctionGraph>>.
+        let mut graph_seen: std::collections::HashSet<
+            *const std::cell::RefCell<crate::flowspace::model::FunctionGraph>,
+        > = std::collections::HashSet::new();
+        let mut s_sigs: Vec<(Vec<SomeValue>, SomeValue)> = Vec::new();
+
+        // upstream: `for row in table: for graph in row.itervalues(): enlist(graph)`.
+        for row in &rows {
+            for pygraph in row.values() {
+                let graph_ref = &pygraph.graph;
+                let key = Rc::as_ptr(graph_ref);
+                // upstream: `if graph in graph_seen: return`.
+                if !graph_seen.insert(key) {
+                    continue;
+                }
+                // upstream: `s_sig = ([binding(v) for v in graph.getargs()],
+                //                     binding(graph.getreturnvar()))`.
+                let (args_hl, returnvar) = {
+                    let g = graph_ref.borrow();
+                    (g.getargs(), g.getreturnvar())
+                };
+                let mut args_s: Vec<SomeValue> = Vec::with_capacity(args_hl.len());
+                for v in &args_hl {
+                    args_s.push(annotator.binding(v));
+                }
+                let return_s = annotator.binding(&returnvar);
+                let s_sig = (args_s, return_s);
+                // upstream: `if s_sig in s_sigs: return`.
+                if !s_sigs.iter().any(|existing| existing == &s_sig) {
+                    s_sigs.push(s_sig);
+                }
+            }
+        }
+        Ok(s_sigs)
     }
 }
 
 /// RPython `class MemoDesc(FunctionDesc)` (description.py:395-404).
 ///
-/// Overrides `pycall` to return the specializer result directly
-/// instead of wrapping it in a graph call. **Deferred** until
-/// `FunctionDesc.specialize` + `FunctionDesc.pycall` land.
+/// Overrides `pycall` to project the specialized graph's return
+/// annotation directly instead of driving a fresh `recursivecall`.
 #[derive(Debug)]
 pub struct MemoDesc {
     pub base: FunctionDesc,
@@ -1165,6 +1528,60 @@ pub struct MemoDesc {
 impl MemoDesc {
     pub fn new(base: FunctionDesc) -> Self {
         MemoDesc { base }
+    }
+
+    /// RPython `MemoDesc.pycall(whence, args, s_previous_result, op=None)`
+    /// (description.py:395-404).
+    ///
+    /// ```python
+    /// def pycall(self, whence, args, s_previous_result, op=None):
+    ///     inputcells = self.parse_arguments(args)
+    ///     s_result = self.specialize(inputcells, op)
+    ///     if isinstance(s_result, FunctionGraph):
+    ///         s_result = s_result.getreturnvar().annotation
+    ///         if s_result is None:
+    ///             s_result = s_ImpossibleValue
+    ///     s_result = unionof(s_result, s_previous_result)
+    ///     return s_result
+    /// ```
+    ///
+    /// In the Rust port `specialize` always returns `Rc<PyGraph>`
+    /// (upstream's union `SomeValue | FunctionGraph` collapses because
+    /// the memoize-on-Some hook isn't ported yet — specialize.py :memo
+    /// branch). The `isinstance(s_result, FunctionGraph)` arm is the
+    /// always-taken path here.
+    pub fn pycall(
+        &self,
+        _whence: Option<(
+            crate::flowspace::model::GraphRef,
+            crate::flowspace::model::BlockRef,
+            usize,
+        )>,
+        args: &ArgumentsForTranslation,
+        s_previous_result: &SomeValue,
+        op_key: Option<super::bookkeeper::PositionKey>,
+    ) -> Result<SomeValue, AnnotatorError> {
+        use super::model::s_impossible_value;
+        // upstream: `inputcells = self.parse_arguments(args)`.
+        let mut inputcells = self.base.parse_arguments(args, None, None)?;
+        // upstream: `s_result = self.specialize(inputcells, op)`.
+        let graph = self.base.specialize(&mut inputcells, op_key)?;
+        // upstream: `if isinstance(s_result, FunctionGraph): s_result =
+        //              s_result.getreturnvar().annotation`. In Rust
+        // `specialize` always returns a PyGraph (FunctionGraph subclass),
+        // so we always take this branch.
+        let returnvar = graph.graph.borrow().getreturnvar();
+        let s_result = match &returnvar {
+            crate::flowspace::model::Hlvalue::Variable(v) => v
+                .annotation
+                .as_ref()
+                .map(|rc| (**rc).clone())
+                .unwrap_or_else(s_impossible_value),
+            _ => s_impossible_value(),
+        };
+        // upstream: `s_result = unionof(s_result, s_previous_result)`.
+        super::model::unionof([&s_result, s_previous_result])
+            .map_err(|e| AnnotatorError::new(format!("MemoDesc.pycall unionof: {}", e)))
     }
 }
 
@@ -1270,15 +1687,26 @@ impl MethodDesc {
     /// RPython `MethodDesc.pycall(whence, args, s_previous_result, op)`
     /// (description.py:439-441).
     ///
-    /// Delegates to `funcdesc.pycall(func_args(args), ...)`; both
-    /// dependencies are deferred to later commits.
+    /// ```python
+    /// def pycall(self, whence, args, s_previous_result, op=None):
+    ///     return self.funcdesc.pycall(whence, self.func_args(args),
+    ///                                 s_previous_result, op)
+    /// ```
     pub fn pycall(
         &self,
+        whence: Option<(
+            crate::flowspace::model::GraphRef,
+            crate::flowspace::model::BlockRef,
+            usize,
+        )>,
         args: &ArgumentsForTranslation,
         s_previous_result: &SomeValue,
+        op_key: Option<PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
         let func_args = self.func_args(args)?;
-        self.funcdesc.borrow().pycall(&func_args, s_previous_result)
+        self.funcdesc
+            .borrow()
+            .pycall(whence, &func_args, s_previous_result, op_key)
     }
 
     /// RPython `MethodDesc.get_graph(args, op)` (description.py:443-445).
@@ -1293,15 +1721,21 @@ impl MethodDesc {
 
     /// RPython `MethodDesc.bind_under(classdef, name)` (description.py:447-449).
     ///
-    /// Upstream emits a warning then re-binds via `funcdesc.bind_under`.
-    /// The Rust port just delegates — warning channel lands with the
-    /// annrpython.py driver.
+    /// ```python
+    /// def bind_under(self, classdef, name):
+    ///     self.bookkeeper.warning("rebinding an already bound %r" % (self,))
+    ///     return self.funcdesc.bind_under(classdef, name)
+    /// ```
     pub fn bind_under(
         &self,
-        classdef: &str,
+        classdef: &Rc<RefCell<super::classdesc::ClassDef>>,
         name: &str,
-    ) -> Result<Rc<RefCell<Desc>>, AnnotatorError> {
-        self.funcdesc.borrow().bind_under(classdef, name)
+    ) -> Rc<RefCell<MethodDesc>> {
+        // upstream: `self.bookkeeper.warning("rebinding an already bound %r" % (self,))`.
+        self.base
+            .bookkeeper
+            .warning(format!("rebinding an already bound MethodDesc {:?}", self));
+        FunctionDesc::bind_under(&self.funcdesc, classdef, name)
     }
 
     /// RPython `MethodDesc.bind_self(newselfclassdef, flags={})`
@@ -1669,13 +2103,27 @@ impl MethodOfFrozenDesc {
 
     /// RPython `MethodOfFrozenDesc.pycall(whence, args,
     /// s_previous_result, op)` (description.py:619-621).
+    ///
+    /// ```python
+    /// def pycall(self, whence, args, s_previous_result, op=None):
+    ///     return self.funcdesc.pycall(whence, self.func_args(args),
+    ///                                 s_previous_result, op)
+    /// ```
     pub fn pycall(
         &self,
+        whence: Option<(
+            crate::flowspace::model::GraphRef,
+            crate::flowspace::model::BlockRef,
+            usize,
+        )>,
         args: &ArgumentsForTranslation,
         s_previous_result: &SomeValue,
+        op_key: Option<PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
         let func_args = self.func_args(args)?;
-        self.funcdesc.borrow().pycall(&func_args, s_previous_result)
+        self.funcdesc
+            .borrow()
+            .pycall(whence, &func_args, s_previous_result, op_key)
     }
 
     /// RPython `MethodOfFrozenDesc.get_graph(args, op)` (description.py:623-625).
@@ -1905,7 +2353,7 @@ mod tests {
         let startblock = crate::flowspace::model::Block::shared(vec![]);
         let graph = FunctionGraph::new("f", startblock);
         Rc::new(PyGraph {
-            graph,
+            graph: Rc::new(std::cell::RefCell::new(graph)),
             func,
             signature: sig,
             defaults,
@@ -2036,11 +2484,75 @@ mod tests {
     }
 
     #[test]
-    fn function_desc_pycall_deferred() {
+    fn function_desc_pycall_without_pyobj_errors_cleanly() {
+        // FunctionDesc with no pyobj can't reach `buildgraph` — pycall
+        // surfaces the missing-pyobj error via specialize → cachedgraph
+        // → buildgraph rather than panicking.
         let fd = FunctionDesc::new(bk(), None, "f", int_sig(&[]), None, None);
         let args = ArgumentsForTranslation::new(vec![], None, None);
-        let err = fd.pycall(&args, &SomeValue::Impossible).unwrap_err();
-        assert!(err.msg.unwrap_or_default().contains("annrpython.py"));
+        let err = fd
+            .pycall(None, &args, &SomeValue::Impossible, None)
+            .unwrap_err();
+        assert!(err.msg.unwrap_or_default().contains("missing pyobj"));
+    }
+
+    #[test]
+    fn flatten_star_args_identity_for_plain_signature() {
+        let fd = FunctionDesc::new(bk(), None, "f", int_sig(&["a", "b"]), None, None);
+        let args = vec![
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Integer(SomeInteger::default()),
+        ];
+        let (out, key) = fd.flatten_star_args(&args).expect("identity path");
+        assert!(key.is_none());
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn flatten_star_args_rejects_kwargs() {
+        let sig = Signature::new(vec!["a".into()], None, Some("kw".into()));
+        let fd = FunctionDesc::new(bk(), None, "f", sig, None, None);
+        let args = vec![
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Integer(SomeInteger::default()),
+        ];
+        let err = fd.flatten_star_args(&args).unwrap_err();
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("** arguments are not supported")
+        );
+    }
+
+    #[test]
+    fn flatten_star_args_expands_tuple_for_vararg() {
+        use super::super::model::SomeTuple;
+        let sig = Signature::new(vec!["a".into()], Some("rest".into()), None);
+        let fd = FunctionDesc::new(bk(), None, "f", sig, None, None);
+        let args = vec![
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::Integer(SomeInteger::default()),
+            ])),
+        ];
+        let (out, key) = fd.flatten_star_args(&args).expect("vararg path");
+        assert_eq!(out.len(), 3, "a + 2 flattened star args");
+        assert_eq!(key.as_deref(), Some("star_2"));
+    }
+
+    #[test]
+    fn memo_desc_pycall_without_pyobj_errors_cleanly() {
+        // MemoDesc shares FunctionDesc's specialize path; no pyobj
+        // surfaces the same buildgraph error via specialize →
+        // cachedgraph → buildgraph.
+        let fd = FunctionDesc::new(bk(), None, "f", int_sig(&[]), None, None);
+        let md = MemoDesc::new(fd);
+        let args = ArgumentsForTranslation::new(vec![], None, None);
+        let err = md
+            .pycall(None, &args, &SomeValue::Impossible, None)
+            .unwrap_err();
+        assert!(err.msg.unwrap_or_default().contains("missing pyobj"));
     }
 
     #[test]
