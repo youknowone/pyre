@@ -308,6 +308,11 @@ fn block_exit_targets(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
         Terminator::Branch {
             if_true, if_false, ..
         } => vec![if_true.0, if_false.0],
+        Terminator::CallWithException {
+            normal_target,
+            except_target,
+            ..
+        } => vec![normal_target.0, except_target.0],
         Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => Vec::new(),
     }
 }

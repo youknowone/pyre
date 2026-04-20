@@ -198,6 +198,31 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                 insert_renamings(false_args, &false_block.inputargs, regallocs, &mut ops);
                 ops.push(FlatOp::Jump(false_label));
             }
+            Terminator::CallWithException {
+                normal_target,
+                normal_args,
+                ..
+            } => {
+                // RPython parity: a block with `exitswitch =
+                // c_last_exception` produces `-live-` before its
+                // normal-path jump (`rpython/jit/codewriter/
+                // liveness.py:5-20`).  The normal Link carries the
+                // call result into the continuation; the exception
+                // Link is consumed by later passes via the shared
+                // exception block (reachable through
+                // `FunctionGraph::successors`).
+                ops.push(FlatOp::Live {
+                    live_values: Vec::new(),
+                });
+                let target_block = graph.block(*normal_target);
+                for (dst, src) in target_block.inputargs.iter().zip(normal_args.iter()) {
+                    ops.push(FlatOp::Move {
+                        dst: *dst,
+                        src: *src,
+                    });
+                }
+                ops.push(FlatOp::Jump(block_labels[normal_target]));
+            }
             Terminator::Return(_val) => {
                 // Return is implicit at the end (no jump needed)
                 // Could emit a FlatOp::Return if needed
@@ -290,6 +315,11 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
         Terminator::Branch {
             if_true, if_false, ..
         } => vec![*if_true, *if_false],
+        Terminator::CallWithException {
+            normal_target,
+            except_target,
+            ..
+        } => vec![*normal_target, *except_target],
         Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => vec![],
     }
 }

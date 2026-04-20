@@ -2326,6 +2326,25 @@ fn remap_terminator(
                 .map(|v| remap_value(v, aliases))
                 .collect(),
         },
+        Terminator::CallWithException {
+            normal_target,
+            normal_args,
+            except_target,
+            except_args,
+        } => Terminator::CallWithException {
+            normal_target: *normal_target,
+            normal_args: normal_args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+            except_target: *except_target,
+            except_args: except_args
+                .iter()
+                .copied()
+                .map(|v| remap_value(v, aliases))
+                .collect(),
+        },
         Terminator::Return(val) => Terminator::Return(val.map(|v| remap_value(v, aliases))),
         Terminator::Abort { reason } => Terminator::Abort {
             reason: reason.clone(),

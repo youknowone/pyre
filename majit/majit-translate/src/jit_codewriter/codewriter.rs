@@ -275,7 +275,15 @@ fn graph_result_kind(
     value_kinds: &std::collections::HashMap<ValueId, RegKind>,
 ) -> char {
     let mut found: Option<char> = None;
+    // RPython parity: FUNC.RESULT is driven by normal-path returns only.
+    // The shared exception block (`FunctionGraph::exception_block`) is
+    // the equivalent of RPython's "raise block" (`flowspace/model.py:198`),
+    // which terminates the graph by propagating an exception and does
+    // NOT participate in FUNC.RESULT typing.  Skip it explicitly.
     for block in &graph.blocks {
+        if Some(block.id) == graph.exception_block {
+            continue;
+        }
         if let Terminator::Return(Some(vid)) = &block.terminator {
             let kind = match value_kinds.get(vid) {
                 Some(RegKind::Int) => 'i',

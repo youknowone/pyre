@@ -611,6 +611,18 @@ pub enum Terminator {
         if_false: BlockId,
         false_args: Vec<ValueId>,
     },
+    /// Call whose last op may raise; block has a normal exit and an
+    /// exception exit.  RPython equivalent: `Block.exitswitch =
+    /// c_last_exception` with `block.exits = [normal_link,
+    /// exception_link]` (`rpython/flowspace/model.py:216`
+    /// `Block.canraise`).  The preceding `operations.last()` is the
+    /// raising op.
+    CallWithException {
+        normal_target: BlockId,
+        normal_args: Vec<ValueId>,
+        except_target: BlockId,
+        except_args: Vec<ValueId>,
+    },
     Return(Option<ValueId>),
     Abort {
         reason: String,
@@ -646,18 +658,14 @@ pub struct FunctionGraph {
     /// Variable names for debugging (RPython Variable._name).
     #[serde(default)]
     pub value_names: std::collections::HashMap<ValueId, String>,
-    /// Result `ValueId`s produced by a Rust `?` operator lowering.
-    ///
-    /// RPython analogue: `Block.exitswitch = c_last_exception` signals that
-    /// the block's last op may raise. Pyre records the same information at
-    /// the value level: every entry here is a value whose producing op
-    /// should be treated as a raising call by the codewriter
-    /// (`jtransform.rs::rewrite_op_direct_call` emits `-live-` when the
-    /// descriptor has `ExtraEffect::CanRaise`, see
-    /// `rpython/jit/codewriter/jtransform.py:456`). Downstream consumers
-    /// seed the call descriptor's effect from this set.
+    /// Shared exception block for `?` lowering: a single block per
+    /// graph that takes the propagated `PyError` as its inputarg and
+    /// returns it.  Created lazily on the first `Expr::Try`.
+    /// RPython analogue: the codewriter coalesces exception paths into
+    /// a single `raise block` (`rpython/flowspace/model.py:198`) that
+    /// all raising blocks' `exits[1]` point to.
     #[serde(default)]
-    pub try_sites: std::collections::HashSet<ValueId>,
+    pub exception_block: Option<BlockId>,
 }
 
 impl FunctionGraph {
@@ -675,8 +683,23 @@ impl FunctionGraph {
             notes: Vec::new(),
             next_value: 0,
             value_names: std::collections::HashMap::new(),
-            try_sites: std::collections::HashSet::new(),
+            exception_block: None,
         }
+    }
+
+    /// Get or create the shared exception block for `?` lowering.
+    /// The block takes the propagated `PyError` as its single
+    /// inputarg and returns it.  RPython parity:
+    /// `flowspace/model.py:198` "raise block".
+    pub fn get_or_create_exception_block(&mut self) -> (BlockId, ValueId) {
+        if let Some(id) = self.exception_block {
+            let arg = self.block(id).inputargs[0];
+            return (id, arg);
+        }
+        let (id, args) = self.create_block_with_args(1);
+        self.block_mut(id).terminator = Terminator::Return(Some(args[0]));
+        self.exception_block = Some(id);
+        (id, args[0])
     }
 
     pub fn create_block(&mut self) -> BlockId {
@@ -780,6 +803,11 @@ impl FunctionGraph {
             Terminator::Branch {
                 if_true, if_false, ..
             } => vec![*if_true, *if_false],
+            Terminator::CallWithException {
+                normal_target,
+                except_target,
+                ..
+            } => vec![*normal_target, *except_target],
             _ => vec![],
         }
     }

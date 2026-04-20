@@ -648,6 +648,17 @@ fn remap_terminator(
             if_false: rb(if_false),
             false_args: false_args.iter().map(rv).collect(),
         },
+        Terminator::CallWithException {
+            normal_target,
+            normal_args,
+            except_target,
+            except_args,
+        } => Terminator::CallWithException {
+            normal_target: rb(normal_target),
+            normal_args: normal_args.iter().map(rv).collect(),
+            except_target: rb(except_target),
+            except_args: except_args.iter().map(rv).collect(),
+        },
         Terminator::Return(v) => Terminator::Return(v.as_ref().map(rv)),
         Terminator::Abort { reason } => Terminator::Abort {
             reason: reason.clone(),
@@ -808,6 +819,15 @@ fn terminator_value_refs(term: &Terminator) -> Vec<ValueId> {
             refs.extend(false_args);
             refs
         }
+        Terminator::CallWithException {
+            normal_args,
+            except_args,
+            ..
+        } => {
+            let mut refs = normal_args.clone();
+            refs.extend(except_args);
+            refs
+        }
         Terminator::Return(Some(v)) => vec![*v],
         Terminator::Return(None) | Terminator::Abort { .. } | Terminator::Unreachable => vec![],
     }
@@ -859,6 +879,17 @@ fn remap_value_in_terminator(term: &Terminator, old: ValueId, new: ValueId) -> T
             true_args: true_args.iter().map(rv).collect(),
             if_false: *if_false,
             false_args: false_args.iter().map(rv).collect(),
+        },
+        Terminator::CallWithException {
+            normal_target,
+            normal_args,
+            except_target,
+            except_args,
+        } => Terminator::CallWithException {
+            normal_target: *normal_target,
+            normal_args: normal_args.iter().map(rv).collect(),
+            except_target: *except_target,
+            except_args: except_args.iter().map(rv).collect(),
         },
         Terminator::Return(v) => Terminator::Return(v.as_ref().map(rv)),
         Terminator::Abort { reason } => Terminator::Abort {

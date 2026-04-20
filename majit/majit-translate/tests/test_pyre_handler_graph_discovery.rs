@@ -22,6 +22,7 @@
 use std::path::PathBuf;
 
 use majit_translate::front::ast::build_function_graph_pub;
+use majit_translate::model::Terminator;
 use syn::{File, Item};
 
 fn pyopcode_rs_path() -> PathBuf {
@@ -54,19 +55,33 @@ struct HandlerGraphStats {
     name: String,
     blocks: usize,
     ops: usize,
-    try_sites: usize,
+    /// Number of blocks whose terminator is `CallWithException` — the
+    /// pyre equivalent of RPython `Block.exitswitch == c_last_exception`
+    /// (`flowspace/model.py:214`). One per Rust `?` operator in the
+    /// handler body.
+    canraise_blocks: usize,
+    /// Whether the graph allocated a shared exception block for `?`
+    /// propagation (`FunctionGraph::get_or_create_exception_block`).
+    has_exception_block: bool,
 }
 
 fn lower_handler(func: &syn::ItemFn) -> HandlerGraphStats {
     let sf = build_function_graph_pub(func);
     let blocks = sf.graph.blocks.len();
     let ops: usize = sf.graph.blocks.iter().map(|b| b.operations.len()).sum();
-    let try_sites = sf.graph.try_sites.len();
+    let canraise_blocks = sf
+        .graph
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.terminator, Terminator::CallWithException { .. }))
+        .count();
+    let has_exception_block = sf.graph.exception_block.is_some();
     HandlerGraphStats {
         name: sf.name,
         blocks,
         ops,
-        try_sites,
+        canraise_blocks,
+        has_exception_block,
     }
 }
 
@@ -88,13 +103,21 @@ fn discover_pyre_opcode_handler_graphs() {
     // Emit the matrix so the phase reviewer can scan it from `cargo test --nocapture`.
     eprintln!("[phase-a.1] pyre-interpreter opcode handler lowering matrix:");
     eprintln!(
-        "[phase-a.1]   {:<40} {:>7} {:>7} {:>10}",
-        "name", "blocks", "ops", "try_sites"
+        "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10}",
+        "name", "blocks", "ops", "canraise", "exc_block"
     );
     for entry in &matrix {
         eprintln!(
-            "[phase-a.1]   {:<40} {:>7} {:>7} {:>10}",
-            entry.name, entry.blocks, entry.ops, entry.try_sites
+            "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10}",
+            entry.name,
+            entry.blocks,
+            entry.ops,
+            entry.canraise_blocks,
+            if entry.has_exception_block {
+                "yes"
+            } else {
+                "no"
+            }
         );
     }
 
@@ -129,15 +152,22 @@ fn discover_pyre_opcode_handler_graphs() {
             });
         // Every super-instruction helper uses `?` on each trait method call
         // (load_local_value / push_value / pop_value / store_local_value),
-        // so the try-site set must be non-empty. A regression here means
-        // `front::ast`'s Expr::Try lowering is silently discarding the
-        // exception edge again, which would force downstream jtransform to
-        // emit `residual_call_*` without `-live-` (violating RPython parity
-        // in `jtransform.py:456`).
+        // so the graph must contain `Terminator::CallWithException` blocks
+        // (one per `?`) plus a shared exception block.  RPython parity:
+        // `flowspace/model.py:214 Block.canraise` + the "raise block" at
+        // `model.py:198`.  A regression here means `Expr::Try` lowering
+        // silently dropped the exception edge, violating RPython parity in
+        // `jtransform.py:456 rewrite_op_direct_call` (which needs the
+        // CFG-level exception exit to emit `residual_call_*` + `-live-`).
         assert!(
-            entry.try_sites > 0,
-            "{} has zero try_sites — `?` lowering lost the exception edge",
-            required
+            entry.canraise_blocks > 0,
+            "{} has zero canraise blocks — `?` lowering lost the exception edge",
+            entry.name
+        );
+        assert!(
+            entry.has_exception_block,
+            "{} has no shared exception block — `?` lowering failed to allocate one",
+            entry.name
         );
     }
 }

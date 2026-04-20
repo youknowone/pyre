@@ -1539,24 +1539,43 @@ fn lower_expr(
 
         // ── try expr? ──
         //
-        // RPython analogue: in a graph produced by the translator, a call
-        // that propagates exceptions leaves its containing `Block` with
-        // `exitswitch = c_last_exception`. The codewriter then reads this
-        // bit (via `EffectInfo::EF_CAN_RAISE` attached to the calldescr)
-        // and emits `residual_call_*` + `-live-`. pyre records the same
-        // information at the value level: the result of a `?`-checked
-        // expression is tagged in `FunctionGraph::try_sites` so later
-        // passes can seed the descriptor with `ExtraEffect::CanRaise`.
-        //
-        // See `rpython/jit/codewriter/jtransform.py:456 rewrite_op_direct_call`
-        // and `rpython/translator/exceptiontransform.py` for the upstream
-        // parity points.
+        // RPython parity (`rpython/flowspace/model.py:214 Block.canraise`
+        // + `rpython/translator/exceptiontransform.py`): a call that
+        // propagates exceptions leaves its containing block with
+        // `exitswitch = c_last_exception` and `exits = [normal_link,
+        // exception_link]`.  We encode the same shape via
+        // `Terminator::CallWithException { normal_target, except_target }`.
+        // The `?`-checked expression lowers as follows:
+        //   1. lower inner expression in the current block (this appends
+        //      the raising call op at the tail);
+        //   2. create a continuation block whose single inputarg carries
+        //      the call result forward on the normal path;
+        //   3. route the exception path to the function's shared
+        //      exception block (`FunctionGraph::get_or_create_exception_block`),
+        //      which takes the propagated `PyError` and returns it — the
+        //      Rust `?` semantics of "early return Err(e)";
+        //   4. switch the caller's cursor to the continuation block so
+        //      subsequent statements lower after the call.
         syn::Expr::Try(t) => {
-            let inner = lower_expr(graph, block, &t.expr, options, ctx);
-            if let Some(value) = inner {
-                graph.try_sites.insert(value);
-            }
-            inner
+            let inner = lower_expr(graph, block, &t.expr, options, ctx)?;
+            let continuation = graph.create_block();
+            let continuation_arg = graph.alloc_value();
+            graph
+                .block_mut(continuation)
+                .inputargs
+                .push(continuation_arg);
+            let (exc_block, _exc_arg) = graph.get_or_create_exception_block();
+            graph.set_terminator(
+                *block,
+                Terminator::CallWithException {
+                    normal_target: continuation,
+                    normal_args: vec![inner],
+                    except_target: exc_block,
+                    except_args: vec![inner],
+                },
+            );
+            *block = continuation;
+            Some(continuation_arg)
         }
 
         // ── fallback ──
