@@ -281,7 +281,7 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             );
         } else {
             match &block.terminator {
-                Terminator::Abort { .. } | Terminator::Unreachable => {
+                Terminator::Unreachable => {
                     // Terminal — no jump
                 }
                 Terminator::Goto { .. } | Terminator::Branch { .. } => {

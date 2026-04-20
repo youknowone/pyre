@@ -696,11 +696,6 @@ pub enum Terminator {
         if_false: BlockId,
         false_args: Vec<ValueId>,
     },
-    /// PRE-EXISTING-ADAPTATION (Gap B — to be removed) — pyre-only
-    /// terminator for unrecoverable exception paths.  Upstream routes
-    /// every raise through `graph.exceptblock` via a `Link(..., exceptblock)`.
-    /// See `front/ast.rs::build_call_graph` for the last producer.
-    Abort { reason: String },
     /// "No terminator yet" placeholder.  Upstream never produces this
     /// variant; it marks blocks before the front-end has filled in a
     /// concrete `exits`, and final blocks (returnblock / exceptblock)
@@ -759,7 +754,7 @@ pub fn control_flow_from_terminator(terminator: &Terminator) -> (Option<ExitSwit
                 Link::new(true_args.clone(), *if_true, Some(ExitCase::Bool(true))),
             ],
         ),
-        Terminator::Abort { .. } | Terminator::Unreachable => (None, Vec::new()),
+        Terminator::Unreachable => (None, Vec::new()),
     }
 }
 
@@ -1015,6 +1010,35 @@ impl FunctionGraph {
             Terminator::Goto {
                 target: returnblock,
                 args: vec![value],
+            },
+        );
+    }
+
+    /// Route `block` to the graph's canonical `exceptblock` — the
+    /// upstream-shaped exit for an unrecoverable exception.
+    ///
+    /// RPython `flowspace/model.py:21-25` declares
+    /// `exceptblock = Block([Variable('etype'), Variable('evalue')])` as
+    /// the single raise destination per graph.  Predecessor blocks route
+    /// to it via `Link(args=[etype, evalue], target=exceptblock)` held in
+    /// `Block.exits` — there is no upstream terminator variant that
+    /// flags "this block raises".
+    ///
+    /// pyre callers that previously wrote `Terminator::Abort` use this
+    /// helper to emit the same CFG shape: a Goto to `graph.exceptblock`
+    /// with two fresh prevblock-side ValueIds standing in for the
+    /// (etype, evalue) pair.  The `_reason` string is retained for
+    /// optional GraphTransformNote annotations (see `jtransform.rs::
+    /// rewrite_graph`'s abort note); pass `""` when not applicable.
+    pub fn set_raise(&mut self, block: BlockId, _reason: &str) {
+        let (exceptblock, _, _) = self.exceptblock_args();
+        let etype = self.alloc_value();
+        let evalue = self.alloc_value();
+        self.set_terminator(
+            block,
+            Terminator::Goto {
+                target: exceptblock,
+                args: vec![etype, evalue],
             },
         );
     }

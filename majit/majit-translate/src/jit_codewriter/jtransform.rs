@@ -276,8 +276,9 @@ impl<'a> Transformer<'a> {
         // rewriting so rules that synthesize values stay unique.
         self.next_synthetic_value = rewritten.next_value();
 
+        let exceptblock = rewritten.exceptblock;
         for block in &mut rewritten.blocks {
-            self.optimize_block(block, &graph.name);
+            self.optimize_block(block, &graph.name, exceptblock);
         }
 
         rewritten.set_next_value(self.next_synthetic_value);
@@ -291,7 +292,12 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: Transformer.optimize_block()
-    fn optimize_block(&mut self, block: &mut crate::model::Block, graph_name: &str) {
+    fn optimize_block(
+        &mut self,
+        block: &mut crate::model::Block,
+        graph_name: &str,
+        exceptblock: crate::model::BlockId,
+    ) {
         let mut new_ops = Vec::with_capacity(block.operations.len());
 
         for original_op in &block.operations {
@@ -323,10 +329,17 @@ impl<'a> Transformer<'a> {
         block.exitswitch = exitswitch;
         block.exits = exits;
 
-        if let Terminator::Abort { reason } = &block.terminator {
+        // Upstream `rpython/translator/backendopt/canraise.py:25-47
+        // analyze_exceptblock_in_graph` identifies raising blocks by the
+        // presence of a Link in `Block.exits` whose target is
+        // `graph.exceptblock`.  pyre records a `GraphTransformNote` for
+        // such blocks so later phases (e.g. reporting) can surface
+        // unconditional raise sites — the note mirrors the upstream signal
+        // without the pyre-specific Terminator::Abort variant.
+        if block.exits.iter().any(|link| link.target == exceptblock) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
-                detail: format!("abort: {reason}"),
+                detail: "abort: raises to exceptblock".to_string(),
             });
         }
     }
@@ -2347,9 +2360,6 @@ fn remap_terminator(
                 .map(|v| remap_value(v, aliases))
                 .collect(),
         },
-        Terminator::Abort { reason } => Terminator::Abort {
-            reason: reason.clone(),
-        },
         Terminator::Unreachable => Terminator::Unreachable,
     }
 }
@@ -2641,12 +2651,7 @@ mod tests {
             },
             false,
         );
-        graph.set_terminator(
-            graph.startblock,
-            Terminator::Abort {
-                reason: "not implemented".into(),
-            },
-        );
+        graph.set_raise(graph.startblock, "not implemented");
         let result = rewrite_graph(&graph, &GraphTransformConfig::default());
         assert_eq!(result.notes.len(), 2); // unknown + abort
     }

@@ -13,7 +13,7 @@ use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
 use crate::front::ast::SemanticFunction;
-use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, Terminator};
+use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 
@@ -2115,17 +2115,27 @@ impl CallControl {
             // RPython: analyze_external_call → getattr(fnobj, 'canraise', True)
             None => return true,
         };
+        let _ = ignore_memoryerror; // see MemoryError-only note below
         for block in &graph.blocks {
             if block.canraise() {
                 return true;
             }
-            // RPython: Abort terminator = except block path.
-            // canraise.py:27-41: analyze_exceptblock_in_graph.
-            if let Terminator::Abort { reason } = &block.terminator {
-                if ignore_memoryerror && is_memoryerror_only(reason) {
-                    // RPython: do_ignore_memory_error skips MemoryError-only
-                    continue;
-                }
+            // RPython `backendopt/canraise.py:25-47 analyze_exceptblock_in_graph`
+            // identifies raising blocks by a `Link` in `Block.exits` whose
+            // target is `graph.exceptblock`.  Pyre now emits that same shape
+            // via `FunctionGraph::set_raise` (upstream's Link(..., exceptblock)).
+            //
+            // The MemoryError-only carve-out requires per-operation raise
+            // classification (`RaiseAnalyzer.ignore_exact_class`,
+            // `canraise.py:11-17 LL_OPERATIONS[opname].canraise`), which
+            // pyre does not yet port; until that lands, both raise-analyzer
+            // passes see the same exceptblock link and the classification
+            // collapses to Yes/No in practice.
+            if block
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock)
+            {
                 return true;
             }
             // RPython: analyze_simple_operation(op) per operation.
@@ -3844,20 +3854,6 @@ fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
     }
 }
 
-/// Check if an Abort reason indicates MemoryError-only.
-///
-/// RPython: `do_ignore_memory_error()` sets `ignore_exact_class = MemoryError`.
-/// Then `canraise != (self.ignore_exact_class,)` filters it out.
-///
-/// In majit, Abort carries a reason string. We check for MemoryError
-/// indicators. This matches:
-/// - "MemoryError" — explicit MemoryError raise
-/// - "alloc" / "allocation" — memory allocation failures
-fn is_memoryerror_only(reason: &str) -> bool {
-    let r = reason.to_lowercase();
-    r.contains("memoryerror") || r.contains("out of memory")
-}
-
 /// Map ValueType to a small integer for array descriptor indexing.
 fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
     use crate::model::ValueType;
@@ -4439,15 +4435,12 @@ mod tests {
         g
     }
 
-    /// Helper: create a FunctionGraph with an Abort terminator.
+    /// Helper: create a FunctionGraph whose entry block routes to the
+    /// canonical exceptblock, matching upstream's Link(..., exceptblock)
+    /// shape for unconditional raise sites.
     fn raising_graph(name: &str) -> FunctionGraph {
         let mut g = FunctionGraph::new(name);
-        g.set_terminator(
-            g.startblock,
-            Terminator::Abort {
-                reason: "error".into(),
-            },
-        );
+        g.set_raise(g.startblock, "error");
         g
     }
 
@@ -4872,25 +4865,16 @@ mod tests {
         assert_eq!(result, CanRaise::Yes);
     }
 
-    #[test]
-    fn test_canraise_memoryerror_only() {
-        // Abort with "MemoryError" reason → MemoryErrorOnly.
-        let mut cc = CallControl::new();
-        let mut graph = FunctionGraph::new("allocator");
-        graph.set_terminator(
-            graph.startblock,
-            Terminator::Abort {
-                reason: "MemoryError: allocation failed".into(),
-            },
-        );
-        let path = CallPath::from_segments(["allocator"]);
-        cc.register_function_graph(path, graph);
-
-        let target = CallTarget::function_path(["allocator"]);
-        let mut cache = AnalysisCache::default();
-        let result = cc._canraise(&target, &mut cache);
-        assert_eq!(result, CanRaise::MemoryErrorOnly);
-    }
+    // RPython `rpython/jit/codewriter/call.py:337-355 _canraise` distinguishes
+    // "raises only MemoryError" (returning the sentinel `"mem"`,
+    // CanRaise::MemoryErrorOnly here) from "raises anything" by running two
+    // RaiseAnalyzer passes — the second configured with
+    // `ignore_exact_class={MemoryError}` — and comparing the results per op.
+    // Pyre does not yet carry per-operation raise-class metadata (the
+    // Abort.reason-string channel that used to approximate it was deleted
+    // with Terminator::Abort), so this classification collapses to Yes/No
+    // in practice.  Re-introduce the MemoryError-only coverage once the
+    // per-op RaiseAnalyzer port lands.
 
     #[test]
     fn struct_layout_depth3_nested_fixed_point() {

@@ -717,9 +717,6 @@ fn remap_terminator(
             if_false: rb(if_false),
             false_args: false_args.iter().map(rv).collect(),
         },
-        Terminator::Abort { reason } => Terminator::Abort {
-            reason: reason.clone(),
-        },
         Terminator::Unreachable => Terminator::Unreachable,
     }
 }
@@ -876,7 +873,7 @@ fn terminator_value_refs(term: &Terminator) -> Vec<ValueId> {
             refs.extend(false_args);
             refs
         }
-        Terminator::Abort { .. } | Terminator::Unreachable => vec![],
+        Terminator::Unreachable => vec![],
     }
 }
 
@@ -934,9 +931,6 @@ fn remap_value_in_terminator(term: &Terminator, old: ValueId, new: ValueId) -> T
             true_args: true_args.iter().map(rv).collect(),
             if_false: *if_false,
             false_args: false_args.iter().map(rv).collect(),
-        },
-        Terminator::Abort { reason } => Terminator::Abort {
-            reason: reason.clone(),
         },
         Terminator::Unreachable => Terminator::Unreachable,
     }

@@ -298,7 +298,6 @@ fn find_backedges_dfs(
 }
 
 fn block_exit_targets(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
-    use crate::model::Terminator;
     let block = match graph.blocks.get(block_idx) {
         Some(b) => b,
         None => return Vec::new(),
