@@ -277,7 +277,12 @@ impl Assembler {
                 state.code.push(0);
             }
 
-            // RPython flatten.py:319-333: {kind}_copy
+            // RPython flatten.py:333 `self.emitline('%s_copy' % kind,
+            // v, "->", w)` — argcodes `i>i` (typed src, result marker,
+            // typed dst). The `>` bears no byte in the stream; it only
+            // flags the result position in the key so the blackhole
+            // wire `int_copy/i>i` (blackhole.rs:5670) finds the handler
+            // and `Assembler.resulttypes[pc]` is populated correctly.
             FlatOp::Move { dst, src } => {
                 let (src_reg, src_kind) = self.lookup_reg_with_kind(*src, regallocs);
                 let (dst_reg, _) = self.lookup_reg_with_kind(*dst, regallocs);
@@ -286,7 +291,7 @@ impl Assembler {
                     'f' => "float",
                     _ => "int",
                 };
-                let key = format!("{kind_name}_copy/{src_kind}{src_kind}");
+                let key = format!("{kind_name}_copy/{src_kind}>{src_kind}");
                 let opnum = self.get_opnum(&key);
                 state.code.push(opnum);
                 state.code.push(src_reg);

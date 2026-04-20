@@ -942,12 +942,13 @@ impl CodeWriter {
         // — `v` is resolved via `getcolor(v)` which returns either a
         // `Register` or an unchanged `Constant` (see `flatten.py:382-384`).
         // The `assembler.py:140-222` dispatch handles both: the Register
-        // source emits an `int_copy/ii` entry, and the Constant source
-        // emits an `int_copy/ci` entry (argcode `'c'` for a compact
-        // Constant). pyre's legacy `load_const_{i,r,f}_value` emits the
-        // same runtime bytes under pyre-only `load_const_*` opnames; the
-        // SSARepr now carries the RPython-parity `*_copy` name with a
-        // ConstInt/ConstRef/ConstFloat source operand.
+        // source emits an `int_copy/i>i` entry, and the Constant source
+        // emits an `int_copy/c>i` entry (argcode `'c'` for a compact
+        // Constant — `>` is the result marker per
+        // `assembler.py:210-212`). pyre's legacy `load_const_{i,r,f}_value`
+        // emits the same runtime bytes under pyre-only `load_const_*`
+        // opnames; the SSARepr now carries the RPython-parity `*_copy`
+        // name with a ConstInt/ConstRef/ConstFloat source operand.
         // `int_eq` is NOT dual-emitted by itself.
         //
         // pyre's only emitter of `OpCode::IntEq` via `record_binop_i` is
