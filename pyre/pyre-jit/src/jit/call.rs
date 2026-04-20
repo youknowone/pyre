@@ -371,10 +371,7 @@ impl CallControl {
             // `CodeWriter::make_jitcodes`'s drain loop at
             // codewriter.py:80 `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
-            self.jitcodes.insert(
-                key,
-                std::sync::Arc::new(PyJitCode::skeleton(merge_point_pc)),
-            );
+            self.reset_jitcode_skeleton(key, merge_point_pc);
             // call.py:171 `self.unfinished_graphs.append(graph)`. pyre
             // also re-pushes on a merge_point_pc refinement so the
             // drain picks the refined entry up again for the recompile
@@ -394,11 +391,50 @@ impl CallControl {
         // Caller contract: do not re-enter `get_jitcode` (or anything
         // else that can call `HashMap::insert` on `self.jitcodes`, such
         // as the `merge_point_pc` refinement path or the
-        // `make_jitcodes` drain replacing the skeleton with the
-        // populated entry) while still holding the returned reference.
-        // A refinement drops the previous `Arc` slot and dangles the
-        // ref.
+        // `make_jitcodes` drain publishing the populated entry) while
+        // still holding the returned reference. When the slot's `Arc`
+        // is still unique pyre mutates it in place to match
+        // RPython's "same JitCode object gets filled later" flow; if
+        // the slot is already shared, the fallback is still to replace
+        // the `Arc`, which dangles the old ref.
         unsafe { &*(entry.as_ref() as *const PyJitCode) }
+    }
+
+    /// RPython mutates the already-cached `JitCode` object in place.
+    /// Pyre can do the same while the slot's `Arc` is still unique;
+    /// otherwise it must fall back to replacing the shared `Arc`.
+    pub fn reset_jitcode_skeleton(&mut self, key: usize, merge_point_pc: Option<usize>) {
+        if let Some(slot) = self.jitcodes.get_mut(&key) {
+            if let Some(existing) = std::sync::Arc::get_mut(slot) {
+                *existing = PyJitCode::skeleton(merge_point_pc);
+                return;
+            }
+        }
+        self.jitcodes.insert(
+            key,
+            std::sync::Arc::new(PyJitCode::skeleton(merge_point_pc)),
+        );
+    }
+
+    /// Publish the populated jitcode into `self.jitcodes[graph]`.
+    ///
+    /// Matches RPython's `transform_graph_to_jitcode(graph, jitcode, ...)`
+    /// shape as closely as the current `Arc<PyJitCode>` split allows:
+    /// mutate the existing cached object when the slot is still unique,
+    /// replace the slot only when another store already cloned it.
+    pub fn publish_jitcode(&mut self, key: usize, pyjitcode: PyJitCode) -> *const PyJitCode {
+        if let Some(slot) = self.jitcodes.get_mut(&key) {
+            if let Some(existing) = std::sync::Arc::get_mut(slot) {
+                *existing = pyjitcode;
+                return existing as *const PyJitCode;
+            }
+            *slot = std::sync::Arc::new(pyjitcode);
+            return std::sync::Arc::as_ptr(slot);
+        }
+        let arc = std::sync::Arc::new(pyjitcode);
+        let raw_ptr = std::sync::Arc::as_ptr(&arc);
+        self.jitcodes.insert(key, arc);
+        raw_ptr
     }
 }
 

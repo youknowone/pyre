@@ -2423,19 +2423,17 @@ impl CodeWriter {
             // codewriter.py:80 `self.transform_graph_to_jitcode(graph,
             //                     jitcode, verbose, len(all_jitcodes))`.
             //
-            // PRE-EXISTING-ADAPTATION: RPython mutates the empty JitCode
-            // skeleton in place (`assembler.assemble(ssarepr, jitcode,
-            // num_regs)` at codewriter.py:67); pyre's
-            // `transform_graph_to_jitcode` returns a fresh `PyJitCode`
-            // and we replace the skeleton entry in `jitcodes` with the
-            // populated one so the "jitcode in dict has its body filled
-            // after drain" invariant is preserved.
+            // PRE-EXISTING-ADAPTATION: `transform_graph_to_jitcode`
+            // still returns a fresh `PyJitCode`, but `publish_jitcode`
+            // now mutates the cached skeleton in place whenever the
+            // slot's `Arc` is still unique. That keeps pyre closer to
+            // RPython's "same JitCode object is filled later" flow; the
+            // fallback for already-shared slots is still to replace the
+            // `Arc`.
             let pyjitcode =
                 self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
             let key = code_ptr as usize;
-            let arc = std::sync::Arc::new(pyjitcode);
-            let raw_ptr = std::sync::Arc::as_ptr(&arc);
-            self.callcontrol().jitcodes.insert(key, arc);
+            let raw_ptr = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
             all_jitcodes.push(raw_ptr);
         }
@@ -2712,5 +2710,49 @@ mod tests {
         assert!(Arc::ptr_eq(&hit_100, &j100));
         assert!(Arc::ptr_eq(&hit_200, &j200));
         assert!(pyre_jit_trace::state::bytecode_for_address(0x300).is_none());
+    }
+
+    #[test]
+    fn drain_unfinished_graphs_preserves_unique_pyjitcode_identity() {
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let key = &code as *const pyre_interpreter::CodeObject as usize;
+
+        let _ = writer
+            .callcontrol()
+            .get_jitcode(&code, w_code as *const (), None);
+        let skeleton_ptr = {
+            let slot = writer
+                .callcontrol()
+                .jitcodes
+                .get(&key)
+                .expect("skeleton jitcode must be cached");
+            Arc::as_ptr(slot)
+        };
+
+        let all_jitcodes = writer.drain_unfinished_graphs();
+        let populated_ptr = {
+            let slot = writer
+                .callcontrol()
+                .jitcodes
+                .get(&key)
+                .expect("populated jitcode must remain cached");
+            Arc::as_ptr(slot)
+        };
+
+        assert_eq!(all_jitcodes, vec![populated_ptr]);
+        assert_eq!(
+            populated_ptr, skeleton_ptr,
+            "unique skeleton Arc should be filled in place"
+        );
+        let pyjit = writer
+            .callcontrol()
+            .find_jitcode(&code as *const _)
+            .unwrap();
+        assert!(
+            !pyjit.metadata.pc_map.is_empty(),
+            "drain must populate bytecode metadata on the existing entry"
+        );
     }
 }
