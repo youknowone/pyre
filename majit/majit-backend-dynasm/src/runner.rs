@@ -78,6 +78,19 @@ pub(crate) fn dynasm_nursery_addrs() -> (usize, usize) {
     with_dynasm_active_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr())).unwrap_or((0, 0))
 }
 
+/// Per-backend `CPU.load_supported_factors` (rewrite.py:1124 /
+/// x86/runner.py:31 / llmodel.py:39). x86 addressing scales natively by
+/// 1/2/4/8, aarch64 has no scaled store form and always expects factor 1.
+#[cfg(target_arch = "x86_64")]
+fn gc_store_supported_factors() -> &'static [i64] {
+    &[1, 2, 4, 8]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn gc_store_supported_factors() -> &'static [i64] {
+    &[1]
+}
+
 fn dynasm_typeid_is_object(typeid: u32) -> Option<bool> {
     with_dynasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
 }
@@ -286,6 +299,12 @@ impl DynasmBackend {
                 jitframe_info: None,
                 constant_types: ct,
                 call_assembler_callee_locs: None,
+                // x86/runner.py:31 `load_supported_factors = (1, 2, 4, 8)`
+                // vs llmodel.py:39 default `(1,)` used by the aarch64
+                // backend (which has no scaled store addressing mode and
+                // asserts boxes[3].getint() == 1 in its regalloc — see
+                // `consider_gc_store_indexed` cfg(target_arch = "aarch64")).
+                load_supported_factors: gc_store_supported_factors(),
             }
         })
     }

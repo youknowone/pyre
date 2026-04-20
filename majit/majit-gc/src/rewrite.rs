@@ -71,6 +71,13 @@ pub struct GcRewriterImpl {
     /// by target token number. Provided by the backend.
     pub call_assembler_callee_locs:
         Option<Box<dyn Fn(u64) -> Option<CallAssemblerCalleeLocs> + Send>>,
+    /// llmodel.py:39 `load_supported_factors = (1,)` — the default for
+    /// CPUs whose addressing mode only scales by one. x86 overrides this
+    /// at `rpython/jit/backend/x86/runner.py:31` with `(1, 2, 4, 8)`.
+    /// Consumed by `cpu_simplify_scale` (rewrite.py:1124) to decide
+    /// whether a non-constant index's factor can be folded into the
+    /// backend's addressing mode or must be pre-scaled in IR.
+    pub load_supported_factors: &'static [i64],
 }
 
 /// JitFrame field descriptors for handle_call_assembler.
@@ -323,13 +330,11 @@ impl RewriteState {
             .insert(op.pos.0, (box_arg, constant));
     }
 
-    /// rewrite.py:173 _try_use_older_box.
+    /// rewrite.py:173-182 _try_use_older_box.
     ///
     /// If `index_box` is a recorded `_constant_additions` entry, replace
     /// it with the older box and add `factor * extra_offset` to
-    /// `offset`.  Currently unused — kept for parity with rewrite.py
-    /// until pyre's setarrayitem path lowers to GC_STORE_INDEXED.
-    #[allow(dead_code)]
+    /// `offset`.
     fn _try_use_older_box(&self, index_box: OpRef, factor: i64, offset: i64) -> (OpRef, i64) {
         if let Some(&(older, extra)) = self._constant_additions.get(&index_box.0) {
             return (older, offset + factor * extra);
@@ -652,31 +657,37 @@ impl GcRewriterImpl {
     // rewrite.py:936-946 handle_write_barrier_setarrayitem
     // ────────────────────────────────────────────────────────
 
-    fn handle_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
-        let rewritten = st.rewrite_op(op);
-        let obj = rewritten.arg(0);
-        // arg(1) = index, arg(2) = value
-
-        // Track the index for pending zero optimization.
-        let index_ref = rewritten.arg(1);
-        if !index_ref.is_none() {
-            st.record_setarrayitem_index(obj, index_ref.0 as usize);
-        }
-
-        if st.take_pending_array_wb(obj) {
-            st.emit(rewritten);
+    /// rewrite.py:514-518 consider_setarrayitem_gc: record the constant
+    /// index so emit_pending_zeros can skip this slot.
+    ///
+    ///     if not isinstance(array_box, ConstPtr) and index_box.is_constant():
+    ///         self.remember_setarrayitem_occurred(array_box, index_box.getint())
+    fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
+        let array_ref = st.resolve(op.arg(0));
+        let index_ref = op.arg(1);
+        if st.resolve_constant(array_ref.0).is_some() {
             return;
         }
+        let Some(idx_val) = st.resolve_constant(index_ref.0) else {
+            return;
+        };
+        st.record_setarrayitem_index(array_ref, idx_val as usize);
+    }
 
-        // rewrite.py:938-941: check the stored VALUE's type (arg2).
-        //   val = op.getarg(0)  [the base object]
-        //   if not self.write_barrier_applied(val):
-        //       v = op.getarg(2)
-        //       if (v.type == 'r' and (not isinstance(v, ConstPtr) or
-        //           rgc.needs_write_barrier(v.value))):
-        //           self.gen_write_barrier_array(val, op.getarg(1))
-        if !st.wb_already_applied(obj) {
-            let v = rewritten.arg(2);
+    /// rewrite.py:936-944: handle_write_barrier_setarrayitem.
+    /// Emits CondCallGcWb / CondCallGcWbArray as needed; the SETARRAYITEM
+    /// op itself is NOT emitted here — RPython forwards the op to
+    /// GC_STORE_INDEXED inside transform_to_gc_load (rewrite.py:220-221)
+    /// and then `self.emit_op(op)` follows the forwarding. We do the
+    /// equivalent in the caller by invoking handle_setarrayitem after WB.
+    fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
+        let val = st.resolve(op.arg(0));
+        if st.take_pending_array_wb(val) {
+            return;
+        }
+        // rewrite.py:938-942
+        if !st.wb_already_applied(val) {
+            let v = st.resolve(op.arg(2));
             let val_is_ref = match st.result_type_of(v) {
                 Some(tp) => tp == Type::Ref,
                 None => op
@@ -686,14 +697,87 @@ impl GcRewriterImpl {
                     .map(|ad| ad.is_array_of_pointers())
                     .unwrap_or(false),
             };
-            let is_null_const = val_is_ref && st.is_null_constant(v);
-
-            if val_is_ref && !is_null_const {
-                self.gen_write_barrier_array(obj, rewritten.arg(1), st);
+            if val_is_ref && !st.is_null_constant(v) {
+                self.gen_write_barrier_array(val, st.resolve(op.arg(1)), st);
             }
         }
+    }
 
-        st.emit(rewritten);
+    /// rewrite.py:132-138 handle_setarrayitem.
+    /// Lowers SETARRAYITEM_GC / SETARRAYITEM_RAW into GC_STORE / GC_STORE_INDEXED
+    /// (the actual emission happens in emit_gc_store_or_indexed).
+    fn handle_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
+        let descr = op.descr.as_ref().expect("SETARRAYITEM needs ArrayDescr");
+        let ad = descr
+            .as_array_descr()
+            .expect("SETARRAYITEM descr must be ArrayDescr");
+        let itemsize = ad.item_size() as i64;
+        let basesize = ad.base_size() as i64;
+        let ptr = st.resolve(op.arg(0));
+        let index = st.resolve(op.arg(1));
+        let value = st.resolve(op.arg(2));
+        self.emit_gc_store_or_indexed(ptr, index, value, itemsize, itemsize, basesize, st);
+    }
+
+    /// rewrite.py:140-158 emit_gc_store_or_indexed (with cpu_simplify_scale
+    /// inlined). `load_supported_factors` drives the non-constant branch:
+    /// factors outside that set are pre-scaled in IR, factors inside it pass
+    /// through to the backend's native addressing mode.
+    fn emit_gc_store_or_indexed(
+        &self,
+        ptr: OpRef,
+        mut index: OpRef,
+        value: OpRef,
+        itemsize: i64,
+        mut factor: i64,
+        mut offset: i64,
+        st: &mut RewriteState,
+    ) {
+        // rewrite.py:142-143: index_box, offset = self._try_use_older_box(
+        //     index_box, factor, offset)
+        let (new_index, new_offset) = st._try_use_older_box(index, factor, offset);
+        index = new_index;
+        offset = new_offset;
+
+        // rewrite.py:1118-1122 cpu_simplify_scale, ConstInt path.
+        if let Some(index_val) = st.resolve_constant(index.0) {
+            offset = index_val * factor + offset;
+            let offset_ref = st.const_int(offset);
+            let itemsize_ref = st.const_int(itemsize);
+            st.emit(Op::new(
+                OpCode::GcStore,
+                &[ptr, offset_ref, value, itemsize_ref],
+            ));
+            return;
+        }
+
+        // rewrite.py:1124-1134 cpu_simplify_scale, non-constant path.
+        // Pre-scale only when the CPU's native addressing mode cannot carry
+        // this factor (mirrors `factor != 1 and factor not in
+        // cpu.load_supported_factors`).
+        if factor != 1 && !self.load_supported_factors.contains(&factor) {
+            assert!(factor > 0, "cpu_simplify_scale: factor must be positive");
+            let mul_op = if (factor & (factor - 1)) == 0 {
+                let shift = (factor as u64).trailing_zeros() as i64;
+                let shift_ref = st.const_int(shift);
+                Op::new(OpCode::IntLshift, &[index, shift_ref])
+            } else {
+                let factor_ref = st.const_int(factor);
+                Op::new(OpCode::IntMul, &[index, factor_ref])
+            };
+            let scaled = st.emit_result(mul_op, OpRef::NONE);
+            st.result_types.insert(scaled.0, Type::Int);
+            index = scaled;
+            factor = 1;
+        }
+
+        let factor_ref = st.const_int(factor);
+        let offset_ref = st.const_int(offset);
+        let itemsize_ref = st.const_int(itemsize);
+        st.emit(Op::new(
+            OpCode::GcStoreIndexed,
+            &[ptr, index, value, factor_ref, offset_ref, itemsize_ref],
+        ));
     }
 
     // ────────────────────────────────────────────────────────
@@ -1035,7 +1119,20 @@ impl GcRewriter for GcRewriterImpl {
                     self.handle_setfield_gc(op, &mut st);
                 }
                 OpCode::SetarrayitemGc => {
-                    self.handle_setarrayitem_gc(op, &mut st);
+                    // rewrite.py:401-404
+                    self.consider_setarrayitem_gc(op, &mut st);
+                    self.handle_write_barrier_setarrayitem(op, &mut st);
+                    // rewrite.py:220-221 transform_to_gc_load forwards the op
+                    // to GC_STORE_INDEXED; emit it now (RPython's emit_op at
+                    // the tail of handle_write_barrier_setarrayitem follows
+                    // the forwarding to do the same).
+                    self.handle_setarrayitem(op, &mut st);
+                    continue;
+                }
+                OpCode::SetarrayitemRaw => {
+                    // rewrite.py:220-221 transform_to_gc_load — no WB for raw.
+                    self.handle_setarrayitem(op, &mut st);
+                    continue;
                 }
 
                 // ── call_assembler: rewrite.py:414 handle_call_assembler ──
@@ -1228,6 +1325,10 @@ mod tests {
             jitframe_info: None,
             constant_types: HashMap::new(),
             call_assembler_callee_locs: None,
+            // llmodel.py:39 default keeps existing pre-scale-everything behavior
+            // in tests written against it; per-backend overrides have dedicated
+            // tests below.
+            load_supported_factors: &[1],
         }
     }
 
@@ -1566,6 +1667,8 @@ mod tests {
         // make_rewriter() has jit_wb_cards_set = 0 (card marking disabled).
         // rewrite.py:955-973: without card marking, gen_write_barrier_array
         // falls back to gen_write_barrier → COND_CALL_GC_WB.
+        // rewrite.py:132 + 1124-1130: non-constant index, itemsize=8 is
+        // power-of-2 → pre-scale via INT_LSHIFT before GC_STORE_INDEXED.
         let rw = make_rewriter();
         let obj = OpRef(0);
         let idx = OpRef(1);
@@ -1578,10 +1681,11 @@ mod tests {
 
         let result = rw.rewrite_for_gc(&ops);
 
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
         assert_eq!(result[0].args[0], obj);
-        assert_eq!(result[1].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(result[1].opcode, OpCode::IntLshift);
+        assert_eq!(result[2].opcode, OpCode::GcStoreIndexed);
     }
 
     // ── Test 12: Collecting op clears WB memoisation ──
@@ -1656,6 +1760,8 @@ mod tests {
 
         let twice = rw.rewrite_for_gc(&once);
 
+        // pending_array_wb suppresses the new WB; SETARRAYITEM is lowered
+        // to GC_STORE_INDEXED (rewrite.py:132 + 220-221).
         assert_eq!(
             twice
                 .iter()
@@ -1667,6 +1773,13 @@ mod tests {
             twice
                 .iter()
                 .filter(|op| op.opcode == OpCode::SetarrayitemGc)
+                .count(),
+            0
+        );
+        assert_eq!(
+            twice
+                .iter()
+                .filter(|op| op.opcode == OpCode::GcStoreIndexed)
                 .count(),
             1
         );
@@ -1878,6 +1991,7 @@ mod tests {
             jitframe_info: None,
             constant_types: HashMap::new(),
             call_assembler_callee_locs: None,
+            load_supported_factors: &[1],
         }
     }
 

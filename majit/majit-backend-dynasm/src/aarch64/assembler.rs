@@ -1844,6 +1844,52 @@ impl AssemblerARM64 {
                 // aarch64/opassembler.py:368: self._write_to_mem(value_loc, base_loc, ofs_loc, scale)
                 self.emit_op_gcstore_regalloc(base, ofs_loc, &val_reg, size);
             }
+            // ── aarch64/opassembler.py:381 emit_op_gc_store_indexed ──
+            // arglocs = [value_loc, base_loc, index_loc, imm(size), imm(ofs)]
+            OpCode::GcStoreIndexed => {
+                if let (Some(value_loc), Some(Loc::Reg(base)), Some(Loc::Reg(index))) =
+                    (arglocs.first(), arglocs.get(1), arglocs.get(2))
+                {
+                    let size = match arglocs.get(3) {
+                        Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
+                        _ => 8,
+                    };
+                    let ofs = match arglocs.get(4) {
+                        Some(Loc::Immed(i)) => i.value as i32,
+                        _ => 0,
+                    };
+                    // aarch64/opassembler.py:385-392: combine ofs into ip0 = index + ofs.
+                    // check_imm_arg() in regalloc.py:161 allows 0..4095; for any
+                    // value outside that (including negatives) RPython falls back
+                    // to load(ip0, ofs_loc) + ADD_rr. ip0 = x16 (reserved scratch).
+                    let combined_index = if ofs != 0 {
+                        if (0..4096).contains(&ofs) {
+                            dynasm!(self.mc ; .arch aarch64
+                                ; mov x16, X(index.value)
+                                ; add x16, x16, ofs as u32);
+                        } else {
+                            self.emit_mov_imm64(16, ofs as i64);
+                            dynasm!(self.mc ; .arch aarch64
+                                ; add x16, x16, X(index.value));
+                        }
+                        crate::regloc::RegLoc::new(16, false)
+                    } else {
+                        *index
+                    };
+                    let val_reg = match value_loc {
+                        Loc::Reg(r) => *r,
+                        Loc::Immed(i) => {
+                            self.emit_mov_imm64(17, i.value);
+                            crate::regloc::RegLoc::new(17, false)
+                        }
+                        _ => crate::regloc::RegLoc::new(17, false),
+                    };
+                    // aarch64/opassembler.py:393-394:
+                    //   scale = get_scale(size_loc.value)
+                    //   self._write_to_mem(value_loc, base_loc, index_loc, scale)
+                    self.emit_op_gcstore_regalloc(base, &Loc::Reg(combined_index), &val_reg, size);
+                }
+            }
             // ── Control flow ──
             OpCode::Jump => {
                 let jump_descr = loop_target_descr(op);

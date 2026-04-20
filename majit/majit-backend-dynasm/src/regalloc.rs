@@ -3078,6 +3078,7 @@ impl RegAlloc {
 
     /// aarch64/regalloc.py:552 prepare_op_gc_store_indexed parity.
     /// Returns [value_loc, base_loc, index_loc, imm(size), imm(ofs)].
+    #[cfg(target_arch = "aarch64")]
     fn consider_gc_store_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.args.iter().copied().collect();
         // aarch64/regalloc.py:554
@@ -3087,7 +3088,15 @@ impl RegAlloc {
         let value_loc = self.make_sure_var_in_reg(op.args[2], tp_val, &args, None, false);
         // aarch64/regalloc.py:556
         let index_loc = self.make_sure_var_in_reg(op.args[1], Type::Int, &args, None, false);
-        // aarch64/regalloc.py:557-559: assert scale==1, ofs/size getint
+        // aarch64/regalloc.py:557 `assert boxes[3].getint() == 1` — the
+        // aarch64 store has no scaled addressing form so the rewriter must
+        // have pre-scaled the index (load_supported_factors = (1,)).
+        let scale = self.const_value(op.args[3]);
+        assert_eq!(
+            scale, 1,
+            "aarch64 GcStoreIndexed requires factor == 1 (got {scale})"
+        );
+        // aarch64/regalloc.py:558-559: ofs/size getint
         let ofs = if op.args.len() > 4 {
             self.const_value(op.args[4])
         } else {
@@ -3107,6 +3116,58 @@ impl RegAlloc {
                 index_loc,
                 Loc::Immed(ImmedLoc::new(size)),
                 Loc::Immed(ImmedLoc::new(ofs)),
+            ],
+            output,
+        );
+    }
+
+    /// x86/regalloc.py:1127 consider_gc_store_indexed parity.
+    /// Returns [base_loc, ofs_loc, value_loc, imm(factor), imm(offset), imm(size)].
+    #[cfg(target_arch = "x86_64")]
+    fn consider_gc_store_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let args: Vec<OpRef> = op.args.iter().copied().collect();
+        // x86/regalloc.py:1129
+        let base_loc = self.make_sure_var_in_reg(op.args[0], Type::Ref, &args, None, false);
+        // x86/regalloc.py:1130-1138: scale/offset/size are ConstInt
+        let factor = if op.args.len() > 3 {
+            self.const_value(op.args[3])
+        } else {
+            1
+        };
+        let offset = if op.args.len() > 4 {
+            self.const_value(op.args[4])
+        } else {
+            0
+        };
+        let size = if op.args.len() > 5 {
+            self.const_value(op.args[5])
+        } else {
+            8
+        };
+        // x86/regalloc.py:1139-1143 `assert size >= 1; need_lower_byte = (size == 1)`.
+        // On x86_64 `no_lower_byte_regs` is empty (regalloc.py:71) so the flag
+        // is a no-op today, but the contract mirrors the byte-store constraint
+        // that `mov r/m8, Rb(val)` in the x86 assembler emitter requires.
+        assert!(
+            size >= 1,
+            "x86 GcStoreIndexed size must be >= 1 (got {size})"
+        );
+        let need_lower_byte = size == 1;
+        // x86/regalloc.py:1144-1145
+        let tp_val = self.tp(op.args[2]);
+        let value_loc = self.make_sure_var_in_reg(op.args[2], tp_val, &args, None, need_lower_byte);
+        // x86/regalloc.py:1146
+        let ofs_loc = self.make_sure_var_in_reg(op.args[1], Type::Int, &args, None, false);
+        // x86/regalloc.py:1147-1148
+        self.perform_discard(
+            i,
+            vec![
+                base_loc,
+                ofs_loc,
+                value_loc,
+                Loc::Immed(ImmedLoc::new(factor)),
+                Loc::Immed(ImmedLoc::new(offset)),
+                Loc::Immed(ImmedLoc::new(size)),
             ],
             output,
         );

@@ -1759,6 +1759,131 @@ impl Assembler386 {
                     }
                 }
             }
+            // ── x86/assembler.py:1753 genop_discard_gc_store_indexed ──
+            // `base_loc, ofs_loc, value_loc, factor_loc, offset_loc, size_loc = arglocs`.
+            // `dest_addr = AddressLoc(base_loc, ofs_loc, scale=get_scale(factor_loc.value), disp=offset_loc.value)`
+            // emits `[base + ofs * 2**scale + disp]`. `load_supported_factors =
+            // (1, 2, 4, 8)` (x86/runner.py:31), so the rewriter passes raw
+            // byte strides in that set straight through here and the native
+            // SIB scaled-index addressing does the multiply. Any other factor
+            // must have been pre-scaled away in `cpu_simplify_scale`.
+            OpCode::GcStoreIndexed => {
+                if let (Some(Loc::Reg(base)), Some(Loc::Reg(ofs_reg)), Some(value_loc)) =
+                    (arglocs.first(), arglocs.get(1), arglocs.get(2))
+                {
+                    let factor = match arglocs.get(3) {
+                        Some(Loc::Immed(i)) => i.value,
+                        _ => 1,
+                    };
+                    let offset = match arglocs.get(4) {
+                        Some(Loc::Immed(i)) => i.value as i32,
+                        _ => 0,
+                    };
+                    let size = match arglocs.get(5) {
+                        Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
+                        _ => 8,
+                    };
+
+                    // Dynasm's `*N` operand is a compile-time literal, so the
+                    // runtime factor is dispatched to four parallel emitters.
+                    // Each inner `emit` closure receives the ready-to-use
+                    // (base, ofs, scale, disp) triple as explicit dynasm
+                    // syntax. `factor == 1` drops the `*1` token because
+                    // dynasm emits a tighter encoding without it.
+                    // Immediate stores stage the value through
+                    // `X86_64_SCRATCH_REG` (r11).  `r0`/rax is in the GPR
+                    // allocation pool (x86/regalloc.rs:19), so using it as
+                    // the scratch here would silently clobber `base.value`
+                    // or `ofs_reg.value` whenever regalloc assigned them
+                    // to EAX.  Upstream `save_into_mem` emits `MOV [mem],
+                    // imm` directly (assembler.py:1671); dynasm-rs does
+                    // not accept an immediate operand in the scaled-index
+                    // `mov` template, so we stage through the dedicated
+                    // non-allocatable scratch register instead.
+                    macro_rules! emit_store_scaled {
+                        ($scale:tt) => {{
+                            match value_loc {
+                                Loc::Reg(val) if val.is_xmm => {
+                                    dynasm!(self.mc ; .arch x64
+                                        ; movsd [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(val.value));
+                                }
+                                Loc::Reg(val) => match size {
+                                    1 => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rb(val.value)),
+                                    2 => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rw(val.value)),
+                                    4 => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rd(val.value)),
+                                    _ => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rq(val.value)),
+                                },
+                                Loc::Immed(i) => {
+                                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                                    dynasm!(self.mc ; .arch x64
+                                        ; mov Rq(scratch), QWORD i.value);
+                                    match size {
+                                        1 => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rb(scratch)),
+                                        2 => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rw(scratch)),
+                                        4 => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rd(scratch)),
+                                        _ => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rq(scratch)),
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }};
+                    }
+                    macro_rules! emit_store_unscaled {
+                        () => {{
+                            match value_loc {
+                                Loc::Reg(val) if val.is_xmm => {
+                                    dynasm!(self.mc ; .arch x64
+                                        ; movsd [Rq(base.value) + Rq(ofs_reg.value) + offset], Rx(val.value));
+                                }
+                                Loc::Reg(val) => match size {
+                                    1 => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rb(val.value)),
+                                    2 => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rw(val.value)),
+                                    4 => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rd(val.value)),
+                                    _ => dynasm!(self.mc ; .arch x64
+                                        ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rq(val.value)),
+                                },
+                                Loc::Immed(i) => {
+                                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                                    dynasm!(self.mc ; .arch x64
+                                        ; mov Rq(scratch), QWORD i.value);
+                                    match size {
+                                        1 => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rb(scratch)),
+                                        2 => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rw(scratch)),
+                                        4 => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rd(scratch)),
+                                        _ => dynasm!(self.mc ; .arch x64
+                                            ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rq(scratch)),
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }};
+                    }
+                    match factor {
+                        1 => emit_store_unscaled!(),
+                        2 => emit_store_scaled!(2),
+                        4 => emit_store_scaled!(4),
+                        8 => emit_store_scaled!(8),
+                        other => panic!(
+                            "x86 GcStoreIndexed: unsupported factor {other}; \
+                             load_supported_factors = (1, 2, 4, 8)"
+                        ),
+                    }
+                }
+            }
             // ── Control flow ──
             OpCode::Jump => {
                 let jump_descr = loop_target_descr(op);

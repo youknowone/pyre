@@ -5465,6 +5465,11 @@ impl CraneliftBackend {
                 .get()
                 .and_then(|info| info.jitframe_descrs.clone()),
             constant_types: ct,
+            // llmodel.py:39 default. Cranelift lowers GcStoreIndexed via
+            // ir::MemFlags and explicit offset arithmetic rather than an
+            // ISA scaled addressing mode, so we keep the rewriter in the
+            // "pre-scale everything" contract that the lowering expects.
+            load_supported_factors: &[1],
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
             // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
             // both sourced directly from the CLT Arc on the target
