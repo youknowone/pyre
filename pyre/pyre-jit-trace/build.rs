@@ -144,6 +144,36 @@ fn main() {
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
+    // Phase D-1 Step 1 (eval-loop automation plan): persist
+    // `pipeline.jitcodes` (RPython `all_jitcodes` from codewriter.py:89) as a
+    // single bincode artifact. Runtime deserializes this once into the shared
+    // MetaInterpStaticData jitcodes store — same single-store model as
+    // RPython `warmspot.py:281-282` `self.metainterp_sd.jitcodes =
+    // codewriter.make_jitcodes()`. No side-table serialization: arm→jitcode
+    // linking goes through the existing `PipelineOpcodeArm.entry_jitcode_index`
+    // field which is already in `jit_metadata.json`.
+    let jitcodes_bin = bincode::serialize(&pipeline.jitcodes).unwrap();
+    std::fs::write(format!("{out_dir}/opcode_jitcodes.bin"), &jitcodes_bin).unwrap();
+
+    // Phase D-1 Step 4: persist `pipeline.opcode_dispatch` (the arm table)
+    // alongside the jitcodes so the runtime can map opcode → arm_id →
+    // entry_jitcode_index → JitCode. This is the same `PipelineOpcodeArm`
+    // shape already present in `jit_metadata.json`; bincode just avoids the
+    // cost of JSON parse at startup.
+    let dispatch_bin = bincode::serialize(&pipeline.opcode_dispatch).unwrap();
+    std::fs::write(format!("{out_dir}/opcode_dispatch.bin"), &dispatch_bin).unwrap();
+
+    // Phase D-2 prerequisite: persist `pipeline.insns` — the opname → u8
+    // table `Assembler.write_insn` grew during assembly. JitCode bytecode
+    // bytes are opaque without it (the mapping is assembler-local, not
+    // part of the serialized JitCode), so any runtime consumer that
+    // wants to decode `JitCode.code` (shadow dispatch, IR diffing)
+    // needs this side by side with opcode_jitcodes.bin. RPython
+    // equivalent: the table handed to `BlackholeInterpBuilder::setup_insns`
+    // at metainterp startup (pyjitpl.py:2227-2243).
+    let insns_bin = bincode::serialize(&pipeline.insns).unwrap();
+    std::fs::write(format!("{out_dir}/opcode_insns.bin"), &insns_bin).unwrap();
+
     // Report
     let arms_with_jitcode = pipeline
         .opcode_dispatch
@@ -151,7 +181,7 @@ fn main() {
         .filter(|arm| arm.entry_jitcode_index.is_some())
         .count();
     eprintln!(
-        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} flattened, {} indexed), {} functions, {} blocks, {} flat ops, {} all_jitcodes, generated {} bytes",
+        "[pyre-jit-trace build.rs] canonical analysis: {} opcode arms ({} flattened, {} indexed), {} functions, {} blocks, {} flat ops, {} all_jitcodes ({} bytes bincode), generated {} bytes",
         pipeline.opcode_dispatch.len(),
         pipeline
             .opcode_dispatch
@@ -163,6 +193,7 @@ fn main() {
         pipeline.total_blocks,
         pipeline.total_ops,
         pipeline.jitcodes.len(),
+        jitcodes_bin.len(),
         code.len(),
     );
 

@@ -4033,6 +4033,46 @@ impl MIFrame {
             return TraceAction::Abort;
         };
 
+        // Phase D-1 wire-up: resolve each opcode to its per-arm jitcode
+        // through the shared `MetaInterpStaticData.jitcodes` table
+        // (RPython `CallControl.jitcodes ≡ metainterp_sd.jitcodes`,
+        // warmspot.py:281-282). Env-gated log-only probe — no execution —
+        // so we can confirm the build→runtime bridge stays in sync as
+        // Phase D-2 (shadow execute) and Phase D-3 (opcode migration)
+        // land. `unresolved` logs the single-variant miss so a dispatch
+        // gap surfaces immediately.
+        if std::env::var_os("PYRE_JIT_JITCODE_PROBE").is_some() {
+            match crate::jitcode_runtime::jitcode_for_instruction(&instruction) {
+                Some(jc) => {
+                    // Walk the jitcode byte stream using the insns argcode
+                    // protocol (blackhole.py:105-232 `_get_method.handler`).
+                    // `complete` flags whether the decoder reached
+                    // `code.len()` without hitting an unknown opcode — a
+                    // structural check the probe can surface per-opcode.
+                    let mut opnames = Vec::new();
+                    let mut last_next = 0usize;
+                    for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+                        opnames.push(op.opname);
+                        last_next = op.next_pc;
+                    }
+                    let complete = last_next == jc.code.len();
+                    eprintln!(
+                        "[jit][probe] pc={pc} instr={} arm_jitcode={} code_len={} ops={} complete={} trace={:?}",
+                        crate::jitcode_runtime::instruction_variant_name(&instruction),
+                        jc.name,
+                        jc.code.len(),
+                        opnames.len(),
+                        complete,
+                        opnames,
+                    );
+                }
+                None => eprintln!(
+                    "[jit][probe] pc={pc} instr={} unresolved",
+                    crate::jitcode_runtime::instruction_variant_name(&instruction),
+                ),
+            }
+        }
+
         self.set_orgpc(pc);
         self.prepare_fallthrough();
         // RPython capture_resumedata(resumepc=orgpc): save pre-opcode

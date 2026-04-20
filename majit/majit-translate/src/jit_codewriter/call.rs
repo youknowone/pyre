@@ -1635,23 +1635,23 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
 }
 
 impl CallControl {
-    /// Collect every `Arc<JitCode>` shell whose body has been committed,
-    /// in allocation order. Shells whose graph was never registered (and
-    /// therefore never reached `transform_graph_to_jitcode`) are skipped.
-    /// This mirrors the previous `Vec<Option<JitCode>>.into_iter().flatten()`
-    /// shape and preserves `result[i].index == i` for the populated
-    /// subsequence (RPython codewriter.py:80 invariant).
+    /// Collect every `Arc<JitCode>` shell in allocation order. The return
+    /// vec is dense: `result[i].index == i` matches RPython
+    /// `codewriter.py:80` `all_jitcodes[jitcode.index] is jitcode`.
+    ///
+    /// Each `get_jitcode` call pushes a path onto `jitcode_alloc_order`
+    /// and assigns `shell.index = next_jitcode_index` (call.rs:1509), so
+    /// `jitcode_alloc_order[i]` is the path of the shell whose
+    /// `.index == i` by construction.  We deliberately do NOT filter on
+    /// `try_body().is_some()`: a body-less shell is a valid allocated
+    /// slot whose `.index` would otherwise clash with a later shell in
+    /// position-space. Empty shells round-trip through bincode (body
+    /// `OnceLock` serializes as `None`) and downstream consumers that
+    /// require a body must check `try_body()` themselves.
     pub fn collect_jitcodes_in_alloc_order(&self) -> Vec<std::sync::Arc<crate::jitcode::JitCode>> {
         self.jitcode_alloc_order
             .iter()
-            .filter_map(|p| {
-                let arc = self.jitcodes[p].clone();
-                if arc.try_body().is_some() {
-                    Some(arc)
-                } else {
-                    None
-                }
-            })
+            .map(|p| self.jitcodes[p].clone())
             .collect()
     }
 

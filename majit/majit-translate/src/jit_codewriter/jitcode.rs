@@ -110,7 +110,7 @@ pub struct JitCode {
     /// otherwise the stable symbolic fallback key; the blackhole-side
     /// inline-call descriptor may still patch its own cached copy from
     /// `all_jitcodes[jitcode.index]`.
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub fnaddr: i64,
     /// RPython `jitcode.py:18` `self.jitdriver_sd = None`. `Some(index)`
     /// for portal jitcodes (set by `grab_initial_jitcodes` /
@@ -128,7 +128,7 @@ pub struct JitCode {
     /// RPython `jitcode.py:19` `self._called_from = called_from` — debug:
     /// which call graph first triggered this jitcode's creation. In RPython
     /// this is a graph object; pyre uses an optional CallPath string.
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub _called_from: Option<String>,
     /// Body — set once after assembly via `set_body`. Direct field accesses
     /// like `jitcode.code` continue to work via `Deref<Target=JitCodeBody>`.

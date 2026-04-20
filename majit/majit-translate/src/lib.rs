@@ -665,7 +665,7 @@ fn analyze_pipeline_from_parsed(
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
 
-    let (opcode_dispatch, jitcodes) = build_canonical_opcode_dispatch(
+    let (opcode_dispatch, jitcodes, insns) = build_canonical_opcode_dispatch(
         parsed_files,
         &canonical_trait_impls,
         &canonical_inherent_methods,
@@ -675,6 +675,7 @@ fn analyze_pipeline_from_parsed(
     );
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
+    pipeline.insns = insns;
 
     pipeline
 }
@@ -711,6 +712,7 @@ fn build_canonical_opcode_dispatch(
 ) -> (
     Vec<pipeline::PipelineOpcodeArm>,
     Vec<std::sync::Arc<jitcode::JitCode>>,
+    std::collections::HashMap<String, u8>,
 ) {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
@@ -820,7 +822,13 @@ fn build_canonical_opcode_dispatch(
     // order in `CallControl::jitcode_alloc_order`.
     let jitcodes = call_control.collect_jitcodes_in_alloc_order();
 
-    (dispatch, jitcodes)
+    // RPython codewriter.py + assembler.py: `Assembler.insns` grows as
+    // `write_insn` encounters new keys.  We snapshot the final table
+    // here so the runtime can map `JitCode.code[i]` bytes back to
+    // opnames — the key consumed by `BlackholeInterpBuilder::setup_insns`.
+    let insns = codewriter.assembler.insns().clone();
+
+    (dispatch, jitcodes, insns)
 }
 
 /// Synthetic CallPath for an opcode-dispatch arm body.
@@ -1248,25 +1256,49 @@ mod tests {
 
         // RPython: CodeWriter.make_jitcodes() produces JitCode for each graph.
         // Verify the full pipeline (regalloc + liveness + assemble) runs.
+        //
+        // `collect_jitcodes_in_alloc_order` preserves the dense invariant
+        // `all_jitcodes[i].index == i` (call.rs:1620-1633, matching RPython
+        // codewriter.py:80), and by construction every slot in the vec is
+        // a legitimate shell produced by `get_jitcode`. Shells whose body
+        // was never committed (e.g. graph registered by a caller but never
+        // drained because the test harness doesn't wire an fnaddr binding)
+        // round-trip as body-less entries — `try_body()` is the documented
+        // probe for distinguishing them.
         eprintln!("\nJitCodes: {}", result.jitcodes.len());
+        let mut bodied = 0usize;
         for (i, jitcode) in result.jitcodes.iter().enumerate() {
-            eprintln!(
-                "  [{}] {} → {} bytes, regs i={} r={} f={}",
-                i,
-                jitcode.name,
-                jitcode.code.len(),
-                jitcode.num_regs_i(),
-                jitcode.num_regs_r(),
-                jitcode.num_regs_f(),
-            );
+            match jitcode.try_body() {
+                Some(body) => {
+                    eprintln!(
+                        "  [{}] {} → {} bytes, regs i={} r={} f={}",
+                        i,
+                        jitcode.name,
+                        body.code.len(),
+                        body.c_num_regs_i,
+                        body.c_num_regs_r,
+                        body.c_num_regs_f,
+                    );
+                    bodied += 1;
+                }
+                None => eprintln!("  [{}] {} → <shell: body not committed>", i, jitcode.name),
+            }
         }
         assert!(
             !result.jitcodes.is_empty(),
             "CodeWriter should produce JitCodes from opcode arms"
         );
         assert!(
-            result.jitcodes.iter().all(|jc| !jc.code.is_empty()),
-            "all JitCodes should have non-empty bytecode"
+            bodied > 0,
+            "at least one JitCode should have a committed body"
+        );
+        assert!(
+            result
+                .jitcodes
+                .iter()
+                .filter_map(|jc| jc.try_body())
+                .all(|body| !body.code.is_empty()),
+            "every committed JitCode body must have non-empty bytecode"
         );
     }
 

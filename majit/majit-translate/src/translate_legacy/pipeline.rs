@@ -117,6 +117,14 @@ pub struct ProgramPipelineResult {
     /// `JitDriverStaticData.mainjitcode` or `IndirectCallTargets`) share
     /// identity with the values appearing here.
     pub jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// RPython: `Assembler.insns` (assembler.py:?). The opcode-key → u8
+    /// table grown on-demand by `write_insn`. Persisted alongside the
+    /// jitcodes so the runtime can map bytecode bytes back to opnames —
+    /// without it, the u8 opcodes embedded in `JitCode.code` are opaque
+    /// (the mapping is local to the build-time assembler instance).
+    /// Consumed by `BlackholeInterpBuilder::setup_insns` at runtime.
+    #[serde(default)]
+    pub insns: std::collections::HashMap<String, u8>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
@@ -182,6 +190,7 @@ pub fn analyze_program(
         functions,
         opcode_dispatch: Vec::new(),
         jitcodes: Vec::new(),
+        insns: std::collections::HashMap::new(),
         total_blocks,
         total_ops,
         total_vable_rewrites,

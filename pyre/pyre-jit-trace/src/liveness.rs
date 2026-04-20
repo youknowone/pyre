@@ -127,25 +127,35 @@ impl LiveVars {
                         }
                     }
                     // Super-instructions LOAD_FAST_LOAD_FAST /
-                    // LOAD_FAST_BORROW_LOAD_FAST_BORROW read two locals in
-                    // one opcode. RPython parity would require GENing both
-                    // indices (liveness.py does one GEN per read), but
-                    // because pyre's codewriter currently routes the
-                    // super-inst portal emit through `move_r` (stale
-                    // ref_regs path — super_inst_parity_blocker memo),
-                    // that path already makes the SSA liveness track
-                    // reg_a/reg_b via `read_ref_reg` side of move_r.
-                    // Enabling GEN here on top of move_r adds no new
-                    // parity — SSA already covers it — and causes the
-                    // live set to linger backward past natural KILLs
-                    // into earlier merge points (fannkuch timeout
-                    // 2026-04-19). Once super-inst portal emit is
-                    // decomposed into two plain `getarrayitem_vable_r`
-                    // ops (Option D), the vable path no longer touches
-                    // ref_regs; GEN must be re-enabled at that point so
-                    // symbolic_locals survives downstream guard
-                    // fail_args.  Tracked in
-                    // phase4_fannkuch_blackhole_stuck_2026_04_20.
+                    // LOAD_FAST_BORROW_LOAD_FAST_BORROW each read two
+                    // locals in one opcode. RPython `liveness.py:59-78`
+                    // does one GEN per read; parity requires the same
+                    // here so `LivenessInfo` reports both reads at
+                    // backward merge points. The earlier rationale for
+                    // omitting this GEN ("SSA already covers it via
+                    // `read_ref_reg` on move_r") was structurally wrong:
+                    // `LivenessInfo` is the bitmap that
+                    // `restore_guard_failure_values` indexes into, not
+                    // an SSA view, so dropping the bit here silently
+                    // drops the local from the vable writeback list at
+                    // every preceding guard PC. Keep fannkuch's
+                    // known-regression memo
+                    // (phase4_fannkuch_blackhole_stuck_2026_04_20) as a
+                    // downstream blocker to investigate separately —
+                    // the parity deviation comes first.
+                    Instruction::LoadFastLoadFast { var_nums }
+                    | Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                        let pair = var_nums.get(op_arg);
+                        for i in [
+                            u32::from(pair.idx_1()) as usize,
+                            u32::from(pair.idx_2()) as usize,
+                        ] {
+                            let word = i / 64;
+                            if word < words_per_pc {
+                                live[word] |= 1u64 << (i % 64);
+                            }
+                        }
+                    }
                     Instruction::StoreFast { var_num } | Instruction::DeleteFast { var_num } => {
                         let i = var_num.get(op_arg).as_usize();
                         let word = i / 64;

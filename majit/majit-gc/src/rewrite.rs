@@ -660,8 +660,10 @@ impl GcRewriterImpl {
     /// rewrite.py:514-518 consider_setarrayitem_gc: record the constant
     /// index so emit_pending_zeros can skip this slot.
     ///
-    ///     if not isinstance(array_box, ConstPtr) and index_box.is_constant():
-    ///         self.remember_setarrayitem_occurred(array_box, index_box.getint())
+    /// ```text
+    /// if not isinstance(array_box, ConstPtr) and index_box.is_constant():
+    ///     self.remember_setarrayitem_occurred(array_box, index_box.getint())
+    /// ```
     fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
         let array_ref = st.resolve(op.arg(0));
         let index_ref = op.arg(1);
@@ -1797,26 +1799,31 @@ mod tests {
     fn test_pending_zero_fully_initialized() {
         // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → ZERO_ARRAY emitted
         // with length=0 (RPython rewrite.py:754 "may be ConstInt(0)").
+        // rewrite.py:514-518 consider_setarrayitem_gc requires the index
+        // to be `ConstInt` (`index_box.is_constant()` / `getint()`); the
+        // pyre equivalent is an entry in the constant pool. OpRefs 10/11/12
+        // hold the literal indices 0/1/2 so `resolve_constant` returns the
+        // item number.
         let rw = make_rewriter();
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
-        let constants = const_pool(&[(3, 3)]);
+        let constants = const_pool(&[(3, 3), (10, 0), (11, 1), (12, 2)]);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(0), OpRef(100)],
+                &[OpRef(0), OpRef(10), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(1), OpRef(100)],
+                &[OpRef(0), OpRef(11), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(2), OpRef(100)],
+                &[OpRef(0), OpRef(12), OpRef(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -1838,21 +1845,22 @@ mod tests {
     fn test_pending_zero_partially_initialized() {
         // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY trimmed to
         // start=2 items, length=2 items → byte_start=8, byte_len=8.
+        // Index OpRefs 10/11 are ConstInt 0/1 per rewrite.py:514-518.
         let rw = make_rewriter();
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(4)], array_descr_int());
         new_array.pos = OpRef(0);
-        let constants = const_pool(&[(4, 4)]);
+        let constants = const_pool(&[(4, 4), (10, 0), (11, 1)]);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(0), OpRef(100)],
+                &[OpRef(0), OpRef(10), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(1), OpRef(100)],
+                &[OpRef(0), OpRef(11), OpRef(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -1914,26 +1922,27 @@ mod tests {
         // trim-from-both-ends only (no middle splitting): start=1 (skip
         // index 0), stop=4 (skip index 4), length=3.  Index 2 falls
         // inside the zero range and is re-zeroed before the SET.
+        // Index OpRefs 10/12/14 hold ConstInt 0/2/4 per rewrite.py:514-518.
         let rw = make_rewriter();
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(5)], array_descr_int());
         new_array.pos = OpRef(0);
-        let constants = const_pool(&[(5, 5)]);
+        let constants = const_pool(&[(5, 5), (10, 0), (12, 2), (14, 4)]);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(0), OpRef(100)],
+                &[OpRef(0), OpRef(10), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(2), OpRef(100)],
+                &[OpRef(0), OpRef(12), OpRef(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(4), OpRef(100)],
+                &[OpRef(0), OpRef(14), OpRef(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
