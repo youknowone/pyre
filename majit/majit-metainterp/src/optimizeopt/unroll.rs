@@ -346,6 +346,7 @@ impl UnrollOptimizer {
             while let Some(op) = p1_iter.next() {
                 p1_ops_in.push(op);
             }
+            let p1_iter_fresh_hw = p1_iter._fresh;
             let p1_ops =
                 opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
             // RPython parity: Phase 1 optimizer may discover new constants
@@ -389,12 +390,24 @@ impl UnrollOptimizer {
                     // majit relies on disjoint integer ranges). The high
                     // water is `final_ctx.next_pos` after Phase 1 emit, with
                     // a floor of `num_inputs` for empty traces.
+                    // Phase 1's emit-side high water (`final_ctx.next_pos`)
+                    // reflects only the positions `ctx.reserve_pos` handed
+                    // out; the per-iteration TraceIterator additionally
+                    // allocates fresh OpRefs via its `_fresh` counter and
+                    // those values can exceed `next_pos` for traces where
+                    // Phase 1 dropped or folded many ops. Taking the max
+                    // with `p1_iter_fresh_hw` keeps Phase 2's inputarg base
+                    // strictly above every OpRef Phase 1 ever allocated,
+                    // so Phase 2's own fresh OpRefs cannot collide with
+                    // values already keyed in `phase1_value_types` /
+                    // `original_trace_op_types`.
                     self.next_global_opref = opt_p1
                         .final_ctx
                         .as_ref()
                         .map(|c| c.next_pos)
                         .unwrap_or(num_inputs as u32)
-                        .max(num_inputs as u32);
+                        .max(num_inputs as u32)
+                        .max(p1_iter_fresh_hw);
                     // RPython Box type parity: Phase 1's emitted op types
                     // must be accessible to Phase 2 (imported_label_args
                     // reference Phase 1 OpRefs). Save Phase 1 value_types.
