@@ -4320,6 +4320,30 @@ macro_rules! bhhandler_ri_i {
     };
 }
 
+/// Decode pattern `@arguments("i", "r", returns="i")` — argcodes `"ir>i"`.
+///
+/// Mirror of `bhhandler_ri_i` with the operand order flipped. Emerges when
+/// the binary int primitive's rhs operand (rather than lhs) lands in a
+/// Ref register due to the tagged-int-in-ref-slot deviation. Since
+/// `registers_r` and `registers_i` are both `Vec<i64>`, the raw i64 read
+/// from the ref slot matches whatever the builder wrote. Becomes dead
+/// code once pyre emits `ref_*` for Ref-typed operands or introduces an
+/// explicit unbox op.
+macro_rules! bhhandler_ir_i {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a = bh.registers_i[code[position] as usize];
+            let b = bh.registers_r[code[position + 1] as usize];
+            bh.registers_i[code[position + 2] as usize] = $bhimpl(a, b);
+            Ok(position + 3)
+        }
+    };
+}
+
 /// Decode pattern `@arguments("r", returns="i")` — argcodes `"r>i"`.
 ///
 /// pyre-specific companion of bhhandler_ri_i: the unary int primitive's
@@ -4477,9 +4501,17 @@ bhhandler_i_i!(handler_int_force_ge_zero, bhimpl_int_force_ge_zero);
 // @arguments("i", "i", returns="i") → argcodes "ii>i" → 2 src regs + 1 dst reg = 3 bytes
 bhhandler_ii_i!(handler_int_add, bhimpl_int_add);
 bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
-// pyre-specific ri>i argcode variants — see bhhandler_ri_i macro docs.
+// pyre-specific ri>i / ir>i argcode variants — see bhhandler_ri_i /
+// bhhandler_ir_i macro docs. Each wraps the same canonical `bhimpl_*` as
+// its `ii>i` sibling; only the register-class of one operand differs.
 bhhandler_ri_i!(handler_int_add_ri, bhimpl_int_add);
 bhhandler_ri_i!(handler_int_sub_ri, bhimpl_int_sub);
+bhhandler_ir_i!(handler_int_add_ir, bhimpl_int_add);
+bhhandler_ri_i!(handler_int_or_ri, bhimpl_int_or);
+bhhandler_ir_i!(handler_int_or_ir, bhimpl_int_or);
+bhhandler_ir_i!(handler_int_le_ir, bhimpl_int_le);
+bhhandler_ri_i!(handler_int_eq_ri, bhimpl_int_eq);
+bhhandler_ri_i!(handler_int_gt_ri, bhimpl_int_gt);
 
 /// Handler for the pyre-emitted `const_int/c>i` opcode.
 ///
@@ -5855,12 +5887,19 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // @arguments("i", "i", returns="i") pattern
     builder.wire_handler("int_add/ii>i", handler_int_add);
     builder.wire_handler("int_sub/ii>i", handler_int_sub);
-    // pyre-specific ri>i variants: lhs sits in a Ref register due to
-    // the tagged-int representation pyre uses for some untyped int
-    // paths (assembler.rs OpKind::BinOp). Same primitive, different
-    // register source.
+    // pyre-specific ri>i / ir>i variants: one operand sits in a Ref
+    // register due to the tagged-int representation pyre uses for some
+    // untyped int paths (assembler.rs OpKind::BinOp). Same primitive,
+    // different register source. See `bhhandler_ri_i` / `bhhandler_ir_i`
+    // macro docs for the tagged-int deviation.
     builder.wire_handler("int_add/ri>i", handler_int_add_ri);
     builder.wire_handler("int_sub/ri>i", handler_int_sub_ri);
+    builder.wire_handler("int_add/ir>i", handler_int_add_ir);
+    builder.wire_handler("int_or/ri>i", handler_int_or_ri);
+    builder.wire_handler("int_or/ir>i", handler_int_or_ir);
+    builder.wire_handler("int_le/ir>i", handler_int_le_ir);
+    builder.wire_handler("int_eq/ri>i", handler_int_eq_ri);
+    builder.wire_handler("int_gt/ri>i", handler_int_gt_ri);
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
     builder.wire_handler("int_and/ii>i", handler_int_and);
     builder.wire_handler("int_or/ii>i", handler_int_or);
