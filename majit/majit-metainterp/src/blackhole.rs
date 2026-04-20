@@ -6271,6 +6271,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setfield_vable_i/rid", handler_setfield_vable_i);
     builder.wire_handler("setfield_vable_r/rrd", handler_setfield_vable_r);
     builder.wire_handler("setfield_vable_f/rfd", handler_setfield_vable_f);
+    // pyre-specific variants — `_v` opname (value type declared as
+    // Unknown/Void) and no leading base-register byte (VableFieldRead /
+    // VableFieldWrite emit the implicit vable through BH_VABLE_PTR set
+    // by `run()`). See handler comments above for the full rationale.
+    builder.wire_handler("setfield_vable_v/id", handler_setfield_vable_v_id_pyre);
+    builder.wire_handler("setfield_vable_v/rd", handler_setfield_vable_v_rd_pyre);
+    builder.wire_handler("getfield_vable_v/d>i", handler_getfield_vable_v_d_i_pyre);
     builder.wire_handler("getarrayitem_vable_i/ridd>i", handler_getarrayitem_vable_i);
     builder.wire_handler("getarrayitem_vable_r/ridd>r", handler_getarrayitem_vable_r);
     builder.wire_handler("setarrayitem_vable_i/riidd", handler_setarrayitem_vable_i);
@@ -6805,6 +6812,69 @@ fn handler_getfield_vable_f(
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
+    Ok(p + 1)
+}
+
+// pyre-specific vable handlers — base pointer is implicit in pyre's
+// VableFieldRead/VableFieldWrite emission (assembler.rs:782-818 encodes
+// only the descr + optional value, no base register), so the struct_ptr
+// is read from the thread-local `BH_VABLE_PTR` set by `run()`
+// (blackhole.rs:1560) which mirrors RPython's `fielddescr` walk of the
+// current virtualizable. `_v` opname is emitted because the OpKind's
+// declared `ty` is Void/Unknown (value_type_to_kind returns 'v'). The
+// byte stream is `<value_kc>d` (setfield) or `d>i` (getfield) — no
+// leading base register byte.
+
+// pyre: `setfield_vable_v/id` — implicit vable base, value in Int reg.
+fn handler_setfield_vable_v_id_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let value = bh.registers_i[code[p] as usize];
+    let struct_ptr = BH_VABLE_PTR.with(|c| c.get());
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
+    }
+    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
+    Ok(p)
+}
+
+// pyre: `setfield_vable_v/rd` — implicit vable base, value in Ref reg.
+fn handler_setfield_vable_v_rd_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let value = bh.registers_r[code[p] as usize];
+    let struct_ptr = BH_VABLE_PTR.with(|c| c.get());
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
+    }
+    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
+    Ok(p)
+}
+
+// pyre: `getfield_vable_v/d>i` — implicit vable base, result in Int reg.
+fn handler_getfield_vable_v_d_i_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = BH_VABLE_PTR.with(|c| c.get());
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
+    }
+    let (descr, p) = read_descr_vable_field(bh, code, p);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
 }
 fn handler_setfield_vable_i(
