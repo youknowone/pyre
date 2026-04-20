@@ -8,7 +8,9 @@
 //! | majit                 | rpython/tool/                 |
 //! |-----------------------|-------------------------------|
 //! | `algo::unionfind`     | `algo/unionfind.py`           |
+//! | `error`               | `error.py`                    |
 //! | `pairtype`            | `pairtype.py`                 |
 
 pub mod algo;
+pub mod error;
 pub mod pairtype;

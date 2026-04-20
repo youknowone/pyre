@@ -242,27 +242,19 @@ impl From<crate::annotator::model::AnnotatorError> for FlowinError {
     }
 }
 
-/// RPython `gather_error(self, graph, block, i)` (annrpython.py:~10,
-/// imported from `rpython/annotator/model.py` area). Upstream joins
-/// `source_lines(graph, block, i, long=True)` with newlines; the Rust
-/// port stubs `source_lines` to a diagnostic string. Wired in so the
-/// `except AnnotatorError` path in `flowin_op_loop` has the upstream
-/// control flow.
+/// RPython `gather_error(annotator, graph, block, operindex)`
+/// (tool/error.py:67-82) — thin wrapper that binds the
+/// [`crate::tool::error::gather_error`] port into annrpython's legacy
+/// call shape. The operindex is `Option<usize>` upstream (`None`
+/// means "no op, block-level"); callers passing a concrete index wrap
+/// it in `Some`.
 pub fn gather_error(
-    _ann: &RPythonAnnotator,
+    ann: &RPythonAnnotator,
     graph: &GraphRef,
     block: &BlockRef,
     i: usize,
 ) -> String {
-    // TODO: port `source_lines(graph, block, i, long=True)` once
-    // flowspace carries enough provenance. For now emit a compact
-    // location string so errors[] has a useful breadcrumb.
-    format!(
-        "source at graph={:?} block={:?} op#{}",
-        graph.borrow().name,
-        BlockKey::of(block),
-        i
-    )
+    crate::tool::error::gather_error(ann, graph, block, Some(i))
 }
 
 /// RAII guard returned by [`RPythonAnnotator::using_policy`] — mirrors
@@ -1531,12 +1523,10 @@ impl RPythonAnnotator {
                 return Err(BlockedInference::new(self, hlop.clone(), None).into());
             }
         }
-        // TODO: `hlop.consider(self)` currently panics on the upstream
-        // `raise AnnotatorError(...)` paths; migrating consider()
-        // itself to `Result<_, AnnotatorError>` is a separate port.
-        // Once that lands, propagate via `?` here; the `FlowinError`
-        // wrapper already covers the downstream variant.
-        let resultcell = hlop.consider(self);
+        // upstream `resultcell = op.consider(self)`; AnnotatorError
+        // raised inside get_specialization / registered handlers
+        // propagates as `FlowinError::Annotator` via the `?`.
+        let resultcell = hlop.consider(self)?;
         // upstream: None → s_ImpossibleValue; s_ImpossibleValue → block.
         if matches!(resultcell, SomeValue::Impossible) {
             return Err(BlockedInference::new(self, hlop.clone(), None).into());
@@ -2443,7 +2433,7 @@ mod tests {
         let args = blk.inputargs.clone();
         drop(blk);
         let hlop = HLOperation::new(OpKind::NewTuple, args);
-        let got = hlop.consider(&ann);
+        let got = hlop.consider(&ann).unwrap();
         if let SomeValue::Tuple(t) = got {
             assert_eq!(t.items.len(), 2);
             assert!(matches!(t.items[0], SomeValue::Integer(_)));
@@ -2470,7 +2460,7 @@ mod tests {
         }
         let args = startblock.borrow().inputargs.clone();
         let hlop = HLOperation::new(OpKind::NewList, args);
-        let got = hlop.consider(&ann);
+        let got = hlop.consider(&ann).unwrap();
         if let SomeValue::List(list) = got {
             assert!(matches!(list.listdef.s_value(), SomeValue::Integer(_)));
         } else {
@@ -2485,18 +2475,18 @@ mod tests {
         use super::super::super::flowspace::operation::{HLOperation, OpKind};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let hlop = HLOperation::new(OpKind::NewDict, vec![]);
-        let got = hlop.consider(&ann);
+        let got = hlop.consider(&ann).unwrap();
         assert!(matches!(got, SomeValue::Dict(_)));
     }
 
     #[test]
-    #[should_panic(expected = "Cannot use extended slicing in rpython")]
     fn consider_newslice_raises_annotator_error() {
         // NewSlice.consider always raises AnnotatorError.
         use super::super::super::flowspace::operation::{HLOperation, OpKind};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let hlop = HLOperation::new(OpKind::NewSlice, vec![]);
-        let _ = hlop.consider(&ann);
+        let err = hlop.consider(&ann).unwrap_err();
+        assert!(err.msg.unwrap_or_default().contains("extended slicing"));
     }
 
     // ------------------------------------------------------------------
@@ -2505,14 +2495,17 @@ mod tests {
 
     #[test]
     fn gather_error_returns_location_string() {
-        // gather_error is a stub that formats a graph/block/op location
-        // breadcrumb; make sure it at least contains the op index.
+        // gather_error formats graph/block/op provenance per upstream
+        // error.py:67-82. Empty-block / out-of-range index path is a
+        // valid call shape (matches upstream's operindex=None default
+        // when the block carries no operations) and surfaces the
+        // "None" breadcrumb before the source_lines body.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let graph = mk_graph("gather", 0);
         let startblock = graph.borrow().startblock.clone();
         let msg = gather_error(&ann, &graph, &startblock, 3);
-        assert!(msg.contains("op#3"), "got {msg:?}");
-        assert!(msg.contains("gather"), "got {msg:?}");
+        // Out-of-range index surfaces the explicit marker.
+        assert!(msg.contains("operindex 3 out of range"), "got {msg:?}");
     }
 
     #[test]

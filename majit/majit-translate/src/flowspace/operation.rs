@@ -1627,86 +1627,122 @@ impl HLOperation {
     pub fn consider(
         &self,
         annotator: &crate::annotator::annrpython::RPythonAnnotator,
-    ) -> crate::annotator::model::SomeValue {
-        use crate::annotator::model::SomeValue;
-        let args_s: Vec<SomeValue> = self
-            .args
-            .iter()
-            .map(|a| {
-                annotator
-                    .annotation(a)
-                    .unwrap_or_else(|| panic!("consider: unbound arg in {:?}", self.kind))
-            })
-            .collect();
+    ) -> Result<crate::annotator::model::SomeValue, crate::annotator::model::AnnotatorError> {
+        use crate::annotator::model::{AnnotatorError, SomeValue};
+        // upstream operation.py:101-104 —
+        //     args_s = [annotator.annotation(arg) for arg in self.args]
+        //     spec = type(self).get_specialization(*args_s)
+        //     return spec(annotator, *self.args)
+        let mut args_s: Vec<SomeValue> = Vec::with_capacity(self.args.len());
+        for a in &self.args {
+            let s = annotator.annotation(a).ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "consider({:?}): unbound argument {:?}",
+                    self.kind, a
+                ))
+            })?;
+            args_s.push(s);
+        }
         match self.kind.dispatch() {
             Dispatch::Single => {
-                let tag = args_s.first().expect("dispatch=1 op with 0 args").tag();
-                _REGISTRY_SINGLE.with(|cell| {
-                    let reg = cell.borrow();
-                    let entries = reg.get(&self.kind).unwrap_or_else(|| {
-                        panic!("no single-dispatch entries for {:?}", self.kind)
-                    });
-                    // Upstream `SingleDispatchMixin._dispatch` (operation.py:212-219)
-                    // walks `type(s_arg).__mro__`.
-                    for c in tag.mro() {
-                        if let Some(spec) = entries.get(c) {
-                            return (spec.apply)(annotator, self);
+                let tag = args_s
+                    .first()
+                    .ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "consider: dispatch=1 op {:?} with 0 args",
+                            self.kind
+                        ))
+                    })?
+                    .tag();
+                let result =
+                    _REGISTRY_SINGLE.with(|cell| -> Result<SomeValue, AnnotatorError> {
+                        let reg = cell.borrow();
+                        let entries = reg.get(&self.kind).ok_or_else(|| {
+                            AnnotatorError::new(format!(
+                                "consider: no single-dispatch entries for {:?}",
+                                self.kind
+                            ))
+                        })?;
+                        // Upstream `SingleDispatchMixin._dispatch`
+                        // (operation.py:212-219) walks
+                        // `type(s_arg).__mro__`.
+                        for c in tag.mro() {
+                            if let Some(spec) = entries.get(c) {
+                                return Ok((spec.apply)(annotator, self));
+                            }
                         }
-                    }
-                    panic!("no unary spec for {:?}({:?})", self.kind, tag);
-                })
+                        Err(AnnotatorError::new(format!(
+                            "consider: no unary spec for {:?}({:?})",
+                            self.kind, tag
+                        )))
+                    })?;
+                Ok(result)
             }
             Dispatch::Double => {
-                let tag_l = args_s.first().expect("dispatch=2 op with 0 args").tag();
-                let tag_r = args_s.get(1).expect("dispatch=2 op with 1 arg").tag();
-                _REGISTRY_DOUBLE.with(|cell| {
-                    let reg = cell.borrow();
-                    let entries = reg.get(&self.kind).unwrap_or_else(|| {
-                        panic!("no double-dispatch entries for {:?}", self.kind)
-                    });
-                    match entries.get((tag_l, tag_r), tag_l.mro(), tag_r.mro()) {
-                        Some(spec) => (spec.apply)(annotator, self),
-                        None => panic!(
-                            "no binary spec for {:?}({:?}, {:?})",
-                            self.kind, tag_l, tag_r
-                        ),
-                    }
-                })
+                let tag_l = args_s
+                    .first()
+                    .ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "consider: dispatch=2 op {:?} with 0 args",
+                            self.kind
+                        ))
+                    })?
+                    .tag();
+                let tag_r = args_s
+                    .get(1)
+                    .ok_or_else(|| {
+                        AnnotatorError::new(format!(
+                            "consider: dispatch=2 op {:?} with 1 arg",
+                            self.kind
+                        ))
+                    })?
+                    .tag();
+                let result =
+                    _REGISTRY_DOUBLE.with(|cell| -> Result<SomeValue, AnnotatorError> {
+                        let reg = cell.borrow();
+                        let entries = reg.get(&self.kind).ok_or_else(|| {
+                            AnnotatorError::new(format!(
+                                "consider: no double-dispatch entries for {:?}",
+                                self.kind
+                            ))
+                        })?;
+                        match entries.get((tag_l, tag_r), tag_l.mro(), tag_r.mro()) {
+                            Some(spec) => Ok((spec.apply)(annotator, self)),
+                            None => Err(AnnotatorError::new(format!(
+                                "consider: no binary spec for {:?}({:?}, {:?})",
+                                self.kind, tag_l, tag_r
+                            ))),
+                        }
+                    })?;
+                Ok(result)
             }
             Dispatch::None => {
                 // operation.py:534-565 — per-class `consider()`
                 // overrides on explicit `Dispatch::None` subclasses.
-                // NewDict / NewTuple / NewList / NewSlice each override
-                // consider directly; the rest (Pow / Format / Trunc /
-                // Index / InplacePow / DivMod / Get / Set / Delete /
-                // UserDel / Buffer / Yield) are `PureOperation` or
-                // unregistered HLOperation subclasses that either
-                // constfold before reaching the annotator or are not
-                // exercised by valid RPython inputs — panic with an
-                // `AnnotatorError`-style message to surface the gap.
-                use crate::annotator::model::{SomeTuple as AnSomeTuple, SomeValue};
+                use crate::annotator::model::SomeTuple as AnSomeTuple;
                 match self.kind {
                     // operation.py:534-539 — NewDict.consider.
-                    OpKind::NewDict => SomeValue::Dict(annotator.bookkeeper.newdict()),
+                    OpKind::NewDict => Ok(SomeValue::Dict(annotator.bookkeeper.newdict())),
                     // operation.py:542-548 — NewTuple.consider.
-                    OpKind::NewTuple => SomeValue::Tuple(AnSomeTuple::new(args_s)),
+                    OpKind::NewTuple => Ok(SomeValue::Tuple(AnSomeTuple::new(args_s))),
                     // operation.py:551-557 — NewList.consider.
                     OpKind::NewList => {
-                        let list = annotator
-                            .bookkeeper
-                            .newlist(&args_s, None)
-                            .unwrap_or_else(|e| panic!("NewList.consider failed: {}", e));
-                        SomeValue::List(list)
+                        let list = annotator.bookkeeper.newlist(&args_s, None)?;
+                        Ok(SomeValue::List(list))
                     }
                     // operation.py:560-565 — NewSlice.consider raises
                     // AnnotatorError outright.
-                    OpKind::NewSlice => {
-                        panic!("AnnotatorError: Cannot use extended slicing in rpython")
-                    }
+                    OpKind::NewSlice => Err(AnnotatorError::new(
+                        "Cannot use extended slicing in rpython",
+                    )),
                     // Unregistered HLOperation subclasses with
                     // `dispatch=None`. Upstream expects these to have
-                    // been constfolded. Surface the gap clearly.
-                    _ => panic!("consider: no Dispatch::None override for {:?}", self.kind),
+                    // been constfolded. Surface the gap as a proper
+                    // error so keepgoing mode can continue.
+                    _ => Err(AnnotatorError::new(format!(
+                        "consider: no Dispatch::None override for {:?}",
+                        self.kind
+                    ))),
                 }
             }
         }

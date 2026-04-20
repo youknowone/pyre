@@ -3000,14 +3000,14 @@ mod tests {
     #[test]
     fn consider_integer_add_returns_someinteger() {
         let (hl, ann) = hl_int_int(OpKind::Add);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_integer_truediv_returns_somefloat() {
         let (hl, ann) = hl_int_int(OpKind::TrueDiv);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
@@ -3022,7 +3022,7 @@ mod tests {
     fn consider_integer_lt_returns_somebool() {
         let (base, ann) = hl_int_int(OpKind::Add);
         let hl = HLOperation::new(OpKind::Lt, base.args.clone());
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -3041,14 +3041,14 @@ mod tests {
     #[test]
     fn consider_bool_and_returns_somebool() {
         let (hl, ann) = hl_bool_bool(OpKind::And);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_bool_xor_returns_somebool() {
         let (hl, ann) = hl_bool_bool(OpKind::Xor);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -3067,14 +3067,14 @@ mod tests {
     #[test]
     fn consider_float_div_returns_somefloat() {
         let (hl, ann) = hl_float_float(OpKind::Div);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_float_add_returns_somefloat() {
         let (hl, ann) = hl_float_float(OpKind::Add);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
@@ -3099,7 +3099,7 @@ mod tests {
     fn consider_string_add_propagates_const() {
         // binaryop.py:345-350 — const+const should yield const=str1+str2.
         let (hl, ann) = hl_string_string_const("foo", "bar");
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::String(s) => {
                 let c = s.inner.base.const_box.expect("const not propagated");
@@ -3120,7 +3120,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::ByteArray(_)), "got {:?}", r);
     }
 
@@ -3136,7 +3136,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::ByteArray(_)), "got {:?}", r);
     }
 
@@ -3151,7 +3151,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -3178,7 +3178,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Tuple(t) => assert_eq!(t.items.len(), 3),
             other => panic!("got {:?}", other),
@@ -3205,7 +3205,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
@@ -3227,7 +3227,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -3243,7 +3243,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Char(c) => assert!(c.inner.no_nul, "no_nul propagated"),
             other => panic!("got {:?}", other),
@@ -3264,7 +3264,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::UnicodeCodePoint(_)), "got {:?}", r);
     }
 
@@ -3279,7 +3279,7 @@ mod tests {
             OpKind::Mul,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
@@ -3305,7 +3305,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(
             matches!(r, SomeValue::Impossible | SomeValue::Integer(_)),
             "got {:?}",
@@ -3325,7 +3325,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -3341,7 +3341,7 @@ mod tests {
             OpKind::Add,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -3409,7 +3409,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 }

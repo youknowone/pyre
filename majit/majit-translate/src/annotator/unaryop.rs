@@ -2727,7 +2727,7 @@ mod tests {
     fn consider_someobject_len_returns_nonneg_integer() {
         // unaryop.py:158-159 — default len returns SomeInteger(nonneg=True).
         let (hl, ann) = hl1(OpKind::Len, SomeValue::object());
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Integer(i) => assert!(i.nonneg, "nonneg not set"),
             other => panic!("got {:?}", other),
@@ -2737,21 +2737,21 @@ mod tests {
     #[test]
     fn consider_somefloat_neg_returns_somefloat() {
         let (hl, ann) = hl1(OpKind::Neg, SomeValue::Float(SomeFloat::new()));
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_somefloat_pos_returns_self() {
         let (hl, ann) = hl1(OpKind::Pos, SomeValue::Float(SomeFloat::new()));
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_someinteger_abs_is_nonneg() {
         let (hl, ann) = hl1(OpKind::Abs, SomeValue::Integer(SomeInteger::default()));
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Integer(i) => assert!(i.nonneg),
             other => panic!("got {:?}", other),
@@ -2761,14 +2761,14 @@ mod tests {
     #[test]
     fn consider_somebool_bool_returns_self() {
         let (hl, ann) = hl1(OpKind::Bool, SomeValue::Bool(SomeBool::new()));
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_somebool_invert_returns_someinteger() {
         let (hl, ann) = hl1(OpKind::Invert, SomeValue::Bool(SomeBool::new()));
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -2783,7 +2783,7 @@ mod tests {
                 SomeValue::Bool(SomeBool::new()),
             ])),
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Integer(i) => {
                 let c = i.base.const_box.expect("const not propagated");
@@ -2796,21 +2796,21 @@ mod tests {
     #[test]
     fn consider_sometuple_iter_returns_someiterator() {
         let (hl, ann) = hl1(OpKind::Iter, SomeValue::Tuple(SomeTuple::new(vec![])));
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_someobject_str_returns_somestring() {
         let (hl, ann) = hl1(OpKind::Str, SomeValue::object());
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
     #[test]
     fn consider_someobject_hex_returns_somestring() {
         let (hl, ann) = hl1(OpKind::Hex, SomeValue::object());
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
     }
 
@@ -2818,7 +2818,7 @@ mod tests {
     fn consider_someobject_pos_returns_impossible() {
         // unaryop.py:252-254 — default pos returns s_ImpossibleValue.
         let (hl, ann) = hl1(OpKind::Pos, SomeValue::object());
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -2847,7 +2847,7 @@ mod tests {
             OpKind::Contains,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
@@ -2857,7 +2857,7 @@ mod tests {
             OpKind::Iter,
             SomeValue::List(mk_list_of(SomeValue::Integer(SomeInteger::default()))),
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -2876,7 +2876,7 @@ mod tests {
         let mut v = Variable::named("d");
         ann.setbinding(&mut v, SomeValue::Dict(s_dict));
         let hl = HLOperation::new(OpKind::Iter, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -2886,7 +2886,7 @@ mod tests {
         let mut s = SomeString::new(false, false);
         s.inner.base.const_box = Some(Constant::new(ConstValue::Str("abc".into())));
         let (hl, ann) = hl1(OpKind::Len, SomeValue::String(s));
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Integer(i) => {
                 let c = i.base.const_box.expect("const not propagated");
@@ -2903,7 +2903,7 @@ mod tests {
             OpKind::Len,
             SomeValue::Char(super::super::model::SomeChar::new(false)),
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Integer(i) => {
                 let c = i.base.const_box.expect("const not propagated");
@@ -2919,7 +2919,7 @@ mod tests {
             OpKind::Ord,
             SomeValue::Char(super::super::model::SomeChar::new(false)),
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         match r {
             SomeValue::Integer(i) => assert!(i.nonneg),
             other => panic!("got {:?}", other),
@@ -2934,7 +2934,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Iter, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -2951,7 +2951,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -2969,7 +2969,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         let SomeValue::Tuple(t) = r else {
             panic!("expected SomeTuple");
         };
@@ -2991,7 +2991,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Integer(_)));
     }
 
@@ -3003,7 +3003,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Char(_)), "got {:?}", r);
     }
 
@@ -3017,7 +3017,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::UnicodeCodePoint(_)), "got {:?}", r);
     }
 
@@ -3029,7 +3029,7 @@ mod tests {
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
@@ -3039,7 +3039,7 @@ mod tests {
             OpKind::GetAttr,
             SomeValue::None_(super::super::model::SomeNone::new()),
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -3049,7 +3049,7 @@ mod tests {
             OpKind::Len,
             SomeValue::None_(super::super::model::SomeNone::new()),
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
@@ -3059,7 +3059,7 @@ mod tests {
             OpKind::Iter,
             SomeValue::String(SomeString::new(false, false)),
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
     }
 
@@ -3085,7 +3085,7 @@ mod tests {
             OpKind::Contains,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let r = hl.consider(&ann);
+        let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 }
