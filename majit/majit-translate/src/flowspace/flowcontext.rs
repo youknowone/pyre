@@ -1733,6 +1733,17 @@ impl FlowContext {
         args: Vec<Hlvalue>,
     ) -> Result<Hlvalue, FlowContextError> {
         self.maybe_merge()?;
+        let opname: String = opname.into();
+        // RPython `HLOperation.eval(ctx)` consults `constfold()` before
+        // `ctx.do_op()` (operation.py:92-96). Mirror that by running
+        // the flowspace-level constant folder over the candidate op;
+        // if it folds, skip emitting a SpaceOperation entirely.
+        if let Some(kind) = super::operation::OpKind::from_opname(&opname) {
+            let hlop = super::operation::HLOperation::new(kind, args.clone());
+            if let Some(folded) = hlop.constfold() {
+                return Ok(folded);
+            }
+        }
         let result = Hlvalue::Variable(Variable::new());
         self.record(SpaceOperation::new(opname, args, result.clone()))?;
         Ok(result)
@@ -3383,6 +3394,21 @@ impl FlowContext {
             Err(err) => Err(err),
         }
     }
+}
+
+/// RPython `flowcontext.py:80-83` — `fixeggblocks(graph)`.
+///
+/// Upstream: walks every block and deletes `SpamBlock.framestate`
+/// "memory saver" after graph construction. The Rust port holds
+/// `framestate` inside [`SpamBlock`] owned by the `FlowContext` rather
+/// than on `Block` itself, so there is nothing to drop from the
+/// finished `FunctionGraph`.
+///
+/// Defined as a no-op here to preserve call-site parity with upstream
+/// `objspace.build_flow`; the slot is reserved for the day SpamBlock
+/// migrates onto `Block` and genuinely holds state worth dropping.
+pub fn fixeggblocks(_graph: &mut FunctionGraph) {
+    // no-op — see module doc.
 }
 
 fn binary_opname(op: BinaryOperator) -> &'static str {

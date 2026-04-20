@@ -17,18 +17,22 @@
 //! | `model`                      | `model.py`                      |
 //! | `bytecode`                   | `bytecode.py`                   |
 //! | `framestate`                 | `framestate.py`                 |
-//! | `operation`       (Phase 3)  | `operation.py`                  |
+//! | `operation`                  | `operation.py`                  |
 //! | `flowcontext`                 | `flowcontext.py`                |
 //! | `flowcontext_py314` (Phase 3)| PYRE-ONLY, no RPython basis     |
-//! | `pygraph`         (Phase 3)  | `pygraph.py`                    |
-//! | `generator`       (Phase 3)  | `generator.py`                  |
+//! | `pygraph`                    | `pygraph.py`                    |
+//! | `generator`                  | `generator.py`                  |
 //! | `argument`                   | `argument.py`                   |
-//! | `objspace`        (Phase 3)  | `objspace.py`                   |
-//! | `specialcase`     (Phase 3)  | `specialcase.py`                |
+//! | `objspace`                   | `objspace.py`                   |
+//! | `specialcase`                | `specialcase.py`                |
 
 pub mod argument;
 pub mod bytecode;
 pub mod flowcontext;
 pub mod framestate;
+pub mod generator;
 pub mod model;
+pub mod objspace;
+pub mod operation;
+pub mod pygraph;
 pub mod specialcase;
