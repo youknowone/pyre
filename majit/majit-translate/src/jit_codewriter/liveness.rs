@@ -147,6 +147,16 @@ fn compute_liveness_pass(
                 alive.remove(&dst);
                 alive.insert(src);
             }
+            FlatOp::Push(src) => {
+                // RPython `flatten.py:329` `%s_push` — reads `v` into
+                // tmpreg. Backwards: treat as a pure use of `src`.
+                alive.insert(*src);
+            }
+            FlatOp::Pop(dst) => {
+                // RPython `flatten.py:331` `%s_pop` — writes tmpreg
+                // into `w`. Backwards: treat as a pure def of `dst`.
+                alive.remove(dst);
+            }
         }
     }
 

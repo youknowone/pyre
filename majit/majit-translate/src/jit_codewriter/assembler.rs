@@ -292,6 +292,41 @@ impl Assembler {
                 state.code.push(src_reg);
                 state.code.push(dst_reg);
             }
+
+            // RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
+            // Argcodes: one typed register, no result marker. Blackhole
+            // wires under `{kind}_push/{kind}` (see blackhole.rs:5727-5729).
+            FlatOp::Push(src) => {
+                let (src_reg, src_kind) = self.lookup_reg_with_kind(*src, regallocs);
+                let kind_name = match src_kind {
+                    'r' => "ref",
+                    'f' => "float",
+                    _ => "int",
+                };
+                let key = format!("{kind_name}_push/{src_kind}");
+                let opnum = self.get_opnum(&key);
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(src_reg);
+            }
+
+            // RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
+            // Argcodes: `>{kind}` — result marker then one typed register.
+            // Blackhole wires under `{kind}_pop/>{kind}` (see
+            // blackhole.rs:5730-5732).
+            FlatOp::Pop(dst) => {
+                let (dst_reg, dst_kind) = self.lookup_reg_with_kind(*dst, regallocs);
+                let kind_name = match dst_kind {
+                    'r' => "ref",
+                    'f' => "float",
+                    _ => "int",
+                };
+                let key = format!("{kind_name}_pop/>{dst_kind}");
+                let opnum = self.get_opnum(&key);
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(dst_reg);
+            }
         }
     }
 

@@ -106,6 +106,20 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     register_repr(*dst, &ssarepr.value_kinds)
                 );
             }
+            FlatOp::Push(src) => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}push {}",
+                    register_repr(*src, &ssarepr.value_kinds)
+                );
+            }
+            FlatOp::Pop(dst) => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}pop -> {}",
+                    register_repr(*dst, &ssarepr.value_kinds)
+                );
+            }
             FlatOp::Live { live_values } => {
                 let mut names: Vec<String> = live_values
                     .iter()

@@ -865,6 +865,12 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             FlatOp::Move { dst, src } => {
                 writeln!(out, "  %i{} = %i{}", dst.0, src.0).ok();
             }
+            FlatOp::Push(src) => {
+                writeln!(out, "  push %i{}", src.0).ok();
+            }
+            FlatOp::Pop(dst) => {
+                writeln!(out, "  pop -> %i{}", dst.0).ok();
+            }
         }
     }
     out

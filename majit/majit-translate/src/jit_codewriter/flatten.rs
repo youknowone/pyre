@@ -32,7 +32,21 @@ pub enum FlatOp {
     /// The true path is always the fallthrough.
     GotoIfNot { cond: ValueId, target: Label },
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
+    ///
+    /// RPython `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
     Move { dst: ValueId, src: ValueId },
+    /// Save a value into the per-kind tmpreg, to break a cycle in a
+    /// link renaming. Always paired with a later `Pop`.
+    ///
+    /// RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
+    /// Blackhole handler: `blackhole.py:661-669` `bhimpl_{int,ref,float}_push`.
+    Push(ValueId),
+    /// Restore a value from the per-kind tmpreg into `dst`, completing
+    /// a cycle break started by a prior `Push`.
+    ///
+    /// RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
+    /// Blackhole handler: `blackhole.py:671-679` `bhimpl_{int,ref,float}_pop`.
+    Pop(ValueId),
     /// Liveness marker — expanded by `compute_liveness()` to include
     /// all values alive at this point.
     ///
@@ -121,14 +135,9 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
         // Terminator → jumps + moves (Phi resolution)
         match &block.terminator {
             Terminator::Goto { target, args } => {
-                // Emit moves for Phi args
+                // RPython `flatten.py:306` `insert_renamings(link)`.
                 let target_block = graph.block(*target);
-                for (dst, src) in target_block.inputargs.iter().zip(args.iter()) {
-                    ops.push(FlatOp::Move {
-                        dst: *dst,
-                        src: *src,
-                    });
-                }
+                insert_renamings(args, &target_block.inputargs, &mut ops);
                 ops.push(FlatOp::Jump(block_labels[target]));
             }
             Terminator::Branch {
@@ -172,24 +181,14 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
                 // RPython flatten.py:264: true path (fallthrough)
                 // insert_renamings(linktrue) + make_bytecode_block(linktrue.target)
                 let true_block = graph.block(*if_true);
-                for (dst, src) in true_block.inputargs.iter().zip(true_args.iter()) {
-                    ops.push(FlatOp::Move {
-                        dst: *dst,
-                        src: *src,
-                    });
-                }
+                insert_renamings(true_args, &true_block.inputargs, &mut ops);
                 ops.push(FlatOp::Jump(true_label));
 
                 // RPython flatten.py:266-267: false path
                 // Label(linkfalse) then insert_renamings + make_bytecode_block
                 ops.push(FlatOp::Label(false_landing));
                 let false_block = graph.block(*if_false);
-                for (dst, src) in false_block.inputargs.iter().zip(false_args.iter()) {
-                    ops.push(FlatOp::Move {
-                        dst: *dst,
-                        src: *src,
-                    });
-                }
+                insert_renamings(false_args, &false_block.inputargs, &mut ops);
                 ops.push(FlatOp::Jump(false_label));
             }
             Terminator::Return(_val) => {
@@ -217,6 +216,9 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
             } => {
                 max_value = max_value.max(*d + 1);
                 max_value = max_value.max(*s + 1);
+            }
+            FlatOp::Push(ValueId(v)) | FlatOp::Pop(ValueId(v)) => {
+                max_value = max_value.max(*v + 1);
             }
             _ => {}
         }
@@ -281,6 +283,91 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
             if_true, if_false, ..
         } => vec![*if_true, *if_false],
         Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => vec![],
+    }
+}
+
+/// `flatten.py:306-334` `def insert_renamings(self, link)`.
+///
+/// Emits the ordered series of `%s_copy` / `%s_push` / `%s_pop` ops
+/// that resolve a link's argument-to-inputarg renaming, breaking any
+/// cycles via `reorder_renaming_list`. Upstream groups by register
+/// kind so it can emit `int_copy` / `ref_copy` / `float_copy` under
+/// different opnames; this helper emits generic `FlatOp::Move` /
+/// `Push` / `Pop` and defers the per-kind opname selection to the
+/// assembler (`assembler.rs::write_insn`), which looks up each value's
+/// kind via the RegAllocResult coloring. Cycle-break correctness is
+/// preserved because cycles live entirely within one kind's register
+/// bank — a single global `reorder_renaming_list` call produces the
+/// same (src, dst) sequence as three per-kind calls would.
+///
+/// Upstream:
+/// ```py
+/// def insert_renamings(self, link):
+///     renamings = {}
+///     lst = [(self.getcolor(v), self.getcolor(link.target.inputargs[i]))
+///            for i, v in enumerate(link.args)
+///            if v.concretetype is not lltype.Void and
+///               v not in (link.last_exception, link.last_exc_value)]
+///     lst.sort(key=lambda(v, w): w.index)
+///     for v, w in lst:
+///         if v == w:
+///             continue
+///         frm, to = renamings.setdefault(w.kind, ([], []))
+///         frm.append(v)
+///         to.append(w)
+///     for kind in KINDS:
+///         if kind in renamings:
+///             frm, to = renamings[kind]
+///             result = reorder_renaming_list(frm, to)
+///             for v, w in result:
+///                 if w is None:
+///                     self.emitline('%s_push' % kind, v)
+///                 elif v is None:
+///                     self.emitline('%s_pop' % kind, "->", w)
+///                 else:
+///                     self.emitline('%s_copy' % kind, v, "->", w)
+///     self.generate_last_exc(link, link.target.inputargs)
+/// ```
+///
+/// `last_exception` / `last_exc_value` handling is not yet ported;
+/// majit's jtransform doesn't surface the per-link exception extras.
+/// When that lands, `generate_last_exc` will be a sibling helper.
+pub fn insert_renamings(link_args: &[ValueId], inputargs: &[ValueId], ops: &mut Vec<FlatOp>) {
+    // PRE-EXISTING-ADAPTATION: majit's synthesized graphs occasionally
+    // hand over `link.args` and `link.target.inputargs` with mismatched
+    // lengths (upstream RPython rejects these at graph-construction
+    // time; pyre tolerates them with a `.zip()` truncation, inherited
+    // from the pre-insert_renamings flatten() implementation). Matching
+    // that truncation keeps the structural port drop-in — downstream
+    // passes see exactly the same Move/Push/Pop stream for the prefix
+    // that upstream would have produced for a well-formed link.
+    // `for i, v in enumerate(link.args): ... (self.getcolor(v),
+    // self.getcolor(link.target.inputargs[i]))`.
+    let mut frm: Vec<ValueId> = Vec::with_capacity(link_args.len().min(inputargs.len()));
+    let mut to: Vec<ValueId> = Vec::with_capacity(link_args.len().min(inputargs.len()));
+    for (v, w) in link_args.iter().zip(inputargs.iter()) {
+        // `if v == w: continue`.
+        if v == w {
+            continue;
+        }
+        frm.push(*v);
+        to.push(*w);
+    }
+    if frm.is_empty() {
+        return;
+    }
+    // `result = reorder_renaming_list(frm, to)`.
+    let result = reorder_renaming_list(&frm, &to);
+    for (v, w) in result {
+        match (v, w) {
+            // `if w is None: self.emitline('%s_push' % kind, v)`.
+            (Some(src), None) => ops.push(FlatOp::Push(src)),
+            // `elif v is None: self.emitline('%s_pop' % kind, "->", w)`.
+            (None, Some(dst)) => ops.push(FlatOp::Pop(dst)),
+            // `else: self.emitline('%s_copy' % kind, v, "->", w)`.
+            (Some(src), Some(dst)) => ops.push(FlatOp::Move { dst, src }),
+            (None, None) => unreachable!("reorder_renaming_list never yields (None, None)"),
+        }
     }
 }
 
@@ -597,6 +684,72 @@ mod tests {
                 (Some(5), Some(6)),
                 (None, Some(5)),
             ]
+        );
+    }
+
+    // `rpython/jit/codewriter/test/test_flatten.py` exercises
+    // `insert_renamings` indirectly via whole-graph tests; majit covers
+    // the standalone helper below.
+    #[test]
+    fn insert_renamings_emits_nothing_for_identity() {
+        // `for i, v in enumerate(link.args): if v == w: continue`.
+        let mut ops: Vec<FlatOp> = Vec::new();
+        let args = vec![ValueId(0), ValueId(1), ValueId(2)];
+        let inputargs = args.clone();
+        insert_renamings(&args, &inputargs, &mut ops);
+        assert_eq!(ops, Vec::<FlatOp>::new());
+    }
+
+    #[test]
+    fn insert_renamings_emits_move_for_acyclic_rename() {
+        // Simple `%0 -> %1` phi resolution.
+        let mut ops: Vec<FlatOp> = Vec::new();
+        insert_renamings(&[ValueId(0)], &[ValueId(1)], &mut ops);
+        assert_eq!(
+            ops,
+            vec![FlatOp::Move {
+                dst: ValueId(1),
+                src: ValueId(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_renamings_breaks_swap_cycle_with_push_pop() {
+        // Swap `%0 <-> %1` — reorder_renaming_list returns
+        // [(0,None), (1,0), (None,1)] which maps to push/copy/pop.
+        let mut ops: Vec<FlatOp> = Vec::new();
+        insert_renamings(
+            &[ValueId(0), ValueId(1)],
+            &[ValueId(1), ValueId(0)],
+            &mut ops,
+        );
+        assert_eq!(
+            ops,
+            vec![
+                FlatOp::Push(ValueId(0)),
+                FlatOp::Move {
+                    dst: ValueId(0),
+                    src: ValueId(1),
+                },
+                FlatOp::Pop(ValueId(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_renamings_tolerates_length_mismatch_by_truncation() {
+        // PRE-EXISTING-ADAPTATION — majit tolerates len(link.args) !=
+        // len(link.target.inputargs) via `.zip()` truncation; iterating
+        // over the shorter prefix only.
+        let mut ops: Vec<FlatOp> = Vec::new();
+        insert_renamings(&[ValueId(0), ValueId(1)], &[ValueId(2)], &mut ops);
+        assert_eq!(
+            ops,
+            vec![FlatOp::Move {
+                dst: ValueId(2),
+                src: ValueId(0),
+            }]
         );
     }
 }
