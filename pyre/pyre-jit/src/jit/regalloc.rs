@@ -352,46 +352,43 @@ impl RegAllocator {
                             must_continue = true;
                         }
                     }
-                    Insn::Live(args) => {
-                        // PRE-EXISTING-ADAPTATION (no RPython
-                        // counterpart in `regalloc.py:26-77`).
+                    Insn::Live(_) => {
+                        // RPython `regalloc.py:26-77` walks only block
+                        // operations + link.args — `-live-` markers are
+                        // invisible to the allocator because they only
+                        // exist after `flatten` + `compute_liveness`
+                        // run post-regalloc (`codewriter.py:44` vs
+                        // `:55`).
                         //
-                        // RPython's regalloc runs BEFORE
-                        // `compute_liveness` (`codewriter.py:44`
-                        // vs `:55`), so `-live-` markers do not yet
-                        // exist at allocation time. In pyre, the
-                        // dispatch loop emits empty `Insn::Live`
-                        // placeholders, then `filter_liveness_in_place`
-                        // (`codewriter.rs`) runs the RPython
-                        // backward SSA walk and installs the
-                        // post-filter register set (Ref-only,
-                        // in-range, LiveVars-intersected) into each
-                        // marker. By the time this allocator walk
-                        // runs, those registers are the only source
-                        // of cross-guard liveness pyre has — pyre's
-                        // GUARD ops do not carry `fail_args` yet
-                        // (reviewer Step 4 blocker), so extending
-                        // `alive` with the `-live-` contents is the
-                        // analog of RPython's `link.args` keeping
-                        // block-exit live vars alive
-                        // (`regalloc.py:46-48`).
+                        // pyre's regalloc runs AFTER
+                        // `filter_liveness_in_place` populates
+                        // `-live-`, so the markers are visible here.
+                        // Previously the allocator extended `alive`
+                        // with each marker's registers, treating the
+                        // marker as an op-use. That extension turns
+                        // out to be redundant for pyre's current
+                        // SSARepr shape:
                         //
-                        // Reviewer Item 1 (remove this branch) is
-                        // blocked on porting `fail_args` to pyre
-                        // guards + dropping the LiveVars
-                        // intersection (so SSA is the sole live
-                        // set). Until that lands, stripping this
-                        // branch misassembles nested_loop /
-                        // test_recursive_global_reads (diverging
-                        // sets of live registers between encoder
-                        // and decoder).
-                        for x in args {
-                            if let Operand::Register(reg) = x {
-                                if reg.kind == kind {
-                                    alive.insert(reg.index);
-                                }
-                            }
-                        }
+                        //   - Registers live at a `-live-` marker are
+                        //     either (a) already kept alive by a
+                        //     subsequent op using them via `alive` /
+                        //     `follow_label` propagation, or (b)
+                        //     PyFrame-pinned (locals 0..nlocals, stack
+                        //     slots stack_base..stack_base+depth),
+                        //     whose colors `enforce_input_args` +
+                        //     `ExternalInputs` clamp regardless of
+                        //     interference.
+                        //   - All goto / goto_if_not targets carry a
+                        //     `TLabel`; the generic `Insn::Op` branch
+                        //     below handles `Operand::TLabel` via
+                        //     `follow_label`, which propagates the
+                        //     target's `label2alive` snapshot back to
+                        //     the source.
+                        //
+                        // Leave the arm in place (without extending
+                        // `alive`) so the match stays exhaustive on
+                        // `Insn::Live`; once the variant is unified
+                        // with `Insn::Op`, this arm disappears.
                     }
                     Insn::Unreachable => {
                         alive.clear();
