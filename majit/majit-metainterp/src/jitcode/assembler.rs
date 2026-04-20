@@ -35,7 +35,6 @@ pub struct JitCodeBuilder {
     /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
-    assembler_targets: Vec<JitCallAssemblerTarget>,
     has_abort: bool,
 }
 
@@ -1286,15 +1285,15 @@ impl JitCodeBuilder {
         concrete_ptr: *const (),
     ) -> u16 {
         let target = JitCallAssemblerTarget::new(token_number, concrete_ptr);
-        if let Some(index) = self
-            .assembler_targets
-            .iter()
-            .position(|existing| *existing == target)
-        {
-            return index as u16;
+        for (idx, entry) in self.descrs.iter().enumerate() {
+            if let RuntimeBhDescr::AssemblerToken(existing) = entry {
+                if *existing == target {
+                    return idx as u16;
+                }
+            }
         }
-        let idx = self.assembler_targets.len() as u16;
-        self.assembler_targets.push(target);
+        let idx = self.descrs.len() as u16;
+        self.descrs.push(RuntimeBhDescr::AssemblerToken(target));
         idx
     }
 
@@ -1323,7 +1322,6 @@ impl JitCodeBuilder {
             exec: super::JitCodeExecState {
                 opcodes: self.opcodes,
                 descrs: self.descrs,
-                assembler_targets: self.assembler_targets,
             },
         }
     }

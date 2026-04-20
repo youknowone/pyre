@@ -248,6 +248,12 @@ pub enum RuntimeBhDescr {
     /// slot. Once pyre emits the function address via an int register
     /// this variant can split into the RPython-shaped pair.
     Call(JitCallTarget),
+    /// Compiled-assembler target for `BC_CALL_ASSEMBLER_*`. The
+    /// `token_number` identifies a `CompiledLoopToken` (RPython
+    /// `compile.py CompiledLoopToken.number`) that the tracer hands to
+    /// `ctx.call_assembler_*_typed` so the metainterp can chain this
+    /// trace into an already-compiled one.
+    AssemblerToken(JitCallAssemblerTarget),
 }
 
 impl RuntimeBhDescr {
@@ -267,6 +273,14 @@ impl RuntimeBhDescr {
             _ => None,
         }
     }
+
+    /// Extract the assembler-call target for `BC_CALL_ASSEMBLER_*`.
+    pub(crate) fn as_assembler_token(&self) -> Option<&JitCallAssemblerTarget> {
+        match self {
+            Self::AssemblerToken(target) => Some(target),
+            _ => None,
+        }
+    }
 }
 
 /// Runtime adapter state — pyre-only fields not present on canonical
@@ -277,12 +291,18 @@ impl RuntimeBhDescr {
 /// runtime jitcodes are generated per-Python-frame and cannot index into
 /// that shared pool because they lack a global allocation index.
 ///
-/// Phase I2 Step 2 progressively moves each pyre-only adapter field
+/// Phase I2 Step 2 moved the four pyre-only adapter fields
 /// (`sub_jitcodes`, `fn_ptrs`, `assembler_targets`, `opcodes`) off the
 /// canonical `JitCode` into this container so the canonical struct
 /// remains byte-for-byte aligned with `rpython/jit/codewriter/jitcode.py`.
-/// Eventually the whole struct disappears when pyre's runtime dispatch
-/// migrates to insns-table + shared descrs pool.
+/// Step 3 now collapses three of those pools (`sub_jitcodes` →
+/// `RuntimeBhDescr::JitCode`, `fn_ptrs` → `RuntimeBhDescr::Call`,
+/// `assembler_targets` → `RuntimeBhDescr::AssemblerToken`) into the
+/// unified `descrs` list — matching the single shared pool model of
+/// RPython `BlackholeInterpBuilder.descrs` / `BlackholeInterpreter.descrs`
+/// (`blackhole.py:103, 288`). Once the `opcodes` pool moves to
+/// per-opname insns entries the whole struct disappears and pyre's
+/// runtime adapter blends back into the RPython dispatch shape.
 #[derive(Clone, Debug, Default)]
 pub struct JitCodeExecState {
     /// IR opcode pool consulted by `BC_RECORD_BINOP_I/F`, `BC_RECORD_UNARY_I/F`
@@ -307,13 +327,6 @@ pub struct JitCodeExecState {
     ///   pointers in one slot; RPython keeps the function address in
     ///   an int register and only the calling convention in the descr.
     pub descrs: Vec<RuntimeBhDescr>,
-    /// CALL_ASSEMBLER target metadata keyed by loop token number. Cold
-    /// field: only consulted when a portal re-enters an assembled loop
-    /// via `bh_call_assembler_*`. Placed last so hotter adapter pools
-    /// occupy the earlier cache lines. RPython stores this on
-    /// `CompiledLoopToken` (compile.py); pyre keeps it per-JitCode
-    /// because the builder-side token pool is separate.
-    pub(crate) assembler_targets: Vec<JitCallAssemblerTarget>,
 }
 
 /// Serialized interpreter step description, mirroring RPython's `JitCode`
@@ -394,9 +407,17 @@ impl JitCode {
 
     /// Transitional CALL_ASSEMBLER target lookup for the hardcoded
     /// JitCodeBuilder bytecode. RPython stores the callee loop token in
-    /// descriptor data; this keeps the private compat table encapsulated.
+    /// descriptor data threaded through the shared `descrs` pool; pyre
+    /// mirrors the shape via the `AssemblerToken` variant.
     pub(crate) fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
-        let target = self.exec.assembler_targets[index];
+        let target = self
+            .exec
+            .descrs
+            .get(index)
+            .and_then(RuntimeBhDescr::as_assembler_token)
+            .unwrap_or_else(|| {
+                panic!("BC_CALL_ASSEMBLER_*: descrs[{index}] is not an AssemblerToken entry",)
+            });
         (target.token_number, target.concrete_ptr)
     }
 
