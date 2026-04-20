@@ -4513,6 +4513,35 @@ bhhandler_ir_i!(handler_int_le_ir, bhimpl_int_le);
 bhhandler_ri_i!(handler_int_eq_ri, bhimpl_int_eq);
 bhhandler_ri_i!(handler_int_gt_ri, bhimpl_int_gt);
 
+// pyre-only: `a += b` in Rust front-end (`front/ast.rs:1604` maps
+// `syn::BinOp::AddAssign` to the BinOp name `"add_assign"`). Under SSA
+// the compound assignment becomes two reads + one write, so the
+// bytecode shape is identical to `int_add/ii>i` — same primitive. Has
+// no RPython analog; canonical RPython lowers `+=` to plain BINARY_ADD
+// before reaching jtransform.
+bhhandler_ii_i!(handler_int_add_assign_pyre, bhimpl_int_add);
+
+// pyre-only: `*x` in Rust front-end (`front/ast.rs:1577` maps
+// `syn::UnOp::Deref` to the UnaryOp name `"deref"`). After rtyper
+// lowering the &i64 input has already been resolved to a plain i64
+// value, so the operation degenerates to a copy at dispatch time. Same
+// primitive as `int_same_as`.
+bhhandler_i_i!(handler_int_deref_pyre, bhimpl_int_same_as);
+
+// pyre-only: `OpKind::Unknown` fallback emitted by the front-end when a
+// syntax node has no dedicated OpKind variant (assembler.rs:1254
+// `OpKind::Unknown { .. } => "unknown".into()`). Carries zero operand
+// bytes (empty argcodes). Reaching here at runtime means a graph that
+// made it through rtyper still has an unrecognized op — log-and-skip
+// rather than panic so shadow dispatch can see the mismatch.
+fn handler_unknown_marker_pyre(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position)
+}
+
 /// Handler for the pyre-emitted `const_int/c>i` opcode.
 ///
 /// RPython uses `c` as a small signed-byte immediate (blackhole.py:121-
@@ -5933,6 +5962,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_le/ir>i", handler_int_le_ir);
     builder.wire_handler("int_eq/ri>i", handler_int_eq_ri);
     builder.wire_handler("int_gt/ri>i", handler_int_gt_ri);
+    // pyre-only primitives — see handler comments for rationale.
+    builder.wire_handler("int_add_assign/ii>i", handler_int_add_assign_pyre);
+    builder.wire_handler("int_deref/i>i", handler_int_deref_pyre);
+    builder.wire_handler("unknown/", handler_unknown_marker_pyre);
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
     builder.wire_handler("int_and/ii>i", handler_int_and);
     builder.wire_handler("int_or/ii>i", handler_int_or);
