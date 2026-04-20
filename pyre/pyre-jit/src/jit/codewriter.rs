@@ -2224,6 +2224,42 @@ impl CodeWriter {
             super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs);
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
+        // Keep `liveness: Vec<LivenessInfo>` in sync with the post-rename
+        // register indices that `get_liveness_info` (assembler.rs:422-437)
+        // will encode into the `all_liveness` byte stream: apply the same
+        // rename table to each per-PC register list, then sort + dedup to
+        // match the encoder's normalisation. Runtime consumers
+        // (`get_list_of_active_boxes`, `frame_value_count_at`) read from
+        // this Vec, so both data sources must agree on the final indices
+        // and counts.
+        let mut liveness = liveness;
+        if !alloc_result.rename.is_empty() {
+            let rename = &alloc_result.rename;
+            let apply = |regs: &mut Vec<u16>, kind: Kind| {
+                for r in regs.iter_mut() {
+                    if let Some(&new) = rename.get(&(kind, *r)) {
+                        *r = new;
+                    }
+                }
+                regs.sort_unstable();
+                regs.dedup();
+            };
+            for info in liveness.iter_mut() {
+                apply(&mut info.live_i_regs, Kind::Int);
+                apply(&mut info.live_r_regs, Kind::Ref);
+                apply(&mut info.live_f_regs, Kind::Float);
+            }
+        } else {
+            for info in liveness.iter_mut() {
+                info.live_i_regs.sort_unstable();
+                info.live_i_regs.dedup();
+                info.live_r_regs.sort_unstable();
+                info.live_r_regs.dedup();
+                info.live_f_regs.sort_unstable();
+                info.live_f_regs.dedup();
+            }
+        }
+
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
         // (or 0 if coloring is empty). Pass through to the Assembler
         // step so `JitCode.num_regs_*` reflect the post-regalloc
