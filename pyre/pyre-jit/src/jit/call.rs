@@ -239,6 +239,24 @@ impl CallControl {
             .map(std::sync::Arc::clone)
     }
 
+    /// Reverse lookup: find the `PyJitCode` whose inner `JitCode` matches
+    /// the given raw pointer. Pyre-only adaptation: RPython's
+    /// `JitCode` has its portal-register assignments embedded in the
+    /// regular inputargs, so the blackhole interpreter can fill them
+    /// via `_prepare_next_section` with no side channel. Pyre carries
+    /// `portal_frame_reg`/`portal_ec_reg` on `PyJitCodeMetadata`
+    /// instead, so the blackhole chain needs this reverse map to
+    /// populate them after `blackhole_from_resumedata` builds the chain.
+    pub fn find_pyjitcode_by_jitcode_ptr(
+        &self,
+        jitcode_ptr: *const majit_metainterp::jitcode::JitCode,
+    ) -> Option<&PyJitCode> {
+        self.jitcodes
+            .values()
+            .find(|pyjit| std::sync::Arc::as_ptr(&pyjit.jitcode) == jitcode_ptr)
+            .map(|arc| arc.as_ref())
+    }
+
     /// RPython: `CallControl.enum_pending_graphs()` (call.py:150-153).
     ///
     /// ```python

@@ -1608,6 +1608,37 @@ pub fn blackhole_resume_via_rd_numb(
         mainjitcode_calldescr: bh.jitcode.calldescr.clone(),
     }];
 
+    // interp_jit.py:64 parity (pyre-adaptation): fill dedicated portal
+    // red-arg registers (frame_ptr, execution_context) for each jitcode
+    // in the chain. RPython encodes these as regular inputargs of the
+    // portal jitcode, so `_prepare_next_section` fills them during
+    // `consume_one_section` without a side channel. Pyre's codewriter
+    // assigns portal registers separately (PyJitCodeMetadata
+    // .portal_frame_reg / .portal_ec_reg) and omits them from liveness,
+    // so the orthodox `blackhole_from_resumedata` path leaves them zero.
+    // Walk the chain and fill them explicitly until the codewriter
+    // change lands; chains are short (typically 1–3 frames) so the
+    // O(jitcodes) scan per frame is inexpensive.
+    let callcontrol = writer.callcontrol();
+    let mut cur: Option<&mut majit_metainterp::blackhole::BlackholeInterpreter> = Some(&mut bh);
+    while let Some(bh_ref) = cur {
+        let jitcode_ptr = std::sync::Arc::as_ptr(&bh_ref.jitcode);
+        if let Some(pyjit) = callcontrol.find_pyjitcode_by_jitcode_ptr(jitcode_ptr) {
+            let vable_ptr = bh_ref.virtualizable_ptr;
+            let ec = if vable_ptr != 0 {
+                unsafe { (*(vable_ptr as *const PyFrame)).execution_context as i64 }
+            } else {
+                0
+            };
+            bh_ref.fill_portal_registers(
+                pyjit.metadata.portal_frame_reg,
+                pyjit.metadata.portal_ec_reg,
+                ec,
+            );
+        }
+        cur = bh_ref.nextblackholeinterp.as_deref_mut();
+    }
+
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
     }
