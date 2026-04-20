@@ -1123,18 +1123,50 @@ fn host_const_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>
                 name
             )),
         },
-        ConstValue::HostObject(h) if h.is_class() => match h.class_get(name) {
-            Some(value) => Ok(Some(value)),
-            None => Err(format!(
+        ConstValue::HostObject(h) if h.is_class() => {
+            // upstream: class-level getattr walks the MRO via `getattr(cls,
+            // attr)`. Rust port handles this via `class_get` which folds
+            // the C3-linearised class hierarchy.
+            match h.class_get(name) {
+                Some(value) => Ok(Some(value)),
+                None => Err(format!(
+                    "getattr({}, {:?}) always raises AttributeError",
+                    h.qualname(),
+                    name
+                )),
+            }
+        }
+        ConstValue::HostObject(h) if h.is_instance() => {
+            // upstream: `getattr(inst, attr)` checks `inst.__dict__`
+            // before the class MRO. Mirror via instance_get then
+            // class_mro_get (FrozenDesc.default_read_attribute uses
+            // the same lookup order, description.rs).
+            if let Some(value) = h.instance_get(name) {
+                return Ok(Some(value));
+            }
+            if let Some(cls) = h.instance_class() {
+                // Walk MRO manually — class_mro_get is internal to
+                // annotator; operation.rs uses class_get + bases.
+                for ancestor in std::iter::once(cls.clone()).chain(cls.mro().into_iter().flatten())
+                {
+                    if let Some(value) = ancestor.class_get(name) {
+                        return Ok(Some(value));
+                    }
+                }
+            }
+            Err(format!(
                 "getattr({}, {:?}) always raises AttributeError",
                 h.qualname(),
                 name
-            )),
-        },
-        // Primitive foldable constants (Int / Float / Str / …) in
-        // upstream would hit `getattr(1, '__class__')` etc.; the Rust
-        // port models no dunder-attribute surface on primitives, so
-        // fold declines — upstream's `WrapException` silent-pass.
+            ))
+        }
+        // Primitive foldable constants (Int / Float / Str / …): upstream
+        // `getattr(1, 'real')` etc. produce bound methods / builtin ints
+        // that would round-trip through `const(result)` + `WrapException`
+        // (operation.py:640-642). The Rust port has no runtime Python
+        // introspection to emulate these, so the fold declines silently,
+        // matching the WrapException-swallow path — the result Variable
+        // stays unbound and the annotator sees the op at binding time.
         _ => Ok(None),
     }
 }
@@ -2138,6 +2170,45 @@ mod tests {
             panic!("expected Constant result");
         };
         assert_eq!(constant.value, ConstValue::Int(42));
+    }
+
+    #[test]
+    fn getattr_constfold_folds_instance_dict_attribute() {
+        // upstream operation.py:634-644 — `getattr(instance, 'attr')`
+        // respects `inst.__dict__` before walking the class MRO. Rust
+        // port mirrors this via HostObject::instance_get.
+        use crate::flowspace::model::HostObject;
+        let cls = HostObject::new_class("Foo", vec![]);
+        cls.class_set("x".to_string(), ConstValue::Int(1)); // class-level
+        let inst = HostObject::new_instance(cls, vec![]);
+        inst.instance_set("x", ConstValue::Int(99)); // shadow
+        inst.instance_set("y", ConstValue::Int(7)); // instance-only
+        // Need to make the instance foldable for the test — it isn't by
+        // default (foldable() returns false for user instances). The
+        // exercise here is host_const_getattr itself, so call the
+        // helper directly through a module intermediary. Upstream's
+        // w_obj.foldable() gate intentionally rejects user instances;
+        // real folds hit this code path via `_freeze_` markers we
+        // don't model. Verify the helper's correctness instead:
+        let r = super::host_const_getattr(&ConstValue::HostObject(inst.clone()), "x")
+            .expect("instance x lookup");
+        assert_eq!(r, Some(ConstValue::Int(99))); // shadowed
+        let r2 = super::host_const_getattr(&ConstValue::HostObject(inst), "y")
+            .expect("instance y lookup");
+        assert_eq!(r2, Some(ConstValue::Int(7))); // instance-only
+    }
+
+    #[test]
+    fn getattr_constfold_instance_falls_through_to_class_mro() {
+        // Attribute missing on instance but present on class → use MRO.
+        use crate::flowspace::model::HostObject;
+        let parent = HostObject::new_class("Parent", vec![]);
+        parent.class_set("z", ConstValue::Int(100));
+        let child = HostObject::new_class("Child", vec![parent.clone()]);
+        let inst = HostObject::new_instance(child, vec![]);
+        let r = super::host_const_getattr(&ConstValue::HostObject(inst), "z")
+            .expect("inherited attribute lookup");
+        assert_eq!(r, Some(ConstValue::Int(100)));
     }
 
     #[test]

@@ -1943,12 +1943,18 @@ impl FrozenDesc {
                 // self.
                 class_mro_get(&pyobj, attr)
             } else if pyobj.is_instance() {
-                // upstream `getattr(instance, attr)` — Rust port can
-                // only resolve class-hierarchy attributes since
-                // HostObject::Instance has no per-instance dict.
-                pyobj
-                    .instance_class()
-                    .and_then(|cls| class_mro_get(cls, attr))
+                // upstream `getattr(instance, attr)` — Python checks the
+                // instance `__dict__` before walking the class MRO, so
+                // per-instance attributes shadow class members. Mirror
+                // that ordering via HostObject::instance_get +
+                // instance_class + class_mro_get.
+                if let Some(v) = pyobj.instance_get(attr) {
+                    Some(v)
+                } else {
+                    pyobj
+                        .instance_class()
+                        .and_then(|cls| class_mro_get(cls, attr))
+                }
             } else {
                 None
             }
@@ -2708,6 +2714,41 @@ mod tests {
         let fd = FrozenDesc::new(bk, pyobj).unwrap();
         let s = fd.s_read_attribute("missing").unwrap();
         assert!(matches!(s, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn frozen_desc_default_read_checks_instance_dict_before_mro() {
+        use crate::flowspace::model::ConstValue;
+        let bk = bk();
+        // class C: a = 1
+        let class_c = HostObject::new_class("C", vec![]);
+        class_c.class_set("a", ConstValue::Int(1));
+        // instance = C()
+        let inst = HostObject::new_instance(class_c.clone(), vec![]);
+        // Per-instance shadow: inst.a = 2
+        inst.instance_set("a", ConstValue::Int(2));
+        // Instance-only attribute: inst.b = 3
+        inst.instance_set("b", ConstValue::Int(3));
+
+        let fd = FrozenDesc::new(bk, inst).unwrap();
+        // Instance dict shadows class MRO.
+        let a = fd.read_attribute("a").unwrap();
+        assert!(matches!(a, ConstValue::Int(2)));
+        // Instance-only attribute.
+        let b = fd.read_attribute("b").unwrap();
+        assert!(matches!(b, ConstValue::Int(3)));
+        // Attribute only on class MRO: class_set on class, not
+        // instance, still reachable.
+        class_c.class_set("c", ConstValue::Int(10));
+        // Bypass attrcache by creating a fresh FrozenDesc.
+        let inst2 = HostObject::new_instance(class_c.clone(), vec![]);
+        let fd2 = FrozenDesc::new(bk2(), inst2).unwrap();
+        let c = fd2.read_attribute("c").unwrap();
+        assert!(matches!(c, ConstValue::Int(10)));
+    }
+
+    fn bk2() -> Rc<Bookkeeper> {
+        Rc::new(Bookkeeper::new())
     }
 
     #[test]

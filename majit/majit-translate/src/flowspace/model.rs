@@ -100,10 +100,14 @@ enum HostObjectKind {
     UserFunction { graph_func: Box<GraphFunc> },
     /// Python instance (raise 문에서 materialise 된 exception 인스턴스
     /// 포함). `class_obj` 는 `__class__`; `args` 는 constructor
-    /// arguments.
+    /// arguments; `instance_dict` 는 per-instance attribute dict
+    /// (`inst.__dict__`) — prebuilt instances attached via class
+    /// annotation decorators populate this so `getattr(inst, attr)`
+    /// in `FrozenDesc.default_read_attribute` can observe them.
     Instance {
         class_obj: HostObject,
         args: Vec<ConstValue>,
+        instance_dict: Mutex<HashMap<String, ConstValue>>,
     },
     /// `Constant.value` 에 담긴 임의의 host object — flowspace 가 구조
     /// 를 모르지만 보존해야 하는 값(예: 포팅되지 않은 `ConstantData`
@@ -276,6 +280,29 @@ impl HostObject {
         }
     }
 
+    /// Instance → per-instance `__dict__` lookup. Mirrors
+    /// `getattr(instance, name)` respecting `inst.__dict__` before
+    /// MRO. Returns `None` when the instance doesn't carry the
+    /// attribute (or `self` isn't an instance).
+    pub fn instance_get(&self, name: &str) -> Option<ConstValue> {
+        match &self.inner.kind {
+            HostObjectKind::Instance { instance_dict, .. } => {
+                instance_dict.lock().unwrap().get(name).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// Instance setter — installs an entry into the per-instance
+    /// `__dict__`. Used by prebuilt-instance fixtures in tests and
+    /// by the `@setattr_to_class_annotation` style decorators
+    /// that populate known attributes upfront.
+    pub fn instance_set(&self, name: impl Into<String>, value: ConstValue) {
+        if let HostObjectKind::Instance { instance_dict, .. } = &self.inner.kind {
+            instance_dict.lock().unwrap().insert(name.into(), value);
+        }
+    }
+
     /// Module member 조회 — upstream `getattr(module, name)`.
     pub fn module_get(&self, name: &str) -> Option<HostObject> {
         match &self.inner.kind {
@@ -361,7 +388,11 @@ impl HostObject {
         HostObject {
             inner: Arc::new(HostObjectInner {
                 qualname,
-                kind: HostObjectKind::Instance { class_obj, args },
+                kind: HostObjectKind::Instance {
+                    class_obj,
+                    args,
+                    instance_dict: Mutex::new(HashMap::new()),
+                },
             }),
         }
     }
