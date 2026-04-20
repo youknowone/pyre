@@ -739,6 +739,14 @@ impl Block {
     }
 }
 
+/// PRE-EXISTING-ADAPTATION — pyre's codewriter graph carries a
+/// `Terminator` enum alongside `Block.exits` / `Block.exitswitch`
+/// (upstream `rpython/flowspace/model.py:174` uses
+/// `exitswitch`/`exits` as the sole CFG source of truth).  This helper
+/// projects a `Terminator` down into the matching canonical shape so
+/// consumers of the RPython-orthodox surface (`make_link`,
+/// `insert_exits`, etc.) can read a single representation.  Delete
+/// once the Terminator variant is removed from the crate model.
 pub fn control_flow_from_terminator(terminator: &Terminator) -> (Option<ExitSwitch>, Vec<Link>) {
     match terminator {
         Terminator::Goto { target, args } => (None, vec![Link::new(args.clone(), *target, None)]),
@@ -761,6 +769,11 @@ pub fn control_flow_from_terminator(terminator: &Terminator) -> (Option<ExitSwit
     }
 }
 
+/// PRE-EXISTING-ADAPTATION — sibling of `control_flow_from_terminator`
+/// that applies renamings to existing `exitswitch`/`exits` metadata.
+/// Upstream `flowspace/model.py:109-168 Link.copy(rename)` performs the
+/// equivalent in-place rename on the canonical representation; pyre
+/// carries the renamer out-of-band while Terminator still coexists.
 pub fn remap_control_flow_metadata<FValue, FBlock>(
     exitswitch: &Option<ExitSwitch>,
     exits: &[Link],
@@ -939,11 +952,21 @@ impl FunctionGraph {
         result
     }
 
+    /// PRE-EXISTING-ADAPTATION — upstream `flowspace/model.py:174`
+    /// edits `Block.exitswitch`/`Block.exits` directly; pyre writes
+    /// through `Terminator` first and projects to `exits` via
+    /// `control_flow_from_terminator` so both representations stay
+    /// synced while Terminator lives alongside the canonical shape.
     pub fn set_terminator(&mut self, block: BlockId, terminator: Terminator) {
         self.blocks[block.0].terminator = terminator;
         self.resync_block_exits(block);
     }
 
+    /// PRE-EXISTING-ADAPTATION — rebuilds `Block.exits` / `exitswitch`
+    /// from `Block.terminator` so the canonical representation
+    /// upstream (`flowspace/model.py:171-181`) demands stays current.
+    /// `with_prevblock` stamps `Link.prevblock` per upstream
+    /// `flowspace/model.py:120`.
     pub fn resync_block_exits(&mut self, block: BlockId) {
         let (exitswitch, exits) = control_flow_from_terminator(&self.blocks[block.0].terminator);
         let block_ref = &mut self.blocks[block.0];
@@ -954,6 +977,12 @@ impl FunctionGraph {
             .collect();
     }
 
+    /// PRE-EXISTING-ADAPTATION — upstream `flowspace/model.py:304`
+    /// `Block.closeblock(*links)` is the single entry for setting the
+    /// can-raise / typed-exception shape.  pyre exposes the same
+    /// contract at method level while the dual `Terminator` field
+    /// remains; every Link gets `prevblock = block` per
+    /// `flowspace/model.py:120`.
     pub fn set_control_flow_metadata(
         &mut self,
         block: BlockId,
@@ -970,14 +999,17 @@ impl FunctionGraph {
 
     /// Route a return through the graph's canonical `returnblock`.
     ///
-    /// The codewriter graph has no first-class Void constant yet, so a
-    /// declared-void return reuses the returnblock's own inputarg as the
-    /// link arg. Downstream `insert_renamings()` recognizes the identity
-    /// mapping and emits no move, leaving the graph in the same
-    /// single-returnblock shape as upstream.
+    /// RPython `flowcontext.py` return handling produces a fresh
+    /// prevblock-side Variable (Void Variable for `return None`), then
+    /// builds a Link carrying that value into the returnblock's
+    /// inputargs.  pyre's codewriter adaptation mirrors that shape: a
+    /// `None` `value` allocates a fresh prevblock-side ValueId whose
+    /// kind defaults to Void (no regalloc color, no emitted move), so
+    /// `Link.args` is always a prevblock value per upstream's
+    /// `flowspace/model.py:114` invariant.
     pub fn set_return(&mut self, block: BlockId, value: Option<ValueId>) {
-        let (returnblock, return_value) = self.returnblock_arg();
-        let value = value.unwrap_or(return_value);
+        let (returnblock, _) = self.returnblock_arg();
+        let value = value.unwrap_or_else(|| self.alloc_value());
         self.set_terminator(
             block,
             Terminator::Goto {

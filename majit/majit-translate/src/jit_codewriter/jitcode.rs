@@ -940,6 +940,21 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             FlatOp::Reraise => {
                 writeln!(out, "  reraise").ok();
             }
+            FlatOp::IntReturn(v) => {
+                writeln!(out, "  int_return %i{}", v.0).ok();
+            }
+            FlatOp::RefReturn(v) => {
+                writeln!(out, "  ref_return %r{}", v.0).ok();
+            }
+            FlatOp::FloatReturn(v) => {
+                writeln!(out, "  float_return %f{}", v.0).ok();
+            }
+            FlatOp::VoidReturn => {
+                writeln!(out, "  void_return").ok();
+            }
+            FlatOp::Raise(v) => {
+                writeln!(out, "  raise %r{}", v.0).ok();
+            }
         }
     }
     out

@@ -173,6 +173,23 @@ fn compute_liveness_pass(
                 alive.remove(dst);
             }
             FlatOp::Reraise => {}
+            FlatOp::IntReturn(v) | FlatOp::RefReturn(v) | FlatOp::FloatReturn(v) => {
+                // RPython blackhole `bhimpl_*_return(a)` reads `a` and
+                // leaves the frame.  Backward walk: the return value is
+                // alive at this point; after it (forward) nothing is.
+                alive.clear();
+                alive.insert(*v);
+            }
+            FlatOp::VoidReturn => {
+                // `bhimpl_void_return()` has no args.  Nothing alive
+                // after the return.
+                alive.clear();
+            }
+            FlatOp::Raise(v) => {
+                // `bhimpl_raise(excvalue)` reads the evalue and raises.
+                alive.clear();
+                alive.insert(*v);
+            }
         }
     }
 

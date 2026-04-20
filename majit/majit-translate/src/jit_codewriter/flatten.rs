@@ -83,6 +83,24 @@ pub enum FlatOp {
     /// Re-raise the current exception.
     /// RPython: `('reraise',)`.
     Reraise,
+    /// RPython `flatten.py:130-138` `make_return`:
+    ///   `{kind}_return` with a single arg when the final block returns
+    ///   a non-void value.  Blackhole: `blackhole.py:841-857` sets
+    ///   `_return_type = kind` and raises `LeaveFrame`.
+    IntReturn(ValueId),
+    /// RPython `flatten.py:137` `ref_return` — blackhole at
+    /// `blackhole.py:847-851`.
+    RefReturn(ValueId),
+    /// RPython `flatten.py:137` `float_return` — blackhole at
+    /// `blackhole.py:853-857`.
+    FloatReturn(ValueId),
+    /// RPython `flatten.py:136` `void_return` — blackhole at
+    /// `blackhole.py:859-863`.
+    VoidReturn,
+    /// RPython `flatten.py:139-143` `make_return` with a 2-inputarg
+    /// final block: emit `raise` on the `evalue` (second inputarg).
+    /// Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
+    Raise(ValueId),
     /// Unreachable marker — marks the end of a code path.
     /// RPython: `---` operation. Resets the alive set in liveness analysis.
     Unreachable,
@@ -163,7 +181,7 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
 
         // RPython flatten.py:177-278 `insert_exits()`.
         if block.exits.len() == 1 {
-            emit_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+            make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
         } else if block.canraise() {
             debug_assert_eq!(block.exits[0].exitcase, None);
             // RPython flatten.py:205-218: walk the operations tail backward
@@ -176,19 +194,19 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                 Some(crate::model::OpKind::Live)
             );
             if !last_is_live {
-                emit_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+                make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
             } else {
                 ops.push(FlatOp::CatchException {
                     target: Label(next_label),
                 });
                 let normal_landing = Label(next_label);
                 next_label += 1;
-                emit_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+                make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
                 ops.push(FlatOp::Label(normal_landing));
                 let mut catches_all = false;
                 for link in &block.exits[1..] {
                     if link.catches_all_exceptions() {
-                        emit_exception_link(graph, &mut ops, &block_labels, link, regallocs);
+                        make_exception_link(graph, &mut ops, &block_labels, link, regallocs);
                         catches_all = true;
                         break;
                     }
@@ -212,7 +230,7 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                         llexitcase,
                         target: mismatch_landing,
                     });
-                    emit_exception_link(graph, &mut ops, &block_labels, link, regallocs);
+                    make_exception_link(graph, &mut ops, &block_labels, link, regallocs);
                     ops.push(FlatOp::Label(mismatch_landing));
                 }
                 if !catches_all {
@@ -244,20 +262,29 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                 target: false_landing,
             });
             // RPython flatten.py:264: true path (fallthrough) — make_link(linktrue).
-            emit_link(graph, &mut ops, &block_labels, linktrue, regallocs);
+            make_link(graph, &mut ops, &block_labels, linktrue, regallocs);
             // RPython flatten.py:266-267: false path — Label(linkfalse)
             // + make_link(linkfalse).
             ops.push(FlatOp::Label(false_landing));
-            emit_link(graph, &mut ops, &block_labels, linkfalse, regallocs);
+            make_link(graph, &mut ops, &block_labels, linkfalse, regallocs);
+        } else if block.exits.is_empty() {
+            // RPython `flatten.py:106-109` `make_bytecode_block`:
+            //   if block.exits == (): self.make_return(block.inputargs)
+            // Final block — emit the matching return from the block's
+            // own inputargs.
+            make_return(
+                graph,
+                &mut ops,
+                regallocs,
+                &block.inputargs,
+                &block.terminator,
+            );
         } else {
             match &block.terminator {
-                Terminator::Return(_val) => {
-                    // Return is implicit at the end (no jump needed)
-                }
                 Terminator::Abort { .. } | Terminator::Unreachable => {
                     // Terminal — no jump
                 }
-                Terminator::Goto { .. } | Terminator::Branch { .. } => {
+                Terminator::Return(_) | Terminator::Goto { .. } | Terminator::Branch { .. } => {
                     panic!("block has control-flow terminator without synchronized exits metadata");
                 }
             }
@@ -292,6 +319,12 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             | FlatOp::LastExcValue { dst: ValueId(d) } => {
                 max_value = max_value.max(*d + 1);
             }
+            FlatOp::IntReturn(ValueId(v))
+            | FlatOp::RefReturn(ValueId(v))
+            | FlatOp::FloatReturn(ValueId(v))
+            | FlatOp::Raise(ValueId(v)) => {
+                max_value = max_value.max(*v + 1);
+            }
             _ => {}
         }
     }
@@ -316,6 +349,20 @@ pub fn flatten_with_types(
 ) -> SSARepr {
     let mut result = flatten(graph, regallocs);
     result.value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(types);
+    // Seed canonical `exceptblock.inputargs` kinds if the rtyper pass
+    // missed them — same contract as
+    // `perform_all_register_allocations`.
+    let except_args = &graph.block(graph.exceptblock).inputargs;
+    if except_args.len() == 2 {
+        result
+            .value_kinds
+            .entry(except_args[0])
+            .or_insert(RegKind::Int);
+        result
+            .value_kinds
+            .entry(except_args[1])
+            .or_insert(RegKind::Ref);
+    }
     result
 }
 
@@ -348,9 +395,14 @@ fn block_order(graph: &FunctionGraph) -> Vec<BlockId> {
     order
 }
 
-/// RPython `flatten.py:140-144` `make_link(link, handling_ovf)`:
-/// `insert_renamings(link)` + `emitline('goto', TLabel(link.target))`.
-fn emit_link(
+/// RPython `flatten.py:148-155` `make_link(link, handling_ovf)`.
+///
+/// The "target is a final block" optimization collapses
+/// `goto + label + make_return` into a direct `make_return(link.args)`.
+/// Fallback: `insert_renamings(link) + goto(TLabel(link.target))` —
+/// `insert_renamings` tail-emits `generate_last_exc` as part of its
+/// own contract.
+fn make_link(
     graph: &FunctionGraph,
     ops: &mut Vec<FlatOp>,
     block_labels: &std::collections::HashMap<BlockId, Label>,
@@ -358,14 +410,122 @@ fn emit_link(
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) {
     let target_block = graph.block(link.target);
-    insert_renamings(&link.args, &target_block.inputargs, regallocs, ops);
+    // RPython `flatten.py:149-153`:
+    //   if (link.target.exits == ()
+    //       and link.last_exception not in link.args
+    //       and link.last_exc_value not in link.args):
+    //       self.make_return(link.args); return
+    // Skip the renaming + goto and emit the final return inline.
+    if target_block.exits.is_empty() {
+        let carries_exception_args = link.last_exception.is_some_and(|v| link.args.contains(&v))
+            || link.last_exc_value.is_some_and(|v| link.args.contains(&v));
+        if !carries_exception_args {
+            make_return(graph, ops, regallocs, &link.args, &target_block.terminator);
+            return;
+        }
+    }
+    insert_renamings(link, &target_block.inputargs, regallocs, ops);
     ops.push(FlatOp::Jump(block_labels[&link.target]));
 }
 
-/// RPython `flatten.py:146-175` `make_exception_link(link, handling_ovf)`:
-/// emit `last_exception` / `last_exc_value` defs, optionally collapse a
-/// bare re-raise link, then delegate to `make_link`.
-fn emit_exception_link(
+/// RPython `flatten.py:336-347` `generate_last_exc(link, inputargs)`.
+///
+/// Emitted by `insert_renamings` at the tail of its rename work.
+/// Walks `zip(link.args, inputargs)` and, for every position where the
+/// link-side arg is one of the exception Variables, writes the
+/// matching `last_exception` / `last_exc_value` op directly into the
+/// target inputarg's register.
+fn generate_last_exc(link: &Link, target_inputargs: &[ValueId], ops: &mut Vec<FlatOp>) {
+    if link.last_exception.is_none() && link.last_exc_value.is_none() {
+        return;
+    }
+    for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
+        if Some(*v) == link.last_exception {
+            ops.push(FlatOp::LastException { dst: *w });
+        }
+    }
+    for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
+        if Some(*v) == link.last_exc_value {
+            ops.push(FlatOp::LastExcValue { dst: *w });
+        }
+    }
+}
+
+/// RPython `flatten.py:130-146` `make_return(args)`.
+///
+/// Emits the matching `{kind}_return` / `void_return` / `raise` + `---`
+/// (`Unreachable`) pair from the final-block inputargs (or, when called
+/// from the `make_link` optimization, directly from the link's args).
+fn make_return(
+    graph: &FunctionGraph,
+    ops: &mut Vec<FlatOp>,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    args: &[ValueId],
+    terminator: &Terminator,
+) {
+    match args.len() {
+        1 => {
+            // `flatten.py:131-138` return-from-function.
+            let v = args[0];
+            let kind = value_kind(v, regallocs);
+            match kind {
+                'v' => ops.push(FlatOp::VoidReturn),
+                'i' => ops.push(FlatOp::IntReturn(v)),
+                'r' => ops.push(FlatOp::RefReturn(v)),
+                'f' => ops.push(FlatOp::FloatReturn(v)),
+                _ => unreachable!("unexpected kind {kind} for return value"),
+            }
+        }
+        2 => {
+            // `flatten.py:139-143` raise-from-function.  Upstream emits
+            // `-live-` before `raise` when the evalue is still a
+            // Variable (xxx hack); pyre's jtransform already inserts
+            // `-live-` where needed upstream of flatten, so we omit the
+            // conditional prefix here.
+            ops.push(FlatOp::Raise(args[1]));
+        }
+        0 => {
+            // RPython reaches `make_return` only for exits == () blocks,
+            // whose inputargs are always `[return_var]` or
+            // `[etype, evalue]`.  An empty args list corresponds to a
+            // declared-void final block without a rtyper-supplied
+            // Void Variable — the pyre adaptation emits `void_return`
+            // and drops the redundant argument.
+            ops.push(FlatOp::VoidReturn);
+        }
+        other => panic!(
+            "make_return: unexpected final-block inputarg count {other} (terminator = {terminator:?})"
+        ),
+    }
+    // RPython `flatten.py:146` `emitline('---')`.
+    ops.push(FlatOp::Unreachable);
+}
+
+fn value_kind(value: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
+    for (kind, ra) in regallocs {
+        if ra.coloring.contains_key(&value) {
+            return match kind {
+                RegKind::Int => 'i',
+                RegKind::Ref => 'r',
+                RegKind::Float => 'f',
+            };
+        }
+    }
+    // `lltype.Void` is not assigned a color by regalloc
+    // (`flatten.py:325 if v.concretetype is not lltype.Void`).
+    'v'
+}
+
+/// RPython `flatten.py:157-175` `make_exception_link(link, handling_ovf)`.
+///
+/// Special-cases the bare reraise link (target has no ops and
+/// `link.args == [link.last_exception, link.last_exc_value]`) into a
+/// `reraise` + `---` pair; otherwise delegates to `make_link`, which
+/// handles the `last_exception` / `last_exc_value` emission through
+/// `generate_last_exc` at the tail of `insert_renamings` — the exception
+/// Variables are written directly into the target inputarg's register,
+/// not into the prevblock-side Variable.
+fn make_exception_link(
     graph: &FunctionGraph,
     ops: &mut Vec<FlatOp>,
     block_labels: &std::collections::HashMap<BlockId, Label>,
@@ -382,17 +542,7 @@ fn emit_exception_link(
         ops.push(FlatOp::Unreachable);
         return;
     }
-    if let Some(last_exception) = link.last_exception {
-        ops.push(FlatOp::LastException {
-            dst: last_exception,
-        });
-    }
-    if let Some(last_exc_value) = link.last_exc_value {
-        ops.push(FlatOp::LastExcValue {
-            dst: last_exc_value,
-        });
-    }
-    emit_link(graph, ops, block_labels, link, regallocs);
+    make_link(graph, ops, block_labels, link, regallocs);
 }
 
 /// Get successor block IDs from orthodox block exits.
@@ -457,12 +607,17 @@ fn successors(block: &crate::model::Block) -> Vec<BlockId> {
 ///     self.generate_last_exc(link, link.target.inputargs)
 /// ```
 ///
-/// `last_exception` / `last_exc_value` handling is not yet ported;
-/// majit's jtransform doesn't surface the per-link exception extras.
-/// When that lands, `generate_last_exc` will be a sibling helper.
+/// The `link` + `target_inputargs` signature mirrors upstream's
+/// `def insert_renamings(self, link)` — `target_inputargs` is
+/// `link.target.inputargs` threaded through pyre's non-`self` call
+/// shape.  The filter drops link args that are `link.last_exception` /
+/// `link.last_exc_value` (upstream `flatten.py:310-311` `v not in
+/// (link.last_exception, link.last_exc_value)`); those values are
+/// instead placed by the `generate_last_exc` tail emission at
+/// `flatten.py:334`.
 pub fn insert_renamings(
-    link_args: &[ValueId],
-    inputargs: &[ValueId],
+    link: &Link,
+    target_inputargs: &[ValueId],
     regallocs: &HashMap<RegKind, RegAllocResult>,
     ops: &mut Vec<FlatOp>,
 ) {
@@ -493,12 +648,16 @@ pub fn insert_renamings(
     // ValueIds for emitting back into `FlatOp::Move/Push/Pop`. Each
     // kept pair satisfies `v_color != w_color` (upstream `if v == w:
     // continue` — after regalloc, equal colors mean equal variables).
-    let cap = link_args.len().min(inputargs.len());
+    let cap = link.args.len().min(target_inputargs.len());
     let mut frm_colors: Vec<usize> = Vec::with_capacity(cap);
     let mut to_colors: Vec<usize> = Vec::with_capacity(cap);
     let mut src_vids: Vec<ValueId> = Vec::with_capacity(cap);
     let mut dst_vids: Vec<ValueId> = Vec::with_capacity(cap);
-    for (v, w) in link_args.iter().zip(inputargs.iter()) {
+    for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
+        // `flatten.py:310-311` skip.
+        if Some(*v) == link.last_exception || Some(*v) == link.last_exc_value {
+            continue;
+        }
         let Some(v_col) = get_color(*v) else { continue };
         let Some(w_col) = get_color(*w) else { continue };
         if v_col == w_col {
@@ -509,48 +668,48 @@ pub fn insert_renamings(
         src_vids.push(*v);
         dst_vids.push(*w);
     }
-    if frm_colors.is_empty() {
-        return;
-    }
 
-    // `result = reorder_renaming_list(frm, to)` — cycle-safe ordering
-    // over the color pairs.
-    let result = reorder_renaming_list(&frm_colors, &to_colors);
+    if !frm_colors.is_empty() {
+        // `result = reorder_renaming_list(frm, to)` — cycle-safe
+        // ordering over the color pairs.
+        let result = reorder_renaming_list(&frm_colors, &to_colors);
 
-    // Map a color back to a representative ValueId so downstream passes
-    // that still use ValueId identity (liveness backward walk, assembler
-    // `lookup_reg_with_kind`) keep working. Every Some(color) in the
-    // output corresponds to at least one entry in the `frm_colors` or
-    // `to_colors` list, respectively.
-    let find_src_vid = |c: usize| -> ValueId {
-        let idx = frm_colors
-            .iter()
-            .position(|&fc| fc == c)
-            .expect("reorder_renaming_list src color must come from frm_colors");
-        src_vids[idx]
-    };
-    let find_dst_vid = |c: usize| -> ValueId {
-        let idx = to_colors
-            .iter()
-            .position(|&tc| tc == c)
-            .expect("reorder_renaming_list dst color must come from to_colors");
-        dst_vids[idx]
-    };
+        // Map a color back to a representative ValueId so downstream
+        // passes that still use ValueId identity (liveness backward
+        // walk, assembler `lookup_reg_with_kind`) keep working.
+        let find_src_vid = |c: usize| -> ValueId {
+            let idx = frm_colors
+                .iter()
+                .position(|&fc| fc == c)
+                .expect("reorder_renaming_list src color must come from frm_colors");
+            src_vids[idx]
+        };
+        let find_dst_vid = |c: usize| -> ValueId {
+            let idx = to_colors
+                .iter()
+                .position(|&tc| tc == c)
+                .expect("reorder_renaming_list dst color must come from to_colors");
+            dst_vids[idx]
+        };
 
-    for (v, w) in result {
-        match (v, w) {
-            // `if w is None: self.emitline('%s_push' % kind, v)`.
-            (Some(src_c), None) => ops.push(FlatOp::Push(find_src_vid(src_c))),
-            // `elif v is None: self.emitline('%s_pop' % kind, "->", w)`.
-            (None, Some(dst_c)) => ops.push(FlatOp::Pop(find_dst_vid(dst_c))),
-            // `else: self.emitline('%s_copy' % kind, v, "->", w)`.
-            (Some(src_c), Some(dst_c)) => ops.push(FlatOp::Move {
-                src: find_src_vid(src_c),
-                dst: find_dst_vid(dst_c),
-            }),
-            (None, None) => unreachable!("reorder_renaming_list never yields (None, None)"),
+        for (v, w) in result {
+            match (v, w) {
+                // `if w is None: self.emitline('%s_push' % kind, v)`.
+                (Some(src_c), None) => ops.push(FlatOp::Push(find_src_vid(src_c))),
+                // `elif v is None: self.emitline('%s_pop' % kind, "->", w)`.
+                (None, Some(dst_c)) => ops.push(FlatOp::Pop(find_dst_vid(dst_c))),
+                // `else: self.emitline('%s_copy' % kind, v, "->", w)`.
+                (Some(src_c), Some(dst_c)) => ops.push(FlatOp::Move {
+                    src: find_src_vid(src_c),
+                    dst: find_dst_vid(dst_c),
+                }),
+                (None, None) => unreachable!("reorder_renaming_list never yields (None, None)"),
+            }
         }
     }
+
+    // RPython `flatten.py:334` `self.generate_last_exc(link, link.target.inputargs)`.
+    generate_last_exc(link, target_inputargs, ops);
 }
 
 /// `flatten.py:395-414` `def reorder_renaming_list(frm, to):`.
@@ -796,14 +955,21 @@ mod tests {
 
     #[test]
     fn flatten_phi_produces_move_ops() {
-        // When a Goto carries Link args to a target with inputargs,
-        // flatten should emit Move ops for Phi resolution.
+        // When a Goto carries Link args to a target with inputargs and
+        // the target is NOT a final block (so the RPython `flatten.py:148-155`
+        // make_return-inline optimization does not fire), flatten must
+        // emit a `{kind}_copy` Move op for Phi resolution.
         let mut graph = FunctionGraph::new("phi");
         let entry = graph.startblock;
         let val = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
 
         let (target, phi_args) = graph.create_block_with_args(1);
-        let _phi = phi_args[0];
+        let phi = phi_args[0];
+
+        // target → returnblock, so target is NOT a final block
+        // (`target.exits.is_empty()` is false once a Goto to returnblock
+        // is installed).
+        graph.set_return(target, Some(phi));
 
         graph.set_terminator(
             entry,
@@ -812,7 +978,6 @@ mod tests {
                 args: vec![val],
             },
         );
-        graph.set_terminator(target, Terminator::Return(None));
 
         let flat = flatten(&graph, &identity_regallocs(8));
         let moves: Vec<_> = flat
@@ -928,11 +1093,14 @@ mod tests {
             )),
             "typed exception link should emit goto_if_exception_mismatch"
         );
+        // RPython `flatten.py:336-347 generate_last_exc` writes the
+        // exception value into the TARGET inputarg's register, not the
+        // prevblock-side `link.last_exc_value` Variable.
         assert!(
             flat.insns
                 .iter()
-                .any(|op| matches!(op, FlatOp::LastExcValue { dst } if *dst == typed_exc_value)),
-            "typed exception link should materialize last_exc_value"
+                .any(|op| matches!(op, FlatOp::LastExcValue { dst } if *dst == handler_exc_value)),
+            "typed exception link should materialize last_exc_value at target inputarg"
         );
     }
 
@@ -1004,17 +1172,22 @@ mod tests {
 
     // `rpython/jit/codewriter/test/test_flatten.py` exercises
     // `insert_renamings` indirectly via whole-graph tests; majit covers
-    // the standalone helper below. Identity coloring (ValueId(n) →
-    // color n) is used so the cycle-break reasoning under test matches
-    // the ValueId-level intuition these cases document.
+    // the standalone helper below.  Each case constructs a minimal
+    // `Link` with no `extravars` so the `flatten.py:310-311` exception
+    // filter doesn't fire; identity coloring (`ValueId(n) → color n`)
+    // keeps the cycle-break reasoning at ValueId level for readability.
+    fn plain_link(args: &[ValueId]) -> Link {
+        Link::new(args.to_vec(), BlockId(0), None)
+    }
+
     #[test]
     fn insert_renamings_emits_nothing_for_identity() {
         // `for i, v in enumerate(link.args): if v == w: continue`.
         let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
-        let args = vec![ValueId(0), ValueId(1), ValueId(2)];
-        let inputargs = args.clone();
-        insert_renamings(&args, &inputargs, &regallocs, &mut ops);
+        let args = [ValueId(0), ValueId(1), ValueId(2)];
+        let link = plain_link(&args);
+        insert_renamings(&link, &args, &regallocs, &mut ops);
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
@@ -1023,7 +1196,8 @@ mod tests {
         // Simple `%0 -> %1` phi resolution.
         let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
-        insert_renamings(&[ValueId(0)], &[ValueId(1)], &regallocs, &mut ops);
+        let link = plain_link(&[ValueId(0)]);
+        insert_renamings(&link, &[ValueId(1)], &regallocs, &mut ops);
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -1039,12 +1213,8 @@ mod tests {
         // [(0,None), (1,0), (None,1)] which maps to push/copy/pop.
         let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
-        insert_renamings(
-            &[ValueId(0), ValueId(1)],
-            &[ValueId(1), ValueId(0)],
-            &regallocs,
-            &mut ops,
-        );
+        let link = plain_link(&[ValueId(0), ValueId(1)]);
+        insert_renamings(&link, &[ValueId(1), ValueId(0)], &regallocs, &mut ops);
         assert_eq!(
             ops,
             vec![
@@ -1079,7 +1249,8 @@ mod tests {
             },
         );
         let mut ops: Vec<FlatOp> = Vec::new();
-        insert_renamings(&[ValueId(0)], &[ValueId(1)], &regallocs, &mut ops);
+        let link = plain_link(&[ValueId(0)]);
+        insert_renamings(&link, &[ValueId(1)], &regallocs, &mut ops);
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
@@ -1109,12 +1280,8 @@ mod tests {
             },
         );
         let mut ops: Vec<FlatOp> = Vec::new();
-        insert_renamings(
-            &[ValueId(0), ValueId(2)],
-            &[ValueId(1), ValueId(3)],
-            &regallocs,
-            &mut ops,
-        );
+        let link = plain_link(&[ValueId(0), ValueId(2)]);
+        insert_renamings(&link, &[ValueId(1), ValueId(3)], &regallocs, &mut ops);
         // Must emit push/copy/pop — NOT two naive Moves.
         assert!(
             ops.iter().any(|o| matches!(o, FlatOp::Push(_))),

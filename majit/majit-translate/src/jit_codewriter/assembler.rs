@@ -397,6 +397,48 @@ impl Assembler {
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
             }
+
+            // RPython `flatten.py:131-138` `make_return`.  Blackhole
+            // handlers: `blackhole.py:841-863 bhimpl_{int,ref,float,void}_return`.
+            FlatOp::IntReturn(v) => {
+                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                debug_assert_eq!(kind, 'i');
+                let opnum = self.get_opnum("int_return/i");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+            }
+            FlatOp::RefReturn(v) => {
+                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                debug_assert_eq!(kind, 'r');
+                let opnum = self.get_opnum("ref_return/r");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+            }
+            FlatOp::FloatReturn(v) => {
+                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                debug_assert_eq!(kind, 'f');
+                let opnum = self.get_opnum("float_return/f");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+            }
+            FlatOp::VoidReturn => {
+                let opnum = self.get_opnum("void_return/");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+            }
+            // RPython `flatten.py:139-143` `make_return` 2-inputarg case.
+            // Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
+            FlatOp::Raise(v) => {
+                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                debug_assert_eq!(kind, 'r');
+                let opnum = self.get_opnum("raise/r");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+            }
         }
     }
 

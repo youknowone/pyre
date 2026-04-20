@@ -2845,13 +2845,19 @@ mod tests {
             .find(|f| f.graph.name == "returns_unit")
             .expect("returns_unit present");
         let entry = func.graph.block(func.graph.startblock);
-        let return_arg = func.graph.block(func.graph.returnblock).inputargs[0];
-        assert_eq!(
-            entry.terminator,
-            Terminator::Goto {
-                target: func.graph.returnblock,
-                args: vec![return_arg],
-            }
+        // RPython `flowcontext.py` emits a fresh Variable on the
+        // prevblock side for `return None`; the returnblock's own
+        // inputarg stays distinct.
+        let returnblock_arg = func.graph.block(func.graph.returnblock).inputargs[0];
+        let Terminator::Goto { target, args } = &entry.terminator else {
+            panic!("expected Goto, got {:?}", entry.terminator);
+        };
+        assert_eq!(*target, func.graph.returnblock);
+        assert_eq!(args.len(), 1);
+        assert_ne!(
+            args[0], returnblock_arg,
+            "void return must allocate a fresh prevblock-side ValueId (`flowspace/model.py:114`), \
+             not reuse the returnblock's own inputarg"
         );
         assert_eq!(entry.exits.len(), 1);
         assert_eq!(entry.exits[0].prevblock, Some(func.graph.startblock));

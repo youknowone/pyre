@@ -169,6 +169,37 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             FlatOp::Reraise => {
                 let _ = writeln!(out, "{prefix}reraise");
             }
+            FlatOp::IntReturn(v) => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}int_return {}",
+                    register_repr(*v, &ssarepr.value_kinds)
+                );
+            }
+            FlatOp::RefReturn(v) => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}ref_return {}",
+                    register_repr(*v, &ssarepr.value_kinds)
+                );
+            }
+            FlatOp::FloatReturn(v) => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}float_return {}",
+                    register_repr(*v, &ssarepr.value_kinds)
+                );
+            }
+            FlatOp::VoidReturn => {
+                let _ = writeln!(out, "{prefix}void_return");
+            }
+            FlatOp::Raise(v) => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}raise {}",
+                    register_repr(*v, &ssarepr.value_kinds)
+                );
+            }
             FlatOp::Unreachable => {
                 let _ = writeln!(out, "{prefix}---");
             }

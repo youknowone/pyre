@@ -418,9 +418,25 @@ pub fn perform_all_register_allocations(
     graph: &FunctionGraph,
     value_kinds: &HashMap<ValueId, RegKind>,
 ) -> HashMap<RegKind, RegAllocResult> {
+    let mut augmented = value_kinds.clone();
+    // Seed canonical `exceptblock.inputargs` kinds — upstream rtyper
+    // assigns `(etype, evalue)` concretetypes `Ptr(OBJECT_VTABLE)` /
+    // `Ptr(OBJECT)` in `rpython/rtyper/rclass.py`; the codewriter
+    // reads them as `i`-typed class identity and `r`-typed instance
+    // pointer respectively (`flatten.py:143` `raise %r`,
+    // `flatten.py:220-231` `last_exception/>i` +
+    // `goto_if_exception_mismatch/i`).  pyre's codewriter creates the
+    // canonical exceptblock eagerly in `FunctionGraph::new`, so the
+    // matching kinds must be available whether or not the upstream
+    // rtyper pass populated them.
+    let except_args = &graph.block(graph.exceptblock).inputargs;
+    if except_args.len() == 2 {
+        augmented.entry(except_args[0]).or_insert(RegKind::Int);
+        augmented.entry(except_args[1]).or_insert(RegKind::Ref);
+    }
     let mut result = HashMap::new();
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-        result.insert(kind, perform_register_allocation(graph, kind, value_kinds));
+        result.insert(kind, perform_register_allocation(graph, kind, &augmented));
     }
     result
 }
