@@ -22,6 +22,7 @@ mod constant_pool;
 pub(crate) mod executor;
 mod fail_descr;
 pub mod greenfield;
+pub mod history;
 pub mod io_buffer;
 pub mod jit;
 mod jit_state;
@@ -29,17 +30,20 @@ pub mod jitcode;
 mod jitdriver;
 pub mod jitexc;
 pub mod jitframe;
+pub mod opencoder;
 pub mod optimize;
 pub mod optimizeopt;
 pub mod parity;
 mod pyjitpl;
 pub mod quasiimmut;
+pub mod recorder;
 pub mod resume;
 pub mod rvmprof;
 mod trace_ctx;
 pub mod virtualizable;
 pub mod virtualref;
 pub mod walkvirtual;
+pub mod warmstate;
 
 pub use call_descr::{
     make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,

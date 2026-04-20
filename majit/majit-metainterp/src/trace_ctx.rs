@@ -1,9 +1,9 @@
 //! No direct RPython equivalent — unified trace recording context
 //! (RPython splits this across MetaInterp.history, compile.py, and Trace).
 
+use crate::recorder::{Trace, TracePosition};
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_trace::heapcache::HeapCache;
-use majit_trace::recorder::{Trace, TracePosition};
 
 use majit_backend::JitCellToken;
 
@@ -715,7 +715,7 @@ impl TraceCtx {
     /// `num_live` is the number of live integer values (for the FailDescr).
     /// opencoder.py:819 parity: capture a snapshot of the interpreter
     /// frame state. Returns a snapshot_id for use as rd_resume_position.
-    pub fn capture_resumedata(&mut self, snapshot: majit_trace::recorder::Snapshot) -> i32 {
+    pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
         self.recorder.capture_resumedata(snapshot)
     }
 

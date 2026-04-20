@@ -24,10 +24,10 @@ pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
 
+use crate::history::TreeLoop;
+use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
-use majit_trace::history::TreeLoop;
-use majit_trace::warmstate::{HotResult, WarmEnterState};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
@@ -134,7 +134,7 @@ pub(crate) struct CompiledTrace {
     /// opencoder.py parity: per-guard snapshots from tracing time.
     /// Indexed by the guard's rd_resume_position. Used for snapshot-based
     /// resume data reconstruction (independent of optimizer's fail_args).
-    pub(crate) snapshots: Vec<majit_trace::recorder::Snapshot>,
+    pub(crate) snapshots: Vec<crate::recorder::Snapshot>,
     /// JitCode for blackhole fallback. RPython stores jitcodes globally;
     /// in majit the JitCode is produced by #[jit_interp] lowering and
     /// stored per-trace so BlackholeInterpreter can execute from guard
@@ -234,7 +234,7 @@ fn heap_value_for(ty: Type, bits: i64) -> Value {
 pub(crate) use crate::trace_ctx::value_to_raw_bits;
 
 fn snapshot_map_from_trace_snapshots(
-    trace_snapshots: &[majit_trace::recorder::Snapshot],
+    trace_snapshots: &[crate::recorder::Snapshot],
     constants: &mut std::collections::HashMap<u32, i64>,
     constant_types: &mut std::collections::HashMap<u32, majit_ir::Type>,
 ) -> (
@@ -260,14 +260,14 @@ fn snapshot_map_from_trace_snapshots(
         .map(|m| m + 1)
         .unwrap_or(0);
     // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
-    let mut tagged_to_opref = |t: &majit_trace::recorder::SnapshotTagged| -> majit_ir::OpRef {
+    let mut tagged_to_opref = |t: &crate::recorder::SnapshotTagged| -> majit_ir::OpRef {
         match t {
-            majit_trace::recorder::SnapshotTagged::Box(n, tp) => {
+            crate::recorder::SnapshotTagged::Box(n, tp) => {
                 snapshot_box_types.insert(*n, *tp);
                 majit_ir::OpRef(*n)
             }
-            majit_trace::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
-            majit_trace::recorder::SnapshotTagged::Const(val, tp) => {
+            crate::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
+            crate::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
                 // Register in pool so is_const → true, get_const → (0, Ref),
                 // getconst → NULLREF. Do NOT short-circuit to OpRef::NONE.
@@ -525,7 +525,7 @@ pub struct MetaInterp<M: Clone> {
     /// Set to potential_retrace_position by retrace_needed(). On the next
     /// compile_loop, the merge point's start position is compared
     /// against this to verify we're retracing from the correct location.
-    pub(crate) retracing_from: Option<majit_trace::recorder::TracePosition>,
+    pub(crate) retracing_from: Option<crate::recorder::TracePosition>,
     /// pyjitpl.py:2374: optimizer state snapshot from the failed bridge attempt.
     /// compile_retrace imports this to resume optimization from where the
     /// first attempt left off.
@@ -542,7 +542,7 @@ pub struct MetaInterp<M: Clone> {
     /// pyjitpl.py:3182: trace position saved before compile_trace records
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
-    pub(crate) potential_retrace_position: Option<majit_trace::recorder::TracePosition>,
+    pub(crate) potential_retrace_position: Option<crate::recorder::TracePosition>,
     /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
     /// quasi-immutable dependencies from the last compilation.
     /// Raw pointers to namespace/quasi-immutable objects that the compiled
@@ -558,9 +558,9 @@ pub struct MetaInterp<M: Clone> {
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
     pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
-    /// pyjitpl.py:2289: self.all_descrs = self.cpu.setup_descrs()
-    /// descr.py:25-47: dense list indexed by descr_index.
-    pub(crate) all_descrs: Vec<DescrRef>,
+    // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
+    // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
+    // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
     /// bridgeopt.py:124 frontend_boxes parity: runtime values from the
     /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
     /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
@@ -1088,7 +1088,6 @@ impl<M: Clone> MetaInterp<M> {
             retrace_after_bridge: false,
             virtualref_boxes: Vec::new(),
             pending_preamble_tokens: HashMap::new(),
-            all_descrs: Vec::new(),
             pending_frontend_boxes: None,
             cls_of_box: Some(default_cls_of_box),
             staticdata: MetaInterpStaticData::new(),
@@ -1192,7 +1191,7 @@ impl<M: Clone> MetaInterp<M> {
     /// optimizer after compilation. Optimizer.ensure_descr_index() assigns
     /// sequential descr_index during collect_optimizer_knowledge_for_resume().
     pub(crate) fn take_back_all_descrs(&mut self, all_descrs: Vec<DescrRef>) {
-        self.all_descrs = all_descrs;
+        self.staticdata.all_descrs = all_descrs;
     }
 
     /// bridgeopt.py:124 parity: set frontend_boxes (raw dead frame values)
@@ -1382,11 +1381,11 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state.set_function_threshold(threshold);
     }
 
-    pub fn warm_state_ref(&self) -> &majit_trace::warmstate::WarmEnterState {
+    pub fn warm_state_ref(&self) -> &crate::warmstate::WarmEnterState {
         &self.warm_state
     }
 
-    pub fn warm_state_mut(&mut self) -> &mut majit_trace::warmstate::WarmEnterState {
+    pub fn warm_state_mut(&mut self) -> &mut crate::warmstate::WarmEnterState {
         &mut self.warm_state
     }
 
@@ -1754,7 +1753,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
-        mut recorder: majit_trace::recorder::Trace,
+        mut recorder: crate::recorder::Trace,
     ) -> BackEdgeAction {
         // RPython parity: each tracing pass starts with cancel_count=0.
         // In RPython, MetaInterp is re-created per _compile_and_run_once.
@@ -2675,7 +2674,7 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
-        unroll_opt.all_descrs = std::mem::take(&mut self.all_descrs);
+        unroll_opt.all_descrs = std::mem::take(&mut self.staticdata.all_descrs);
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         // history.py: carry retraced_count across recompilations
         let prior_retraced_count = self
@@ -3570,7 +3569,7 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
-        unroll_opt.all_descrs = std::mem::take(&mut self.all_descrs);
+        unroll_opt.all_descrs = std::mem::take(&mut self.staticdata.all_descrs);
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = self
             .compiled_loops
@@ -3971,7 +3970,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
+        optimizer.all_descrs = std::mem::take(&mut self.staticdata.all_descrs);
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
         // history.py:_make_op parity: every InputArg carries its type
@@ -4339,7 +4338,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
+        optimizer.all_descrs = std::mem::take(&mut self.staticdata.all_descrs);
         optimizer.constant_types = constant_types.clone();
         optimizer.numbering_type_overrides = numbering_overrides;
         // RPython Box.type parity: register inputarg types.
@@ -5869,7 +5868,7 @@ impl<M: Clone> MetaInterp<M> {
     // ── Bridge Compilation ──────────────────────────────────────
 
     /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
-    fn cut_tentative_op(&mut self, cut_at: majit_trace::recorder::TracePosition) {
+    fn cut_tentative_op(&mut self, cut_at: crate::recorder::TracePosition) {
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.recorder.unfinalize();
             ctx.recorder.cut(cut_at);
@@ -6063,7 +6062,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
+        optimizer.all_descrs = std::mem::take(&mut self.staticdata.all_descrs);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
         for arg in bridge_inputargs {
@@ -6335,7 +6334,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut self.all_descrs);
+        optimizer.all_descrs = std::mem::take(&mut self.staticdata.all_descrs);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
         // RPython Box.type parity: inputargs carry their types implicitly
@@ -6411,7 +6410,7 @@ impl<M: Clone> MetaInterp<M> {
                     frontend_boxes,
                     liveboxes,
                     livebox_types,
-                    all_descrs: self.all_descrs.clone(),
+                    all_descrs: self.staticdata.all_descrs.clone(),
                     cls_of_box: self.cls_of_box,
                 })
             })
@@ -10751,6 +10750,16 @@ pub struct MetaInterpStaticData {
     /// `addr2name` and `indirectcall_dict` caches.  Populated on first
     /// call to `bytecode_for_address` / `get_name_from_address`.
     pub globaldata: MetaInterpGlobalData,
+    /// pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()`.
+    /// descr.py:25-47: dense list indexed by `descr_index`.
+    ///
+    /// RPython stores this on `metainterp_sd` (the static data object),
+    /// not on the live `MetaInterp` — opencoder / bridgeopt / optimizer
+    /// all read `metainterp_sd.all_descrs`. Pyre mirrors that location
+    /// so `opencoder::Trace` (which lives in this crate now) can read
+    /// the length directly via `self.metainterp_sd.all_descrs.len()`
+    /// from `_encode_descr` and the TraceIterator.
+    pub all_descrs: Vec<DescrRef>,
 }
 
 /// pyjitpl.py:2357-2373 `class MetaInterpGlobalData`.

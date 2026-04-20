@@ -334,7 +334,7 @@ impl UnrollOptimizer {
             // sequence is bit-identical to the input — this wrap is a
             // structural alignment with RPython's `trace.get_iter()`
             // call site, not a functional change.
-            let mut p1_iter = majit_trace::opencoder::TraceIterator::new(
+            let mut p1_iter = crate::opencoder::TraceIterator::new(
                 ops,
                 0,
                 ops.len(),
@@ -592,7 +592,7 @@ impl UnrollOptimizer {
         // shared-inputarg layout; only the Phase 2 optimizer internals
         // see the disjoint range.
         let phase2_inputarg_base = self.next_global_opref.max(body_num_inputs as u32);
-        let mut iter = majit_trace::opencoder::TraceIterator::new(
+        let mut iter = crate::opencoder::TraceIterator::new(
             &ops,
             0,
             ops.len(),

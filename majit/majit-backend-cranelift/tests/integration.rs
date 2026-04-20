@@ -14,7 +14,7 @@ use majit_ir::{
     ArrayDescr, Descr, DescrRef, FailDescr, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type,
     Value,
 };
-use majit_trace::recorder::Trace;
+use majit_metainterp::recorder::Trace;
 
 fn magic_numbers(m: i64) -> (u64, u32) {
     debug_assert!(m >= 3);

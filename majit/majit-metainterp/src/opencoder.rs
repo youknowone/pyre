@@ -1149,16 +1149,27 @@ pub struct TraceRecordBuffer {
     /// `Option<(u32, Vec<usize>)>` where the u32 is the `_count` snapshot
     /// at cache time.
     pub _deadranges: Option<(u32, Vec<usize>)>,
+
+    /// opencoder.py:472 `self.metainterp_sd = metainterp_sd`.
+    /// RPython stores the whole static data object so `_encode_descr` and
+    /// `TraceIterator` can read `metainterp_sd.all_descrs` (length +
+    /// contents) for descriptor index arithmetic. Pyre mirrors that via
+    /// `Arc<MetaInterpStaticData>` so the Trace can outlive its creating
+    /// MetaInterp frame without rebuilding the reference. Optional because
+    /// construction in isolated unit tests passes `None` — those tests
+    /// don't exercise descr encoding (they use the pre-B4 `all_descrs_len`
+    /// parameter explicitly).
+    pub metainterp_sd: Option<std::sync::Arc<crate::MetaInterpStaticData>>,
 }
 
 impl TraceRecordBuffer {
     /// opencoder.py:471-501 Trace.__init__(max_num_inputargs, metainterp_sd).
     ///
-    /// The `metainterp_sd` argument in RPython carries `all_descrs` for
-    /// descriptor index arithmetic. pyre's DescrRef already holds a
-    /// global index via `get_descr_index`, so the `all_descrs_len`
-    /// offset used by `_encode_descr` / `TraceIterator` is supplied per
-    /// call site rather than stored on the trace.
+    /// Constructs a Trace without a metainterp_sd — the `_encode_descr`
+    /// path then requires the `all_descrs_len` argument to be threaded by
+    /// the caller. Production code should use `new_with_metainterp_sd` so
+    /// `_encode_descr` can read `metainterp_sd.all_descrs.len()` directly
+    /// (RPython parity).
     pub fn new(max_num_inputargs: u32) -> Self {
         let mut t = TraceRecordBuffer {
             _ops: vec![0u8; INIT_SIZE],
@@ -1186,6 +1197,7 @@ impl TraceRecordBuffer {
             _consts_ptr: 0,
             _consts_ptr_nodict: 0,
             _deadranges: None,
+            metainterp_sd: None,
         };
         // opencoder.py:489 — `append_snapshot_array_data_int(0)` so all
         // zero-length arrays share index 0. Append via the signed-varint
@@ -1193,6 +1205,35 @@ impl TraceRecordBuffer {
         // helper, but the byte pattern must land regardless.
         t.append_snapshot_array_data_int(0);
         t
+    }
+
+    /// opencoder.py:471-501 Trace.__init__(max_num_inputargs, metainterp_sd).
+    ///
+    /// Literal RPython constructor: stores `metainterp_sd` on the Trace
+    /// so `_encode_descr` and `TraceIterator` can read
+    /// `metainterp_sd.all_descrs` without threading the length through
+    /// every call site.
+    pub fn new_with_metainterp_sd(
+        max_num_inputargs: u32,
+        metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
+    ) -> Self {
+        let mut t = Self::new(max_num_inputargs);
+        t.metainterp_sd = Some(metainterp_sd);
+        t
+    }
+
+    /// opencoder.py:707 `len(self.metainterp_sd.all_descrs)` — read the
+    /// global descriptor table length from the attached metainterp_sd.
+    /// Panics if the Trace was constructed without a metainterp_sd; the
+    /// two-arg `_encode_descr` overload should be used instead in that case.
+    fn all_descrs_len(&self) -> u32 {
+        match &self.metainterp_sd {
+            Some(sd) => sd.all_descrs.len() as u32,
+            None => panic!(
+                "Trace::_encode_descr requires metainterp_sd; use \
+                 new_with_metainterp_sd or the explicit all_descrs_len overload"
+            ),
+        }
     }
 
     /// opencoder.py:503-508 set_inputargs(inputargs).
@@ -1625,11 +1666,25 @@ impl TraceRecordBuffer {
     ///     ref so the TraceIterator can look it up with
     ///     `_descrs[descr_index - all_descr_len - 1]`.
     ///
-    /// `all_descrs_len` is the global descriptor table length at
-    /// encode time — the caller provides it so the Trace type does not
-    /// need a back-reference to metainterp state (RPython stores
-    /// `metainterp_sd` directly; pyre passes it per-call).
-    pub fn _encode_descr(&mut self, descr: &majit_ir::DescrRef, all_descrs_len: u32) -> i64 {
+    /// RPython reads `len(self.metainterp_sd.all_descrs)` at encode
+    /// time. Pyre reads it off `self.metainterp_sd.all_descrs.len()`
+    /// from the attached static data. Use `new_with_metainterp_sd`
+    /// to attach the static data; isolated unit tests that construct
+    /// a Trace with `new()` should use `_encode_descr_with_len`
+    /// instead and pass the length explicitly.
+    pub fn _encode_descr(&mut self, descr: &majit_ir::DescrRef) -> i64 {
+        let all_descrs_len = self.all_descrs_len();
+        self._encode_descr_with_len(descr, all_descrs_len)
+    }
+
+    /// Test-only overload of `_encode_descr` that accepts an explicit
+    /// `all_descrs_len`. Production callers should attach `metainterp_sd`
+    /// via `new_with_metainterp_sd` and use `_encode_descr(descr)`.
+    pub fn _encode_descr_with_len(
+        &mut self,
+        descr: &majit_ir::DescrRef,
+        all_descrs_len: u32,
+    ) -> i64 {
         let descr_index = descr.get_descr_index();
         if descr_index >= 0 {
             return (descr_index as i64) + 1;
@@ -2822,19 +2877,57 @@ mod tests {
         let mut buf = TraceRecordBuffer::new(0);
         // Global descrs return `get_descr_index() + 1`.
         let d_global: majit_ir::DescrRef = Arc::new(D { idx: 17 });
-        assert_eq!(buf._encode_descr(&d_global, 100), 18);
+        assert_eq!(buf._encode_descr_with_len(&d_global, 100), 18);
         assert_eq!(buf._descrs.len(), 1, "global descr must not append");
 
         // Local descrs (get_descr_index == -1) append and return
         // `all_descrs_len + len(_descrs) - 1 + 1`.
         let d_local: majit_ir::DescrRef = Arc::new(D { idx: -1 });
         // first local append: _descrs goes 1 → 2; encoded = 100 + 2.
-        assert_eq!(buf._encode_descr(&d_local, 100), 102);
+        assert_eq!(buf._encode_descr_with_len(&d_local, 100), 102);
         assert_eq!(buf._descrs.len(), 2);
         // second local append: _descrs goes 2 → 3; encoded = 100 + 3.
         let d_local2: majit_ir::DescrRef = Arc::new(D { idx: -1 });
-        assert_eq!(buf._encode_descr(&d_local2, 100), 103);
+        assert_eq!(buf._encode_descr_with_len(&d_local2, 100), 103);
         assert_eq!(buf._descrs.len(), 3);
+    }
+
+    /// Phase S smoke test: `_encode_descr` reads `all_descrs.len()` from
+    /// the attached `MetaInterpStaticData` (RPython
+    /// `len(self.metainterp_sd.all_descrs)` parity).
+    #[test]
+    fn test_encode_descr_reads_metainterp_sd_s() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct D {
+            idx: i32,
+        }
+        impl majit_ir::Descr for D {
+            fn index(&self) -> u32 {
+                0
+            }
+            fn get_descr_index(&self) -> i32 {
+                self.idx
+            }
+        }
+
+        let mut sd = crate::MetaInterpStaticData::new();
+        // Seed all_descrs with 7 dummies so the length drives the encoding.
+        for _ in 0..7 {
+            sd.all_descrs.push(Arc::new(D { idx: 0 }));
+        }
+        let mut buf = TraceRecordBuffer::new_with_metainterp_sd(0, Arc::new(sd));
+
+        // Global descr returns `get_descr_index() + 1`.
+        let d_global: majit_ir::DescrRef = Arc::new(D { idx: 3 });
+        assert_eq!(buf._encode_descr(&d_global), 4);
+        assert_eq!(buf._descrs.len(), 1, "global descr must not append");
+
+        // Local descr encodes to all_descrs.len() + local_slot + 1 = 7 + 2.
+        let d_local: majit_ir::DescrRef = Arc::new(D { idx: -1 });
+        assert_eq!(buf._encode_descr(&d_local), 9);
+        assert_eq!(buf._descrs.len(), 2);
     }
 
     /// Phase B3 smoke test: fixed-arity record_op* does NOT write a

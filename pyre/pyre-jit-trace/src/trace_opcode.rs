@@ -1557,7 +1557,7 @@ impl MIFrame {
             // snapshot needs only the active_boxes portion.
             let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             let callee_snapshot_types = &callee_snapshot_types_full[__n..];
-            let mut frames = vec![majit_trace::recorder::SnapshotFrame {
+            let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
                 pc: callee_live_pc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(
@@ -1602,7 +1602,7 @@ impl MIFrame {
                 } else {
                     &[]
                 };
-                frames.push(majit_trace::recorder::SnapshotFrame {
+                frames.push(majit_metainterp::recorder::SnapshotFrame {
                     jitcode_index: *pfa_jitcode_index as u32,
                     pc: *pfa_resumepc as u32,
                     boxes: Self::fail_args_to_snapshot_boxes_typed(
@@ -1622,7 +1622,7 @@ impl MIFrame {
             let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
             // pyjitpl.py:2597: self.virtualref_boxes
             let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
-            let snapshot = majit_trace::recorder::Snapshot {
+            let snapshot = majit_metainterp::recorder::Snapshot {
                 frames,
                 vable_boxes,
                 vref_boxes,
@@ -1731,8 +1731,8 @@ impl MIFrame {
         // pyjitpl.py:2597-2600: history.trace.capture_resumedata(
         //     self.framestack, virtualizable_boxes, self.virtualref_boxes,
         //     after_residual_call)
-        let snapshot = majit_trace::recorder::Snapshot {
-            frames: vec![majit_trace::recorder::SnapshotFrame {
+        let snapshot = majit_metainterp::recorder::Snapshot {
+            frames: vec![majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index,
                 pc: snapshot_live_pc as u32,
                 boxes: snapshot_boxes,
@@ -1759,7 +1759,7 @@ impl MIFrame {
     fn opref_to_snapshot_tagged(
         opref: OpRef,
         ctx: &majit_metainterp::TraceCtx,
-    ) -> majit_trace::recorder::SnapshotTagged {
+    ) -> majit_metainterp::recorder::SnapshotTagged {
         Self::opref_to_snapshot_tagged_for_slot(opref, ctx, None)
     }
 
@@ -1777,9 +1777,9 @@ impl MIFrame {
         opref: OpRef,
         ctx: &majit_metainterp::TraceCtx,
         declared_type: Option<majit_ir::Type>,
-    ) -> majit_trace::recorder::SnapshotTagged {
+    ) -> majit_metainterp::recorder::SnapshotTagged {
         if opref.is_none() {
-            majit_trace::recorder::SnapshotTagged::Const(
+            majit_metainterp::recorder::SnapshotTagged::Const(
                 0,
                 declared_type.unwrap_or(majit_ir::Type::Ref),
             )
@@ -1799,13 +1799,13 @@ impl MIFrame {
                 .const_type(opref)
                 .or(declared_type)
                 .unwrap_or(majit_ir::Type::Int);
-            majit_trace::recorder::SnapshotTagged::Const(val, tp)
+            majit_metainterp::recorder::SnapshotTagged::Const(val, tp)
         } else {
             // resume.py:211,214: box.type for _number_boxes TAGVIRTUAL/TAGBOX.
             let tp = ctx
                 .get_opref_type(opref)
                 .unwrap_or_else(|| panic!("missing snapshot box type for {:?}", opref));
-            majit_trace::recorder::SnapshotTagged::Box(opref.0, tp)
+            majit_metainterp::recorder::SnapshotTagged::Box(opref.0, tp)
         }
     }
 
@@ -1828,7 +1828,7 @@ impl MIFrame {
     fn build_virtualizable_boxes(
         sym: &PyreSym,
         ctx: &majit_metainterp::TraceCtx,
-    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+    ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
         // opencoder.py:718-726 _list_of_boxes_virtualizable parity:
         // RPython format: [virtualizable_ptr, static_fields..., array_items...]
         // (virtualizable_ptr moved from end to front).
@@ -1995,7 +1995,7 @@ impl MIFrame {
     fn build_virtualref_boxes(
         sym: &PyreSym,
         ctx: &majit_metainterp::TraceCtx,
-    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+    ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
         sym.virtualref_boxes
             .iter()
             .map(|&(opref, _concrete)| Self::opref_to_snapshot_tagged(opref, ctx))
@@ -2006,7 +2006,7 @@ impl MIFrame {
     fn fail_args_to_snapshot_boxes(
         fail_args: &[OpRef],
         ctx: &majit_metainterp::TraceCtx,
-    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+    ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
         fail_args
             .iter()
             .map(|&opref| Self::opref_to_snapshot_tagged(opref, ctx))
@@ -2020,25 +2020,25 @@ impl MIFrame {
         active_boxes: &[OpRef],
         types: &[majit_ir::Type],
         ctx: &majit_metainterp::TraceCtx,
-    ) -> Vec<majit_trace::recorder::SnapshotTagged> {
+    ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
         active_boxes
             .iter()
             .enumerate()
             .map(|(i, &opref)| {
                 if opref.is_none() {
-                    majit_trace::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
+                    majit_metainterp::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
                 } else if ctx.constant_value(opref).is_some() {
                     let val = ctx.constant_value(opref).unwrap_or(0);
                     // resume.py:157-183 `getconst(const)` dispatches on
                     // `const.type`; pyre's plain `const_int(v)` has an
                     // intrinsic INT type (see `opref_to_snapshot_tagged`).
                     let tp = ctx.const_type(opref).unwrap_or(majit_ir::Type::Int);
-                    majit_trace::recorder::SnapshotTagged::Const(val, tp)
+                    majit_metainterp::recorder::SnapshotTagged::Const(val, tp)
                 } else {
                     let tp = types.get(i).copied().unwrap_or_else(|| {
                         panic!("missing fail-arg box type at index {} for {:?}", i, opref)
                     });
-                    majit_trace::recorder::SnapshotTagged::Box(opref.0, tp)
+                    majit_metainterp::recorder::SnapshotTagged::Box(opref.0, tp)
                 }
             })
             .collect()
@@ -2202,7 +2202,7 @@ impl MIFrame {
         // keep their original return_point pc.
         let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let callee_snapshot_types = &callee_snapshot_types_full[__n..];
-        let mut frames = vec![majit_trace::recorder::SnapshotFrame {
+        let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
             pc: resume_pc as u32,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
@@ -2220,7 +2220,7 @@ impl MIFrame {
             } else {
                 &[]
             };
-            frames.push(majit_trace::recorder::SnapshotFrame {
+            frames.push(majit_metainterp::recorder::SnapshotFrame {
                 jitcode_index: *pfa_jitcode_index as u32,
                 pc: *pfa_resumepc as u32,
                 boxes: Self::fail_args_to_snapshot_boxes_typed(parent_active, parent_types, ctx),
@@ -2236,7 +2236,7 @@ impl MIFrame {
 
         let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
         let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
-        let snapshot = majit_trace::recorder::Snapshot {
+        let snapshot = majit_metainterp::recorder::Snapshot {
             frames,
             vable_boxes,
             vref_boxes,
@@ -4176,7 +4176,7 @@ impl MIFrame {
                 // fail_arg_types includes header; snapshot
                 // needs only the active_boxes portion.
                 let snapshot_types = &fail_arg_types[__n..];
-                let mut frames = vec![majit_trace::recorder::SnapshotFrame {
+                let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
                     jitcode_index,
                     pc: resume_pc as u32,
                     boxes: Self::fail_args_to_snapshot_boxes_typed(
@@ -4199,7 +4199,7 @@ impl MIFrame {
                     } else {
                         &[]
                     };
-                    frames.push(majit_trace::recorder::SnapshotFrame {
+                    frames.push(majit_metainterp::recorder::SnapshotFrame {
                         jitcode_index: *pfa_jitcode_index as u32,
                         pc: *pfa_resumepc as u32,
                         boxes: Self::fail_args_to_snapshot_boxes_typed(
@@ -4217,7 +4217,7 @@ impl MIFrame {
                     all_types.extend_from_slice(&pt);
                 }
                 let vable_boxes = Self::build_virtualizable_boxes(this.sym(), ctx);
-                let snapshot = majit_trace::recorder::Snapshot {
+                let snapshot = majit_metainterp::recorder::Snapshot {
                     frames,
                     vable_boxes,
                     vref_boxes: Self::build_virtualref_boxes(this.sym(), ctx),

@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
+use crate::history::TreeLoop;
 use majit_ir::{Op, OpRef, Type};
-use majit_trace::history::TreeLoop;
 
 /// A small, stable parity case format for comparing majit traces against
 /// RPython-derived expectations.
@@ -125,9 +125,9 @@ pub fn assert_trace_parity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recorder::Trace;
     use crate::{TraceCtx, make_fail_descr};
     use majit_ir::{OpCode, Type};
-    use majit_trace::recorder::Trace;
 
     fn finish_trace_ctx(mut ctx: TraceCtx, finish_args: &[OpRef]) -> (TreeLoop, HashMap<u32, i64>) {
         ctx.recorder

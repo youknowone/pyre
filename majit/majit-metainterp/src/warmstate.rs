@@ -13,8 +13,9 @@ use majit_backend::JitCellToken;
 use majit_ir::Type;
 use std::sync::Arc;
 
-use crate::counter::JitCounter;
-use crate::logger::Logger;
+use majit_trace::counter::JitCounter;
+use majit_trace::logger::Logger;
+
 use crate::recorder::Trace;
 
 /// Flags on a BaseJitCell, mirroring warmstate.py JC_* constants.
@@ -171,7 +172,7 @@ pub enum CellJitState {
     Compiled(Arc<JitCellToken>),
 }
 
-pub use crate::memmgr::LoopAging;
+pub use majit_trace::memmgr::LoopAging;
 
 /// Warm state manager — the orchestrator of the JIT lifecycle.
 ///
@@ -298,7 +299,7 @@ pub struct WarmEnterState {
     pureop_historylength: u32,
     /// warmspot.py:110: memory_manager — generation-based loop aging.
     /// pyjitpl.py:2348: try_to_free_some_loops calls next_generation().
-    pub memory_manager: crate::memmgr::LoopAging,
+    pub memory_manager: majit_trace::memmgr::LoopAging,
 }
 
 /// Result of checking whether a green key is hot.
@@ -372,7 +373,7 @@ impl WarmEnterState {
             disable_unrolling_threshold: 0,
             pureop_historylength: 16,
             memory_manager: {
-                let mut m = crate::memmgr::LoopAging::new(0);
+                let mut m = majit_trace::memmgr::LoopAging::new(0);
                 // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
                 // PARAMETERS is 0, applied in production via set_user_param).
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
@@ -412,7 +413,7 @@ impl WarmEnterState {
             disable_unrolling_threshold: 0,
             pureop_historylength: 16,
             memory_manager: {
-                let mut m = crate::memmgr::LoopAging::new(0);
+                let mut m = majit_trace::memmgr::LoopAging::new(0);
                 // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
                 // PARAMETERS is 0, applied in production via set_user_param).
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
