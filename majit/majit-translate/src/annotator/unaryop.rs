@@ -1906,25 +1906,14 @@ fn container_getanyitem(
             }
         }
         // unaryop.py:664-665 — `SomeStringOrUnicode.getanyitem` returns
-        // the basecharclass. model.py:326-329:
+        // `self.basecharclass()`. model.py:326-329 assigns
         //   SomeString.basecharclass = SomeChar
         //   SomeUnicodeString.basecharclass = SomeUnicodeCodePoint
-        SomeValue::String(s) => SomeValue::Char(super::model::SomeChar::new(s.inner.no_nul)),
-        SomeValue::UnicodeString(s) => {
-            SomeValue::UnicodeCodePoint(super::model::SomeUnicodeCodePoint::new(s.inner.no_nul))
-        }
-        SomeValue::ByteArray(_) => {
-            // Python-3 semantics: iterating a bytearray yields ints in
-            // 0..256. Upstream model.py has no basecharclass on
-            // SomeByteArray; the Rust port matches that omission by
-            // widening to SomeInteger(nonneg=True).
-            SomeValue::Integer(SomeInteger::new(true, false))
-        }
-        SomeValue::Char(_) | SomeValue::UnicodeCodePoint(_) => {
-            // Iterating a single character is not meaningful upstream;
-            // widen to the char itself so a degenerate iterator does
-            // not panic.
-            s_container.clone()
+        // and the class is called with no arguments — so the char's
+        // `no_nul` defaults to False regardless of the string's.
+        SomeValue::String(_) => SomeValue::Char(super::model::SomeChar::new(false)),
+        SomeValue::UnicodeString(_) => {
+            SomeValue::UnicodeCodePoint(super::model::SomeUnicodeCodePoint::new(false))
         }
         other => panic!("getanyitem: unsupported container {other:?}"),
     }
@@ -3019,18 +3008,6 @@ mod tests {
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
         let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::UnicodeCodePoint(_)), "got {:?}", r);
-    }
-
-    #[test]
-    fn consider_someiterator_next_on_bytearray_returns_integer() {
-        use super::super::model::SomeByteArray;
-        let ann = mk_ann();
-        let it = SomeIterator::new(SomeValue::ByteArray(SomeByteArray::new(false)), vec![]);
-        let mut v = Variable::named("it");
-        ann.setbinding(&mut v, SomeValue::Iterator(it));
-        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
-        let r = hl.consider(&ann).unwrap();
-        assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
     }
 
     #[test]
