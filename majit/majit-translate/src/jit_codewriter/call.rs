@@ -40,6 +40,33 @@ pub enum CanRaise {
     Yes,
 }
 
+/// Internal lattice for RaiseAnalyzer parity.
+///
+/// Ordered as `No < MemoryErrorOnly < Yes`; joins preserve the strongest
+/// evidence seen while traversing a graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RaiseClass {
+    No,
+    MemoryErrorOnly,
+    Yes,
+}
+
+impl RaiseClass {
+    fn join(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+impl From<RaiseClass> for CanRaise {
+    fn from(value: RaiseClass) -> Self {
+        match value {
+            RaiseClass::No => CanRaise::No,
+            RaiseClass::MemoryErrorOnly => CanRaise::MemoryErrorOnly,
+            RaiseClass::Yes => CanRaise::Yes,
+        }
+    }
+}
+
 /// RPython: DependencyTracker equivalent — caches transitive analysis results.
 ///
 /// Each analyzer in RPython has its own `seen` set (via `analyze_direct_call`).
@@ -2101,79 +2128,66 @@ impl CallControl {
     ///
     /// `ignore_memoryerror` controls whether ops that can only raise
     /// MemoryError are treated as non-raising (canraise.py:11-17).
-    fn analyze_can_raise_impl(
-        &self,
-        path: &CallPath,
-        seen: &mut HashSet<CallPath>,
-        ignore_memoryerror: bool,
-    ) -> bool {
+    fn analyze_can_raise_impl(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> RaiseClass {
         if !seen.insert(path.clone()) {
-            return false; // cycle → bottom_result
+            return RaiseClass::No; // cycle → bottom_result
         }
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // RPython: analyze_external_call → getattr(fnobj, 'canraise', True)
-            None => return true,
+            None => return RaiseClass::Yes,
         };
-        let _ = ignore_memoryerror; // see MemoryError-only note below
+        let mut result = RaiseClass::No;
         for block in &graph.blocks {
-            if block.canraise() {
-                return true;
-            }
-            // RPython `backendopt/canraise.py:25-47 analyze_exceptblock_in_graph`
-            // identifies raising blocks by a `Link` in `Block.exits` whose
-            // target is `graph.exceptblock`.  Pyre now emits that same shape
-            // via `FunctionGraph::set_raise` (upstream's Link(..., exceptblock)).
-            //
-            // The MemoryError-only carve-out requires per-operation raise
-            // classification (`RaiseAnalyzer.ignore_exact_class`,
-            // `canraise.py:11-17 LL_OPERATIONS[opname].canraise`), which
-            // pyre does not yet port; until that lands, both raise-analyzer
-            // passes see the same exceptblock link and the classification
-            // collapses to Yes/No in practice.
-            if block
-                .exits
-                .iter()
-                .any(|link| link.target == graph.exceptblock)
-            {
-                return true;
-            }
             // RPython: analyze_simple_operation(op) per operation.
             // canraise.py:14-17: LL_OPERATIONS[op.opname].canraise
             for op in &block.operations {
-                match &op.kind {
+                let op_result = match &op.kind {
                     OpKind::Call { target, .. } => {
                         let callee_path = match self.target_to_path(target) {
                             Some(p) => p,
-                            None => return true, // unresolvable → conservative
+                            None => return RaiseClass::Yes, // unresolvable → conservative
                         };
-                        if self.analyze_can_raise_impl(&callee_path, seen, ignore_memoryerror) {
-                            return true;
-                        }
+                        self.analyze_can_raise_impl(&callee_path, seen)
                     }
                     OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => return true, // graphanalyze.py:117-121 → top_result()
+                        None => RaiseClass::Yes, // graphanalyze.py:117-121 → top_result()
                         Some(graphs) => {
+                            let mut family = RaiseClass::No;
                             for callee_path in graphs {
-                                if self.analyze_can_raise_impl(
-                                    callee_path,
-                                    seen,
-                                    ignore_memoryerror,
-                                ) {
-                                    return true;
+                                family =
+                                    family.join(self.analyze_can_raise_impl(callee_path, seen));
+                                if family == RaiseClass::Yes {
+                                    break;
                                 }
                             }
+                            family
                         }
                     },
-                    other => {
-                        if op_can_raise(other, ignore_memoryerror) {
-                            return true;
-                        }
-                    }
+                    other => op_can_raise(other),
+                };
+                result = result.join(op_result);
+                if result == RaiseClass::Yes {
+                    return result;
                 }
             }
         }
-        false
+        // RPython `backendopt/canraise.py:27-41 analyze_exceptblock_in_graph`
+        // treats direct links to `graph.exceptblock` as raising unless the
+        // graph merely re-raises a previously-caught exception, in which case
+        // the original raise site already accounts for it.
+        if graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.exits.iter())
+            .any(|link| link.target == graph.exceptblock)
+        {
+            if exceptblock_is_reraise_of_caught_exception(graph) {
+                return result;
+            }
+            return result.join(RaiseClass::Yes);
+        }
+        result
     }
 
     /// RPython: VirtualizableAnalyzer.analyze() (effectinfo.py:401-404).
@@ -2407,35 +2421,18 @@ impl CallControl {
 
     /// Cached version of _canraise for a CallTarget.
     ///
-    /// RPython call.py:337-355 — _canraise uses two analyzers:
-    /// 1. raise_analyzer.can_raise(op)
-    /// 2. raise_analyzer_ignore_memoryerror.can_raise(op)
+    /// RPython call.py:337-355 — `_canraise()` returns the tri-state
+    /// `{False, "mem", True}` collapsed here to [`CanRaise`].
     ///
-    /// If (1) is True and (2) is False → "mem" (MemoryErrorOnly).
-    /// If (1) is True and (2) is True → True.
-    /// If (1) is False → False.
+    /// Pyre computes the same lattice directly inside
+    /// `analyze_can_raise_impl()` instead of running two separate
+    /// BoolGraphAnalyzer instances.
     fn cached_can_raise_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> CanRaise {
         if let Some(&result) = cache.can_raise.get(&path) {
             return result;
         }
-        // RPython call.py:342: self.raise_analyzer.can_raise(op)
         let mut seen = HashSet::new();
-        let can_raise = self.analyze_can_raise_impl(&path, &mut seen, false);
-        let result = if !can_raise {
-            // RPython call.py:348: return False
-            CanRaise::No
-        } else {
-            // RPython call.py:343: self.raise_analyzer_ignore_memoryerror.can_raise(op)
-            let mut seen2 = HashSet::new();
-            let can_raise_non_memoryerror = self.analyze_can_raise_impl(&path, &mut seen2, true);
-            if can_raise_non_memoryerror {
-                // RPython call.py:344: return True
-                CanRaise::Yes
-            } else {
-                // RPython: return "mem"
-                CanRaise::MemoryErrorOnly
-            }
-        };
+        let result = CanRaise::from(self.analyze_can_raise_impl(path, &mut seen));
         cache.can_raise.insert(path.clone(), result);
         result
     }
@@ -3745,23 +3742,23 @@ fn get_type_flag(type_str: &str) -> (majit_ir::descr::ArrayFlag, majit_ir::value
 /// Returns true if the operation itself (not counting transitive calls)
 /// can raise an exception. When `ignore_memoryerror` is true, operations
 /// that can only raise MemoryError are treated as non-raising.
-fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
-    // RPython canraise.py:14-17:
+fn op_can_raise(op: &OpKind) -> RaiseClass {
+    // RPython canraise.py:14-18:
     //   canraise = LL_OPERATIONS[op.opname].canraise
     //   return bool(canraise) and canraise != (self.ignore_exact_class,)
     //
-    // canraise.py:18: unknown op → log.WARNING + return True
-    //
-    // Each op has a canraise tuple. When ignore_exact_class == MemoryError,
-    // ops that can ONLY raise MemoryError are treated as non-raising.
+    // Model the tri-state directly:
+    //   ()                  -> No
+    //   (MemoryError,)      -> MemoryErrorOnly
+    //   anything else truthy -> Yes
     match op {
         // ── Known non-raising ops (canraise = ()) ─────────────────
         // RPython LL: getfield_gc, setfield_gc → cannot raise
-        OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => false,
+        OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
         // RPython LL: getarrayitem_gc, setarrayitem_gc → cannot raise
-        OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => false,
+        OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => RaiseClass::No,
         // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
-        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => false,
+        OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
         // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise
         // (non-ovf, non-div arithmetic)
         OpKind::BinOp { op, .. }
@@ -3770,12 +3767,12 @@ fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
                 && !op.contains("rem")
                 && !op.contains("ovf") =>
         {
-            false
+            RaiseClass::No
         }
         // RPython LL: int_neg, bool_not → cannot raise
-        OpKind::UnaryOp { op, .. } if !op.contains("ovf") => false,
+        OpKind::UnaryOp { op, .. } if !op.contains("ovf") => RaiseClass::No,
         // RPython LL: same_as, cast_*, hint → cannot raise
-        OpKind::Input { .. } | OpKind::ConstInt(_) => false,
+        OpKind::Input { .. } | OpKind::ConstInt(_) => RaiseClass::No,
         // JIT-specific ops that cannot raise
         OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
@@ -3789,12 +3786,12 @@ fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
         // jtransform.py:901-903 — `record_quasiimmut_field` is pure bookkeeping
         // that the metainterp converts into a guard; cannot raise.
         | OpKind::RecordQuasiImmutField { .. }
-        | OpKind::Live => false,
+        | OpKind::Live => RaiseClass::No,
         // Virtualizable field/array access (from boxes, no heap) → cannot raise
         OpKind::VableFieldRead { .. }
         | OpKind::VableFieldWrite { .. }
         | OpKind::VableArrayRead { .. }
-        | OpKind::VableArrayWrite { .. } => false,
+        | OpKind::VableArrayWrite { .. } => RaiseClass::No,
         // Post-jtransform call ops: raise is determined by their descriptor,
         // not by op_can_raise. These are not "simple operations" in RPython
         // terms — they're handled by analyze() → analyze_direct_call.
@@ -3804,37 +3801,70 @@ fn op_can_raise(op: &OpKind, _ignore_memoryerror: bool) -> bool {
         | OpKind::InlineCall { .. }
         | OpKind::RecursiveCall { .. }
         | OpKind::ConditionalCall { .. }
-        | OpKind::ConditionalCallValue { .. } => false,
+        | OpKind::ConditionalCallValue { .. } => RaiseClass::No,
 
         // ── Known raising ops ─────────────────────────────────────
-        // RPython LL: jit_force_virtualizable → canraise
-        OpKind::VableForce => true,
+        // RPython LL: jit_force_virtualizable has `canrun=True`, not
+        // `canraise`; effect classification handles its special meaning.
+        OpKind::VableForce => RaiseClass::No,
         // RPython LL: int_floordiv, int_mod → canraise = (ZeroDivisionError,)
-        OpKind::BinOp { .. } => true, // div/mod/rem/ovf (others matched above)
+        OpKind::BinOp { .. } => RaiseClass::Yes, // div/mod/rem/ovf (others matched above)
         // RPython LL: int_neg_ovf → canraise = (OverflowError,)
-        OpKind::UnaryOp { .. } => true, // ovf (others matched above)
+        OpKind::UnaryOp { .. } => RaiseClass::Yes, // ovf (others matched above)
 
         // ── Calls handled by analyze() dispatch, not here ─────────
         // RPython: Call ops dispatch to analyze_direct_call/analyze_external_call.
         // op_can_raise is only for "simple operations" (non-call).
         // But if we see a Call here (shouldn't happen in normal flow),
         // be conservative.
-        OpKind::Call { .. } => true,
+        OpKind::Call { .. } => RaiseClass::Yes,
 
         // ── vtable entry extraction: pure memory load, no raise ──
         // RPython: op.args[0] in indirect_call is a plain Variable,
         // the address extraction itself has no raising analogue.
-        OpKind::VtableMethodPtr { .. } => false,
+        OpKind::VtableMethodPtr { .. } => RaiseClass::No,
         // ── indirect_call canraise comes from the family's calldescr ──
         // (analyze() dispatch, not here). Not yet emitted; arm reserved
         // for Phase B.
-        OpKind::IndirectCall { .. } => true,
+        OpKind::IndirectCall { .. } => RaiseClass::Yes,
 
         // ── Unknown ops: canraise.py:18 → True (conservative) ─────
         // RPython: log.WARNING("Unknown operation: %s" % op.opname)
         //          return True
-        OpKind::Unknown { .. } => true,
+        OpKind::Unknown { .. } => RaiseClass::Yes,
     }
+}
+
+fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
+    use crate::model::LinkArg;
+
+    let except_value = graph.block(graph.exceptblock).inputargs.get(1).copied();
+    let Some(except_value) = except_value else {
+        return false;
+    };
+
+    let mut families =
+        crate::tool::algo::unionfind::UnionFind::<crate::model::ValueId, ()>::new(|_| ());
+    for block in &graph.blocks {
+        for link in &block.exits {
+            for (arg, &target_arg) in link
+                .args
+                .iter()
+                .zip(graph.block(link.target).inputargs.iter())
+            {
+                if let LinkArg::Value(value) = arg {
+                    families.union(*value, target_arg);
+                }
+            }
+        }
+    }
+    let except_rep = families.find_rep(except_value);
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.exits.iter())
+        .filter_map(|link| link.last_exc_value.as_ref().and_then(|arg| arg.as_value()))
+        .any(|value| families.find_rep(value) == except_rep)
 }
 
 /// Map ValueType to a small integer for array descriptor indexing.
@@ -4145,7 +4175,9 @@ pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FunctionGraph, ValueId, ValueType};
+    use crate::model::{
+        ExitSwitch, FunctionGraph, Link, LinkArg, ValueId, ValueType, exception_exitcase,
+    };
 
     /// Synthetic `OpKind::Call` wrapper — mirrors RPython test_jtransform
     /// helpers that pass a pre-built `SpaceOperation('direct_call', ...)`
@@ -4421,6 +4453,39 @@ mod tests {
     fn raising_graph(name: &str) -> FunctionGraph {
         let mut g = FunctionGraph::new(name);
         g.set_raise(g.startblock, "error");
+        g
+    }
+
+    /// Synthetic graph that only re-raises a previously-caught exception.
+    ///
+    /// This mirrors the special case in
+    /// `canraise.py:27-41 analyze_exceptblock_in_graph`: the graph itself
+    /// should not be treated as the origin of the exception.
+    fn reraise_only_graph(name: &str) -> FunctionGraph {
+        let mut g = FunctionGraph::new(name);
+        let entry = g.startblock;
+        let continuation = g.create_block();
+        let continuation_arg = g.alloc_value();
+        g.block_mut(continuation).inputargs.push(continuation_arg);
+        let last_exception = g.alloc_value();
+        let last_exc_value = g.alloc_value();
+        g.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![
+                Link::new(vec![continuation_arg], continuation, None),
+                Link::new(
+                    vec![last_exception, last_exc_value],
+                    g.exceptblock,
+                    Some(exception_exitcase()),
+                )
+                .extravars(
+                    Some(LinkArg::from(last_exception)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
+            ],
+        );
+        g.set_return(continuation, Some(continuation_arg));
         g
     }
 
@@ -4760,6 +4825,18 @@ mod tests {
 
         let r2 = cc._canraise(&target, &mut cache);
         assert_eq!(r2, CanRaise::Yes);
+    }
+
+    #[test]
+    fn test_canraise_reraise_only_graph_is_not_new_raise_site() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["reraise_only"]);
+        cc.register_function_graph(path.clone(), reraise_only_graph("reraise_only"));
+
+        let target = CallTarget::function_path(["reraise_only"]);
+        let mut cache = AnalysisCache::default();
+        let result = cc._canraise(&target, &mut cache);
+        assert_eq!(result, CanRaise::No);
     }
 
     #[test]

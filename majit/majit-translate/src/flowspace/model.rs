@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::bytecode::HostCode;
 use crate::annotator::model::SomeValue;
@@ -86,6 +86,7 @@ enum HostObjectKind {
     Class {
         bases: Vec<HostObject>,
         members: Mutex<HashMap<String, ConstValue>>,
+        reusable_prebuilt_instance: OnceLock<HostObject>,
     },
     /// Python module object. `members` 는 module dict — `getattr` 조회
     /// 대상. `LazyLock` singleton 의 Sync 요구를 만족하려고 `Mutex`.
@@ -269,6 +270,24 @@ impl HostObject {
         }
     }
 
+    /// RPython `rclass.InstanceRepr.get_reusable_prebuilt_instance()`
+    /// 대응 surface. 표준 예외 재전파는 같은 prebuilt instance 를
+    /// 반복 사용해야 하므로 class object 내부 OnceLock 에 singleton
+    /// 을 붙여 둔다.
+    pub fn reusable_prebuilt_instance(&self) -> Option<HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::Class {
+                reusable_prebuilt_instance,
+                ..
+            } => Some(
+                reusable_prebuilt_instance
+                    .get_or_init(|| HostObject::new_instance(self.clone(), Vec::new()))
+                    .clone(),
+            ),
+            _ => None,
+        }
+    }
+
     /// `cls.__mro__` — C3 linearisation over `__bases__`. Non-class 는
     /// None. 상위 class 가 중복된 경우를 처리하지만, 복수 정의 충돌시
     /// `TypeError: MRO conflict` 대신 None 을 돌려준다 (upstream
@@ -345,6 +364,7 @@ impl HostObject {
                 kind: HostObjectKind::Class {
                     bases,
                     members: Mutex::new(HashMap::new()),
+                    reusable_prebuilt_instance: OnceLock::new(),
                 },
             }),
         }
@@ -366,6 +386,7 @@ impl HostObject {
                 kind: HostObjectKind::Class {
                     bases,
                     members: Mutex::new(members),
+                    reusable_prebuilt_instance: OnceLock::new(),
                 },
             }),
         }
@@ -919,6 +940,46 @@ impl HostEnv {
                 && obj.is_subclass_of(self.lookup_builtin("BaseException").as_ref().unwrap())
         })
     }
+
+    /// RPython `exceptiondata.py:get_standard_ll_exc_instance_by_class`.
+    /// 표준 예외 class 는 reusable prebuilt instance 를 shared singleton
+    /// 으로 materialize 한다.
+    pub fn lookup_standard_exception_instance(&self, name: &str) -> Option<HostObject> {
+        self.lookup_exception_class(name)
+            .and_then(|cls| cls.reusable_prebuilt_instance())
+    }
+
+    fn builtin_singleton_name<'a>(&'a self, obj: &HostObject) -> Option<&'a str> {
+        self.builtins
+            .get_key_value(obj.qualname())
+            .and_then(|(name, builtin)| (builtin == obj).then_some(name.as_str()))
+            .or_else(|| {
+                self.builtins
+                    .iter()
+                    .find_map(|(name, builtin)| (builtin == obj).then_some(name.as_str()))
+            })
+    }
+
+    fn imported_module_name(&self, obj: &HostObject) -> Option<String> {
+        let mods = self.modules.lock().unwrap();
+        mods.get_key_value(obj.qualname())
+            .and_then(|(name, module)| (module == obj).then_some(name.clone()))
+            .or_else(|| {
+                mods.iter()
+                    .find_map(|(name, module)| (module == obj).then_some(name.clone()))
+            })
+    }
+
+    fn standard_exception_instance_name(&self, obj: &HostObject) -> Option<String> {
+        let cls = obj.instance_class()?;
+        let class_name = cls.qualname();
+        let builtin_cls = self.lookup_exception_class(class_name)?;
+        if builtin_cls != *cls {
+            return None;
+        }
+        let standard = self.lookup_standard_exception_instance(class_name)?;
+        (standard == *obj).then_some(class_name.to_owned())
+    }
 }
 
 /// 프로세스 전역 host namespace singleton. bootstrap 은 upstream
@@ -1017,12 +1078,11 @@ impl std::fmt::Display for ConstValue {
 /// `Link.last_exception` / `Link.last_exc_value` flow through a
 /// bincode-serialized `SSARepr` (see
 /// `pyre-jit-trace/build.rs`).  The simple leaf variants round-trip
-/// faithfully; every complex host-level shape (`Dict`, `Code`,
-/// `Function`, `HostObject`, `Tuple`/`List`, `Atom`) has no
-/// cross-process identity to preserve and deserializes back as
-/// `Placeholder`.  This matches upstream's Python-side `repr` / pickle
-/// behaviour: the complex payloads are reconstituted on the bootstrap
-/// side, not round-tripped through the serialized JitCode artefact.
+/// faithfully; `HostObject` only round-trips for bootstrap singletons
+/// that have an upstream-stable identity (`__builtin__` entries,
+/// imported stdlib module placeholders, standard exception reusable
+/// instances).  Unsupported host payloads fail closed during serialize
+/// instead of silently decoding to the wrong object.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SerializableConstValue {
@@ -1033,8 +1093,9 @@ enum SerializableConstValue {
     Bool(bool),
     None,
     SpecTag(u64),
-    /// Host-dependent payloads flatten to a qualname + Placeholder marker.
-    HostQualname(String),
+    BuiltinSingleton(String),
+    ImportedModule(String),
+    StandardExceptionInstance(String),
     /// Complex variants without a cross-process identity serialize as
     /// `Opaque` and deserialize back to `ConstValue::Placeholder`.
     Opaque,
@@ -1050,9 +1111,21 @@ impl serde::Serialize for ConstValue {
             ConstValue::Bool(value) => SerializableConstValue::Bool(*value),
             ConstValue::None => SerializableConstValue::None,
             ConstValue::SpecTag(id) => SerializableConstValue::SpecTag(*id),
-            ConstValue::HostObject(obj) => {
-                SerializableConstValue::HostQualname(obj.qualname().to_string())
-            }
+            ConstValue::HostObject(obj) => match HOST_ENV.builtin_singleton_name(obj) {
+                Some(name) => SerializableConstValue::BuiltinSingleton(name.to_owned()),
+                None => match HOST_ENV.standard_exception_instance_name(obj) {
+                    Some(name) => SerializableConstValue::StandardExceptionInstance(name),
+                    None => match HOST_ENV.imported_module_name(obj) {
+                        Some(name) => SerializableConstValue::ImportedModule(name),
+                        None => {
+                            return Err(<S::Error as serde::ser::Error>::custom(format!(
+                                "unsupported HostObject serialization for {}",
+                                obj.qualname()
+                            )));
+                        }
+                    },
+                },
+            },
             ConstValue::Atom(_)
             | ConstValue::Dict(_)
             | ConstValue::Tuple(_)
@@ -1077,10 +1150,22 @@ impl<'de> serde::Deserialize<'de> for ConstValue {
             SerializableConstValue::Bool(value) => ConstValue::Bool(value),
             SerializableConstValue::None => ConstValue::None,
             SerializableConstValue::SpecTag(id) => ConstValue::SpecTag(id),
-            SerializableConstValue::HostQualname(name) => match HOST_ENV.lookup_builtin(&name) {
+            SerializableConstValue::BuiltinSingleton(name) => {
+                match HOST_ENV.lookup_builtin(&name) {
+                    Some(obj) => ConstValue::HostObject(obj),
+                    None => ConstValue::Placeholder,
+                }
+            }
+            SerializableConstValue::ImportedModule(name) => match HOST_ENV.import_module(&name) {
                 Some(obj) => ConstValue::HostObject(obj),
                 None => ConstValue::Placeholder,
             },
+            SerializableConstValue::StandardExceptionInstance(name) => {
+                match HOST_ENV.lookup_standard_exception_instance(&name) {
+                    Some(obj) => ConstValue::HostObject(obj),
+                    None => ConstValue::Placeholder,
+                }
+            }
         })
     }
 }
@@ -3378,5 +3463,49 @@ mod tests {
     fn mro_on_non_class_returns_none() {
         let m = HostObject::new_module("pkg");
         assert!(m.mro().is_none());
+    }
+
+    #[test]
+    fn builtin_exception_class_roundtrips_with_identity() {
+        let value = ConstValue::HostObject(
+            HOST_ENV
+                .lookup_exception_class("OverflowError")
+                .expect("missing builtin OverflowError"),
+        );
+        let encoded = serde_json::to_string(&value).expect("serialize builtin exception class");
+        let decoded: ConstValue =
+            serde_json::from_str(&encoded).expect("deserialize builtin exception class");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn standard_exception_instance_roundtrips_with_identity() {
+        let value = ConstValue::HostObject(
+            HOST_ENV
+                .lookup_standard_exception_instance("OverflowError")
+                .expect("missing standard OverflowError instance"),
+        );
+        let encoded = serde_json::to_string(&value).expect("serialize standard exception instance");
+        let decoded: ConstValue =
+            serde_json::from_str(&encoded).expect("deserialize standard exception instance");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn unsupported_host_object_serialize_errors() {
+        let user_exc = HostObject::new_class(
+            "UserExc",
+            vec![
+                HOST_ENV
+                    .lookup_builtin("Exception")
+                    .expect("missing builtin Exception"),
+            ],
+        );
+        let value = ConstValue::HostObject(HostObject::new_instance(user_exc, Vec::new()));
+        let err = serde_json::to_string(&value).expect_err("unsupported host object should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported HostObject serialization")
+        );
     }
 }

@@ -611,13 +611,11 @@ fn overflow_jump_op(op: &SpaceOperation, target: Label) -> Option<FlatOp> {
 }
 
 fn overflow_error_instance() -> ConstValue {
-    let overflow_cls = crate::flowspace::model::HOST_ENV
-        .lookup_exception_class("OverflowError")
-        .expect("HOST_ENV missing OverflowError");
-    ConstValue::HostObject(crate::flowspace::model::HostObject::new_instance(
-        overflow_cls,
-        Vec::new(),
-    ))
+    ConstValue::HostObject(
+        crate::flowspace::model::HOST_ENV
+            .lookup_standard_exception_instance("OverflowError")
+            .expect("HOST_ENV missing standard OverflowError instance"),
+    )
 }
 
 /// RPython `flatten.py:157-175` `make_exception_link(link, handling_ovf)`.
@@ -1318,10 +1316,14 @@ mod tests {
         );
 
         let flat = flatten(&graph, &identity_regallocs(16));
+        let standard_overflow = crate::flowspace::model::HOST_ENV
+            .lookup_standard_exception_instance("OverflowError")
+            .expect("missing standard OverflowError instance");
         assert!(
-            flat.insns
-                .iter()
-                .any(|op| matches!(op, FlatOp::RaiseConst(ConstValue::HostObject(_)))),
+            flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::RaiseConst(ConstValue::HostObject(obj)) if *obj == standard_overflow
+            )),
             "overflow direct reraises should emit raise Constant(OverflowError-instance)"
         );
         assert!(
