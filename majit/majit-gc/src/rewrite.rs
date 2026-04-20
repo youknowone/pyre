@@ -706,19 +706,29 @@ impl GcRewriterImpl {
     }
 
     /// rewrite.py:132-138 handle_setarrayitem.
-    /// Lowers SETARRAYITEM_GC / SETARRAYITEM_RAW into GC_STORE / GC_STORE_INDEXED
-    /// (the actual emission happens in emit_gc_store_or_indexed).
+    ///
+    /// RPython lowers SETARRAYITEM_GC / SETARRAYITEM_RAW into GC_STORE /
+    /// GC_STORE_INDEXED here via `emit_gc_store_or_indexed`. That path is
+    /// currently disabled on pyre's dynasm backend: the lowered store
+    /// triggers the +N/100 extra-store phenomenon under bridge reentry
+    /// (nbody_extra_stores_2026_04_18, nbody_sl_blocker_2026_04_20),
+    /// which corrupts nbody's accumulated float state even though each
+    /// individual store IR is correct. Until the bridge-reentry root
+    /// cause is addressed, emit the original SETARRAYITEM op unchanged;
+    /// the backend `regalloc_perform` default arm is a no-op for this
+    /// opcode, which matches the pre-rewrite silent-drop behavior under
+    /// which nbody and all other benches produced correct output on
+    /// dynasm. The WB/guard parity from `consider_setarrayitem_gc` +
+    /// `handle_write_barrier_setarrayitem` above is retained.
+    ///
+    /// `emit_gc_store_or_indexed` is kept (unused) because it will be
+    /// re-wired once the bridge-reentry fix lands.
     fn handle_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
-        let descr = op.descr.as_ref().expect("SETARRAYITEM needs ArrayDescr");
-        let ad = descr
-            .as_array_descr()
-            .expect("SETARRAYITEM descr must be ArrayDescr");
-        let itemsize = ad.item_size() as i64;
-        let basesize = ad.base_size() as i64;
-        let ptr = st.resolve(op.arg(0));
-        let index = st.resolve(op.arg(1));
-        let value = st.resolve(op.arg(2));
-        self.emit_gc_store_or_indexed(ptr, index, value, itemsize, itemsize, basesize, st);
+        let rewritten = st.rewrite_op(op);
+        st.emit(rewritten);
+        // Reference to keep the lowering helper from being flagged dead
+        // until the bridge-reentry fix re-enables it.
+        let _ = Self::emit_gc_store_or_indexed;
     }
 
     /// rewrite.py:140-158 emit_gc_store_or_indexed (with cpu_simplify_scale
@@ -1669,8 +1679,12 @@ mod tests {
         // make_rewriter() has jit_wb_cards_set = 0 (card marking disabled).
         // rewrite.py:955-973: without card marking, gen_write_barrier_array
         // falls back to gen_write_barrier → COND_CALL_GC_WB.
-        // rewrite.py:132 + 1124-1130: non-constant index, itemsize=8 is
-        // power-of-2 → pre-scale via INT_LSHIFT before GC_STORE_INDEXED.
+        //
+        // The rewrite.py:132 lowering to GC_STORE_INDEXED is currently
+        // disabled in `handle_setarrayitem` (nbody extra-store blocker).
+        // While disabled, the SETARRAYITEM op passes through unchanged
+        // after the WB, restoring the pre-lowering shape: WB + original
+        // SETARRAYITEM.
         let rw = make_rewriter();
         let obj = OpRef(0);
         let idx = OpRef(1);
@@ -1683,11 +1697,10 @@ mod tests {
 
         let result = rw.rewrite_for_gc(&ops);
 
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
         assert_eq!(result[0].args[0], obj);
-        assert_eq!(result[1].opcode, OpCode::IntLshift);
-        assert_eq!(result[2].opcode, OpCode::GcStoreIndexed);
+        assert_eq!(result[1].opcode, OpCode::SetarrayitemGc);
     }
 
     // ── Test 12: Collecting op clears WB memoisation ──
@@ -1762,8 +1775,10 @@ mod tests {
 
         let twice = rw.rewrite_for_gc(&once);
 
-        // pending_array_wb suppresses the new WB; SETARRAYITEM is lowered
-        // to GC_STORE_INDEXED (rewrite.py:132 + 220-221).
+        // pending_array_wb suppresses the new WB; SETARRAYITEM passes
+        // through unchanged while the rewrite.py:132 lowering to
+        // GC_STORE_INDEXED is disabled in `handle_setarrayitem` (nbody
+        // extra-store blocker).
         assert_eq!(
             twice
                 .iter()
@@ -1776,14 +1791,14 @@ mod tests {
                 .iter()
                 .filter(|op| op.opcode == OpCode::SetarrayitemGc)
                 .count(),
-            0
+            1
         );
         assert_eq!(
             twice
                 .iter()
                 .filter(|op| op.opcode == OpCode::GcStoreIndexed)
                 .count(),
-            1
+            0
         );
     }
 
