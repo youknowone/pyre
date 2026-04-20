@@ -246,24 +246,28 @@ impl Assembler {
                     .insert(label.name.clone(), state.builder.current_pos());
                 state.builder.mark_label(label_id);
             }
-            Insn::Live(args) => {
-                // `assembler.py:149` increments `self.num_liveness_ops`.
-                // pyre's counter lives on `ASSEMBLER_STATE`; `intern_liveness`
-                // below takes care of the `+= 1`, so there is no local
-                // pre-increment here (matching upstream: the bump happens
-                // inside `_encode_liveness`).
-                let live_i = get_liveness_info(args, Kind::Int);
-                let live_r = get_liveness_info(args, Kind::Ref);
-                let live_f = get_liveness_info(args, Kind::Float);
-                let patch_offset = state.builder.live_placeholder();
-                let offset = self.encode_liveness_info(&live_i, &live_r, &live_f);
-                state.builder.patch_live_offset(patch_offset, offset);
-            }
             Insn::Op {
                 opname,
                 args,
                 result,
             } => {
+                // `assembler.py:143-158` `-live-` branch. `liveness.py:5-12`
+                // uses `insn[0] == '-live-'` as the discriminator; pyre
+                // matches on `opname` to keep the tuple-shape parity.
+                if opname == super::flatten::OPNAME_LIVE {
+                    // `assembler.py:149` increments `self.num_liveness_ops`.
+                    // pyre's counter lives on `ASSEMBLER_STATE`;
+                    // `intern_liveness` below takes care of the `+= 1`, so
+                    // there is no local pre-increment here (matching
+                    // upstream: the bump happens inside `_encode_liveness`).
+                    let live_i = get_liveness_info(args, Kind::Int);
+                    let live_r = get_liveness_info(args, Kind::Ref);
+                    let live_f = get_liveness_info(args, Kind::Float);
+                    let patch_offset = state.builder.live_placeholder();
+                    let offset = self.encode_liveness_info(&live_i, &live_r, &live_f);
+                    state.builder.patch_live_offset(patch_offset, offset);
+                    return;
+                }
                 // `assembler.py:208-209`:
                 //   elif isinstance(x, IndirectCallTargets):
                 //       self.indirectcalltargets.update(x.lst)
@@ -1312,7 +1316,7 @@ mod tests {
         let mut ssarepr = SSARepr::new("live");
         ssarepr
             .insns
-            .push(Insn::Live(vec![Operand::Register(r(Kind::Ref, 0))]));
+            .push(Insn::live(vec![Operand::Register(r(Kind::Ref, 0))]));
         ssarepr.insns.push(Insn::op(
             "ref_return",
             vec![Operand::Register(r(Kind::Ref, 0))],

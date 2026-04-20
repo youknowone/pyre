@@ -444,27 +444,31 @@ impl Operand {
     }
 }
 
+/// RPython `-live-` marker opname (`liveness.py:5-12`). Stored as the
+/// first tuple element in RPython's ssarepr; pyre stores it as the
+/// `opname` field of `Insn::Op`, matching the tuple-shape exactly.
+pub const OPNAME_LIVE: &str = "-live-";
+
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
-/// The five RPython tuple shapes enumerated above, plus one
-/// pyre-specific `PcAnchor` variant — see its docstring for rationale.
+/// The four RPython tuple shapes enumerated above (`Label`, `-live-`,
+/// `---`, regular op), plus one pyre-specific `PcAnchor` variant — see
+/// its docstring for rationale. `-live-` shares the `Op` variant with
+/// regular operations, matching RPython's tuple representation where
+/// `insn[0] == '-live-'` is the discriminator.
 #[derive(Debug, Clone)]
 pub enum Insn {
     /// `(Label(name),)` — block-entry marker.
     Label(Label),
-    /// `('-live-', arg1, ...)` — liveness placeholder.
-    ///
-    /// `compute_liveness` (see `liveness.rs`) rewrites this in place with
-    /// the full set of registers alive at this program point.
-    Live(Vec<Operand>),
     /// `('---',)` — unreachable marker; clears the liveness pass's alive
     /// set (`liveness.py:70`).
     Unreachable,
-    /// `(opname, args..., ['->' result])` — regular operation.
-    ///
-    /// `result` is `Some(register)` iff the RPython tuple contains a
-    /// trailing `'->' result` pair; the assembler emits the `>` argcode
-    /// in that case (`assembler.py:210-219`).
+    /// `(opname, args..., ['->' result])` — regular operation, including
+    /// `-live-` liveness markers (`opname == OPNAME_LIVE`). `result` is
+    /// `Some(register)` iff the RPython tuple contains a trailing
+    /// `'->' result` pair; the assembler emits the `>` argcode in that
+    /// case (`assembler.py:210-219`). `-live-` always has
+    /// `result == None`.
     Op {
         opname: String,
         args: Vec<Operand>,
@@ -483,7 +487,7 @@ pub enum Insn {
     /// without emitting any bytecode. This replaces the older
     /// dispatch-time `pc_map[py_pc] = current_pos()` snapshot, which
     /// became stale whenever `compute_liveness::remove_repeated_live`
-    /// merged consecutive `Insn::Live` markers and shifted insn indices.
+    /// merged consecutive `-live-` markers and shifted insn indices.
     ///
     /// Closest RPython analog: `Label(block)` markers used to anchor
     /// merge-point block entries (`flatten.py`); pyre's anchor is the
@@ -507,6 +511,36 @@ impl Insn {
             opname: opname.into(),
             args,
             result: Some(result),
+        }
+    }
+
+    /// `('-live-', args...)` marker, RPython `liveness.py` parity.
+    pub fn live(args: Vec<Operand>) -> Self {
+        Insn::Op {
+            opname: OPNAME_LIVE.to_string(),
+            args,
+            result: None,
+        }
+    }
+
+    /// `true` iff this instruction is a `-live-` marker.
+    pub fn is_live(&self) -> bool {
+        matches!(self, Insn::Op { opname, .. } if opname == OPNAME_LIVE)
+    }
+
+    /// `Some(&args)` if this instruction is a `-live-` marker, else `None`.
+    pub fn live_args(&self) -> Option<&[Operand]> {
+        match self {
+            Insn::Op { opname, args, .. } if opname == OPNAME_LIVE => Some(args),
+            _ => None,
+        }
+    }
+
+    /// `Some(&mut args)` if this instruction is a `-live-` marker, else `None`.
+    pub fn live_args_mut(&mut self) -> Option<&mut Vec<Operand>> {
+        match self {
+            Insn::Op { opname, args, .. } if opname == OPNAME_LIVE => Some(args),
+            _ => None,
         }
     }
 }

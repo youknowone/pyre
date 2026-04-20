@@ -36,8 +36,8 @@ pub fn compute_liveness(ssarepr: &mut SSARepr) {
 }
 
 /// Fixpoint dataflow only, skipping `remove_repeated_live` so external
-/// `Insn::Live` indices stay stable. Used by the codewriter's Phase 4
-/// migration where `live_patches` caches insn indices.
+/// `-live-` marker indices stay stable. Used by the codewriter's
+/// `filter_liveness_in_place` where `live_patches` caches insn indices.
 pub fn compute_liveness_preserve_positions(ssarepr: &mut SSARepr) {
     let mut label2alive: HashMap<String, HashSet<Register>> = HashMap::new();
     while _compute_liveness_must_continue(ssarepr, &mut label2alive) {}
@@ -102,7 +102,7 @@ fn _compute_liveness_must_continue(
         }
 
         // `liveness.py:44-53` `if insn[0] == '-live-':`.
-        if let Insn::Live(args) = &insn {
+        if let Some(args) = insn.live_args() {
             // `liveness.py:45` `labels = []`.
             let mut labels: Vec<Operand> = Vec::new();
             // `liveness.py:46-51` — iterate args, add registers to alive,
@@ -125,11 +125,11 @@ fn _compute_liveness_must_continue(
             //   ssarepr.insns[i] = insn[:1] + tuple(alive) + tuple(labels)
             //
             // The first slot is the `-live-` tag itself (preserved by
-            // writing another `Insn::Live(...)`), followed by the alive
-            // set, followed by the labels.
+            // constructing another `Insn::live(...)`), followed by the
+            // alive set, followed by the labels.
             let mut new_args: Vec<Operand> = alive.iter().copied().map(Operand::Register).collect();
             new_args.extend(labels);
-            ssarepr.insns[i] = Insn::Live(new_args);
+            ssarepr.insns[i] = Insn::live(new_args);
             // `liveness.py:53` `continue`.
             continue;
         }
@@ -158,7 +158,8 @@ fn _compute_liveness_must_continue(
         // consuming operands.
         let (args, result) = match &insn {
             Insn::Op { args, result, .. } => (args.as_slice(), result),
-            // `Label`, `Live`, `Unreachable` were handled above.
+            // `Label`, `-live-` (via `live_args`), `Unreachable`, and
+            // `PcAnchor` were handled above.
             _ => unreachable!("non-Op insn after branches"),
         };
         if let Some(reg) = result {
@@ -259,7 +260,7 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
         // `liveness.py:87` `insn = ssarepr.insns[i]`.
         let insn = ssarepr.insns[i].clone();
         // `liveness.py:88-91`.
-        if !matches!(insn, Insn::Live(_)) {
+        if !insn.is_live() {
             res.push(insn);
             i += 1;
             continue;
@@ -273,7 +274,7 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
         // `liveness.py:97-106` inner loop.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
-            if matches!(next, Insn::Live(_)) {
+            if next.is_live() {
                 lives.push(next);
                 i += 1;
             } else if matches!(next, Insn::Label(_)) {
@@ -302,7 +303,7 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
         // `test_live_duplicate`.
         let mut liveset: HashSet<LiveItem> = HashSet::new();
         for live in &lives {
-            if let Insn::Live(args) = live {
+            if let Some(args) = live.live_args() {
                 for a in args {
                     if let Some(item) = LiveItem::from_operand(a) {
                         liveset.insert(item);
@@ -327,7 +328,7 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
             (LiveItem::TLabel(_), LiveItem::Register(_)) => std::cmp::Ordering::Greater,
             (LiveItem::TLabel(la), LiveItem::TLabel(lb)) => la.name.cmp(&lb.name),
         });
-        res.push(Insn::Live(
+        res.push(Insn::live(
             sorted.into_iter().map(LiveItem::into_operand).collect(),
         ));
     }
@@ -363,7 +364,7 @@ mod tests {
             vec![Operand::Register(r_i(1)), Operand::Register(r_i(2))],
             r_i(3),
         ));
-        s.insns.push(Insn::Live(Vec::new()));
+        s.insns.push(Insn::live(Vec::new()));
         s.insns
             .push(Insn::op("int_return", vec![Operand::Register(r_i(3))]));
         compute_liveness(&mut s);
@@ -372,10 +373,7 @@ mod tests {
         let expanded = s
             .insns
             .iter()
-            .find_map(|insn| match insn {
-                Insn::Live(args) => Some(args.clone()),
-                _ => None,
-            })
+            .find_map(|insn| insn.live_args().map(|a| a.to_vec()))
             .expect("Live marker survives compute_liveness");
         let regs: Vec<Register> = expanded
             .iter()
@@ -395,15 +393,15 @@ mod tests {
         // seq: ('-live-',) ('---',) (int_return, r1)
         // After Unreachable, no registers are alive for the earlier Live.
         let mut s = SSARepr::new("t");
-        s.insns.push(Insn::Live(Vec::new()));
+        s.insns.push(Insn::live(Vec::new()));
         s.insns.push(Insn::Unreachable);
         s.insns
             .push(Insn::op("int_return", vec![Operand::Register(r_i(1))]));
         compute_liveness(&mut s);
-        let expanded = match &s.insns[0] {
-            Insn::Live(args) => args.clone(),
-            _ => panic!("expected Live first"),
-        };
+        let expanded = s.insns[0]
+            .live_args()
+            .expect("expected Live first")
+            .to_vec();
         assert!(
             expanded.is_empty(),
             "Live before '---' should have empty alive set, got {:?}",
@@ -415,13 +413,11 @@ mod tests {
     fn remove_repeated_live_merges_runs() {
         // Two consecutive -live- markers collapse into one.
         let mut s = SSARepr::new("t");
-        s.insns.push(Insn::Live(vec![Operand::Register(r_i(1))]));
-        s.insns.push(Insn::Live(vec![Operand::Register(r_i(2))]));
+        s.insns.push(Insn::live(vec![Operand::Register(r_i(1))]));
+        s.insns.push(Insn::live(vec![Operand::Register(r_i(2))]));
         remove_repeated_live(&mut s);
         assert_eq!(s.insns.len(), 1);
-        let Insn::Live(args) = &s.insns[0] else {
-            panic!("expected single Live")
-        };
+        let args = s.insns[0].live_args().expect("expected single Live");
         let regs: Vec<Register> = args
             .iter()
             .filter_map(|o| {
@@ -450,27 +446,26 @@ mod tests {
         // picks up r1.
         let mut s = SSARepr::new("t");
         s.insns.push(Insn::Label(FLabel::new("L0")));
-        s.insns.push(Insn::Live(Vec::new()));
+        s.insns.push(Insn::live(Vec::new()));
         s.insns
             .push(Insn::op("int_return", vec![Operand::Register(r_i(1))]));
         s.insns.push(Insn::Unreachable);
         s.insns.push(Insn::Label(FLabel::new("L1")));
-        s.insns.push(Insn::Live(Vec::new()));
+        s.insns.push(Insn::live(Vec::new()));
         compute_liveness(&mut s);
         let regs_at = |idx: usize| -> Vec<Register> {
-            match &s.insns[idx] {
-                Insn::Live(args) => args
-                    .iter()
-                    .filter_map(|o| {
-                        if let Operand::Register(r) = o {
-                            Some(*r)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-                _ => panic!("expected Live"),
-            }
+            s.insns[idx]
+                .live_args()
+                .expect("expected Live")
+                .iter()
+                .filter_map(|o| {
+                    if let Operand::Register(r) = o {
+                        Some(*r)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         };
         assert_eq!(regs_at(1), vec![r_i(1)]);
         assert!(regs_at(5).is_empty());
@@ -491,7 +486,7 @@ mod tests {
     fn live_with_tlabel_keeps_label() {
         let mut s = SSARepr::new("t");
         s.insns
-            .push(Insn::Live(vec![Operand::TLabel(TLabel::new("L1"))]));
+            .push(Insn::live(vec![Operand::TLabel(TLabel::new("L1"))]));
         s.insns
             .push(Insn::op("foo", vec![Operand::Register(r_i(0))]));
         s.insns.push(Insn::Unreachable);
@@ -500,9 +495,7 @@ mod tests {
             .push(Insn::op("bar", vec![Operand::Register(r_i(1))]));
         compute_liveness(&mut s);
 
-        let Insn::Live(args) = &s.insns[0] else {
-            panic!("expected live")
-        };
+        let args = s.insns[0].live_args().expect("expected live");
         assert!(
             args.iter()
                 .any(|a| matches!(a, Operand::Register(r) if *r == r_i(0)))
@@ -533,8 +526,8 @@ mod tests {
     fn repeated_live_merges_registers_and_tlabels() {
         let mut s = SSARepr::new("t");
         s.insns
-            .push(Insn::Live(vec![Operand::TLabel(TLabel::new("L1"))]));
-        s.insns.push(Insn::Live(vec![Operand::Register(r_i(12))]));
+            .push(Insn::live(vec![Operand::TLabel(TLabel::new("L1"))]));
+        s.insns.push(Insn::live(vec![Operand::Register(r_i(12))]));
         s.insns
             .push(Insn::op("foo", vec![Operand::Register(r_i(0))]));
         s.insns.push(Insn::Unreachable);
@@ -543,14 +536,8 @@ mod tests {
             .push(Insn::op("bar", vec![Operand::Register(r_i(1))]));
         compute_liveness(&mut s);
 
-        let live_idx = s
-            .insns
-            .iter()
-            .position(|insn| matches!(insn, Insn::Live(_)))
-            .unwrap();
-        let Insn::Live(args) = &s.insns[live_idx] else {
-            panic!("expected live")
-        };
+        let live_idx = s.insns.iter().position(|insn| insn.is_live()).unwrap();
+        let args = s.insns[live_idx].live_args().expect("expected live");
         assert!(
             args.iter()
                 .any(|a| matches!(a, Operand::Register(r) if *r == r_i(0)))
@@ -596,7 +583,7 @@ mod tests {
             "goto_maybe",
             vec![Operand::TLabel(TLabel::new("L1"))],
         ));
-        s.insns.push(Insn::Live(Vec::new()));
+        s.insns.push(Insn::live(Vec::new()));
         s.insns.push(Insn::op(
             "fooswitch",
             vec![Operand::descr(
@@ -618,14 +605,8 @@ mod tests {
 
         compute_liveness(&mut s);
 
-        let live_idx = s
-            .insns
-            .iter()
-            .position(|insn| matches!(insn, Insn::Live(_)))
-            .unwrap();
-        let Insn::Live(args) = &s.insns[live_idx] else {
-            panic!("expected live")
-        };
+        let live_idx = s.insns.iter().position(|insn| insn.is_live()).unwrap();
+        let args = s.insns[live_idx].live_args().expect("expected live");
         assert!(
             args.iter()
                 .any(|a| matches!(a, Operand::Register(r) if *r == r_i(3)))

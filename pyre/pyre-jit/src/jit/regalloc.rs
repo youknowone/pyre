@@ -352,44 +352,6 @@ impl RegAllocator {
                             must_continue = true;
                         }
                     }
-                    Insn::Live(_) => {
-                        // RPython `regalloc.py:26-77` walks only block
-                        // operations + link.args — `-live-` markers are
-                        // invisible to the allocator because they only
-                        // exist after `flatten` + `compute_liveness`
-                        // run post-regalloc (`codewriter.py:44` vs
-                        // `:55`).
-                        //
-                        // pyre's regalloc runs AFTER
-                        // `filter_liveness_in_place` populates
-                        // `-live-`, so the markers are visible here.
-                        // Previously the allocator extended `alive`
-                        // with each marker's registers, treating the
-                        // marker as an op-use. That extension turns
-                        // out to be redundant for pyre's current
-                        // SSARepr shape:
-                        //
-                        //   - Registers live at a `-live-` marker are
-                        //     either (a) already kept alive by a
-                        //     subsequent op using them via `alive` /
-                        //     `follow_label` propagation, or (b)
-                        //     PyFrame-pinned (locals 0..nlocals, stack
-                        //     slots stack_base..stack_base+depth),
-                        //     whose colors `enforce_input_args` +
-                        //     `ExternalInputs` clamp regardless of
-                        //     interference.
-                        //   - All goto / goto_if_not targets carry a
-                        //     `TLabel`; the generic `Insn::Op` branch
-                        //     below handles `Operand::TLabel` via
-                        //     `follow_label`, which propagates the
-                        //     target's `label2alive` snapshot back to
-                        //     the source.
-                        //
-                        // Leave the arm in place (without extending
-                        // `alive`) so the match stays exhaustive on
-                        // `Insn::Live`; once the variant is unified
-                        // with `Insn::Op`, this arm disappears.
-                    }
                     Insn::Unreachable => {
                         alive.clear();
                     }
@@ -590,14 +552,18 @@ fn follow_label(
 
 /// Apply the rename table to the `SSARepr` in place.
 ///
-/// Walks every `Insn::Op`, rewriting `Register` operands and `result`
-/// registers through the rename table. Leaves constants, labels,
-/// descrs, and indirect-call-target operands untouched.
+/// Walks every `Insn::Op` (including `-live-` markers), rewriting
+/// `Register` operands and `result` registers through the rename
+/// table. Leaves constants, labels, descrs, and indirect-call-target
+/// operands untouched.
 ///
-/// `Insn::Live` markers have empty args at this point in the pipeline
-/// (dispatch emits placeholders, `filter_liveness_in_place` only runs
-/// AFTER this function per `codewriter.py:44-56` parity), so they
-/// don't need rewriting here.
+/// `-live-` markers happen to be empty at the point this function
+/// runs in the current pipeline (dispatch emits placeholders,
+/// `filter_liveness_in_place` only populates them AFTER, per
+/// `codewriter.py:44-56` parity), so the walk is a no-op on them —
+/// but the handling is order-agnostic: if a `-live-` marker ever
+/// arrives here with registers, they'd be remapped consistently with
+/// the surrounding ops.
 pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), u16>) {
     if rename.is_empty() {
         return;
@@ -611,13 +577,6 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), 
                 for op in args.iter_mut() {
                     rename_operand(op, rename);
                 }
-            }
-            Insn::Live(args) => {
-                debug_assert!(
-                    args.is_empty(),
-                    "apply_rename: expected Insn::Live args to be empty at this pipeline stage, got {:?}",
-                    args,
-                );
             }
             Insn::Label(_) | Insn::Unreachable | Insn::PcAnchor(_) => {}
         }

@@ -234,15 +234,14 @@ fn register_helper_fn_pointers(
 /// moved `Label` instead of the `-live-` marker.)
 ///
 /// After the dataflow, pyre applies an in-place post-filter to each
-/// `Insn::Live` so the args carry only the subset of registers the
-/// runtime contract is currently wired to consume (see rules below).
-/// `apply_rename` then rewrites the remaining register indices, and
-/// `get_liveness_info` at assemble time (`assembler.rs:422-437`)
-/// partitions by kind and emits the `all_liveness` byte stream. Both
-/// the tracer's `get_list_of_active_boxes` and the blackhole's
-/// bridge-resume `consume_one_section` read `all_liveness` via
-/// `LivenessIterator`, so the single post-rename `Insn::Live` is the
-/// sole source.
+/// `-live-` marker so the args carry only the subset of registers
+/// the runtime contract is currently wired to consume (see rules
+/// below). `get_liveness_info` at assemble time
+/// (`assembler.rs:422-437`) partitions by kind and emits the
+/// `all_liveness` byte stream. Both the tracer's
+/// `get_list_of_active_boxes` and the blackhole's bridge-resume
+/// `consume_one_section` read `all_liveness` via `LivenessIterator`,
+/// so the single post-rename `-live-` marker is the sole source.
 ///
 /// Post-filter rules (pyre-only adaptation on top of SSA output):
 ///   - Only Ref-kind registers: pyre Int/Float regs are scratch
@@ -288,9 +287,9 @@ fn filter_liveness_in_place(
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     for &(py_pc, insn_idx) in live_patches.iter() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
-            Some(Insn::Live(args)) => args,
+            Some(insn) if insn.is_live() => insn.live_args_mut().unwrap(),
             Some(other) => panic!(
-                "filter_liveness_in_place: expected Insn::Live at index {insn_idx}, got {other:?}"
+                "filter_liveness_in_place: expected -live- marker at index {insn_idx}, got {other:?}"
             ),
             None => panic!(
                 "filter_liveness_in_place: insn index {insn_idx} out of range (len {})",
@@ -1154,12 +1153,12 @@ impl CodeWriter {
         // entry and at every point with a live resume set; `assembler.py:146-158`
         // allocates an `all_liveness` slot and encodes the live-register
         // triple. pyre patches the live-offset after the assembler
-        // computes liveness for the Python PC, so the SSARepr Insn::Live
-        // is empty until Phase 4's compute_liveness replaces it.
+        // computes liveness for the Python PC, so the SSARepr `-live-`
+        // marker is empty until `filter_liveness_in_place` fills it.
         macro_rules! emit_live_placeholder {
             ($ssarepr:expr) => {{
                 let idx = $ssarepr.insns.len();
-                $ssarepr.insns.push(Insn::Live(Vec::new()));
+                $ssarepr.insns.push(Insn::live(Vec::new()));
                 idx
             }};
         }
@@ -2167,9 +2166,10 @@ impl CodeWriter {
         // SSARepr (`codewriter.py:44` vs `:53-56`). Regalloc uses
         // `block.operations` + `link.args` for interference; `-live-`
         // markers don't exist yet. pyre dispatches directly to the
-        // SSARepr, but after Step 4 landed the allocator no longer
-        // reads `Insn::Live` either (see `regalloc.rs`'s `Insn::Live`
-        // arm), so it matches the upstream pre-liveness ordering.
+        // SSARepr — at regalloc time the `-live-` markers are present
+        // but hold empty args (`filter_liveness_in_place` runs post-
+        // rename), so the allocator's generic `Insn::Op` walk is a
+        // no-op on them, matching the upstream pre-liveness ordering.
         let max_stack_depth_observed = depth_at_pc.iter().copied().max().unwrap_or(0);
         let inputs = super::regalloc::ExternalInputs {
             portal_frame_reg,
