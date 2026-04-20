@@ -230,21 +230,35 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 /// jitcodes.
 ///
 /// RPython: `BlackholeInterpBuilder.__init__` (blackhole.py:55-61) runs
-/// `setup_insns(asm.insns)` + `setup_descrs(asm.descrs)` immediately.
-/// pyre mirrors that sequence, feeding the runtime `insns` table
-/// deserialized from the build-time bincode artifact.
+/// `setup_insns(asm.insns)` + `setup_descrs(asm.descrs)` immediately
+/// and `setup_insns` (blackhole.py:66) resolves each opname via
+/// `_get_method` eagerly, raising `AttributeError` if any `bhimpl_*` is
+/// missing.
 ///
-/// Phase D-2 groundwork: callers can now get a fully-populated builder
-/// whose `_insns` and dispatch-table indices match the bytecode stored
-/// in `ALL_JITCODES`. Descrs are left empty — RPython populates them
-/// from the assembler alongside insns, but majit's build-time descrs
-/// pool is not yet serialized into the build artifact, so consumers
-/// that need descr-typed opcodes (`d`/`j`) must still supply their own
-/// via `builder.setup_descrs(...)` for now.
+/// pyre mirrors that fail-fast contract: after `setup_insns` +
+/// `wire_bhimpl_handlers`, assert that every opname in the insns table
+/// has an explicit handler. If any remain unwired we panic here
+/// instead of letting dispatch surface a confusing runtime error.
+///
+/// Descrs are still left empty — RPython populates them from the
+/// assembler alongside insns, but majit's build-time descrs pool is
+/// not yet serialized into the build artifact, so consumers that need
+/// descr-typed opcodes (`d`/`j`) must supply their own via
+/// `builder.setup_descrs(...)`. Tracked as a separate parity item.
 pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
     builder.setup_insns(insns_opname_to_byte());
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+    let unwired = builder.unwired_opnames();
+    if !unwired.is_empty() {
+        panic!(
+            "build_default_bh_builder: {} insns opnames have no bhimpl_* \
+             handler (RPython blackhole.py:66 raises AttributeError here): \
+             {:?}",
+            unwired.len(),
+            unwired,
+        );
+    }
     builder
 }
 

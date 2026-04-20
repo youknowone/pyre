@@ -2856,14 +2856,15 @@ impl BlackholeInterpBuilder {
 
     /// List of opnames whose dispatch table entry is still the
     /// `setup_insns` placeholder — i.e. no `bhimpl_*` handler has been
-    /// wired for them yet. The caller uses this to report which ops are
-    /// still unported before flipping the production dispatch path to
-    /// table-driven.
+    /// wired for them yet.
     ///
-    /// RPython has no analogue: `setup_insns` resolves every entry via
-    /// `_get_method` and would raise `AttributeError` immediately for a
-    /// missing `bhimpl_*`. pyre defers resolution so Phase D migration
-    /// can report gaps without panicking the whole runtime.
+    /// RPython has no analogue: `setup_insns` (blackhole.py:66) resolves
+    /// every entry via `_get_method` and would raise `AttributeError`
+    /// immediately for a missing `bhimpl_*`. pyre splits that into two
+    /// phases — `setup_insns` fills placeholders, `wire_bhimpl_handlers`
+    /// resolves them — so the final fail-fast check lives at the caller
+    /// (see `build_default_bh_builder` in `pyre-jit-trace`). This
+    /// accessor is the diagnostic handle used by that assertion.
     pub fn unwired_opnames(&self) -> Vec<&str> {
         let placeholder = unwired_handler_placeholder as BhOpcodeHandler;
         self._insns
@@ -5832,47 +5833,6 @@ fn handler_residual_call_r_v(
     Ok(p)
 }
 
-// Pyre descr-first variants of residual_call_ir_r and residual_call_r_r.
-//
-// RPython's rewrite_call (rpython/jit/codewriter/jtransform.py:422-431)
-// emits argument lists first and the calldescr last — the resulting
-// blackhole key is `/iIRd>r`. pyre's `Assembler::encode_op` for
-// `OpKind::CallResidual` (assembler.rs:481-505) pushes the `d` byte
-// immediately after the funcptr register and before the argument lists,
-// yielding keys `/idIR>r` and `/idR>r`. The underlying
-// `bhimpl_residual_call_*` is unchanged; only the byte order differs,
-// so this handler just reorders the decode steps.
-
-// `residual_call_ir_r/idIR>r` — pyre order: funcptr, descr, I-list, R-list, >r.
-fn handler_residual_call_ir_r_pyre_idir(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    let (calldescr, p) = read_descr(bh, code, position + 1);
-    let calldescr = calldescr.as_calldescr().clone();
-    let (ai, p) = read_list_i(bh, code, p);
-    let (ar, p) = read_list_r(bh, code, p);
-    bh.registers_r[code[p] as usize] =
-        bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr).0 as i64;
-    Ok(p + 1)
-}
-
-// `residual_call_r_r/idR>r` — pyre order: funcptr, descr, R-list, >r.
-fn handler_residual_call_r_r_pyre_idr(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    let (calldescr, p) = read_descr(bh, code, position + 1);
-    let calldescr = calldescr.as_calldescr().clone();
-    let (ar, p) = read_list_r(bh, code, p);
-    bh.registers_r[code[p] as usize] = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr).0 as i64;
-    Ok(p + 1)
-}
-
 /// Wire all currently-ported bhimpl methods into a `BlackholeInterpBuilder`'s
 /// dispatch table. Called once after `setup_insns`.
 ///
@@ -5883,10 +5843,11 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_same_as/i>i", handler_int_same_as);
     builder.wire_handler("int_neg/i>i", handler_int_neg);
     builder.wire_handler("int_invert/i>i", handler_int_invert);
-    // pyre emits `int_not/r>i` for Rust-source `!x` on an i64 that
-    // landed in a Ref register. Bitwise NOT (RPython int_invert), not
-    // logical not — `!` on integers in Rust is ~, same semantics.
-    builder.wire_handler("int_not/r>i", handler_int_not_r);
+    // pyre-specific `int_invert/r>i`: bitwise NOT on an i64 that landed
+    // in a Ref register due to pyre's tagged-int register class mixing.
+    // Same RPython bhimpl (`bhimpl_int_invert`), only the source register
+    // class differs — see `int_add/ri>i` for the broader pattern.
+    builder.wire_handler("int_invert/r>i", handler_int_not_r);
     builder.wire_handler("int_is_true/i>i", handler_int_is_true);
     builder.wire_handler("int_is_zero/i>i", handler_int_is_zero);
     builder.wire_handler("int_force_ge_zero/i>i", handler_int_force_ge_zero);
@@ -5902,11 +5863,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_sub/ri>i", handler_int_sub_ri);
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
     builder.wire_handler("int_and/ii>i", handler_int_and);
-    // RPython's canonical opname is `int_and` (blackhole.py:500); pyre's
-    // build-time codewriter also emits `int_bitand` because the pyre
-    // source uses the fn name `int_bitand` (call.rs:3919
-    // INT_ARITH_TARGETS). Both resolve to `a & b` — same bhimpl.
-    builder.wire_handler("int_bitand/ii>i", handler_int_and);
     builder.wire_handler("int_or/ii>i", handler_int_or);
     builder.wire_handler("int_xor/ii>i", handler_int_xor);
     builder.wire_handler("int_rshift/ii>i", handler_int_rshift);
@@ -6112,19 +6068,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("residual_call_r_i/iRd>i", handler_residual_call_r_i);
     builder.wire_handler("residual_call_r_r/iRd>r", handler_residual_call_r_r);
     builder.wire_handler("residual_call_r_v/iRd", handler_residual_call_r_v);
-    // pyre descr-first variants: Assembler::encode_op's OpKind::CallResidual
-    // arm (assembler.rs:481-505) emits `d` before the I/R lists, yielding
-    // keys `idIR>r` / `idR>r` instead of the RPython `iIRd>r` / `iRd>r`.
-    // Same bhimpl_residual_call_* call, only the byte order differs.
-    builder.wire_handler(
-        "residual_call_ir_r/idIR>r",
-        handler_residual_call_ir_r_pyre_idir,
-    );
-    builder.wire_handler(
-        "residual_call_r_r/idR>r",
-        handler_residual_call_r_r_pyre_idr,
-    );
-
     // Misc no-ops (blackhole.py:1017-1049)
     builder.wire_handler("jit_debug/riiii", handler_jit_debug);
     builder.wire_handler("jit_enter_portal_frame/i", handler_jit_enter_portal_frame);

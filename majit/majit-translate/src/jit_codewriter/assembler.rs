@@ -462,12 +462,13 @@ impl Assembler {
                     OpKind::CallElidable { .. } => "call_elidable",
                     _ => "residual_call",
                 };
-                // RPython `assembler.py:160-174` walks `op.args` in order:
-                // funcptr first, then calldescr. jtransform now
-                // materializes direct-call funcptrs as `ConstInt`
-                // values, so every post-jtransform call op reaches the
-                // assembler as `CallFuncPtr::Value(...)` and encodes the
-                // orthodox leading `i` operand.
+                // RPython `jtransform.py:422-431` `rewrite_call` emits args
+                // by kind (I, R, F) first, then the calldescr, producing
+                // keys like `residual_call_ir_r/iIRd>r`. jtransform now
+                // materializes direct-call funcptrs as `ConstInt` values,
+                // so every post-jtransform call op reaches the assembler
+                // as `CallFuncPtr::Value(...)` and encodes the orthodox
+                // leading `i` operand.
                 match funcptr {
                     crate::model::CallFuncPtr::Value(vid) => {
                         let (reg, kc) = self.lookup_reg_with_kind(*vid, regallocs);
@@ -478,7 +479,11 @@ impl Assembler {
                         panic!("call op reached assembler without materialized funcptr: {target}");
                     }
                 }
-                // RPython assembler.py:197-207: descriptor as 2-byte index
+                // Reserve the descr slot up front — the index is allocated
+                // here so the `arg_classes` suffix below can reference it,
+                // but the two bytes are written AFTER the I/R/F lists to
+                // match `jtransform.py:422-431` ordering: `iIRFd` /
+                // `iIRd` / `iRd`.
                 let descr_idx = self.descrs.len();
                 let calldescr = crate::jitcode::BhCallDescr {
                     arg_classes: self.kinds_suffix(args_i, args_r, args_f).to_string(),
@@ -486,9 +491,6 @@ impl Assembler {
                 };
                 self.descrs
                     .push(crate::jitcode::BhDescr::Call { calldescr });
-                state.code.push((descr_idx & 0xFF) as u8);
-                state.code.push((descr_idx >> 8) as u8);
-                argcodes.push('d');
                 // RPython jtransform.py:422-431: kind-separated sublists
                 let kinds = self.kinds_suffix(args_i, args_r, args_f);
                 if kinds.contains('i') {
@@ -503,6 +505,12 @@ impl Assembler {
                     self.emit_list_of_kind(args_f, RegKind::Float, regallocs, state);
                     argcodes.push('F');
                 }
+                // RPython assembler.py:197-207: descriptor as 2-byte index,
+                // emitted last per jtransform.py:422-431 ordering so the
+                // blackhole key suffix is `...d>k`.
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
                 // Result
                 if let Some(result) = op.result {
                     argcodes.push('>');
@@ -1146,8 +1154,26 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::VableArrayWrite { item_ty, .. } => {
             format!("setarrayitem_vable_{}", value_type_to_kind(item_ty))
         }
-        OpKind::BinOp { op, .. } => format!("int_{op}"),
-        OpKind::UnaryOp { op, .. } => format!("int_{op}"),
+        // RPython `blackhole.py:500` canonical opnames for bitwise ints are
+        // `int_and` / `int_or` / `int_xor`. pyre's front-end (`front/ast.rs`
+        // `binary_op_name`) uses Rust's `syn::BinOp` trait names
+        // (`bitand`/`bitor`/`bitxor`) for source faithfulness, so rename them
+        // here at the emission boundary instead of duplicating wire entries
+        // in the blackhole dispatch table.
+        OpKind::BinOp { op, .. } => match op.as_str() {
+            "bitand" => "int_and".into(),
+            "bitor" => "int_or".into(),
+            "bitxor" => "int_xor".into(),
+            _ => format!("int_{op}"),
+        },
+        // RPython `blackhole.py:488-498`: bitwise NOT on i64 is `int_invert`.
+        // pyre's front-end uses Rust's `syn::UnOp::Not` spelling `not` for
+        // both logical-not and bitwise-not (they share the `!` token at the
+        // AST level); canonicalize to `int_invert` at the emission boundary.
+        OpKind::UnaryOp { op, .. } => match op.as_str() {
+            "not" => "int_invert".into(),
+            _ => format!("int_{op}"),
+        },
         OpKind::VableForce => "hint_force_virtualizable".into(),
         // jtransform.py:1731-1743 — jit.* builtin ops
         OpKind::JitDebug { .. } => "jit_debug".into(),
@@ -1402,8 +1428,10 @@ mod tests {
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
 
+        // RPython jtransform.py:422-431 canonical order:
+        // `residual_call_r_r/iRd>r` (funcptr, R-list, descr, >result).
         assert!(
-            asm.insns.contains_key("residual_call_r_r/idR>r"),
+            asm.insns.contains_key("residual_call_r_r/iRd>r"),
             "expected funcptr-first residual_call key, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
