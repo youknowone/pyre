@@ -37,7 +37,7 @@ pub fn compute_liveness(ssarepr: &mut SSARepr) {
 
 /// Fixpoint dataflow only, skipping `remove_repeated_live` so external
 /// `-live-` marker indices stay stable. Used by the codewriter's
-/// `filter_liveness_in_place` where `live_patches` caches insn indices.
+/// `filter_liveness_in_place` where `live_patches` caches marker indices.
 pub fn compute_liveness_preserve_positions(ssarepr: &mut SSARepr) {
     let mut label2alive: HashMap<String, HashSet<Register>> = HashMap::new();
     while _compute_liveness_must_continue(ssarepr, &mut label2alive) {}
@@ -417,7 +417,9 @@ mod tests {
         s.insns.push(Insn::live(vec![Operand::Register(r_i(2))]));
         remove_repeated_live(&mut s);
         assert_eq!(s.insns.len(), 1);
-        let args = s.insns[0].live_args().expect("expected single Live");
+        let args = s.insns[0]
+            .live_args()
+            .expect("expected single -live- marker");
         let regs: Vec<Register> = args
             .iter()
             .filter_map(|o| {
@@ -495,7 +497,7 @@ mod tests {
             .push(Insn::op("bar", vec![Operand::Register(r_i(1))]));
         compute_liveness(&mut s);
 
-        let args = s.insns[0].live_args().expect("expected live");
+        let args = s.insns[0].live_args().expect("expected -live- marker");
         assert!(
             args.iter()
                 .any(|a| matches!(a, Operand::Register(r) if *r == r_i(0)))
@@ -537,7 +539,9 @@ mod tests {
         compute_liveness(&mut s);
 
         let live_idx = s.insns.iter().position(|insn| insn.is_live()).unwrap();
-        let args = s.insns[live_idx].live_args().expect("expected live");
+        let args = s.insns[live_idx]
+            .live_args()
+            .expect("expected -live- marker");
         assert!(
             args.iter()
                 .any(|a| matches!(a, Operand::Register(r) if *r == r_i(0)))
@@ -606,7 +610,9 @@ mod tests {
         compute_liveness(&mut s);
 
         let live_idx = s.insns.iter().position(|insn| insn.is_live()).unwrap();
-        let args = s.insns[live_idx].live_args().expect("expected live");
+        let args = s.insns[live_idx]
+            .live_args()
+            .expect("expected -live- marker");
         assert!(
             args.iter()
                 .any(|a| matches!(a, Operand::Register(r) if *r == r_i(3)))

@@ -229,7 +229,7 @@ fn register_helper_fn_pointers(
 /// `remove_repeated_live` so `live_patches` insn indices stay valid
 /// offsets into `ssarepr.insns`. (The full `compute_liveness` would
 /// call `remove_repeated_live`'s `res.extend(labels); res.push(live)`
-/// reorder loop, which swaps `Live, Label` into `Label, Live` even
+/// reorder loop, which swaps `-live-, Label` into `Label, -live-` even
 /// when nothing is merged — `live_patches[i].1` then points at the
 /// moved `Label` instead of the `-live-` marker.)
 ///
