@@ -36,7 +36,9 @@ use super::model::{
 use super::policy::Specializer;
 use super::signature::ParamType;
 use crate::flowspace::argument::{CallShape, Signature};
-use crate::flowspace::model::{BlockRefExt, ConstValue, Constant, HostObject, checkgraph};
+use crate::flowspace::model::{
+    BlockRefExt, ConstValue, Constant, HostObject, checkgraph, host_getattr,
+};
 use crate::flowspace::objspace::build_flow;
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::UnionFindInfo;
@@ -1841,9 +1843,100 @@ impl MethodDesc {
         Ok(())
     }
 
-    // `MethodDesc.simplify_desc_set` (description.py:473-519) — the
-    // selfclassdef / flags collapse — is deferred until classdesc.py
-    // provides `ClassDef.issubclass` and `bookkeeper.getmethoddesc`.
+    /// RPython `MethodDesc.simplify_desc_set(descs)` (description.py:473-519).
+    pub fn simplify_desc_set(descs: &mut std::collections::BTreeMap<DescKey, DescEntry>) {
+        let mut lst: Vec<Rc<RefCell<MethodDesc>>> = descs
+            .values()
+            .filter_map(|entry| entry.as_method())
+            .collect();
+        if lst.len() <= 1 {
+            return;
+        }
+
+        // description.py:486-504 — keep only the intersection of all flags.
+        let mut commonflags = lst[0].borrow().flags.clone();
+        commonflags.retain(|key, value| {
+            lst[1..]
+                .iter()
+                .all(|desc| desc.borrow().flags.get(key) == Some(value))
+        });
+
+        let mut replacements: Vec<(DescKey, DescEntry)> = Vec::new();
+        for desc in &lst {
+            let borrowed = desc.borrow();
+            if borrowed.flags != commonflags {
+                let newdesc = borrowed.base.bookkeeper.getmethoddesc(
+                    &borrowed.funcdesc,
+                    borrowed.originclassdef,
+                    borrowed.selfclassdef,
+                    &borrowed.name,
+                    commonflags.clone(),
+                );
+                replacements.push((DescKey::from_rc(desc), DescEntry::Method(newdesc)));
+            }
+        }
+        for (old_key, new_entry) in replacements {
+            descs.remove(&old_key);
+            descs.insert(new_entry.desc_key(), new_entry);
+        }
+
+        // description.py:505-519 — remove methods shadowed by a more
+        // general selfclassdef on the same func/origin/name triple.
+        lst = descs
+            .values()
+            .filter_map(|entry| entry.as_method())
+            .collect();
+        let mut groups: HashMap<(DescKey, ClassDefKey, String), Vec<Rc<RefCell<MethodDesc>>>> =
+            HashMap::new();
+        for desc in &lst {
+            let borrowed = desc.borrow();
+            if borrowed.selfclassdef.is_none() {
+                continue;
+            }
+            groups
+                .entry((
+                    DescKey::from_rc(&borrowed.funcdesc),
+                    borrowed.originclassdef,
+                    borrowed.name.clone(),
+                ))
+                .or_default()
+                .push(desc.clone());
+        }
+        for group in groups.values() {
+            if group.len() <= 1 {
+                continue;
+            }
+            let mut remove: Vec<DescKey> = Vec::new();
+            for desc1 in group {
+                let borrowed1 = desc1.borrow();
+                let Some(cdef1) = borrowed1.selfclassdef else {
+                    continue;
+                };
+                for desc2 in group {
+                    let borrowed2 = desc2.borrow();
+                    let Some(cdef2) = borrowed2.selfclassdef else {
+                        continue;
+                    };
+                    if cdef1 == cdef2 {
+                        continue;
+                    }
+                    let Some(classdef1) = borrowed1.base.bookkeeper.lookup_classdef(cdef1) else {
+                        continue;
+                    };
+                    let Some(classdef2) = borrowed2.base.bookkeeper.lookup_classdef(cdef2) else {
+                        continue;
+                    };
+                    if classdef1.borrow().issubclass(&classdef2) {
+                        remove.push(DescKey::from_rc(desc1));
+                        break;
+                    }
+                }
+            }
+            for key in remove {
+                descs.remove(&key);
+            }
+        }
+    }
 }
 
 /// RPython helper `new_or_old_class(c)` (description.py:522-526).
@@ -1858,23 +1951,6 @@ impl MethodDesc {
 /// fallback becomes a real `type(pyobj)` lookup.
 pub fn new_or_old_class(pyobj: &HostObject) -> Option<HostObject> {
     pyobj.instance_class().cloned()
-}
-
-/// Walk the MRO of `cls` and return the first class-dict entry for
-/// `attr`. Mirror of Python's `getattr(cls, attr)` when `cls` has no
-/// per-object shadow: check `cls.__dict__[attr]`, then walk base
-/// classes via `cls.__mro__`.
-fn class_mro_get(cls: &HostObject, attr: &str) -> Option<ConstValue> {
-    if let Some(v) = cls.class_get(attr) {
-        return Some(v);
-    }
-    let mro = cls.mro()?;
-    for base in mro.iter().skip(1) {
-        if let Some(v) = base.class_get(attr) {
-            return Some(v);
-        }
-    }
-    None
 }
 
 /// RPython `read_attribute` callback type for [`FrozenDesc`]
@@ -1918,10 +1994,8 @@ impl FrozenDesc {
     ///
     /// With `read_attribute = None`, upstream installs the default
     /// `lambda attr: getattr(pyobj, attr)`. The Rust port supplies
-    /// [`Self::default_read_attribute`] — a module-aware reader that
-    /// falls through to `None` (= AttributeError) for non-module
-    /// HostObjects; once classdesc.py lands, full host-level getattr
-    /// replaces the default.
+    /// [`Self::default_read_attribute`] — a host-level `getattr`
+    /// mirror for the HostObject kinds currently modelled.
     pub fn new(bookkeeper: Rc<Bookkeeper>, pyobj: HostObject) -> Result<Self, AnnotatorError> {
         let callback = Self::default_read_attribute(pyobj.clone());
         Self::new_with_read_attribute(bookkeeper, pyobj, callback)
@@ -1950,44 +2024,14 @@ impl FrozenDesc {
     /// Default `read_attribute` closure — Rust equivalent of upstream
     /// `lambda attr: getattr(pyobj, attr)` (description.py:534).
     ///
-    /// Python's `getattr(obj, attr)` does a type-dispatched lookup:
-    ///
-    /// * On **modules** — `obj.__dict__[attr]`.
-    /// * On **classes** — `obj.__dict__[attr]`, else walk `__mro__` of
-    ///   `obj` (class-of-class).
-    /// * On **instances** — `obj.__dict__[attr]`, else walk the MRO of
-    ///   `obj.__class__`.
-    ///
-    /// The Rust port covers all three by reflecting through the
-    /// available `HostObject` surfaces. Instance `__dict__` isn't
-    /// modelled yet, so instance-level frozen attributes fall through
-    /// to the class-hierarchy lookup — matching upstream's behaviour
-    /// for PBCs that expose immutable class-level attributes.
+    /// The Rust port routes through [`crate::flowspace::model::host_getattr`].
+    /// That helper mirrors the host kinds the current model can
+    /// represent, including staticmethod unwrapping. Descriptors whose
+    /// runtime result would require executing Python code still surface
+    /// as "attribute missing" until the host runtime grows that
+    /// capability.
     pub fn default_read_attribute(pyobj: HostObject) -> FrozenReadAttr {
-        Box::new(move |attr: &str| -> Option<ConstValue> {
-            if pyobj.is_module() {
-                pyobj.module_get(attr).map(ConstValue::HostObject)
-            } else if pyobj.is_class() {
-                // upstream `getattr(cls, attr)` — walk MRO starting at
-                // self.
-                class_mro_get(&pyobj, attr)
-            } else if pyobj.is_instance() {
-                // upstream `getattr(instance, attr)` — Python checks the
-                // instance `__dict__` before walking the class MRO, so
-                // per-instance attributes shadow class members. Mirror
-                // that ordering via HostObject::instance_get +
-                // instance_class + class_mro_get.
-                if let Some(v) = pyobj.instance_get(attr) {
-                    Some(v)
-                } else {
-                    pyobj
-                        .instance_class()
-                        .and_then(|cls| class_mro_get(cls, attr))
-                }
-            } else {
-                None
-            }
-        })
+        Box::new(move |attr: &str| host_getattr(&pyobj, attr).ok())
     }
 
     /// RPython `FrozenDesc.has_attribute(attr)` (description.py:539-546).
@@ -2848,6 +2892,57 @@ mod tests {
     }
 
     #[test]
+    fn method_desc_simplify_desc_set_intersects_flags_and_drops_shadowed_subclass() {
+        let bk = bk();
+        let base = crate::annotator::classdesc::ClassDef::new_standalone("pkg.Base", None);
+        let child = crate::annotator::classdesc::ClassDef::new_standalone("pkg.Child", Some(&base));
+        bk.register_classdef(base.clone());
+        bk.register_classdef(child.clone());
+        let fd = wrap_fd(&bk, "m");
+        let origin = ClassDefKey::from_classdef(&base);
+
+        let mut base_flags = std::collections::BTreeMap::new();
+        base_flags.insert("access_directly".into(), true);
+        let mut child_flags = base_flags.clone();
+        child_flags.insert("fresh_malloc".into(), true);
+
+        let base_md = bk.getmethoddesc(
+            &fd,
+            origin,
+            Some(ClassDefKey::from_classdef(&base)),
+            "m",
+            base_flags.clone(),
+        );
+        let child_md = bk.getmethoddesc(
+            &fd,
+            origin,
+            Some(ClassDefKey::from_classdef(&child)),
+            "m",
+            child_flags,
+        );
+
+        let mut descs = std::collections::BTreeMap::new();
+        descs.insert(DescKey::from_rc(&base_md), DescEntry::Method(base_md));
+        descs.insert(DescKey::from_rc(&child_md), DescEntry::Method(child_md));
+
+        MethodDesc::simplify_desc_set(&mut descs);
+
+        assert_eq!(descs.len(), 1);
+        let remaining = descs
+            .values()
+            .next()
+            .unwrap()
+            .as_method()
+            .expect("remaining desc must be MethodDesc");
+        let borrowed = remaining.borrow();
+        assert_eq!(
+            borrowed.selfclassdef,
+            Some(ClassDefKey::from_classdef(&base))
+        );
+        assert_eq!(borrowed.flags, base_flags);
+    }
+
+    #[test]
     fn frozen_desc_new_accepts_module_host_object() {
         let bk = bk();
         let pyobj = HostObject::new_module("os");
@@ -3011,6 +3106,23 @@ mod tests {
     }
 
     #[test]
+    fn frozen_desc_default_reader_unwraps_staticmethod() {
+        let bk = bk();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func =
+            HostObject::new_user_function(crate::flowspace::model::GraphFunc::new("f", globals));
+        let cls = HostObject::new_class("Cls", vec![]);
+        cls.class_set(
+            "f",
+            ConstValue::HostObject(HostObject::new_staticmethod("Cls.f", func.clone())),
+        );
+
+        let fd = FrozenDesc::new(bk, cls).unwrap();
+        let v = fd.read_attribute("f").unwrap();
+        assert_eq!(v, ConstValue::HostObject(func));
+    }
+
+    #[test]
     fn frozen_desc_default_reader_routes_instance_through_class() {
         // upstream default reader: `getattr(instance, name)` falls
         // through to the class hierarchy when the instance has no
@@ -3024,6 +3136,24 @@ mod tests {
         let fd = FrozenDesc::new(bk, instance).unwrap();
         let v = fd.read_attribute("TAG").unwrap();
         assert!(matches!(v, ConstValue::Str(ref s) if s == "tag"));
+    }
+
+    #[test]
+    fn frozen_desc_default_reader_unwraps_instance_staticmethod() {
+        let bk = bk();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func =
+            HostObject::new_user_function(crate::flowspace::model::GraphFunc::new("f", globals));
+        let cls = HostObject::new_class("Cls", vec![]);
+        cls.class_set(
+            "f",
+            ConstValue::HostObject(HostObject::new_staticmethod("Cls.f", func.clone())),
+        );
+        let instance = HostObject::new_instance(cls, vec![]);
+
+        let fd = FrozenDesc::new(bk, instance).unwrap();
+        let v = fd.read_attribute("f").unwrap();
+        assert_eq!(v, ConstValue::HostObject(func));
     }
 
     #[test]

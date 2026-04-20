@@ -267,6 +267,7 @@ pub struct MethodDescKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EmulatedPbcCallKey {
     Position(PositionKey),
+    ClassDef(ClassDefKey),
     RDictCall {
         item_id: usize,
         role: &'static str,
@@ -1421,6 +1422,9 @@ impl Bookkeeper {
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
+        if obj.is_property() {
+            return Ok(SomeValue::Property(super::model::SomeProperty::new(obj)));
+        }
         // upstream bookkeeper.py:309-311 — BUILTIN_ANALYZERS lookup
         // produces SomeBuiltin. The Rust port keeps the analyser
         // registry empty (builtin.py is still deferred), so
@@ -1907,6 +1911,26 @@ mod tests {
             .immutablevalue(&ConstValue::HostObject(bltn))
             .expect("builtin HostObject must produce SomeBuiltin");
         assert!(matches!(s, SomeValue::Builtin(_)));
+    }
+
+    #[test]
+    fn immutablevalue_property_returns_someproperty() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{Constant, GraphFunc, HostObject};
+
+        let bk = bk();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let fget = HostObject::new_user_function(GraphFunc::new("fget", globals));
+        let prop = HostObject::new_property("pkg.C.x", Some(fget.clone()), None, None);
+
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(prop))
+            .expect("property HostObject must produce SomeProperty");
+
+        match s {
+            SomeValue::Property(prop) => assert_eq!(prop.fget, Some(fget)),
+            other => panic!("expected SomeProperty, got {other:?}"),
+        }
     }
 
     #[test]

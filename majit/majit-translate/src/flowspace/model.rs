@@ -532,6 +532,75 @@ impl HostObject {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostGetAttrError {
+    Missing,
+    Unsupported,
+}
+
+fn host_class_mro_get(cls: &HostObject, name: &str) -> Option<ConstValue> {
+    if let Some(value) = cls.class_get(name) {
+        return Some(value);
+    }
+    let mro = cls.mro()?;
+    for base in mro.iter().skip(1) {
+        if let Some(value) = base.class_get(name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn host_unwrap_staticmethod(value: ConstValue) -> ConstValue {
+    match value {
+        ConstValue::HostObject(host) if host.is_staticmethod() => host
+            .staticmethod_func()
+            .cloned()
+            .map(ConstValue::HostObject)
+            .unwrap_or(ConstValue::HostObject(host)),
+        other => other,
+    }
+}
+
+/// Best-effort host-level `getattr(obj, name)` over the HostObject
+/// kinds modelled by the current Rust port.
+///
+/// This mirrors the parts of Python descriptor lookup the HostObject
+/// carrier can represent directly today:
+/// * modules read from the module dict;
+/// * class lookup walks the class MRO and unwraps `staticmethod`;
+/// * instance lookup consults `__dict__` first, then the class MRO, and
+///   unwraps `staticmethod`.
+///
+/// Descriptors that would require executing Python code or materialising
+/// a bound method object are still outside the current host model and
+/// therefore remain unresolved here.
+pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGetAttrError> {
+    if pyobj.is_module() {
+        return pyobj
+            .module_get(name)
+            .map(ConstValue::HostObject)
+            .ok_or(HostGetAttrError::Missing);
+    }
+    if pyobj.is_class() {
+        return host_class_mro_get(pyobj, name)
+            .map(host_unwrap_staticmethod)
+            .ok_or(HostGetAttrError::Missing);
+    }
+    if pyobj.is_instance() {
+        if let Some(value) = pyobj.instance_get(name) {
+            return Ok(value);
+        }
+        let cls = pyobj
+            .instance_class()
+            .ok_or(HostGetAttrError::Unsupported)?;
+        return host_class_mro_get(cls, name)
+            .map(host_unwrap_staticmethod)
+            .ok_or(HostGetAttrError::Missing);
+    }
+    Err(HostGetAttrError::Unsupported)
+}
+
 /// C3 linearisation — CPython `type.__mro__` 알고리즘의 Rust 포트.
 ///
 /// C3 규칙: `L[C] = C + merge(L[B1], L[B2], …, [B1, B2, …])` 에서

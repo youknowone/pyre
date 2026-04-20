@@ -48,7 +48,7 @@ use core::fmt;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::super::flowspace::model::{Constant, Variable};
+use super::super::flowspace::model::{Constant, HostObject, Variable};
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
 
@@ -141,6 +141,8 @@ pub enum KnownType {
     /// `builtin_function_or_method` — the RPython
     /// `SomeBuiltin.knowntype = BuiltinFunctionType`.
     BuiltinFunctionOrMethod,
+    /// `property` — the RPython `SomeProperty.knowntype = type(property)`.
+    PropertyType,
     /// `ReferenceType` — the RPython
     /// `SomeWeakRef.knowntype = weakref.ReferenceType`.
     WeakrefReference,
@@ -166,6 +168,7 @@ impl fmt::Display for KnownType {
             KnownType::Bytearray => "bytearray",
             KnownType::NoneType => "NoneType",
             KnownType::BuiltinFunctionOrMethod => "builtin_function_or_method",
+            KnownType::PropertyType => "property",
             KnownType::WeakrefReference => "ReferenceType",
             KnownType::Other => "<other>",
         };
@@ -1316,17 +1319,12 @@ impl SomePBC {
     ///         kind.simplify_desc_set(self.descriptions)
     /// ```
     ///
-    /// Upstream `Desc.simplify_desc_set` is a `@staticmethod` no-op
-    /// for every subclass except `MethodDesc`, which collapses shadow
-    /// methods (description.py override). Rust port honours the base
-    /// no-op contract; the MethodDesc override lands when method
-    /// shadowing becomes a regression source.
     pub fn simplify(&mut self) -> Result<(), AnnotatorError> {
-        let _kind = self.get_kind()?;
+        let kind = self.get_kind()?;
         if self.descriptions.len() > 1 {
-            // `Desc.simplify_desc_set(descs)` — base `@staticmethod`
-            // no-op for FunctionDesc / ClassDesc / FrozenDesc /
-            // MethodOfFrozenDesc. MethodDesc override deferred.
+            if matches!(kind, DescKind::Method) {
+                super::description::MethodDesc::simplify_desc_set(&mut self.descriptions);
+            }
         }
         Ok(())
     }
@@ -1484,6 +1482,42 @@ impl SomeObjectTrait for SomeNone {
     }
     fn can_be_none(&self) -> bool {
         true
+    }
+}
+
+/// RPython `class SomeProperty(SomeObject)` (model.py:672-682).
+///
+/// Used only as the annotation carrier for immutable `property`
+/// descriptors returned by `bookkeeper.immutablevalue`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SomeProperty {
+    pub base: SomeObjectBase,
+    pub fget: Option<HostObject>,
+    pub fset: Option<HostObject>,
+}
+
+impl SomeProperty {
+    pub fn new(prop: &HostObject) -> Self {
+        SomeProperty {
+            base: SomeObjectBase::new(KnownType::PropertyType, true),
+            fget: prop.property_fget().cloned(),
+            fset: prop.property_fset().cloned(),
+        }
+    }
+}
+
+impl SomeObjectTrait for SomeProperty {
+    fn knowntype(&self) -> KnownType {
+        KnownType::PropertyType
+    }
+    fn immutable(&self) -> bool {
+        true
+    }
+    fn is_constant(&self) -> bool {
+        self.base.const_box.is_some()
+    }
+    fn can_be_none(&self) -> bool {
+        false
     }
 }
 
@@ -1761,6 +1795,7 @@ pub enum SomeValue {
     Exception(SomeException),
     PBC(SomePBC),
     None_(SomeNone),
+    Property(SomeProperty),
     Builtin(SomeBuiltin),
     BuiltinMethod(SomeBuiltinMethod),
     WeakRef(SomeWeakRef),
@@ -1797,6 +1832,7 @@ pub enum SomeValueTag {
     Exception,
     PBC,
     None_,
+    Property,
     Builtin,
     BuiltinMethod,
     WeakRef,
@@ -1836,6 +1872,7 @@ impl SomeValueTag {
             T::Exception => &[T::Exception, T::Instance, T::Object],
             T::PBC => &[T::PBC, T::Object],
             T::None_ => &[T::None_, T::Object],
+            T::Property => &[T::Property, T::Object],
             T::Builtin => &[T::Builtin, T::Object],
             T::BuiltinMethod => &[T::BuiltinMethod, T::Object],
             T::WeakRef => &[T::WeakRef, T::Object],
@@ -1875,6 +1912,7 @@ impl SomeValue {
             SomeValue::Exception(_) => T::Exception,
             SomeValue::PBC(_) => T::PBC,
             SomeValue::None_(_) => T::None_,
+            SomeValue::Property(_) => T::Property,
             SomeValue::Builtin(_) => T::Builtin,
             SomeValue::BuiltinMethod(_) => T::BuiltinMethod,
             SomeValue::WeakRef(_) => T::WeakRef,
@@ -1981,6 +2019,7 @@ impl SomeValue {
             SomeValue::Exception(s) => s.base.const_box.as_ref(),
             SomeValue::PBC(s) => s.base.const_box.as_ref(),
             SomeValue::None_(s) => s.base.const_box.as_ref(),
+            SomeValue::Property(s) => s.base.const_box.as_ref(),
             SomeValue::Builtin(s) => s.base.const_box.as_ref(),
             SomeValue::BuiltinMethod(s) => s.base.const_box.as_ref(),
             SomeValue::WeakRef(s) => s.base.const_box.as_ref(),
@@ -2014,6 +2053,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Exception(s) => s.knowntype(),
             SomeValue::PBC(s) => s.knowntype(),
             SomeValue::None_(s) => s.knowntype(),
+            SomeValue::Property(s) => s.knowntype(),
             SomeValue::Builtin(s) => s.knowntype(),
             SomeValue::BuiltinMethod(s) => s.knowntype(),
             SomeValue::WeakRef(s) => s.knowntype(),
@@ -2044,6 +2084,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Exception(s) => s.immutable(),
             SomeValue::PBC(s) => s.immutable(),
             SomeValue::None_(s) => s.immutable(),
+            SomeValue::Property(s) => s.immutable(),
             SomeValue::Builtin(s) => s.immutable(),
             SomeValue::BuiltinMethod(s) => s.immutable(),
             SomeValue::WeakRef(s) => s.immutable(),
@@ -2074,6 +2115,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Exception(s) => s.is_constant(),
             SomeValue::PBC(s) => s.is_constant(),
             SomeValue::None_(s) => s.is_constant(),
+            SomeValue::Property(s) => s.is_constant(),
             SomeValue::Builtin(s) => s.is_constant(),
             SomeValue::BuiltinMethod(s) => s.is_constant(),
             SomeValue::WeakRef(s) => s.is_constant(),
@@ -2109,6 +2151,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Exception(s) => s.can_be_none(),
             SomeValue::PBC(s) => s.can_be_none(),
             SomeValue::None_(s) => s.can_be_none(),
+            SomeValue::Property(s) => s.can_be_none(),
             SomeValue::Builtin(s) => s.can_be_none(),
             SomeValue::BuiltinMethod(s) => s.can_be_none(),
             SomeValue::WeakRef(s) => s.can_be_none(),

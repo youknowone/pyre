@@ -184,6 +184,7 @@ fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
             py_bool(pbc.can_be_none)
         ),
         SomeValue::None_(_) => "SomeNone()".into(),
+        SomeValue::Property(_) => "SomeProperty()".into(),
         SomeValue::Builtin(_) => "SomeBuiltin()".into(),
         SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod()".into(),
         SomeValue::WeakRef(_) => "SomeWeakRef()".into(),

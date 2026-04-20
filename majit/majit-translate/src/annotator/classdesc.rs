@@ -65,7 +65,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
-use super::bookkeeper::{Bookkeeper, PositionKey};
+use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::model::{AnnotatorError, DescKind, SomeInteger, SomeString, SomeValue, union};
 use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
 
@@ -1026,11 +1026,9 @@ impl ClassDesc {
 
     /// RPython `ClassDesc._init_classdef(self)` (classdesc.py:672-697).
     ///
-    /// The `bookkeeper.emulate_pbc_call(__del__, …)` tail
-    /// (classdesc.py:691-696) requires the call-family machinery ported
-    /// in `binaryop.py` + `annrpython.py` driver. Presence of `__del__`
-    /// on a classdict therefore surfaces as [`AnnotatorError`] so
-    /// `__del__`-bearing classes abort until the dep lands.
+    /// The final `__del__` branch mirrors upstream's
+    /// `bookkeeper.emulate_pbc_call(classdef, s_func, args_s)` exactly,
+    /// keyed by the unique [`ClassDef`].
     pub fn _init_classdef(
         this: &Rc<RefCell<Self>>,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
@@ -1074,12 +1072,23 @@ impl ClassDesc {
         }
         ClassDef::setup(&classdef, classsources)?;
 
-        // classdesc.py:691-696 — __del__ emulate_pbc_call path.
+        // classdesc.py:691-696 — annotate `__del__` if present.
         if this.borrow().classdict.contains_key("__del__") {
-            return Err(AnnotatorError::new(
-                "ClassDesc._init_classdef: __del__ triggers bookkeeper.emulate_pbc_call \
-                 (Phase 5 P5.2+ binaryop.py + annrpython.py dep — see classdesc.py:691-696)",
-            ));
+            let s_func = Self::s_read_attribute(this, "__del__")?;
+            let args_s = [SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef.clone()),
+                false,
+                std::collections::BTreeMap::new(),
+            ))];
+            let s = bk.emulate_pbc_call(
+                EmulatedPbcCallKey::ClassDef(super::description::ClassDefKey::from_classdef(
+                    &classdef,
+                )),
+                &s_func,
+                &args_s,
+                &[],
+            )?;
+            assert!(super::model::s_none().contains(&s));
         }
         Ok(classdef)
     }
@@ -2182,6 +2191,27 @@ mod tests {
         Rc::new(Bookkeeper::new())
     }
 
+    fn compiled_graph_func(src: &str) -> crate::flowspace::model::GraphFunc {
+        use rustpython_compiler::{Mode, compile as rp_compile};
+        use rustpython_compiler_core::bytecode::ConstantData;
+
+        let code = rp_compile(src, Mode::Exec, "<test>".into(), Default::default())
+            .expect("compile should succeed");
+        let inner = code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some(&**code),
+                _ => None,
+            })
+            .expect("function body should be a code constant");
+        crate::flowspace::model::GraphFunc::from_host_code(
+            crate::flowspace::bytecode::HostCode::from_code(inner),
+            Constant::new(ConstValue::Dict(Default::default())),
+            Vec::new(),
+        )
+    }
+
     fn make_classdesc(bk: &Rc<Bookkeeper>, name: &str) -> Rc<RefCell<ClassDesc>> {
         let pyobj = HostObject::new_class(name, vec![]);
         Rc::new(RefCell::new(ClassDesc::new_shell(bk, pyobj, name.into())))
@@ -2728,13 +2758,21 @@ mod tests {
     }
 
     #[test]
-    fn classdesc_init_classdef_rejects_del_with_citation() {
+    fn classdesc_init_classdef_emulates_del_call() {
         let bk = make_bk();
         let cls = HostObject::new_class("pkg.HasDel", vec![]);
-        cls.class_set("__del__", ConstValue::Int(0));
+        cls.class_set(
+            "__del__",
+            ConstValue::HostObject(HostObject::new_user_function(compiled_graph_func(
+                "def __del__(self):\n    return None\n",
+            ))),
+        );
         let desc_rc = ClassDesc::new(&bk, cls, None, None, None).unwrap();
-        let err = ClassDesc::_init_classdef(&desc_rc).unwrap_err();
-        assert!(err.msg.as_deref().unwrap().contains("emulate_pbc_call"));
+        let classdef = ClassDesc::_init_classdef(&desc_rc).unwrap();
+        let key = EmulatedPbcCallKey::ClassDef(
+            super::super::description::ClassDefKey::from_classdef(&classdef),
+        );
+        assert!(bk.emulated_pbc_calls.borrow().contains_key(&key));
     }
 
     #[test]

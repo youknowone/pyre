@@ -41,7 +41,9 @@
 use std::collections::HashMap;
 
 use super::flowcontext::FlowingError;
-use super::model::{ConstValue, Constant, Hlvalue, SpaceOperation, Variable};
+use super::model::{
+    ConstValue, Constant, Hlvalue, HostGetAttrError, SpaceOperation, Variable, host_getattr,
+};
 
 /// RPython `NOT_REALLY_CONST` (operation.py:22-35). Maps a module
 /// qualname to the set of attribute names that are *real* constants
@@ -1115,51 +1117,15 @@ impl HLOperation {
 ///   so the call surfaces as a `FlowingError`.
 fn host_const_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>, String> {
     match obj {
-        ConstValue::HostObject(h) if h.is_module() => match h.module_get(name) {
-            Some(value) => Ok(Some(ConstValue::HostObject(value))),
-            None => Err(format!(
+        ConstValue::HostObject(h) => match host_getattr(h, name) {
+            Ok(value) => Ok(Some(value)),
+            Err(HostGetAttrError::Missing) => Err(format!(
                 "getattr({}, {:?}) always raises AttributeError",
                 h.qualname(),
                 name
             )),
+            Err(HostGetAttrError::Unsupported) => Ok(None),
         },
-        ConstValue::HostObject(h) if h.is_class() => {
-            // upstream: class-level getattr walks the MRO via `getattr(cls,
-            // attr)`. Rust port handles this via `class_get` which folds
-            // the C3-linearised class hierarchy.
-            match h.class_get(name) {
-                Some(value) => Ok(Some(value)),
-                None => Err(format!(
-                    "getattr({}, {:?}) always raises AttributeError",
-                    h.qualname(),
-                    name
-                )),
-            }
-        }
-        ConstValue::HostObject(h) if h.is_instance() => {
-            // upstream: `getattr(inst, attr)` checks `inst.__dict__`
-            // before the class MRO. Mirror via instance_get then
-            // class_mro_get (FrozenDesc.default_read_attribute uses
-            // the same lookup order, description.rs).
-            if let Some(value) = h.instance_get(name) {
-                return Ok(Some(value));
-            }
-            if let Some(cls) = h.instance_class() {
-                // Walk MRO manually — class_mro_get is internal to
-                // annotator; operation.rs uses class_get + bases.
-                for ancestor in std::iter::once(cls.clone()).chain(cls.mro().into_iter().flatten())
-                {
-                    if let Some(value) = ancestor.class_get(name) {
-                        return Ok(Some(value));
-                    }
-                }
-            }
-            Err(format!(
-                "getattr({}, {:?}) always raises AttributeError",
-                h.qualname(),
-                name
-            ))
-        }
         // Primitive foldable constants (Int / Float / Str / …): upstream
         // `getattr(1, 'real')` etc. produce bound methods / builtin ints
         // that would round-trip through `const(result)` + `WrapException`
