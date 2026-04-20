@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::call::CallDescriptor;
 use crate::model::{
-    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, Terminator,
-    ValueId, ValueType, remap_control_flow_metadata,
+    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueId,
+    ValueType, remap_control_flow_metadata,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -2412,7 +2412,7 @@ fn classify_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, ValueType};
 
     #[test]
     fn rewrite_graph_tags_vable_fields() {

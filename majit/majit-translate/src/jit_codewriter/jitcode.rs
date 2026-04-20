@@ -905,7 +905,7 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             FlatOp::GotoIfExceptionMismatch { llexitcase, target } => {
                 writeln!(
                     out,
-                    "  goto_if_exception_mismatch ${}, L{}",
+                    "  goto_if_exception_mismatch ${:?}, L{}",
                     llexitcase, target.0
                 )
                 .ok();

@@ -293,8 +293,10 @@ fn remap_callee_values(
         // by the raising op / branch condition, so it is already in
         // `op_value_refs` — but the per-link args must be copied here.
         for link in &block.exits {
-            for &v in &link.args {
-                map.entry(v).or_insert_with(|| graph.alloc_value());
+            for arg in &link.args {
+                if let Some(v) = arg.as_value() {
+                    map.entry(v).or_insert_with(|| graph.alloc_value());
+                }
             }
         }
         if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {

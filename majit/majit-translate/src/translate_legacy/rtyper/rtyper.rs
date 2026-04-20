@@ -88,8 +88,9 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
         for link in &block.exits {
             let target_block = graph.block(link.target);
             for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                let Some(src) = src.as_value() else { continue };
                 if state.get(*dst) == &ConcreteType::Unknown {
-                    let src_ty = state.get(*src).clone();
+                    let src_ty = state.get(src).clone();
                     if src_ty != ConcreteType::Unknown {
                         state.concrete_types.insert(*dst, src_ty);
                     }
@@ -176,7 +177,7 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{FunctionGraph, OpKind, ValueType};
     use crate::translate_legacy::annotator::annrpython as annotate;
 
     #[test]

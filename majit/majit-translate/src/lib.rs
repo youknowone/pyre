@@ -56,8 +56,7 @@ pub use jtransform::{
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{
-    Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
-    ValueType,
+    Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueId, ValueType,
 };
 pub use parse::{
     CallPath, ExtractedHandlerCall, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,

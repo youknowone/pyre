@@ -9,7 +9,7 @@ use syn::{Item, ItemFn};
 
 use crate::ParsedInterpreter;
 use crate::model::{
-    BlockId, CallTarget, ExitSwitch, FunctionGraph, ImmutableRank, Link, OpKind, Terminator,
+    BlockId, CallTarget, ExitSwitch, FunctionGraph, ImmutableRank, Link, LinkArg, OpKind,
     UnknownKind, ValueId, ValueType, exception_exitcase,
 };
 
@@ -1468,7 +1468,10 @@ fn lower_expr(
                         exc_block,
                         Some(exception_exitcase()),
                     )
-                    .extravars(Some(last_exception), Some(last_exc_value)),
+                    .extravars(
+                        Some(LinkArg::from(last_exception)),
+                        Some(LinkArg::from(last_exc_value)),
+                    ),
                 ],
             );
             *block = continuation;
@@ -2715,7 +2718,9 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(
             entry.exits[0].args,
-            vec![entry.operations[0].result.expect("const result")],
+            vec![crate::model::LinkArg::from(
+                entry.operations[0].result.expect("const result"),
+            )],
         );
     }
 
@@ -2746,7 +2751,8 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(entry.exits[0].args.len(), 1);
         assert_ne!(
-            entry.exits[0].args[0], returnblock_arg,
+            entry.exits[0].args[0].as_value(),
+            Some(returnblock_arg),
             "void return must allocate a fresh prevblock-side ValueId (`flowspace/model.py:114`), \
              not reuse the returnblock's own inputarg"
         );

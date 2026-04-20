@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
-use crate::model::{Block, FunctionGraph, Terminator, ValueId};
+use crate::model::{Block, FunctionGraph, ValueId};
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 
@@ -246,8 +246,10 @@ impl RegAllocator {
         // iterate `block.exits` for `link.args` + `block.exitswitch` for the
         // branch condition.
         for link in &block.exits {
-            for &v in &link.args {
-                die_at.remove(&v);
+            for arg in &link.args {
+                if let Some(v) = arg.as_value() {
+                    die_at.remove(&v);
+                }
             }
         }
         if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
@@ -300,8 +302,10 @@ impl RegAllocator {
         for block in &graph.blocks {
             for link in &block.exits {
                 let target_block = graph.block(link.target);
-                for (&v, &w) in link.args.iter().zip(target_block.inputargs.iter()) {
-                    self.try_coalesce(v, w, consider);
+                for (v, &w) in link.args.iter().zip(target_block.inputargs.iter()) {
+                    if let Some(v) = v.as_value() {
+                        self.try_coalesce(v, w, consider);
+                    }
                 }
             }
         }
@@ -415,7 +419,7 @@ pub fn perform_all_register_allocations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{FunctionGraph, OpKind, ValueType};
 
     #[test]
     fn non_overlapping_lifetimes_share_register() {

@@ -101,7 +101,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let num = name_label(*target, &mut seenlabels, &mut next_label);
                 let _ = writeln!(
                     out,
-                    "{prefix}goto_if_exception_mismatch ${llexitcase}, L{num}"
+                    "{prefix}goto_if_exception_mismatch ${llexitcase:?}, L{num}"
                 );
             }
             FlatOp::GotoIfNot { cond, target } => {

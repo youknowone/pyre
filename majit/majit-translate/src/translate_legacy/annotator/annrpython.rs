@@ -9,7 +9,7 @@
 //! each op's inputs and computing the output type. Iterates to
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
-use crate::model::{FunctionGraph, OpKind, Terminator, ValueId, ValueType};
+use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
 use std::collections::HashMap;
 
 /// Annotation state: maps ValueId → inferred ValueType.
@@ -71,7 +71,8 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
             for link in &block.exits {
                 let target_block = graph.block(link.target);
                 for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    let src_ty = state.get(*src).clone();
+                    let Some(src) = src.as_value() else { continue };
+                    let src_ty = state.get(src).clone();
                     let current = state.get(*dst).clone();
                     let merged = union_type(&current, &src_ty);
                     if merged != current {
@@ -190,7 +191,7 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
     #[test]
     fn annotates_const_int() {

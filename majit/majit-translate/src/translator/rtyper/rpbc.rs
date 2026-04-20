@@ -156,7 +156,7 @@ pub fn assert_no_indirect_call_targets(graph: &FunctionGraph) {
 mod tests {
     use super::*;
     use crate::call::CallControl;
-    use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{FunctionGraph, OpKind, ValueType};
     use crate::translate_legacy::annotator::annrpython::annotate;
     use crate::translate_legacy::rtyper::rtyper::resolve_types;
 

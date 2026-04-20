@@ -3316,7 +3316,9 @@ fn collect_readwrite_effects(
         for link in &block.exits {
             if let Some(target_block) = graph.blocks.get(link.target.0) {
                 for (ia, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    phi_sources.insert(*ia, *src);
+                    if let Some(src) = src.as_value() {
+                        phi_sources.insert(*ia, src);
+                    }
                 }
             }
         }
@@ -4406,9 +4408,6 @@ mod tests {
     }
 
     // ── getcalldescr tests ───────────────────────────���──────────────
-
-    use crate::model::Terminator;
-
     /// Helper: create a FunctionGraph with just a return.
     fn simple_graph(name: &str) -> FunctionGraph {
         let mut g = FunctionGraph::new(name);

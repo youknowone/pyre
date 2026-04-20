@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use crate::flatten::{FlatOp, Label, RegKind, SSARepr};
+use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
 use crate::model::ValueId;
 use crate::regalloc::RegAllocResult;
@@ -283,13 +284,10 @@ impl Assembler {
                 //            Constant(link.llexitcase,
                 //                     lltype.typeOf(link.llexitcase)),
                 //            TLabel(link))
-                // Flatten already narrowed per `lltype.typeOf` to `i64`
-                // (`lltype.Signed`); the opname suffix encodes the
-                // matching kind.
                 let opnum = self.get_opnum("goto_if_exception_mismatch/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                let encoded_llexitcase = self.emit_const_i(*llexitcase, state);
+                let encoded_llexitcase = self.emit_llexitcase(llexitcase, state);
                 state.code.push(encoded_llexitcase);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
@@ -1125,6 +1123,16 @@ impl Assembler {
         state.constants_i.push(value);
         (state.num_regs_i + state.constants_i.len() - 1) as u8
     }
+
+    fn emit_llexitcase(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+        match value {
+            ConstValue::Int(value) => self.emit_const_i(*value, state),
+            ConstValue::HostObject(obj) => self.emit_const_i(obj.identity_id() as i64, state),
+            other => {
+                panic!("goto_if_exception_mismatch: unsupported llexitcase constant {other:?}")
+            }
+        }
+    }
 }
 
 /// Per-assembly state (RPython: Assembler.setup() fields).
@@ -1493,7 +1501,7 @@ mod tests {
 
     #[test]
     fn assemble_with_registers() {
-        use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+        use crate::model::{FunctionGraph, OpKind, ValueType};
         // Build graph for regalloc (regalloc operates on graph, not SSARepr)
         let mut graph = FunctionGraph::new("add");
         let entry = graph.startblock;
@@ -1558,7 +1566,7 @@ mod tests {
     fn assemble_direct_residual_call_encodes_leading_funcptr_operand() {
         use crate::call::CallControl;
         use crate::jtransform::{GraphTransformConfig, Transformer};
-        use crate::model::{FunctionGraph, OpKind, Terminator, ValueType};
+        use crate::model::{FunctionGraph, OpKind, ValueType};
         use crate::translate_legacy::annotator::annrpython::annotate;
         use crate::translate_legacy::rtyper::rtyper::resolve_types;
 
@@ -1626,7 +1634,7 @@ mod tests {
     fn no_legacy_funcptr_from_vtable_after_new_pipeline() {
         use crate::call::CallControl;
         use crate::jtransform::{GraphTransformConfig, Transformer};
-        use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
+        use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
         use crate::translate_legacy::annotator::annrpython::annotate;
         use crate::translate_legacy::rtyper::rtyper::resolve_types;
         use crate::translator::rtyper::rpbc::lower_indirect_calls;
@@ -1723,9 +1731,7 @@ mod tests {
         use crate::call::CallControl;
         use crate::flatten::flatten as flatten_graph;
         use crate::jtransform::{GraphTransformConfig, Transformer};
-        use crate::model::{
-            FieldDescriptor, FunctionGraph, ImmutableRank, OpKind, Terminator, ValueType,
-        };
+        use crate::model::{FieldDescriptor, FunctionGraph, ImmutableRank, OpKind, ValueType};
 
         let mut cc = CallControl::new();
         cc.immutable_fields_by_struct.insert(

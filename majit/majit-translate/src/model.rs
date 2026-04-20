@@ -618,7 +618,7 @@ pub enum ExitCase {
 /// RPython `flowspace/model.py:109-168` `Link`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
-    pub args: Vec<ValueId>,
+    pub args: Vec<LinkArg>,
     pub target: BlockId,
     #[serde(skip, default)]
     pub exitcase: Option<ExitCase>,
@@ -632,12 +632,20 @@ pub struct Link {
     /// round-trip to the backend intact.
     #[serde(skip, default)]
     pub llexitcase: Option<ConstValue>,
-    pub last_exception: Option<ValueId>,
-    pub last_exc_value: Option<ValueId>,
+    pub last_exception: Option<LinkArg>,
+    pub last_exc_value: Option<LinkArg>,
 }
 
 impl Link {
     pub fn new(args: Vec<ValueId>, target: BlockId, exitcase: Option<ExitCase>) -> Self {
+        Self::new_mixed(
+            args.into_iter().map(LinkArg::from).collect(),
+            target,
+            exitcase,
+        )
+    }
+
+    pub fn new_mixed(args: Vec<LinkArg>, target: BlockId, exitcase: Option<ExitCase>) -> Self {
         Self {
             args,
             target,
@@ -661,8 +669,8 @@ impl Link {
 
     pub fn extravars(
         mut self,
-        last_exception: Option<ValueId>,
-        last_exc_value: Option<ValueId>,
+        last_exception: Option<LinkArg>,
+        last_exc_value: Option<LinkArg>,
     ) -> Self {
         self.last_exception = last_exception;
         self.last_exc_value = last_exc_value;
@@ -679,36 +687,42 @@ pub fn exception_exitcase() -> ExitCase {
     ExitCase::Const(ConstValue::builtin("Exception"))
 }
 
-/// How control flow leaves a basic block.
-///
-/// RPython equivalent: `Block.exitswitch` + `Block.exits` (Links).
-/// Each variant that targets another block carries `args` which map
-/// to the target block's `inputargs` (RPython `Link.args`).
+/// RPython `Link.args` items are Variables or Constants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Terminator {
-    /// Unconditional jump. `args` → target.inputargs.
-    Goto { target: BlockId, args: Vec<ValueId> },
-    /// Conditional branch. Each arm carries its own args.
-    Branch {
-        cond: ValueId,
-        if_true: BlockId,
-        true_args: Vec<ValueId>,
-        if_false: BlockId,
-        false_args: Vec<ValueId>,
-    },
-    /// "No terminator yet" placeholder.  Upstream never produces this
-    /// variant; it marks blocks before the front-end has filled in a
-    /// concrete `exits`, and final blocks (returnblock / exceptblock)
-    /// whose canonical upstream shape is `operations=()` + `exits=()`.
-    Unreachable,
+pub enum LinkArg {
+    Value(ValueId),
+    Const(ConstValue),
+}
+
+impl LinkArg {
+    pub fn as_value(&self) -> Option<ValueId> {
+        match self {
+            Self::Value(value) => Some(*value),
+            Self::Const(_) => None,
+        }
+    }
+}
+
+impl From<ValueId> for LinkArg {
+    fn from(value: ValueId) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl From<ConstValue> for LinkArg {
+    fn from(value: ConstValue) -> Self {
+        Self::Const(value)
+    }
 }
 
 /// A basic block in the control flow graph.
 ///
-/// RPython equivalent: `flowspace/model.py Block`.
-/// - `inputargs`: Phi-node inputs from predecessor Links (RPython Block.inputargs)
-/// - `ops`: sequential operations within this block
-/// - `terminator`: how control leaves this block
+/// RPython equivalent: `flowspace/model.py:171-180 Block` — slots
+/// `inputargs operations exitswitch exits`.  Upstream has no separate
+/// terminator surface: fall-through is `exitswitch=None` with a single
+/// `Link`, bool branches are `exitswitch=Variable` with two Links
+/// carrying `Bool(false)`/`Bool(true)` exitcases, can-raise is
+/// `exitswitch=c_last_exception`, and final blocks have `exits=()`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Block {
     pub id: BlockId,
@@ -721,7 +735,6 @@ pub struct Block {
     pub exitswitch: Option<ExitSwitch>,
     /// RPython `Block.exits`.
     pub exits: Vec<Link>,
-    pub terminator: Terminator,
 }
 
 impl Block {
@@ -748,39 +761,11 @@ impl Block {
     }
 }
 
-/// PRE-EXISTING-ADAPTATION — pyre's codewriter graph carries a
-/// `Terminator` enum alongside `Block.exits` / `Block.exitswitch`
-/// (upstream `rpython/flowspace/model.py:174` uses
-/// `exitswitch`/`exits` as the sole CFG source of truth).  This helper
-/// projects a `Terminator` down into the matching canonical shape so
-/// consumers of the RPython-orthodox surface (`make_link`,
-/// `insert_exits`, etc.) can read a single representation.  Delete
-/// once the Terminator variant is removed from the crate model.
-pub fn control_flow_from_terminator(terminator: &Terminator) -> (Option<ExitSwitch>, Vec<Link>) {
-    match terminator {
-        Terminator::Goto { target, args } => (None, vec![Link::new(args.clone(), *target, None)]),
-        Terminator::Branch {
-            cond,
-            if_true,
-            true_args,
-            if_false,
-            false_args,
-        } => (
-            Some(ExitSwitch::Value(*cond)),
-            vec![
-                Link::new(false_args.clone(), *if_false, Some(ExitCase::Bool(false))),
-                Link::new(true_args.clone(), *if_true, Some(ExitCase::Bool(true))),
-            ],
-        ),
-        Terminator::Unreachable => (None, Vec::new()),
-    }
-}
-
-/// PRE-EXISTING-ADAPTATION — sibling of `control_flow_from_terminator`
-/// that applies renamings to existing `exitswitch`/`exits` metadata.
-/// Upstream `flowspace/model.py:109-168 Link.copy(rename)` performs the
-/// equivalent in-place rename on the canonical representation; pyre
-/// carries the renamer out-of-band while Terminator still coexists.
+/// RPython `flowspace/model.py:238-244 renamevariables` applies a
+/// value renaming to `inputargs` / `operations` / `exitswitch` /
+/// `link.args`.  Pyre threads the renamer out-of-band here so callers
+/// can reshape both the exitswitch variable and every exit link in one
+/// call.
 pub fn remap_control_flow_metadata<FValue, FBlock>(
     exitswitch: &Option<ExitSwitch>,
     exits: &[Link],
@@ -798,13 +783,26 @@ where
     let exits = exits
         .iter()
         .map(|link| Link {
-            args: link.args.iter().copied().map(&remap_value).collect(),
+            args: link
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    LinkArg::Value(value) => LinkArg::Value(remap_value(*value)),
+                    LinkArg::Const(value) => LinkArg::Const(value.clone()),
+                })
+                .collect(),
             target: remap_block(link.target),
             exitcase: link.exitcase.clone(),
             prevblock: link.prevblock.map(&remap_block),
             llexitcase: link.llexitcase.clone(),
-            last_exception: link.last_exception.map(&remap_value),
-            last_exc_value: link.last_exc_value.map(&remap_value),
+            last_exception: link.last_exception.as_ref().map(|arg| match arg {
+                LinkArg::Value(value) => LinkArg::Value(remap_value(*value)),
+                LinkArg::Const(value) => LinkArg::Const(value.clone()),
+            }),
+            last_exc_value: link.last_exc_value.as_ref().map(|arg| match arg {
+                LinkArg::Value(value) => LinkArg::Value(remap_value(*value)),
+                LinkArg::Const(value) => LinkArg::Const(value.clone()),
+            }),
         })
         .collect();
     (exitswitch, exits)
@@ -814,12 +812,10 @@ where
 pub struct FunctionGraph {
     pub name: String,
     pub startblock: BlockId,
-    /// RPython `FunctionGraph.returnblock` — `Block([return_var])`.
-    ///
-    /// The codewriter-side graph still admits direct `Terminator::Return`
-    /// uses during the ongoing port, but keep the canonical final-block
-    /// identity on the graph itself so front-end and later passes can
-    /// converge toward upstream `flowspace/model.py:17-25`.
+    /// RPython `flowspace/model.py:17-18 FunctionGraph.returnblock` —
+    /// `Block([return_var])` with `operations=()` and `exits=()`.
+    /// Blocks returning a value route to it via
+    /// `Link([value], returnblock)` held in `Block.exits`.
     pub returnblock: BlockId,
     /// RPython `FunctionGraph.exceptblock` — `Block([etype, evalue])`.
     pub exceptblock: BlockId,
@@ -845,6 +841,12 @@ impl FunctionGraph {
             startblock: entry,
             returnblock,
             exceptblock,
+            // RPython `flowspace/model.py:14-25 FunctionGraph.__init__`:
+            //   startblock created empty; returnblock = Block([return_var]);
+            //   exceptblock = Block([Variable('etype'), Variable('evalue')]).
+            // Final blocks have `operations=()` and `exits=()`; fall-through
+            // for the startblock is likewise `exits=[]` until the front-end
+            // closes it.
             blocks: vec![
                 Block {
                     id: entry,
@@ -852,21 +854,13 @@ impl FunctionGraph {
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
-                    terminator: Terminator::Unreachable,
                 },
-                // RPython `flowspace/model.py:17-25` `FunctionGraph.__init__`:
-                // returnblock and exceptblock are final blocks with empty
-                // operations and `exits = ()`.  There is no upstream
-                // terminator variant; pyre tracks "no terminator" with the
-                // `Unreachable` placeholder until the field itself is
-                // removed (Gap B).
                 Block {
                     id: returnblock,
                     inputargs: vec![return_value],
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
-                    terminator: Terminator::Unreachable,
                 },
                 Block {
                     id: exceptblock,
@@ -874,7 +868,6 @@ impl FunctionGraph {
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
-                    terminator: Terminator::Unreachable,
                 },
             ],
             notes: Vec::new(),
@@ -911,7 +904,6 @@ impl FunctionGraph {
             operations: Vec::new(),
             exitswitch: None,
             exits: Vec::new(),
-            terminator: Terminator::Unreachable,
         });
         id
     }
@@ -926,7 +918,6 @@ impl FunctionGraph {
             operations: Vec::new(),
             exitswitch: None,
             exits: Vec::new(),
-            terminator: Terminator::Unreachable,
         });
         (id, args)
     }
@@ -965,37 +956,13 @@ impl FunctionGraph {
         result
     }
 
-    /// PRE-EXISTING-ADAPTATION — upstream `flowspace/model.py:174`
-    /// edits `Block.exitswitch`/`Block.exits` directly; pyre writes
-    /// through `Terminator` first and projects to `exits` via
-    /// `control_flow_from_terminator` so both representations stay
-    /// synced while Terminator lives alongside the canonical shape.
-    pub fn set_terminator(&mut self, block: BlockId, terminator: Terminator) {
-        self.blocks[block.0].terminator = terminator;
-        self.resync_block_exits(block);
-    }
-
-    /// PRE-EXISTING-ADAPTATION — rebuilds `Block.exits` / `exitswitch`
-    /// from `Block.terminator` so the canonical representation
-    /// upstream (`flowspace/model.py:171-181`) demands stays current.
-    /// `with_prevblock` stamps `Link.prevblock` per upstream
-    /// `flowspace/model.py:120`.
-    pub fn resync_block_exits(&mut self, block: BlockId) {
-        let (exitswitch, exits) = control_flow_from_terminator(&self.blocks[block.0].terminator);
-        let block_ref = &mut self.blocks[block.0];
-        block_ref.exitswitch = exitswitch;
-        block_ref.exits = exits
-            .into_iter()
-            .map(|link| link.with_prevblock(block))
-            .collect();
-    }
-
-    /// PRE-EXISTING-ADAPTATION — upstream `flowspace/model.py:304`
-    /// `Block.closeblock(*links)` is the single entry for setting the
-    /// can-raise / typed-exception shape.  pyre exposes the same
-    /// contract at method level while the dual `Terminator` field
-    /// remains; every Link gets `prevblock = block` per
-    /// `flowspace/model.py:120`.
+    /// RPython `flowspace/model.py:250 recloseblock(*exits)` — stamp
+    /// `link.prevblock` on each exit and install them as the block's
+    /// exits, overwriting any previous contents.  The `exitswitch`
+    /// field is passed alongside so callers who set a bool branch or
+    /// can-raise shape keep both halves of the canonical CFG surface
+    /// updated in a single call (pyre-side ergonomics; upstream writes
+    /// `block.exitswitch = ...` before `closeblock`).
     pub fn set_control_flow_metadata(
         &mut self,
         block: BlockId,
@@ -1038,13 +1005,8 @@ impl FunctionGraph {
     /// `target` carrying `args`, `exitswitch = None`.  Upstream
     /// equivalent: `block.closeblock(Link(args, target))`
     /// (`flowspace/model.py:304`).
-    ///
-    /// While the pyre-only `Terminator` dual still coexists with
-    /// `Block.exits`, this helper routes through `set_terminator` so the
-    /// two representations stay synced for readers that have not yet
-    /// migrated off `block.terminator`.
     pub fn set_goto(&mut self, block: BlockId, target: BlockId, args: Vec<ValueId>) {
-        self.set_terminator(block, Terminator::Goto { target, args });
+        self.set_control_flow_metadata(block, None, vec![Link::new(args, target, None)]);
     }
 
     /// Shorthand for the boolean-branch shape — two Links with
@@ -1063,15 +1025,13 @@ impl FunctionGraph {
         if_false: BlockId,
         false_args: Vec<ValueId>,
     ) {
-        self.set_terminator(
+        self.set_control_flow_metadata(
             block,
-            Terminator::Branch {
-                cond,
-                if_true,
-                true_args,
-                if_false,
-                false_args,
-            },
+            Some(ExitSwitch::Value(cond)),
+            vec![
+                Link::new(false_args, if_false, Some(ExitCase::Bool(false))),
+                Link::new(true_args, if_true, Some(ExitCase::Bool(true))),
+            ],
         );
     }
 
@@ -1101,12 +1061,12 @@ impl FunctionGraph {
     /// `Block.exits` — there is no upstream terminator variant that
     /// flags "this block raises".
     ///
-    /// pyre callers that previously wrote `Terminator::Abort` use this
-    /// helper to emit the same CFG shape: a Goto to `graph.exceptblock`
-    /// with two fresh prevblock-side ValueIds standing in for the
-    /// (etype, evalue) pair.  The `_reason` string is retained for
-    /// optional GraphTransformNote annotations (see `jtransform.rs::
-    /// rewrite_graph`'s abort note); pass `""` when not applicable.
+    /// Emits the same CFG shape as upstream: a Link to
+    /// `graph.exceptblock` with two fresh prevblock-side ValueIds
+    /// standing in for the `(etype, evalue)` pair.  The `_reason`
+    /// string is retained for optional GraphTransformNote annotations
+    /// (see `jtransform.rs::rewrite_graph`'s abort note); pass `""`
+    /// when not applicable.
     pub fn set_raise(&mut self, block: BlockId, _reason: &str) {
         let (exceptblock, _, _) = self.exceptblock_args();
         let etype = self.alloc_value();
@@ -1284,6 +1244,6 @@ mod tests {
         assert_eq!(entry_block.exits.len(), 1);
         assert_eq!(entry_block.exits[0].prevblock, Some(entry));
         assert_eq!(entry_block.exits[0].target, graph.returnblock);
-        assert_eq!(entry_block.exits[0].args, vec![value]);
+        assert_eq!(entry_block.exits[0].args, vec![LinkArg::from(value)]);
     }
 }

@@ -989,6 +989,102 @@ pub enum ConstValue {
     SpecTag(u64),
 }
 
+impl std::fmt::Display for ConstValue {
+    /// RPython `Constant.__repr__` prints the wrapped Python value via
+    /// `repr()`; pyre renders the simple leaf variants directly and
+    /// delegates the complex host / code / function shapes to `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConstValue::Atom(atom) => write!(f, "{atom}"),
+            ConstValue::Placeholder => f.write_str("<placeholder>"),
+            ConstValue::Int(value) => write!(f, "{value}"),
+            ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
+            ConstValue::Str(value) => write!(f, "{value:?}"),
+            ConstValue::Bool(value) => write!(f, "{value}"),
+            ConstValue::None => f.write_str("None"),
+            ConstValue::SpecTag(id) => write!(f, "<spec-tag {id}>"),
+            ConstValue::HostObject(obj) => write!(f, "{}", obj.qualname()),
+            ConstValue::Dict(_)
+            | ConstValue::Tuple(_)
+            | ConstValue::List(_)
+            | ConstValue::Code(_)
+            | ConstValue::Function(_) => write!(f, "{self:?}"),
+        }
+    }
+}
+
+/// Serialize / Deserialize are required wherever `Link.args` /
+/// `Link.last_exception` / `Link.last_exc_value` flow through a
+/// bincode-serialized `SSARepr` (see
+/// `pyre-jit-trace/build.rs`).  The simple leaf variants round-trip
+/// faithfully; every complex host-level shape (`Dict`, `Code`,
+/// `Function`, `HostObject`, `Tuple`/`List`, `Atom`) has no
+/// cross-process identity to preserve and deserializes back as
+/// `Placeholder`.  This matches upstream's Python-side `repr` / pickle
+/// behaviour: the complex payloads are reconstituted on the bootstrap
+/// side, not round-tripped through the serialized JitCode artefact.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SerializableConstValue {
+    Placeholder,
+    Int(i64),
+    Float(u64),
+    Str(String),
+    Bool(bool),
+    None,
+    SpecTag(u64),
+    /// Host-dependent payloads flatten to a qualname + Placeholder marker.
+    HostQualname(String),
+    /// Complex variants without a cross-process identity serialize as
+    /// `Opaque` and deserialize back to `ConstValue::Placeholder`.
+    Opaque,
+}
+
+impl serde::Serialize for ConstValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let tag = match self {
+            ConstValue::Placeholder => SerializableConstValue::Placeholder,
+            ConstValue::Int(value) => SerializableConstValue::Int(*value),
+            ConstValue::Float(bits) => SerializableConstValue::Float(*bits),
+            ConstValue::Str(value) => SerializableConstValue::Str(value.clone()),
+            ConstValue::Bool(value) => SerializableConstValue::Bool(*value),
+            ConstValue::None => SerializableConstValue::None,
+            ConstValue::SpecTag(id) => SerializableConstValue::SpecTag(*id),
+            ConstValue::HostObject(obj) => {
+                SerializableConstValue::HostQualname(obj.qualname().to_string())
+            }
+            ConstValue::Atom(_)
+            | ConstValue::Dict(_)
+            | ConstValue::Tuple(_)
+            | ConstValue::List(_)
+            | ConstValue::Code(_)
+            | ConstValue::Function(_) => SerializableConstValue::Opaque,
+        };
+        <SerializableConstValue as serde::Serialize>::serialize(&tag, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ConstValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let tag = <SerializableConstValue as serde::Deserialize<'de>>::deserialize(deserializer)?;
+        Ok(match tag {
+            SerializableConstValue::Placeholder | SerializableConstValue::Opaque => {
+                ConstValue::Placeholder
+            }
+            SerializableConstValue::Int(value) => ConstValue::Int(value),
+            SerializableConstValue::Float(bits) => ConstValue::Float(bits),
+            SerializableConstValue::Str(value) => ConstValue::Str(value),
+            SerializableConstValue::Bool(value) => ConstValue::Bool(value),
+            SerializableConstValue::None => ConstValue::None,
+            SerializableConstValue::SpecTag(id) => ConstValue::SpecTag(id),
+            SerializableConstValue::HostQualname(name) => match HOST_ENV.lookup_builtin(&name) {
+                Some(obj) => ConstValue::HostObject(obj),
+                None => ConstValue::Placeholder,
+            },
+        })
+    }
+}
+
 impl Hash for ConstValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);

@@ -9,8 +9,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::flowspace::model::ConstValue;
 use crate::model::{
-    BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, SpaceOperation, Terminator, ValueId,
+    BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation, ValueId,
 };
 use crate::regalloc::RegAllocResult;
 
@@ -40,14 +41,12 @@ pub enum FlatOp {
     CatchException { target: Label },
     /// RPython `flatten.py:228-231`
     /// `('goto_if_exception_mismatch', Constant(link.llexitcase, lltype.typeOf(link.llexitcase)), TLabel(link))`.
-    /// The link-side `llexitcase` is an arbitrary `Constant` in RPython
-    /// (`Link.llexitcase: Option<ConstValue>` here); the flatten pass
-    /// narrows it per `lltype.typeOf` to the backend's encoded kind —
-    /// today only `lltype.Signed` (`ConstValue::Int`) lands here, so
-    /// the serialized payload stays `i64`.  When class-pointer
-    /// llexitcases start reaching flatten, widen this variant to a
-    /// kind + payload pair.
-    GotoIfExceptionMismatch { llexitcase: i64, target: Label },
+    /// The link-side `llexitcase` is preserved as the full RPython-style
+    /// Constant and encoded by the assembler according to backend needs.
+    GotoIfExceptionMismatch {
+        llexitcase: ConstValue,
+        target: Label,
+    },
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
     ///
     /// RPython `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
@@ -212,20 +211,10 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                     }
                     let mismatch_landing = Label(next_label);
                     next_label += 1;
-                    // RPython `flatten.py:228-231` mints
-                    // `Constant(link.llexitcase, lltype.typeOf(link.llexitcase))`
-                    // directly from the link's low-level exitcase value;
-                    // here we narrow per `lltype.typeOf` to the payload
-                    // shape `FlatOp::GotoIfExceptionMismatch` carries today.
-                    let llexitcase = match link.llexitcase.as_ref() {
-                        Some(crate::flowspace::model::ConstValue::Int(value)) => *value,
-                        Some(other) => panic!(
-                            "goto_if_exception_mismatch: lltype.typeOf({other:?}) \
-                             not yet bridged — widen `FlatOp::GotoIfExceptionMismatch` \
-                             to carry the matching kind before exercising this link"
-                        ),
-                        None => panic!("typed exception links need llexitcase for parity"),
-                    };
+                    let llexitcase = link
+                        .llexitcase
+                        .clone()
+                        .expect("typed exception links need llexitcase for parity");
                     ops.push(FlatOp::GotoIfExceptionMismatch {
                         llexitcase,
                         target: mismatch_landing,
@@ -272,7 +261,9 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             //   if block.exits == (): self.make_return(block.inputargs)
             // Final block — emit the matching return from the block's
             // own inputargs.
-            make_return(graph, &mut ops, regallocs, &block.inputargs);
+            let final_args: Vec<LinkArg> =
+                block.inputargs.iter().copied().map(LinkArg::from).collect();
+            make_return(graph, &mut ops, regallocs, &final_args);
         } else {
             // Upstream `flatten.py:177-278 insert_exits` only handles the
             // four Block.exits shapes above (single goto, can-raise
@@ -413,8 +404,14 @@ fn make_link(
     //       self.make_return(link.args); return
     // Skip the renaming + goto and emit the final return inline.
     if target_block.exits.is_empty() {
-        let carries_exception_args = link.last_exception.is_some_and(|v| link.args.contains(&v))
-            || link.last_exc_value.is_some_and(|v| link.args.contains(&v));
+        let carries_exception_args = link
+            .last_exception
+            .as_ref()
+            .is_some_and(|arg| link.args.contains(arg))
+            || link
+                .last_exc_value
+                .as_ref()
+                .is_some_and(|arg| link.args.contains(arg));
         if !carries_exception_args {
             let _ = target_block;
             make_return(graph, ops, regallocs, &link.args);
@@ -437,12 +434,12 @@ fn generate_last_exc(link: &Link, target_inputargs: &[ValueId], ops: &mut Vec<Fl
         return;
     }
     for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
-        if Some(*v) == link.last_exception {
+        if Some(v) == link.last_exception.as_ref() {
             ops.push(FlatOp::LastException { dst: *w });
         }
     }
     for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
-        if Some(*v) == link.last_exc_value {
+        if Some(v) == link.last_exc_value.as_ref() {
             ops.push(FlatOp::LastExcValue { dst: *w });
         }
     }
@@ -457,12 +454,20 @@ fn make_return(
     _graph: &FunctionGraph,
     ops: &mut Vec<FlatOp>,
     regallocs: &HashMap<RegKind, RegAllocResult>,
-    args: &[ValueId],
+    args: &[LinkArg],
 ) {
+    let expect_value_arg = |arg: &LinkArg, context: &str| -> ValueId {
+        match arg {
+            LinkArg::Value(value) => *value,
+            LinkArg::Const(value) => {
+                panic!("{context}: Constant link arg {value:?} is not supported in this path")
+            }
+        }
+    };
     match args.len() {
         1 => {
             // `flatten.py:131-138` return-from-function.
-            let v = args[0];
+            let v = expect_value_arg(&args[0], "make_return");
             let kind = value_kind(v, regallocs);
             match kind {
                 'v' => ops.push(FlatOp::VoidReturn),
@@ -480,7 +485,7 @@ fn make_return(
             ops.push(FlatOp::Live {
                 live_values: Vec::new(),
             });
-            ops.push(FlatOp::Raise(args[1]));
+            ops.push(FlatOp::Raise(expect_value_arg(&args[1], "make_return")));
         }
         0 => {
             // RPython reaches `make_return` only for exits == () blocks,
@@ -531,8 +536,21 @@ fn make_exception_link(
     debug_assert!(link.last_exception.is_some());
     debug_assert!(link.last_exc_value.is_some());
     let target = graph.block(link.target);
-    if target.operations.is_empty()
-        && link.args == vec![link.last_exception.unwrap(), link.last_exc_value.unwrap()]
+    // Bare-reraise special case: upstream `flatten.py:160-168` collapses
+    // `Link([last_exception, last_exc_value], graph.exceptblock)` into a
+    // single `reraise` + `---` pair so the common propagate-unhandled
+    // shape doesn't need a renaming.  Require the target to be the
+    // graph's canonical `exceptblock` in addition to the args pattern,
+    // otherwise a typed-exception link whose args happen to match
+    // (e.g. a catch handler that receives both exception variables) is
+    // mis-classified as a reraise.
+    if link.target == graph.exceptblock
+        && target.operations.is_empty()
+        && link.args
+            == vec![
+                link.last_exception.clone().unwrap(),
+                link.last_exc_value.clone().unwrap(),
+            ]
     {
         ops.push(FlatOp::Reraise);
         ops.push(FlatOp::Unreachable);
@@ -646,17 +664,18 @@ pub fn insert_renamings(
     let mut dst_vids: Vec<ValueId> = Vec::with_capacity(cap);
     for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
         // `flatten.py:310-311` skip.
-        if Some(*v) == link.last_exception || Some(*v) == link.last_exc_value {
+        if Some(v) == link.last_exception.as_ref() || Some(v) == link.last_exc_value.as_ref() {
             continue;
         }
-        let Some(v_col) = get_color(*v) else { continue };
+        let Some(v) = v.as_value() else { continue };
+        let Some(v_col) = get_color(v) else { continue };
         let Some(w_col) = get_color(*w) else { continue };
         if v_col == w_col {
             continue;
         }
         frm_colors.push(v_col);
         to_colors.push(w_col);
-        src_vids.push(*v);
+        src_vids.push(v);
         dst_vids.push(*w);
     }
 
@@ -806,7 +825,7 @@ where
 mod tests {
     use super::*;
     use crate::flowspace::model::ConstValue;
-    use crate::model::{ExitCase, FunctionGraph, OpKind, Terminator, exception_exitcase};
+    use crate::model::{ExitCase, FunctionGraph, OpKind, exception_exitcase};
 
     /// Test helper — build a `regallocs` map that assigns each
     /// `ValueId(n)` the color `n` in `RegKind::Int`. This turns the
@@ -954,7 +973,10 @@ mod tests {
                     exc_block,
                     Some(exception_exitcase()),
                 )
-                .extravars(Some(last_exception), Some(last_exc_value)),
+                .extravars(
+                    Some(LinkArg::from(last_exception)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
             ],
         );
 
@@ -979,31 +1001,42 @@ mod tests {
         graph.push_op(entry, OpKind::Live, false);
 
         let handler = graph.create_block();
+        let handler_exc_type = graph.alloc_value();
         let handler_exc_value = graph.alloc_value();
+        graph.block_mut(handler).inputargs.push(handler_exc_type);
         graph.block_mut(handler).inputargs.push(handler_exc_value);
         graph.set_goto(handler, graph.returnblock, vec![handler_exc_value]);
 
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
-        let typed_exc_value = graph.alloc_value();
+        let value_error = ConstValue::builtin("ValueError");
         graph.set_goto(entry, graph.returnblock, vec![call_result]);
         graph.set_control_flow_metadata(
             entry,
             Some(crate::model::ExitSwitch::LastException),
             vec![
                 crate::model::Link::new(vec![call_result], graph.returnblock, None),
-                crate::model::Link::new(
-                    vec![typed_exc_value],
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::from(value_error.clone()),
+                        LinkArg::from(last_exc_value),
+                    ],
                     handler,
-                    Some(ExitCase::Const(ConstValue::builtin("ValueError"))),
+                    Some(ExitCase::Const(value_error.clone())),
                 )
                 .with_llexitcase(ConstValue::Int(123))
-                .extravars(Some(last_exception), Some(typed_exc_value)),
+                .extravars(
+                    Some(LinkArg::from(value_error)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
                 crate::model::Link::new(
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(exception_exitcase()),
                 )
-                .extravars(Some(last_exception), Some(last_exc_value)),
+                .extravars(
+                    Some(LinkArg::from(last_exception)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
             ],
         );
 
@@ -1012,11 +1045,17 @@ mod tests {
             flat.insns.iter().any(|op| matches!(
                 op,
                 FlatOp::GotoIfExceptionMismatch {
-                    llexitcase: 123,
+                    llexitcase: ConstValue::Int(123),
                     ..
                 }
             )),
             "typed exception link should emit goto_if_exception_mismatch"
+        );
+        assert!(
+            flat.insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::LastException { dst } if *dst == handler_exc_type)),
+            "typed exception link should materialize last_exception at target inputarg"
         );
         // RPython `flatten.py:336-347 generate_last_exc` writes the
         // exception value into the TARGET inputarg's register, not the
