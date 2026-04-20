@@ -448,21 +448,13 @@ fn decode_exception_catch_sites(
 // exceeds 256 — the same condition that crashes the RPython
 // translator.
 
-/// B6 Phase 3b dual emission entry point for residual calls.
-///
-/// Each per-PC handler that previously called one of `assembler.call_*_typed`
-/// directly now funnels through this helper. Two steps:
-///   1. `emit_residual_call_shape` pushes the upstream-canonical
-///      `residual_call_{kinds}_{reskind}` Insn into the walker-local
-///      `ssarepr` (the Phase 3c authoritative input).
-///   2. The matching `assembler.{...}_typed` call is dispatched below to
-///      preserve the runtime path (the `SSAReprEmitter::ssarepr` consumed
-///      by `Assembler::assemble` today still carries the pyre-only
-///      `call_*` opname). Once Phase 3c switches the assembler input,
-///      step 2 can be removed.
+/// Entry point for residual calls. Pushes the upstream-canonical
+/// `residual_call_{kinds}_{reskind}` Insn into the walker-local
+/// `ssarepr`; `Assembler::assemble`'s `dispatch_residual_call` arm
+/// reconstructs the runtime `call_*_typed` path from the SSA operand
+/// shape (jtransform.py:414-435 `rewrite_call` parity).
 fn emit_residual_call(
     ssarepr: &mut SSARepr,
-    assembler: &mut SSAReprEmitter,
     flavor: CallFlavor,
     fn_idx: u16,
     call_args: &[majit_metainterp::jitcode::JitCallArg],
@@ -470,24 +462,6 @@ fn emit_residual_call(
     dst: Option<u16>,
 ) {
     emit_residual_call_shape(ssarepr, flavor, fn_idx, call_args, reskind, dst);
-    match (flavor, reskind) {
-        (CallFlavor::Plain, ResKind::Int) => {
-            assembler.call_int_typed(fn_idx, call_args, dst.unwrap());
-        }
-        (CallFlavor::Plain, ResKind::Ref) => {
-            assembler.call_ref_typed(fn_idx, call_args, dst.unwrap());
-        }
-        (CallFlavor::MayForce, ResKind::Ref) => {
-            assembler.call_may_force_ref_typed(fn_idx, call_args, dst.unwrap());
-        }
-        (CallFlavor::MayForce, ResKind::Void) => {
-            assembler.call_may_force_void_typed_args(fn_idx, call_args);
-        }
-        (flavor, reskind) => panic!(
-            "emit_residual_call: unsupported runtime (flavor, reskind) = ({:?}, {:?})",
-            flavor, reskind
-        ),
-    }
 }
 
 /// Upstream-shape Insn builder for the walker-local `ssarepr`. See
@@ -928,20 +902,14 @@ impl CodeWriter {
         // stays in sync at every guard/call point — matching RPython's
         // per-push/per-pop semantics.
         macro_rules! emit_vsd {
-            ($asm:expr, $depth:expr) => {
+            ($depth:expr) => {
                 if is_portal {
                     emit_load_const_i!(
                         ssarepr,
-                        $asm,
                         int_tmp0,
                         (stack_base_absolute + $depth as usize) as i64
                     );
-                    emit_vable_setfield_int!(
-                        ssarepr,
-                        $asm,
-                        VABLE_VALUESTACKDEPTH_FIELD_IDX,
-                        int_tmp0
-                    );
+                    emit_vable_setfield_int!(ssarepr, VABLE_VALUESTACKDEPTH_FIELD_IDX, int_tmp0);
                 }
             };
         }
@@ -966,14 +934,13 @@ impl CodeWriter {
         // load the thread-local exception into the handler's input
         // register.
         macro_rules! emit_last_exc_value {
-            ($ssarepr:expr, $asm:expr, $dst:expr) => {{
+            ($ssarepr:expr, $dst:expr) => {{
                 let dst = $dst;
                 $ssarepr.insns.push(Insn::op_with_result(
                     "last_exc_value",
                     Vec::new(),
                     Register::new(Kind::Ref, dst),
                 ));
-                $asm.last_exc_value(dst);
             }};
         }
 
@@ -1031,7 +998,7 @@ impl CodeWriter {
         // caller-order list. See `B6_CODEWRITER_PIPELINE_PLAN.md`.
 
         macro_rules! emit_load_const_i {
-            ($ssarepr:expr, $asm:expr, $dst:expr, $value:expr $(,)?) => {{
+            ($ssarepr:expr, $dst:expr, $value:expr $(,)?) => {{
                 let dst = $dst;
                 let value: i64 = $value;
                 $ssarepr.insns.push(Insn::op_with_result(
@@ -1039,7 +1006,6 @@ impl CodeWriter {
                     vec![Operand::ConstInt(value)],
                     Register::new(Kind::Int, dst),
                 ));
-                $asm.load_const_i_value(dst, value);
             }};
         }
 
@@ -1055,16 +1021,15 @@ impl CodeWriter {
         // return path; `assembler.py:221` turns that into the `ref_return/r`
         // bytecode key.
         macro_rules! emit_ref_return {
-            ($ssarepr:expr, $asm:expr, $src:expr) => {{
+            ($ssarepr:expr, $src:expr) => {{
                 let src = $src;
                 $ssarepr
                     .insns
                     .push(Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]));
                 // `rpython/jit/codewriter/flatten.py:144-146`: terminators
                 // emit `('---',)` so the backward liveness pass clears its
-                // alive set. Mirrors `SSAReprEmitter::ref_return`.
+                // alive set.
                 $ssarepr.insns.push(Insn::Unreachable);
-                $asm.ref_return(src);
             }};
         }
 
@@ -1076,7 +1041,7 @@ impl CodeWriter {
         // Phase 3c dispatch (`assembler.rs::dispatch_op:345`) can resolve
         // it against `builder_label`.
         macro_rules! emit_goto {
-            ($ssarepr:expr, $asm:expr, $labels:expr, $target_py_pc:expr) => {{
+            ($ssarepr:expr, $target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
                 $ssarepr.insns.push(Insn::op(
                     "goto",
@@ -1085,9 +1050,8 @@ impl CodeWriter {
                 // `rpython/jit/codewriter/flatten.py:111-112`: an
                 // unconditional goto implicitly ends a block so the
                 // liveness pass (`liveness.py:68-69`) can reset the alive
-                // set. Matches `SSAReprEmitter::jump`'s internal push.
+                // set.
                 $ssarepr.insns.push(Insn::Unreachable);
-                $asm.jump($labels[target_py_pc]);
             }};
         }
 
@@ -1098,13 +1062,12 @@ impl CodeWriter {
         // jitdriver so `jdindex` is always 0 — the arg is the
         // `Constant(jdindex, lltype.Signed)` from upstream.
         macro_rules! emit_loop_header {
-            ($ssarepr:expr, $asm:expr, $jdindex:expr) => {{
+            ($ssarepr:expr, $jdindex:expr) => {{
                 let jdindex: u16 = $jdindex;
                 $ssarepr.insns.push(Insn::op(
                     "loop_header",
                     vec![Operand::ConstInt(jdindex as i64)],
                 ));
-                $asm.loop_header(jdindex);
             }};
         }
 
@@ -1123,9 +1086,8 @@ impl CodeWriter {
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
-            ($ssarepr:expr, $asm:expr) => {{
+            ($ssarepr:expr) => {{
                 $ssarepr.insns.push(Insn::op("abort_permanent", Vec::new()));
-                $asm.abort_permanent();
             }};
         }
 
@@ -1135,12 +1097,11 @@ impl CodeWriter {
         // into `raise/r`. pyre's single `emit_raise(exc_reg)` call site
         // (RAISE_VARARGS with argc >= 1) corresponds to the same edge.
         macro_rules! emit_raise {
-            ($ssarepr:expr, $asm:expr, $src:expr) => {{
+            ($ssarepr:expr, $src:expr) => {{
                 let src = $src;
                 $ssarepr
                     .insns
                     .push(Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]));
-                $asm.emit_raise(src);
             }};
         }
 
@@ -1149,9 +1110,8 @@ impl CodeWriter {
         // the re-raise edge; `assembler.py:220` turns it into
         // `reraise/`. pyre emits this for RAISE_VARARGS with argc == 0.
         macro_rules! emit_reraise {
-            ($ssarepr:expr, $asm:expr) => {{
+            ($ssarepr:expr) => {{
                 $ssarepr.insns.push(Insn::op("reraise", Vec::new()));
-                $asm.emit_reraise();
             }};
         }
 
@@ -1165,7 +1125,7 @@ impl CodeWriter {
         // `catch_landing_{landing_label}` — distinct from the
         // `pc{py_pc}` naming used for PC-indexed labels.
         macro_rules! emit_catch_exception {
-            ($ssarepr:expr, $asm:expr, $catch_label:expr) => {{
+            ($ssarepr:expr, $catch_label:expr) => {{
                 let catch_label = $catch_label;
                 $ssarepr.insns.push(Insn::op(
                     "catch_exception",
@@ -1174,7 +1134,6 @@ impl CodeWriter {
                         catch_label
                     )))],
                 ));
-                $asm.catch_exception(catch_label);
             }};
         }
 
@@ -1187,7 +1146,7 @@ impl CodeWriter {
         // `catch_landing_{u16}`) match the TLabel schemes used by
         // `emit_goto!` and `emit_catch_exception!`.
         macro_rules! emit_mark_label_pc {
-            ($ssarepr:expr, $asm:expr, $labels:expr, $py_pc:expr) => {{
+            ($ssarepr:expr, $py_pc:expr) => {{
                 let py_pc = $py_pc;
                 $ssarepr
                     .insns
@@ -1195,11 +1154,10 @@ impl CodeWriter {
                         "pc{}",
                         py_pc
                     ))));
-                $asm.mark_label($labels[py_pc]);
             }};
         }
         macro_rules! emit_mark_label_catch_landing {
-            ($ssarepr:expr, $asm:expr, $landing_label:expr) => {{
+            ($ssarepr:expr, $landing_label:expr) => {{
                 let landing_label = $landing_label;
                 $ssarepr
                     .insns
@@ -1207,7 +1165,6 @@ impl CodeWriter {
                         "catch_landing_{}",
                         landing_label
                     ))));
-                $asm.mark_label(landing_label);
             }};
         }
 
@@ -1219,14 +1176,9 @@ impl CodeWriter {
         // computes liveness for the Python PC, so the SSARepr Insn::Live
         // is empty until Phase 4's compute_liveness replaces it.
         macro_rules! emit_live_placeholder {
-            ($ssarepr:expr, $asm:expr) => {{
-                // Phase 3c Step 3: compute the insn index from the external
-                // SSARepr directly. `$asm.live_placeholder()` is a no-op
-                // holdover kept for compile compatibility until Step 3b
-                // drops the walker's per-op `$asm.XXX()` lines.
+            ($ssarepr:expr) => {{
                 let idx = $ssarepr.insns.len();
                 $ssarepr.insns.push(Insn::Live(Vec::new()));
-                let _ = $asm.live_placeholder();
                 idx
             }};
         }
@@ -1238,7 +1190,7 @@ impl CodeWriter {
         // `_rewrite_equality` + flatten.py:247 specialisation
         // `goto_if_not_int_is_zero <v> L` (blackhole.py:916-920).
         macro_rules! emit_goto_if_not {
-            ($ssarepr:expr, $asm:expr, $labels:expr, $cond:expr, $py_pc:expr) => {{
+            ($ssarepr:expr, $cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
                 $ssarepr.insns.push(Insn::op(
@@ -1248,11 +1200,10 @@ impl CodeWriter {
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 ));
-                $asm.branch_reg_zero(cond, $labels[py_pc]);
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
-            ($ssarepr:expr, $asm:expr, $labels:expr, $cond:expr, $py_pc:expr) => {{
+            ($ssarepr:expr, $cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
                 $ssarepr.insns.push(Insn::op(
@@ -1262,7 +1213,6 @@ impl CodeWriter {
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 ));
-                $asm.goto_if_not_int_is_zero(cond, $labels[py_pc]);
             }};
         }
 
@@ -1281,7 +1231,7 @@ impl CodeWriter {
         // relies on the Phase 3c dispatch aliases (added alongside)
         // to route the full-form opnames to the same builder methods.
         macro_rules! emit_vable_getfield_ref {
-            ($ssarepr:expr, $asm:expr, $dst:expr, $field_idx:expr) => {{
+            ($ssarepr:expr, $dst:expr, $field_idx:expr) => {{
                 let dst = $dst;
                 let field_idx = $field_idx;
                 $ssarepr.insns.push(Insn::op_with_result(
@@ -1289,11 +1239,10 @@ impl CodeWriter {
                     vec![Operand::ConstInt(field_idx as i64)],
                     Register::new(Kind::Ref, dst),
                 ));
-                $asm.vable_getfield_ref(dst, field_idx);
             }};
         }
         macro_rules! emit_vable_setfield_int {
-            ($ssarepr:expr, $asm:expr, $field_idx:expr, $src:expr) => {{
+            ($ssarepr:expr, $field_idx:expr, $src:expr) => {{
                 let field_idx = $field_idx;
                 let src = $src;
                 $ssarepr.insns.push(Insn::op(
@@ -1303,11 +1252,10 @@ impl CodeWriter {
                         Operand::reg(Kind::Int, src),
                     ],
                 ));
-                $asm.vable_setfield_int(field_idx, src);
             }};
         }
         macro_rules! emit_vable_getarrayitem_ref {
-            ($ssarepr:expr, $asm:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
+            ($ssarepr:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
                 let dst = $dst;
                 let field_idx = $field_idx;
                 let index = $index;
@@ -1319,11 +1267,10 @@ impl CodeWriter {
                     ],
                     Register::new(Kind::Ref, dst),
                 ));
-                $asm.vable_getarrayitem_ref(dst, field_idx, index);
             }};
         }
         macro_rules! emit_vable_setarrayitem_ref {
-            ($ssarepr:expr, $asm:expr, $field_idx:expr, $index:expr, $src:expr) => {{
+            ($ssarepr:expr, $field_idx:expr, $index:expr, $src:expr) => {{
                 let field_idx = $field_idx;
                 let index = $index;
                 let src = $src;
@@ -1335,7 +1282,6 @@ impl CodeWriter {
                         Operand::reg(Kind::Ref, src),
                     ],
                 ));
-                $asm.vable_setarrayitem_ref(field_idx, index, src);
             }};
         }
 
@@ -1347,7 +1293,7 @@ impl CodeWriter {
         // The SSARepr arg list follows the RPython `(src, '->', dst)`
         // shape via `op_with_result`.
         macro_rules! emit_move_r {
-            ($ssarepr:expr, $asm:expr, $dst:expr, $src:expr) => {{
+            ($ssarepr:expr, $dst:expr, $src:expr) => {{
                 let dst = $dst;
                 let src = $src;
                 $ssarepr.insns.push(Insn::op_with_result(
@@ -1355,7 +1301,6 @@ impl CodeWriter {
                     vec![Operand::reg(Kind::Ref, src)],
                     Register::new(Kind::Ref, dst),
                 ));
-                $asm.move_r(dst, src);
             }};
         }
 
@@ -1366,7 +1311,7 @@ impl CodeWriter {
         // `jit_merge_point/IRR` (int-list, ref-list, ref-list). pyre
         // emits this at the portal loop header.
         macro_rules! emit_jit_merge_point {
-            ($ssarepr:expr, $asm:expr, $greens_i:expr, $greens_r:expr, $reds_r:expr) => {{
+            ($ssarepr:expr, $greens_i:expr, $greens_r:expr, $reds_r:expr) => {{
                 let greens_i: &[u8] = $greens_i;
                 let greens_r: &[u8] = $greens_r;
                 let reds_r: &[u8] = $reds_r;
@@ -1386,7 +1331,6 @@ impl CodeWriter {
                         Operand::ListOfKind(to_list(Kind::Ref, reds_r)),
                     ],
                 ));
-                $asm.jit_merge_point(greens_i, greens_r, reds_r);
             }};
         }
 
@@ -1397,13 +1341,13 @@ impl CodeWriter {
                 current_depth = handler_depth;
             }
             // RPython flatten.py: Label(block) at block entry
-            emit_mark_label_pc!(ssarepr, assembler, labels, py_pc);
+            emit_mark_label_pc!(ssarepr, py_pc);
             // Phase 3c Step 2: pc_map records walker-local SSARepr insn
             // indices. `insn_pos_to_byte_offset` translates them to byte
             // offsets after `Assembler::assemble` populates
             // `ssarepr.insns_pos`.
             pc_map[py_pc] = ssarepr.insns.len();
-            let live_patch = emit_live_placeholder!(ssarepr, assembler);
+            let live_patch = emit_live_placeholder!(ssarepr);
             live_patches.push((py_pc, live_patch));
             depth_at_pc[py_pc] = current_depth;
 
@@ -1421,7 +1365,7 @@ impl CodeWriter {
                     );
                 } else {
                     // pyre has a single jitdriver (PyPyJitDriver), index 0.
-                    emit_loop_header!(ssarepr, assembler, 0);
+                    emit_loop_header!(ssarepr, 0);
                 }
             }
 
@@ -1476,22 +1420,20 @@ impl CodeWriter {
                     if is_portal {
                         emit_load_const_i!(
                             ssarepr,
-                            assembler,
                             int_tmp0,
                             local_to_vable_slot(reg as usize) as i64
                         );
                         emit_vable_getarrayitem_ref!(
                             ssarepr,
-                            assembler,
                             stack_base + current_depth,
                             0_u16,
                             int_tmp0
                         );
                     } else {
-                        emit_move_r!(ssarepr, assembler, stack_base + current_depth, reg);
+                        emit_move_r!(ssarepr, stack_base + current_depth, reg);
                     }
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // jtransform.py:1898 do_fixed_list_setitem vable case:
@@ -1503,51 +1445,47 @@ impl CodeWriter {
                 Instruction::StoreFast { var_num } => {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                     if is_portal {
                         emit_load_const_i!(
                             ssarepr,
-                            assembler,
                             int_tmp0,
                             local_to_vable_slot(reg as usize) as i64
                         );
                         emit_vable_setarrayitem_ref!(
                             ssarepr,
-                            assembler,
                             0_u16,
                             int_tmp0,
                             stack_base + current_depth
                         );
                     } else {
-                        emit_move_r!(ssarepr, assembler, reg, stack_base + current_depth);
+                        emit_move_r!(ssarepr, reg, stack_base + current_depth);
                     }
                 }
 
                 Instruction::LoadSmallInt { i } => {
                     let val = i.get(op_arg) as u32 as i64;
-                    emit_load_const_i!(ssarepr, assembler, int_tmp0, val);
+                    emit_load_const_i!(ssarepr, int_tmp0, val);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::Plain,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::LoadConst { consti } => {
                     let idx = consti.get(op_arg).as_usize();
                     // jtransform.py: getfield_vable_r for pycode (field 1)
-                    emit_vable_getfield_ref!(ssarepr, assembler, obj_tmp0, VABLE_CODE_FIELD_IDX);
-                    emit_load_const_i!(ssarepr, assembler, int_tmp0, idx as i64);
+                    emit_vable_getfield_ref!(ssarepr, obj_tmp0, VABLE_CODE_FIELD_IDX);
+                    emit_load_const_i!(ssarepr, int_tmp0, idx as i64);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::Plain,
                         load_const_fn_idx,
                         &[
@@ -1557,9 +1495,9 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // CPython 3.13 super-instructions LOAD_FAST_LOAD_FAST /
@@ -1583,12 +1521,12 @@ impl CodeWriter {
                     let pair = var_nums.get(op_arg);
                     let reg_a = u32::from(pair.idx_1()) as u16;
                     let reg_b = u32::from(pair.idx_2()) as u16;
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, reg_a);
+                    emit_move_r!(ssarepr, stack_base + current_depth, reg_a);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, reg_b);
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, stack_base + current_depth, reg_b);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
@@ -1600,61 +1538,51 @@ impl CodeWriter {
                     let store_reg = u32::from(pair.idx_1()) as u16;
                     let load_reg = u32::from(pair.idx_2()) as u16;
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                     if is_portal {
                         emit_load_const_i!(
                             ssarepr,
-                            assembler,
                             int_tmp0,
                             local_to_vable_slot(store_reg as usize) as i64
                         );
                         emit_vable_setarrayitem_ref!(
                             ssarepr,
-                            assembler,
                             0_u16,
                             int_tmp0,
                             stack_base + current_depth
                         );
                         emit_load_const_i!(
                             ssarepr,
-                            assembler,
                             int_tmp0,
                             local_to_vable_slot(load_reg as usize) as i64
                         );
                         emit_vable_getarrayitem_ref!(
                             ssarepr,
-                            assembler,
                             stack_base + current_depth,
                             0_u16,
                             int_tmp0
                         );
                     } else {
-                        emit_move_r!(ssarepr, assembler, store_reg, stack_base + current_depth);
-                        emit_move_r!(ssarepr, assembler, stack_base + current_depth, load_reg);
+                        emit_move_r!(ssarepr, store_reg, stack_base + current_depth);
+                        emit_move_r!(ssarepr, stack_base + current_depth, load_reg);
                     }
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // STORE_SUBSCR: stack [value, obj, key] → obj[key] = value
                 Instruction::StoreSubscr => {
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp1, stack_base + current_depth); // key
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp1, stack_base + current_depth); // key
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth); // obj
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth); // obj
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(
-                        ssarepr,
-                        assembler,
-                        arg_regs_start,
-                        stack_base + current_depth
-                    ); // value
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, arg_regs_start, stack_base + current_depth); // value
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         store_subscr_fn_idx,
                         &[
@@ -1669,14 +1597,14 @@ impl CodeWriter {
 
                 Instruction::PopTop => {
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                     // regalloc.py: discard = just decrement depth, no bytecode
                 }
 
                 Instruction::PushNull => {
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, null_ref_reg);
+                    emit_move_r!(ssarepr, stack_base + current_depth, null_ref_reg);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // jtransform.py: rewrite_op_int_add etc.
@@ -1694,16 +1622,15 @@ impl CodeWriter {
                         as u32;
                     // Pop rhs (blackhole will see vsd reflect this pop).
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                     let rhs_reg = stack_base + current_depth;
                     // Pop lhs.
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                     let lhs_reg = stack_base + current_depth;
-                    emit_load_const_i!(ssarepr, assembler, op_code_reg, op_val as i64);
+                    emit_load_const_i!(ssarepr, op_code_reg, op_val as i64);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
@@ -1714,9 +1641,9 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
@@ -1724,15 +1651,14 @@ impl CodeWriter {
                     // Same stack-direct pattern as BinaryOp — see its comment.
                     let op_val = compare_op_tag(opname.get(op_arg)) as u32;
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                     let rhs_reg = stack_base + current_depth;
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                     let lhs_reg = stack_base + current_depth;
-                    emit_load_const_i!(ssarepr, assembler, op_code_reg, op_val as i64);
+                    emit_load_const_i!(ssarepr, op_code_reg, op_val as i64);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
@@ -1743,9 +1669,9 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // flatten.py:240-260 + blackhole.py:865-869. truth_fn returns
@@ -1761,11 +1687,10 @@ impl CodeWriter {
                         delta.get(op_arg).as_usize(),
                     );
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -1773,7 +1698,7 @@ impl CodeWriter {
                         Some(int_tmp0),
                     );
                     if target_py_pc < num_instrs {
-                        emit_goto_if_not!(ssarepr, assembler, labels, int_tmp0, target_py_pc);
+                        emit_goto_if_not!(ssarepr, int_tmp0, target_py_pc);
                     }
                 }
 
@@ -1791,11 +1716,10 @@ impl CodeWriter {
                         delta.get(op_arg).as_usize(),
                     );
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -1803,13 +1727,7 @@ impl CodeWriter {
                         Some(int_tmp0),
                     );
                     if target_py_pc < num_instrs {
-                        emit_goto_if_not_int_is_zero!(
-                            ssarepr,
-                            assembler,
-                            labels,
-                            int_tmp0,
-                            target_py_pc
-                        );
+                        emit_goto_if_not_int_is_zero!(ssarepr, int_tmp0, target_py_pc);
                     }
                 }
 
@@ -1822,14 +1740,14 @@ impl CodeWriter {
                         delta.get(op_arg).as_usize(),
                     );
                     if target_py_pc < num_instrs {
-                        emit_goto!(ssarepr, assembler, labels, target_py_pc);
+                        emit_goto!(ssarepr, target_py_pc);
                     }
                 }
 
                 instr @ Instruction::JumpBackward { .. } => {
                     if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg) {
                         if target_py_pc < num_instrs {
-                            emit_goto!(ssarepr, assembler, labels, target_py_pc);
+                            emit_goto!(ssarepr, target_py_pc);
                         }
                     }
                 }
@@ -1837,9 +1755,9 @@ impl CodeWriter {
                 // flatten.py: int_return / ref_return
                 Instruction::ReturnValue => {
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
-                    emit_ref_return!(ssarepr, assembler, obj_tmp0);
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                    emit_ref_return!(ssarepr, obj_tmp0);
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call (residual)
@@ -1847,17 +1765,11 @@ impl CodeWriter {
                     let raw_namei = namei.get(op_arg) as usize as i64;
                     // jtransform.py: getfield_vable_r for w_globals (field 3)
                     // and pycode (field 1) — namespace for lookup, code for names.
-                    emit_vable_getfield_ref!(
-                        ssarepr,
-                        assembler,
-                        obj_tmp0,
-                        VABLE_NAMESPACE_FIELD_IDX
-                    );
-                    emit_vable_getfield_ref!(ssarepr, assembler, obj_tmp1, VABLE_CODE_FIELD_IDX);
-                    emit_load_const_i!(ssarepr, assembler, int_tmp0, raw_namei);
+                    emit_vable_getfield_ref!(ssarepr, obj_tmp0, VABLE_NAMESPACE_FIELD_IDX);
+                    emit_vable_getfield_ref!(ssarepr, obj_tmp1, VABLE_CODE_FIELD_IDX);
+                    emit_load_const_i!(ssarepr, int_tmp0, raw_namei);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         load_global_fn_idx,
                         &[
@@ -1870,13 +1782,13 @@ impl CodeWriter {
                     );
                     // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
                     if raw_namei & 1 != 0 {
-                        emit_move_r!(ssarepr, assembler, stack_base + current_depth, null_ref_reg);
+                        emit_move_r!(ssarepr, stack_base + current_depth, null_ref_reg);
                         current_depth += 1;
-                        emit_vsd!(assembler, current_depth);
+                        emit_vsd!(current_depth);
                     }
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call →
@@ -1894,19 +1806,18 @@ impl CodeWriter {
                     let nargs = argc.get(op_arg) as usize;
                     for i in (0..nargs).rev() {
                         current_depth -= 1;
-                        emit_vsd!(assembler, current_depth);
+                        emit_vsd!(current_depth);
                         emit_move_r!(
                             ssarepr,
-                            assembler,
                             arg_regs_start + i as u16,
                             stack_base + current_depth
                         );
                     }
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp1, stack_base + current_depth); // callable
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp1, stack_base + current_depth); // callable
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth); // NULL (discard)
+                    emit_vsd!(current_depth); // NULL (discard)
 
                     // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
                     // call_fn(callable, arg0, ...) → result
@@ -1924,7 +1835,7 @@ impl CodeWriter {
                     // extern "C" fn with that many i64 parameters.
                     // nargs > 8 → abort_permanent (no matching helper).
                     if nargs > 8 {
-                        emit_abort_permanent!(ssarepr, assembler);
+                        emit_abort_permanent!(ssarepr);
                     } else {
                         let fn_idx = match nargs {
                             0 => call_fn_0_idx,
@@ -1939,7 +1850,6 @@ impl CodeWriter {
                         };
                         emit_residual_call(
                             &mut ssarepr,
-                            &mut assembler,
                             CallFlavor::MayForce,
                             fn_idx,
                             &call_args,
@@ -1947,9 +1857,9 @@ impl CodeWriter {
                             Some(obj_tmp0),
                         );
                     }
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // Python 3.13: ToBool converts TOS to bool before branch.
@@ -1960,12 +1870,11 @@ impl CodeWriter {
                 // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                 Instruction::UnaryNegative => {
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
-                    emit_load_const_i!(ssarepr, assembler, int_tmp0, 0);
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                    emit_load_const_i!(ssarepr, int_tmp0, 0);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
@@ -1974,14 +1883,12 @@ impl CodeWriter {
                     );
                     emit_load_const_i!(
                         ssarepr,
-                        assembler,
                         int_tmp0,
                         binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
                             .expect("subtract must have a jit binary-op tag"),
                     );
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
@@ -1992,9 +1899,9 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // JumpBackwardNoInterrupt reuses `backward_jump_target`:
@@ -2005,7 +1912,7 @@ impl CodeWriter {
                 instr @ Instruction::JumpBackwardNoInterrupt { .. } => {
                     if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg) {
                         if target_py_pc < num_instrs {
-                            emit_goto!(ssarepr, assembler, labels, target_py_pc);
+                            emit_goto!(ssarepr, target_py_pc);
                         }
                     }
                 }
@@ -2015,10 +1922,9 @@ impl CodeWriter {
                     let argc = count.get(op_arg) as usize;
                     for i in (0..argc.min(2)).rev() {
                         current_depth -= 1;
-                        emit_vsd!(assembler, current_depth);
+                        emit_vsd!(current_depth);
                         emit_move_r!(
                             ssarepr,
-                            assembler,
                             arg_regs_start + i as u16,
                             stack_base + current_depth
                         );
@@ -2026,10 +1932,10 @@ impl CodeWriter {
                     // Discard extra items beyond 2 (helper supports 0-2).
                     for _ in 2..argc {
                         current_depth -= 1;
-                        emit_vsd!(assembler, current_depth);
+                        emit_vsd!(current_depth);
                     }
                     // build_list_fn(argc, item0, item1) → list
-                    emit_load_const_i!(ssarepr, assembler, int_tmp0, argc as i64);
+                    emit_load_const_i!(ssarepr, int_tmp0, argc as i64);
                     let item0 = if argc >= 1 {
                         majit_metainterp::jitcode::JitCallArg::reference(arg_regs_start)
                     } else {
@@ -2042,7 +1948,6 @@ impl CodeWriter {
                     };
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         build_list_fn_idx,
                         &[
@@ -2053,9 +1958,9 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // Exception handling: residual calls to frame helpers.
@@ -2066,12 +1971,12 @@ impl CodeWriter {
                     let n = argc.get(op_arg) as i64;
                     if n >= 1 {
                         current_depth -= 1;
-                        emit_vsd!(assembler, current_depth);
-                        emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth);
-                        emit_raise!(ssarepr, assembler, obj_tmp0);
+                        emit_vsd!(current_depth);
+                        emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth);
+                        emit_raise!(ssarepr, obj_tmp0);
                     } else {
                         // reraise: re-raise exception_last_value
-                        emit_reraise!(ssarepr, assembler);
+                        emit_reraise!(ssarepr);
                     }
                 }
 
@@ -2079,26 +1984,24 @@ impl CodeWriter {
                     // flatten.py: dup = ref_copy TOS → TOS+1
                     emit_move_r!(
                         ssarepr,
-                        assembler,
                         stack_base + current_depth,
                         stack_base + current_depth - 1
                     );
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::CheckExcMatch => {
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp1, stack_base + current_depth); // match type
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp1, stack_base + current_depth); // match type
                     current_depth -= 1;
-                    emit_vsd!(assembler, current_depth);
-                    emit_move_r!(ssarepr, assembler, obj_tmp0, stack_base + current_depth); // exception
+                    emit_vsd!(current_depth);
+                    emit_move_r!(ssarepr, obj_tmp0, stack_base + current_depth); // exception
                     // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
-                    emit_load_const_i!(ssarepr, assembler, int_tmp0, 10); // isinstance op
+                    emit_load_const_i!(ssarepr, int_tmp0, 10); // isinstance op
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut assembler,
                         CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
@@ -2109,9 +2012,9 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    emit_move_r!(ssarepr, assembler, stack_base + current_depth, obj_tmp0);
+                    emit_move_r!(ssarepr, stack_base + current_depth, obj_tmp0);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::PopExcept => {
@@ -2121,21 +2024,24 @@ impl CodeWriter {
 
                 Instruction::Reraise { .. } => {
                     // Exception path: abort_permanent.
-                    emit_abort_permanent!(ssarepr, assembler);
+                    emit_abort_permanent!(ssarepr);
                 }
 
                 Instruction::Copy { i } => {
                     let d = i.get(op_arg) as usize;
                     if d == 1 {
-                        assembler
-                            .move_r(stack_base + current_depth, stack_base + current_depth - 1);
+                        emit_move_r!(
+                            ssarepr,
+                            stack_base + current_depth,
+                            stack_base + current_depth - 1
+                        );
                         current_depth += 1;
-                        emit_vsd!(assembler, current_depth);
+                        emit_vsd!(current_depth);
                     } else {
                         // COPY(d>1): exception handler pattern only.
                         // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
                         // doesn't trigger the has_abort(BC_ABORT=13) check.
-                        emit_abort_permanent!(ssarepr, assembler);
+                        emit_abort_permanent!(ssarepr);
                     }
                 }
 
@@ -2143,7 +2049,7 @@ impl CodeWriter {
                 | Instruction::StoreName { .. }
                 | Instruction::MakeFunction { .. } => {
                     // Module-level only: abort_permanent (won't block blackhole).
-                    emit_abort_permanent!(ssarepr, assembler);
+                    emit_abort_permanent!(ssarepr);
                 }
 
                 // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
@@ -2155,23 +2061,21 @@ impl CodeWriter {
                     let reg_b = u32::from(pair.idx_2()) as u16;
                     for reg in [reg_a, reg_b] {
                         current_depth -= 1;
-                        emit_vsd!(assembler, current_depth);
+                        emit_vsd!(current_depth);
                         if is_portal {
                             emit_load_const_i!(
                                 ssarepr,
-                                assembler,
                                 int_tmp0,
                                 local_to_vable_slot(reg as usize) as i64,
                             );
                             emit_vable_setarrayitem_ref!(
                                 ssarepr,
-                                assembler,
                                 0_u16,
                                 int_tmp0,
                                 stack_base + current_depth
                             );
                         } else {
-                            emit_move_r!(ssarepr, assembler, reg, stack_base + current_depth);
+                            emit_move_r!(ssarepr, reg, stack_base + current_depth);
                         }
                     }
                 }
@@ -2182,11 +2086,11 @@ impl CodeWriter {
                 // underflow.
                 Instruction::UnpackSequence { count } => {
                     let n = count.get(op_arg) as u16;
-                    emit_abort_permanent!(ssarepr, assembler);
+                    emit_abort_permanent!(ssarepr);
                     // Stack effect: pop 1 + push n = net (n - 1)
                     if current_depth > 0 {
                         current_depth -= 1;
-                        emit_vsd!(assembler, current_depth);
+                        emit_vsd!(current_depth);
                     }
                     current_depth += n;
                 }
@@ -2196,19 +2100,19 @@ impl CodeWriter {
                 // don't underflow.
                 Instruction::GetIter => {
                     // pop iterable, push iterator: net 0
-                    emit_abort_permanent!(ssarepr, assembler);
+                    emit_abort_permanent!(ssarepr);
                 }
 
                 Instruction::ForIter { .. } => {
                     // push next item: net +1
-                    emit_abort_permanent!(ssarepr, assembler);
+                    emit_abort_permanent!(ssarepr);
                     current_depth += 1;
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::EndFor => {
                     // pop iterator + last value: net -2
-                    emit_abort_permanent!(ssarepr, assembler);
+                    emit_abort_permanent!(ssarepr);
                     current_depth = current_depth.saturating_sub(2);
                     // No emit_vsd: after abort_permanent, depth is
                     // simulation-only for subsequent compile-time tracking.
@@ -2217,16 +2121,16 @@ impl CodeWriter {
                 Instruction::PopIter => {
                     // pop iterator: net -1
                     current_depth = current_depth.saturating_sub(1);
-                    emit_vsd!(assembler, current_depth);
+                    emit_vsd!(current_depth);
                 }
 
                 // Unsupported instruction: abort_permanent.
                 _other => {
-                    emit_abort_permanent!(ssarepr, assembler);
+                    emit_abort_permanent!(ssarepr);
                 }
             }
             if let Some(catch_label) = catch_for_pc[py_pc] {
-                emit_catch_exception!(ssarepr, assembler, catch_label);
+                emit_catch_exception!(ssarepr, catch_label);
             }
         }
 
@@ -2275,24 +2179,23 @@ impl CodeWriter {
         fill_assembler_liveness(&mut ssarepr, &liveness, &live_patches);
 
         for site in catch_sites {
-            emit_mark_label_catch_landing!(ssarepr, assembler, site.landing_label);
+            emit_mark_label_catch_landing!(ssarepr, site.landing_label);
             let mut exc_slot = stack_base + site.stack_depth;
             if site.push_lasti {
-                emit_load_const_i!(ssarepr, assembler, int_tmp0, site.lasti_py_pc as i64);
+                emit_load_const_i!(ssarepr, int_tmp0, site.lasti_py_pc as i64);
                 emit_residual_call(
                     &mut ssarepr,
-                    &mut assembler,
                     CallFlavor::Plain,
                     box_int_fn_idx,
                     &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
                     ResKind::Ref,
                     Some(obj_tmp0),
                 );
-                emit_move_r!(ssarepr, assembler, exc_slot, obj_tmp0);
+                emit_move_r!(ssarepr, exc_slot, obj_tmp0);
                 exc_slot += 1;
             }
-            emit_last_exc_value!(ssarepr, assembler, exc_slot);
-            emit_goto!(ssarepr, assembler, labels, site.handler_py_pc);
+            emit_last_exc_value!(ssarepr, exc_slot);
+            emit_goto!(ssarepr, site.handler_py_pc);
         }
 
         // codewriter.py:45-47 `for kind in KINDS:

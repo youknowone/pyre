@@ -1,73 +1,55 @@
-//! SSAReprEmitter — adapter that exposes a `JitCodeBuilder`-shaped API
-//! but records per-op work as `Insn::Op` values into an `SSARepr`.
+//! SSAReprEmitter — setup-side carrier for the walker.
 //!
-//! Enables pyre's CPython-bytecode walker (`codewriter.rs::transform_graph_to_jitcode`)
-//! to migrate from direct `JitCodeBuilder` emission (a pyre-only fusion
-//! of `flatten_graph` + `assembler.assemble`) to the RPython pipeline
-//! shape `flatten_graph → compute_liveness → assembler.assemble`
-//! without rewriting every handler line-by-line at once. Each walker
-//! handler that still calls `builder.xxx(...)` against a real
-//! `JitCodeBuilder` keeps compiling if the variable is swapped for
-//! `SSAReprEmitter`, because every production `xxx(...)` method is
-//! mirrored here with the same signature — the only difference being
-//! that the body pushes an `Insn::Op` onto `self.ssarepr` instead of
-//! emitting bytes.
-//!
-//! Setup operations that don't map to an `Insn::Op` (register-file
-//! sizing, constant-pool registration, function-pointer table,
-//! virtualizable setup) pass through to an internal `JitCodeBuilder`
-//! unchanged; `assemble_into_jitcode()` at the end feeds that builder
-//! (as the `setup`-side carrier) into `Assembler::assemble` alongside
-//! the accumulated `SSARepr`, which then emits every per-op bytecode.
+//! The walker (`codewriter.rs::transform_graph_to_jitcode`) accumulates
+//! per-op work directly into a walker-local `SSARepr`; this emitter
+//! survives only to host the `JitCodeBuilder` setup state
+//! (register-file sizing, constant pools, fn-pointer table,
+//! virtualizable setup, jitcode name, abort flag) that
+//! `Assembler::assemble` needs as its starting builder. The per-op
+//! methods that used to mirror `JitCodeBuilder` and push `Insn::Op`
+//! values are gone — Phase 3c collapsed the dual emitter into the
+//! single walker-local `SSARepr` (commit bc0d6a06c4).
 //!
 //! Reference: `rpython/jit/codewriter/codewriter.py:33-73`.
+//!
+//! `emit_portal_jit_merge_point` is the only semantic helper left —
+//! it registers the portal greens/reds constants with the builder and
+//! pushes the `jit_merge_point` Insn into the walker-local `SSARepr`.
 
-use majit_ir::OpCode;
-use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
+use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
 
 use super::assembler::{Assembler, NumRegs};
-use super::flatten::{Insn, Kind, Label, ListOfKind, Operand, Register, SSARepr, TLabel};
+use super::flatten::{Insn, Kind, ListOfKind, Operand, SSARepr};
 
-/// Walker-visible builder that is a `JitCodeBuilder` look-alike. Every
-/// per-op method appends an `Insn::Op` to an internal `SSARepr` and
-/// every setup call is forwarded to a real `JitCodeBuilder`.
+/// Setup-side carrier. Every method is either a `JitCodeBuilder`
+/// passthrough or `finish_with_positions_from` — the finalization hook
+/// that hands the builder to `Assembler::assemble` alongside the
+/// walker-local `SSARepr`.
 pub(super) struct SSAReprEmitter {
     /// Setup-state builder — carries `fn_ptrs`, constant pools,
     /// register-file sizing, and the jitcode name. `Assembler::assemble`
     /// consumes this builder after the walker is done; the finished
     /// `JitCode` keeps these tables intact.
     builder: JitCodeBuilder,
-    /// Accumulating SSARepr. `name` is assigned by `set_name`; `insns`
-    /// is appended to by every per-op method and the label/live helpers.
-    pub ssarepr: SSARepr,
-    /// Bridges pyre's integer label IDs (walker-local u16 counter) to
-    /// RPython-style `Label(name)` / `TLabel(name)` strings used inside
-    /// `SSARepr.insns`. `new_label()` allocates the next id and pushes
-    /// `format!("L{id}")` into this vector; `mark_label` / `jump` /
-    /// `branch_reg_zero` / `catch_exception` resolve ids back to the
-    /// stored name.
-    label_names: Vec<String>,
-    /// `Insn::Live` indices returned from `live_placeholder` for later
-    /// `patch_live_offset` no-op bookkeeping (see method comment).
-    pending_live_positions: Vec<usize>,
+    /// Counter for walker-side label-id allocation. `new_label()`
+    /// returns the next id; walker macros format it into the TLabel
+    /// name (`catch_landing_{id}`) that `Assembler::assemble` resolves
+    /// against `state.label_positions`.
+    next_label_id: u16,
 }
 
 impl SSAReprEmitter {
     pub fn new() -> Self {
         Self {
             builder: JitCodeBuilder::default(),
-            ssarepr: SSARepr::new(String::new()),
-            label_names: Vec::new(),
-            pending_live_positions: Vec::new(),
+            next_label_id: 0,
         }
     }
 
     // ---- setup passthrough (mirrors JitCodeBuilder setup API) ----
 
     pub fn set_name(&mut self, name: impl Into<String>) {
-        let name = name.into();
-        self.builder.set_name(name.clone());
-        self.ssarepr.name = name;
+        self.builder.set_name(name);
     }
 
     pub fn ensure_i_regs(&mut self, count: u16) {
@@ -76,34 +58,6 @@ impl SSAReprEmitter {
 
     pub fn ensure_r_regs(&mut self, count: u16) {
         self.builder.ensure_r_regs(count);
-    }
-
-    pub fn ensure_f_regs(&mut self, count: u16) {
-        self.builder.ensure_f_regs(count);
-    }
-
-    pub fn num_regs_i(&self) -> u16 {
-        self.builder.num_regs_i()
-    }
-
-    pub fn num_regs_r(&self) -> u16 {
-        self.builder.num_regs_r()
-    }
-
-    pub fn num_regs_f(&self) -> u16 {
-        self.builder.num_regs_f()
-    }
-
-    pub fn num_consts_i(&self) -> u16 {
-        self.builder.num_consts_i()
-    }
-
-    pub fn num_consts_r(&self) -> u16 {
-        self.builder.num_consts_r()
-    }
-
-    pub fn num_consts_f(&self) -> u16 {
-        self.builder.num_consts_f()
     }
 
     fn add_const_i(&mut self, value: i64) -> u16 {
@@ -122,276 +76,30 @@ impl SSAReprEmitter {
         self.builder.has_abort_flag()
     }
 
-    pub fn set_abort_flag(&mut self, v: bool) {
-        self.builder.set_abort_flag(v);
-    }
+    // ---- label id allocation ----
 
-    // ---- label mechanics ----
-
-    /// `assembler.py` uses string-named labels; pyre's walker allocates
-    /// u16 ids and indexes into a `Vec<u16>`. Bridge: each new id gets
-    /// a unique `L{id}` name stored here, exposed as `TLabel(name)` in
-    /// the SSARepr.
+    /// Allocate the next u16 label id. The walker formats the id into
+    /// a TLabel name (`catch_landing_{id}`) that `Assembler::assemble`
+    /// resolves against the matching `Insn::Label` pushed into the
+    /// walker-local `SSARepr`.
     pub fn new_label(&mut self) -> u16 {
-        let id = self.label_names.len() as u16;
-        self.label_names.push(format!("L{}", id));
+        let id = self.next_label_id;
+        self.next_label_id = self
+            .next_label_id
+            .checked_add(1)
+            .expect("label id overflow");
         id
     }
 
-    pub fn mark_label(&mut self, _id: u16) {
-        // Phase 3c Step 3: Label push dropped. Walker's
-        // `emit_mark_label_pc!` / `emit_mark_label_catch_landing!`
-        // macros push Insn::Label to the external SSARepr directly.
-    }
+    // ---- portal jit_merge_point ----
 
-    fn label_name(&self, id: u16) -> String {
-        self.label_names
-            .get(id as usize)
-            .cloned()
-            .unwrap_or_else(|| panic!("SSAReprEmitter: unknown label id {}", id))
-    }
-
-    fn tlabel(&self, id: u16) -> Operand {
-        Operand::TLabel(TLabel::new(self.label_name(id)))
-    }
-
-    // ---- liveness placeholders ----
-
-    /// Emit an empty `Insn::Live` and return its position in
-    /// `ssarepr.insns`. The pyre walker uses this as a pseudo-"byte
-    /// offset" key to later call `patch_live_offset(offset, ...)`;
-    /// under SSARepr semantics the live register set is filled by
-    /// `compute_liveness` before `Assembler::assemble` runs.
-    pub fn live_placeholder(&mut self) -> usize {
-        // Phase 3c Step 3: internal SSARepr is no longer populated. The
-        // walker's `emit_live_placeholder!` macro pushes Insn::Live to
-        // the external SSARepr and returns the external index itself;
-        // this method's return value is unused by walker code now.
-        let idx = self.pending_live_positions.len();
-        self.pending_live_positions.push(idx);
-        idx
-    }
-
-    /// pyre's walker passes in an interned all-liveness offset here.
-    /// Under SSARepr semantics, the live set is represented as
-    /// `Insn::Live` register operands, and `Assembler::assemble`
-    /// re-interns them per-jitcode (`assembler.py:234-248`). We keep
-    /// this method so walker call sites still compile; the offset
-    /// value itself is dropped on the floor until the walker migrates
-    /// to emitting `Insn::Live(vec![Operand::Register(...), ...])`
-    /// directly.
-    pub fn patch_live_offset(&mut self, _patch_offset: usize, _offset: u16) {
-        // Intentional no-op — SSARepr owns the live set semantics.
-    }
-
-    /// Replace the `Insn::Live` placeholder at `insn_idx` with one
-    /// whose args are the full live-register triple.
-    ///
-    /// pyre's walker produces liveness via `LiveVars` after finishing
-    /// the bytecode walk; this method is the hook that transfers that
-    /// externally-computed information back into the SSARepr so
-    /// `Assembler::assemble`'s `encode_liveness_info` sees the correct
-    /// set and delegates to `pyre_jit_trace::state::intern_liveness`
-    /// with it. Future work (Phase 4) replaces this with
-    /// `super::liveness::compute_liveness(&mut ssarepr)` which
-    /// derives the same information from the SSARepr backward
-    /// dataflow (`liveness.py:19-23`).
-    pub fn fill_live_args(
-        &mut self,
-        insn_idx: usize,
-        live_i: &[u16],
-        live_r: &[u16],
-        live_f: &[u16],
-    ) {
-        let mut args: Vec<Operand> = Vec::with_capacity(live_i.len() + live_r.len() + live_f.len());
-        for &r in live_i {
-            args.push(Operand::reg(Kind::Int, r));
-        }
-        for &r in live_r {
-            args.push(Operand::reg(Kind::Ref, r));
-        }
-        for &r in live_f {
-            args.push(Operand::reg(Kind::Float, r));
-        }
-        match self.ssarepr.insns.get_mut(insn_idx) {
-            Some(Insn::Live(existing)) => *existing = args,
-            Some(other) => panic!(
-                "fill_live_args: insn at {} is not Insn::Live: {:?}",
-                insn_idx, other
-            ),
-            None => panic!("fill_live_args: insn index {} out of bounds", insn_idx),
-        }
-    }
-
-    /// pyre's walker uses `current_pos()` to record the byte offset of
-    /// a given Python PC into `pc_map`. In the SSARepr world the
-    /// "position" of the next-emitted instruction is the `insns` index;
-    /// `Assembler::assemble` populates `ssarepr.insns_pos` post-hoc so
-    /// the walker's pc_map is translated from insn index → byte offset
-    /// in a single follow-up pass. Return the insn index for now.
-    pub fn current_pos(&self) -> usize {
-        self.ssarepr.insns.len()
-    }
-
-    // ---- per-op emission: every method below is an `Insn::Op` push ----
-
-    pub fn move_r(&mut self, dst: u16, src: u16) {
-        // flatten.py `'->', reg` parity: destination in the result slot,
-        // not in args. Keeps `compute_liveness` `alive.discard(result)`
-        // at liveness.rs:148 correct for register-copy semantics.
-        self.push_op_with_result(
-            "move_r",
-            vec![Operand::reg(Kind::Ref, src)],
-            Register::new(Kind::Ref, dst),
-        );
-    }
-
-    pub fn move_i(&mut self, dst: u16, src: u16) {
-        self.push_op_with_result(
-            "move_i",
-            vec![Operand::reg(Kind::Int, src)],
-            Register::new(Kind::Int, dst),
-        );
-    }
-
-    pub fn move_f(&mut self, dst: u16, src: u16) {
-        self.push_op_with_result(
-            "move_f",
-            vec![Operand::reg(Kind::Float, src)],
-            Register::new(Kind::Float, dst),
-        );
-    }
-
-    pub fn load_const_i_value(&mut self, dst: u16, value: i64) {
-        self.push_op_with_result(
-            "load_const_i",
-            vec![Operand::ConstInt(value)],
-            Register::new(Kind::Int, dst),
-        );
-    }
-
-    pub fn load_const_r_value(&mut self, dst: u16, value: i64) {
-        self.push_op_with_result(
-            "load_const_r",
-            vec![Operand::ConstRef(value)],
-            Register::new(Kind::Ref, dst),
-        );
-    }
-
-    pub fn load_const_f_value(&mut self, dst: u16, value: i64) {
-        self.push_op_with_result(
-            "load_const_f",
-            vec![Operand::ConstFloat(value)],
-            Register::new(Kind::Float, dst),
-        );
-    }
-
-    pub fn ref_return(&mut self, src: u16) {
-        self.push_op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
-        // Phase 3c Step 3: Unreachable push dropped. Walker's
-        // `emit_ref_return!` macro pushes Insn::Unreachable to the
-        // external SSARepr directly per flatten.py:144-146.
-    }
-
-    pub fn abort(&mut self) {
-        self.push_op("abort", Vec::new());
-    }
-
-    pub fn abort_permanent(&mut self) {
-        self.push_op("abort_permanent", Vec::new());
-    }
-
-    pub fn emit_raise(&mut self, src: u16) {
-        self.push_op("raise", vec![Operand::reg(Kind::Ref, src)]);
-    }
-
-    pub fn emit_reraise(&mut self) {
-        self.push_op("reraise", Vec::new());
-    }
-
-    pub fn last_exc_value(&mut self, dst: u16) {
-        // Destination in result slot so backward liveness sees the define.
-        self.push_op_with_result("last_exc_value", Vec::new(), Register::new(Kind::Ref, dst));
-    }
-
-    pub fn jump(&mut self, label: u16) {
-        self.push_op("jump", vec![self.tlabel(label)]);
-        // Phase 3c Step 3: Unreachable push dropped. Walker's
-        // `emit_goto!` macro pushes Insn::Unreachable to the external
-        // SSARepr directly per flatten.py:111-112.
-    }
-
-    /// RPython jtransform.py:1714-1718 handle_jit_marker__loop_header.
-    /// Emits `SpaceOperation('loop_header', [c_index], None)` where c_index
-    /// is the jitdriver index. pyre has a single jitdriver (PyPyJitDriver),
-    /// so callers pass 0.
-    pub fn loop_header(&mut self, jdindex: u16) {
-        self.push_op("loop_header", vec![Operand::ConstInt(jdindex as i64)]);
-    }
-
-    pub fn branch_reg_zero(&mut self, cond: u16, label: u16) {
-        self.push_op(
-            "branch_reg_zero",
-            vec![Operand::reg(Kind::Int, cond), self.tlabel(label)],
-        );
-    }
-
-    pub fn goto_if_not_int_eq(&mut self, lhs: u16, rhs: u16, label: u16) {
-        self.push_op(
-            "goto_if_not_int_eq",
-            vec![
-                Operand::reg(Kind::Int, lhs),
-                Operand::reg(Kind::Int, rhs),
-                self.tlabel(label),
-            ],
-        );
-    }
-
-    pub fn goto_if_not_int_ne(&mut self, lhs: u16, rhs: u16, label: u16) {
-        self.push_op(
-            "goto_if_not_int_ne",
-            vec![
-                Operand::reg(Kind::Int, lhs),
-                Operand::reg(Kind::Int, rhs),
-                self.tlabel(label),
-            ],
-        );
-    }
-
-    /// flatten.py:247 + blackhole.py:916-920 unary specialisation of
-    /// `goto_if_not` over `int_is_zero(a)`. Branches to `label` when
-    /// `a != 0` (truthy), falls through otherwise.
-    pub fn goto_if_not_int_is_zero(&mut self, cond: u16, label: u16) {
-        self.push_op(
-            "goto_if_not_int_is_zero",
-            vec![Operand::reg(Kind::Int, cond), self.tlabel(label)],
-        );
-    }
-
-    pub fn catch_exception(&mut self, label: u16) {
-        self.push_op("catch_exception", vec![self.tlabel(label)]);
-    }
-
-    fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
-        self.push_op(
-            "jit_merge_point",
-            vec![
-                list_of_regs(Kind::Int, greens_i),
-                list_of_regs(Kind::Ref, greens_r),
-                list_of_regs(Kind::Ref, reds_r),
-            ],
-        );
-    }
-
-    /// Portal-only lowering for interp_jit.py's merge point arguments.
-    /// Keeping the constant-pool/register arithmetic here matches the
-    /// upstream shape more closely than open-coding it in the bytecode
-    /// walker and preserves the u8 operand invariant at the point where
-    /// the indices are formed.
-    ///
-    /// Dual-emits the same three ListOfKind arg shape into the walker-
-    /// local `ssarepr` so Phase 3c can read the same `jit_merge_point`
-    /// Insn from the external accumulator.
+    /// Portal-only lowering for `interp_jit.py`'s merge point arguments.
+    /// Registers the constant-pool entries for `next_instr` /
+    /// `is_being_profiled` / `pycode`, computes their `num_regs + idx`
+    /// positions, and pushes the `jit_merge_point` Insn into the
+    /// walker-local `SSARepr` with three `ListOfKind` sublists
+    /// (greens_i, greens_r, reds_r) — matching
+    /// `jtransform.py:rewrite_op_jit_merge_point`'s SpaceOperation shape.
     pub fn emit_portal_jit_merge_point(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -427,175 +135,13 @@ impl SSAReprEmitter {
                 list_of_regs(Kind::Ref, reds_r),
             ],
         ));
-        self.jit_merge_point(greens_i, greens_r, reds_r);
-    }
-
-    pub fn record_binop_i(&mut self, dst: u16, op: OpCode, lhs: u16, rhs: u16) {
-        self.push_op_with_result(
-            "record_binop_i",
-            vec![
-                Operand::OpCode(op),
-                Operand::reg(Kind::Int, lhs),
-                Operand::reg(Kind::Int, rhs),
-            ],
-            Register::new(Kind::Int, dst),
-        );
-    }
-
-    pub fn vable_getfield_int(&mut self, dest: u16, field_idx: u16) {
-        // dispatch_op "getfield_vable_i" reads dst from `result`,
-        // args[0] as ConstInt(field_idx).
-        self.push_op_with_result(
-            "getfield_vable_i",
-            vec![Operand::ConstInt(field_idx as i64)],
-            Register::new(Kind::Int, dest),
-        );
-    }
-
-    pub fn vable_getfield_ref(&mut self, dest: u16, field_idx: u16) {
-        self.push_op_with_result(
-            "getfield_vable_r",
-            vec![Operand::ConstInt(field_idx as i64)],
-            Register::new(Kind::Ref, dest),
-        );
-    }
-
-    pub fn vable_setfield_int(&mut self, field_idx: u16, src: u16) {
-        // dispatch_op "setfield_vable_i" reads field_idx as args[0],
-        // src register as args[1]. No result.
-        self.push_op(
-            "setfield_vable_i",
-            vec![
-                Operand::ConstInt(field_idx as i64),
-                Operand::reg(Kind::Int, src),
-            ],
-        );
-    }
-
-    pub fn vable_setfield_ref(&mut self, field_idx: u16, src: u16) {
-        self.push_op(
-            "setfield_vable_r",
-            vec![
-                Operand::ConstInt(field_idx as i64),
-                Operand::reg(Kind::Ref, src),
-            ],
-        );
-    }
-
-    pub fn vable_getarrayitem_ref(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
-        // dispatch_op "getarrayitem_vable_r" reads dst from `result`,
-        // args[0] ConstInt(array_idx), args[1] Register::Int(index_reg).
-        self.push_op_with_result(
-            "getarrayitem_vable_r",
-            vec![
-                Operand::ConstInt(array_idx as i64),
-                Operand::reg(Kind::Int, index_reg),
-            ],
-            Register::new(Kind::Ref, dest),
-        );
-    }
-
-    pub fn vable_setarrayitem_ref(&mut self, array_idx: u16, index_reg: u16, src: u16) {
-        self.push_op(
-            "setarrayitem_vable_r",
-            vec![
-                Operand::ConstInt(array_idx as i64),
-                Operand::reg(Kind::Int, index_reg),
-                Operand::reg(Kind::Ref, src),
-            ],
-        );
-    }
-
-    pub fn call_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.push_call_like(
-            "call_int",
-            fn_ptr_idx,
-            arg_regs,
-            Some(Register::new(Kind::Int, dst)),
-        );
-    }
-
-    pub fn call_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.push_call_like(
-            "call_ref",
-            fn_ptr_idx,
-            arg_regs,
-            Some(Register::new(Kind::Ref, dst)),
-        );
-    }
-
-    pub fn call_may_force_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.push_call_like(
-            "call_may_force_ref",
-            fn_ptr_idx,
-            arg_regs,
-            Some(Register::new(Kind::Ref, dst)),
-        );
-    }
-
-    pub fn call_may_force_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.push_call_like("call_may_force_void", fn_ptr_idx, arg_regs, None);
     }
 
     // ---- finalization ----
 
-    /// `assembler.py:34-54` `assemble(ssarepr, jitcode, num_regs)`.
-    /// Consume this emitter, run the accumulated SSARepr through
-    /// `Assembler::assemble` against the pre-populated builder, and
-    /// return the resulting `JitCode`.
-    ///
-    /// The `num_regs` override forwarded to `Assembler::assemble` is
-    /// derived from whatever the caller already called
-    /// `ensure_{i,r,f}_regs(...)` with — the emitter treats those calls
-    /// as the walker's `num_regs` promise and re-hands them to the
-    /// assembler so `emit_reg`'s bounds check (`assembler.py:73`) sees
-    /// the same ceiling the walker computed.
-    ///
-    /// `assembler` must be a persistent `Assembler` shared across all
-    /// jitcodes compiled in this process so `all_liveness` /
-    /// `all_liveness_positions` accumulate correctly
-    /// (`pyjitpl.py:2264`).
-    pub fn finish_with(mut self, assembler: &mut Assembler) -> JitCode {
-        let num_regs = NumRegs {
-            int: self.builder.num_regs_i(),
-            ref_: self.builder.num_regs_r(),
-            float: self.builder.num_regs_f(),
-        };
-        assembler.assemble(&mut self.ssarepr, self.builder, Some(num_regs))
-    }
-
-    /// Same as `finish_with` but overrides the per-kind register-file
-    /// ceiling. Mirrors RPython `transform_graph_to_jitcode`'s
-    /// `num_regs` pass-through.
-    pub fn finish_with_num_regs(mut self, assembler: &mut Assembler, num_regs: NumRegs) -> JitCode {
-        assembler.assemble(&mut self.ssarepr, self.builder, Some(num_regs))
-    }
-
-    /// **Test-only** wrapper around `finish_with` that creates a
-    /// throw-away `Assembler`.
-    ///
-    /// `codewriter.py:20-23` pins the `Assembler` to a single long-lived
-    /// instance on `CodeWriter`; fresh assemblers per call split the
-    /// per-kind liveness counters and diverge from upstream. Production
-    /// paths must borrow the CodeWriter's `Assembler` via
-    /// `crate::jit::codewriter::with_codewriter(...)` and call
-    /// `finish_with` / `finish_with_positions` explicitly. This wrapper
-    /// remains only for unit tests that do not exercise the
-    /// translator-session accumulator invariant.
-    #[cfg(test)]
-    pub fn finish(self) -> JitCode {
-        let mut assembler = Assembler::new();
-        self.finish_with(&mut assembler)
-    }
-
-    /// Translate an insn-index position (returned from `current_pos()`
-    /// or `live_placeholder()`) into the corresponding JitCode byte
-    /// offset using the `ssarepr.insns_pos` table that
+    /// Translate an insn-index position into the corresponding JitCode
+    /// byte offset using the `ssarepr.insns_pos` table that
     /// `Assembler::assemble` populates (`assembler.py:41-44`).
-    ///
-    /// Only meaningful AFTER `finish*()` — but since those methods
-    /// consume `self`, callers that need both the JitCode and the
-    /// translation must invoke `finish_and_translate_positions` instead.
     pub fn insn_pos_to_byte_offset(
         ssarepr: &SSARepr,
         positions: impl IntoIterator<Item = usize>,
@@ -618,37 +164,17 @@ impl SSAReprEmitter {
             .collect()
     }
 
-    /// Assemble and return the finished JitCode along with the
-    /// translated byte offsets for each caller-provided insn index.
-    /// Used by the walker to convert its `pc_map` (Python PC →
-    /// insn index) into the final byte-offset form that runtime
-    /// readers expect.
+    /// Feed the walker-local `SSARepr` into `Assembler::assemble`
+    /// against the pre-populated builder, translate the walker's
+    /// per-PC insn-index map into byte offsets, and return the
+    /// finished `JitCode` alongside the translated positions.
     ///
     /// `num_regs` is the post-regalloc per-kind ceiling computed by
     /// `super::regalloc::allocate_registers` from `max(color)+1`
-    /// (RPython parity: `codewriter.py:62-67`). Passing the
-    /// pre-regalloc builder values would over-allocate the
-    /// `JitCode.num_regs_*` slots that `Assembler::emit_reg`'s
-    /// 256-bound assertion (`assembler.py:73`) checks against.
-    pub fn finish_with_positions(
-        mut self,
-        assembler: &mut Assembler,
-        insn_positions: &[usize],
-        num_regs: NumRegs,
-    ) -> (JitCode, Vec<usize>) {
-        let jitcode = assembler.assemble(&mut self.ssarepr, self.builder, Some(num_regs));
-        let byte_positions =
-            Self::insn_pos_to_byte_offset(&self.ssarepr, insn_positions.iter().copied());
-        (jitcode, byte_positions)
-    }
-
-    /// Phase 3c Step 2: feed the walker-local `SSARepr` into
-    /// `Assembler::assemble` instead of the emitter's internal one. The
-    /// emitter is consumed for its builder side (fn_ptrs / consts /
-    /// register-file sizing) but its internal `ssarepr` is dropped.
-    ///
-    /// Once Step 3 removes the internal accumulator entirely,
-    /// `finish_with_positions` can collapse into this signature.
+    /// (`codewriter.py:62-67`). Passing pre-regalloc builder values
+    /// would over-allocate the `JitCode.num_regs_*` slots that
+    /// `Assembler::emit_reg`'s 256-bound assertion (`assembler.py:73`)
+    /// checks against.
     pub fn finish_with_positions_from(
         self,
         assembler: &mut Assembler,
@@ -660,53 +186,6 @@ impl SSAReprEmitter {
         let byte_positions =
             Self::insn_pos_to_byte_offset(&ssarepr, insn_positions.iter().copied());
         (jitcode, byte_positions)
-    }
-
-    /// **Test-only** twin of `finish_with_positions` that creates a
-    /// throw-away `Assembler`. Production callers must supply the
-    /// CodeWriter-owned `Assembler` — see the note on `finish()`.
-    #[cfg(test)]
-    pub fn finish_and_translate_positions(self, insn_positions: &[usize]) -> (JitCode, Vec<usize>) {
-        let num_regs = NumRegs {
-            int: self.builder.num_regs_i(),
-            ref_: self.builder.num_regs_r(),
-            float: self.builder.num_regs_f(),
-        };
-        let mut assembler = Assembler::new();
-        self.finish_with_positions(&mut assembler, insn_positions, num_regs)
-    }
-
-    // ---- internals ----
-    //
-    // Phase 3c Step 3: per-op SSARepr pushes that previously fed
-    // `SSAReprEmitter::ssarepr` are no-ops now that
-    // `Assembler::assemble` consumes the walker-local `SSARepr`
-    // directly (Step 2 swap, commit bc0d6a06c4). The method shells
-    // below keep the call sites compiling; the bodies drop their
-    // writes so the internal accumulator stays empty. Per-op method
-    // call sites in the walker become dead and are deleted in
-    // Step 3b, then the methods and the `ssarepr` field are deleted
-    // in Step 3c.
-    #[allow(dead_code)]
-    fn push_op(&mut self, _opname: &'static str, _args: Vec<Operand>) {}
-
-    #[allow(dead_code)]
-    fn push_op_with_result(
-        &mut self,
-        _opname: &'static str,
-        _args: Vec<Operand>,
-        _result: Register,
-    ) {
-    }
-
-    #[allow(dead_code)]
-    fn push_call_like(
-        &mut self,
-        _opname: &'static str,
-        _fn_ptr_idx: u16,
-        _arg_regs: &[JitCallArg],
-        _result: Option<Register>,
-    ) {
     }
 }
 
@@ -724,25 +203,3 @@ fn list_of_regs(kind: Kind, regs: &[u8]) -> Operand {
     let content: Vec<Operand> = regs.iter().map(|&r| Operand::reg(kind, r as u16)).collect();
     Operand::ListOfKind(ListOfKind::new(kind, content))
 }
-
-/// Translate a runtime `JitCallArg` back into the `Operand::Register`
-/// shape the Assembler's `expect_call_arg` consumes.
-fn call_arg_to_operand(arg: &JitCallArg) -> Operand {
-    use majit_metainterp::jitcode::JitArgKind;
-    let kind = match arg.kind {
-        JitArgKind::Int => Kind::Int,
-        JitArgKind::Ref => Kind::Ref,
-        JitArgKind::Float => Kind::Float,
-    };
-    Operand::reg(kind, arg.reg)
-}
-
-// Phase 3c Step 3 obsoleted the SSAReprEmitter-internal SSARepr
-// unit tests (`emitter_builds_simple_return_sequence`,
-// `emitter_labels_bridge_u16_ids_to_tlabel_names`,
-// `emitter_live_placeholder_returns_insn_index`). They probed
-// `em.ssarepr.insns` directly, which no longer accumulates Insns —
-// the walker-local `SSARepr` has become the authoritative accumulator
-// (commit bc0d6a06c4). Integration coverage for the same ops comes
-// from `pyre/check.sh` plus the `eval::tests` suite, which exercises
-// the walker end-to-end.
