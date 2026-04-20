@@ -140,8 +140,13 @@ fn transform_all_handlers_to_jitcode() {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let mut cw = CodeWriter::new();
             let config = GraphTransformConfig::default();
-            let ssarepr =
-                cw.transform_graph_to_jitcode(&graph_for_transform, &mut cc, &config, &jitcode);
+            let ssarepr = cw.transform_graph_to_jitcode(
+                &graph_for_transform,
+                &path,
+                &mut cc,
+                &config,
+                &jitcode,
+            );
             let body = jitcode.body();
             (ssarepr.insns.len(), body.code.len())
         }));

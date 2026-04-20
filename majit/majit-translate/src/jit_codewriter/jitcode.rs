@@ -121,10 +121,11 @@ pub struct JitCode {
     #[serde(with = "oncelock_usize_serde")]
     pub jitdriver_sd: OnceLock<usize>,
     /// RPython `codewriter.py:68` `jitcode.index = index` — sequential
-    /// position in `all_jitcodes[]`. Set at `CallControl::get_jitcode`
-    /// allocation time. Used by `inline_call` ops to reference callee
-    /// jitcode by index.
-    pub index: usize,
+    /// position in `all_jitcodes[]`. Set once when the codewriter has
+    /// finished assembling the jitcode and appended it to the completed
+    /// list, matching upstream `CodeWriter.make_jitcodes()`.
+    #[serde(with = "oncelock_usize_serde")]
+    index: OnceLock<usize>,
     /// RPython `jitcode.py:19` `self._called_from = called_from` — debug:
     /// which call graph first triggered this jitcode's creation. In RPython
     /// this is a graph object; pyre uses an optional CallPath string.
@@ -199,7 +200,7 @@ impl JitCode {
             name: name.into(),
             fnaddr: 0,
             jitdriver_sd: OnceLock::new(),
-            index: 0,
+            index: OnceLock::new(),
             _called_from: None,
             body: OnceLock::new(),
         }
@@ -237,6 +238,27 @@ impl JitCode {
     /// `grab_initial_jitcodes` / `drain_pending_graphs`).
     pub fn jitdriver_sd(&self) -> Option<usize> {
         self.jitdriver_sd.get().copied()
+    }
+
+    /// RPython `jitcode.index` reader. Panics until the jitcode has been
+    /// fully assembled and appended to `all_jitcodes[]`.
+    pub fn index(&self) -> usize {
+        *self
+            .index
+            .get()
+            .expect("JitCode index not yet set — assemble and append it before reading index")
+    }
+
+    /// Optional reader for diagnostics while this JitCode is still only a
+    /// shell on `unfinished_graphs`.
+    pub fn try_index(&self) -> Option<usize> {
+        self.index.get().copied()
+    }
+
+    /// Set `jitcode.index` once, at the moment the finished jitcode is
+    /// appended to `all_jitcodes[]`.
+    pub fn set_index(&self, idx: usize) {
+        self.index.set(idx).expect("JitCode index already set");
     }
 
     /// Set `jitdriver_sd` once. Panics on second call.

@@ -60,6 +60,7 @@ impl CodeWriter {
     pub fn transform_graph_to_jitcode(
         &mut self,
         graph: &FunctionGraph,
+        path: &crate::parse::CallPath,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
         jitcode: &std::sync::Arc<JitCode>,
@@ -150,9 +151,7 @@ impl CodeWriter {
                 }
             }
             let cfg_kind = graph_result_kind(&rewritten.graph, &ssarepr.value_kinds);
-            let declared_kind = callcontrol
-                .path_for_jitcode_index(jitcode.index)
-                .and_then(|p| callcontrol.declared_return_kind(p));
+            let declared_kind = callcontrol.declared_return_kind(path);
             let result_type = declared_kind.unwrap_or(cfg_kind);
             // Cross-check: when both sources are present they must agree,
             // with one pre-existing exception. RPython `call.py:182-187
@@ -259,14 +258,18 @@ impl CodeWriter {
                 // runtime condition.
                 panic!(
                     "drain_pending_graphs: jitcode shell has no matching graph — \
-                     path={:?} idx={} name={:?}. Producer allocated a jitcode \
+                     path={:?} idx={:?} name={:?}. Producer allocated a jitcode \
                      under a path that `function_graphs` does not contain. \
                      Fix the producer (prefer `CallControl::target_to_path`) \
                      instead of silently skipping.",
-                    path.segments, jitcode.index, jitcode.name,
+                    path.segments,
+                    jitcode.try_index(),
+                    jitcode.name,
                 );
             };
-            let _ssarepr = self.transform_graph_to_jitcode(&graph, callcontrol, config, &jitcode);
+            let _ssarepr =
+                self.transform_graph_to_jitcode(&graph, &path, callcontrol, config, &jitcode);
+            callcontrol.finish_jitcode(jitcode.clone());
 
             // RPython call.py:148: jd.mainjitcode.jitdriver_sd = jd
             for jd in callcontrol.jitdrivers_sd() {

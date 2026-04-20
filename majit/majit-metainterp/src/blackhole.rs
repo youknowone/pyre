@@ -1033,6 +1033,109 @@ impl Default for BlackholeInterpreter {
 }
 
 impl BlackholeInterpreter {
+    fn reset_position_state(&mut self, position: usize) {
+        self.position = position;
+        self.aborted = false;
+        self.got_exception = false;
+        self.last_opcode_position = position;
+        self.exception_last_value = 0;
+    }
+
+    fn init_register_file_from_i64s(
+        regs: &mut Vec<i64>,
+        num_regs_and_consts: usize,
+        target_index: usize,
+        constants: impl IntoIterator<Item = i64>,
+    ) {
+        if num_regs_and_consts > 0 {
+            regs.clear();
+            regs.resize(num_regs_and_consts, 0);
+            for (i, c) in constants.into_iter().enumerate() {
+                regs[target_index + i] = c;
+            }
+        } else {
+            regs.clear();
+        }
+    }
+
+    fn init_register_files_from_runtime_jitcode(&mut self, jitcode: &JitCode) {
+        Self::init_register_file_from_i64s(
+            &mut self.registers_i,
+            jitcode.num_regs_and_consts_i(),
+            jitcode.num_regs_i() as usize,
+            jitcode.constants_i.iter().copied(),
+        );
+        Self::init_register_file_from_i64s(
+            &mut self.registers_r,
+            jitcode.num_regs_and_consts_r(),
+            jitcode.num_regs_r() as usize,
+            jitcode.constants_r.iter().copied(),
+        );
+        Self::init_register_file_from_i64s(
+            &mut self.registers_f,
+            jitcode.num_regs_and_consts_f(),
+            jitcode.num_regs_f() as usize,
+            jitcode.constants_f.iter().copied(),
+        );
+    }
+
+    /// RPython `blackhole.py:313-337` register-file setup against the
+    /// canonical codewriter `JitCode`.
+    ///
+    /// This intentionally stops short of installing `self.jitcode` for
+    /// dispatch: pyre's execution path still expects the runtime adapter
+    /// `crate::jitcode::JitCode` for `exec.*` pools. The extracted helper
+    /// keeps the upstream-common part of `setposition` usable without a
+    /// build→runtime conversion layer.
+    pub fn prepare_registers_for_canonical_jitcode(
+        &mut self,
+        jitcode: &majit_translate::jitcode::JitCode,
+        position: usize,
+    ) {
+        let body = jitcode.body();
+        Self::init_register_file_from_i64s(
+            &mut self.registers_i,
+            jitcode.num_regs_and_consts_i(),
+            jitcode.num_regs_i(),
+            body.constants_i.iter().copied(),
+        );
+        Self::init_register_file_from_i64s(
+            &mut self.registers_r,
+            jitcode.num_regs_and_consts_r(),
+            jitcode.num_regs_r(),
+            body.constants_r.iter().map(|&c| c as i64),
+        );
+        Self::init_register_file_from_i64s(
+            &mut self.registers_f,
+            jitcode.num_regs_and_consts_f(),
+            jitcode.num_regs_f(),
+            body.constants_f.iter().map(|&c| c.to_bits() as i64),
+        );
+        self.reset_position_state(position);
+    }
+
+    /// Explicit mixed-mode helper: keep dispatch on the current runtime
+    /// adapter jitcode, but source the blackhole.py:312 register-file
+    /// sizing and constant copy from the canonical codewriter JitCode.
+    ///
+    /// Production `blackhole_from_resumedata` follows upstream again and
+    /// calls plain `setposition(jitcode, pc)`. This helper remains for
+    /// tests and for future callers that truly own both halves of the same
+    /// jitcode object graph. The caller must pass the exact matching
+    /// canonical jitcode object, not an unrelated build artifact looked up
+    /// by a coincidentally equal integer index.
+    pub fn setposition_with_canonical_jitcode(
+        &mut self,
+        runtime_jitcode: std::sync::Arc<JitCode>,
+        canonical_jitcode: &majit_translate::jitcode::JitCode,
+        position: usize,
+    ) {
+        self.prepare_registers_for_canonical_jitcode(canonical_jitcode, position);
+        // RPython: descrs / opnames stay shared on the builder; pyre still
+        // needs the runtime adapter jitcode installed for dispatch.
+        self.jitcode = runtime_jitcode;
+    }
+
     pub fn new() -> Self {
         Self {
             cpu: None,
@@ -1070,56 +1173,10 @@ impl BlackholeInterpreter {
     /// Allocates registers sized to hold both working regs and constants,
     /// then copies constants into the upper portion of each register array.
     pub fn setposition(&mut self, jitcode: std::sync::Arc<JitCode>, position: usize) {
-        // blackhole.py:313-315
-        let num_regs_and_consts_i = jitcode.num_regs_and_consts_i();
-        let num_regs_and_consts_r = jitcode.num_regs_and_consts_r();
-        let num_regs_and_consts_f = jitcode.num_regs_and_consts_f();
-
-        // blackhole.py:324-327
-        if num_regs_and_consts_i > 0 {
-            self.registers_i.clear();
-            self.registers_i.resize(num_regs_and_consts_i, 0);
-            // blackhole.py:441-449 copy_constants
-            let target_index = jitcode.num_regs_i() as usize;
-            for (i, &c) in jitcode.constants_i.iter().enumerate() {
-                self.registers_i[target_index + i] = c;
-            }
-        } else {
-            self.registers_i.clear();
-        }
-
-        // blackhole.py:328-331
-        if num_regs_and_consts_r > 0 {
-            self.registers_r.clear();
-            self.registers_r.resize(num_regs_and_consts_r, 0);
-            let target_index = jitcode.num_regs_r() as usize;
-            for (i, &c) in jitcode.constants_r.iter().enumerate() {
-                self.registers_r[target_index + i] = c;
-            }
-        } else {
-            self.registers_r.clear();
-        }
-
-        // blackhole.py:332-335
-        if num_regs_and_consts_f > 0 {
-            self.registers_f.clear();
-            self.registers_f.resize(num_regs_and_consts_f, 0);
-            let target_index = jitcode.num_regs_f() as usize;
-            for (i, &c) in jitcode.constants_f.iter().enumerate() {
-                self.registers_f[target_index + i] = c;
-            }
-        } else {
-            self.registers_f.clear();
-        }
-
-        // blackhole.py:336-337
+        self.init_register_files_from_runtime_jitcode(&jitcode);
         // RPython: descrs are shared on the builder (setup_descrs).
         self.jitcode = jitcode;
-        self.position = position;
-        self.aborted = false;
-        self.got_exception = false;
-        self.last_opcode_position = position;
-        self.exception_last_value = 0;
+        self.reset_position_state(position);
     }
 
     /// interp_jit.py:64 parity: fill dedicated portal red-arg registers

@@ -1539,6 +1539,13 @@ pub fn blackhole_resume_via_rd_numb(
             return None;
         }
         let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
+        // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
+        // `state::code_for_jitcode_index` indices name the runtime
+        // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
+        // are not the same index space as `jitcode_runtime::ALL_JITCODES`
+        // (build-time opcode-dispatch artifacts).  Do not cross-lookup the
+        // canonical store by `jitcode_index` until pyre actually shares a
+        // single JitCode object graph end-to-end.
         Some(
             resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
                 .with_virtualizable_stack_base(pyjitcode.metadata.stack_base)

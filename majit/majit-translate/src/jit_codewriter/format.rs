@@ -499,17 +499,21 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
         }
         // jtransform.py:473-482 `handle_regular_call`:
         //   args = [jitcode] + [I?, R?, F? sublists]   # only kinds present
-        // → format.py:34-35 renders the JitCode object via JitCode.__repr__;
-        //   pyre stores `jitcode_index` so we surface the same
-        //   `<JitCode #N>` shape (mirroring JitCode.__repr__'s identity slot).
+        // → format.py:34-35 renders the JitCode object via JitCode.__repr__.
+        //   Before the codewriter assigns the final dense index, fall back
+        //   to the symbolic jitcode name for debugging.
         OpKind::InlineCall {
-            jitcode_index,
+            jitcode,
             args_i,
             args_r,
             args_f,
             ..
         } => {
-            let mut parts = vec![format!("<JitCode #{jitcode_index}>")];
+            let head = match jitcode.try_index() {
+                Some(index) => format!("<JitCode #{index}>"),
+                None => format!("<JitCode {:?}>", jitcode.name),
+            };
+            let mut parts = vec![head];
             if !args_i.is_empty() {
                 parts.push(list_of_kind_repr('i', args_i, kinds));
             }
@@ -702,9 +706,11 @@ mod tests {
         use crate::model::{OpKind, SpaceOperation};
         let mut ssa = empty_ssa();
         ssa.value_kinds.insert(ValueId(1), RegKind::Ref);
+        let callee = std::sync::Arc::new(crate::jitcode::JitCode::new("callee"));
+        callee.set_index(7);
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::InlineCall {
-                jitcode_index: 7,
+                jitcode: crate::jitcode::JitCodeHandle::new(callee),
                 args_i: vec![],
                 args_r: vec![ValueId(1)],
                 args_f: vec![],

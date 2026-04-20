@@ -137,7 +137,7 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
     // first Rust pattern majit-translate's pipeline cannot lower.
     let mut cw = CodeWriter::new();
     let config = GraphTransformConfig::default();
-    let ssarepr = cw.transform_graph_to_jitcode(&sf.graph, &mut cc, &config, &jitcode);
+    let ssarepr = cw.transform_graph_to_jitcode(&sf.graph, &path, &mut cc, &config, &jitcode);
 
     // Minimal shape check: the SSARepr must carry at least as many
     // instructions as the original graph had operations. Transform passes

@@ -615,13 +615,13 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             result_kind: *result_kind,
         },
         OpKind::InlineCall {
-            jitcode_index,
+            jitcode,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::InlineCall {
-            jitcode_index: *jitcode_index,
+            jitcode: jitcode.clone(),
             args_i: args_i.iter().map(remap).collect(),
             args_r: args_r.iter().map(remap).collect(),
             args_f: args_f.iter().map(remap).collect(),

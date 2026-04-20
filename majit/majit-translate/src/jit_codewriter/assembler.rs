@@ -26,9 +26,10 @@ use crate::regalloc::RegAllocResult;
 pub struct Assembler {
     /// RPython: Assembler.insns — map {opcode_key: opcode_number}
     insns: HashMap<String, u8>,
-    /// RPython: Assembler.descrs — list of descriptors.
-    /// RPython stores AbstractDescr objects; pyre uses BhDescr enum.
-    descrs: Vec<crate::jitcode::BhDescr>,
+    /// RPython: Assembler.descrs — list of descriptors. Inline-call
+    /// descriptors keep the callee JitCode object until the final
+    /// snapshot, where `jitcode.index` is guaranteed to be assigned.
+    descrs: Vec<AssemblerDescr>,
     /// RPython: `Assembler.indirectcalltargets` — merged `IndirectCallTargets`
     /// sidecars from every `residual_call` emitted during assembly
     /// (`assembler.py:208-209`).  RPython stores `JitCode` objects; we
@@ -76,6 +77,10 @@ impl Assembler {
             all_liveness_positions: HashMap::new(),
             num_liveness_ops: 0,
         }
+    }
+
+    fn push_ready_descr(&mut self, descr: crate::jitcode::BhDescr) {
+        self.descrs.push(AssemblerDescr::Ready(descr));
     }
 
     /// RPython: `Assembler.assemble(ssarepr, jitcode, num_regs)`.
@@ -470,7 +475,7 @@ impl Assembler {
         match &op.kind {
             // RPython: inline_call → [jitcode, I[...], R[...], F[...]]
             OpKind::InlineCall {
-                jitcode_index,
+                jitcode,
                 args_i,
                 args_r,
                 args_f,
@@ -484,9 +489,8 @@ impl Assembler {
                     arg_classes: self.kinds_suffix(args_i, args_r, args_f).to_string(),
                     result_type: *result_kind,
                 };
-                self.descrs.push(crate::jitcode::BhDescr::JitCode {
-                    jitcode_index: *jitcode_index,
-                    fnaddr: 0, // resolved at runtime from all_jitcodes[jitcode_index]
+                self.descrs.push(AssemblerDescr::PendingJitCode {
+                    jitcode: jitcode.clone(),
                     calldescr,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
@@ -636,8 +640,7 @@ impl Assembler {
                     arg_classes: self.kinds_suffix(args_i, args_r, args_f).to_string(),
                     result_type: *result_kind,
                 };
-                self.descrs
-                    .push(crate::jitcode::BhDescr::Call { calldescr });
+                self.push_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
                 // RPython jtransform.py:422-431: kind-separated sublists
                 let kinds = self.kinds_suffix(args_i, args_r, args_f);
                 if kinds.contains('i') {
@@ -698,7 +701,7 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Field {
+                self.push_ready_descr(crate::jitcode::BhDescr::Field {
                     offset: 0,
                     name: field.name.clone(),
                     owner: field.owner_root.clone().unwrap_or_default(),
@@ -738,7 +741,7 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::VtableMethod {
+                self.push_ready_descr(crate::jitcode::BhDescr::VtableMethod {
                     trait_root: trait_root.clone(),
                     method_name: method_name.clone(),
                 });
@@ -772,7 +775,7 @@ impl Assembler {
                 argcodes.push(kc);
                 for fd in [field, mutate_field] {
                     let descr_idx = self.descrs.len();
-                    self.descrs.push(crate::jitcode::BhDescr::Field {
+                    self.push_ready_descr(crate::jitcode::BhDescr::Field {
                         offset: 0,
                         name: fd.name.clone(),
                         owner: fd.owner_root.clone().unwrap_or_default(),
@@ -796,7 +799,7 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Field {
+                self.push_ready_descr(crate::jitcode::BhDescr::Field {
                     offset: 0,
                     name: field.name.clone(),
                     owner: field.owner_root.clone().unwrap_or_default(),
@@ -823,7 +826,7 @@ impl Assembler {
                 argcodes.push(kc);
                 let (itemsize, is_item_signed) = arraydescrof(item_ty, array_type_id.as_deref());
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Array {
+                self.push_ready_descr(crate::jitcode::BhDescr::Array {
                     itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
@@ -861,7 +864,7 @@ impl Assembler {
                 argcodes.push(kc);
                 let (itemsize, is_item_signed) = arraydescrof(item_ty, array_type_id.as_deref());
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Array {
+                self.push_ready_descr(crate::jitcode::BhDescr::Array {
                     itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
@@ -880,7 +883,7 @@ impl Assembler {
             OpKind::VableFieldRead { field_index, .. } => {
                 // RPython: vable field → VableField descriptor (index, not byte offset).
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::VableField {
+                self.push_ready_descr(crate::jitcode::BhDescr::VableField {
                     index: *field_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
@@ -904,7 +907,7 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::VableField {
+                self.push_ready_descr(crate::jitcode::BhDescr::VableField {
                     index: *field_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
@@ -927,7 +930,7 @@ impl Assembler {
                 argcodes.push(kc);
                 // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::VableArray {
+                self.push_ready_descr(crate::jitcode::BhDescr::VableArray {
                     index: *array_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
@@ -935,7 +938,7 @@ impl Assembler {
                 argcodes.push('d');
                 // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
                 let descr_idx2 = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Array {
+                self.push_ready_descr(crate::jitcode::BhDescr::Array {
                     itemsize: *array_itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
@@ -971,7 +974,7 @@ impl Assembler {
                 argcodes.push(kc);
                 // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
                 let descr_idx = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::VableArray {
+                self.push_ready_descr(crate::jitcode::BhDescr::VableArray {
                     index: *array_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
@@ -979,7 +982,7 @@ impl Assembler {
                 argcodes.push('d');
                 // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
                 let descr_idx2 = self.descrs.len();
-                self.descrs.push(crate::jitcode::BhDescr::Array {
+                self.push_ready_descr(crate::jitcode::BhDescr::Array {
                     itemsize: *array_itemsize,
                     is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
                     is_array_of_structs: false,
@@ -1387,10 +1390,24 @@ impl Assembler {
         &self.insns
     }
 
-    /// RPython: Assembler.descrs — the descriptor table. Needed by
-    /// BlackholeInterpBuilder::setup_descrs() for 'd'/'j' argcode resolution.
-    pub fn descrs(&self) -> &[crate::jitcode::BhDescr] {
-        &self.descrs
+    /// Snapshot the descriptor table after all jitcodes have been fully
+    /// assembled. Pending inline-call descriptors are lowered here to the
+    /// final `(jitcode_index, fnaddr, calldescr)` form that runtime
+    /// consumers expect.
+    pub fn snapshot_descrs(&self) -> Vec<crate::jitcode::BhDescr> {
+        self.descrs
+            .iter()
+            .map(|descr| match descr {
+                AssemblerDescr::Ready(descr) => descr.clone(),
+                AssemblerDescr::PendingJitCode { jitcode, calldescr } => {
+                    crate::jitcode::BhDescr::JitCode {
+                        jitcode_index: jitcode.index(),
+                        fnaddr: jitcode.fnaddr,
+                        calldescr: calldescr.clone(),
+                    }
+                }
+            })
+            .collect()
     }
 
     pub fn finished(&mut self, callinfocollection: &CallInfoCollection) {
@@ -1408,6 +1425,15 @@ impl Assembler {
     pub fn count_jitcodes(&self) -> usize {
         self.count_jitcodes
     }
+}
+
+#[derive(Debug, Clone)]
+enum AssemblerDescr {
+    Ready(crate::jitcode::BhDescr),
+    PendingJitCode {
+        jitcode: crate::jitcode::JitCodeHandle,
+        calldescr: crate::jitcode::BhCallDescr,
+    },
 }
 
 impl Default for Assembler {
@@ -1766,8 +1792,8 @@ mod tests {
             asm.insns.keys().collect::<Vec<_>>()
         );
         // Two BhDescr::Field entries — for `value` and `mutate_value`.
-        let field_descr_names: Vec<&str> = asm
-            .descrs
+        let descrs = asm.snapshot_descrs();
+        let field_descr_names: Vec<&str> = descrs
             .iter()
             .filter_map(|d| match d {
                 crate::jitcode::BhDescr::Field { name, owner, .. } if owner == "Cell" => {

@@ -4619,6 +4619,56 @@ mod tests {
             RebuiltValue::Box(1, majit_ir::Type::Int)
         );
     }
+
+    #[test]
+    fn blackhole_from_resumedata_accepts_runtime_jitcode_without_canonical_pair() {
+        use crate::blackhole::BlackholeInterpBuilder;
+        use crate::jitcode::{BC_ABORT, BC_LIVE, JitCodeBuilder};
+
+        let mut writer = crate::resumecode::Writer::new(6);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count: no failargs
+        writer.append_int(0); // vable_array length
+        writer.append_int(0); // vref_array length
+        writer.append_int(0); // jitcode_pos
+        writer.append_int(0); // pc
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        let mut runtime = JitCodeBuilder::default().finish();
+        runtime.code = vec![BC_LIVE, 0, 0, BC_ABORT];
+        runtime.c_num_regs_i = 1;
+        runtime.constants_i = vec![321];
+        let runtime = std::sync::Arc::new(runtime);
+
+        let mut builder = BlackholeInterpBuilder::new();
+        let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
+            Some(ResolvedJitCode::new(runtime.clone(), 0).with_liveness_metadata(vec![0, 0, 0]))
+        };
+
+        let (bh, virtualizable_ptr) = blackhole_from_resumedata(
+            &mut builder,
+            &resolve_jitcode,
+            &rd_numb,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &NullAllocator,
+        )
+        .expect("runtime-only jitcode should still resume");
+
+        assert_eq!(virtualizable_ptr, 0);
+        assert!(std::sync::Arc::ptr_eq(&bh.jitcode, &runtime));
+        assert_eq!(bh.position, 0);
+        assert_eq!(bh.registers_i, vec![0, 321]);
+        assert_eq!(bh.liveness_info, vec![0, 0, 0]);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -5879,7 +5929,7 @@ pub fn blackhole_from_resumedata<'a>(
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc)
         let resolved = resolve_jitcode(jitcode_pos, pc)?;
-        nextbh.setposition(resolved.jitcode, resolved.pc);
+        nextbh.setposition(resolved.jitcode.clone(), resolved.pc);
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;
         }

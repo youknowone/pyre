@@ -3,12 +3,12 @@
 //! RPython's `JitCode` (jitcode.py:9) is a single class that owns
 //! both the bytecode (`code` / `constants_*` / `c_num_regs_*`) and
 //! the per-graph metadata (`name`, `fnaddr`, `calldescr`,
-//! `jitdriver_sd`). pyre's runtime layer carries the same shape but
-//! splits the storage:
+//! `jitdriver_sd`). pyre still has a split runtime representation:
 //!
-//!   * `majit_metainterp::jitcode::JitCode` holds the canonical
-//!     bytecode container (`code`, `constants_*`, `num_regs_*`).
-//!     It is the "compiled bytecode" half.
+//!   * `majit_metainterp::jitcode::JitCode` is the current runtime
+//!     adapter bytecode container (`code`, `constants_*`, `num_regs_*`,
+//!     plus pyre-only `exec.*` pools). It is not the canonical
+//!     codewriter `majit_translate::jitcode::JitCode`.
 //!   * `PyJitCode` (this struct) wraps that JitCode together with
 //!     pyre-only translation metadata — `pc_map` (Python PC → byte
 //!     offset), `merge_point_pc`, register layout — that RPython
@@ -21,16 +21,17 @@
 //! `Arc<PyJitCode>` instances. RPython's `MetaInterpStaticData.jitcodes`
 //! list and `CallControl.jitcodes` dict reference identical
 //! `JitCode` Python objects via Python's reference semantics; pyre
-//! mirrors that with shared `Arc` ownership of the unified shape
-//! defined here.
+//! mirrors the shared-identity part with `Arc<PyJitCode>`, but still
+//! keeps the extra runtime adapter split described above.
 
-use majit_metainterp::jitcode::JitCode;
+use majit_metainterp::jitcode::JitCode as RuntimeJitCode;
 
 /// Pyre-only metadata attached to a Python CodeObject's compiled JitCode.
 ///
 /// RPython does not need these fields because its bytecode PCs are already
 /// JitCode PCs. Pyre translates CPython bytecode to JitCode lazily, so the
-/// translation maps live here instead of polluting the canonical JitCode.
+/// translation maps live here instead of polluting either upstream's
+/// canonical `JitCode` or pyre's eventual single-store replacement.
 pub struct PyJitCodeMetadata {
     /// py_pc → jitcode byte offset. Named for RPython's `frame.pc →
     /// jitcode position` flow; the runtime side reads this to map
@@ -56,7 +57,7 @@ pub struct PyJitCodeMetadata {
 /// `JitCode` references are shared the same way through Python's
 /// refcount semantics.
 pub struct PyJitCode {
-    pub jitcode: std::sync::Arc<JitCode>,
+    pub jitcode: std::sync::Arc<RuntimeJitCode>,
     pub metadata: PyJitCodeMetadata,
     /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
     /// Precomputed at compile time to avoid repeated bytecode scanning.
@@ -87,7 +88,7 @@ impl PyJitCode {
     /// `get_jitcode`).
     pub fn skeleton(merge_point_pc: Option<usize>) -> Self {
         Self {
-            jitcode: std::sync::Arc::new(JitCode::default()),
+            jitcode: std::sync::Arc::new(RuntimeJitCode::default()),
             metadata: PyJitCodeMetadata {
                 pc_map: Vec::new(),
                 depth_at_py_pc: Vec::new(),

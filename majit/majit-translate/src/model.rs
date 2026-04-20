@@ -452,9 +452,11 @@ pub enum OpKind {
     /// RPython: `inline_call_{kinds}_{reskind}(jitcode, [i_args], [r_args], [f_args])`
     /// RPython jtransform.py:473-482.
     InlineCall {
-        /// Index into CallControl.jitcodes — the callee's JitCode.
-        /// RPython: `callcontrol.get_jitcode(targetgraph)`
-        jitcode_index: usize,
+        /// RPython: `callcontrol.get_jitcode(targetgraph)` returns the
+        /// callee JitCode object itself, not its final `index`.
+        /// pyre carries the same identity-bearing handle until the
+        /// assembler snapshots the final descriptor table.
+        jitcode: crate::jitcode::JitCodeHandle,
         /// Integer arguments (RPython: ListOfKind('int', ...))
         args_i: Vec<ValueId>,
         /// Reference arguments (RPython: ListOfKind('ref', ...))

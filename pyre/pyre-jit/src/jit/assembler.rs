@@ -59,6 +59,11 @@ pub struct Assembler {
 /// matches RPython's `set of JitCodes` (Python set dedupes by object
 /// identity, not value equality).  Used as the element type of
 /// `Assembler::indirectcalltargets`.
+///
+/// The stored `JitCode` is still pyre's runtime adapter
+/// `majit_metainterp::jitcode::JitCode`; once the runtime path consumes
+/// the canonical codewriter `JitCode` directly, this wrapper should move
+/// with that type rather than preserving a second object graph.
 #[derive(Debug, Clone)]
 pub struct ArcByPtr(pub Arc<JitCode>);
 
@@ -122,10 +127,10 @@ impl Assembler {
     }
 
     /// Return the accumulated indirect-call target set as a deduped
-    /// `Vec<Arc<JitCode>>`.  Matches the shape expected by
-    /// `MetaInterpStaticData::setup_indirectcalltargets` which pipes
-    /// `asm.indirectcalltargets` into the staticdata per
-    /// `pyjitpl.py:2262`.
+    /// `Vec<Arc<JitCode>>`.  Matches the current runtime-adapter shape
+    /// expected by `MetaInterpStaticData::setup_indirectcalltargets`;
+    /// upstream parity for the dict-building semantics lives below that
+    /// storage type, in `pyjitpl`'s fnaddr→jitcode helper.
     pub fn indirectcalltargets_vec(&self) -> Vec<Arc<JitCode>> {
         self.indirectcalltargets
             .iter()

@@ -10734,11 +10734,15 @@ pub struct MetaInterpStaticData {
     /// pyjitpl.py:2245-2246 `setup_descrs(descrs)` — descriptor index table.
     pub opcode_descrs: Vec<u64>,
     /// pyjitpl.py:2248-2249 `setup_indirectcalltargets(indirectcalltargets)`.
-    /// Stores `Arc<JitCode>` references so `bytecode_for_address` can
-    /// hand a hot copy back to `MIFrame::do_residual_or_indirect_call`
-    /// for `MetaInterp::perform_call(jitcode, ...)` — matching the
-    /// upstream `for jitcode in self.indirectcalltargets` loop in
-    /// `pyjitpl.py:2334-2342`.
+    /// Stores runtime-adapter `Arc<JitCode>` references so
+    /// `bytecode_for_address` can hand a hot copy back to
+    /// `MIFrame::do_residual_or_indirect_call` for
+    /// `MetaInterp::perform_call(jitcode, ...)`.
+    ///
+    /// The dict semantics are upstream-orthodox (`for jitcode in
+    /// self.indirectcalltargets: d[jitcode.fnaddr] = jitcode` at
+    /// `pyjitpl.py:2334-2342`), but pyre has not yet switched this
+    /// storage edge over to the canonical codewriter `JitCode`.
     pub indirectcalltargets: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
     /// pyjitpl.py:2251-2253 `setup_list_of_addr2name(list_of_addr2name)`.
     /// Pair-list of (fnaddr, name) for debug introspection.
@@ -10802,11 +10806,40 @@ pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
     pub addr2name: Option<std::collections::HashMap<usize, String>>,
     /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
+    /// Stores the current runtime-adapter `JitCode`; the helper that
+    /// builds this dict is intentionally type-agnostic so canonical
+    /// codewriter jitcodes can reuse the same semantics.
     pub indirectcall_dict:
         Option<std::collections::HashMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
     /// pyjitpl.py:2293-2303 `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
+}
+
+fn build_indirectcall_dict<T>(
+    targets: &[std::sync::Arc<T>],
+    fnaddr_of: impl Fn(&T) -> usize,
+) -> std::collections::HashMap<usize, std::sync::Arc<T>> {
+    let mut d = std::collections::HashMap::new();
+    for jitcode in targets {
+        let fnaddr = fnaddr_of(jitcode);
+        debug_assert!(
+            !d.contains_key(&fnaddr),
+            "duplicate fnaddr in indirectcalltargets"
+        );
+        d.insert(fnaddr, jitcode.clone());
+    }
+    d
+}
+
+fn bytecode_for_address_in_targets<T>(
+    targets: &[std::sync::Arc<T>],
+    cache: &mut Option<std::collections::HashMap<usize, std::sync::Arc<T>>>,
+    fnaddress: usize,
+    fnaddr_of: impl Fn(&T) -> usize,
+) -> Option<std::sync::Arc<T>> {
+    let dict = cache.get_or_insert_with(|| build_indirectcall_dict(targets, fnaddr_of));
+    dict.get(&fnaddress).cloned()
 }
 
 impl MetaInterpStaticData {
@@ -10932,18 +10965,12 @@ impl MetaInterpStaticData {
         &mut self,
         fnaddress: usize,
     ) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
-        let dict = self.globaldata.indirectcall_dict.get_or_insert_with(|| {
-            let mut d = std::collections::HashMap::new();
-            for jitcode in &self.indirectcalltargets {
-                debug_assert!(
-                    !d.contains_key(&(jitcode.fnaddr as usize)),
-                    "duplicate fnaddr in indirectcalltargets"
-                );
-                d.insert(jitcode.fnaddr as usize, jitcode.clone());
-            }
-            d
-        });
-        dict.get(&fnaddress).cloned()
+        bytecode_for_address_in_targets(
+            &self.indirectcalltargets,
+            &mut self.globaldata.indirectcall_dict,
+            fnaddress,
+            |jitcode| jitcode.fnaddr as usize,
+        )
     }
 }
 
@@ -10951,6 +10978,7 @@ impl MetaInterpStaticData {
 mod metainterp_static_data_tests {
     use super::*;
     use crate::jitcode::{JitCode, JitCodeBuilder};
+    use majit_translate::jitcode::JitCode as BuildJitCode;
 
     /// Build a placeholder `Arc<JitCode>` whose `fnaddr` matches the
     /// given address.  Real production code populates `fnaddr` via
@@ -11002,6 +11030,66 @@ mod metainterp_static_data_tests {
         ]);
         assert!(sd.bytecode_for_address(0x100).is_none());
         assert!(sd.bytecode_for_address(0x200).is_some());
+    }
+
+    #[test]
+    fn build_indirectcall_dict_accepts_canonical_build_jitcodes() {
+        // Same RPython dict semantics should work for the canonical
+        // codewriter JitCode object graph too: the helper cares only
+        // about shared object identity + `jitcode.fnaddr`.
+        let mut j100 = BuildJitCode::new("build/j100");
+        j100.fnaddr = 0x100;
+        let j100 = std::sync::Arc::new(j100);
+
+        let mut j200 = BuildJitCode::new("build/j200");
+        j200.fnaddr = 0x200;
+        let j200 = std::sync::Arc::new(j200);
+
+        let dict = build_indirectcall_dict(&[j100.clone(), j200.clone()], |jitcode| {
+            jitcode.fnaddr as usize
+        });
+        assert!(std::sync::Arc::ptr_eq(dict.get(&0x100).unwrap(), &j100));
+        assert!(std::sync::Arc::ptr_eq(dict.get(&0x200).unwrap(), &j200));
+        assert!(!dict.contains_key(&0x300));
+    }
+
+    #[test]
+    fn bytecode_for_address_helper_accepts_canonical_build_jitcodes() {
+        // The actual `bytecode_for_address` lookup path should be reusable
+        // with the canonical codewriter JitCode store too. This keeps the
+        // fnaddr->jitcode semantics independent from the current runtime
+        // adapter storage edge.
+        let mut j100 = BuildJitCode::new("build/j100");
+        j100.fnaddr = 0x100;
+        let j100 = std::sync::Arc::new(j100);
+
+        let mut j200 = BuildJitCode::new("build/j200");
+        j200.fnaddr = 0x200;
+        let j200 = std::sync::Arc::new(j200);
+
+        let targets = vec![j100.clone(), j200.clone()];
+        let mut cache = None;
+
+        assert!(std::sync::Arc::ptr_eq(
+            &bytecode_for_address_in_targets(&targets, &mut cache, 0x100, |jitcode| {
+                jitcode.fnaddr as usize
+            })
+            .unwrap(),
+            &j100
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &bytecode_for_address_in_targets(&targets, &mut cache, 0x200, |jitcode| {
+                jitcode.fnaddr as usize
+            })
+            .unwrap(),
+            &j200
+        ));
+        assert!(
+            bytecode_for_address_in_targets(&targets, &mut cache, 0x300, |jitcode| {
+                jitcode.fnaddr as usize
+            })
+            .is_none()
+        );
     }
 
     #[test]

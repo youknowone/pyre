@@ -985,13 +985,15 @@ impl<'a> Transformer<'a> {
         // qualified key (`call.rs:941`) and leaves the shell body-less in
         // `drain_pending_graphs`. Phase I3 of the eval-loop automation
         // plan (`producer_side_jitcode_shell_leaks_2026_04_20.md`).
-        let jitcode_index = if let Some(cc) = self.callcontrol.as_mut() {
+        let jitcode = if let Some(cc) = self.callcontrol.as_mut() {
             let path = cc
                 .target_to_path(target)
                 .unwrap_or_else(|| target_to_call_path(target));
-            cc.get_jitcode(&path).index
+            crate::jitcode::JitCodeHandle::new(cc.get_jitcode(&path))
         } else {
-            0
+            crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(crate::jitcode::JitCode::new(
+                "<missing-callcontrol>",
+            )))
         };
         // RPython jtransform.py:480: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
@@ -1000,7 +1002,7 @@ impl<'a> Transformer<'a> {
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
-            detail: format!("call {target} → inline_call[jitcode={jitcode_index}]"),
+            detail: format!("call {target} → inline_call[jitcode={:?}]", jitcode.name),
         });
         self.calls_classified += 1;
         // RPython jtransform.py:480-481: inline_call always followed by -live-
@@ -1008,7 +1010,7 @@ impl<'a> Transformer<'a> {
             SpaceOperation {
                 result: op.result,
                 kind: OpKind::InlineCall {
-                    jitcode_index,
+                    jitcode,
                     args_i,
                     args_r,
                     args_f,
@@ -2205,13 +2207,13 @@ fn remap_op(
             result_kind: *result_kind,
         },
         OpKind::InlineCall {
-            jitcode_index,
+            jitcode,
             args_i,
             args_r,
             args_f,
             result_kind,
         } => OpKind::InlineCall {
-            jitcode_index: *jitcode_index,
+            jitcode: jitcode.clone(),
             args_i: args_i
                 .iter()
                 .copied()
@@ -2952,11 +2954,14 @@ mod tests {
             .expect("residual call with indirect_targets");
 
         assert_eq!(residual.lst.len(), 2);
-        // Jitcode indices are sequentially assigned from 0; the handles
-        // carry their `JitCode.index` as the orthodox stable handle.
-        let mut sorted: Vec<usize> = residual.lst.iter().map(|h| h.index).collect();
-        sorted.sort();
-        assert_eq!(sorted, vec![0, 1]);
+        // `IndirectCallTargets.lst` carries shell handles returned by
+        // `CallControl::get_jitcode()`. RPython appends/indices jitcodes
+        // only after `transform_graph_to_jitcode(...)` completes, so the
+        // candidate handles must still be unindexed at this stage.
+        assert!(
+            residual.lst.iter().all(|h| h.try_index().is_none()),
+            "indirect target shells should not have final all_jitcodes indices yet"
+        );
     }
 
     // ── Kind matrix: `indirect_regular_call_{r,ir,irf}_{i,r,f,v}` ────

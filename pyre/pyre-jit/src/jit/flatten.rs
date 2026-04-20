@@ -206,9 +206,11 @@ impl ListOfKind {
 ///
 /// The list carries `JitCode` references (RPython `list of JitCodes`, in
 /// which each entry is a Python-object reference shared with other call
-/// sites and with the assembler's `indirectcalltargets` set).  pyre's
-/// parity representation is `Vec<Arc<JitCode>>` — `Arc` provides the
-/// shared-reference semantics of a Python object reference.
+/// sites and with the assembler's `indirectcalltargets` set).  pyre still
+/// stores the runtime adapter `majit_metainterp::jitcode::JitCode` here;
+/// `Arc` preserves the shared-reference semantics of the Python object
+/// reference, but the canonical codewriter `majit_translate::jitcode::JitCode`
+/// has not reached this runtime path yet.
 #[derive(Debug, Clone, Default)]
 pub struct IndirectCallTargets {
     pub lst: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,

@@ -301,12 +301,10 @@ pub struct CallControl {
     /// the stable symbolic address shim.
     function_fnaddrs: HashMap<CallPath, i64>,
 
-    /// Allocation order of `Arc<JitCode>` shells. `jitcode_alloc_order[i]`
-    /// is the path whose `JitCode.index == i`. Used by
-    /// `collect_jitcodes_in_alloc_order` to materialise the
-    /// `all_jitcodes[]` vector with the RPython invariant
-    /// `all_jitcodes[i].index == i` (codewriter.py:80).
-    jitcode_alloc_order: Vec<CallPath>,
+    /// RPython `all_jitcodes` materialized incrementally by
+    /// `CodeWriter.make_jitcodes()`. Entries are appended only after a
+    /// jitcode has been fully assembled.
+    finished_jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
 
     /// RPython: `CallControl.unfinished_graphs` — graphs pending assembly.
     unfinished_graphs: Vec<CallPath>,
@@ -323,9 +321,6 @@ pub struct CallControl {
 
     /// call.py:41 `self.randomeffects_analyzer = RandomEffectsAnalyzer(translator)`.
     pub randomeffects_analyzer: majit_ir::effectinfo::RandomEffectsAnalyzer,
-
-    /// Next JitCode index to assign.
-    next_jitcode_index: usize,
 
     /// RPython: `getattr(func, "_elidable_function_", False)` (call.py:239).
     /// Targets known to be elidable (pure, no side effects).
@@ -653,13 +648,12 @@ impl CallControl {
             builtin_targets: HashSet::new(),
             jitcodes: HashMap::new(),
             function_fnaddrs: HashMap::new(),
-            jitcode_alloc_order: Vec::new(),
+            finished_jitcodes: Vec::new(),
             unfinished_graphs: Vec::new(),
             callinfocollection: majit_ir::CallInfoCollection::new(),
             virtualizable_analyzer: majit_ir::effectinfo::VirtualizableAnalyzer,
             quasiimmut_analyzer: majit_ir::effectinfo::QuasiImmutAnalyzer,
             randomeffects_analyzer: majit_ir::effectinfo::RandomEffectsAnalyzer,
-            next_jitcode_index: 0,
             elidable_targets: HashSet::new(),
             loopinvariant_targets: HashSet::new(),
             known_struct_names: HashSet::new(),
@@ -1485,12 +1479,12 @@ impl CallControl {
     /// RPython: `CallControl.get_jitcode(graph, called_from)`.
     ///
     /// Retrieve or create the `Arc<JitCode>` shell for the given graph.
-    /// The shell carries `name`/`index` plus the graph's bound helper
-    /// address when available, otherwise the stable symbolic fallback; the
-    /// body is filled later by `CodeWriter::transform_graph_to_jitcode`
-    /// via `JitCode::set_body`.
-    /// Callers that only need the integer index (e.g. `InlineCall` ops)
-    /// read `.index` on the returned shell.
+    /// The shell carries `name` plus the graph's bound helper address when
+    /// available, otherwise the stable symbolic fallback; the body is
+    /// filled later by `CodeWriter::transform_graph_to_jitcode` via
+    /// `JitCode::set_body`. Upstream `jitcode.index` is not assigned here;
+    /// pyre follows the same rule and sets it only when the finished
+    /// jitcode is appended to `all_jitcodes[]`.
     ///
     /// RPython call.py:155-172: creates JitCode(graph.name, fnaddr, calldescr)
     /// and adds graph to unfinished_graphs for later assembly.
@@ -1506,8 +1500,6 @@ impl CallControl {
             "{:?} has _gctransformer_hint_close_stack_",
             path
         );
-        let index = self.next_jitcode_index;
-        self.next_jitcode_index += 1;
         // Shell name mirrors RPython `graph.name`. We use the path's last
         // segment to stay readable in dumps; the assembler no longer
         // touches the name (it lives on the shell from allocation).
@@ -1516,7 +1508,6 @@ impl CallControl {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{path:?}"));
         let mut shell = crate::jitcode::JitCode::new(name);
-        shell.index = index;
         shell.fnaddr = self
             .function_fnaddrs
             .get(path)
@@ -1524,7 +1515,6 @@ impl CallControl {
             .unwrap_or_else(|| symbolic_fnaddr_for_path(path));
         let arc = std::sync::Arc::new(shell);
         self.jitcodes.insert(path.clone(), arc.clone());
-        self.jitcode_alloc_order.push(path.clone());
         self.unfinished_graphs.push(path.clone());
         arc
     }
@@ -1538,11 +1528,13 @@ impl CallControl {
         self.jitcodes.get(path).cloned()
     }
 
-    /// Reverse lookup: `JitCode.index → CallPath`. Mirrors `RPython
-    /// codewriter.py:80` `all_jitcodes[jitcode.index] is jitcode` invariant
-    /// — pyre stores the path-to-index mapping in `jitcode_alloc_order`.
-    pub fn path_for_jitcode_index(&self, index: usize) -> Option<&CallPath> {
-        self.jitcode_alloc_order.get(index)
+    /// Append a fully assembled jitcode to `all_jitcodes[]` and assign
+    /// its final dense index. Mirrors RPython `all_jitcodes.append(jitcode)`
+    /// immediately after `transform_graph_to_jitcode(...)`.
+    pub fn finish_jitcode(&mut self, jitcode: std::sync::Arc<crate::jitcode::JitCode>) {
+        let index = self.finished_jitcodes.len();
+        jitcode.set_index(index);
+        self.finished_jitcodes.push(jitcode);
     }
 
     /// RPython `call.py:182-187 get_jitcode_calldescr` source-of-truth for
@@ -1635,24 +1627,24 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
 }
 
 impl CallControl {
-    /// Collect every `Arc<JitCode>` shell in allocation order. The return
-    /// vec is dense: `result[i].index == i` matches RPython
-    /// `codewriter.py:80` `all_jitcodes[jitcode.index] is jitcode`.
-    ///
-    /// Each `get_jitcode` call pushes a path onto `jitcode_alloc_order`
-    /// and assigns `shell.index = next_jitcode_index` (call.rs:1509), so
-    /// `jitcode_alloc_order[i]` is the path of the shell whose
-    /// `.index == i` by construction.  We deliberately do NOT filter on
-    /// `try_body().is_some()`: a body-less shell is a valid allocated
-    /// slot whose `.index` would otherwise clash with a later shell in
-    /// position-space. Empty shells round-trip through bincode (body
-    /// `OnceLock` serializes as `None`) and downstream consumers that
-    /// require a body must check `try_body()` themselves.
+    /// Return the completed `all_jitcodes[]` list in append order. Every
+    /// entry must have both a body and a dense final `.index`.
     pub fn collect_jitcodes_in_alloc_order(&self) -> Vec<std::sync::Arc<crate::jitcode::JitCode>> {
-        self.jitcode_alloc_order
-            .iter()
-            .map(|p| self.jitcodes[p].clone())
-            .collect()
+        for (i, jitcode) in self.finished_jitcodes.iter().enumerate() {
+            assert!(
+                jitcode.try_body().is_some(),
+                "collect_jitcodes_in_alloc_order: jitcode {:?} at slot {i} has no body",
+                jitcode.name
+            );
+            assert_eq!(
+                jitcode.index(),
+                i,
+                "collect_jitcodes_in_alloc_order: jitcode {:?} has index {} at slot {i}",
+                jitcode.name,
+                jitcode.index()
+            );
+        }
+        self.finished_jitcodes.clone()
     }
 
     /// RPython: `CallControl.grab_initial_jitcodes()` (call.py:145-148).

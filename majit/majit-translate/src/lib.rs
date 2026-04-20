@@ -756,6 +756,7 @@ fn build_canonical_opcode_dispatch(
     // `drain_pending_graphs` will recompute its own SSARepr+JitCode below
     // and place the result at `jitcodes[entry_jitcode_index]`.
     let mut dispatch: Vec<pipeline::PipelineOpcodeArm> = Vec::with_capacity(opcode_arms.len());
+    let mut dispatch_paths: Vec<Option<parse::CallPath>> = Vec::with_capacity(opcode_arms.len());
     for (arm_id, arm) in opcode_arms.into_iter().enumerate() {
         let _resolved_calls = resolve_handler_calls(
             &arm.handler_calls,
@@ -793,20 +794,23 @@ fn build_canonical_opcode_dispatch(
             flatten::flatten_with_types(&rewritten.graph, &rewritten_type_state, &regallocs)
         });
 
-        // Register the arm body in CallControl + reserve a jitcode slot.
-        // RPython call.py:155-172 `get_jitcode(graph)`.
-        let entry_jitcode_index = arm.body_graph.map(|body_graph| {
+        // Register the arm body in CallControl. RPython call.py:155-172
+        // `get_jitcode(graph)` returns the callee object; the final
+        // `jitcode.index` is assigned only after assembly completes.
+        let entry_jitcode_path = arm.body_graph.map(|body_graph| {
             let synthetic_path = synthetic_opcode_arm_path(&arm.selector, arm_id);
             call_control.register_function_graph(synthetic_path.clone(), body_graph);
-            call_control.get_jitcode(&synthetic_path).index
+            let _ = call_control.get_jitcode(&synthetic_path);
+            synthetic_path
         });
 
         dispatch.push(pipeline::PipelineOpcodeArm {
             arm_id,
             selector: arm.selector,
-            entry_jitcode_index,
+            entry_jitcode_index: None,
             flattened,
         });
+        dispatch_paths.push(entry_jitcode_path);
     }
 
     // Phase 3: Drain pending graphs.
@@ -823,9 +827,18 @@ fn build_canonical_opcode_dispatch(
         .assembler
         .finished(&call_control.callinfocollection);
 
-    // Materialise `all_jitcodes[]` from the per-CallPath shells. RPython
-    // invariant `all_jitcodes[i].index == i` is preserved by allocation
-    // order in `CallControl::jitcode_alloc_order`.
+    for (arm, path) in dispatch.iter_mut().zip(dispatch_paths.into_iter()) {
+        if let Some(path) = path {
+            let jitcode = call_control
+                .jitcode_handle(&path)
+                .expect("opcode arm jitcode handle must exist after registration");
+            arm.entry_jitcode_index = Some(jitcode.index());
+        }
+    }
+
+    // Materialise `all_jitcodes[]` from the completed jitcodes. Each
+    // jitcode receives its dense index when appended, matching RPython
+    // `make_jitcodes()`.
     let jitcodes = call_control.collect_jitcodes_in_alloc_order();
 
     // RPython codewriter.py + assembler.py: `Assembler.insns` grows as
@@ -838,7 +851,7 @@ fn build_canonical_opcode_dispatch(
     // shared descr table every 'd'/'j' argcode indexes into at runtime.
     // Snapshotted here so the build artifact carries it alongside
     // `insns`, mirroring RPython's single-store model.
-    let descrs: Vec<jitcode::BhDescr> = codewriter.assembler.descrs().to_vec();
+    let descrs: Vec<jitcode::BhDescr> = codewriter.assembler.snapshot_descrs();
 
     (dispatch, jitcodes, insns, descrs)
 }

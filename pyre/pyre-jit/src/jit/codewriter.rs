@@ -2409,8 +2409,9 @@ impl CodeWriter {
     ///
     /// RPython's `make_jitcodes` (codewriter.py:79-85) drains the queue
     /// once and then calls `assembler.finished()`. Both pyre adapters
-    /// run the same drain so each batch ends with `assembler.finished()`,
-    /// matching `codewriter.py:85`.
+    /// run the same drain so each batch ends with `assembler.finished()`
+    /// and the matching `setup_indirectcalltargets(asm.indirectcalltargets)`
+    /// publish, matching `codewriter.py:85` plus `pyjitpl.py:2262`.
     pub(crate) fn drain_unfinished_graphs(&self) -> Vec<*const PyJitCode> {
         let mut all_jitcodes: Vec<*const PyJitCode> = Vec::new();
         // codewriter.py:79 `for graph, jitcode in enum_pending_graphs():`.
@@ -2442,7 +2443,21 @@ impl CodeWriter {
         self.assembler
             .borrow_mut()
             .finished(&self.callcontrol().callinfocollection);
+        self.publish_indirectcalltargets();
         all_jitcodes
+    }
+
+    /// `pyjitpl.py:2262`
+    /// `self.setup_indirectcalltargets(asm.indirectcalltargets)`.
+    ///
+    /// RPython wires the codewriter's accumulated assembler set into
+    /// `MetaInterpStaticData` during `finish_setup(codewriter, optimizer)`.
+    /// pyre publishes the same accumulated set after each drain batch so the
+    /// trace-side staticdata stays aligned with the writer's current
+    /// `Assembler.indirectcalltargets`.
+    fn publish_indirectcalltargets(&self) {
+        let targets = self.assembler.borrow().indirectcalltargets_vec();
+        pyre_jit_trace::state::setup_indirectcalltargets(targets);
     }
 
     /// call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — propagate the
@@ -2659,3 +2674,43 @@ pub fn find_loop_header_pcs(
 // `liveness_regs_to_u8_sorted` tests removed alongside the helper.
 // The 256-register cap is now enforced inside `encode_liveness` and
 // covered by `majit_translate::liveness::encode_liveness*` tests.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::assembler::ArcByPtr;
+    use std::sync::Arc;
+
+    fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<JitCode> {
+        let mut jitcode = JitCodeBuilder::default().finish();
+        jitcode.fnaddr = fnaddr as i64;
+        Arc::new(jitcode)
+    }
+
+    #[test]
+    fn publish_indirectcalltargets_updates_trace_staticdata() {
+        let writer = CodeWriter::new();
+        let j100 = make_runtime_jitcode_with_fnaddr(0x100);
+        let j200 = make_runtime_jitcode_with_fnaddr(0x200);
+
+        {
+            let mut assembler = writer.assembler.borrow_mut();
+            assembler
+                .indirectcalltargets
+                .insert(ArcByPtr::new(j100.clone()));
+            assembler
+                .indirectcalltargets
+                .insert(ArcByPtr::new(j200.clone()));
+        }
+
+        writer.publish_indirectcalltargets();
+
+        let hit_100 = pyre_jit_trace::state::bytecode_for_address(0x100)
+            .expect("fnaddr 0x100 must be published to trace staticdata");
+        let hit_200 = pyre_jit_trace::state::bytecode_for_address(0x200)
+            .expect("fnaddr 0x200 must be published to trace staticdata");
+        assert!(Arc::ptr_eq(&hit_100, &j100));
+        assert!(Arc::ptr_eq(&hit_200, &j200));
+        assert!(pyre_jit_trace::state::bytecode_for_address(0x300).is_none());
+    }
+}

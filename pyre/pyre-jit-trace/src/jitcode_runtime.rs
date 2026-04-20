@@ -46,10 +46,11 @@ static ALL_JITCODES: LazyLock<Vec<Arc<JitCode>>> = LazyLock::new(|| {
     // `collect_jitcodes_in_alloc_order` is caught immediately.
     for (i, jc) in vec.iter().enumerate() {
         assert_eq!(
-            jc.index, i,
+            jc.index(),
+            i,
             "pyre-jit-trace: jitcode[{i}].index = {} (expected {i}); \
              RPython invariant `all_jitcodes[i].index == i` broken",
-            jc.index,
+            jc.index(),
         );
     }
     vec
@@ -971,35 +972,31 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_jitcode_drives_blackhole_setposition() {
-        // Phase D-2 Slice 2 integration: end-to-end path from a real
-        // deserialized ALL_JITCODES entry through the build→runtime
-        // `From` conversion into `BlackholeInterpreter::setposition`.
-        // This covers the full Phase D-2 prerequisite surface:
-        //   bincode → ALL_JITCODES → From<&build_time::JitCode> → setposition
-        // without actually dispatching any bhimpl (which would require
-        // descrs + fn_ptrs population, Slice 3+ scope).
-        use majit_metainterp::blackhole::BlackholeInterpreter;
-        use majit_metainterp::jitcode::JitCode as RtJitCode;
-
+    fn pop_top_jitcode_is_complete_in_canonical_store() {
+        // RPython parity target: the deserialized `ALL_JITCODES` entries
+        // are themselves the canonical objects produced by
+        // `CodeWriter.make_jitcodes()`. Avoid the transitional
+        // build→runtime `From` adapter here and assert directly on the
+        // canonical object that build.rs persisted.
+        let arm_id =
+            arm_id_for_instruction(&Instruction::PopTop).expect("PopTop must resolve to an arm_id");
+        let arm = get_arm(arm_id).expect("PopTop arm must exist");
         let bt_jc = jitcode_for_instruction(&Instruction::PopTop)
             .expect("PopTop must resolve to a jitcode");
-        let rt_jc = std::sync::Arc::new(RtJitCode::from(&*bt_jc));
-        // The conversion preserves the bytecode bytes exactly.
-        assert_eq!(rt_jc.code, bt_jc.code);
-        assert!(!rt_jc.code.is_empty());
-        assert_eq!(rt_jc.name, bt_jc.name);
-
-        let mut bh = BlackholeInterpreter::new();
-        bh.setposition(rt_jc.clone(), 0);
-        assert_eq!(bh.position, 0);
-        // num_regs_and_consts_i = c_num_regs_i + len(constants_i); the
-        // allocation must accommodate both.
-        let expected_i = rt_jc.c_num_regs_i as usize + rt_jc.constants_i.len();
-        assert_eq!(bh.registers_i.len(), expected_i);
-        let expected_r = rt_jc.c_num_regs_r as usize + rt_jc.constants_r.len();
-        assert_eq!(bh.registers_r.len(), expected_r);
-        let expected_f = rt_jc.c_num_regs_f as usize + rt_jc.constants_f.len();
-        assert_eq!(bh.registers_f.len(), expected_f);
+        assert!(!bt_jc.code.is_empty());
+        assert_eq!(bt_jc.name, "Instruction::PopTop#13");
+        assert_eq!(arm.entry_jitcode_index, Some(bt_jc.index()));
+        assert_eq!(
+            bt_jc.num_regs_and_consts_i(),
+            bt_jc.num_regs_i() + bt_jc.constants_i.len()
+        );
+        assert_eq!(
+            bt_jc.num_regs_and_consts_r(),
+            bt_jc.num_regs_r() + bt_jc.constants_r.len()
+        );
+        assert_eq!(
+            bt_jc.num_regs_and_consts_f(),
+            bt_jc.num_regs_f() + bt_jc.constants_f.len()
+        );
     }
 }

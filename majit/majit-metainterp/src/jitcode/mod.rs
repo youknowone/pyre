@@ -1,6 +1,9 @@
 mod assembler;
 
 pub use assembler::JitCodeBuilder;
+pub use majit_translate::jitcode::{
+    BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, JitCode as CanonicalJitCode,
+};
 
 use majit_ir::OpCode;
 
@@ -412,57 +415,6 @@ impl std::fmt::Display for JitCode {
     }
 }
 
-/// Convert a build-time `majit_translate::jitcode::JitCode` (emitted by
-/// `build.rs` and serialized to `opcode_jitcodes.bin`) into a runtime
-/// `JitCode` usable by `BlackholeInterpreter::dispatch_one`.
-///
-/// Field-width and representation differences that this conversion
-/// papers over (RPython has one `JitCode` struct, so there is no upstream
-/// counterpart for the width mismatch — it exists only because pyre's
-/// build-time serialization uses narrower fields to save space):
-///
-///   - `c_num_regs_{i,r,f}`: build-time `u8`, runtime `u16`.
-///   - `constants_r`: build-time `Vec<u64>`, runtime `Vec<i64>` (same
-///     bit pattern; GCREF pointer reinterpretation).
-///   - `constants_f`: build-time `Vec<f64>`, runtime `Vec<i64>`
-///     (runtime stores `longlong.FLOATSTORAGE` bits per RPython
-///     `jitcode.py:34`; `f64::to_bits` yields the same raw pattern).
-///
-/// Runtime-only fields (`opcodes`, `sub_jitcodes`, `fn_ptrs`,
-/// `assembler_targets`) default-initialize to empty — they are populated
-/// by the runtime codewriter (`pyre-jit/src/jit/`) for function-level
-/// jitcodes, not by `build.rs`. Phase D-2's shadow dispatch is
-/// intentionally limited to opcode arms whose decomposed bytecode does
-/// not reach `inline_call` / `residual_call` until these pools are
-/// wired too.
-///
-/// Panics if the build-time jitcode body has not been set
-/// (`set_body()` not called). Build artifacts that were fully assembled
-/// by `codewriter.drain_pending_graphs` always satisfy this.
-impl From<&majit_translate::jitcode::JitCode> for JitCode {
-    fn from(bt: &majit_translate::jitcode::JitCode) -> Self {
-        let body = bt.body();
-        Self {
-            name: bt.name.clone(),
-            code: body.code.clone(),
-            c_num_regs_i: body.c_num_regs_i as u16,
-            c_num_regs_r: body.c_num_regs_r as u16,
-            c_num_regs_f: body.c_num_regs_f as u16,
-            constants_i: body.constants_i.clone(),
-            constants_r: body.constants_r.iter().map(|&u| u as i64).collect(),
-            constants_f: body
-                .constants_f
-                .iter()
-                .map(|&f| f.to_bits() as i64)
-                .collect(),
-            jitdriver_sd: bt.jitdriver_sd.get().copied(),
-            fnaddr: bt.fnaddr,
-            calldescr: body.calldescr.clone(),
-            exec: JitCodeExecState::default(),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitCallTarget {
     pub trace_ptr: *const (),
@@ -582,62 +534,13 @@ mod tests {
     use majit_translate::jitcode::{JitCode as BuildJitCode, JitCodeBody as BuildJitCodeBody};
 
     #[test]
-    fn from_build_jitcode_shares_code_and_widens_reg_counts() {
-        // Build-time: u8 register counts, Vec<u64> ref constants,
-        // Vec<f64> float constants. Runtime needs u16 / Vec<i64>.
-        let body = BuildJitCodeBody {
-            code: vec![0xAA, 0xBB, 0xCC],
-            c_num_regs_i: 17,
-            c_num_regs_r: 5,
-            c_num_regs_f: 2,
-            constants_i: vec![42, -1],
-            constants_r: vec![0x_FFFF_FFFF_FFFF_0000_u64],
-            constants_f: vec![1.5_f64, -0.25_f64],
-            ..Default::default()
-        };
-        let bt = BuildJitCode::new("test/jc");
-        bt.set_body(body);
-
-        let rt: JitCode = (&bt).into();
-
-        assert_eq!(rt.name, "test/jc");
-        assert_eq!(rt.code, vec![0xAA, 0xBB, 0xCC]);
-        assert_eq!(rt.c_num_regs_i, 17);
-        assert_eq!(rt.c_num_regs_r, 5);
-        assert_eq!(rt.c_num_regs_f, 2);
-        assert_eq!(rt.constants_i, vec![42, -1]);
-        // u64 → i64 bit-reinterpret: the top bit flips to signed.
-        assert_eq!(rt.constants_r, vec![0xFFFF_FFFF_FFFF_0000_u64 as i64]);
-        // f64 → bits → i64: round-trip via f64::to_bits.
-        assert_eq!(rt.constants_f[0], f64::to_bits(1.5_f64) as i64);
-        assert_eq!(rt.constants_f[1], f64::to_bits(-0.25_f64) as i64);
-        // Runtime-only fields default-init empty.
-        assert!(rt.exec.opcodes.is_empty());
-        assert!(rt.exec.sub_jitcodes.is_empty());
-        assert!(rt.exec.fn_ptrs.is_empty());
-        assert!(rt.exec.assembler_targets.is_empty());
-    }
-
-    #[test]
-    fn from_build_jitcode_preserves_jitdriver_and_fnaddr() {
-        let body = BuildJitCodeBody::default();
-        let mut bt = BuildJitCode::new("portal/jc");
-        bt.fnaddr = 0x1234;
-        bt.set_body(body);
-        bt.set_jitdriver_sd(3);
-
-        let rt: JitCode = (&bt).into();
-        assert_eq!(rt.jitdriver_sd, Some(3));
-        assert_eq!(rt.fnaddr, 0x1234);
-    }
-
-    #[test]
-    fn setposition_accepts_converted_jitcode_and_sizes_register_files() {
-        // Slice 2: end-to-end proof that a build-time JitCode converted via
-        // `From<&BuildJitCode>` is directly usable as input to
-        // `BlackholeInterpreter::setposition`. This is the integration point
-        // the Phase D-2 blackhole record-on-execute path needs in place
-        // before any bhimpl dispatch is attempted.
+    fn canonical_build_jitcode_sizes_blackhole_register_files_without_conversion() {
+        // Extract the upstream-common part of blackhole.py:312 setposition
+        // (register sizing + constant copy) and apply it directly to the
+        // canonical codewriter JitCode. Dispatch still needs the runtime
+        // adapter JitCode for exec.* pools, but the register-file setup no
+        // longer needs a build→runtime conversion just to match RPython's
+        // `num_regs_* + len(constants_*)` logic.
         //
         // RPython: `blackhole.py:312 setposition` allocates `num_regs_i +
         // len(constants_i)` slots per register file and copies each constant
@@ -658,9 +561,8 @@ mod tests {
         let bt = BuildJitCode::new("slice2/test");
         bt.set_body(body);
 
-        let rt_jc = std::sync::Arc::new(JitCode::from(&bt));
         let mut bh = BlackholeInterpreter::new();
-        bh.setposition(rt_jc.clone(), 0);
+        bh.prepare_registers_for_canonical_jitcode(&bt, 0);
 
         // num_regs_and_consts_i = 4 + 3 = 7; constants occupy [4..7].
         assert_eq!(bh.registers_i.len(), 7);
@@ -679,6 +581,36 @@ mod tests {
         assert_eq!(bh.registers_f[1], f64::to_bits(1.25_f64) as i64);
 
         assert_eq!(bh.position, 0);
-        assert_eq!(&bh.jitcode.code, &[BC_LIVE, 0x00, 0x00]);
+        assert!(bh.jitcode.code.is_empty());
+    }
+
+    #[test]
+    fn canonical_setposition_keeps_runtime_dispatch_jitcode_but_uses_canonical_constants() {
+        use crate::blackhole::BlackholeInterpreter;
+
+        let body = BuildJitCodeBody {
+            code: vec![BC_LIVE, 0x00, 0x00],
+            c_num_regs_i: 1,
+            c_num_regs_r: 0,
+            c_num_regs_f: 0,
+            constants_i: vec![777],
+            ..Default::default()
+        };
+        let canonical = BuildJitCode::new("slice2/canonical");
+        canonical.set_body(body);
+
+        let mut runtime = JitCodeBuilder::default().finish();
+        runtime.code = vec![BC_ABORT];
+        runtime.c_num_regs_i = 1;
+        let runtime = std::sync::Arc::new(runtime);
+
+        let mut bh = BlackholeInterpreter::new();
+        bh.setposition_with_canonical_jitcode(runtime.clone(), &canonical, 0);
+
+        assert_eq!(bh.registers_i.len(), 2);
+        assert_eq!(bh.registers_i[1], 777);
+        assert!(std::sync::Arc::ptr_eq(&bh.jitcode, &runtime));
+        assert_eq!(bh.jitcode.code, vec![BC_ABORT]);
+        assert_eq!(bh.position, 0);
     }
 }
