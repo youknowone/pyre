@@ -127,6 +127,15 @@ enum HostObjectKind {
         fset: Option<HostObject>,
         fdel: Option<HostObject>,
     },
+    /// Python `staticmethod(func)` descriptor. The wrapped callable is
+    /// typically a user-function HostObject; `ClassDesc.s_get_value`
+    /// unwraps it before calling `immutablevalue`, matching
+    /// `value.__get__(42)` upstream.
+    StaticMethod { func: HostObject },
+    /// Python `classmethod(func)` descriptor. `ClassDesc.s_get_value`
+    /// recognizes this wrapper and raises the upstream
+    /// "classmethods are not supported" error.
+    ClassMethod { func: HostObject },
 }
 
 impl PartialEq for HostObject {
@@ -394,6 +403,15 @@ impl HostObject {
         }
     }
 
+    /// RPython `func_with_new_name(func, newname)` helper surface for
+    /// user functions. Mirrors the upstream behavior that allocates a
+    /// fresh function object sharing the same code/defaults/closure but
+    /// exposing a different `__name__`.
+    pub fn renamed_user_function(&self, newname: &str) -> Option<Self> {
+        let graph_func = self.user_function()?;
+        Some(Self::new_user_function(graph_func.with_new_name(newname)))
+    }
+
     pub fn new_instance(class_obj: HostObject, args: Vec<ConstValue>) -> Self {
         let qualname = format!("{}-instance", class_obj.qualname());
         HostObject {
@@ -465,6 +483,50 @@ impl HostObject {
     pub fn property_fdel(&self) -> Option<&HostObject> {
         match &self.inner.kind {
             HostObjectKind::Property { fdel, .. } => fdel.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Python `staticmethod(func)` constructor.
+    pub fn new_staticmethod(qualname: impl Into<String>, func: HostObject) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::StaticMethod { func },
+            }),
+        }
+    }
+
+    pub fn is_staticmethod(&self) -> bool {
+        matches!(self.inner.kind, HostObjectKind::StaticMethod { .. })
+    }
+
+    /// Upstream `staticmethod.__get__(42)` unwraps back to the wrapped
+    /// callable object without binding.
+    pub fn staticmethod_func(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::StaticMethod { func } => Some(func),
+            _ => None,
+        }
+    }
+
+    /// Python `classmethod(func)` constructor.
+    pub fn new_classmethod(qualname: impl Into<String>, func: HostObject) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::ClassMethod { func },
+            }),
+        }
+    }
+
+    pub fn is_classmethod(&self) -> bool {
+        matches!(self.inner.kind, HostObjectKind::ClassMethod { .. })
+    }
+
+    pub fn classmethod_func(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::ClassMethod { func } => Some(func),
             _ => None,
         }
     }
@@ -888,6 +950,7 @@ impl Hash for ConstValue {
             }
             ConstValue::Function(func) => {
                 func.name.hash(state);
+                func._jit_look_inside_.hash(state);
                 func.globals.hash(state);
                 func.closure.hash(state);
                 func.defaults.hash(state);
@@ -1913,6 +1976,13 @@ pub struct GraphFunc {
     /// Upstream generator helper attribute populated by
     /// `attach_next_method()`.
     pub _generator_next_method_of_: Option<HostObject>,
+    /// Upstream function attribute consulted by
+    /// `annotator/specialize.py:64` and `jit/codewriter/policy.py:56`.
+    ///
+    /// `None` mirrors the common "attribute absent" case so callers
+    /// can apply the same default as upstream's
+    /// `getattr(func, '_jit_look_inside_', True)`.
+    pub _jit_look_inside_: Option<bool>,
     /// Python function `__globals__`, wrapped as a flow-space
     /// constant.
     pub globals: Constant,
@@ -1941,6 +2011,7 @@ impl GraphFunc {
             class_: None,
             annspecialcase: None,
             _generator_next_method_of_: None,
+            _jit_look_inside_: None,
             globals,
             closure: Vec::new(),
             defaults: Vec::new(),
@@ -1950,6 +2021,15 @@ impl GraphFunc {
             filename: None,
             not_rpython: false,
         }
+    }
+
+    /// RPython `func_with_new_name(func, newname)` copies the function
+    /// object while reusing `__code__`, `__defaults__`, and
+    /// `__closure__`; the `__code__.co_name` payload stays unchanged.
+    pub fn with_new_name(&self, newname: &str) -> Self {
+        let mut cloned = self.clone();
+        cloned.name = newname.to_string();
+        cloned
     }
 
     pub fn from_host_code(code: HostCode, globals: Constant, defaults: Vec<Constant>) -> Self {

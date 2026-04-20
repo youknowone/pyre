@@ -826,9 +826,10 @@ impl ClassDesc {
     /// Property branch (classdesc.py:591-602) is a line-by-line port:
     /// fget / fset are stored as `name__getter__` / `name__setter__`
     /// hidden functions before the property object itself is retained
-    /// under `name`. Staticmethod / MemberDescriptor branches remain
-    /// structurally deferred (HostObject lacks those descriptor
-    /// variants). FunctionType + mixin uses
+    /// under `name`. `staticmethod` / `classmethod` descriptors are
+    /// carried through the `HostObject` wrapper variants so
+    /// `s_get_value` can preserve the upstream binding rules.
+    /// FunctionType + mixin uses
     /// [`Bookkeeper::newfuncdesc`] to preserve mixin-specific
     /// FunctionDesc identity (classdesc.py:608-613).
     pub fn add_source_attribute(
@@ -844,32 +845,27 @@ impl ClassDesc {
                 //              `newname = name + '__getter__'`
                 //              `func = func_with_new_name(value.fget, newname)`
                 //              `self.add_source_attribute(newname, func, mixin)`.
-                //
-                // Rust deviation (parity rule #1): `func_with_new_name`
-                // renames the underlying Python function object so the
-                // later FunctionDesc carries the `__getter__`/`__setter__`
-                // name. `HostObject` is Arc-immutable; cloning with a new
-                // qualname would require duplicating the embedded
-                // `GraphFunc`. For now we keep the original fget/fset
-                // HostObject (its FunctionDesc will inherit the original
-                // function's name); the classdict key carries the
-                // `__getter__` / `__setter__` suffix so attribute lookup
-                // at the unaryop transform still matches upstream.
                 if let Some(fget) = host.property_fget() {
                     let newname = format!("{name}__getter__");
+                    let renamed = fget
+                        .renamed_user_function(&newname)
+                        .unwrap_or_else(|| fget.clone());
                     Self::add_source_attribute(
                         this,
                         &newname,
-                        ConstValue::HostObject(fget.clone()),
+                        ConstValue::HostObject(renamed),
                         mixin,
                     )?;
                 }
                 if let Some(fset) = host.property_fset() {
                     let newname = format!("{name}__setter__");
+                    let renamed = fset
+                        .renamed_user_function(&newname)
+                        .unwrap_or_else(|| fset.clone());
                     Self::add_source_attribute(
                         this,
                         &newname,
-                        ConstValue::HostObject(fset.clone()),
+                        ConstValue::HostObject(renamed),
                         mixin,
                     )?;
                 }
@@ -905,8 +901,32 @@ impl ClassDesc {
             }
         }
 
-        // classdesc.py:619-622 — staticmethod + mixin. HostObject does
-        // not model staticmethod today; stay with Constant storage.
+        // classdesc.py:619-622 — staticmethod + mixin. Upstream clones
+        // the wrapped function so each mixed-in class gets a distinct
+        // function object identity. Mirror that by cloning the inner
+        // UserFunction host when possible, then re-wrapping it in a
+        // fresh staticmethod host object.
+        let value = if let ConstValue::HostObject(ref host) = value {
+            if host.is_staticmethod() && mixin {
+                let wrapped = host.staticmethod_func().ok_or_else(|| {
+                    AnnotatorError::new("ClassDesc.add_source_attribute: malformed staticmethod")
+                })?;
+                let cloned_wrapped = if let Some(graph_func) = wrapped.user_function() {
+                    HostObject::new_user_function(graph_func.clone())
+                } else {
+                    wrapped.clone()
+                };
+                ConstValue::HostObject(HostObject::new_staticmethod(
+                    host.qualname().to_string(),
+                    cloned_wrapped,
+                ))
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+
         // classdesc.py:624-626 — MemberDescriptor skip. HostObject does
         // not emit MemberDescriptors so nothing to guard against.
 
@@ -1145,17 +1165,22 @@ impl ClassDesc {
         } else {
             // upstream: `args = args.prepend(s_instance); s_init.call(args)`.
             let bound_args = args.prepend(s_instance.clone());
-            // upstream: `s_init.call(args)` — SomePBC routes to bookkeeper.pbc_call.
-            if let SomeValue::PBC(ref pbc) = s_init {
-                let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
-                    AnnotatorError::new("ClassDesc.pycall: Bookkeeper backlink dropped")
-                })?;
-                bk.pbc_call_args(pbc, &bound_args)?;
+            match &s_init {
+                SomeValue::PBC(pbc) => {
+                    let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+                        AnnotatorError::new("ClassDesc.pycall: Bookkeeper backlink dropped")
+                    })?;
+                    bk.pbc_call_args(pbc, &bound_args)?;
+                }
+                SomeValue::None_(_) => {
+                    let _ = s_impossible_value;
+                }
+                _ => {
+                    return Err(AnnotatorError::new(
+                        "Cannot prove that the object is callable",
+                    ));
+                }
             }
-            // Other SomeValue.call paths (SomeObject default = error) — the
-            // annotator would see an AnnotatorError; when __init__ resolves
-            // to something other than PBC we defer the `.call(args)` port
-            // to the SomeValue.call dispatcher commit.
         }
         Ok(s_instance)
     }
@@ -1310,11 +1335,6 @@ impl ClassDesc {
     ///     return s_value
     /// ```
     ///
-    /// Note: `isinstance(value, staticmethod)` / `classmethod` runtime
-    /// checks require Python value introspection — the Rust port does
-    /// not carry these wrappers yet and returns the value unwrapped.
-    /// classmethod guard lives here as a [`HostObject::class_is`] check
-    /// once those wrappers are modelled.
     pub fn s_get_value(
         this: &Rc<RefCell<Self>>,
         classdef: Option<&Rc<RefCell<ClassDef>>>,
@@ -1333,11 +1353,27 @@ impl ClassDesc {
         })?;
         match entry {
             ClassDictEntry::Constant(c) => {
-                // upstream: staticmethod / classmethod wrappers not modelled
-                // in the Rust ConstValue carrier yet. Route straight through
-                // immutablevalue; bind_callables_under when classdef given.
-                let s_value = bookkeeper.immutablevalue(&c.value)?;
-                if let Some(cd) = classdef {
+                let mut bind_classdef = classdef.cloned();
+                let value = match &c.value {
+                    ConstValue::HostObject(host) if host.is_staticmethod() => {
+                        bind_classdef = None;
+                        ConstValue::HostObject(
+                            host.staticmethod_func()
+                                .ok_or_else(|| {
+                                    AnnotatorError::new(
+                                        "ClassDesc.s_get_value: malformed staticmethod wrapper",
+                                    )
+                                })?
+                                .clone(),
+                        )
+                    }
+                    ConstValue::HostObject(host) if host.is_classmethod() => {
+                        return Err(AnnotatorError::new("classmethods are not supported"));
+                    }
+                    other => other.clone(),
+                };
+                let s_value = bookkeeper.immutablevalue(&value)?;
+                if let Some(cd) = bind_classdef.as_ref() {
                     Ok(super::model::bind_callables_under(&s_value, cd, name))
                 } else {
                     Ok(s_value)
@@ -1442,12 +1478,11 @@ impl ClassDesc {
                         ));
                     }
                 },
-                // s_result is `s_Impossible` at `compute_at_fixpoint` /
-                // `emulated_pbc_calls` drain (upstream passes
-                // `s_ImpossibleValue`); fall back to the uniqueclassdef
-                // path so those drains still register the __init__ call
-                // site.
-                _ => vec![Self::getuniqueclassdef(&descs[0])?],
+                _ => {
+                    return Err(AnnotatorError::new(
+                        "calling a class didn't return an instance??",
+                    ));
+                }
             }
         } else {
             let mut cds = Vec::with_capacity(descs.len());
@@ -2601,6 +2636,65 @@ mod tests {
             },
             other => panic!("expected Constant entry for property, got {other:?}"),
         }
+        match cd.classdict.get("x__getter__").unwrap() {
+            ClassDictEntry::Constant(c) => match &c.value {
+                ConstValue::HostObject(h) => {
+                    let func = h.user_function().expect("getter must stay a user function");
+                    assert_eq!(func.name, "x__getter__");
+                }
+                other => panic!("expected getter HostObject, got {other:?}"),
+            },
+            other => panic!("expected Constant getter entry, got {other:?}"),
+        }
+        match cd.classdict.get("x__setter__").unwrap() {
+            ClassDictEntry::Constant(c) => match &c.value {
+                ConstValue::HostObject(h) => {
+                    let func = h.user_function().expect("setter must stay a user function");
+                    assert_eq!(func.name, "x__setter__");
+                }
+                other => panic!("expected setter HostObject, got {other:?}"),
+            },
+            other => panic!("expected Constant setter entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classdesc_add_source_attribute_mixin_staticmethod_clones_wrapper_function() {
+        use crate::flowspace::model::GraphFunc;
+        let bk = make_bk();
+        let cls = HostObject::new_class("pkg.WithStatic", vec![]);
+        let desc_rc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            cls,
+            "pkg.WithStatic".into(),
+        )));
+        let fn_host = HostObject::new_user_function(GraphFunc::new(
+            "f",
+            Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        let static_host = HostObject::new_staticmethod("pkg.WithStatic.f", fn_host.clone());
+        ClassDesc::add_source_attribute(&desc_rc, "f", ConstValue::HostObject(static_host), true)
+            .unwrap();
+        let cd = desc_rc.borrow();
+        match cd.classdict.get("f").unwrap() {
+            ClassDictEntry::Constant(c) => match &c.value {
+                ConstValue::HostObject(h) => {
+                    assert!(h.is_staticmethod());
+                    let stored_func = h.staticmethod_func().expect("wrapped function");
+                    assert!(
+                        !stored_func.is_classmethod() && !stored_func.is_staticmethod(),
+                        "staticmethod must wrap the bare function object"
+                    );
+                    assert_ne!(
+                        stored_func.identity_id(),
+                        fn_host.identity_id(),
+                        "mixin staticmethod should clone the wrapped function identity"
+                    );
+                }
+                other => panic!("expected staticmethod HostObject, got {other:?}"),
+            },
+            other => panic!("expected Constant entry for staticmethod, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2663,7 +2757,6 @@ mod tests {
         // Desc variant is constructable from a DescEntry handle — use a
         // Function entry via the DescEntry::is_function helper to avoid
         // re-porting bookkeeper.newfuncdesc in the test.
-        use crate::annotator::description::DescEntry;
         use crate::flowspace::model::GraphFunc;
         let bk = make_bk();
         let host = HostObject::new_user_function(GraphFunc::new(
@@ -2767,6 +2860,23 @@ mod tests {
     }
 
     #[test]
+    fn classdesc_consider_call_site_single_class_requires_instance_result() {
+        use super::super::argument::simple_args;
+        use super::super::model::SomeValue;
+        let bk = make_bk();
+        let common = make_classdesc(&bk, "pkg.Common");
+        let _ = ClassDesc::getuniqueclassdef(&common).unwrap();
+        let args = simple_args(vec![]);
+        let err = ClassDesc::consider_call_site(&[common], &args, &SomeValue::Impossible, None)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("calling a class didn't return an instance??"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn classdesc_getcommonbase_walks_chain() {
         // classdesc.py:906-915: getcommonbase([A,B]) returns the nearest
         // shared ancestor. When A and B share a direct parent P, the
@@ -2833,5 +2943,78 @@ mod tests {
             SomeValue::Integer(_) => {}
             other => panic!("expected SomeInteger from immutablevalue, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn classdesc_s_get_value_unwraps_staticmethod_without_binding() {
+        use crate::flowspace::model::GraphFunc;
+
+        let bk = make_bk();
+        let cdesc = make_classdesc(&bk, "pkg.StaticHolder");
+        let classdef = ClassDesc::getuniqueclassdef(&cdesc).unwrap();
+        let fn_host = HostObject::new_user_function(GraphFunc::new(
+            "f",
+            Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        cdesc.borrow_mut().classdict.insert(
+            "f".into(),
+            ClassDictEntry::constant(ConstValue::HostObject(HostObject::new_staticmethod(
+                "pkg.StaticHolder.f",
+                fn_host,
+            ))),
+        );
+
+        let sv = ClassDesc::s_get_value(&cdesc, Some(&classdef), "f").unwrap();
+
+        let SomeValue::PBC(pbc) = sv else {
+            panic!("expected SomePBC from staticmethod lookup");
+        };
+        assert_eq!(pbc.descriptions.len(), 1);
+        let desc = pbc.descriptions.values().next().unwrap();
+        assert!(desc.is_function(), "staticmethod lookup must stay unbound");
+    }
+
+    #[test]
+    fn classdesc_s_get_value_rejects_classmethod() {
+        use crate::flowspace::model::GraphFunc;
+
+        let bk = make_bk();
+        let cdesc = make_classdesc(&bk, "pkg.ClassMethodHolder");
+        cdesc.borrow_mut().classdict.insert(
+            "f".into(),
+            ClassDictEntry::constant(ConstValue::HostObject(HostObject::new_classmethod(
+                "pkg.ClassMethodHolder.f",
+                HostObject::new_user_function(GraphFunc::new(
+                    "f",
+                    Constant::new(ConstValue::Dict(Default::default())),
+                )),
+            ))),
+        );
+
+        let err = ClassDesc::s_get_value(&cdesc, None, "f").unwrap_err();
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("classmethods are not supported")
+        );
+    }
+
+    #[test]
+    fn classdesc_pycall_rejects_non_callable_init() {
+        let bk = make_bk();
+        let cdesc = make_classdesc(&bk, "pkg.BadInit");
+        cdesc.borrow_mut().classdict.insert(
+            "__init__".into(),
+            ClassDictEntry::constant(ConstValue::Int(7)),
+        );
+        let args = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
+
+        let err = ClassDesc::pycall(&cdesc, None, &args, &SomeValue::Impossible, None).unwrap_err();
+
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("Cannot prove that the object is callable")
+        );
     }
 }
