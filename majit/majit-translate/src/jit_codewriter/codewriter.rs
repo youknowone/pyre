@@ -19,7 +19,7 @@ use crate::call::CallControl;
 use crate::flatten::{RegKind, SSARepr, flatten_with_types};
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
-use crate::model::{FunctionGraph, Terminator, ValueId};
+use crate::model::{FunctionGraph, ValueId};
 
 /// RPython: `codewriter.py::CodeWriter`.
 ///
@@ -300,51 +300,27 @@ impl Default for CodeWriter {
     }
 }
 
-/// Mirror of `FUNC.RESULT` in `rpython/jit/codewriter/call.py:182-187`.
+/// Mirror of `FUNC.RESULT` in `rpython/jit/codewriter/call.py:181-187`.
 ///
-/// Walks every `Terminator::Return(Some(_))` in the graph and reports the
-/// kind char of the returned value. Returns `'v'` when every terminator is
-/// `Return(None)` (or there are no `Return` terminators at all). Panics
-/// when two `Return` terminators disagree — RPython's `FUNC.RESULT` is a
-/// single type per graph, so a conflict means an upstream pass produced a
-/// graph that no `BhCallDescr` can describe.
+/// Upstream reads `lltype.typeOf(fnptr).TO.RESULT` from the function
+/// pointer type; the graph-level surface is
+/// `flowspace/model.py:17-18` `graph.returnblock = Block([return_var])`,
+/// where `return_var.concretetype` carries the same information.
+/// pyre stores the kind in `value_kinds[returnblock.inputargs[0]]`
+/// after the rtyper pass, so read it directly instead of scanning
+/// block terminators.
 fn graph_result_kind(
     graph: &FunctionGraph,
     value_kinds: &std::collections::HashMap<ValueId, RegKind>,
 ) -> char {
-    let mut found: Option<char> = None;
-    let use_canonical_returnblock = !graph.predecessors(graph.returnblock).is_empty();
-    // RPython parity: FUNC.RESULT is driven by normal-path returns only.
-    // `FunctionGraph.exceptblock` is the canonical raise block
-    // (`flowspace/model.py:21-25`) and does NOT participate in
-    // FUNC.RESULT typing.  Skip it explicitly.
-    for block in &graph.blocks {
-        if block.id == graph.exceptblock {
-            continue;
-        }
-        if use_canonical_returnblock {
-            if block.id != graph.returnblock {
-                continue;
-            }
-        } else if block.id == graph.returnblock {
-            continue;
-        }
-        if let Terminator::Return(Some(vid)) = &block.terminator {
-            let kind = match value_kinds.get(vid) {
-                Some(RegKind::Int) => 'i',
-                Some(RegKind::Ref) => 'r',
-                Some(RegKind::Float) => 'f',
-                None => 'v',
-            };
-            match found {
-                None => found = Some(kind),
-                Some(prev) if prev == kind => {}
-                Some(prev) => panic!(
-                    "graph {} has inconsistent return kinds: {prev} vs {kind}",
-                    graph.name
-                ),
-            }
-        }
+    let returnblock = graph.block(graph.returnblock);
+    match returnblock.inputargs.first() {
+        Some(vid) => match value_kinds.get(vid) {
+            Some(RegKind::Int) => 'i',
+            Some(RegKind::Ref) => 'r',
+            Some(RegKind::Float) => 'f',
+            None => 'v',
+        },
+        None => 'v',
     }
-    found.unwrap_or('v')
 }
