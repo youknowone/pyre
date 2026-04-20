@@ -398,6 +398,133 @@ impl Desc {
     }
 }
 
+/// PRE-EXISTING-ADAPTATION: single-inheritance Desc hierarchy in Rust.
+///
+/// Upstream `rpython/annotator/description.py` + `classdesc.py` define
+/// `FunctionDesc / MethodDesc / ClassDesc / FrozenDesc /
+/// MethodOfFrozenDesc / MemoDesc` as subclasses of a common `Desc`
+/// base. Python `isinstance(desc, FunctionDesc)` branches at every
+/// bookkeeper callsite. The Rust port uses composition — each subclass
+/// wraps [`Desc`] as a `base` field — so the common storage shape for
+/// `bookkeeper.descs` needs a discriminated container. [`DescEntry`]
+/// is that container: one variant per upstream subclass, each
+/// variant holding `Rc<RefCell<SubclassDesc>>`. Identity (upstream
+/// `desc is other_desc`) routes through [`DescEntry::desc_key`] which
+/// returns the inner `Rc::as_ptr` identity.
+///
+/// Callsite mapping (upstream → Rust):
+/// * `isinstance(desc, FunctionDesc)` → `matches!(entry,
+///   DescEntry::Function(_))`
+/// * `desc.pycall(...)` → per-variant dispatch via `match entry { ... }`
+/// * `bookkeeper.descs[pyobj] = result` →
+///   `bookkeeper.descs.insert(pyobj, entry)`
+#[derive(Clone, Debug)]
+pub enum DescEntry {
+    /// upstream `FunctionDesc` — ported file description.py:190-393.
+    Function(Rc<RefCell<FunctionDesc>>),
+    /// upstream `MethodDesc` — description.py:407-519.
+    Method(Rc<RefCell<MethodDesc>>),
+    /// upstream `FrozenDesc` — description.py:528-599.
+    Frozen(Rc<RefCell<FrozenDesc>>),
+    /// upstream `MethodOfFrozenDesc` — description.py:601-637.
+    MethodOfFrozen(Rc<RefCell<MethodOfFrozenDesc>>),
+    /// upstream `ClassDesc` — classdesc.py:488-918. Currently the c1
+    /// shell (`classdesc::ClassDesc::new_shell`) until c2 lands the
+    /// full `__init__` body.
+    Class(Rc<RefCell<super::classdesc::ClassDesc>>),
+}
+
+impl DescEntry {
+    /// RPython `id(desc)` — pointer-identity handle. Used as the dict
+    /// key by `CallFamily.descs`, `FrozenAttrFamily.descs`, and
+    /// `ClassAttrFamily.descs`.
+    pub fn desc_key(&self) -> DescKey {
+        match self {
+            DescEntry::Function(rc) => DescKey::from_rc(rc),
+            DescEntry::Method(rc) => DescKey::from_rc(rc),
+            DescEntry::Frozen(rc) => DescKey::from_rc(rc),
+            DescEntry::MethodOfFrozen(rc) => DescKey::from_rc(rc),
+            DescEntry::Class(rc) => DescKey::from_rc(rc),
+        }
+    }
+
+    /// RPython `desc.pyobj` — the wrapped host object. FunctionDesc /
+    /// FrozenDesc / ClassDesc all carry one. MethodDesc /
+    /// MethodOfFrozenDesc return `None` (upstream `MethodDesc.pyobj is
+    /// None`).
+    pub fn pyobj(&self) -> Option<HostObject> {
+        match self {
+            DescEntry::Function(rc) => rc.borrow().base.pyobj.clone(),
+            DescEntry::Method(_) => None,
+            DescEntry::Frozen(rc) => rc.borrow().base.pyobj.clone(),
+            DescEntry::MethodOfFrozen(_) => None,
+            DescEntry::Class(rc) => Some(rc.borrow().pyobj.clone()),
+        }
+    }
+
+    /// Shorthand predicates matching upstream `isinstance(desc, ...)`
+    /// dispatch at bookkeeper callsites.
+    pub fn is_function(&self) -> bool {
+        matches!(self, DescEntry::Function(_))
+    }
+    pub fn is_method(&self) -> bool {
+        matches!(self, DescEntry::Method(_))
+    }
+    pub fn is_frozen(&self) -> bool {
+        matches!(self, DescEntry::Frozen(_))
+    }
+    pub fn is_method_of_frozen(&self) -> bool {
+        matches!(self, DescEntry::MethodOfFrozen(_))
+    }
+    pub fn is_class(&self) -> bool {
+        matches!(self, DescEntry::Class(_))
+    }
+
+    /// Variant-specific getter. Returns `None` when `self` is a
+    /// different variant — the caller is expected to branch via
+    /// `is_function()` first.
+    pub fn as_function(&self) -> Option<Rc<RefCell<FunctionDesc>>> {
+        match self {
+            DescEntry::Function(rc) => Some(rc.clone()),
+            _ => None,
+        }
+    }
+    pub fn as_class(&self) -> Option<Rc<RefCell<super::classdesc::ClassDesc>>> {
+        match self {
+            DescEntry::Class(rc) => Some(rc.clone()),
+            _ => None,
+        }
+    }
+    pub fn as_frozen(&self) -> Option<Rc<RefCell<FrozenDesc>>> {
+        match self {
+            DescEntry::Frozen(rc) => Some(rc.clone()),
+            _ => None,
+        }
+    }
+    pub fn as_method(&self) -> Option<Rc<RefCell<MethodDesc>>> {
+        match self {
+            DescEntry::Method(rc) => Some(rc.clone()),
+            _ => None,
+        }
+    }
+    pub fn as_method_of_frozen(&self) -> Option<Rc<RefCell<MethodOfFrozenDesc>>> {
+        match self {
+            DescEntry::MethodOfFrozen(rc) => Some(rc.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Identity equality — two [`DescEntry`]s are equal iff they wrap the
+/// same underlying `Rc`. Upstream `desc is other_desc`.
+impl PartialEq for DescEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.desc_key() == other.desc_key()
+    }
+}
+
+impl Eq for DescEntry {}
+
 /// RPython `class FunctionDesc(Desc)` (description.py:190-393).
 ///
 /// "The 'FunctionDesc' wraps a Python function or method." Fields

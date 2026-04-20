@@ -45,8 +45,11 @@
 //!   A4.6 with a single `match (SomeValue, SomeValue)` body.
 
 use core::fmt;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::super::flowspace::model::Constant;
+use super::classdesc::ClassDef;
 
 // ---------------------------------------------------------------------------
 // KnownType — mirror of upstream `SomeObject.knowntype` class attribute.
@@ -838,90 +841,26 @@ impl SomeObjectTrait for SomeIterator {
 // Instance / PBC / Builtin / Exception / None / Weakref / TypeOf variants (A4.5).
 // ---------------------------------------------------------------------------
 
-/// RPython `rpython/annotator/classdesc.py:ClassDef` — describes a
-/// user class's inheritance / attribute layout.
-///
-/// **Phase 4 A4.5 stub — documented per CLAUDE.md parity rule #1.**
-///
-/// Upstream `ClassDef` (classdesc.py) carries:
-///   * `classdesc: ClassDesc` — the linked description object.
-///   * `basedef: Optional<ClassDef>` — the super-class link.
-///   * `subdefs: List<ClassDef>` — the sub-class links.
-///   * `attrs: Dict<str, Attribute>` — attribute annotations.
-///   * `mro: List<ClassDef>` — method resolution order.
-///   * `repr`, `lifetime`, `lookup_filter`, and a dozen flags.
-///
-/// This Rust placeholder carries only the fully-qualified name so
-/// that Phase 4-level call sites that need to reference "some class"
-/// (e.g. `SomeInstance`, `SomePBC`, `SomeException`) have a
-/// hashable / `Eq` handle. [`Self::issubclass`] is a strict
-/// name-equality stub; it does NOT walk an inheritance tree. Phase 5's
-/// classdesc.py port (968 LOC) replaces this struct with the real
-/// definition and rewires `issubclass` to consult `self.mro`.
-///
-/// Callers that rely on `issubclass` for actual hierarchy decisions
-/// must either wait for Phase 5 or confirm their input classes are
-/// primitive (name-equal ↔ identity-equal).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ClassDef {
-    /// RPython `classdef.name` — the fully-qualified class name.
-    pub name: String,
-    /// Minimal stand-in for upstream `classdef.basedef`.
-    pub basedef: Option<Box<ClassDef>>,
+// Phase 4 A4.5's `ClassDef` stub has been replaced by the real
+// [`classdesc::ClassDef`] port (Phase 5 P5.2 c1). The Rust enum now
+// re-uses that shared handle; callers reference classes through
+// `Rc<RefCell<classdesc::ClassDef>>` with identity equality via
+// `Rc::ptr_eq`, matching upstream Python class identity.
+
+/// Identity equality for `Option<Rc<RefCell<ClassDef>>>` — two `Some`
+/// values are equal only if they point at the same `Rc`; `None` is
+/// equal to `None`.
+fn classdef_opt_eq(a: &Option<Rc<RefCell<ClassDef>>>, b: &Option<Rc<RefCell<ClassDef>>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
 }
 
-impl ClassDef {
-    pub fn new(name: impl Into<String>) -> Self {
-        ClassDef {
-            name: name.into(),
-            basedef: None,
-        }
-    }
-
-    pub fn with_base(name: impl Into<String>, basedef: ClassDef) -> Self {
-        ClassDef {
-            name: name.into(),
-            basedef: Some(Box::new(basedef)),
-        }
-    }
-
-    /// RPython `classdef.issubclass(other)`.
-    ///
-    /// The Rust port mirrors the upstream single-inheritance walk over
-    /// `basedef`; richer MRO behaviour lands with the full classdesc
-    /// port.
-    pub fn issubclass(&self, other: &ClassDef) -> bool {
-        if self == other {
-            return true;
-        }
-        let mut current = self.basedef.as_deref();
-        while let Some(base) = current {
-            if base == other {
-                return true;
-            }
-            current = base.basedef.as_deref();
-        }
-        false
-    }
-
-    /// RPython `classdef.commonbase(other)` as used by
-    /// `pair(SomeInstance, SomeInstance).union()` in binaryop.py.
-    pub fn commonbase(&self, other: &ClassDef) -> Option<ClassDef> {
-        if self.issubclass(other) {
-            return Some(other.clone());
-        }
-        if other.issubclass(self) {
-            return Some(self.clone());
-        }
-        let mut current = self.basedef.as_deref();
-        while let Some(base) = current {
-            if other.issubclass(base) {
-                return Some(base.clone());
-            }
-            current = base.basedef.as_deref();
-        }
-        None
-    }
+/// Identity-equality membership test for a `Vec<Rc<RefCell<ClassDef>>>`.
+fn classdef_vec_contains(v: &[Rc<RefCell<ClassDef>>], needle: &Rc<RefCell<ClassDef>>) -> bool {
+    v.iter().any(|c| Rc::ptr_eq(c, needle))
 }
 
 /// RPython `rpython/annotator/description.py:Desc` — the "description"
@@ -960,12 +899,16 @@ impl Desc {
 }
 
 /// RPython `class SomeInstance(SomeObject)` (model.py:431-462).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Equality on `classdef` is Python-identity (`Rc::ptr_eq`) matching
+/// upstream's `cls is other_cls` semantics — the manual `PartialEq`
+/// impl below routes the field through [`classdef_opt_eq`].
+#[derive(Clone, Debug)]
 pub struct SomeInstance {
     pub base: SomeObjectBase,
     /// RPython `self.classdef`. `None` denotes `object`-only instances
     /// (upstream: `SomeInstance(classdef=None)`).
-    pub classdef: Option<ClassDef>,
+    pub classdef: Option<Rc<RefCell<ClassDef>>>,
     pub can_be_none: bool,
     /// RPython `self.flags = flags` (model.py:438).
     ///
@@ -984,7 +927,7 @@ pub struct SomeInstance {
 impl SomeInstance {
     /// RPython `SomeInstance.__init__(classdef, can_be_None=False, flags={})`.
     pub fn new(
-        classdef: Option<ClassDef>,
+        classdef: Option<Rc<RefCell<ClassDef>>>,
         can_be_none: bool,
         flags: std::collections::BTreeMap<String, bool>,
     ) -> Self {
@@ -996,6 +939,17 @@ impl SomeInstance {
         }
     }
 }
+
+impl PartialEq for SomeInstance {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base
+            && classdef_opt_eq(&self.classdef, &other.classdef)
+            && self.can_be_none == other.can_be_none
+            && self.flags == other.flags
+    }
+}
+
+impl Eq for SomeInstance {}
 
 impl SomeObjectTrait for SomeInstance {
     fn knowntype(&self) -> KnownType {
@@ -1017,17 +971,21 @@ impl SomeObjectTrait for SomeInstance {
 
 /// RPython `class SomeException(SomeObject)` (model.py:482-492). Set of
 /// exception classdefs obeying `type(exc) in self.classes`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Equality on `classdefs` is identity-based (`Rc::ptr_eq` per entry,
+/// order-independent) — the manual `PartialEq` impl routes through
+/// [`classdef_vec_contains`].
+#[derive(Clone, Debug)]
 pub struct SomeException {
     pub base: SomeObjectBase,
-    pub classdefs: Vec<ClassDef>,
+    pub classdefs: Vec<Rc<RefCell<ClassDef>>>,
 }
 
 impl SomeException {
-    pub fn new(classdefs: Vec<ClassDef>) -> Self {
-        let mut unique = Vec::new();
+    pub fn new(classdefs: Vec<Rc<RefCell<ClassDef>>>) -> Self {
+        let mut unique: Vec<Rc<RefCell<ClassDef>>> = Vec::new();
         for classdef in classdefs {
-            if !unique.contains(&classdef) {
+            if !classdef_vec_contains(&unique, &classdef) {
                 unique.push(classdef);
             }
         }
@@ -1054,6 +1012,22 @@ impl SomeException {
         unionof(&instances).expect("SomeException.as_some_instance() must union its classdefs")
     }
 }
+
+impl PartialEq for SomeException {
+    fn eq(&self, other: &Self) -> bool {
+        if self.base != other.base || self.classdefs.len() != other.classdefs.len() {
+            return false;
+        }
+        for c in &self.classdefs {
+            if !classdef_vec_contains(&other.classdefs, c) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Eq for SomeException {}
 
 impl SomeObjectTrait for SomeException {
     fn knowntype(&self) -> KnownType {
@@ -1390,21 +1364,31 @@ impl SomeObjectTrait for SomeImpossibleValue {
 
 /// RPython `class SomeWeakRef(SomeObject)` (model.py:700-709).
 /// Stands for a `weakref.ref` whose target has a known classdef.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Equality on `classdef` is identity-based (`Rc::ptr_eq`).
+#[derive(Clone, Debug)]
 pub struct SomeWeakRef {
     pub base: SomeObjectBase,
     /// RPython `self.classdef` — `None` for known-dead weakrefs.
-    pub classdef: Option<ClassDef>,
+    pub classdef: Option<Rc<RefCell<ClassDef>>>,
 }
 
 impl SomeWeakRef {
-    pub fn new(classdef: Option<ClassDef>) -> Self {
+    pub fn new(classdef: Option<Rc<RefCell<ClassDef>>>) -> Self {
         SomeWeakRef {
             base: SomeObjectBase::new(KnownType::WeakrefReference, true),
             classdef,
         }
     }
 }
+
+impl PartialEq for SomeWeakRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base && classdef_opt_eq(&self.classdef, &other.classdef)
+    }
+}
+
+impl Eq for SomeWeakRef {}
 
 impl SomeObjectTrait for SomeWeakRef {
     fn knowntype(&self) -> KnownType {
@@ -1987,7 +1971,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             let can_be_none = a.can_be_none || b.can_be_none;
             let merged_classdef = match (&a.classdef, &b.classdef) {
                 (None, _) | (_, None) => Some(None),
-                (Some(ca), Some(cb)) => ca.commonbase(cb).map(Some),
+                (Some(ca), Some(cb)) => ClassDef::commonbase(ca, cb).map(Some),
             };
             let Some(merged_classdef) = merged_classdef else {
                 return Err(UnionError {
@@ -2026,7 +2010,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::Exception(a), SomeValue::Exception(b)) => {
             let mut classdefs = a.classdefs.clone();
             for c in &b.classdefs {
-                if !classdefs.contains(c) {
+                if !classdef_vec_contains(&classdefs, c) {
                     classdefs.push(c.clone());
                 }
             }
@@ -2109,7 +2093,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         (SomeValue::WeakRef(a), SomeValue::WeakRef(b)) => {
             let merged_classdef = match (&a.classdef, &b.classdef) {
                 (None, _) | (_, None) => Some(None),
-                (Some(ca), Some(cb)) => ca.commonbase(cb).map(Some),
+                (Some(ca), Some(cb)) => ClassDef::commonbase(ca, cb).map(Some),
             };
             let Some(merged_classdef) = merged_classdef else {
                 return Err(UnionError {
@@ -2470,7 +2454,7 @@ mod tests {
 
     #[test]
     fn someinstance_tracks_can_be_none_flag() {
-        let cdef = Some(ClassDef::new("my_pkg.C"));
+        let cdef = Some(ClassDef::new_standalone("my_pkg.C", None));
         let s = SomeValue::Instance(SomeInstance::new(
             cdef.clone(),
             false,
@@ -2740,7 +2724,7 @@ mod tests {
 
     #[test]
     fn union_none_and_instance_makes_instance_nullable() {
-        let cdef = Some(ClassDef::new("pkg.X"));
+        let cdef = Some(ClassDef::new_standalone("pkg.X", None));
         let inst = SomeValue::Instance(SomeInstance::new(
             cdef.clone(),
             false,
@@ -2763,14 +2747,14 @@ mod tests {
         flags_b.insert("immutable".to_string(), true);
         flags_b.insert("pinned".to_string(), true);
 
-        let cdef = Some(ClassDef::new("pkg.X"));
+        let cdef = Some(ClassDef::new_standalone("pkg.X", None));
         let a = SomeValue::Instance(SomeInstance::new(cdef.clone(), false, flags_a));
         let b = SomeValue::Instance(SomeInstance::new(cdef.clone(), true, flags_b));
         let u = union(&a, &b).unwrap();
         let SomeValue::Instance(inst) = u else {
             panic!("expected SomeInstance");
         };
-        assert_eq!(inst.classdef, cdef);
+        assert!(classdef_opt_eq(&inst.classdef, &cdef));
         assert!(inst.can_be_none);
         assert_eq!(inst.flags.len(), 1);
         assert!(inst.flags.contains_key("immutable"));
@@ -2780,12 +2764,12 @@ mod tests {
     #[test]
     fn union_distinct_classdef_instances_errors() {
         let a = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new("pkg.A")),
+            Some(ClassDef::new_standalone("pkg.A", None)),
             false,
             std::collections::BTreeMap::new(),
         ));
         let b = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new("pkg.B")),
+            Some(ClassDef::new_standalone("pkg.B", None)),
             false,
             std::collections::BTreeMap::new(),
         ));
@@ -2794,8 +2778,8 @@ mod tests {
 
     #[test]
     fn union_instance_uses_common_base_classdef() {
-        let base = ClassDef::new("pkg.Base");
-        let sub = ClassDef::with_base("pkg.Sub", base.clone());
+        let base = ClassDef::new_standalone("pkg.Base", None);
+        let sub = ClassDef::new_standalone("pkg.Sub", Some(&base));
         let a = SomeValue::Instance(SomeInstance::new(
             Some(sub),
             false,
@@ -2810,7 +2794,7 @@ mod tests {
         let SomeValue::Instance(inst) = u else {
             panic!("expected SomeInstance");
         };
-        assert_eq!(inst.classdef, Some(base));
+        assert!(classdef_opt_eq(&inst.classdef, &Some(base)));
     }
 
     #[test]
@@ -2821,7 +2805,7 @@ mod tests {
             std::collections::BTreeMap::new(),
         ));
         let b = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new("pkg.X")),
+            Some(ClassDef::new_standalone("pkg.X", None)),
             false,
             std::collections::BTreeMap::new(),
         ));
@@ -2834,14 +2818,11 @@ mod tests {
 
     #[test]
     fn union_exception_unions_classdef_sets() {
-        let a = SomeValue::Exception(SomeException::new(vec![
-            ClassDef::new("ValueError"),
-            ClassDef::new("TypeError"),
-        ]));
-        let b = SomeValue::Exception(SomeException::new(vec![
-            ClassDef::new("TypeError"),
-            ClassDef::new("KeyError"),
-        ]));
+        let ve = ClassDef::new_standalone("ValueError", None);
+        let te = ClassDef::new_standalone("TypeError", None);
+        let ke = ClassDef::new_standalone("KeyError", None);
+        let a = SomeValue::Exception(SomeException::new(vec![ve.clone(), te.clone()]));
+        let b = SomeValue::Exception(SomeException::new(vec![te.clone(), ke.clone()]));
         let u = union(&a, &b).unwrap();
         let SomeValue::Exception(exc) = u else {
             panic!("expected SomeException");
@@ -2851,12 +2832,13 @@ mod tests {
 
     #[test]
     fn union_exception_and_none_routes_through_someinstance() {
-        let exc = SomeValue::Exception(SomeException::new(vec![ClassDef::new("ValueError")]));
+        let ve = ClassDef::new_standalone("ValueError", None);
+        let exc = SomeValue::Exception(SomeException::new(vec![ve.clone()]));
         let u = union(&exc, &s_none()).unwrap();
         let SomeValue::Instance(inst) = u else {
             panic!("expected SomeInstance");
         };
-        assert_eq!(inst.classdef, Some(ClassDef::new("ValueError")));
+        assert!(classdef_opt_eq(&inst.classdef, &Some(ve)));
         assert!(inst.can_be_none);
     }
 
@@ -2920,11 +2902,14 @@ mod tests {
 
     #[test]
     fn union_weakref_pairs_follow_instance_shape() {
-        let a = SomeValue::WeakRef(SomeWeakRef::new(Some(ClassDef::new("pkg.X"))));
-        let b = SomeValue::WeakRef(SomeWeakRef::new(Some(ClassDef::new("pkg.X"))));
+        let x = ClassDef::new_standalone("pkg.X", None);
+        let a = SomeValue::WeakRef(SomeWeakRef::new(Some(x.clone())));
+        let b = SomeValue::WeakRef(SomeWeakRef::new(Some(x.clone())));
         assert!(union(&a, &b).is_ok());
 
-        let c = SomeValue::WeakRef(SomeWeakRef::new(Some(ClassDef::new("pkg.Y"))));
+        let c = SomeValue::WeakRef(SomeWeakRef::new(Some(ClassDef::new_standalone(
+            "pkg.Y", None,
+        ))));
         assert!(union(&a, &c).is_err());
 
         let dead = SomeValue::WeakRef(SomeWeakRef::new(None));

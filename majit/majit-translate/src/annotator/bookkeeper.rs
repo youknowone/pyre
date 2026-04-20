@@ -27,13 +27,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use super::classdesc::{ClassDef, ClassDesc};
+use super::description::{ClassDefKey, DescEntry, DescKey, FrozenDesc, FunctionDesc, MethodDesc};
 use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
-    AnnotatorError, Desc, DescKind, SomeBool, SomeBuiltin, SomeByteArray, SomeChar, SomeDict,
-    SomeFloat, SomeInteger, SomeList, SomePBC, SomeString, SomeTuple, SomeUnicodeCodePoint,
-    SomeUnicodeString, SomeValue, s_none,
+    AnnotatorError, Desc, DescKind, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat,
+    SomeInteger, SomeList, SomePBC, SomeString, SomeTuple, SomeValue, s_none,
 };
+use crate::flowspace::argument::Signature;
+use crate::flowspace::bytecode::cpython_code_signature;
 use crate::flowspace::model::{ConstValue, Constant, HostObject};
 
 /// RPython `bookkeeper.position_key` (bookkeeper.py:147) — the tuple
@@ -97,6 +100,44 @@ pub struct Bookkeeper {
     /// RPython `self.dictdefs = {}` (bookkeeper.py:60). Same
     /// `Option<PositionKey>` key semantics as `listdefs`.
     pub dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
+    /// RPython `self.descs = {}` (bookkeeper.py:67). Maps
+    /// `Constant(pyobj)` to a FunctionDesc / ClassDesc / FrozenDesc /
+    /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py:353-409. The
+    /// Rust port keys directly on [`HostObject`] (which already has
+    /// `Arc::ptr_eq` identity) via [`DescEntry`].
+    pub descs: RefCell<HashMap<HostObject, DescEntry>>,
+    /// RPython `self.classdefs = []` (bookkeeper.py:68). Populated by
+    /// `ClassDesc._init_classdef` (classdesc.py:672-697). ClassDef
+    /// identity is Rc pointer equality — matches upstream's Python
+    /// `cls is other` comparisons.
+    pub classdefs: RefCell<Vec<Rc<RefCell<ClassDef>>>>,
+    /// RPython `self.methoddescs = {}` (bookkeeper.py:69). Keyed by
+    /// `(funcdesc, originclassdef, selfclassdef, name, flags)` tuple
+    /// so repeated `getmethoddesc(...)` calls with the same inputs
+    /// share identity, per bookkeeper.py:431-442.
+    pub methoddescs: RefCell<HashMap<MethodDescKey, Rc<RefCell<MethodDesc>>>>,
+}
+
+/// Key for the `Bookkeeper.methoddescs` cache. Upstream uses a tuple
+/// `(funcdesc, originclassdef, selfclassdef, name, tuple(flags.items()))`
+/// — Python hashes on object identity for `funcdesc` / `classdef`, and
+/// on value for the rest. The Rust port mirrors that by keying on the
+/// pointer identity of the two descriptor Rcs plus the stringified
+/// name + flags.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MethodDescKey {
+    /// RPython `funcdesc` — pointer identity via [`DescKey::from_rc`].
+    pub funcdesc_id: DescKey,
+    /// RPython `originclassdef` — `ClassDefKey` already carries the
+    /// pointer identity.
+    pub originclassdef: ClassDefKey,
+    /// RPython `selfclassdef` — `None` for unbound methods.
+    pub selfclassdef: Option<ClassDefKey>,
+    /// RPython `name`.
+    pub name: String,
+    /// RPython `tuple(flags.items())` — flattened sort-stable flag
+    /// entries.
+    pub flags: Vec<(String, bool)>,
 }
 
 impl Bookkeeper {
@@ -109,6 +150,9 @@ impl Bookkeeper {
             position_key: RefCell::new(None),
             listdefs: RefCell::new(HashMap::new()),
             dictdefs: RefCell::new(HashMap::new()),
+            descs: RefCell::new(HashMap::new()),
+            classdefs: RefCell::new(Vec::new()),
+            methoddescs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -207,6 +251,165 @@ impl Bookkeeper {
     /// RPython `Bookkeeper.newdict()` (bookkeeper.py:209-212).
     pub fn newdict(self: &Rc<Self>) -> SomeDict {
         SomeDict::new(self.getdictdef(false, false, false))
+    }
+
+    /// RPython `Bookkeeper.getdesc(pyobj)` (bookkeeper.py:353-409).
+    ///
+    /// Returns the cached [`DescEntry`] for `pyobj`, or constructs a
+    /// fresh one per upstream's `isinstance` dispatch. The Rust port
+    /// branches on [`HostObject`] kind:
+    ///   * `UserFunction` → [`Self::newfuncdesc`]
+    ///   * `Class` → `ClassDesc` (c1 shell — c2c replaces this with the
+    ///     full `ClassDesc::__init__` body; the shell still satisfies
+    ///     identity-caching so basedesc lookups land in a shared Rc)
+    ///   * `Instance` / `BuiltinCallable` / `Module` / `Opaque` →
+    ///     [`Self::getfrozen`] (upstream's `_freeze_` fallback)
+    ///
+    /// The upstream bound-method branch (MethodType) has no direct
+    /// HostObject counterpart yet; when HostObject gains a `Method`
+    /// variant (c3), this function routes it through
+    /// `getmethoddesc(self.getdesc(im_func), …)` matching
+    /// bookkeeper.py:374-396.
+    pub fn getdesc(self: &Rc<Self>, pyobj: &HostObject) -> Result<DescEntry, AnnotatorError> {
+        if let Some(existing) = self.descs.borrow().get(pyobj) {
+            return Ok(existing.clone());
+        }
+        let entry = if pyobj.is_user_function() {
+            DescEntry::Function(self.newfuncdesc(pyobj)?)
+        } else if pyobj.is_class() {
+            // upstream bookkeeper.py:367-373 — pyobj is `object` check
+            // raises, and `__builtin__` module check routes to
+            // `getfrozen`. The Rust port currently treats every non-
+            // builtin HostObject-class as a ClassDesc; builtin types
+            // aren't modelled as HostObject::Class yet (they show up as
+            // BuiltinCallable / primitive ConstValue), so the branch
+            // isn't reachable. `object` identity isn't materialised
+            // either.
+            let name = pyobj.qualname().to_string();
+            let desc_rc = ClassDesc::new(self, pyobj.clone(), Some(name), None, None)?;
+            DescEntry::Class(desc_rc)
+        } else if pyobj.is_builtin_callable()
+            || pyobj.is_instance()
+            || pyobj.is_module()
+            || pyobj.is_opaque()
+        {
+            DescEntry::Frozen(self.getfrozen(pyobj)?)
+        } else {
+            return Err(AnnotatorError::new(format!(
+                "Bookkeeper.getdesc({:?}): unexpected prebuilt constant",
+                pyobj.qualname()
+            )));
+        };
+        self.descs.borrow_mut().insert(pyobj.clone(), entry.clone());
+        Ok(entry)
+    }
+
+    /// RPython `Bookkeeper.newfuncdesc(pyfunc)` (bookkeeper.py:411-426).
+    ///
+    /// Rust port: pull signature / defaults from the HostObject's
+    /// [`crate::flowspace::model::GraphFunc`], and request a
+    /// specializer from `AnnotatorPolicy.get_specializer(tag)` once
+    /// the policy backlink is wired (annrpython.py c1 dep). For now
+    /// the specializer is `None`, matching upstream's `tag = None →
+    /// default_specialize` path. The `MemoDesc` branch
+    /// (bookkeeper.py:424-425) lands with specialize.py.
+    pub fn newfuncdesc(
+        self: &Rc<Self>,
+        pyfunc: &HostObject,
+    ) -> Result<Rc<RefCell<FunctionDesc>>, AnnotatorError> {
+        let gf = pyfunc.user_function().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "newfuncdesc({:?}) called on non-user-function HostObject",
+                pyfunc.qualname()
+            ))
+        })?;
+        // upstream bookkeeper.py:418 `signature = cpython_code_signature(pyfunc.__code__)`.
+        let name = gf.name.clone();
+        let signature = match gf.code.as_ref() {
+            Some(code) => cpython_code_signature(code),
+            // No HostCode attached — upstream hits the
+            // `_generator_next_method_of_` branch (bookkeeper.py:413-416)
+            // or fails. The Rust port defaults to the single-arg
+            // `Signature(['entry'])` matching upstream's generator
+            // fallback so tests that wire GraphFunc without a HostCode
+            // still traverse.
+            None => Signature::new(vec!["entry".to_string()], None, None),
+        };
+        let defaults = if gf.defaults.is_empty() {
+            None
+        } else {
+            Some(gf.defaults.clone())
+        };
+        let fd = FunctionDesc::new(
+            self.clone(),
+            Some(pyfunc.clone()),
+            name,
+            signature,
+            defaults,
+            None, // specializer wired with annrpython.py policy callback
+        );
+        Ok(Rc::new(RefCell::new(fd)))
+    }
+
+    /// RPython `Bookkeeper.getfrozen(pyobj)` (bookkeeper.py:428-429).
+    pub fn getfrozen(
+        self: &Rc<Self>,
+        pyobj: &HostObject,
+    ) -> Result<Rc<RefCell<FrozenDesc>>, AnnotatorError> {
+        let fd = FrozenDesc::new(self.clone(), pyobj.clone())?;
+        Ok(Rc::new(RefCell::new(fd)))
+    }
+
+    /// RPython `Bookkeeper.getmethoddesc(funcdesc, originclassdef,
+    /// selfclassdef, name, flags={})` (bookkeeper.py:431-442).
+    ///
+    /// Caches MethodDescs by the `(funcdesc-id, origindef-id,
+    /// selfdef-id, name, flags)` tuple — upstream's Python tuple hash
+    /// keyed on identity for the descriptor / classdef entries.
+    pub fn getmethoddesc(
+        self: &Rc<Self>,
+        funcdesc: &Rc<RefCell<FunctionDesc>>,
+        originclassdef: ClassDefKey,
+        selfclassdef: Option<ClassDefKey>,
+        name: &str,
+        flags: std::collections::BTreeMap<String, bool>,
+    ) -> Rc<RefCell<MethodDesc>> {
+        let flags_vec: Vec<(String, bool)> = flags.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let key = MethodDescKey {
+            funcdesc_id: DescKey::from_rc(funcdesc),
+            originclassdef,
+            selfclassdef,
+            name: name.to_string(),
+            flags: flags_vec,
+        };
+        if let Some(existing) = self.methoddescs.borrow().get(&key) {
+            return existing.clone();
+        }
+        let md = MethodDesc::new(
+            self.clone(),
+            funcdesc.clone(),
+            originclassdef,
+            selfclassdef,
+            name,
+            flags,
+        );
+        let rc = Rc::new(RefCell::new(md));
+        self.methoddescs.borrow_mut().insert(key, rc.clone());
+        rc
+    }
+
+    /// RPython `bookkeeper.classdefs.append(classdef)` — invoked from
+    /// `ClassDesc._init_classdef` (classdesc.py:674). Callers hand over
+    /// the fresh `Rc<RefCell<ClassDef>>` so the bookkeeper retains the
+    /// identity alongside every other reachable classdef.
+    pub fn register_classdef(self: &Rc<Self>, classdef: Rc<RefCell<ClassDef>>) {
+        self.classdefs.borrow_mut().push(classdef);
+    }
+
+    /// Snapshot of every registered classdef — test helper + upstream
+    /// `bookkeeper.classdefs` read access.
+    pub fn classdef_snapshot(&self) -> Vec<Rc<RefCell<ClassDef>>> {
+        self.classdefs.borrow().clone()
     }
 
     /// RPython `Bookkeeper.immutablevalue(x)` (bookkeeper.py:214-325).
@@ -408,7 +611,8 @@ impl Default for Bookkeeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotator::model::{SomeChar, SomeFloat, SomeString};
+    use crate::annotator::model::{SomeByteArray, SomeChar, SomeFloat, SomeString};
+    use crate::flowspace::model::GraphFunc;
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
@@ -726,5 +930,99 @@ mod tests {
             }
             other => panic!("expected SomeChar, got {other:?}"),
         }
+    }
+
+    // --- Phase 5 P5.2 classdesc c2: descs / classdefs / getdesc ---
+
+    #[test]
+    fn getdesc_for_user_function_returns_function_entry() {
+        let bk = bk();
+        let gf = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
+        let host = HostObject::new_user_function(gf);
+        let entry = bk.getdesc(&host).unwrap();
+        assert!(entry.is_function());
+        let fd = entry.as_function().unwrap();
+        assert_eq!(fd.borrow().name, "f");
+    }
+
+    #[test]
+    fn getdesc_caches_same_pyobj() {
+        // Two getdesc calls with the same HostObject return the same
+        // Rc (identity equal).
+        let bk = bk();
+        let gf = GraphFunc::new("g", Constant::new(ConstValue::Dict(Default::default())));
+        let host = HostObject::new_user_function(gf);
+        let a = bk.getdesc(&host).unwrap();
+        let b = bk.getdesc(&host).unwrap();
+        assert_eq!(a, b);
+        // Same underlying FunctionDesc Rc — pointer-identity.
+        let a_fd = a.as_function().unwrap();
+        let b_fd = b.as_function().unwrap();
+        assert!(Rc::ptr_eq(&a_fd, &b_fd));
+    }
+
+    #[test]
+    fn getdesc_for_class_returns_class_entry_shell() {
+        let bk = bk();
+        let cls = HostObject::new_class("pkg.Foo", vec![]);
+        let entry = bk.getdesc(&cls).unwrap();
+        assert!(entry.is_class());
+        let cd = entry.as_class().unwrap();
+        assert_eq!(cd.borrow().name, "pkg.Foo");
+    }
+
+    #[test]
+    fn getdesc_for_instance_returns_frozen_entry() {
+        let bk = bk();
+        let cls = HostObject::new_class("pkg.Foo", vec![]);
+        let inst = HostObject::new_instance(cls, vec![]);
+        let entry = bk.getdesc(&inst).unwrap();
+        assert!(entry.is_frozen());
+    }
+
+    #[test]
+    fn getdesc_for_builtin_callable_returns_frozen_entry() {
+        // bookkeeper.py treats builtin callables as frozen PBCs via
+        // the _freeze_ fallback.
+        let bk = bk();
+        let obj = HostObject::new_builtin_callable("len");
+        let entry = bk.getdesc(&obj).unwrap();
+        assert!(entry.is_frozen());
+    }
+
+    #[test]
+    fn getmethoddesc_caches_identity() {
+        // Two calls with the same funcdesc/classdefs/name/flags
+        // return the same MethodDesc Rc.
+        let bk = bk();
+        let gf = GraphFunc::new("m", Constant::new(ConstValue::Dict(Default::default())));
+        let host = HostObject::new_user_function(gf);
+        let fd = bk.getdesc(&host).unwrap().as_function().unwrap();
+        let origin = crate::annotator::description::ClassDefKey::from_raw(1);
+        let self_def = Some(crate::annotator::description::ClassDefKey::from_raw(2));
+        let flags = std::collections::BTreeMap::new();
+        let a = bk.getmethoddesc(&fd, origin, self_def, "m", flags.clone());
+        let b = bk.getmethoddesc(&fd, origin, self_def, "m", flags.clone());
+        assert!(Rc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn register_classdef_appends_to_snapshot() {
+        let bk = bk();
+        let cd_rc = ClassDef::new_standalone("pkg.C", None);
+        bk.register_classdef(cd_rc.clone());
+        let snap = bk.classdef_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(Rc::ptr_eq(&snap[0], &cd_rc));
+    }
+
+    #[test]
+    fn descentry_identity_eq() {
+        let bk = bk();
+        let gf = GraphFunc::new("h", Constant::new(ConstValue::Dict(Default::default())));
+        let host = HostObject::new_user_function(gf);
+        let a = bk.getdesc(&host).unwrap();
+        let b = bk.getdesc(&host).unwrap();
+        assert_eq!(a.desc_key(), b.desc_key());
     }
 }

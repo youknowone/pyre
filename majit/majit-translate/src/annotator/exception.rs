@@ -2,24 +2,28 @@
 //!
 //! RPython upstream: `rpython/annotator/exception.py` (7 LOC).
 //!
-//! Phase 5 P5.1 port.
+//! Phase 5 P5.1 port + c1b migration — classdefs land as
+//! `Rc<RefCell<classdesc::ClassDef>>` so identity equality (`Rc::ptr_eq`)
+//! matches upstream's Python class identity.
 //!
 //! Rust adaptation (parity rule #1): upstream imports live Python
 //! exception classes (`TypeError`, `OverflowError`, …) and
-//! `rstackovf._StackOverflow`. The Rust port carries placeholder
-//! [`ClassDef`]s bearing the qualified class names — the real
-//! identity-hash set over live Python classes lands when Phase 5's
-//! bookkeeper.py provides a ClassDesc registry. Until then this list
-//! is consumed via name-equality against the annotator's
-//! `HOST_ENV.lookup_exception_class` lookup.
+//! `rstackovf._StackOverflow`. The Rust port uses
+//! [`classdesc::ClassDef::new_standalone`] to build fresh classdef
+//! shells under the upstream qualnames; when Phase 5's bookkeeper.py
+//! provides a real ClassDesc registry these callers route through
+//! `bookkeeper.getdesc(cls).getuniqueclassdef()` instead.
 
-use super::model::ClassDef;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use super::classdesc::ClassDef;
 
 /// RPython `exception.standardexceptions` (exception.py:4-7).
 ///
 /// Names follow upstream — see flowspace's `HOST_ENV` for the live
 /// exception classes that the annotator builds on.
-pub fn standard_exceptions() -> Vec<ClassDef> {
+pub fn standard_exceptions() -> Vec<Rc<RefCell<ClassDef>>> {
     [
         "TypeError",
         "OverflowError",
@@ -43,7 +47,7 @@ pub fn standard_exceptions() -> Vec<ClassDef> {
         "_StackOverflow",
     ]
     .iter()
-    .map(|name| ClassDef::new(*name))
+    .map(|name| ClassDef::new_standalone(*name, None))
     .collect()
 }
 
@@ -56,9 +60,9 @@ mod tests {
         let excs = standard_exceptions();
         assert_eq!(excs.len(), 16);
         // Spot-check a few entries so rename-away regressions fire.
-        let names: Vec<&str> = excs.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"TypeError"));
-        assert!(names.contains(&"OverflowError"));
-        assert!(names.contains(&"_StackOverflow"));
+        let names: Vec<String> = excs.iter().map(|c| c.borrow().name.clone()).collect();
+        assert!(names.iter().any(|n| n == "TypeError"));
+        assert!(names.iter().any(|n| n == "OverflowError"));
+        assert!(names.iter().any(|n| n == "_StackOverflow"));
     }
 }

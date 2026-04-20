@@ -78,8 +78,16 @@ struct HostObjectInner {
 
 enum HostObjectKind {
     /// Python type/class object. `bases` 는 `__bases__` 튜플; 재귀적
-    /// `issubclass` 순회에 사용.
-    Class { bases: Vec<HostObject> },
+    /// `issubclass` 순회에 사용. `members` 는 `cls.__dict__` 대응 —
+    /// annotator ClassDesc.__init__ 이 `_mixin_`, `_immutable_fields_`,
+    /// `__slots__`, `_attrs_`, `__NOT_RPYTHON__`,
+    /// `_annspecialcase_` 등을 읽고, `add_sources_for_class` 가 모든
+    /// 엔트리를 순회한다. 값 타입이 임의의 Python 값(bool, tuple,
+    /// function, property, …)이므로 `ConstValue` carrier 로 담는다.
+    Class {
+        bases: Vec<HostObject>,
+        members: Mutex<HashMap<String, ConstValue>>,
+    },
     /// Python module object. `members` 는 module dict — `getattr` 조회
     /// 대상. `LazyLock` singleton 의 Sync 요구를 만족하려고 `Mutex`.
     Module {
@@ -167,9 +175,82 @@ impl HostObject {
             return true;
         }
         match &self.inner.kind {
-            HostObjectKind::Class { bases } => bases.iter().any(|b| b.is_subclass_of(other)),
+            HostObjectKind::Class { bases, .. } => bases.iter().any(|b| b.is_subclass_of(other)),
             _ => false,
         }
+    }
+
+    /// Class.__bases__ — bases tuple view. Non-class 는 None.
+    pub fn class_bases(&self) -> Option<&[HostObject]> {
+        match &self.inner.kind {
+            HostObjectKind::Class { bases, .. } => Some(bases.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// `cls.__dict__.get(name)` — class dict lookup. Non-class 는
+    /// None.
+    pub fn class_get(&self, name: &str) -> Option<ConstValue> {
+        match &self.inner.kind {
+            HostObjectKind::Class { members, .. } => members.lock().unwrap().get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Class dict setter — bootstrap / ClassDesc.create_new_attribute
+    /// 경로에서 사용. Non-class 에 대해서는 no-op.
+    pub fn class_set(&self, name: impl Into<String>, value: ConstValue) {
+        if let HostObjectKind::Class { members, .. } = &self.inner.kind {
+            members.lock().unwrap().insert(name.into(), value);
+        }
+    }
+
+    /// `cls.__dict__.keys()` — class dict key snapshot. Non-class 는
+    /// 빈 Vec.
+    pub fn class_dict_keys(&self) -> Vec<String> {
+        match &self.inner.kind {
+            HostObjectKind::Class { members, .. } => {
+                members.lock().unwrap().keys().cloned().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `cls.__dict__.items()` — class dict entry snapshot. Non-class
+    /// 는 빈 Vec.
+    pub fn class_dict_items(&self) -> Vec<(String, ConstValue)> {
+        match &self.inner.kind {
+            HostObjectKind::Class { members, .. } => members
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `cls.__dict__.__contains__(name)` — class dict 키 존재 검사.
+    /// Non-class 는 false.
+    pub fn class_has(&self, name: &str) -> bool {
+        match &self.inner.kind {
+            HostObjectKind::Class { members, .. } => members.lock().unwrap().contains_key(name),
+            _ => false,
+        }
+    }
+
+    /// `cls.__mro__` — C3 linearisation over `__bases__`. Non-class 는
+    /// None. 상위 class 가 중복된 경우를 처리하지만, 복수 정의 충돌시
+    /// `TypeError: MRO conflict` 대신 None 을 돌려준다 (upstream
+    /// `type(...).__mro__` 은 TypeError 를 던짐). RPython annotator 는
+    /// `add_mixins` 의 `type('tmp', tuple(mixins) + (object,), {}).__mro__`
+    /// 경로에서만 이 함수를 쓰므로, mixin 계층이 C3 충돌을 일으키지 않는
+    /// 한 None 경로는 타지 않는다.
+    pub fn mro(&self) -> Option<Vec<HostObject>> {
+        if !self.is_class() {
+            return None;
+        }
+        c3_linearise(self)
     }
 
     /// Instance → `__class__`. None 이면 `self` 가 인스턴스가 아님.
@@ -208,7 +289,31 @@ impl HostObject {
         HostObject {
             inner: Arc::new(HostObjectInner {
                 qualname: qualname.into(),
-                kind: HostObjectKind::Class { bases },
+                kind: HostObjectKind::Class {
+                    bases,
+                    members: Mutex::new(HashMap::new()),
+                },
+            }),
+        }
+    }
+
+    /// `new_class` + initial class dict. annotator
+    /// `ClassDesc.__init__` 가 mixin 분리 + `add_sources_for_class`
+    /// 를 돌리기 전에, bootstrap 이 미리 만들어놓은 class object 에
+    /// 필요한 멤버 (`_mixin_`, `_immutable_fields_`, …) 를 즉시 넣어
+    /// 주기 위한 편의 생성자.
+    pub fn new_class_with_members(
+        qualname: impl Into<String>,
+        bases: Vec<HostObject>,
+        members: HashMap<String, ConstValue>,
+    ) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::Class {
+                    bases,
+                    members: Mutex::new(members),
+                },
             }),
         }
     }
@@ -268,6 +373,51 @@ impl HostObject {
 
     pub fn is_opaque(&self) -> bool {
         matches!(self.inner.kind, HostObjectKind::Opaque)
+    }
+}
+
+/// C3 linearisation — CPython `type.__mro__` 알고리즘의 Rust 포트.
+///
+/// C3 규칙: `L[C] = C + merge(L[B1], L[B2], …, [B1, B2, …])` 에서
+/// `merge` 는 각 리스트의 head 를 후보로 보고, **다른 어떤 리스트의
+/// tail 에도 등장하지 않는** head 를 선택해 결과에 append 하고 모든
+/// 리스트에서 제거한다. 선택 가능한 head 가 없으면 conflict 로
+/// linearisation 실패 (Python 은 TypeError). 여기서는 None 을
+/// 돌려주고, annotator `add_mixins` 처럼 단일 상속 + mixin 인 경우에는
+/// 항상 성공한다.
+fn c3_linearise(cls: &HostObject) -> Option<Vec<HostObject>> {
+    let bases = cls.class_bases()?;
+    let mut lists: Vec<Vec<HostObject>> = Vec::new();
+    for base in bases {
+        let base_mro = c3_linearise(base)?;
+        lists.push(base_mro);
+    }
+    if !bases.is_empty() {
+        lists.push(bases.to_vec());
+    }
+    let mut result: Vec<HostObject> = vec![cls.clone()];
+    loop {
+        lists.retain(|l| !l.is_empty());
+        if lists.is_empty() {
+            return Some(result);
+        }
+        // 첫 번째 good head 를 찾는다.
+        let mut chosen: Option<HostObject> = None;
+        for list in &lists {
+            let head = &list[0];
+            let appears_in_tail = lists.iter().any(|other| other[1..].contains(head));
+            if !appears_in_tail {
+                chosen = Some(head.clone());
+                break;
+            }
+        }
+        let head = chosen?;
+        result.push(head.clone());
+        for list in lists.iter_mut() {
+            if !list.is_empty() && list[0] == head {
+                list.remove(0);
+            }
+        }
     }
 }
 
@@ -2687,5 +2837,111 @@ mod tests {
         assert_eq!(op2.result, Hlvalue::Variable(r_new));
         assert_eq!(op2.args[0], Hlvalue::Variable(a_new));
         assert_eq!(op2.args[1], Hlvalue::Variable(b));
+    }
+
+    // --- HostObject class_dict / mro — Phase 5 P5.2 classdesc c2 ---
+
+    #[test]
+    fn class_dict_get_set_roundtrip() {
+        let cls = HostObject::new_class("pkg.Foo", vec![]);
+        assert!(cls.class_get("_mixin_").is_none());
+        cls.class_set("_mixin_", ConstValue::Bool(true));
+        match cls.class_get("_mixin_") {
+            Some(ConstValue::Bool(true)) => {}
+            other => panic!("expected Bool(true), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_dict_keys_snapshot_matches_insert() {
+        let cls = HostObject::new_class("pkg.Foo", vec![]);
+        cls.class_set("a", ConstValue::Int(1));
+        cls.class_set("b", ConstValue::Int(2));
+        let mut keys = cls.class_dict_keys();
+        keys.sort();
+        assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn class_dict_items_roundtrip() {
+        let cls = HostObject::new_class("pkg.Foo", vec![]);
+        cls.class_set("x", ConstValue::Int(7));
+        let items = cls.class_dict_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "x");
+        match items[0].1 {
+            ConstValue::Int(7) => {}
+            ref other => panic!("expected Int(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_has_reflects_membership() {
+        let cls = HostObject::new_class("pkg.Foo", vec![]);
+        assert!(!cls.class_has("missing"));
+        cls.class_set("here", ConstValue::Int(0));
+        assert!(cls.class_has("here"));
+    }
+
+    #[test]
+    fn new_class_with_members_seeds_initial_dict() {
+        let mut seed: HashMap<String, ConstValue> = HashMap::new();
+        seed.insert("_mixin_".into(), ConstValue::Bool(true));
+        let cls = HostObject::new_class_with_members("pkg.Foo", vec![], seed);
+        match cls.class_get("_mixin_") {
+            Some(ConstValue::Bool(true)) => {}
+            other => panic!("expected Bool(true), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_dict_on_module_returns_empty() {
+        let m = HostObject::new_module("pkg");
+        assert_eq!(m.class_dict_keys(), Vec::<String>::new());
+        assert!(m.class_get("anything").is_none());
+        assert!(!m.class_has("anything"));
+    }
+
+    #[test]
+    fn class_bases_matches_ctor() {
+        let base = HostObject::new_class("pkg.Base", vec![]);
+        let child = HostObject::new_class("pkg.Child", vec![base.clone()]);
+        let bases = child.class_bases().expect("class has bases");
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0], base);
+    }
+
+    #[test]
+    fn mro_single_inheritance_chain() {
+        // A <- B <- C, mro = [C, B, A]
+        let a = HostObject::new_class("pkg.A", vec![]);
+        let b = HostObject::new_class("pkg.B", vec![a.clone()]);
+        let c = HostObject::new_class("pkg.C", vec![b.clone()]);
+        let mro = c.mro().expect("single-inheritance mro");
+        assert_eq!(mro, vec![c, b, a]);
+    }
+
+    #[test]
+    fn mro_diamond_c3_order() {
+        // A, B<-A, C<-A, D<-B,C → mro = [D, B, C, A]
+        let a = HostObject::new_class("pkg.A", vec![]);
+        let b = HostObject::new_class("pkg.B", vec![a.clone()]);
+        let c = HostObject::new_class("pkg.C", vec![a.clone()]);
+        let d = HostObject::new_class("pkg.D", vec![b.clone(), c.clone()]);
+        let mro = d.mro().expect("diamond mro");
+        assert_eq!(mro, vec![d, b, c, a]);
+    }
+
+    #[test]
+    fn mro_empty_bases_is_singleton() {
+        let a = HostObject::new_class("pkg.A", vec![]);
+        let mro = a.mro().expect("no-base mro");
+        assert_eq!(mro, vec![a]);
+    }
+
+    #[test]
+    fn mro_on_non_class_returns_none() {
+        let m = HostObject::new_module("pkg");
+        assert!(m.mro().is_none());
     }
 }

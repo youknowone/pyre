@@ -31,6 +31,7 @@
 
 pub mod argument;
 pub mod bookkeeper;
+pub mod classdesc;
 pub mod description;
 pub mod dictdef;
 pub mod exception;
