@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crate::call::{CallControl, CallKind};
 use crate::model::{
     BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
-    control_flow_from_terminator, remap_control_flow_metadata,
+    remap_control_flow_metadata,
 };
 
 fn remap_call_funcptr<F: Fn(&ValueId) -> ValueId>(funcptr: &CallFuncPtr, remap: &F) -> CallFuncPtr {
@@ -110,9 +110,17 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         _ => unreachable!("InlineSite should point to a Call op"),
     };
 
-    // Separate ops into before-call and after-call
+    // Separate ops into before-call and after-call.  The caller block's
+    // full CFG metadata (terminator + exitswitch + exits) must follow
+    // the `after_ops` into the merge block so the original control-flow
+    // shape (including any can-raise exits) is preserved.  Upstream
+    // `rpython/flowspace/model.py:174` treats `Block.exitswitch` +
+    // `Block.exits` as the single CFG source of truth, so they move
+    // together with the ops they guard.
     let after_ops: Vec<SpaceOperation> = block.operations[op_index + 1..].to_vec();
     let after_terminator = block.terminator.clone();
+    let after_exitswitch = block.exitswitch.clone();
+    let after_exits = block.exits.clone();
 
     // Truncate the original block to before-call ops only
     graph.blocks[block_id.0].operations.truncate(op_index);
@@ -132,23 +140,38 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             let (id, args) = graph.create_block_with_args(1);
             // The merge block's inputarg replaces the original call result.
             // We need to remap all references to original_result → merge_args[0]
-            // in the after_ops and after_terminator.
+            // in the after_ops, the after_terminator, and the exit metadata.
             let remapped_after_ops = remap_value_in_ops(&after_ops, original_result, args[0]);
             let remapped_after_term =
                 remap_value_in_terminator(&after_terminator, original_result, args[0]);
             graph.blocks[id.0].operations = remapped_after_ops;
-            graph.blocks[id.0].terminator = remapped_after_term;
-            let (exitswitch, exits) = control_flow_from_terminator(&graph.blocks[id.0].terminator);
-            graph.blocks[id.0].exitswitch = exitswitch;
-            graph.blocks[id.0].exits = exits;
+            // `set_terminator` resyncs `exits`/`exitswitch` from the new
+            // terminator and stamps `prevblock = id` on the derived links
+            // (`model.rs::resync_block_exits`).  `set_control_flow_metadata`
+            // then overwrites with the caller block's original exits
+            // (remapped), so the can-raise/typed-exception shape survives
+            // the split even when `control_flow_from_terminator` would
+            // produce a bare goto.
+            graph.set_terminator(id, remapped_after_term);
+            let (remapped_switch, remapped_exits) = remap_control_flow_metadata(
+                &after_exitswitch,
+                &after_exits,
+                |v| if v == original_result { args[0] } else { v },
+                |b| b,
+            );
+            if !remapped_exits.is_empty() || remapped_switch.is_some() {
+                graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
+            }
             (id, args)
         } else {
             let id = graph.create_block();
             graph.blocks[id.0].operations = after_ops;
-            graph.blocks[id.0].terminator = after_terminator;
-            let (exitswitch, exits) = control_flow_from_terminator(&graph.blocks[id.0].terminator);
-            graph.blocks[id.0].exitswitch = exitswitch;
-            graph.blocks[id.0].exits = exits;
+            graph.set_terminator(id, after_terminator);
+            let (remapped_switch, remapped_exits) =
+                remap_control_flow_metadata(&after_exitswitch, &after_exits, |v| v, |b| b);
+            if !remapped_exits.is_empty() || remapped_switch.is_some() {
+                graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
+            }
             (id, vec![])
         };
 
@@ -179,7 +202,14 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             .collect();
         graph.blocks[new_block_id.0].operations = new_ops;
 
-        // Remap terminator, replacing Return with Goto to merge block
+        // Remap terminator, replacing Return with Goto to merge block.
+        // A callee `Return` has no exits metadata, so when we rewrite it
+        // to a merge-block Goto the exits must be derived from the NEW
+        // terminator; otherwise the merged block would end up with a
+        // control-flow terminator and an empty `exits`, violating
+        // upstream's "`Block.exitswitch`/`Block.exits` is the single
+        // CFG source of truth" invariant (`flowspace/model.py:174`).
+        let was_return = matches!(&callee_block.terminator, Terminator::Return(_));
         let new_terminator = match &callee_block.terminator {
             Terminator::Return(Some(ret_val)) => {
                 let remapped_ret = value_map[ret_val];
@@ -212,15 +242,23 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             }
             other => remap_terminator(other, &value_map, &block_map),
         };
-        graph.blocks[new_block_id.0].terminator = new_terminator;
-        let (exitswitch, exits) = remap_control_flow_metadata(
-            &callee_block.exitswitch,
-            &callee_block.exits,
-            |v| value_map[&v],
-            |b| block_map[&b],
-        );
-        graph.blocks[new_block_id.0].exitswitch = exitswitch;
-        graph.blocks[new_block_id.0].exits = exits;
+        // `set_terminator` resyncs `exitswitch`/`exits` from the
+        // terminator and stamps `prevblock = new_block_id` on each
+        // derived link (`model.rs::resync_block_exits`).
+        graph.set_terminator(new_block_id, new_terminator);
+        if !was_return {
+            // Preserve the callee block's upstream CFG shape (can-raise,
+            // typed-exception, bool-branch metadata) with renamed
+            // values and blocks.  `set_control_flow_metadata` stamps
+            // `prevblock` on every link.
+            let (exitswitch, exits) = remap_control_flow_metadata(
+                &callee_block.exitswitch,
+                &callee_block.exits,
+                |v| value_map[&v],
+                |b| block_map[&b],
+            );
+            graph.set_control_flow_metadata(new_block_id, exitswitch, exits);
+        }
     }
 
     // --- Connect caller's before-block to callee entry ---
@@ -247,14 +285,18 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         }
     }
 
-    // Set the before-block's terminator to jump to callee entry
-    graph.blocks[block_id.0].terminator = Terminator::Goto {
-        target: callee_entry,
-        args: vec![],
-    };
-    let (exitswitch, exits) = control_flow_from_terminator(&graph.blocks[block_id.0].terminator);
-    graph.blocks[block_id.0].exitswitch = exitswitch;
-    graph.blocks[block_id.0].exits = exits;
+    // Set the before-block's terminator to jump to callee entry.
+    // `set_terminator` resyncs `exits`/`exitswitch` to a single Goto
+    // link with `prevblock = block_id`, replacing the caller block's
+    // original exits (which have already been moved to the merge block
+    // above).
+    graph.set_terminator(
+        block_id,
+        Terminator::Goto {
+            target: callee_entry,
+            args: vec![],
+        },
+    );
 }
 
 /// Allocate fresh ValueIds for all values in the callee graph.
@@ -1076,5 +1118,67 @@ mod tests {
             has_array_read,
             "2-level inlined graph should have ArrayRead"
         );
+    }
+
+    /// Post-inline regression: every block whose terminator is a
+    /// control-flow op (Goto/Branch) must carry matching `Block.exits`
+    /// metadata, and every resulting Link must stamp `prevblock` with
+    /// the block it exits.  RPython `flowspace/model.py:174` keeps
+    /// `exitswitch`/`exits` as the single CFG source of truth, so pyre
+    /// must not let the inline rewrite produce terminator/exits drift
+    /// or `prevblock = None` links.
+    #[test]
+    fn inline_preserves_exits_and_prevblock_invariants() {
+        let callee = make_simple_callee();
+
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let base = caller.push_op(
+            entry,
+            OpKind::Input {
+                name: "base".into(),
+                ty: ValueType::Ref,
+            },
+            true,
+        );
+        let result = caller.push_op(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["callee"]),
+                args: vec![base.unwrap()],
+                result_ty: ValueType::Ref,
+            },
+            true,
+        );
+        caller.set_terminator(entry, Terminator::Return(result));
+
+        let mut cc = CallControl::new();
+        cc.register_function_graph(CallPath::from_segments(["callee"]), callee);
+        cc.find_all_graphs_for_tests();
+
+        let count = inline_graph(&mut caller, &cc, 3);
+        assert!(count >= 1, "callee should inline at least once");
+
+        for block in &caller.blocks {
+            match &block.terminator {
+                Terminator::Goto { .. } | Terminator::Branch { .. } => {
+                    assert!(
+                        !block.exits.is_empty(),
+                        "block {:?} has control-flow terminator but empty exits",
+                        block.id
+                    );
+                }
+                _ => {}
+            }
+            for link in &block.exits {
+                assert_eq!(
+                    link.prevblock,
+                    Some(block.id),
+                    "link in block {:?} targeting {:?} missing prevblock stamp",
+                    block.id,
+                    link.target
+                );
+            }
+        }
     }
 }
