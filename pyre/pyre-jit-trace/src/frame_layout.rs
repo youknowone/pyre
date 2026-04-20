@@ -1,5 +1,4 @@
 use majit_ir::Type;
-use majit_ir::descr::{EffectInfo, make_call_descr};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use pyre_interpreter::pyframe::PyFrame;
 
@@ -73,13 +72,16 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
 pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     let mut info = crate::virtualizable_gen::build_virtualizable_info();
     info.set_parent_descr(crate::state::pyframe_size_descr());
-    // virtualizable.py:45-47: clear_vable_ptr + clear_vable_descr.
-    // COND_CALL(cond, funcptr, vable_box) — takes one Ref arg, returns void.
-    info.clear_vable_fn = Some(pyre_clear_vable_token);
-    info.clear_vable_descr = Some(make_call_descr(
-        vec![Type::Ref],
-        Type::Void,
-        EffectInfo::default(),
-    ));
+    // rpython/jit/metainterp/virtualizable.py:293-301 `clear_vable_ptr`
+    // + `clear_vable_descr`. The descr must carry
+    // EffectInfo.MOST_GENERAL + OopSpecIndex.JitForceVirtualizable
+    // and mark the call CANNOT_RAISE — `VirtualizableInfo::make_clear
+    // _vable_descr` is the single-source-of-truth factory that
+    // constructs exactly that descriptor. Using
+    // `make_call_descr(.., EffectInfo::default())` here would drop
+    // the CANNOT_RAISE / OS_JIT_FORCE_VIRTUALIZABLE flags and cause
+    // the optimizer to treat the call as a raising general call.
+    info.clear_vable_ptr = Some(pyre_clear_vable_token as *const () as usize);
+    info.clear_vable_descr = Some(VirtualizableInfo::make_clear_vable_descr());
     info
 }

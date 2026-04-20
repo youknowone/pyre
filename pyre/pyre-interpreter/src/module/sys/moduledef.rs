@@ -170,16 +170,42 @@ pub fn init(ns: &mut DictStorage) {
         "getdefaultencoding",
         crate::make_builtin_function("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
     );
-    // sys.getrecursionlimit / setrecursionlimit
+    // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py:45.
+    // The runtime stack budget lives in `crate::stack_check`; both
+    // helpers route through it so the interpreter, JIT prologue probe,
+    // and blackhole resume see a consistent recursion budget.
     dict_storage_store(
         ns,
         "getrecursionlimit",
-        crate::make_builtin_function("getrecursionlimit", |_| Ok(w_int_new(1000))),
+        crate::make_builtin_function("getrecursionlimit", |args| {
+            // pypy/module/sys/vm.py:72 — no arguments.
+            if !args.is_empty() {
+                return Err(crate::PyError::type_error(
+                    "getrecursionlimit() takes no arguments",
+                ));
+            }
+            Ok(w_int_new(crate::stack_check::get_recursion_limit() as i64))
+        }),
     );
     dict_storage_store(
         ns,
         "setrecursionlimit",
-        crate::make_builtin_function("setrecursionlimit", |_| Ok(w_none())),
+        crate::make_builtin_function("setrecursionlimit", |args| {
+            // pypy/module/sys/vm.py:63 `@unwrap_spec(new_limit="c_int")`
+            // — exactly one positional argument, coerced through
+            // baseobjspace.c_int_w (gateway_int_w + 32-bit range
+            // check). `c_int_w` accepts int subclasses and any object
+            // implementing `__int__`, rejects floats, and surfaces
+            // out-of-range values as OverflowError.
+            if args.len() != 1 {
+                return Err(crate::PyError::type_error(
+                    "setrecursionlimit() takes exactly one argument",
+                ));
+            }
+            let new_limit = crate::baseobjspace::c_int_w(args[0])?;
+            crate::stack_check::set_recursion_limit(new_limit)?;
+            Ok(w_none())
+        }),
     );
     // sys.intern
     dict_storage_store(

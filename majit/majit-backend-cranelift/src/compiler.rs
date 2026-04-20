@@ -1762,6 +1762,64 @@ pub fn register_call_assembler_force(f: extern "C" fn(i64) -> i64) {
     let _ = CALL_ASSEMBLER_FORCE_FN.set(f);
 }
 
+static CALL_ASSEMBLER_UNBOX_INT_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
+
+pub fn register_call_assembler_unbox_int(f: fn(i64) -> i64) {
+    let _ = CALL_ASSEMBLER_UNBOX_INT_FN.set(f);
+}
+
+/// rpython/jit/backend/llsupport/llmodel.py:229-234 `insert_stack_check`
+/// parity. Mirrors the dynasm-side address registration API so the
+/// interpreter can install the three RPython-style probe addresses
+/// uniformly across backends.
+///
+/// Cranelift does not emit an inline SP probe today; the prologue
+/// calls [`register_prologue_probe_addr`]'s registered function (which
+/// combines fast path + slowpath in one call) because Cranelift IR
+/// does not expose a "read current SP" intrinsic. When such an
+/// intrinsic lands, the prologue emitter will switch to the
+/// `MOV [endaddr]; SUB sp; CMP [lengthaddr]; BLR slowpath` sequence
+/// matching `assembler.py:1085-1091`, consuming the three RPython-
+/// style addresses below directly.
+#[derive(Copy, Clone, Debug)]
+pub struct StackCheckAddresses {
+    pub end_adr: usize,
+    pub length_adr: usize,
+    pub slowpath_addr: usize,
+}
+
+static STACK_CHECK_ADDRS: OnceLock<StackCheckAddresses> = OnceLock::new();
+
+pub fn register_stack_check_addresses(end_adr: usize, length_adr: usize, slowpath_addr: usize) {
+    let _ = STACK_CHECK_ADDRS.set(StackCheckAddresses {
+        end_adr,
+        length_adr,
+        slowpath_addr,
+    });
+}
+
+pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
+    STACK_CHECK_ADDRS.get().copied()
+}
+
+/// Address of a Rust function `extern "C" fn() -> u8` that performs
+/// the combined fast-path + slowpath stack check and returns 1 on
+/// real overflow (after raising a pending exception into the
+/// pyre-interpreter slot). The interpreter registers this via
+/// [`register_prologue_probe_addr`] at startup; Cranelift emits a call
+/// to this address in every trace prologue (see codegen at
+/// `compile_trace`), through the thin i64 wrapper below to keep the
+/// IR-level signature unambiguous.
+static PROLOGUE_PROBE_ADDR: OnceLock<usize> = OnceLock::new();
+
+pub fn register_prologue_probe_addr(addr: usize) {
+    let _ = PROLOGUE_PROBE_ADDR.set(addr);
+}
+
+pub fn prologue_probe_addr() -> Option<usize> {
+    PROLOGUE_PROBE_ADDR.get().copied()
+}
+
 /// Execute compiled code for a token directly, bypassing the JitDriver chain.
 ///
 /// PyPy assembler_call_helper equivalent: dispatches through compiled code
@@ -2596,20 +2654,23 @@ extern "C" fn call_assembler_guard_failure(
     outputs_ptr: *const i64,
     inputs_ptr: *const i64,
 ) -> i64 {
-    // warmspot.py:1021-1028 assembler_call_helper parity:
-    // This function is the Rust equivalent of RPython's assembler_call_helper.
-    // It handles ALL non-finish cases: bridge dispatch, bridge compilation,
-    // and blackhole resume. Deep recursion via CALL_ASSEMBLER chains needs
-    // stack growth protection (rstack.stack_almost_full parity).
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
-        call_assembler_guard_failure_inner(
-            token_number,
-            fail_descr_ptr,
-            frame_ptr,
-            outputs_ptr,
-            inputs_ptr,
-        )
-    })
+    // warmspot.py:1021-1028 assembler_call_helper parity: Rust
+    // equivalent of RPython's assembler_call_helper. Handles ALL
+    // non-finish cases: bridge dispatch, bridge compilation, and
+    // blackhole resume.
+    //
+    // No alternate-stack switch: upstream runs on the caller's stack
+    // so the compiled prologue's inline SP probe
+    // (`_call_header_with_stack_check`,
+    // rpython/jit/backend/x86/assembler.py:1085) measures against the
+    // same `PYRE_STACKTOOBIG.stack_end` the rest of the runtime uses.
+    call_assembler_guard_failure_inner(
+        token_number,
+        fail_descr_ptr,
+        frame_ptr,
+        outputs_ptr,
+        inputs_ptr,
+    )
 }
 
 fn call_assembler_guard_failure_inner(
@@ -2917,13 +2978,18 @@ extern "C" fn call_assembler_shim(
     outcome_ptr: u64,
     _expected_result_kind: u64,
 ) -> u64 {
-    // warmspot.py:1017-1024 assembler_call_helper parity:
-    // handle_fail always raises JitException, never returns silently.
-    // stacker::maybe_grow ensures recursive CALL_ASSEMBLER does not
-    // exhaust the native stack (rstack.py stack_almost_full parity).
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
-        call_assembler_shim_inner(target_token, args_ptr, outcome_ptr, _expected_result_kind)
-    })
+    // warmspot.py:1017-1024 assembler_call_helper parity: handle_fail
+    // always raises JitException, never returns silently.
+    //
+    // No alternate-stack switch here. Upstream RPython runs the shim
+    // on the caller's native stack so the compiled prologue's inline
+    // probe (`_call_header_with_stack_check`,
+    // rpython/jit/backend/x86/assembler.py:1085 parity) measures SP
+    // against the same `PYRE_STACKTOOBIG.stack_end` the rest of the
+    // runtime uses. Growing the stack via `stacker::maybe_grow` here
+    // would read `stack_end` from a different guard page, breaking the
+    // budget comparison.
+    call_assembler_shim_inner(target_token, args_ptr, outcome_ptr, _expected_result_kind)
 }
 
 fn call_assembler_shim_inner(
@@ -2932,6 +2998,13 @@ fn call_assembler_shim_inner(
     outcome_ptr: u64,
     _expected_result_kind: u64,
 ) -> u64 {
+    // No wrapper-level stack probe here. assembler.py:2254-2265
+    // `_genop_call_assembler` emits a plain CALL to the target trace;
+    // the prologue of the target (`_call_header_with_stack_check`,
+    // assembler.py:1080) runs the inline SP probe. Pyre's Cranelift
+    // prologue emits the same probe at trace compile time via
+    // `prologue_probe_addr()`, so any extra probe here would duplicate
+    // the check the callee is about to perform on the same stack.
     let outcome = outcome_ptr as usize as *mut i64;
 
     let target = unsafe { &*fast_lookup_ca_target(target_token) };
@@ -4775,18 +4848,20 @@ fn run_compiled_code(
     max_output_slots: usize,
     inputs: &[i64],
 ) -> JitExecResult {
-    // rstack parity: grow stack before JIT code execution to prevent
-    // stack overflow during CALL_ASSEMBLER recursion.
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
-        run_compiled_code_inner(
-            code_ptr,
-            fail_descrs,
-            gc_runtime_id,
-            num_ref_roots,
-            max_output_slots,
-            inputs,
-        )
-    })
+    // No alternate-stack switch here. The compiled prologue's inline
+    // SP probe (`_call_header_with_stack_check`,
+    // rpython/jit/backend/x86/assembler.py:1085 parity) reads
+    // `PYRE_STACKTOOBIG.stack_end` against the caller's real SP;
+    // running the compiled code on a grown stack would shift SP onto
+    // a different guard region and make the budget compare meaningless.
+    run_compiled_code_inner(
+        code_ptr,
+        fail_descrs,
+        gc_runtime_id,
+        num_ref_roots,
+        max_output_slots,
+        inputs,
+    )
 }
 
 fn run_compiled_code_inner(
@@ -5898,11 +5973,50 @@ impl CraneliftBackend {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
+        // assembler.py:1080 _call_header_with_stack_check — Cranelift
+        // emits a call to the registered combined-probe function
+        // (PROLOGUE_PROBE_ADDR) which runs the fast path + slowpath
+        // and raises a Python RecursionError on real overflow. The
+        // function returns i64 (0 = OK, 1 = overflow) so brif can
+        // branch on it directly. If no address is registered
+        // (bench/tests), the probe is elided.
+        let initial_jf_ptr = builder.block_params(entry_block)[0];
+        let probe_addr = prologue_probe_addr().unwrap_or(0);
+        let stack_check_result = if probe_addr != 0 {
+            emit_host_call(
+                &mut builder,
+                ptr_type,
+                call_conv,
+                probe_addr,
+                &[],
+                Some(cl_types::I64),
+            )
+            .expect("pyre_stack_check_for_jit_prologue must return an i64")
+        } else {
+            builder.ins().iconst(cl_types::I64, 0)
+        };
+        let stack_overflow_block = builder.create_block();
+        let stack_check_continue = builder.create_block();
+        builder.ins().brif(
+            stack_check_result,
+            stack_overflow_block,
+            &[],
+            stack_check_continue,
+            &[],
+        );
+
+        builder.switch_to_block(stack_overflow_block);
+        builder.seal_block(stack_overflow_block);
+        builder.ins().return_(&[initial_jf_ptr]);
+
+        builder.switch_to_block(stack_check_continue);
+        builder.seal_block(stack_check_continue);
+
         // jf_ptr serves as both inputs_ptr (entry) and the exit-frame base.
         // RPython: EBP = jitframe pointer throughout compiled code.
         // After a collecting call, _reload_frame_if_necessary reloads
         // jf_ptr from the shadow stack (GC may have moved the jitframe).
-        let mut jf_ptr = builder.block_params(entry_block)[0];
+        let mut jf_ptr = initial_jf_ptr;
         let inputs_ptr = jf_ptr; // alias for entry loading
 
         // assembler.py:1074 _call_header_shadowstack — inline MOVs:

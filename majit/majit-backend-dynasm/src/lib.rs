@@ -96,9 +96,13 @@ pub type BridgeFn = fn(u64, u64, u32, *const i64, usize, usize) -> bool;
 /// Force callee: (callee_frame_ptr) → result
 pub type ForceFn = extern "C" fn(i64) -> i64;
 
+/// Unbox int from Ref: (raw_ref) → i64
+pub type UnboxIntFn = fn(i64) -> i64;
+
 static CA_BLACKHOLE_FN: OnceLock<BlackholeFn> = OnceLock::new();
 static CA_BRIDGE_FN: OnceLock<BridgeFn> = OnceLock::new();
 static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
+static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
 
 /// Register blackhole resume handler (same API as Cranelift).
 pub fn register_call_assembler_blackhole(f: BlackholeFn) {
@@ -119,6 +123,54 @@ pub fn register_call_assembler_force(f: ForceFn) {
 /// Returns 0 if not registered.
 pub fn call_assembler_force_fn_addr() -> usize {
     CA_FORCE_FN.get().map(|f| *f as usize).unwrap_or(0)
+}
+
+/// Register int unbox handler (same API as Cranelift).
+pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
+    CA_UNBOX_INT_FN.set(f).ok();
+}
+
+/// rpython/jit/backend/llsupport/llmodel.py:229-234 `insert_stack_check`
+/// parity. The interpreter registers the three addresses the JIT
+/// prologue needs to emit the inline stack-overflow probe matching
+/// `rpython/jit/backend/x86/assembler.py:1085-1091`:
+///
+///   * `end_adr` — address of `PYRE_STACKTOOBIG.stack_end`
+///     (`LL_stack_get_end_adr`). The probe loads this and subtracts
+///     the current SP.
+///   * `length_adr` — address of `PYRE_STACKTOOBIG.stack_length`
+///     (`LL_stack_get_length_adr`). The probe compares the diff
+///     against this.
+///   * `slowpath_addr` — `pyre_stack_too_big_slowpath` function
+///     pointer (`STACK_CHECK_SLOWPATH` in llmodel). Called on fast-
+///     path miss with the current SP; returns 1 on real overflow.
+#[derive(Copy, Clone, Debug)]
+pub struct StackCheckAddresses {
+    pub end_adr: usize,
+    pub length_adr: usize,
+    pub slowpath_addr: usize,
+}
+
+static STACK_CHECK_ADDRS: OnceLock<StackCheckAddresses> = OnceLock::new();
+
+/// Register the three addresses the JIT prologue needs for the inline
+/// stack-overflow probe. Called once at startup from pyre-jit; matches
+/// `rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check`.
+pub fn register_stack_check_addresses(end_adr: usize, length_adr: usize, slowpath_addr: usize) {
+    let _ = STACK_CHECK_ADDRS.set(StackCheckAddresses {
+        end_adr,
+        length_adr,
+        slowpath_addr,
+    });
+}
+
+/// Retrieve the registered inline-probe addresses. Returns `None` if
+/// the interpreter has not yet registered them (tests or early
+/// startup); the prologue emitter skips the probe in that case,
+/// mirroring `assembler.py:1082 "if self.stack_check_slowpath == 0:
+/// pass (no stack check)"`.
+pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
+    STACK_CHECK_ADDRS.get().copied()
 }
 
 /// assembler.py:345 assembler_helper_adr parity:
@@ -213,10 +265,16 @@ pub fn call_assembler_helper_addr() -> usize {
     call_assembler_helper_trampoline as *const () as usize
 }
 
-/// rstack.stack_almost_full parity: CALL_ASSEMBLER recursive callee
-/// execution trampoline with stacker protection.  The JIT-generated
-/// code calls this instead of directly branching to the callee entry,
-/// so each recursion level gets stack growth when needed.
+/// CALL_ASSEMBLER recursive callee execution trampoline. JIT-generated
+/// code calls this instead of directly branching to the callee entry.
+///
+/// No alternate-stack switch: upstream RPython enters the callee on
+/// the caller's native stack, and the callee's compiled prologue
+/// performs its own inline SP probe
+/// (rpython/jit/backend/x86/assembler.py:1085
+/// `_call_header_with_stack_check`) against `PYRE_STACKTOOBIG.stack_end`.
+/// Growing the stack here would shift SP into a different guard
+/// region and invalidate that budget comparison.
 ///
 /// Input:  arg0 = callee jf_ptr, arg1 = callee entry address
 /// Output: callee's returned jf_ptr
@@ -224,11 +282,9 @@ pub extern "C" fn call_assembler_execute_trampoline(
     jf_ptr: *mut jitframe::JitFrame,
     callee_addr: usize,
 ) -> *mut jitframe::JitFrame {
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, || {
-        let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
-            unsafe { std::mem::transmute(callee_addr) };
-        unsafe { func(jf_ptr) }
-    })
+    let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
+        unsafe { std::mem::transmute(callee_addr) };
+    unsafe { func(jf_ptr) }
 }
 
 /// Return the address of the execute trampoline.

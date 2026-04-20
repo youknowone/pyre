@@ -14,9 +14,9 @@ dynasm = ["majit-metainterp/dynasm"]
 
 [dependencies]
 pyre-object = { workspace = true }
+majit-gc = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
-stacker = "0.1"
 rustpython-compiler = { workspace = true }
 rustpython-compiler-core = { workspace = true }
 malachite-bigint = { workspace = true }

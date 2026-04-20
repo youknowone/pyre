@@ -3694,6 +3694,119 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
 // Builtin type method implementations moved to type_methods.rs
 // (PyPy: listobject.py, unicodeobject.py, dictobject.py, tupleobject.py)
 
+/// baseobjspace.py:317-339 `W_Root.int(space)` — the number protocol
+/// portion of `space.int(w_obj)`. Look up `__int__`; if absent, fall
+/// back to `__index__`. Validate the result is a `W_AbstractIntObject`.
+///
+/// Note: `__trunc__` is NOT consulted here. `__trunc__` belongs to the
+/// `int(...)` builtin path (`intobject.py:989 _new_baseint`), not to
+/// `space.int()` / `space.int_w()`.
+fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    // baseobjspace.py:319 `w_impl = space.lookup(self, '__int__')`
+    let w_impl = unsafe { lookup(obj, "__int__") }
+        // baseobjspace.py:321-323 `w_impl = space.lookup(self, '__index__')`
+        .or_else(|| unsafe { lookup(obj, "__index__") });
+    let Some(method) = w_impl else {
+        // baseobjspace.py:323 `self._typed_unwrap_error(space, "integer")`
+        return Err(PyError::type_error("expected integer"));
+    };
+    // baseobjspace.py:324 `w_result = space.get_and_call_function(w_impl, self)`
+    let w_result = crate::builtins::call_and_check(method, &[obj])?;
+    // baseobjspace.py:326-337 validate that w_result is a W_AbstractIntObject.
+    if unsafe { pyre_object::pyobject::is_int_or_long(w_result) } {
+        return Ok(w_result);
+    }
+    // baseobjspace.py:338-339 non-int result → TypeError.
+    Err(PyError::type_error("__int__ returned non-int"))
+}
+
+/// baseobjspace.py:1811-1824 `ObjSpace.int_w(w_obj,
+/// allow_conversion=True)` composed with `baseobjspace.py:279-285
+/// W_Root.int_w`:
+///
+/// ```python
+/// # ObjSpace.int_w
+/// return w_obj.int_w(self, allow_conversion)
+/// # W_Root.int_w
+/// w_obj = self
+/// if allow_conversion:
+///     w_obj = space.int(self)
+/// return w_obj._int_w(space)
+/// ```
+///
+/// Fast paths for `W_IntObject` / `W_LongObject` match
+/// `intobject.py:558` / `longobject.py` `_int_w`. For non-int/long
+/// objects, delegate to `space_int` (the `space.int(self)` protocol)
+/// and then re-apply `_int_w`. `allow_conversion=True` is implicit —
+/// the `unwrap_spec` call sites that pyre supports all opt in.
+///
+/// Floats are explicitly rejected by `floatobject.py:177`.
+pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    if obj.is_null() {
+        return Err(PyError::type_error("int_w: null object"));
+    }
+    // floatobject.py:177 `int_w` — floats are explicitly rejected.
+    if unsafe { pyre_object::pyobject::is_float(obj) } {
+        return Err(PyError::type_error(
+            "an integer is required (got type float)",
+        ));
+    }
+    // intobject.py:558 `W_IntObject._int_w` — self.intval. Fast path.
+    if unsafe { pyre_object::pyobject::is_int(obj) } {
+        return Ok(unsafe { pyre_object::intobject::w_int_get_value(obj) });
+    }
+    // longobject.py:157 `W_LongObject._int_w` — self.num.toint(), raises
+    // OverflowError if the bigint does not fit in a machine word. Fast path.
+    if unsafe { pyre_object::pyobject::is_long(obj) } {
+        let big = unsafe { pyre_object::longobject::w_long_get_value(obj) };
+        return i64::try_from(big)
+            .map_err(|_| PyError::overflow_error("int too large to convert to int"));
+    }
+    // baseobjspace.py:284 `w_obj = space.int(self)` — __int__ or __index__.
+    let w_obj = space_int(obj)?;
+    // baseobjspace.py:285 `return w_obj._int_w(space)` — re-apply the
+    // typed unwrap on the (int/long) result space.int returned.
+    if unsafe { pyre_object::pyobject::is_int(w_obj) } {
+        return Ok(unsafe { pyre_object::intobject::w_int_get_value(w_obj) });
+    }
+    if unsafe { pyre_object::pyobject::is_long(w_obj) } {
+        let big = unsafe { pyre_object::longobject::w_long_get_value(w_obj) };
+        return i64::try_from(big)
+            .map_err(|_| PyError::overflow_error("int too large to convert to int"));
+    }
+    // Unreachable: space_int returns W_AbstractIntObject or errors.
+    Err(PyError::type_error("__int__ returned non-int"))
+}
+
+/// pypy/interpreter/baseobjspace.py:1957 `gateway_int_w = int_w`.
+/// The gateway entry point used by `@unwrap_spec` coercion.
+#[inline]
+pub fn gateway_int_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    int_w(obj)
+}
+
+/// pypy/interpreter/baseobjspace.py:1976-1982 `c_int_w(w_obj)`.
+///
+/// ```python
+/// def c_int_w(self, w_obj):
+///     value = self.gateway_int_w(w_obj)
+///     if value < INT_MIN or value > INT_MAX:
+///         raise oefmt(self.w_OverflowError, "expected a 32-bit integer")
+///     return value
+/// ```
+///
+/// Used by `@unwrap_spec(name="c_int")` (gateway.py). The only caller
+/// today is `sys.setrecursionlimit` (pypy/module/sys/vm.py:63), whose
+/// argument is typed as `c_int`; values outside the 32-bit signed
+/// range surface as `OverflowError` rather than a silent clamp.
+pub fn c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
+    let value = gateway_int_w(obj)?;
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+        return Err(PyError::overflow_error("expected a 32-bit integer"));
+    }
+    Ok(value as i32)
+}
+
 /// Look up a descriptor on an object's type.
 ///
 /// PyPy equivalent: `space.lookup(w_obj, name)`.

@@ -12,6 +12,7 @@ use crate::jit::trace::trace_bytecode;
 use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{PyResult, StepResult, execute_opcode_step};
+use pyre_object::pyobject::is_int;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 
@@ -54,7 +55,7 @@ pub(crate) fn take_last_guard_frames() -> Option<Vec<crate::call_jit::ResumedFra
 }
 
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
-enum LoopResult {
+pub(crate) enum LoopResult {
     Done(PyResult),
     ContinueRunningNormally,
 }
@@ -287,11 +288,14 @@ thread_local! {
         // portal_runner is called when ContinueRunningNormally is raised
         // at a recursive portal level during blackhole execution.
         d.register_portal_runner(pyre_portal_runner);
-        // PyPy interp_jit.py:75 — JitDriver(is_recursive=True)
+        // pypy/module/pypyjit/interp_jit.py:72-78 PyPyJitDriver(..., is_recursive=True).
+        // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
+        // — without this flag the recursive-portal bookkeeping stays
+        // disabled while is_main_jitcode() callers still assume it was
+        // set, leaving the metadata internally inconsistent.
         d.set_is_recursive(true);
-        // warmstate.py:259 trace_eagerness=200 (RPython default).
-        // warmspot.py:449 — portal result_type = getkind(portal.getreturnvar()).
-        // PyPy portal returns W_Root (REF). pyre portal returns PyObjectRef (REF).
+        // warmspot.py:449 — jd.result_type = getkind(portal.getreturnvar().concretetype)[0]
+        // PyPy dispatch() returns W_Root → Ref.
         d.set_result_type(majit_ir::Type::Ref);
         (d, info)
     });
@@ -866,9 +870,7 @@ fn split_kwargs(
 pub fn releaseall(_space: pyre_object::PyObjectRef) {
     let _ = _space;
     let (driver, _) = driver_pair();
-    // Mark compiled loops for release without clearing warm-state.
-    // Matches RPython's release_all_loops() semantics: the loops are
-    // freed at the next collection, not immediately invalidated.
+    // memmgr.py:85 release_all_loops parity.
     driver.mark_all_loops_for_release();
 }
 
@@ -922,7 +924,7 @@ fn init_callbacks() {
 /// Read the call depth from pyre-interpreter's CALL_DEPTH TLS.
 /// Replaces the separate JIT_CALL_DEPTH — single source of truth.
 #[inline(always)]
-fn call_depth() -> u32 {
+pub(crate) fn call_depth() -> u32 {
     pyre_interpreter::call::call_depth()
 }
 
@@ -960,25 +962,14 @@ fn register_quasi_immutable_deps(green_key: u64) {
     }
 }
 
-/// rstack.py:75-90 stack_almost_full():
-///   current = llop.stack_current(Signed)
-///   length = 15 * (r_uint(_stack_get_length()) >> 4)
-///   ofs = r_uint(end - current)
-///   return ofs > length
-///
-/// "True if more than 15/16th full." Uses stacker::remaining_stack()
-/// which reads the actual stack pointer — direct structural parity
-/// with RPython's llop.stack_current.
+/// rpython/rlib/rstack.py:75-90 `stack_almost_full` parity — delegates
+/// to [`pyre_interpreter::stack_check::stack_almost_full`], which reads
+/// the shared [`PYRE_STACKTOOBIG`](pyre_interpreter::stack_check::
+/// PYRE_STACKTOOBIG) budget maintained by `sys.setrecursionlimit`. Kept
+/// as a thin wrapper so existing call sites in this module stay short.
 #[inline]
 fn stack_almost_full() -> bool {
-    // rstack.py:82: length = 15 * (stack_length >> 4) = 15/16 * stack_length
-    // When remaining < 1/16 of the stack, we're "almost full".
-    // stacker::remaining_stack() returns None if the stack limit is unknown;
-    // treat that as "not full" (same as RPython's untranslated fallback).
-    match stacker::remaining_stack() {
-        Some(remaining) => remaining < 512 * 1024, // 512KB ≈ 1/16 of 8MB
-        None => false,
-    }
+    pyre_interpreter::stack_check::stack_almost_full()
 }
 
 /// Evaluate a Python frame with JIT compilation.
@@ -1026,19 +1017,6 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    if let Some(result) = try_function_entry_jit(frame) {
-        return result;
-    }
-    handle_jitexception(frame)
-}
-
-/// RPython warmspot.py:941 portal_runner for force callbacks.
-///
-/// Unlike eval_with_jit, this does NOT register callbacks (already done)
-/// and is safe to call from force helpers during compiled code execution.
-/// RPython: bhimpl_recursive_call → portal_runner → CAN enter JIT.
-pub(crate) fn portal_runner_for_force(frame: &mut PyFrame) -> PyResult {
-    frame.fix_array_ptrs();
     if let Some(result) = try_function_entry_jit(frame) {
         return result;
     }
@@ -1097,19 +1075,21 @@ pub(crate) fn pyre_portal_runner(
 /// warmspot.py:961-1007 handle_jitexception.
 ///
 /// RPython: CRN → portal_ptr(*args) re-invokes the interpreter.
-/// pyre: CRN → re-loop eval_loop_jit(frame). frame.next_instr is
-/// already set from green_int[0] at the CRN source (eval.rs:1631),
-/// and frame locals are already written by the blackhole's
-/// bhimpl_vable_setarrayitem_ref (shadow write). Red args need not
-/// be re-extracted — bh_portal_runner also only extracts next_instr.
-/// portal_runner_for_force was tried and regressed nested_loop
-/// (try_function_entry_jit causes incorrect inner-loop recompilation).
+/// pyre: CRN → re-loop eval_loop_jit(frame). This does NOT call
+/// maybe_compile_and_run (warmspot.py:948); portal_ptr is a plain
+/// interpreter dispatch, and pyre's eval_loop_jit is the equivalent.
+/// TODO: exact portal_ptr(*args) parity (currently `continue`
+/// re-enters without re-extracting CRN args from the exception).
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     loop {
         match eval_loop_jit(frame) {
             LoopResult::Done(result) => return result,
             LoopResult::ContinueRunningNormally => {
+                // RPython warmspot.py:976-978: result = portal_ptr(*args).
+                // The blackhole has already written back the merge point
+                // state to the frame (call_jit.rs:999-1013). Re-enter
+                // eval_loop_jit with that state — do NOT reset to entry.
                 frame.fix_array_ptrs();
                 continue;
             }
@@ -1136,16 +1116,27 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 ///   maybe_compile_and_run(state.increment_function_threshold, *args)
 ///   return portal_ptr(*args)
 ///
-/// Delegates to portal_runner_for_force (which calls
-/// try_function_entry_jit = maybe_compile_and_run, then
-/// handle_jitexception = portal_ptr).
-///
 /// warmspot.py:997-1005: ExitFrameWithExceptionRef → re-raise.
 pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
-    match portal_runner_for_force(frame) {
-        Ok(result) => result,
+    // warmspot.py:941-955 ll_portal_runner:
+    //   maybe_compile_and_run(state.increment_function_threshold, *args)
+    //   return portal_ptr(*args)
+    //
+    // portal_ptr is the JIT-aware interpreter (jit_merge_point +
+    // can_enter_jit). pyre's equivalent is handle_jitexception →
+    // eval_loop_jit, NOT eval_frame_plain. Routing through
+    // eval_frame_plain here would skip maybe_enter_jit at every
+    // opcode of the recursive portal frame, which breaks parity for
+    // bhimpl_recursive_call_* paths.
+    frame.fix_array_ptrs();
+    let result = if let Some(result) = try_function_entry_jit(frame) {
+        result
+    } else {
+        handle_jitexception(frame)
+    };
+    match result {
+        Ok(r) => r,
         Err(err) => {
-            // warmspot.py:998-1005: ExitFrameWithExceptionRef → re-raise.
             #[cfg(feature = "cranelift")]
             majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
             #[cfg(not(feature = "cranelift"))]
@@ -1309,6 +1300,57 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     }
 }
 
+/// pyjitpl.py:2837-2845 _interpret() parity for bridge tracing.
+///
+/// RPython's bridge tracing uses the same MetaInterp._interpret() loop
+/// as normal tracing. This function provides the same eval loop as
+/// eval_loop_jit, but always calls jit_merge_point_hook since tracing
+/// is already active from start_bridge_tracing.
+pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let env = PyreEnv;
+    let (driver, info) = driver_pair();
+
+    loop {
+        if frame.next_instr() >= code.instructions.len() {
+            return LoopResult::Done(Ok(w_none()));
+        }
+
+        let pc = frame.next_instr();
+        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            return LoopResult::Done(Ok(w_none()));
+        };
+
+        // pyjitpl.py:1892-1914 run_one_step: trace + execute.
+        if driver.is_tracing() {
+            if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
+                return loop_result;
+            }
+        } else {
+            // Tracing ended (bridge compiled or aborted).
+            return LoopResult::Done(Ok(w_none()));
+        }
+
+        // handle_bytecode: execute the bytecode on the concrete frame.
+        let next_instr = frame.next_instr() + 1;
+        frame.set_last_instr_from_next_instr(next_instr);
+        match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
+            Ok(StepResult::Continue) => {}
+            Ok(StepResult::CloseLoop { .. }) => {}
+            Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
+            Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
+            Err(err) => {
+                let mut next_instr = frame.next_instr();
+                if pyre_interpreter::eval::handle_exception(frame, &err, &mut next_instr) {
+                    frame.set_last_instr_from_next_instr(next_instr);
+                    continue;
+                }
+                return LoopResult::Done(Err(err));
+            }
+        }
+    }
+}
+
 /// RPython jit_merge_point slow path — only called when tracing is active.
 #[cold]
 #[inline(never)]
@@ -1434,7 +1476,10 @@ fn maybe_compile_and_run(
         .counter
         .tick(green_key)
     {
-        if driver.meta_interp().is_tracing_key(green_key) {
+        if driver
+            .meta_interp()
+            .is_tracing_key((frame.pycode as usize, loop_header_pc))
+        {
             return None;
         }
         return bound_reached(frame, green_key, loop_header_pc, driver, info, env);
@@ -1625,6 +1670,21 @@ fn execute_assembler(
         || {},
     );
 
+    // rstack.stack_check_slowpath → _StackOverflow parity: drain the
+    // JIT-overflow flag the backend probe records when it trips. The
+    // backend detects the overflow inside compiled code and exits via
+    // the dedicated stack-overflow block; we surface the user-visible
+    // RecursionError here on the way back to the interpreter loop.
+    if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        return Some(LoopResult::Done(Err(exc)));
+    }
+
+    // warmspot.py:998 ExitFrameWithExceptionRef: check for exceptions
+    // stashed by blackhole/force callbacks across FFI boundaries.
+    if let Some(exc) = crate::call_jit::take_ca_exception() {
+        return Some(LoopResult::Done(Err(exc)));
+    }
+
     if majit_metainterp::majit_log_enabled() {
         let kind = match &outcome {
             DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -1649,8 +1709,8 @@ fn execute_assembler(
             let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
-                    green_key, raw_int_result, typed_values
+                    "[jit][handle-outcome] finished key={} typed_values={:?}",
+                    green_key, typed_values
                 );
             }
             let [value] = typed_values.as_slice() else {
@@ -1662,10 +1722,17 @@ fn execute_assembler(
             };
             let result = match value {
                 majit_ir::Value::Int(raw) => {
-                    let _ = raw_int_result;
+                    // compile.py:631 DoneWithThisFrameDescrInt parity —
+                    // unused in pyre (result_type=Ref), but handle
+                    // gracefully just in case.
                     pyre_object::intobject::w_int_new(*raw)
                 }
-                majit_ir::Value::Ref(value) => value.as_usize() as pyre_object::PyObjectRef,
+                majit_ir::Value::Ref(value) => {
+                    // compile.py:640 DoneWithThisFrameDescrRef parity:
+                    // return get_result() as-is. jitframe GC trace hook
+                    // (jitframe.rs:293) keeps interior refs alive.
+                    value.as_usize() as pyre_object::PyObjectRef
+                }
                 majit_ir::Value::Float(f) => pyre_object::floatobject::w_float_new(*f),
                 majit_ir::Value::Void => {
                     return Some(LoopResult::Done(Err(
@@ -1719,11 +1786,29 @@ fn execute_assembler(
                             }
                             Some(LoopResult::ContinueRunningNormally)
                         }
+                        crate::call_jit::BlackholeResult::DoneWithThisFrameRef(v) => {
+                            Some(LoopResult::Done(Ok(*v)))
+                        }
+                        crate::call_jit::BlackholeResult::DoneWithThisFrameInt(v) => {
+                            // warmspot.py:988-990: box Int to Ref for portal result_type=Ref
+                            Some(LoopResult::Done(Ok(
+                                pyre_object::intobject::w_int_new(*v) as pyre_object::PyObjectRef
+                            )))
+                        }
+                        crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(exc) => {
+                            // warmspot.py:998-1005 ExitFrameWithExceptionRef:
+                            // propagate the Python exception, don't swallow it.
+                            Some(LoopResult::Done(Err(exc.clone())))
+                        }
                         crate::call_jit::BlackholeResult::Failed => {
+                            // RPython: blackhole resume never fails — rd_numb
+                            // is always complete. Hitting this path means
+                            // resume data generation has a bug. Invalidate
+                            // the loop and fall back to the interpreter.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit][BUG] blackhole failed key={} — invalidating",
-                                    green_key,
+                                    "[jit][BUG] blackhole failed key={} trace={} guard={} — invalidating",
+                                    green_key, trace_id, fail_index,
                                 );
                             }
                             driver.invalidate_loop(green_key);
@@ -1787,7 +1872,10 @@ fn bound_reached(
     frame.set_last_instr_from_next_instr(loop_header_pc);
     let mut jit_state = build_jit_state(frame, info);
     // warmstate.py:473-477 JC_TRACING
-    if driver.meta_interp().is_tracing_key(green_key) {
+    if driver
+        .meta_interp()
+        .is_tracing_key((frame.pycode as usize, loop_header_pc))
+    {
         return None;
     }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
@@ -1881,6 +1969,14 @@ fn bound_reached(
         None
     };
     if let Some(outcome) = outcome {
+        // rstack.stack_check_slowpath → _StackOverflow parity: drain
+        // the JIT-overflow flag the backend probe records when it
+        // trips. The backend's prologue exits via the dedicated
+        // stack-overflow block; we surface RecursionError here on the
+        // way back to the interpreter loop.
+        if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+            return Some(LoopResult::Done(Err(exc)));
+        }
         // compile.py:701-717 handle_fail: bridge/blackhole decision.
         if let DetailedDriverRunOutcome::GuardFailure {
             fail_index,
@@ -1991,7 +2087,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
 
     // RPython warmstate.py:473-477: per-cell JC_TRACING.
-    if driver.meta_interp().is_tracing_key(green_key) {
+    if driver
+        .meta_interp()
+        .is_tracing_key((frame.pycode as usize, frame.next_instr()))
+    {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
@@ -2016,6 +2115,17 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             &env,
             || {},
         );
+        // rstack.stack_check_slowpath → _StackOverflow parity: drain
+        // the JIT-overflow flag the backend probe records when it
+        // trips during compiled execution at function entry.
+        if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+            return Some(Err(exc));
+        }
+        // warmspot.py:998 ExitFrameWithExceptionRef: check for exceptions
+        // stashed by blackhole/force callbacks across FFI boundaries.
+        if let Some(exc) = crate::call_jit::take_ca_exception() {
+            return Some(Err(exc));
+        }
         if majit_metainterp::majit_log_enabled() {
             let kind = match &outcome {
                 DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -2110,44 +2220,38 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
 
-    // RPython warmstate.py:446 maybe_compile_and_run: standard counter
-    // threshold for ALL functions. No self-recursive boosting.
-    let should_trace = driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .should_trace_function_entry(green_key);
-    let count = driver
-        .meta_interp()
-        .warm_state_ref()
-        .function_entry_count(green_key);
-    let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
-    let boosted = driver.is_function_boosted(green_key);
+    // warmstate.py:467 jitcounter.tick(hash, increment_threshold). The
+    // fast path above already fired the counter for this entry, so go
+    // straight to bound_reached without re-ticking.
     if majit_metainterp::majit_log_enabled() {
+        let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
         eprintln!(
-            "[jit][func-entry] count key={} arg0={:?} count={} boosted={} threshold={}",
+            "[jit][func-entry] fired key={} arg0={:?} threshold={}",
             green_key,
             debug_first_arg_int(frame),
-            count,
-            boosted,
-            function_threshold
+            function_threshold,
         );
     }
-    if !should_trace {
+    // warmstate.py:425-444 bound_reached parity:
+    //   if not confirm_enter_jit(*args): return
+    //   jitcounter.decay_all_counters()
+    //   if rstack.stack_almost_full(): return
+    //   metainterp.compile_and_run_once(jitdriver_sd, *args)
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .counter
+        .decay_all_counters();
+    if stack_almost_full() {
         return None;
     }
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .reset_function_entry_count(green_key);
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][func-entry] start tracing key={} arg0={:?} count={} boosted={}",
+            "[jit][func-entry] start tracing key={} arg0={:?}",
             green_key,
             debug_first_arg_int(frame),
-            count,
-            boosted
         );
     }
     driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
@@ -2176,8 +2280,8 @@ fn handle_jit_outcome(
             let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][handle-outcome] finished key={} raw_flag={} typed_values={:?}",
-                    green_key, raw_int_result, typed_values
+                    "[jit][handle-outcome] finished typed_values={:?}",
+                    typed_values
                 );
             }
             let [value] = typed_values.as_slice() else {
@@ -2187,20 +2291,16 @@ fn handle_jit_outcome(
             };
             let value = match value {
                 majit_ir::Value::Int(raw) => {
-                    // RPython parity: top-level finish values are already typed
-                    // (MIFrame.make_result_of_lastop / finishframe).  An INT
-                    // result register represents a Python int payload, not an
-                    // object pointer.  Re-box at the interpreter boundary
-                    // regardless of whether majit marked the trace as a
-                    // raw-int-finish optimization.
-                    let _ = raw_int_result;
+                    // compile.py:631 DoneWithThisFrameDescrInt parity —
+                    // unused in pyre (result_type=Ref), but handle
+                    // gracefully just in case.
                     pyre_object::intobject::w_int_new(*raw)
                 }
-                majit_ir::Value::Ref(value) => value.as_usize() as pyre_object::PyObjectRef,
-                majit_ir::Value::Float(f) => {
-                    // Re-box the raw float into a W_FloatObject.
-                    pyre_object::floatobject::w_float_new(*f)
+                majit_ir::Value::Ref(value) => {
+                    // compile.py:640 DoneWithThisFrameDescrRef parity.
+                    value.as_usize() as pyre_object::PyObjectRef
                 }
+                majit_ir::Value::Float(f) => pyre_object::floatobject::w_float_new(*f),
                 majit_ir::Value::Void => {
                     return JitAction::Return(Err(pyre_interpreter::PyError::type_error(
                         "compiled finish produced a void return value",
@@ -4005,7 +4105,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                 // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
                 let size = element_fields.len();
                 // item_size from arraydescr (RPython: self.arraydescr)
-                let is = arraydescr
+                let item_size = arraydescr
                     .as_ref()
                     .and_then(|d| d.as_array_descr())
                     .map(|ad| ad.item_size())
@@ -4016,7 +4116,7 @@ fn rebuild_state_after_failure_from_recovery_layout(
                             .map(|ifd| ifd.array_descr().item_size())
                             .unwrap_or(fielddescrs.len() * 8)
                     });
-                let array = pyre_object::allocate_array_struct(size, is);
+                let array = pyre_object::allocate_array_struct(size, item_size);
                 for (i, ef) in element_fields.iter().enumerate() {
                     for &(field_idx, ref src) in ef.iter() {
                         if let Some(val) = resolve_value(src, &materialized) {
@@ -4024,7 +4124,9 @@ fn rebuild_state_after_failure_from_recovery_layout(
                             // field_idx is the canonical position in fielddescrs
                             if let Some(fd) = fielddescrs.get(field_idx as usize) {
                                 let (fo, fs, ft) = extract_interior_field_info(fd);
-                                pyre_object::setinteriorfield(array, i, fo, fs, is, ft, val as i64);
+                                pyre_object::setinteriorfield(
+                                    array, i, fo, fs, item_size, ft, val as i64,
+                                );
                             }
                         }
                     }
@@ -4248,11 +4350,13 @@ pub(crate) struct PyreBlackholeAllocator;
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
         // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
-        let descr_size = typedescr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
-        let type_id = typedescr.index();
+        // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
+        let sd = typedescr
+            .as_size_descr()
+            .expect("allocate_struct: not a SizeDescr");
         let bh_descr = majit_translate::jitcode::BhDescr::Size {
-            size: descr_size,
-            type_id: type_id as u32,
+            size: sd.size(),
+            type_id: sd.type_id(),
             vtable: 0,
         };
         let (driver, _) = driver_pair();
@@ -4260,11 +4364,15 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     }
 
     fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
-        // resume.py:1437-1439 allocate_with_vtable(known_class, descr) →
+        // resume.py:1437-1439 allocate_with_vtable →
         //   exec_new_with_vtable(self.cpu, descr)
+        // llmodel.py:778-782 bh_new_with_vtable: allocate AND set vtable.
         use pyre_jit_trace::descr::{W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID};
-        let descr_index = descr.index() as u32;
-        let descr_size = descr.as_size_descr().map(|sd| sd.size()).unwrap_or(0);
+        let sd = descr
+            .as_size_descr()
+            .expect("allocate_with_vtable: not a SizeDescr");
+        let descr_index = sd.type_id();
+        let descr_size = sd.size();
         match descr_index {
             W_INT_GC_TYPE_ID => {
                 let obj = Box::new(pyre_object::intobject::W_IntObject {

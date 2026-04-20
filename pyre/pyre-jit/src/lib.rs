@@ -36,6 +36,69 @@ pub use pyre_jit_trace::{
 mod tests {
     use super::*;
 
+    /// rpython/rlib/rstack.py:42 stack_check / assembler.py:1080
+    /// _call_header_with_stack_check parity contract: backend slowpath
+    /// wrappers MUST construct a fresh `RecursionError` and place it
+    /// into `JIT_PENDING_EXCEPTION`; the JIT glue drains that slot at
+    /// every backend boundary and raises the exception in the
+    /// interpreter — matches RPython
+    /// `stack_check_slowpath → _StackOverflow → pos_exception() →
+    /// propagate_exception_path`.
+    ///
+    /// The dynasm x86/aarch64 inline probes and cranelift prologue
+    /// call `pyre_stack_check_slowpath_for_backend` /
+    /// `pyre_stack_check_for_jit_prologue` directly. We exercise the
+    /// end-to-end wiring here so any future change that re-routes the
+    /// probe trips the test.
+    #[test]
+    fn stack_overflow_probe_raises_into_pending_exception_slot() {
+        use pyre_interpreter::stack_check;
+
+        // Install the same backend bridge call_jit::install_jit_call_bridge
+        // wires up at runtime, so the registered slowpath addresses
+        // really are the ones the cranelift / dynasm prologues invoke.
+        crate::call_jit::install_jit_call_bridge();
+
+        stack_check::reset_stack_base();
+        let _ = stack_check::drain_jit_pending_exception();
+
+        // Drive the backend-callable slowpath directly and verify it
+        // constructs the exception into the pending slot.
+        let sp = {
+            let probe: usize = 0;
+            &probe as *const usize as usize
+        };
+        let above = sp.saturating_add(2 * stack_check::MAX_STACK_SIZE);
+        // stack.c:40 baseptr is read from the TLS mirror, not the
+        // global cache; plant both so the slowpath sees a base far
+        // above the current SP and trips the real-overflow branch.
+        stack_check::plant_stack_end_for_tests(above);
+        assert_eq!(
+            stack_check::pyre_stack_check_slowpath_for_backend(sp),
+            1,
+            "backend slowpath must signal overflow"
+        );
+        assert!(
+            stack_check::is_jit_overflow_pending(),
+            "slowpath must raise into JIT_PENDING_EXCEPTION",
+        );
+        let err = stack_check::drain_jit_pending_exception()
+            .expect_err("pending exception must surface as RecursionError");
+        assert_eq!(err.kind, pyre_interpreter::PyErrorKind::RecursionError);
+        assert!(
+            !stack_check::is_jit_overflow_pending(),
+            "drain must clear the slot",
+        );
+
+        // Restore defaults so the rest of the test binary sees a sane
+        // budget. The synthetic high base above would make
+        // set_recursion_limit's internal stack_check trip, so reset
+        // the base first.
+        stack_check::reset_stack_base();
+        stack_check::set_recursion_limit(stack_check::DEFAULT_RECURSION_LIMIT)
+            .expect("default limit");
+    }
+
     #[test]
     fn test_trace_functions_exist() {
         // Verify auto-generated trace functions are callable

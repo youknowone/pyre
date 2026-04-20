@@ -317,25 +317,26 @@ impl PartialEq for ExitVirtualLayout {
             (
                 Self::ArrayStruct {
                     descr_index: a1,
-                    fielddescrs: a2,
-                    element_fields: a3,
-                    ..
+                    arraydescr: a_ad,
+                    fielddescrs: a_fds,
+                    element_fields: a2,
                 },
                 Self::ArrayStruct {
                     descr_index: b1,
-                    fielddescrs: b2,
-                    element_fields: b3,
-                    ..
+                    arraydescr: b_ad,
+                    fielddescrs: b_fds,
+                    element_fields: b2,
                 },
             ) => {
-                // virtualstate.py:298-304: arraydescr identity + per-fielddescr identity
+                // virtualstate.py:295-305: arraydescr identity + per-fielddescr identity
                 a1 == b1
-                    && a2.len() == b2.len()
-                    && a2
+                    && a_ad.as_ref().map(|d| d.index()) == b_ad.as_ref().map(|d| d.index())
+                    && a_fds.len() == b_fds.len()
+                    && a_fds
                         .iter()
-                        .zip(b2.iter())
+                        .zip(b_fds.iter())
                         .all(|(a, b)| a.index() == b.index())
-                    && a3 == b3
+                    && a2 == b2
             }
             (
                 Self::RawSlice {

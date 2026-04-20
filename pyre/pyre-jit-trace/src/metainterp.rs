@@ -20,7 +20,15 @@ pub struct MetaInterpFrame {
     pub owned_sym: Option<Box<PyreSym>>,
     pub jitcode: *const (),
     pub pc: usize,
-    pub greenkey: Option<u64>,
+    /// Raw `(code_ptr, target_pc)` greenkey components. Used for
+    /// element-wise recursion-depth comparison in
+    /// `step_root_frame` — see the filter at the
+    /// `max_unroll_recursion` check. This is `Option<(usize, usize)>`
+    /// rather than `Option<u64>` so the comparison cannot be fooled
+    /// by hash collisions, matching
+    /// rpython/jit/metainterp/pyjitpl.py:1396-1401 element-wise
+    /// `same_constant` iteration.
+    pub greenkey: Option<(usize, usize)>,
     pub concrete_frame: usize,
     /// Box for heap stability across Vec reallocs.
     pub owned_concrete_frame: Option<Box<pyre_interpreter::pyframe::PyFrame>>,
@@ -164,7 +172,12 @@ impl PyreMetaInterp {
         drop(fs);
 
         if let Some(pending) = pending {
-            // RPython perform_call: callee deferred via pending_inline_frame.
+            // pyjitpl.py:1415 `self.metainterp.perform_call(portal_code,
+            // allboxes)` — push callee frame onto framestack, trace
+            // into callee. The recursion-limit check lives at the
+            // decision site (trace_opcode.rs `_opimpl_recursive_call`
+            // parity block); over-limit callees never produce a
+            // pending here.
             let top = self.framestack.last_mut().unwrap();
             let sym = unsafe { &mut *top.sym };
             let next_pc = sym
@@ -354,7 +367,7 @@ impl PyreMetaInterp {
         caller_result_idx: Option<usize>,
     ) {
         let (driver, _) = crate::driver::driver_pair();
-        driver.enter_inline_frame(pending.green_key);
+        driver.enter_inline_frame(pending.green_key_raw);
         ctx.push_inline_trace_position(pending.green_key);
 
         let callee_code = pending.concrete_frame.pycode;
@@ -376,7 +389,7 @@ impl PyreMetaInterp {
             owned_sym: Some(owned_sym),
             jitcode: callee_code,
             pc: 0,
-            greenkey: Some(pending.green_key),
+            greenkey: Some(pending.green_key_raw),
             concrete_frame: cf_addr,
             owned_concrete_frame: Some(owned_cf),
             parent_frames: pending.parent_frames,
@@ -537,14 +550,22 @@ impl PyreMetaInterp {
 
     fn handle_close_loop(&self, ctx: &mut TraceCtx, action: &TraceAction, pc: usize) {
         let w_code = self.framestack[0].jitcode;
-        if let TraceAction::CloseLoopWithArgs {
-            loop_header_pc: Some(target_pc),
+        let target_pc = if let TraceAction::CloseLoopWithArgs {
+            loop_header_pc: Some(tp),
             ..
         } = action
         {
-            ctx.set_green_key(crate::driver::make_green_key(w_code, *target_pc));
+            Some(*tp)
         } else if matches!(action, TraceAction::CloseLoop) {
-            ctx.set_green_key(crate::driver::make_green_key(w_code, pc));
+            Some(pc)
+        } else {
+            None
+        };
+        if let Some(tp) = target_pc {
+            ctx.set_green_key(
+                crate::driver::make_green_key(w_code, tp),
+                (w_code as usize, tp),
+            );
         }
     }
 

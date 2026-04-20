@@ -549,6 +549,17 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_rd_virtuals(green_key, trace_id, fail_index)
     }
 
+    /// resume.py:926 _prepare parity: get rd_pendingfields for a guard.
+    pub fn get_rd_pendingfields(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<majit_ir::GuardPendingFieldEntry>> {
+        self.meta
+            .get_rd_pendingfields(green_key, trace_id, fail_index)
+    }
+
     /// compile.py:710 recovery_layout header_pc parity: get the merge point
     /// PC for blackhole resume from a guard exit.
     pub fn get_merge_point_pc(
@@ -610,10 +621,12 @@ impl<S: JitState> JitDriver<S> {
         self.meta.is_tracing()
     }
 
-    /// RPython JC_TRACING parity: true only when tracing this specific key.
+    /// RPython JC_TRACING parity: true only when tracing this specific
+    /// key. `target_raw` is the structured `(code_ptr, pc)` greenkey
+    /// matching pyjitpl.py:1396-1401's element-wise comparison.
     #[inline]
-    pub fn is_tracing_key(&self, green_key: u64) -> bool {
-        self.meta.is_tracing_key(green_key)
+    pub fn is_tracing_key(&self, target_raw: (usize, usize)) -> bool {
+        self.meta.is_tracing_key(target_raw)
     }
 
     /// Whether the driver is currently tracing a bridge.
@@ -794,7 +807,6 @@ impl<S: JitState> JitDriver<S> {
             TraceAction::Continue => {}
             TraceAction::CompileTrace => {
                 self.meta.abort_trace(false);
-                self.meta.warm_state.reset_function_counts();
                 self.sym = None;
                 self.meta.clear_trace_session();
                 self.compile_trace_success = true;
@@ -1056,7 +1068,6 @@ impl<S: JitState> JitDriver<S> {
                         .warm_state
                         .attach_procedure_to_interp(green_key, install_token);
                 }
-                self.meta.warm_state.reset_function_counts();
                 // Blackhole transition: clear all driver tracing state.
                 self.sym = None;
                 self.meta.clear_trace_session();
@@ -1232,7 +1243,6 @@ impl<S: JitState> JitDriver<S> {
             self.merge_point(trace_fn);
             if self.take_compile_trace_success() {
                 self.meta.abort_trace(false);
-                self.meta.warm_state.reset_function_counts();
                 self.sym = None;
                 self.meta.clear_trace_session();
                 return Some(DetailedDriverRunOutcome::Jump {
@@ -1547,10 +1557,12 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        match self
-            .meta
-            .force_start_tracing(green_key, descriptor, &live_values)
-        {
+        match self.meta.force_start_tracing(
+            green_key,
+            (state.code_ptr(), target_pc),
+            descriptor,
+            &live_values,
+        ) {
             BackEdgeAction::StartedTracing => {
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
@@ -1585,10 +1597,13 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        match self
-            .meta
-            .bound_reached(green_key, None, descriptor, &live_values)
-        {
+        match self.meta.bound_reached(
+            green_key,
+            (state.code_ptr(), target_pc),
+            None,
+            descriptor,
+            &live_values,
+        ) {
             BackEdgeAction::StartedTracing => {
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
@@ -1622,6 +1637,7 @@ impl<S: JitState> JitDriver<S> {
 
         match self.meta.on_back_edge_typed(
             green_key,
+            (state.code_ptr(), target_pc),
             structured_green_key,
             descriptor,
             &live_values,
@@ -1909,20 +1925,6 @@ impl<S: JitState> JitDriver<S> {
     /// Get mutable access to the underlying MetaInterp.
     pub fn meta_interp_mut(&mut self) -> &mut MetaInterp<S::Meta> {
         &mut self.meta
-    }
-
-    /// Check if a function was boosted for fast tracing.
-    pub fn is_function_boosted(&self, callee_key: u64) -> bool {
-        self.meta.warm_state_ref().is_boosted(callee_key)
-    }
-
-    /// Boost a function entry so the next eval-time entry can start tracing.
-    ///
-    /// This mirrors PyPy's warmstate path used when recursive inlining hits
-    /// the depth limit and we want the callee to converge to its own
-    /// function-entry trace quickly.
-    pub fn boost_function_entry(&mut self, callee_key: u64) {
-        self.meta.warm_state_mut().boost_function_entry(callee_key);
     }
 
     pub fn run_compiled_with_blackhole_fallback_keyed(
@@ -2510,25 +2512,27 @@ impl<S: JitState> JitDriver<S> {
     /// Returns `Inline` if the callee should be traced through,
     /// `CallAssembler` if it already has compiled code, or
     /// `ResidualCall` if it should be left as an opaque call.
-    pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
-        self.meta.should_inline(callee_key)
+    pub fn should_inline(&mut self, callee_key: u64, callee_raw: (usize, usize)) -> InlineDecision {
+        self.meta.should_inline(callee_key, callee_raw)
     }
 
     /// Inline decision with externally-held ctx (merge_point callback).
     pub fn should_inline_with_ctx(
         &mut self,
         callee_key: u64,
+        callee_raw: (usize, usize),
         ctx: &crate::trace_ctx::TraceCtx,
     ) -> InlineDecision {
-        self.meta.should_inline_with_ctx(callee_key, ctx)
+        self.meta
+            .should_inline_with_ctx(callee_key, callee_raw, ctx)
     }
 
     /// Begin inlining a function call during tracing.
     ///
     /// Records EnterPortalFrame and pushes an inline frame.
     /// Returns `true` if inlining started successfully.
-    pub fn enter_inline_frame(&mut self, callee_key: u64) -> bool {
-        self.meta.enter_inline_frame(callee_key)
+    pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
+        self.meta.enter_inline_frame(callee_raw)
     }
 
     /// End an inlined function call during tracing.
@@ -3401,13 +3405,13 @@ mod tests {
         assert!(matches!(
             driver
                 .meta
-                .on_back_edge_typed(key, None, None, &typed_live_values),
+                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
             BackEdgeAction::Interpret
         ));
         assert!(matches!(
             driver
                 .meta
-                .on_back_edge_typed(key, None, None, &typed_live_values),
+                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
             BackEdgeAction::StartedTracing
         ));
 
@@ -3457,13 +3461,13 @@ mod tests {
         assert!(matches!(
             driver
                 .meta
-                .on_back_edge_typed(key, None, None, &typed_live_values),
+                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
             BackEdgeAction::Interpret
         ));
         assert!(matches!(
             driver
                 .meta
-                .on_back_edge_typed(key, None, None, &typed_live_values),
+                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
             BackEdgeAction::StartedTracing
         ));
 

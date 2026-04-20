@@ -883,6 +883,26 @@ impl Assembler386 {
     /// Emit the function prologue.
     /// x64: System V AMD64 ABI — first arg (jf_ptr) in RDI.
     /// aarch64: AAPCS64 — first arg (jf_ptr) in X0.
+    ///
+    /// assembler.py:1080-1091 `_call_header_with_stack_check`: inline
+    /// SP probe at the very top of every JIT loop so deep compiled-to-
+    /// compiled CALL_ASSEMBLER recursion surfaces a controlled
+    /// RecursionError. On overflow, the body is skipped and the
+    /// caller-provided jf_ptr is returned in RAX so the JIT glue
+    /// drains the overflow flag on the way back to the interpreter.
+    ///
+    /// Inline probe (assembler.py:1085-1091 parity):
+    /// ```text
+    ///   MOV  rax, [endaddr]        ; rpy_stacktoobig.stack_end
+    ///   SUB  rax, rsp              ; ofs = end - current_sp
+    ///   CMP  rax, [lengthaddr]     ; vs rpy_stacktoobig.stack_length
+    ///   JBE  continue              ; fast path: ofs <= length
+    ///   MOV  rdi, rsp              ; arg0 = current sp
+    ///   CALL pyre_stack_too_big_slowpath
+    ///   TEST al, al
+    ///   JZ   continue              ; slowpath: 0 = OK
+    ///   ; fallthrough = real overflow → return rbp as jf_ptr
+    /// ```
     fn _call_header(&mut self, inputargs: &[InputArg]) {
         dynasm!(self.mc
             ; .arch x64
@@ -890,6 +910,34 @@ impl Assembler386 {
             ; push r12               // save r12 (used by genop_call_assembler)
             ; mov rbp, rdi
         );
+        if let Some(addrs) = crate::stack_check_addresses() {
+            let continue_label = self.mc.new_dynamic_label();
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc
+                ; .arch x64
+                // Fast path: load end, subtract SP, compare with length.
+                ; mov Rq(scratch), QWORD addrs.end_adr as i64
+                ; mov rax, [Rq(scratch)]
+                ; sub rax, rsp
+                ; mov Rq(scratch), QWORD addrs.length_adr as i64
+                ; cmp rax, [Rq(scratch)]
+                ; jbe =>continue_label
+                // Slow path: call pyre_stack_too_big_slowpath(rsp).
+                ; mov rdi, rsp
+                ; mov Rq(scratch), QWORD addrs.slowpath_addr as i64
+                ; call Rq(scratch)
+                ; test al, al
+                ; jz =>continue_label
+                // Overflow fallthrough: return rbp as jf_ptr.
+                ; mov rax, rbp
+                ; pop r12
+                ; pop rbp
+                ; ret
+                ; =>continue_label
+            );
+        }
+        // When addresses are not registered (tests / early startup), no
+        // stack check is emitted — assembler.py:1082-1083 parity.
         self.setup_input_state(inputargs);
     }
 

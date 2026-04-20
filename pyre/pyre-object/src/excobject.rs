@@ -33,18 +33,19 @@ pub enum ExcKind {
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
     ReferenceError = 16,
     GeneratorExit = 17,
+    RecursionError = 18,
     /// Base class for all operating-system errors
     /// (formerly IOError / WindowsError / EnvironmentError in Python 2).
     /// pypy/module/exceptions/interp_exceptions.py W_OSError.
-    OSError = 18,
+    OSError = 19,
     /// Subclass of OSError raised when a file or directory is not found.
-    FileNotFoundError = 19,
+    FileNotFoundError = 20,
     /// Subclass of ValueError raised by codecs on invalid input.
-    UnicodeDecodeError = 20,
+    UnicodeDecodeError = 21,
     /// Subclass of ValueError raised by codecs on invalid input.
-    UnicodeEncodeError = 21,
+    UnicodeEncodeError = 22,
     /// Raised by sys.exit(). Subclass of BaseException, not Exception.
-    SystemExit = 22,
+    SystemExit = 23,
 }
 
 /// Layout: `[ob_type: *const PyType | kind: ExcKind | message: *mut String]`
@@ -120,6 +121,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::AssertionError => "AssertionError",
         ExcKind::ReferenceError => "ReferenceError",
         ExcKind::GeneratorExit => "GeneratorExit",
+        ExcKind::RecursionError => "RecursionError",
         ExcKind::OSError => "OSError",
         ExcKind::FileNotFoundError => "FileNotFoundError",
         ExcKind::UnicodeDecodeError => "UnicodeDecodeError",
@@ -146,6 +148,9 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
             kind,
             ExcKind::ArithmeticError | ExcKind::ZeroDivisionError | ExcKind::OverflowError
         );
+    }
+    if type_name == "RuntimeError" {
+        return matches!(kind, ExcKind::RuntimeError | ExcKind::RecursionError);
     }
     // OSError hierarchy — FileNotFoundError is-a OSError is-a Exception.
     // IOError / EnvironmentError are aliases for OSError in Python 3.
@@ -183,6 +188,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "AssertionError" => Some(ExcKind::AssertionError),
         "ReferenceError" => Some(ExcKind::ReferenceError),
         "GeneratorExit" => Some(ExcKind::GeneratorExit),
+        "RecursionError" => Some(ExcKind::RecursionError),
         "OSError" | "IOError" | "EnvironmentError" => Some(ExcKind::OSError),
         "FileNotFoundError" => Some(ExcKind::FileNotFoundError),
         "UnicodeDecodeError" => Some(ExcKind::UnicodeDecodeError),

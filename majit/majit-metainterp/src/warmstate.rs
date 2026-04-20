@@ -264,18 +264,9 @@ pub struct WarmEnterState {
     /// to the set of green_key_hashes whose compiled loops depend on that field.
     /// When a quasi-immutable field is mutated, all dependent loops are invalidated.
     quasiimmut_deps: HashMap<u64, HashSet<u64>>,
-    /// Per-function call counts during the current trace.
-    ///
-    /// Tracks how many times each function (identified by callee_key) has been
-    /// encountered during tracing. Used by `should_inline_function()` to decide
-    /// whether to inline or leave as residual call.
-    function_call_counts: HashMap<u64, u32>,
-    /// Function-entry hot counts outside active tracing.
-    ///
-    /// Unlike `function_call_counts`, these persist across interpreter entries
-    /// and drive separate function traces for recursive/non-inlineable portal
-    /// calls.
-    function_entry_counts: HashMap<u64, u32>,
+    // Function-entry hotness rides on the shared `counter: JitCounter`
+    // below (warmstate.py:467 — maybe_compile_and_run's tick + reset
+    // goes through the common timetable, not a separate HashMap).
 
     // warmstate.py:299-320 — retrace_limit / max_retrace_guards /
     // max_unroll_loops / max_unroll_recursion live on
@@ -363,8 +354,6 @@ impl WarmEnterState {
             tracing_generation: 0,
             jitlog: Logger::from_env(),
             quasiimmut_deps: HashMap::new(),
-            function_call_counts: HashMap::new(),
-            function_entry_counts: HashMap::new(),
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
@@ -403,8 +392,6 @@ impl WarmEnterState {
             tracing_generation: 0,
             jitlog,
             quasiimmut_deps: HashMap::new(),
-            function_call_counts: HashMap::new(),
-            function_entry_counts: HashMap::new(),
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
@@ -558,7 +545,6 @@ impl WarmEnterState {
     /// Creates a new Trace for retracing, similar to starting a
     /// fresh trace but from a guard's failure inputs.
     pub fn start_retrace(&mut self, input_types: &[Type]) -> Trace {
-        self.reset_function_counts();
         Trace::with_input_types_and_limit(input_types, self.trace_limit as usize)
     }
 
@@ -899,21 +885,6 @@ impl WarmEnterState {
         self.max_inline_depth
     }
 
-    /// Record a function call during tracing and decide whether to inline it.
-    ///
-    /// Mirrors RPython's inlining heuristic: a function must be called
-    /// at least `function_threshold` times before being inlined,
-    /// and the current inline depth must not exceed `max_inline_depth`.
-    /// Returns `true` if the function should be inlined.
-    pub fn should_inline_function(&mut self, callee_key: u64) -> bool {
-        if !self.can_inline_callable(callee_key) {
-            return false;
-        }
-        let count = self.function_call_counts.entry(callee_key).or_insert(0);
-        *count += 1;
-        *count >= self.function_threshold
-    }
-
     /// Whether this callee is eligible for inlining at all.
     ///
     /// Mirrors PyPy's `can_inline_callable`: once a green key is marked
@@ -1017,31 +988,20 @@ impl WarmEnterState {
         self.counter.change_current_fraction(green_key_hash, 0.98);
     }
 
-    /// Boost a function's entry counter to threshold - 1.
-    /// Next call through eval_with_jit will trigger tracing.
-    /// PyPy equivalent: mark for separate functrace after recursive depth limit.
-    pub fn boost_function_entry(&mut self, callee_key: u64) {
-        let threshold = self.function_threshold;
-        let count = self.function_entry_counts.entry(callee_key).or_insert(0);
-        if *count < threshold.saturating_sub(1) {
-            *count = threshold.saturating_sub(1);
-        }
-    }
-
-    /// Check if a function was boosted (counter >= threshold - 1).
-    pub fn is_boosted(&self, callee_key: u64) -> bool {
-        self.function_entry_counts
-            .get(&callee_key)
-            .map_or(false, |&c| c >= self.function_threshold.saturating_sub(1))
-    }
-
-    /// Tick the separate function-entry hot counter.
+    /// warmstate.py:467 jitcounter.tick(hash, increment_threshold) parity.
     ///
-    /// Mirrors warmstate.py's `maybe_compile_and_run(function_threshold, ...)`
-    /// semantics for function entries:
-    /// - compiled or currently tracing keys do not restart here
-    /// - a `DONT_TRACE_HERE` key with no prior procedure token gets one eager
-    ///   retry, and subsequent retries are thresholded again
+    /// Function-entry hotness rides on the same `JitCounter` timetable as
+    /// the loop counter (counter.py:16-202). `maybe_compile_and_run`
+    /// increments the per-hash float with `increment_threshold =
+    /// 1/function_threshold`; `tick_with_threshold` returns true (and
+    /// auto-resets the slot) when the accumulated value reaches 1.0 —
+    /// exactly counter.py:185-201.
+    ///
+    /// The cell lookup replicates `maybe_compile_and_run`'s pre-tick
+    /// shortcuts (warmstate.py:473-495):
+    ///   * compiled or currently-tracing keys skip tracing
+    ///   * a `DONT_TRACE_HERE` cell with no seen procedure token fires
+    ///     eagerly on the first visit after tracing completes
     pub fn should_trace_function_entry(&mut self, green_key_hash: u64) -> bool {
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
@@ -1056,41 +1016,13 @@ impl WarmEnterState {
                 }
             }
         }
-        let count = self
-            .function_entry_counts
-            .entry(green_key_hash)
-            .or_insert(0);
-        *count += 1;
-        *count >= self.function_threshold
-    }
-
-    pub fn function_entry_count(&self, green_key_hash: u64) -> u32 {
-        self.function_entry_counts
-            .get(&green_key_hash)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub fn reset_function_entry_count(&mut self, green_key_hash: u64) {
-        self.function_entry_counts.remove(&green_key_hash);
+        self.counter
+            .tick_with_threshold(green_key_hash, self.function_threshold)
     }
 
     /// Check if inlining is allowed at the given depth.
     pub fn can_inline_at_depth(&self, current_depth: usize) -> bool {
         (current_depth as u32) < self.max_inline_depth
-    }
-
-    /// Reset function call counts (called when tracing ends).
-    pub fn reset_function_counts(&mut self) {
-        self.function_call_counts.clear();
-    }
-
-    /// Get the current call count for a specific function.
-    pub fn function_call_count(&self, callee_key: u64) -> u32 {
-        self.function_call_counts
-            .get(&callee_key)
-            .copied()
-            .unwrap_or(0)
     }
 
     /// Log a bridge compilation. No-op if Logger is disabled.
@@ -1833,50 +1765,6 @@ mod tests {
         assert_eq!(ws.function_threshold(), 10);
     }
 
-    #[test]
-    fn test_should_inline_function_below_threshold() {
-        let mut ws = WarmEnterState::new(3);
-        ws.set_function_threshold(3);
-
-        // First two calls: below threshold, don't inline
-        assert!(!ws.should_inline_function(42));
-        assert!(!ws.should_inline_function(42));
-
-        // Third call: reaches threshold, inline
-        assert!(ws.should_inline_function(42));
-
-        // Subsequent calls: still inline
-        assert!(ws.should_inline_function(42));
-    }
-
-    #[test]
-    fn test_should_inline_function_different_keys() {
-        let mut ws = WarmEnterState::new(3);
-        ws.set_function_threshold(2);
-
-        assert!(!ws.should_inline_function(1));
-        assert!(!ws.should_inline_function(2));
-        // Key 1 reaches threshold on second call
-        assert!(ws.should_inline_function(1));
-        // Key 2 reaches threshold on second call
-        assert!(ws.should_inline_function(2));
-    }
-
-    #[test]
-    fn test_function_count_reset() {
-        let mut ws = WarmEnterState::new(3);
-        ws.set_function_threshold(2);
-
-        assert!(!ws.should_inline_function(42));
-        assert_eq!(ws.function_call_count(42), 1);
-
-        ws.reset_function_counts();
-        assert_eq!(ws.function_call_count(42), 0);
-
-        // After reset, needs to reach threshold again
-        assert!(!ws.should_inline_function(42));
-    }
-
     // ── Trace limit lifecycle tests (RPython: test_tracelimit.py) ──
 
     #[test]
@@ -1908,17 +1796,14 @@ mod tests {
     #[test]
     fn test_disable_noninlinable_function_blocks_inlining() {
         let mut ws = WarmEnterState::new(3);
-        ws.set_function_threshold(2);
 
-        assert!(!ws.should_inline_function(42));
-        assert!(ws.should_inline_function(42));
+        // Fresh cell: can_inline_callable returns true by default.
+        assert!(ws.can_inline_callable(42));
 
-        ws.reset_function_counts();
+        // dont_trace_here → JC_DONT_TRACE_HERE flag, can_inline_callable
+        // returns false (warmstate.py:669-676 parity).
         ws.disable_noninlinable_function(42);
-
         assert!(!ws.can_inline_callable(42));
-        assert!(!ws.should_inline_function(42));
-        assert!(!ws.should_inline_function(42));
     }
 
     #[test]
@@ -2334,7 +2219,6 @@ mod tests {
         // a function can be inlined (depth < max), but the trace
         // can still be too long. The WarmEnterState correctly tracks both.
         let mut ws = WarmEnterState::new(3);
-        ws.set_function_threshold(2);
         ws.set_max_inline_depth(3);
 
         // Depth 0: allowed
@@ -2343,15 +2227,6 @@ mod tests {
         assert!(ws.can_inline_at_depth(2));
         // Depth 3: not allowed (>= 3)
         assert!(!ws.can_inline_at_depth(3));
-
-        // Inlining decisions are independent of trace length:
-        // function 42 needs 2 calls before inlining
-        assert!(!ws.should_inline_function(42));
-        assert!(ws.should_inline_function(42));
-
-        // Even at max depth, inlining threshold still tracks calls
-        ws.reset_function_counts();
-        assert!(!ws.should_inline_function(42));
     }
 
     #[test]

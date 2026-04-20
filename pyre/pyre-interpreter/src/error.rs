@@ -86,6 +86,7 @@ pub enum PyErrorKind {
     /// BaseException subclass — raised inside generators by gen.close().
     /// Not a subclass of Exception, so `except Exception` does not catch it.
     GeneratorExit,
+    RecursionError,
     /// Internal: RETURN_GENERATOR unwind signal (not a real exception).
     /// Carries the generator PyObjectRef as message.
     GeneratorReturn,
@@ -200,6 +201,14 @@ impl PyError {
         }
     }
 
+    pub fn recursion_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::RecursionError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
     pub fn stop_iteration() -> Self {
         PyError {
             kind: PyErrorKind::StopIteration,
@@ -235,6 +244,7 @@ impl PyError {
             PyErrorKind::AssertionError => ExcKind::AssertionError,
             PyErrorKind::ReferenceError => ExcKind::ReferenceError,
             PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
+            PyErrorKind::RecursionError => ExcKind::RecursionError,
             PyErrorKind::GeneratorReturn => ExcKind::RuntimeError,
             PyErrorKind::OSError => ExcKind::OSError,
             PyErrorKind::FileNotFoundError => ExcKind::FileNotFoundError,
@@ -281,6 +291,7 @@ impl PyError {
             ExcKind::AssertionError => PyErrorKind::AssertionError,
             ExcKind::ReferenceError => PyErrorKind::ReferenceError,
             ExcKind::GeneratorExit => PyErrorKind::GeneratorExit,
+            ExcKind::RecursionError => PyErrorKind::RecursionError,
             ExcKind::BaseException | ExcKind::Exception => PyErrorKind::RuntimeError,
             ExcKind::OSError => PyErrorKind::OSError,
             ExcKind::FileNotFoundError => PyErrorKind::FileNotFoundError,

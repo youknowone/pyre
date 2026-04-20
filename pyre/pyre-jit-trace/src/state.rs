@@ -10,6 +10,7 @@ use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
     JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx,
 };
+use pyre_interpreter::PyError;
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 use pyre_interpreter::pyframe::{PendingInlineResult, PyFrame};
@@ -244,6 +245,9 @@ impl MetaInterpStaticData {
         let payload =
             supplied.unwrap_or_else(|| std::sync::Arc::new(crate::PyJitCode::skeleton(None)));
         let index = self.jitcodes.len() as i32;
+        if std::env::var_os("MAJIT_LOG").is_some() && index > 30 {
+            eprintln!("[jitcode-for] new idx={} code={:#x}", index, key);
+        }
         let jitcode = Box::new(JitCode {
             code,
             index,
@@ -445,6 +449,31 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, supplied))
 }
 
+/// Read-only JitCode lookup by CodeObject-wrapper pointer.
+///
+/// Blackhole/resume paths must not invoke the compile callback: any
+/// nested `jitcode_for` call re-enters the JIT pipeline (compile,
+/// warmstate bookkeeping) from inside a guard-failure decoder, which
+/// caused SIGSEGVs on nbody. Returns null if the code has never been
+/// registered — callers decide whether to fall back to the LiveVars
+/// path.
+///
+/// Uses the same key as `MetaInterpStaticData::jitcode_for`
+/// (`code as usize` — the tracer-side `jitcode_for(w_code)` call
+/// sites at trace_opcode.rs:3501 / :3580 / state.rs:1908 all pass
+/// the w_code wrapper pointer).
+pub(crate) fn jitcode_lookup(code: *const ()) -> *const JitCode {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let key = code as usize;
+        match sd.by_code.get(&key) {
+            Some(&idx) => &*sd.jitcodes[idx] as *const JitCode,
+            None => std::ptr::null(),
+        }
+    })
+}
+
 /// warmspot.py:282 metainterp_sd.jitcodes[jitcode_index]:
 /// Resolve jitcode_index (sequential int from snapshot numbering)
 /// to the corresponding CodeObject pointer.
@@ -492,10 +521,15 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
                 return length_i + length_r + length_f;
             }
         }
-        // Skeleton fallback: no pc_map / all_liveness yet for this
-        // CodeObject; count the LiveVars-reported live locals + stack
-        // slots so the encoder-decoder counts still agree for inlined
-        // frames whose majit_jitcode has not been built at trace time.
+        // Skeleton / uninit-jitcode fallback. Production runs go
+        // through the `jitcode_for` drain which fills pc_map +
+        // liveness before any guard capture (audit 2026-04-20: 0 hits
+        // across pyre/check.sh), but unit-test entry points
+        // (`PyreSym::new_uninit`) legitimately land here. Mirror
+        // trace_opcode.rs:get_list_of_active_boxes: iterate locals +
+        // stack filtering by is_local_live / is_stack_live so the
+        // decoded value count agrees with the encoder's BC_LIVE box
+        // count.
         if !jc.code.is_null() {
             let raw = unsafe { jc.raw_code() };
             let live = crate::liveness::liveness_for(raw);
@@ -1666,15 +1700,6 @@ pub(crate) fn boxed_slot_value_for_type(_slot_type: Type, value: &Value) -> PyOb
     }
 }
 
-/// RPython parity: virtualizable array slots are always GCREF.
-/// When restoring from guard failure, treat ALL values as Ref (PyObjectRef).
-/// Int values that look like heap pointers are used directly; otherwise box.
-/// RPython parity: virtualizable array slots are always GCREF.
-/// When restoring from guard failure, treat ALL values as Ref (PyObjectRef).
-/// Int values that look like heap pointers are used directly (they are
-/// PyObjectRef that the optimizer typed as Int during unboxing). Zero/null
-/// values become PY_NULL. Only true small ints (non-zero, non-pointer)
-/// need boxing.
 /// virtualizable.py:126/139 parity: box value for frame array slot.
 /// Frame array items (locals_cells_stack_w[*]) are declared as GCREF
 /// (interp_jit.py:25). The optimizer may unbox ints/floats in fail_args;
@@ -1839,26 +1864,60 @@ impl PyreSym {
         } else {
             vec![OpRef::NONE; nlocals]
         };
-        let inputarg_slot_types = self.vable_array_base.map(|base| {
+        // RPython resume.py:1042 parity: bridge traces enter with the
+        // failing guard's saved boxes, NOT with the loop's full
+        // virtualizable inputarg layout. Each `bridge_local_oprefs[i]`
+        // points at the bridge inputarg slot the rebuilt frame placed in
+        // local i, so the type for local i must come from
+        // `inputarg_types[bridge_local_oprefs[i].0]` instead of the
+        // loop's `vable_array_base + i` indexing (which only applies to
+        // loops where every local sits in a fixed virtualizable slot).
+        //
+        // Loop / function-entry traces still use vable_array_base because
+        // their inputarg list is the full vable layout.
+        let inputarg_slot_types = if let Some(ref overrides) = self.bridge_local_oprefs {
             let inputarg_types = ctx.inputarg_types();
             let locals: Vec<Type> = (0..nlocals)
                 .map(|i| {
-                    inputarg_types
-                        .get(base as usize + i)
-                        .copied()
+                    overrides
+                        .get(i)
+                        .and_then(|opref| {
+                            if opref.is_none() || opref.is_constant() {
+                                None
+                            } else {
+                                inputarg_types.get(opref.0 as usize).copied()
+                            }
+                        })
                         .unwrap_or(Type::Ref)
                 })
                 .collect();
-            let stack: Vec<Type> = (0..stack_only_depth)
-                .map(|i| {
-                    inputarg_types
-                        .get(base as usize + nlocals + i)
-                        .copied()
-                        .unwrap_or(Type::Ref)
-                })
-                .collect();
-            (locals, stack)
-        });
+            // Bridges have no symbolic stack at entry — the stack is
+            // empty when control resumes from the failing guard. Leave
+            // the stack-types vector empty so it gets reconstructed from
+            // the concrete frame below.
+            Some((locals, Vec::<Type>::new()))
+        } else {
+            self.vable_array_base.map(|base| {
+                let inputarg_types = ctx.inputarg_types();
+                let locals: Vec<Type> = (0..nlocals)
+                    .map(|i| {
+                        inputarg_types
+                            .get(base as usize + i)
+                            .copied()
+                            .unwrap_or(Type::Ref)
+                    })
+                    .collect();
+                let stack: Vec<Type> = (0..stack_only_depth)
+                    .map(|i| {
+                        inputarg_types
+                            .get(base as usize + nlocals + i)
+                            .copied()
+                            .unwrap_or(Type::Ref)
+                    })
+                    .collect();
+                (locals, stack)
+            })
+        };
         if self.is_function_entry_trace {
             // virtualizable.py:86 read_boxes() parity: all array items
             // are GC pointers → Ref. No pre-unboxing at function entry.
@@ -3598,26 +3657,29 @@ impl JitState for PyreJitState {
         //
         // values[3..] = compact active_boxes from get_list_of_active_boxes,
         // which filters by liveness. Use the same liveness table to restore.
-        let raw_code_ptr = if self.frame != 0 {
+        // Two distinct pointers for the same PyFrame.pycode:
+        //   - `w_code_ptr`  : Python CodeObject WRAPPER (`PyObjectRef`).
+        //                     Key used by `jitcode_for`/`jitcode_lookup`
+        //                     (see trace_opcode.rs:3501/:3580 and
+        //                     state.rs:1908 — all pass the wrapper).
+        //   - `raw_code_ptr`: unwrapped Rust `CodeObject`. Consumed by
+        //                     `liveness_for` (the LiveVars cache key).
+        let (w_code_ptr, raw_code_ptr) = if self.frame != 0 {
             let w_code = unsafe {
                 *((self.frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
                     as *const *const ())
             };
             if !w_code.is_null() {
-                unsafe {
+                let raw = unsafe {
                     pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                         as *const pyre_interpreter::CodeObject
-                }
+                };
+                (w_code, raw)
             } else {
-                std::ptr::null()
+                (std::ptr::null(), std::ptr::null())
             }
         } else {
-            std::ptr::null()
-        };
-        let live = if !raw_code_ptr.is_null() {
-            Some(liveness_for(raw_code_ptr))
-        } else {
-            None
+            (std::ptr::null(), std::ptr::null())
         };
         // resume.py:1383: info = blackholeinterp.get_current_position_info()
         // blackhole.py:337: position was set by setposition(jitcode, pc) where
@@ -3625,26 +3687,94 @@ impl JitState for PyreJitState {
         // next_instr = orgpc + 1 + caches, which may have different liveness.
         let live_pc = self.resume_pc.take().unwrap_or_else(|| self.next_instr());
         let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        for local_idx in 0..nlocals {
-            // resume.py:1077: only live registers consume a value from the
-            // compact array. Dead registers keep their previous contents.
-            let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
-            if is_live {
-                if let Some(value) = values.get(idx) {
-                    let boxed = virtualizable_box_value(value);
-                    let _ = self.set_local_at(local_idx, boxed);
-                }
-                idx += 1;
+        // resume.py:1077 consume_boxes parity — iterate the SAME
+        // `all_liveness` BC_LIVE data the encoder used in
+        // `trace_opcode.rs::get_list_of_active_boxes`. For every live
+        // reg idx, consume one tagged `values[idx]` and route to the
+        // PyFrame slot:
+        //   - `reg < nlocals` → `set_local_at(reg, …)`
+        //   - `nlocals <= reg < nlocals + stack_only` → `set_stack_at`
+        // This keeps the encoder/decoder contract aligned on jitcode
+        // SSA liveness rather than the LiveVars approximation.
+        //
+        // Falls back to the LiveVars path below only when the frame's
+        // code is not (yet) registered or has no pc_map entry — i.e.
+        // the same fallback branch trace_opcode.rs:313-334 takes.
+        let decoded_via_jitcode: bool = (|| {
+            if w_code_ptr.is_null() {
+                return false;
             }
-        }
-        for stack_idx in 0..stack_only {
-            let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
-            if is_live {
-                if let Some(value) = values.get(idx) {
-                    let boxed = virtualizable_box_value(value);
-                    let _ = self.set_stack_at(stack_idx, boxed);
+            let jc_ptr = jitcode_lookup(w_code_ptr);
+            if jc_ptr.is_null() {
+                return false;
+            }
+            let jc = unsafe { &*jc_ptr };
+            let payload = &jc.payload;
+            let Some(&jit_pc) = payload.metadata.pc_map.get(live_pc) else {
+                return false;
+            };
+            let all_liveness = liveness_info_snapshot();
+            let off = payload.jitcode.get_live_vars_info(jit_pc, op_live());
+            if off + 2 >= all_liveness.len() {
+                return false;
+            }
+            let length_i = all_liveness[off] as u32;
+            let length_r = all_liveness[off + 1] as u32;
+            let length_f = all_liveness[off + 2] as u32;
+            let mut cursor = off + 3;
+            use majit_translate::liveness::LivenessIterator;
+            for length in [length_i, length_r, length_f] {
+                if length == 0 {
+                    continue;
                 }
-                idx += 1;
+                let mut it = LivenessIterator::new(cursor, length, &all_liveness);
+                while let Some(reg_idx) = it.next() {
+                    let reg = reg_idx as usize;
+                    if let Some(value) = values.get(idx) {
+                        let boxed = virtualizable_box_value(value);
+                        if reg < nlocals {
+                            let _ = self.set_local_at(reg, boxed);
+                        } else {
+                            let stack_idx = reg - nlocals;
+                            if stack_idx < stack_only {
+                                let _ = self.set_stack_at(stack_idx, boxed);
+                            }
+                        }
+                    }
+                    idx += 1;
+                }
+                cursor = it.offset;
+            }
+            true
+        })();
+        if !decoded_via_jitcode {
+            // Fallback: LiveVars-based decode (skeleton jitcode / no
+            // pc_map entry / unregistered code). Retained for RPython
+            // parity with `get_list_of_active_boxes` skeleton path.
+            let live = if !raw_code_ptr.is_null() {
+                Some(liveness_for(raw_code_ptr))
+            } else {
+                None
+            };
+            for local_idx in 0..nlocals {
+                let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
+                if is_live {
+                    if let Some(value) = values.get(idx) {
+                        let boxed = virtualizable_box_value(value);
+                        let _ = self.set_local_at(local_idx, boxed);
+                    }
+                    idx += 1;
+                }
+            }
+            for stack_idx in 0..stack_only {
+                let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
+                if is_live {
+                    if let Some(value) = values.get(idx) {
+                        let boxed = virtualizable_box_value(value);
+                        let _ = self.set_stack_at(stack_idx, boxed);
+                    }
+                    idx += 1;
+                }
             }
         }
 
@@ -5584,6 +5714,14 @@ pub struct PendingInlineFrame {
     pub concrete_frame: pyre_interpreter::pyframe::PyFrame,
     pub drop_frame_opref: Option<OpRef>,
     pub green_key: u64,
+    /// Raw `(code_ptr, target_pc)` greenkey components for element-
+    /// wise recursion-depth comparison. `green_key` above is the u64
+    /// hash derived from this pair and stays the identity key for
+    /// HashMap lookups; `green_key_raw` element-wise equality matches
+    /// rpython/jit/metainterp/pyjitpl.py:1396-1401 `for i in
+    /// range(len(gk)): if not gk[i].same_constant(greenboxes[i])`
+    /// without the hash-collision risk a u64-only comparison carries.
+    pub green_key_raw: (usize, usize),
     /// opencoder.py:819-834: accumulated parent frame chain.
     /// Each: (fail_args, types, resumepc, jitcode_index).
     pub parent_frames: Vec<(Vec<OpRef>, Vec<Type>, usize, i32)>,

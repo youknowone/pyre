@@ -5837,6 +5837,15 @@ pub fn blackhole_from_resumedata<'a>(
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
 ) -> Option<(BlackholeInterpreter, i64)> {
+    // resume.py:1315-1327 The initialization is stack-critical code: it
+    // must not be interrupted by StackOverflow, otherwise the
+    // jit_virtual_refs are left in a dangling state.
+    //
+    // RPython wraps the body in try/finally so _stop() runs on every
+    // exit path. The RAII CriticalCodeGuard gives us Drop-based
+    // guarantee — ordinary returns, `?` propagation, AND panic unwind
+    // all re-enable the report_error flag.
+    let _cc_guard = crate::CriticalCodeGuard::enter();
     // resume.py:1317-1321
     let mut resumereader = ResumeDataDirectReader::new(
         rd_numb,
@@ -5852,6 +5861,7 @@ pub fn blackhole_from_resumedata<'a>(
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
+    drop(_cc_guard);
 
     // resume.py:1404: virtualizable pointer read by consume_vable_info.
     let virtualizable_ptr = resumereader.virtualizable_ptr;

@@ -18,15 +18,34 @@ use pyre_object::pyobject::is_int;
 use pyre_object::{PY_NULL, PyObjectRef};
 
 use pyre_interpreter::pyframe::PyFrame;
+use pyre_jit_trace::trace::trace_bytecode;
 
 // Force cache removed: CallAssemblerI + bridge handles recursion
 // natively without memoization.
 
 thread_local! {
+    /// Stash Python exceptions from blackhole/force paths that cross
+    /// FFI boundaries (compiled code → callback → exception).
+    static LAST_CA_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::error::PyError>> =
+        const { std::cell::RefCell::new(None) };
     static RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>, bool)>> =
         const { UnsafeCell::new(None) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
+}
+
+/// Take stashed exception from blackhole/force FFI paths.
+pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
+    LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
+}
+
+/// Park a Python exception that needs to surface across an FFI boundary
+/// (callback emitted by compiled code → here → eventually picked up by
+/// `take_ca_exception` in the eval loop).
+pub fn set_pending_ca_exception(err: pyre_interpreter::error::PyError) {
+    LAST_CA_EXCEPTION.with(|c| {
+        *c.borrow_mut() = Some(err);
+    });
 }
 
 // warmspot.py:449 portal result_type == REF: FINISH always boxes via
@@ -309,7 +328,24 @@ extern "C" fn jit_call_user_function_from_frame(
     // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
     match pyre_interpreter::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
-        Err(err) => panic!("jit user-function call failed: {err}"),
+        Err(err) => {
+            // llmodel.py:194-199 _store_exception: write the exception
+            // to the backend's `_exception_emulator` tp/val cells. The
+            // matching GUARD_NO_EXCEPTION in the trace then reads
+            // pos_exception()/pos_exc_value() and fails, and resume
+            // data hands control to the except block. Do NOT stash the
+            // PyError through a side channel — that would let the
+            // interpreter-side eval loop surface it before the guard
+            // machinery sees it, bypassing try/except.
+            let exc_obj = err.exc_object;
+            if exc_obj != pyre_object::PY_NULL {
+                #[cfg(feature = "cranelift")]
+                majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
+                #[cfg(feature = "dynasm")]
+                majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
+            }
+            0 // garbage — GUARD_NO_EXCEPTION will fire
+        }
     }
 }
 
@@ -411,8 +447,6 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
 /// Called by `bh.resolve_field_offsets()` after `setposition()`.
 fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     use pyre_interpreter::pyframe::PyFrame;
-    // RPython: FieldDescr.offset is bound at rtyper time via symbolic.get_field_token.
-    // pyre: Rust struct layouts are resolved here via std::mem::offset_of!.
     match field_name {
         "execution_context" => std::mem::offset_of!(PyFrame, execution_context),
         "code" | "pycode" => std::mem::offset_of!(PyFrame, pycode),
@@ -646,7 +680,19 @@ pub fn resume_in_blackhole(
         static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
     }
-    let builder = BH_BUILDER3.with(|cell| unsafe { &mut *cell.get() });
+    // Helper closures that scope the &mut to a single call so that
+    // bh.run() (which may re-enter resume_in_blackhole through
+    // bh_call_fn_impl → eval_with_jit → guard failure) cannot create
+    // overlapping &mut references to the same thread-local pool.
+    let acquire_bh = || -> majit_metainterp::blackhole::BlackholeInterpreter {
+        BH_BUILDER3.with(|cell| unsafe { (&mut *cell.get()).acquire_interp() })
+    };
+    let release_bh = |bh: majit_metainterp::blackhole::BlackholeInterpreter| {
+        BH_BUILDER3.with(|cell| unsafe { (&mut *cell.get()).release_interp(bh) });
+    };
+    let release_chain_bh = |chain: Option<majit_metainterp::blackhole::BlackholeInterpreter>| {
+        BH_BUILDER3.with(|cell| unsafe { (&mut *cell.get()).release_chain(chain) });
+    };
 
     // resume.py:1333-1343 blackhole_from_resumedata:
     // Build chain bottom-up. Process in reverse so the LAST acquired
@@ -684,7 +730,7 @@ pub fn resume_in_blackhole(
                     sec_idx, section.py_pc,
                 );
             }
-            builder.release_chain(prev_bh);
+            release_chain_bh(prev_bh);
             return BlackholeResult::Failed;
         }
         let code = unsafe {
@@ -708,7 +754,7 @@ pub fn resume_in_blackhole(
             }
         }
         if py_pc >= code.instructions.len() {
-            builder.release_chain(prev_bh);
+            release_chain_bh(prev_bh);
             return BlackholeResult::Failed;
         }
 
@@ -723,18 +769,18 @@ pub fn resume_in_blackhole(
         let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
             Some(pjc) => pjc,
             None => {
-                builder.release_chain(prev_bh);
+                release_chain_bh(prev_bh);
                 return BlackholeResult::Failed;
             }
         };
         let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
             pyjitcode.metadata.pc_map[py_pc]
         } else {
-            builder.release_chain(prev_bh);
+            release_chain_bh(prev_bh);
             return BlackholeResult::Failed;
         };
 
-        let mut bh = builder.acquire_interp();
+        let mut bh = acquire_bh();
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
         // pyjitpl.py:2264: metainterp_sd.liveness_info — global pool.
         bh.liveness_info = pyre_jit_trace::state::liveness_info_snapshot();
@@ -884,7 +930,7 @@ pub fn resume_in_blackhole(
             // blackhole.py:1068: raise ContinueRunningNormally(*args)
             // Propagated from run() as RPython's JitException equivalent.
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-            builder.release_interp(bh);
+
             let mut red_ref: Vec<PyObjectRef> =
                 args.red_ref.iter().map(|&v| v as PyObjectRef).collect();
             if red_ref.is_empty() {
@@ -916,7 +962,7 @@ pub fn resume_in_blackhole(
                     bh.position, bh.last_opcode_position
                 );
             }
-            builder.release_interp(bh);
+            release_bh(bh);
             return BlackholeResult::Failed;
         }
 
@@ -958,7 +1004,7 @@ pub fn resume_in_blackhole(
         if bh.got_exception {
             let exc_value = bh.exception_last_value;
             let next = bh.nextblackholeinterp.take();
-            builder.release_interp(bh);
+            release_bh(bh);
 
             let Some(mut caller_bh) = next.map(|b| *b) else {
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
@@ -1008,7 +1054,6 @@ pub fn resume_in_blackhole(
                     bh.get_tmpreg_f() as u64,
                 )),
             };
-            builder.release_interp(bh);
             return result;
         };
 
@@ -1019,7 +1064,6 @@ pub fn resume_in_blackhole(
             BhReturnType::Float => caller_bh.setup_return_value_f(bh.get_tmpreg_f()),
             BhReturnType::Void => {}
         }
-        builder.release_interp(bh);
 
         bh = caller_bh;
     }
@@ -1183,9 +1227,6 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
     raw_int_arg: i64,
 ) -> i64 {
     let callable_ref = callable as PyObjectRef;
-    let w_code = unsafe { pyre_interpreter::getcode(callable_ref) };
-    let green_key = crate::eval::make_green_key(w_code, 0);
-    let (_token_num, _memo_safe) = recursive_dispatch(callable_ref, green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
@@ -1249,10 +1290,47 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     result
 }
 
+/// Unbox a Ref (PyObjectRef to boxed int) to a raw i64 value.
+/// Used by call_assembler_guard_failure's FALLBACK path when the first
+/// local is a Ref type (boxed int) instead of raw Int.
+fn unbox_int_for_force(raw: i64) -> i64 {
+    let obj = raw as pyre_object::PyObjectRef;
+    if !obj.is_null() && unsafe { is_int(obj) } {
+        unsafe { w_int_get_value(obj) }
+    } else {
+        raw
+    }
+}
+
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         register_jit_function_caller(jit_call_user_function_from_frame);
+        // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start
+        // /stop hooks — wrap blackhole_from_resumedata,
+        // handle_async_forcing, and handle_guard_failure_in_trace so
+        // StackOverflow doesn't interrupt those critical sections.
+        // The pyre helpers are `extern "C" fn()`; thin wrappers adapt
+        // them to the Rust `fn()` signature register_criticalcode_hooks
+        // expects.
+        fn criticalcode_start_adapter() {
+            pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
+        }
+        fn criticalcode_stop_adapter() {
+            pyre_interpreter::stack_check::pyre_stack_criticalcode_stop();
+        }
+        majit_metainterp::register_criticalcode_hooks(
+            criticalcode_start_adapter,
+            criticalcode_stop_adapter,
+        );
+        // rpython/rlib/rstack.py:75-90 stack_almost_full hook — lets
+        // compile.py:702-703 and warmstate.py:430 query the recursion-
+        // limit-driven PYRE_STACKTOOBIG budget instead of the OS thread
+        // stack.
+        fn stack_almost_full_adapter() -> bool {
+            pyre_interpreter::stack_check::stack_almost_full()
+        }
+        majit_metainterp::register_stack_almost_full_hook(stack_almost_full_adapter);
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
@@ -1261,6 +1339,23 @@ pub fn install_jit_call_bridge() {
                 jit_blackhole_resume_from_guard,
             );
             majit_backend_cranelift::register_jitframe_layout(arena_global_info());
+            majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
+            // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
+            // parity. Cranelift's prologue calls pyre_stack_check_for_jit_prologue
+            // directly (combined fast path + slowpath in one function call, since
+            // Cranelift IR does not expose a "read current SP" intrinsic). The
+            // inline-style addresses are also registered for symmetry with the
+            // dynasm probe path (consumed when Cranelift gains a get-SP intrinsic).
+            majit_backend_cranelift::register_stack_check_addresses(
+                pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
+                pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
+                pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend as *const ()
+                    as usize,
+            );
+            majit_backend_cranelift::register_prologue_probe_addr(
+                pyre_interpreter::stack_check::pyre_stack_check_for_jit_prologue as *const ()
+                    as usize,
+            );
         }
         #[cfg(feature = "dynasm")]
         {
@@ -1268,6 +1363,16 @@ pub fn install_jit_call_bridge() {
             majit_backend_dynasm::register_call_assembler_bridge(jit_ca_handle_guard_failure);
             majit_backend_dynasm::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
+            );
+            majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
+            // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
+            // parity. The backend inlines MOV [endaddr]; SUB rsp; CMP [lengthaddr]
+            // in every JIT prologue and calls slowpath_addr on miss.
+            majit_backend_dynasm::register_stack_check_addresses(
+                pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
+                pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
+                pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend as *const ()
+                    as usize,
             );
         }
     });
@@ -1290,6 +1395,21 @@ fn jit_blackhole_resume_from_guard(
     raw_deadframe_ptr: *const i64,
     num_raw_deadframe: usize,
 ) -> Option<i64> {
+    // rstack.stack_check_slowpath → _StackOverflow parity: drain the
+    // pending JIT-prologue overflow exception when the backend probe
+    // tripped. The blackhole resume path is one of the three
+    // boundaries the user listed (compiled entry / call_assembler /
+    // blackhole resume), so we surface RecursionError here as well as
+    // in eval.rs. We do this BEFORE setting up resume state so deep
+    // recursion through the blackhole interpreter cannot accumulate
+    // further damage.
+    if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        // Stash for the eval loop to surface — same channel the
+        // blackhole/force callbacks already use for cross-FFI errors.
+        crate::call_jit::set_pending_ca_exception(exc);
+        return None;
+    }
+
     if fail_values_ptr.is_null() || num_fail_values == 0 {
         return None;
     }
@@ -1337,6 +1457,8 @@ fn jit_blackhole_resume_from_guard(
         // resume.py:924-926 _prepare: get rd_virtuals for TAGVIRTUAL materialization.
         let rd_virtuals = driver.get_rd_virtuals(actual_green_key, trace_id, fail_index);
         let rd_virtuals_ref = rd_virtuals.as_deref();
+        // resume.py:926 _prepare_pendingfields: get rd_pendingfields for deferred writes.
+        let rd_pendingfields = driver.get_rd_pendingfields(actual_green_key, trace_id, fail_index);
         // resume.py parity: deadframe_types tells decode_ref() whether a
         // TAGBOX slot holds a raw int (needs boxing) or a GcRef (use as-is).
         // Without this, unboxed ints are treated as pointers → SIGSEGV.
@@ -1346,15 +1468,22 @@ fn jit_blackhole_resume_from_guard(
             &rd_numb,
             &rd_consts,
             raw_deadframe,
-            None,
+            rd_pendingfields.as_deref(),
             rd_virtuals_ref,
             deadframe_types.as_deref(),
         );
         return handle_blackhole_result(result, actual_green_key);
     }
 
-    // RPython: every guard has rd_numb from capture_resumedata +
-    // store_final_boxes_in_guard. No heuristic fallback path.
+    // RPython compile.py:701-716 parity: every guard must have rd_numb
+    // from capture_resumedata + store_final_boxes_in_guard (resume.py:397).
+    // Hitting this path means a guard was compiled without snapshot data.
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[blackhole-resume] no rd_numb for key={} trace={} fail={} (force_fn fallback)",
+            actual_green_key, trace_id, fail_index,
+        );
+    }
     None
 }
 
@@ -1371,12 +1500,16 @@ pub fn blackhole_resume_via_rd_numb(
 ) -> BlackholeResult {
     use majit_metainterp::resume;
 
-    // Thread-local BH pool (RPython BlackholeInterpBuilder).
+    // Thread-local BH pool (RPython BlackholeInterpBuilder). Each access
+    // is scoped to a single call so that bh.run() (which may re-enter
+    // blackhole_resume_via_rd_numb) cannot create overlapping &mut refs.
     thread_local! {
         static BH_BUILDER_RD: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
     }
-    let builder = BH_BUILDER_RD.with(|cell| unsafe { &mut *cell.get() });
+    let release_bh_rd = |bh: majit_metainterp::blackhole::BlackholeInterpreter| {
+        BH_BUILDER_RD.with(|cell| unsafe { (&mut *cell.get()).release_interp(bh) });
+    };
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
     // to a pyre JitCode via CodeWriter.
@@ -1431,21 +1564,26 @@ pub fn blackhole_resume_via_rd_numb(
     // resume.py:1314: vrefinfo = metainterp_sd.virtualref_info
     // resume.py:1316: ginfo = jitdriver_sd.greenfield_info
     let allocator = crate::eval::PyreBlackholeAllocator;
-    let bh = resume::blackhole_from_resumedata(
-        builder,
-        &resolve_jitcode,
-        rd_numb,
-        rd_consts,
-        deadframe,
-        deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
-        rd_virtuals_slice,      // rd_virtuals
-        None,                   // rd_pendingfields
-        rd_guard_pendingfields, // rd_guard_pendingfields
-        None,                   // vrefinfo — pyre has no virtualref mechanism
-        Some(&vinfo as &dyn resume::VirtualizableInfo),
-        None, // ginfo — pyre has no greenfield mechanism
-        &allocator,
-    );
+    // Scope the &mut to chain construction; the run() loop below uses
+    // release_bh_rd to drop and re-acquire the borrow.
+    let bh = BH_BUILDER_RD.with(|cell| unsafe {
+        let builder = &mut *cell.get();
+        resume::blackhole_from_resumedata(
+            builder,
+            &resolve_jitcode,
+            rd_numb,
+            rd_consts,
+            deadframe,
+            deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
+            rd_virtuals_slice,      // rd_virtuals
+            None,                   // rd_pendingfields
+            rd_guard_pendingfields, // rd_guard_pendingfields
+            None,                   // vrefinfo — pyre has no virtualref mechanism
+            Some(&vinfo as &dyn resume::VirtualizableInfo),
+            None, // ginfo — pyre has no greenfield mechanism
+            &allocator,
+        )
+    });
 
     let Some((mut bh, virtualizable_ptr)) = bh else {
         return BlackholeResult::Failed;
@@ -1479,7 +1617,7 @@ pub fn blackhole_resume_via_rd_numb(
         if let Some(args) = bh.run() {
             // blackhole.py:1068: raise ContinueRunningNormally(*args)
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-            builder.release_interp(bh);
+
             let mut red_ref: Vec<PyObjectRef> =
                 args.red_ref.iter().map(|&v| v as PyObjectRef).collect();
             if red_ref.is_empty() {
@@ -1503,13 +1641,13 @@ pub fn blackhole_resume_via_rd_numb(
             };
         }
         if bh.aborted {
-            builder.release_interp(bh);
+            release_bh_rd(bh);
             return BlackholeResult::Failed;
         }
         if bh.got_exception {
             let exc_value = bh.exception_last_value;
             let next = bh.nextblackholeinterp.take();
-            builder.release_interp(bh);
+            release_bh_rd(bh);
             let Some(mut caller_bh) = next.map(|b| *b) else {
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
                 //   e = cast_opaque_ptr(GCREF, e)
@@ -1556,7 +1694,6 @@ pub fn blackhole_resume_via_rd_numb(
                     bh.get_tmpreg_f() as u64,
                 )),
             };
-            builder.release_interp(bh);
             return result;
         }
         let mut caller_bh = caller.unwrap();
@@ -1567,7 +1704,7 @@ pub fn blackhole_resume_via_rd_numb(
             BhReturnType::Float => caller_bh.setup_return_value_f(bh.get_tmpreg_f()),
             BhReturnType::Void => {}
         }
-        builder.release_interp(bh);
+        release_bh_rd(bh);
         bh = caller_bh;
     }
 }
@@ -1690,7 +1827,6 @@ pub fn trace_and_compile_from_bridge(
 ) -> bool {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
-    use crate::jit::trace::trace_bytecode;
 
     let info = {
         let (_, info) = crate::eval::driver_pair();
@@ -2540,23 +2676,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
-    // RPython bhimpl_residual_call: dispatch builtin vs user function.
-    if unsafe { is_function(callable) } {
-        let code = unsafe { pyre_interpreter::getcode(callable) };
-        if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
-            let func =
-                unsafe { pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef) };
-            match func(args) {
-                Ok(result) if !result.is_null() => return result as i64,
-                Ok(_) => return 0,
-                Err(err) => {
-                    let exc_obj = err.to_exc_object();
-                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-                    return 0;
-                }
-            }
-        }
-    } else {
+    if !unsafe { is_function(callable) } {
         let err = pyre_interpreter::PyError::type_error("call on non-function callable");
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
@@ -2565,6 +2685,22 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     // blackhole go through cpu.bh_call_* which is a plain call, NOT
     // through the portal runner. call_user_function_plain uses
     // eval_frame_plain (no JIT re-entry), matching RPython semantics.
+    //
+    // Builtin functions (print, len, etc.) have no PyFrame and cannot go
+    // through call_user_function_plain. Dispatch directly.
+    let code = unsafe { pyre_interpreter::getcode(callable) };
+    if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
+        let func = unsafe { pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef) };
+        match func(args) {
+            Ok(result) if !result.is_null() => return result as i64,
+            Ok(_) => return 0,
+            Err(err) => {
+                let exc_obj = err.to_exc_object();
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                return 0;
+            }
+        }
+    }
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
     let parent_frame = unsafe { &*parent_frame_ptr };

@@ -47,6 +47,7 @@ pub mod warmstate;
 
 pub use call_descr::{
     make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,
+    make_call_descr_with_effect,
 };
 pub use constant_pool::ConstantPool;
 pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
@@ -216,6 +217,105 @@ pub fn green_key_hash(values: &[i64]) -> u64 {
 // ── we_are_jitted / JIT mode flag ──
 // Re-exported from majit-codegen so both meta and backend can access it.
 pub use majit_backend::{JittedGuard, set_jitted, we_are_jitted};
+
+// ── rstack criticalcode hooks ──
+// rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start/stop.
+// Used by blackhole_from_resumedata / handle_async_forcing /
+// initialize_state_from_guard_failure to suppress StackOverflow during
+// critical sections that would leave virtual references dangling.
+//
+// The actual implementation lives in pyre-interpreter (the interpreter
+// owns the rpy_stacktoobig struct). majit-metainterp cannot depend on
+// pyre-interpreter directly — pyre depends on majit, not the other way
+// — so the interpreter registers the two hooks at startup.
+use std::sync::OnceLock;
+
+static CRITICALCODE_START_FN: OnceLock<fn()> = OnceLock::new();
+static CRITICALCODE_STOP_FN: OnceLock<fn()> = OnceLock::new();
+static STACK_ALMOST_FULL_FN: OnceLock<fn() -> bool> = OnceLock::new();
+
+/// Register the `_stack_criticalcode_start` / `_stack_criticalcode_stop`
+/// hooks the interpreter implements. Called once at JIT install time.
+pub fn register_criticalcode_hooks(start: fn(), stop: fn()) {
+    let _ = CRITICALCODE_START_FN.set(start);
+    let _ = CRITICALCODE_STOP_FN.set(stop);
+}
+
+/// Register the `rstack.stack_almost_full` hook the interpreter
+/// implements against its `PYRE_STACKTOOBIG` budget. Called once at
+/// JIT install time. When no hook is registered, [`stack_almost_full`]
+/// returns `false` — matching RPython's untranslated fallback in
+/// `rpython/rlib/rstack.py:76-77`.
+pub fn register_stack_almost_full_hook(f: fn() -> bool) {
+    let _ = STACK_ALMOST_FULL_FN.set(f);
+}
+
+/// rpython/rlib/rstack.py:75-90 `stack_almost_full`. Returns `true` if
+/// the stack is more than 15/16ths full against the recursion-limit
+/// budget. Dispatches to the interpreter-registered hook; in tests or
+/// standalone binaries without the interpreter's stack-check layer,
+/// returns `false` (rstack.py:76-77 `if not we_are_translated: return
+/// False`).
+#[inline]
+pub fn stack_almost_full() -> bool {
+    if let Some(f) = STACK_ALMOST_FULL_FN.get() {
+        f()
+    } else {
+        false
+    }
+}
+
+/// rpython/translator/c/src/stack.h:42 `LL_stack_criticalcode_start`.
+/// No-op if the hook is not registered (tests / standalone binaries
+/// that don't install the interpreter's stack-check layer).
+#[inline]
+pub fn criticalcode_start() {
+    if let Some(f) = CRITICALCODE_START_FN.get() {
+        f();
+    }
+}
+
+/// rpython/translator/c/src/stack.h:43 `LL_stack_criticalcode_stop`.
+#[inline]
+pub fn criticalcode_stop() {
+    if let Some(f) = CRITICALCODE_STOP_FN.get() {
+        f();
+    }
+}
+
+/// RAII guard wrapping [`criticalcode_start`] / [`criticalcode_stop`].
+///
+/// RPython's `rstack._stack_criticalcode_start()` uses try/finally to
+/// guarantee the matching `_stop()` runs on every exit path (including
+/// exceptions). Rust's equivalent is `Drop`: this guard calls
+/// `criticalcode_stop()` in its destructor so ordinary returns,
+/// `?`-propagated errors, and `panic!` unwind all re-enable the
+/// `report_error` flag. Matches rpython/jit/metainterp/resume.py:1315
+/// + rpython/jit/metainterp/pyjitpl.py:3281 +
+/// rpython/jit/metainterp/compile.py:976 `try/finally` semantics.
+pub struct CriticalCodeGuard {
+    _private: (),
+}
+
+impl CriticalCodeGuard {
+    /// Enter a critical section. The returned guard must be held for
+    /// the duration of the section; dropping it re-enables stack-
+    /// overflow reporting, even if the drop is triggered by panic
+    /// unwinding.
+    #[inline]
+    #[must_use = "CriticalCodeGuard re-enables stack overflow reporting only on drop — binding it to `_` drops it immediately, defeating the guard"]
+    pub fn enter() -> Self {
+        criticalcode_start();
+        CriticalCodeGuard { _private: () }
+    }
+}
+
+impl Drop for CriticalCodeGuard {
+    #[inline]
+    fn drop(&mut self) {
+        criticalcode_stop();
+    }
+}
 
 #[cfg(test)]
 mod tests {

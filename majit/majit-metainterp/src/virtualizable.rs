@@ -161,12 +161,13 @@ pub struct VirtualizableInfo {
     /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to array field index.
     pub array_field_by_descrs: HashMap<usize, usize>,
-    /// virtualizable.py:45-46: self.clear_vable_ptr = ...
-    /// C-ABI function pointer: fn(obj_ptr) that writes TOKEN_NONE to vable_token.
-    /// Used by COND_CALL in emit_force_virtualizable (pyjitpl.py:1197).
-    pub clear_vable_fn: Option<unsafe extern "C" fn(i64)>,
-    /// virtualizable.py:47: self.clear_vable_descr = ...
-    /// CallDescr for the COND_CALL that invokes clear_vable_fn.
+    /// virtualizable.py:294-295 `clear_vable_ptr`: function pointer to
+    /// `clear_vable_token`, callable from JIT-compiled COND_CALL.
+    /// Signature: `extern "C" fn(*mut u8)`. Stored as raw address so
+    /// `VirtualizableInfo` stays Send+Sync.
+    pub clear_vable_ptr: Option<usize>,
+    /// virtualizable.py:300-301 `clear_vable_descr`: CallDescr for the
+    /// COND_CALL that invokes `clear_vable_ptr`.
     pub clear_vable_descr: Option<DescrRef>,
 }
 
@@ -185,7 +186,7 @@ impl Clone for VirtualizableInfo {
             _array_field_descrs: self._array_field_descrs.clone(),
             static_field_by_descrs: self.static_field_by_descrs.clone(),
             array_field_by_descrs: self.array_field_by_descrs.clone(),
-            clear_vable_fn: self.clear_vable_fn,
+            clear_vable_ptr: self.clear_vable_ptr,
             clear_vable_descr: self.clear_vable_descr.clone(),
         }
     }
@@ -221,7 +222,7 @@ impl VirtualizableInfo {
             _array_field_descrs: Vec::new(),
             static_field_by_descrs: HashMap::new(),
             array_field_by_descrs: HashMap::new(),
-            clear_vable_fn: None,
+            clear_vable_ptr: None,
             clear_vable_descr: None,
         }
     }
@@ -317,6 +318,40 @@ impl VirtualizableInfo {
             majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
                 .with_flag(flag)
                 .with_parent_descr(parent.clone(), index_in_parent),
+        )
+    }
+
+    /// virtualizable.py:293-301 `finish()` registers the `clear_vable_ptr`
+    /// function pointer and `clear_vable_descr` call descriptor.
+    ///
+    /// `clear_fn` is an `extern "C" fn(*mut u8)` that clears the vable token,
+    /// forcing the virtualizable if necessary. Hosts must call this after
+    /// `build_virtualizable_info()` to enable `emit_force_virtualizable`.
+    pub fn set_clear_vable(&mut self, clear_fn: *const (), clear_descr: DescrRef) {
+        self.clear_vable_ptr = Some(clear_fn as usize);
+        self.clear_vable_descr = Some(clear_descr);
+    }
+
+    /// virtualizable.py:300-301 `clear_vable_descr` factory. Creates
+    /// the CallDescr for the `COND_CALL` that invokes `clear_vable_ptr`.
+    ///
+    /// ```text
+    /// self.clear_vable_descr = staticdata.calldescr_for_call(
+    ///     [llmemory.GCREF], lltype.Void,
+    ///     EffectInfo.MOST_GENERAL,
+    ///     oopspecindex=EffectInfo.OS_JIT_FORCE_VIRTUALIZABLE)
+    /// ```
+    pub fn make_clear_vable_descr() -> DescrRef {
+        use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex};
+        crate::call_descr::make_call_descr_with_effect(
+            &[Type::Ref],
+            Type::Void,
+            // rpython/jit/metainterp/virtualizable.py:296 — the force helper
+            // clears the vable_token in place; it cannot raise.
+            EffectInfo::const_new(
+                ExtraEffect::CannotRaise,
+                OopSpecIndex::JitForceVirtualizable,
+            ),
         )
     }
 

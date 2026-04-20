@@ -1345,9 +1345,9 @@ impl<M: Clone> MetaInterp<M> {
     /// Update the green_key associated with the current trace.
     /// Called when tracing started at function entry but the loop closes
     /// at a backward jump with a different PC.
-    pub fn update_tracing_green_key(&mut self, key: u64) {
+    pub fn update_tracing_green_key(&mut self, key: u64, raw: (usize, usize)) {
         if let Some(ctx) = self.tracing.as_mut() {
-            ctx.green_key = key;
+            ctx.set_green_key(key, raw);
         }
     }
 
@@ -1609,13 +1609,14 @@ impl<M: Clone> MetaInterp<M> {
     /// from the returned InputArg OpRefs (OpRef(0), OpRef(1), ...).
     pub fn on_back_edge(&mut self, green_key: u64, live_values: &[i64]) -> BackEdgeAction {
         let typed_values: Vec<Value> = live_values.iter().copied().map(Value::Int).collect();
-        self.on_back_edge_typed(green_key, None, None, &typed_values)
+        self.on_back_edge_typed(green_key, (0, 0), None, None, &typed_values)
     }
 
     /// Force-start tracing for a green key, bypassing the hot counter.
     pub fn force_start_tracing(
         &mut self,
         green_key: u64,
+        green_key_raw: (usize, usize),
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
@@ -1639,6 +1640,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
 
                 let mut ctx = TraceCtx::new(recorder, green_key);
+                ctx.set_root_green_key_raw(green_key_raw);
                 ctx.initial_inputarg_consts = live_values
                     .iter()
                     .map(|v| {
@@ -1700,6 +1702,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn bound_reached(
         &mut self,
         green_key: u64,
+        green_key_raw: (usize, usize),
         green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
@@ -1712,6 +1715,7 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing(recorder) => self.setup_tracing(
                 green_key,
+                green_key_raw,
                 green_key_values,
                 driver_descriptor,
                 live_values,
@@ -1725,6 +1729,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn on_back_edge_typed(
         &mut self,
         green_key: u64,
+        green_key_raw: (usize, usize),
         green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
@@ -1737,6 +1742,7 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing(recorder) => self.setup_tracing(
                 green_key,
+                green_key_raw,
                 green_key_values,
                 driver_descriptor,
                 live_values,
@@ -1750,6 +1756,7 @@ impl<M: Clone> MetaInterp<M> {
     fn setup_tracing(
         &mut self,
         green_key: u64,
+        green_key_raw: (usize, usize),
         green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
@@ -1776,6 +1783,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             TraceCtx::new(recorder, green_key)
         };
+        ctx.set_root_green_key_raw(green_key_raw);
         ctx.initial_inputarg_consts = live_values
             .iter()
             .map(|v| {
@@ -2329,11 +2337,16 @@ impl<M: Clone> MetaInterp<M> {
     /// RPython JC_TRACING parity: check if we are currently tracing
     /// this specific green key. Returns false for different green keys,
     /// matching RPython's per-cell JC_TRACING flag.
+    ///
+    /// `target_raw` is the structured `(code_ptr, pc)` greenkey;
+    /// comparison routes through `TraceCtx::is_tracing_key` which walks
+    /// `green_key_raw` + `inline_frames` element-wise (pyjitpl.py:1396-
+    /// 1401 parity).
     #[inline]
-    pub fn is_tracing_key(&self, green_key: u64) -> bool {
+    pub fn is_tracing_key(&self, target_raw: (usize, usize)) -> bool {
         self.tracing
             .as_ref()
-            .is_some_and(|ctx| ctx.green_key == green_key || ctx.root_green_key() == green_key)
+            .is_some_and(|ctx| ctx.is_tracing_key(target_raw))
     }
 
     /// Finish the current active trace without optimizing or compiling it.
@@ -2493,7 +2506,6 @@ impl<M: Clone> MetaInterp<M> {
                     let ok = self.compile_retrace(jump_args, meta.clone());
                     if ok {
                         self.cancel_count = 0;
-                        self.warm_state.reset_function_counts();
                         return CompileOutcome::Compiled {
                             green_key: 0,
                             from_retry: false,
@@ -2509,7 +2521,6 @@ impl<M: Clone> MetaInterp<M> {
                         if let Some(ctx) = self.tracing.take() {
                             self.warm_state.abort_tracing(ctx.green_key, false);
                         }
-                        self.warm_state.reset_function_counts();
                         return CompileOutcome::Aborted;
                     }
                     // Not too many — clear retrace state and fall through
@@ -2524,7 +2535,6 @@ impl<M: Clone> MetaInterp<M> {
                     if let Some(ctx) = self.tracing.take() {
                         self.warm_state.abort_tracing(ctx.green_key, false);
                     }
-                    self.warm_state.reset_function_counts();
                     return CompileOutcome::Aborted;
                 }
             }
@@ -2813,7 +2823,6 @@ impl<M: Clone> MetaInterp<M> {
                             Err(_) => {
                                 self.warm_state.abort_tracing(green_key, false);
                                 self.exported_state = None;
-                                self.warm_state.reset_function_counts();
                                 return CompileOutcome::Aborted;
                             }
                         }
@@ -2864,7 +2873,6 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.cancel_count += 1;
-                self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
         };
@@ -2881,7 +2889,6 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.cancel_count += 1;
-                self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
         };
@@ -3021,7 +3028,6 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
-                self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
         };
@@ -3148,7 +3154,6 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
-                self.warm_state.reset_function_counts();
                 let from_retry = self.cancel_count > 0;
                 // When replacing an existing inner-loop entry with a
                 // cross-loop cut, suppress meta rebuild — the existing
@@ -3179,7 +3184,6 @@ impl<M: Clone> MetaInterp<M> {
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
-                self.warm_state.reset_function_counts();
                 return CompileOutcome::Cancelled;
             }
         }
@@ -3901,7 +3905,6 @@ impl<M: Clone> MetaInterp<M> {
             }
             ctx.recorder.abort();
             self.warm_state.abort_tracing(green_key, permanent);
-            self.warm_state.reset_function_counts();
             self.pending_token = None;
             // Stash green_key / permanent for the subsequent
             // `aborted_tracing` call so its hook fires with the upstream
@@ -4252,7 +4255,6 @@ impl<M: Clone> MetaInterp<M> {
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
                     .attach_procedure_to_interp(green_key, install_token);
-                self.warm_state.reset_function_counts();
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -4273,7 +4275,6 @@ impl<M: Clone> MetaInterp<M> {
                     cb(green_key, &msg);
                 }
                 self.warm_state.abort_tracing(green_key, false);
-                self.warm_state.reset_function_counts();
                 // pyjitpl.py:2761/:2786 `aborted_tracing` is the single
                 // bump site for `stats.aborted()`; keep the increment
                 // there so the caller-side `aborted_tracing(stb.reason)`
@@ -5385,65 +5386,18 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// rstack.py stack_almost_full: True if stack is > 15/16th full.
-    /// compile.py:703: skip bridge compilation when stack space is low.
+    /// rpython/rlib/rstack.py:75-90 `stack_almost_full` — delegates to
+    /// the interpreter-registered hook (see
+    /// `majit_metainterp::register_stack_almost_full_hook`) which reads
+    /// `PYRE_STACKTOOBIG.stack_end` / `stack_length` and tracks
+    /// `sys.setrecursionlimit`. Without a registered hook (tests),
+    /// returns `false` matching `if not we_are_translated: return False`
+    /// at rstack.py:76-77. Used by `compile.py:702-703` to skip bridge
+    /// compilation and by `warmstate.py:430` to back off when stack
+    /// space is tight.
     #[inline]
     pub fn stack_almost_full() -> bool {
-        // rstack.py: remaining < length * 15/16 means almost full.
-        // Use platform API to get accurate stack bounds.
-        let local_var: u8 = 0;
-        let sp = &local_var as *const u8 as usize;
-        #[cfg(target_os = "macos")]
-        {
-            unsafe extern "C" {
-                fn pthread_self() -> usize;
-                fn pthread_get_stackaddr_np(thread: usize) -> *const u8;
-                fn pthread_get_stacksize_np(thread: usize) -> usize;
-            }
-            let thread = unsafe { pthread_self() };
-            let stack_top = unsafe { pthread_get_stackaddr_np(thread) } as usize;
-            let stack_size = unsafe { pthread_get_stacksize_np(thread) };
-            // Stack grows downward: remaining = sp - stack_bottom
-            let stack_bottom = stack_top.saturating_sub(stack_size);
-            let remaining = sp.saturating_sub(stack_bottom);
-            let threshold = stack_size / 16; // 1/16 of total
-            return remaining < threshold;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::mem::MaybeUninit;
-            unsafe extern "C" {
-                fn pthread_self() -> usize;
-                fn pthread_getattr_np(thread: usize, attr: *mut [u8; 64]) -> i32;
-                fn pthread_attr_getstack(
-                    attr: *const [u8; 64],
-                    stackaddr: *mut *mut u8,
-                    stacksize: *mut usize,
-                ) -> i32;
-                fn pthread_attr_destroy(attr: *mut [u8; 64]) -> i32;
-            }
-            let mut attr = MaybeUninit::<[u8; 64]>::zeroed();
-            let thread = unsafe { pthread_self() };
-            if unsafe { pthread_getattr_np(thread, attr.as_mut_ptr()) } == 0 {
-                let attr = unsafe { attr.assume_init_mut() };
-                let mut stack_addr: *mut u8 = std::ptr::null_mut();
-                let mut stack_size: usize = 0;
-                if unsafe { pthread_attr_getstack(attr, &mut stack_addr, &mut stack_size) } == 0 {
-                    unsafe { pthread_attr_destroy(attr) };
-                    let stack_bottom = stack_addr as usize;
-                    let remaining = sp.saturating_sub(stack_bottom);
-                    let threshold = stack_size / 16;
-                    return remaining < threshold;
-                }
-                unsafe { pthread_attr_destroy(attr) };
-            }
-            false // fallback: assume not full
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = sp;
-            false // unsupported platform: assume not full
-        }
+        crate::stack_almost_full()
     }
 
     /// pyjitpl.py:2345-2348: try_to_free_some_loops — advance the
@@ -6035,6 +5989,20 @@ impl<M: Clone> MetaInterp<M> {
         let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
         let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
         exit_layout.rd_virtuals.clone()
+    }
+
+    /// resume.py:926 _prepare parity: get rd_pendingfields for a guard.
+    pub fn get_rd_pendingfields(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<majit_ir::GuardPendingFieldEntry>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
+        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        exit_layout.rd_pendingfields.clone()
     }
 
     /// compile.py:1002-1021 ResumeFromInterpDescr.compile_and_attach parity.
@@ -6849,6 +6817,14 @@ impl<M: Clone> MetaInterp<M> {
         let exit_layout =
             Self::compiled_exit_layout_from_trace(trace, green_key, norm_tid, fail_index)?;
 
+        // compile.py:973-985 don't interrupt me! If the stack runs out
+        // in force_from_resumedata() then we have seen cpu.force() but
+        // not self.save_data(), leaving in an inconsistent state.
+        //
+        // RPython wraps the body in try/finally. CriticalCodeGuard's
+        // Drop impl re-enables report_error on every exit — including
+        // panic unwind — matching the RPython contract.
+        let _cc_guard = crate::CriticalCodeGuard::enter();
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
         let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
         let rd_consts: Vec<i64> = exit_layout
@@ -6871,6 +6847,7 @@ impl<M: Clone> MetaInterp<M> {
             None, // ginfo — pyre has no greenfield mechanism
             &allocator,
         );
+        drop(_cc_guard);
         // compile.py:999-1000: obj = AllVirtuals(all_virtuals)
         //   metainterp_sd.cpu.set_savedata_ref(deadframe, obj.hide())
         // Return the virtual caches so the caller can store them.
@@ -7012,6 +6989,12 @@ impl<M: Clone> MetaInterp<M> {
                     rd_virtuals: None,
                     rd_pendingfields: None,
                 });
+        // pyjitpl.py:3277-3288 initialize_state_from_guard_failure:
+        // guard failure rebuild is stack-critical code — must not be
+        // interrupted by StackOverflow, otherwise jit_virtual_refs are
+        // left in a dangling state. RPython try/finally; Rust Drop
+        // guard — see CriticalCodeGuard.
+        let _cc_guard = crate::CriticalCodeGuard::enter();
         let reconstructed_state = exit_layout
             .resume_layout
             .as_ref()
@@ -7034,6 +7017,7 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .map(|state| state.pending_fields.clone())
             .unwrap_or_default();
+        drop(_cc_guard);
 
         Some(GuardRecovery {
             trace_id,
@@ -7722,49 +7706,93 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Check if a function call should be inlined during tracing.
     ///
-    /// Mirrors RPython's inlining heuristic from warmstate.py:
-    /// 1. If the callee already has compiled code → CALL_ASSEMBLER
-    /// 2. If not tracing → residual call
-    /// 3. If recursion depth too deep → residual call
-    /// 4. If the function hasn't been called enough times → residual call
-    ///    (controlled by `function_threshold`)
-    /// 5. Otherwise → inline
+    /// Line-by-line port of `_opimpl_recursive_call` (pyjitpl.py:1375-1423)
+    /// + `do_recursive_call` (pyjitpl.py:1425-1432). Decision flow:
     ///
-    /// `callee_key` identifies the called function's JitDriver.
-    pub fn should_inline(&mut self, callee_key: u64) -> InlineDecision {
+    /// 1. Not tracing → CALL_ASSEMBLER if compiled, else residual.
+    /// 2. `!can_inline_callable` (cell has `JC_DONT_TRACE_HERE` or
+    ///    `can_never_inline`) → fall through to assembler / residual.
+    /// 3. `recursive_depth >= max_unroll_recursion` → `dont_trace_here`
+    ///    + fall through to assembler / residual.
+    /// 4. Otherwise → inline (`perform_call`).
+    ///
+    /// `recursive_depth` mirrors the RPython framestack walk at
+    /// pyjitpl.py:1389-1402 which skips frames with `greenkey is None`
+    /// (the root frame created by `initialize_state_from_start` /
+    /// `newframe(mainjitcode)` at pyjitpl.py:3270 — always greenkey-None).
+    /// Pyre's `has_inline_frame_for` therefore walks `inline_frames`
+    /// only, which counts the same population: already-inlined portal
+    /// frames.
+    pub fn should_inline(&mut self, callee_key: u64, callee_raw: (usize, usize)) -> InlineDecision {
         // Extract inline-relevant info from ctx before calling impl
         // (avoids borrow conflict between self.tracing and &mut self).
-        let ctx_info = self.tracing.as_ref().map(|ctx| {
-            (
-                ctx.inline_depth(),
-                ctx.is_tracing_key(callee_key),
-                ctx.recursive_depth(callee_key),
-            )
-        });
+        let ctx_info = self
+            .tracing
+            .as_ref()
+            .map(|ctx| (ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
         self.should_inline_core(callee_key, ctx_info)
     }
 
     pub fn should_inline_with_ctx(
         &mut self,
         callee_key: u64,
+        callee_raw: (usize, usize),
         ctx: &crate::trace_ctx::TraceCtx,
     ) -> InlineDecision {
-        let ctx_info = Some((
-            ctx.inline_depth(),
-            ctx.is_tracing_key(callee_key),
-            ctx.recursive_depth(callee_key),
-        ));
+        let ctx_info = Some((ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
         self.should_inline_core(callee_key, ctx_info)
     }
 
-    /// Core inline decision logic.
-    /// ctx_info: Option<(inline_depth, is_tracing_key, recursive_depth)>
+    /// Core inline decision logic — RPython `_opimpl_recursive_call`
+    /// (pyjitpl.py:1375-1423) + `do_recursive_call`
+    /// (pyjitpl.py:1425-1432) + `do_residual_call`
+    /// (pyjitpl.py:1996-2055) decision tree.
+    ///
+    /// `ctx_info = Some((inline_depth, recursive_depth))` when tracing,
+    /// `None` outside a trace.
+    ///
+    /// pyre note: `recursive_depth` here is the direct analog of
+    /// RPython's `count` at pyjitpl.py:1389-1402 and uses the same
+    /// gate as RPython — a flat `< max_unroll_recursion` check.
+    /// There is no `is_self_recursive` secondary gate (pyjitpl.py
+    /// does not distinguish "self-recursive" from "recursive depth N"
+    /// — `count` is a single integer) and no
+    /// `should_inline_function` helper-threshold (that was pyre's
+    /// runtime stand-in for RPython's jtransform-time helper-inlining
+    /// decision; until jtransform is ported, eager inlining on hot
+    /// paths is accepted as a temporary perf regression).
     fn should_inline_core(
         &mut self,
         callee_key: u64,
-        ctx_info: Option<(usize, bool, usize)>,
+        ctx_info: Option<(usize, usize)>,
     ) -> InlineDecision {
-        let callee_compiled = self.compiled_loops.contains_key(&callee_key);
+        // pyre adaptation: `pending_token` covers the window between
+        // beginning a self-recursive CALL_ASSEMBLER convergence and
+        // installing the compiled trace in `compiled_loops`. RPython
+        // closes the same gap through `get_assembler_token`, which
+        // synthesises a `compile_tmp_callback` token on demand
+        // (warmstate.py:714). Pyre has no `compile_tmp_callback`, so
+        // the pending-token entry stands in for an already-installed
+        // token for inlining-decision purposes only.
+        let callee_compiled = self.compiled_loops.contains_key(&callee_key)
+            || self.pending_token.map_or(false, |(k, _)| k == callee_key);
+
+        // Not tracing: pyjitpl.py:1381 `warmrunnerstate.inlining`
+        // is only meaningful inside a trace. Route compiled
+        // callees to CALL_ASSEMBLER and the rest residually.
+        let Some((inline_depth, recursive_depth)) = ctx_info else {
+            if callee_compiled {
+                return InlineDecision::CallAssembler;
+            }
+            return InlineDecision::ResidualCall;
+        };
+
+        // pyjitpl.py:1382 `warmrunnerstate.can_inline_callable(greenboxes)`:
+        // returns False when the cell is flagged `JC_DONT_TRACE_HERE`
+        // (set at 1413 by `dont_trace_here` after recursion reached
+        // `max_unroll_recursion`) or when `can_never_inline` is True.
+        // When False, pyjitpl.py:1417 sets `assembler_call = True`
+        // and falls through to `do_recursive_call`.
         if !self.warm_state.can_inline_callable(callee_key) {
             if callee_compiled {
                 return InlineDecision::CallAssembler;
@@ -7772,48 +7800,35 @@ impl<M: Clone> MetaInterp<M> {
             return InlineDecision::ResidualCall;
         }
 
-        if let Some((inline_depth, is_self_recursive, recursive_depth)) = ctx_info {
-            if inline_depth >= MAX_INLINE_DEPTH {
-                if callee_compiled {
-                    return InlineDecision::CallAssembler;
-                }
-                return InlineDecision::ResidualCall;
+        // pyre-only safety guard. RPython imposes no cap on
+        // `metainterp.framestack` depth beyond `rstack`; this bound
+        // exists to protect the Rust interpreter thread from
+        // runaway native-stack usage when a trace keeps inlining.
+        if inline_depth >= MAX_INLINE_DEPTH {
+            if callee_compiled {
+                return InlineDecision::CallAssembler;
             }
-
-            // pyjitpl.py:1382-1416 _opimpl_recursive_call:
-            // Self-recursion uses max_unroll_recursion strategy.
-            // depth < max_unroll → Inline (perform_call path).
-            // depth >= max_unroll → CallAssembler if token exists.
-            // RPython's get_assembler_token (warmstate.py:714) creates
-            // a compile_tmp_callback when no token exists. Pyre lacks
-            // compile_tmp_callback, so ResidualCall when no token.
-            // dont_trace_here is called by the dispatch site (Phase 1).
-            if is_self_recursive {
-                if recursive_depth < self.max_unroll_recursion {
-                    return InlineDecision::Inline;
-                }
-                if callee_compiled || self.pending_token.map_or(false, |(k, _)| k == callee_key) {
-                    return InlineDecision::CallAssembler;
-                }
-                return InlineDecision::ResidualCall;
-            }
-
-            if !self.warm_state.should_inline_function(callee_key) {
-                if callee_compiled {
-                    return InlineDecision::CallAssembler;
-                }
-                return InlineDecision::ResidualCall;
-            }
-
-            return InlineDecision::Inline;
+            return InlineDecision::ResidualCall;
         }
 
-        // Not tracing — use CALL_ASSEMBLER if compiled.
-        if callee_compiled {
-            return InlineDecision::CallAssembler;
+        // pyjitpl.py:1404 `count >= max_unroll_recursion` →
+        // `dont_trace_here(greenboxes)` + fall through to
+        // `do_recursive_call(..., assembler_call=True)`. Pyre's
+        // tracer also calls `disable_noninlinable_function` at the
+        // same decision point (trace_opcode.rs:3044-3049); doing it
+        // here too is idempotent and keeps the metainterp path
+        // self-consistent when entered without the tracer wrapper.
+        if recursive_depth >= self.max_unroll_recursion {
+            self.warm_state.disable_noninlinable_function(callee_key);
+            if callee_compiled {
+                return InlineDecision::CallAssembler;
+            }
+            return InlineDecision::ResidualCall;
         }
 
-        InlineDecision::ResidualCall
+        // pyjitpl.py:1415 `perform_call(portal_code, allboxes,
+        // greenkey=greenboxes)`.
+        InlineDecision::Inline
     }
 
     /// Begin inlining a function call during tracing.
@@ -7824,7 +7839,7 @@ impl<M: Clone> MetaInterp<M> {
     /// semantics and only bloat the trace.
     ///
     /// Returns `true` if inlining started, `false` if not tracing or depth exceeded.
-    pub fn enter_inline_frame(&mut self, callee_key: u64) -> bool {
+    pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return false,
@@ -7833,7 +7848,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        ctx.push_inline_frame(callee_key, MAX_INLINE_DEPTH as u32);
+        ctx.push_inline_frame(callee_raw, MAX_INLINE_DEPTH as u32);
         true
     }
 
@@ -8685,7 +8700,13 @@ impl<M: Clone> MetaInterp<M> {
         // Bump the existing TraceCtx inline-depth counter so trace
         // recorder bookkeeping (already wired through pyre's tracer)
         // stays in sync; the canonical frame storage is `framestack`.
-        let _ = self.enter_inline_frame(greenkey.unwrap_or_default());
+        // The `newframe` path predates the raw (code_ptr, pc) greenkey
+        // and operates on sub-jitcodes rather than portal frames, so
+        // project the u64 greenkey into the raw slot verbatim —
+        // pyjitpl.py:1396-1401 element-wise parity still holds because
+        // this caller doesn't feed the recursion-depth walk.
+        let raw = (greenkey.unwrap_or_default() as usize, 0);
+        let _ = self.enter_inline_frame(raw);
         // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
         let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
         frame.greenkey = greenkey;
@@ -8943,8 +8964,12 @@ impl<M: Clone> MetaInterp<M> {
         result_type: majit_ir::Type,
     ) -> Result<(), SwitchToBlackhole> {
         // pyjitpl.py:3199 self.store_token_in_vable()
-        // store_token_in_vable_setfield is a no-op when no virtualizable
-        // is registered or when the frontend already wrote the token.
+        // Early-return on no-vinfo / no-vbox / forced_virtualizable ==
+        // vbox (pyjitpl.py:3223-3228). The accompanying GUARD_NOT_FORCED_2
+        // is emitted by the pyre frontend wrapper
+        // (pyre-jit-trace/src/trace_opcode.rs::store_token_in_vable)
+        // through MIFrame::generate_guard so the guard captures fresh
+        // resumedata at the current framestack position.
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.store_token_in_vable_setfield();
         }
@@ -9011,6 +9036,11 @@ impl<M: Clone> MetaInterp<M> {
         valuebox: Option<OpRef>,
     ) -> Result<(), SwitchToBlackhole> {
         // pyjitpl.py:3239 self.store_token_in_vable()
+        // Same split as compile_done_with_this_frame: the
+        // GUARD_NOT_FORCED_2 that RPython's store_token_in_vable emits
+        // (pyjitpl.py:3236) is produced by the pyre frontend wrapper
+        // (pyre-jit-trace/src/trace_opcode.rs::store_token_in_vable)
+        // through MIFrame::generate_guard.
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.store_token_in_vable_setfield();
         }
@@ -11005,7 +11035,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
         // Use a real callable address so executor::execute_varargs does
@@ -11069,7 +11099,7 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_void_helper as i64 as usize;
         meta.staticdata
             .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
         let funcbox = (JitArgKind::Ref, OpRef(100), fnaddr as i64); // non-Const
@@ -11293,7 +11323,7 @@ mod metainterp_static_data_tests {
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
 
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         struct NoopSym;
@@ -11456,7 +11486,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr = StubCallDescr {
@@ -11517,7 +11547,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr = StubCallDescr {
@@ -11579,7 +11609,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -11696,7 +11726,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut portal = JitCodeBuilder::new().finish();
@@ -11717,7 +11747,7 @@ mod metainterp_static_data_tests {
         // remove.  Single-frame stack short-circuits.
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
-        meta.force_start_tracing(0, None, &[]);
+        meta.force_start_tracing(0, (0, 0), None, &[]);
 
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
         meta.perform_call(jitcode, &[], None).unwrap_err();
@@ -11738,7 +11768,7 @@ mod metainterp_static_data_tests {
         // ConstInt(resvalue) is returned in place of the op.
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -11807,7 +11837,7 @@ mod metainterp_static_data_tests {
         // assembler_call).
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -11853,7 +11883,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -11899,7 +11929,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -11951,7 +11981,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut effect = majit_ir::EffectInfo::default();
@@ -11996,7 +12026,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -12043,7 +12073,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -12092,7 +12122,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -12147,8 +12177,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:1882-1886 — ovf_flag → GUARD_OVERFLOW + pc=label, return None
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
-        meta.force_start_tracing(0, None, &[]);
-        let action = meta.force_start_tracing(0, None, &[]);
+        meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         // Already tracing returns AlreadyTracing — that's fine, the
         // first call already started the trace.
         let _ = action;
@@ -12178,7 +12208,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:1888-1890 — !ovf_flag → GUARD_NO_OVERFLOW, return resbox
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.ovf_flag = false;
@@ -12201,7 +12231,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.last_exc_value = 0;
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let result = meta.handle_possible_exception();
         assert!(matches!(result, Ok(())));
@@ -12227,7 +12257,7 @@ mod metainterp_static_data_tests {
         meta.cls_of_box = Some(|_| 0xc1a55);
         meta.last_exc_value = 0xfeed;
 
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         // pyjitpl.py:2533-2538: with an empty framestack the exception
         // unwind drains immediately and surfaces
@@ -12276,7 +12306,7 @@ mod metainterp_static_data_tests {
         meta.last_exc_value = 0xfeed;
         meta.class_of_last_exc_is_const = true;
 
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let result = meta.handle_possible_exception();
         assert!(matches!(
@@ -12491,7 +12521,7 @@ mod metainterp_static_data_tests {
         meta.cls_of_box = Some(|_| 0xcafef00d);
         meta.last_exc_value = 0xbeef;
 
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.framestack
@@ -12640,7 +12670,7 @@ mod metainterp_static_data_tests {
         // ConstInt(jd_no), ConstInt(unique_id), None)
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.enter_portal_frame(3, 0xfeed);
@@ -12667,7 +12697,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2459 — history.record1(rop.LEAVE_PORTAL_FRAME, ConstInt(jd_no), None)
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.leave_portal_frame(7);
@@ -13044,10 +13074,16 @@ mod tests {
         attach_procedure_to_interp_entry(meta, green_key, &inputargs, ops, constants);
     }
 
+    extern "C" fn test_clear_vable_token(_gcref: *mut u8) {}
+
     fn test_vable_info_static_only() -> VirtualizableInfo {
         let mut info = VirtualizableInfo::new(0);
         info.add_field("pc", Type::Int, 8);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info.set_clear_vable(
+            test_clear_vable_token as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
         info
     }
 
@@ -13062,6 +13098,10 @@ mod tests {
             majit_ir::make_array_descr(0, 8, Type::Int),
         );
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info.set_clear_vable(
+            test_clear_vable_token as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
         info
     }
 
@@ -13090,7 +13130,7 @@ mod tests {
     ) {
         meta.set_virtualizable_info(info);
         meta.set_vable_array_lengths(array_lengths);
-        let action = meta.force_start_tracing(777, None, live_values);
+        let action = meta.force_start_tracing(777, (0, 0), None, live_values);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
     }
 
@@ -13254,12 +13294,13 @@ mod tests {
         // followed by the caller's GETFIELD_GC_I (the actual non-vable
         // field read).
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 5);
+        assert_eq!(ops.len(), 6);
         assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
         assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
         assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
         assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
-        assert_eq!(ops[4].opcode, OpCode::GetfieldGcI); // caller fallback
+        assert_eq!(ops[4].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
+        assert_eq!(ops[5].opcode, OpCode::GetfieldGcI); // caller fallback
     }
 
     #[test]
@@ -13287,13 +13328,14 @@ mod tests {
         // and Step 5a GETFIELD_GC_R(token_descr) + PTR_NE) precede the
         // caller's two-op fallback, totalling 6 ops.
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 6);
+        assert_eq!(ops.len(), 7);
         assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
         assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
         assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
         assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
-        assert_eq!(ops[4].opcode, OpCode::GetfieldGcR); // caller fallback: arraybox
-        assert_eq!(ops[5].opcode, OpCode::GetarrayitemGcI); // caller fallback: item read
+        assert_eq!(ops[4].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
+        assert_eq!(ops[5].opcode, OpCode::GetfieldGcR); // caller fallback: arraybox
+        assert_eq!(ops[6].opcode, OpCode::GetarrayitemGcI); // caller fallback: item read
     }
 
     #[test]
@@ -13418,7 +13460,7 @@ mod tests {
                 previous_tokens: Vec::new(),
             },
         );
-        let action = meta.force_start_tracing(777, None, &[]);
+        let action = meta.force_start_tracing(777, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let frame_box = {
             let ctx = meta.trace_ctx().unwrap();
@@ -13582,7 +13624,7 @@ mod tests {
             "virtualizable config should only exist while tracing is active"
         );
 
-        let action = meta.force_start_tracing(777, None, &[Value::Int(0x1234)]);
+        let action = meta.force_start_tracing(777, (0, 0), None, &[Value::Int(0x1234)]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert!(
             meta.current_virtualizable_optimizer_config().is_none(),

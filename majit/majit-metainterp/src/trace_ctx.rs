@@ -39,9 +39,22 @@ pub struct TraceCtx {
     pub(crate) recorder: Trace,
     pub(crate) green_key: u64,
     root_green_key: u64,
+    /// Structured `(code_ptr, pc)` counterpart to `green_key`. Keeps
+    /// pyjitpl.py:1396-1401's element-wise `same_constant` parity when
+    /// comparing against inline-frame green keys; the u64 `green_key`
+    /// above is the hash derived from this pair and stays the identity
+    /// key for HashMap lookups (warmstate / compiled_loops / pending
+    /// token) while comparisons route through the raw pair.
+    pub(crate) green_key_raw: (usize, usize),
+    root_green_key_raw: (usize, usize),
     pub(crate) constants: ConstantPool,
-    /// Stack of inlined function frames (callee green_keys).
-    inline_frames: Vec<u64>,
+    /// Stack of inlined function frames (callee green keys as raw
+    /// `(code_ptr, pc)` pairs). rpython/jit/metainterp/pyjitpl.py:1390
+    /// walks `self.metainterp.framestack` element-wise; pyre mirrors
+    /// that by storing the structured greenkey per inline frame and
+    /// doing tuple-equality comparisons in [`recursive_depth`] and
+    /// [`is_tracing_key`].
+    inline_frames: Vec<(usize, usize)>,
     /// Start positions for currently active inlined trace-through frames.
     ///
     /// This mirrors the subset of PyPy's `portal_trace_positions` that we
@@ -315,6 +328,8 @@ impl TraceCtx {
             recorder,
             green_key,
             root_green_key: green_key,
+            green_key_raw: (0, 0),
+            root_green_key_raw: (0, 0),
             constants: ConstantPool::new(),
             inline_frames: Vec::new(),
             inline_trace_positions: Vec::new(),
@@ -363,6 +378,8 @@ impl TraceCtx {
             recorder,
             green_key,
             root_green_key: green_key,
+            green_key_raw: (0, 0),
+            root_green_key_raw: (0, 0),
             constants: ConstantPool::new(),
             inline_frames: Vec::new(),
             inline_trace_positions: Vec::new(),
@@ -408,20 +425,57 @@ impl TraceCtx {
     /// RPython pyjitpl.py reached_loop_header(): when func-entry tracing
     /// hits a back-edge, the loop must be registered under the back-edge's
     /// green key, not the function-entry key.
-    pub fn set_green_key(&mut self, key: u64) {
+    pub fn set_green_key(&mut self, key: u64, raw: (usize, usize)) {
         self.green_key = key;
+        self.green_key_raw = raw;
     }
 
-    /// Check if `key` matches the current trace's green_key or any
-    /// inlined frame's key. Used for self-recursion detection.
-    pub fn is_tracing_key(&self, key: u64) -> bool {
-        self.green_key == key || self.inline_frames.contains(&key)
+    /// Record the structured greenkey for the root trace. Called once
+    /// at trace start to seed `green_key_raw` and `root_green_key_raw`
+    /// from the tracer-side `(code_ptr, pc)`. Subsequent back-edge
+    /// retargeting flows through [`set_green_key`].
+    pub fn set_root_green_key_raw(&mut self, raw: (usize, usize)) {
+        self.green_key_raw = raw;
+        self.root_green_key_raw = raw;
     }
 
-    /// Count how many times `key` appears in the frame stack (recursive depth).
-    pub fn recursive_depth(&self, key: u64) -> usize {
-        let root = if self.green_key == key { 1 } else { 0 };
-        root + self.inline_frames.iter().filter(|&&k| k == key).count()
+    /// pyjitpl.py:1396-1401 element-wise greenkey comparison against
+    /// the current trace's greenkey and each inline-frame greenkey.
+    pub fn is_tracing_key(&self, target: (usize, usize)) -> bool {
+        self.green_key_raw == target
+            || self.root_green_key_raw == target
+            || self.inline_frames.contains(&target)
+    }
+
+    /// pyjitpl.py:1390-1402 recursion counting only walks portal
+    /// frames already pushed on `framestack`; the root trace entry is
+    /// not counted unless it has become an actual inline frame.
+    pub fn has_inline_frame_for(&self, target: (usize, usize)) -> bool {
+        self.inline_frames.contains(&target)
+    }
+
+    /// pyjitpl.py:1389-1402 `_opimpl_recursive_call` element-wise walk:
+    ///
+    /// ```python
+    /// count = 0
+    /// for f in self.metainterp.framestack:
+    ///     if f.jitcode is not portal_code: continue
+    ///     gk = f.greenkey
+    ///     for i in range(len(gk)):
+    ///         if not gk[i].same_constant(greenboxes[i]): break
+    ///     else: count += 1
+    /// ```
+    ///
+    /// Pyre's greenkey is `(code_ptr, pc)` — a fixed-arity pair — so
+    /// tuple equality reproduces the element-wise `same_constant`
+    /// result without an intermediate hash that could falsely collide.
+    ///
+    /// Only inlined portal frames count here. The root frame is
+    /// created without a `greenkey` in upstream `initialize_state_from_start`
+    /// / `newframe(mainjitcode)`, so counting `root_green_key_raw` would
+    /// make self-recursion hit `max_unroll_recursion` one level early.
+    pub fn recursive_depth(&self, target: (usize, usize)) -> usize {
+        self.inline_frames.iter().filter(|&&k| k == target).count()
     }
 
     /// Register a deferred OpRef replacement. When the trace is finalized,
@@ -560,11 +614,14 @@ impl TraceCtx {
 
     /// Push an inline frame (entering a callee).
     /// Returns false if the max inline depth has been exceeded.
-    pub(crate) fn push_inline_frame(&mut self, callee_key: u64, max_depth: u32) -> bool {
+    /// `callee_raw` is the structured `(code_ptr, pc)` greenkey, stored
+    /// in `inline_frames` so `recursive_depth` / `is_tracing_key` can
+    /// walk it element-wise (pyjitpl.py:1396-1401 parity).
+    pub(crate) fn push_inline_frame(&mut self, callee_raw: (usize, usize), max_depth: u32) -> bool {
         if (self.inline_frames.len() as u32) >= max_depth {
             return false;
         }
-        self.inline_frames.push(callee_key);
+        self.inline_frames.push(callee_raw);
         true
     }
 
@@ -1378,6 +1435,54 @@ impl TraceCtx {
         self.vable_setfield_descr(vable_opref, null, info.token_field_descr());
     }
 
+    /// pyjitpl.py:1148-1158 `MIFrame.emit_force_virtualizable(fielddescr, box)`.
+    ///
+    /// ```text
+    /// def emit_force_virtualizable(self, fielddescr, box):
+    ///     vinfo = fielddescr.get_vinfo()
+    ///     assert vinfo is not None
+    ///     token_descr = vinfo.vable_token_descr
+    ///     mi = self.metainterp
+    ///     tokenbox = mi.execute_and_record(rop.GETFIELD_GC_R, token_descr, box)
+    ///     condbox = mi.execute_and_record(rop.PTR_NE, None, tokenbox, CONST_NULL)
+    ///     funcbox = ConstInt(rffi.cast(lltype.Signed, vinfo.clear_vable_ptr))
+    ///     calldescr = vinfo.clear_vable_descr
+    ///     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
+    ///                          calldescr, False, False)
+    /// ```
+    fn emit_force_virtualizable(&mut self, vable_opref: OpRef) {
+        //     vinfo = fielddescr.get_vinfo()
+        //     assert vinfo is not None
+        let info = self
+            .virtualizable_info
+            .clone()
+            .expect("emit_force_virtualizable: vinfo is None");
+        //     token_descr = vinfo.vable_token_descr
+        let token_descr = info.token_field_descr();
+        //     tokenbox = mi.execute_and_record(rop.GETFIELD_GC_R, token_descr, box)
+        let tokenbox = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
+        //     condbox = mi.execute_and_record(rop.PTR_NE, None, tokenbox, CONST_NULL)
+        let null_ref = self.const_null();
+        let condbox = self.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
+        //     funcbox = ConstInt(rffi.cast(lltype.Signed, vinfo.clear_vable_ptr))
+        let clear_ptr = info
+            .clear_vable_ptr
+            .expect("emit_force_virtualizable: clear_vable_ptr not set");
+        let funcbox = self.const_int(clear_ptr as i64);
+        //     calldescr = vinfo.clear_vable_descr
+        let clear_descr = info
+            .clear_vable_descr
+            .clone()
+            .expect("emit_force_virtualizable: clear_vable_descr not set");
+        //     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
+        //                          calldescr, False, False)
+        self.recorder.record_op_with_descr(
+            OpCode::CondCallN,
+            &[condbox, funcbox, vable_opref],
+            clear_descr,
+        );
+    }
+
     /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`.
     ///
     /// ```text
@@ -1500,23 +1605,7 @@ impl TraceCtx {
         //             rop.COND_CALL, [condbox, funcbox, box],
         //             vinfo.clear_vable_descr, False, False)
         if !self.heap_cache.is_unescaped(vable_opref) {
-            if let Some(info) = self.virtualizable_info.clone() {
-                let token_descr = info.token_field_descr();
-                let tokenbox =
-                    self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
-                let null_ref = self.const_null();
-                let condbox = self.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
-                if let (Some(clear_fn), Some(clear_descr)) =
-                    (info.clear_vable_fn, info.clear_vable_descr.clone())
-                {
-                    let funcbox = self.const_int(clear_fn as usize as i64);
-                    self.recorder.record_op_with_descr(
-                        OpCode::CondCallN,
-                        &[condbox, funcbox, vable_opref],
-                        clear_descr,
-                    );
-                }
-            }
+            self.emit_force_virtualizable(vable_opref);
         }
         // Step 5b: mark this box as a known nonstandard virtualizable so
         // future accesses short-circuit at Step 1.

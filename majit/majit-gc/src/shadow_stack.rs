@@ -10,28 +10,37 @@
 ///   Entry: inline MOVs push [is_minor=1, jf_ptr] to root stack
 ///   Per-call: push_gcmap writes jf_gcmap; pop_gcmap clears it
 ///   GC: walk_jf_roots → read jf_gcmap → trace ref slots
-///   Exit: inline SUB decrements root_stack_top by 2*WORD
+///   Exit: pop_jf_to(depth)   — _call_footer_shadowstack
 ///
 /// The jitframe shadow stack uses a flat memory array with a global
 /// root_stack_top pointer, matching RPython's ShadowStackPool.
 /// Compiled code manipulates root_stack_top with inline load/store
 /// instructions (no function calls), exactly as in assembler.py:1122-1136.
-use std::cell::RefCell;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, RefCell};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::GcRef;
 
-/// Maximum shadow stack depth. RPython uses a fixed-size stack.
-const MAX_SHADOW_STACK_DEPTH: usize = 8192;
+/// shadowstack.py:281 default root_stack_depth. RPython allocates
+/// `163840 * sizeofaddr` bytes for the initial shadow stack pool.
+const DEFAULT_SHADOW_STACK_DEPTH: usize = 163840;
 
 /// WORD size (bytes). RPython: arch.py WORD.
 const WORD: usize = std::mem::size_of::<usize>();
 
-// ── Flat jitframe shadow stack (ShadowStackPool parity) ─────────
+// ── Heap-allocated growable jitframe shadow stack (ShadowStackPool parity) ─
 //
-// RPython's ShadowStackPool pre-allocates a contiguous array. Each
-// entry is [is_minor_marker: WORD, jf_ptr: WORD] = 2*WORD bytes.
+// RPython's ShadowStackPool starts with `DEFAULT_ROOT_STACK_DEPTH`
+// entries and grows via `increase_root_stack_depth` which
+// `raw_malloc`s a larger buffer and copies the used portion
+// (rpython/memory/gctransform/shadowstack.py:351). Pyre mirrors this
+// with a single heap-allocated `Box<[usize]>` whose base pointer is
+// published through `ROOT_STACK_BASE`; compiled JIT code reads/writes
+// `ROOT_STACK_TOP` (stable static address) and dereferences it just
+// like RPython.
+//
+// Each entry is [is_minor_marker: WORD, jf_ptr: WORD] = 2*WORD bytes.
 // root_stack_top points past the last entry (next free slot).
 //
 // assembler.py:1122-1128 _call_header_shadowstack:
@@ -44,18 +53,26 @@ const WORD: usize = std::mem::size_of::<usize>();
 // assembler.py:1130-1136 _call_footer_shadowstack:
 //   SUB [root_stack_top_addr], 2*WORD  // decrement top
 
-/// Sync wrapper for the flat shadow stack buffer.
-struct RootStackBuf {
-    data: UnsafeCell<[usize; MAX_SHADOW_STACK_DEPTH * 2]>,
-}
-// SAFETY: JIT execution is single-threaded; buffer accessed only from
-// the thread that owns the compiled code.
-unsafe impl Sync for RootStackBuf {}
+/// Base pointer of the currently-allocated jitframe shadow-stack
+/// backing buffer. 0 until first use. Updated atomically during
+/// `increase_root_stack_depth` so subsequent pushes land in the new
+/// buffer. The `*mut usize` behind this address is held alive by
+/// [`ROOT_STACK_OWNER`] so this atomic always points into live memory.
+static ROOT_STACK_BASE: AtomicUsize = AtomicUsize::new(0);
 
-/// Pre-allocated flat array for jitframe shadow stack entries.
-static JF_ROOT_STACK: RootStackBuf = RootStackBuf {
-    data: UnsafeCell::new([0; MAX_SHADOW_STACK_DEPTH * 2]),
-};
+/// Current capacity in entries (each entry is 2 usize words). 0 until
+/// first use. `push_jf` asserts `depth < capacity` to catch any
+/// recursion that outruns `increase_root_stack_depth` — when this
+/// fires, the interpreter must have failed to call
+/// `increase_root_stack_depth` with a sufficient new depth.
+static ROOT_STACK_CAPACITY: AtomicUsize = AtomicUsize::new(0);
+
+/// Owns the actual `Box<[usize]>` backing buffer and serializes the
+/// allocation/grow sequence. Pushes and pops are lock-free — they only
+/// read the atomic base/top, which is safe because pyre is currently
+/// single-threaded so `increase_root_stack_depth` never overlaps a
+/// push/pop on the same thread.
+static ROOT_STACK_OWNER: Mutex<Option<Box<[usize]>>> = Mutex::new(None);
 
 /// Callback type for tracing a libc-allocated jitframe's interior.
 /// The jitframe lives in malloc memory (not nursery, not oldgen), so
@@ -115,17 +132,68 @@ pub fn trace_libc_jitframe(obj_addr: usize, update: &mut dyn FnMut(*mut GcRef)) 
     }
 }
 
-/// gc.py:255 root_stack_top — pointer into JF_ROOT_STACK.
-/// Compiled code reads/writes this with inline MOV instructions.
-/// Initialized to point at the start of JF_ROOT_STACK.
+/// gc.py:255 root_stack_top — pointer into the heap-allocated backing
+/// buffer. Compiled code reads/writes this with inline MOV
+/// instructions. Initialized on first use by [`ensure_root_stack_init`].
 static ROOT_STACK_TOP: AtomicUsize = AtomicUsize::new(0);
 
-/// Ensure ROOT_STACK_TOP is initialized to point at JF_ROOT_STACK base.
+/// Ensure the jitframe shadow-stack backing buffer is allocated and
+/// `ROOT_STACK_BASE` / `ROOT_STACK_TOP` / `ROOT_STACK_CAPACITY` atomics
+/// are set. Idempotent; cheap fast path when already initialized.
 fn ensure_root_stack_init() {
-    if ROOT_STACK_TOP.load(Ordering::Acquire) == 0 {
-        let base = JF_ROOT_STACK.data.get() as usize;
-        ROOT_STACK_TOP.store(base, Ordering::Release);
+    if ROOT_STACK_BASE.load(Ordering::Acquire) != 0 {
+        return;
     }
+    let mut owner = ROOT_STACK_OWNER.lock().unwrap_or_else(|p| p.into_inner());
+    if ROOT_STACK_BASE.load(Ordering::Acquire) == 0 {
+        grow_root_stack_locked(&mut owner, DEFAULT_SHADOW_STACK_DEPTH);
+    }
+}
+
+/// Grow the jitframe shadow stack to `new_capacity` entries while
+/// holding the owner lock. Copies the `used_bytes` portion of the
+/// current buffer into the new one, updates the published atomics,
+/// then drops the old buffer (its backing `Box<[usize]>` is stored in
+/// the owner Mutex). No-op when `new_capacity` does not exceed the
+/// current capacity.
+///
+/// rpython/memory/gctransform/shadowstack.py:351
+/// `increase_root_stack_depth` parity: allocate new, copy used
+/// portion, update pointers, free old. RPython also has to handle
+/// per-thread stacks (`_resize_thread_shadowstacks`); pyre skips that
+/// because the whole engine is single-threaded today.
+fn grow_root_stack_locked(owner: &mut Option<Box<[usize]>>, new_capacity: usize) {
+    let current_capacity = ROOT_STACK_CAPACITY.load(Ordering::Acquire);
+    if new_capacity <= current_capacity && owner.is_some() {
+        return;
+    }
+    let current_base = ROOT_STACK_BASE.load(Ordering::Acquire);
+    let current_top = ROOT_STACK_TOP.load(Ordering::Acquire);
+    let used_bytes = current_top.saturating_sub(current_base);
+
+    let mut new_buf: Box<[usize]> = vec![0usize; new_capacity * 2].into_boxed_slice();
+    let new_ptr = new_buf.as_mut_ptr() as usize;
+
+    if current_base != 0 && used_bytes > 0 {
+        // SAFETY: `current_base` points into the previous buffer held
+        // by the owner (about to be replaced); the destination is the
+        // fresh allocation. Pyre is single-threaded so no push/pop
+        // operation can be reading the old buffer concurrently.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                current_base as *const u8,
+                new_ptr as *mut u8,
+                used_bytes,
+            );
+        }
+    }
+
+    ROOT_STACK_BASE.store(new_ptr, Ordering::Release);
+    ROOT_STACK_TOP.store(new_ptr + used_bytes, Ordering::Release);
+    ROOT_STACK_CAPACITY.store(new_capacity, Ordering::Release);
+    // Dropping the previous Box<[usize]> (if any) happens here when
+    // the old `Some(buf)` is replaced.
+    *owner = Some(new_buf);
 }
 
 /// gc.py:255-257 get_root_stack_top_addr()
@@ -137,6 +205,10 @@ pub fn get_root_stack_top_addr() -> usize {
 }
 
 thread_local! {
+    /// shadowstack.py:287 `root_stack_depth`. Growable via
+    /// `increase_root_stack_depth`; can never shrink.
+    static MAX_SHADOW_STACK_DEPTH: Cell<usize> = const { Cell::new(DEFAULT_SHADOW_STACK_DEPTH) };
+
     /// Thread-local shadow stack for individual GcRef roots.
     static SHADOW_STACK: RefCell<ShadowStack> = RefCell::new(ShadowStack::new());
 
@@ -168,7 +240,8 @@ pub fn push(gcref: GcRef) -> usize {
     SHADOW_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.entries.len();
-        assert!(depth < MAX_SHADOW_STACK_DEPTH, "shadow stack overflow");
+        let max = MAX_SHADOW_STACK_DEPTH.with(|c| c.get());
+        assert!(depth < max, "shadow stack overflow");
         ss.entries.push(gcref);
         depth
     })
@@ -190,6 +263,17 @@ pub fn pop_to(depth: usize) -> Vec<GcRef> {
             ss.entries.split_off(depth)
         })
         .unwrap_or_default()
+}
+
+/// Like `pop_to` but silently no-ops if the shadow stack thread-local
+/// is already torn down (program shutdown). Drop callers should use this
+/// because the TLS drop order between `JitDriver` and `SHADOW_STACK` is
+/// not deterministic in Rust.
+pub fn try_pop_to(depth: usize) {
+    let _ = SHADOW_STACK.try_with(|ss| {
+        let mut ss = ss.borrow_mut();
+        ss.entries.truncate(depth);
+    });
 }
 
 /// Get a GcRef at the given index.
@@ -224,12 +308,37 @@ pub fn depth() -> usize {
         .unwrap_or(0)
 }
 
+/// rpython/memory/gctransform/shadowstack.py:351
+/// `increase_root_stack_depth` parity. Grows BOTH:
+///   * the per-thread safety cap for the generic GcRef shadow stack
+///     (`MAX_SHADOW_STACK_DEPTH`); and
+///   * the jitframe shadow stack's backing buffer (reallocates via
+///     [`grow_root_stack_locked`] so compiled code can push up to
+///     `new_depth` jitframes without running off the end).
+///
+/// Never shrinks. Called from `sys.setrecursionlimit` with
+/// `int(new_limit * 0.001 * 163840)` (pypy/module/sys/vm.py:70).
+pub fn increase_root_stack_depth(new_depth: usize) {
+    MAX_SHADOW_STACK_DEPTH.with(|c| {
+        if new_depth > c.get() {
+            c.set(new_depth);
+        }
+    });
+    let mut owner = ROOT_STACK_OWNER.lock().unwrap_or_else(|p| p.into_inner());
+    // Lazy-init if we haven't set up the default buffer yet (so the
+    // resize is idempotent even before the first push_jf).
+    if owner.is_none() {
+        grow_root_stack_locked(&mut owner, DEFAULT_SHADOW_STACK_DEPTH);
+    }
+    grow_root_stack_locked(&mut owner, new_depth);
+}
+
 /// Clear both shadow stacks.
 pub fn clear() {
     SHADOW_STACK.with(|ss| ss.borrow_mut().entries.clear());
-    // Reset root_stack_top to base of flat array.
     ensure_root_stack_init();
-    let base = JF_ROOT_STACK.data.get() as usize;
+    // Reset root_stack_top to base of the current backing buffer.
+    let base = ROOT_STACK_BASE.load(Ordering::Acquire);
     ROOT_STACK_TOP.store(base, Ordering::Release);
 }
 
@@ -248,10 +357,16 @@ pub fn clear() {
 pub fn push_jf(jf_ptr: GcRef) -> usize {
     ensure_root_stack_init();
     unsafe {
-        let base = JF_ROOT_STACK.data.get() as *mut usize;
+        let base = ROOT_STACK_BASE.load(Ordering::Acquire) as *mut usize;
         let top = ROOT_STACK_TOP.load(Ordering::Acquire) as *mut usize;
         let depth = (top as usize - base as usize) / (2 * WORD);
-        assert!(depth < MAX_SHADOW_STACK_DEPTH, "jf shadow stack overflow");
+        let capacity = ROOT_STACK_CAPACITY.load(Ordering::Acquire);
+        assert!(
+            depth < capacity,
+            "jf shadow stack overflow — capacity {}, depth {}",
+            capacity,
+            depth
+        );
         // assembler.py:1125: MOV [ebx], 1
         *top = 1;
         // assembler.py:1126: MOV [ebx + WORD], ebp
@@ -269,8 +384,9 @@ pub fn push_jf(jf_ptr: GcRef) -> usize {
 ///   MOV ecx, [rootstacktop]
 ///   MOV ebp, [ecx - WORD]
 pub fn peek_jf(depth: usize) -> GcRef {
+    ensure_root_stack_init();
     unsafe {
-        let base = JF_ROOT_STACK.data.get() as *const usize;
+        let base = ROOT_STACK_BASE.load(Ordering::Acquire) as *const usize;
         // entry at `depth`: base[depth*2] = is_minor, base[depth*2+1] = jf_ptr
         GcRef(*base.add(depth * 2 + 1))
     }
@@ -283,7 +399,7 @@ pub fn peek_jf(depth: usize) -> GcRef {
 pub fn pop_jf_to(depth: usize) {
     ensure_root_stack_init();
     unsafe {
-        let base = JF_ROOT_STACK.data.get() as *mut usize;
+        let base = ROOT_STACK_BASE.load(Ordering::Acquire) as *mut usize;
         let new_top = base.add(depth * 2);
         ROOT_STACK_TOP.store(new_top as usize, Ordering::Release);
     }
@@ -292,7 +408,7 @@ pub fn pop_jf_to(depth: usize) {
 /// Current depth of the jitframe shadow stack.
 pub fn jf_depth() -> usize {
     ensure_root_stack_init();
-    let base = JF_ROOT_STACK.data.get() as usize;
+    let base = ROOT_STACK_BASE.load(Ordering::Acquire);
     let top = ROOT_STACK_TOP.load(Ordering::Acquire);
     (top - base) / (2 * WORD)
 }
@@ -311,7 +427,7 @@ pub fn jf_depth() -> usize {
 pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
     ensure_root_stack_init();
     unsafe {
-        let base = JF_ROOT_STACK.data.get() as *mut usize;
+        let base = ROOT_STACK_BASE.load(Ordering::Acquire) as *mut usize;
         let top = ROOT_STACK_TOP.load(Ordering::Acquire) as *mut usize;
         let mut ptr = base;
         while ptr < top {
@@ -337,7 +453,7 @@ pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
 pub fn jf_top_ptr() -> GcRef {
     ensure_root_stack_init();
     unsafe {
-        let base = JF_ROOT_STACK.data.get() as usize;
+        let base = ROOT_STACK_BASE.load(Ordering::Acquire);
         let top = ROOT_STACK_TOP.load(Ordering::Acquire);
         if top <= base {
             return GcRef::NULL;
@@ -389,10 +505,8 @@ pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64) -> usize {
     BH_REGS_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
-        assert!(
-            depth < MAX_SHADOW_STACK_DEPTH,
-            "blackhole regs stack overflow"
-        );
+        let max = MAX_SHADOW_STACK_DEPTH.with(|c| c.get());
+        assert!(depth < max, "blackhole regs stack overflow");
         ss.push(BhRegsEntry {
             regs_ptr: regs.as_mut_ptr(),
             regs_len: regs.len(),
@@ -509,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_push_pop_roundtrip() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear();
         let a = GcRef(0x1000);
         let b = GcRef(0x2000);
@@ -527,7 +641,7 @@ mod tests {
 
     #[test]
     fn test_walk_roots_updates() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear();
         push(GcRef(0x1000));
         push(GcRef(0x2000));
@@ -544,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_extern_c_interface() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear();
         let depth = majit_shadow_stack_push(0x3000);
         assert_eq!(depth, 0);
@@ -561,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_jf_shadow_stack_push_pop() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear();
         assert_eq!(jf_depth(), 0);
         let depth = push_jf(GcRef(0x1000));
@@ -577,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_walk_jf_roots_updates_gcref() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear();
         push_jf(GcRef(0x1000));
         push_jf(GcRef(0x2000));
@@ -595,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_jf_top_ptr_reload() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         clear();
         push_jf(GcRef(0xABCD));
         assert_eq!(jf_top_ptr(), GcRef(0xABCD));
@@ -612,13 +726,13 @@ mod tests {
 
     #[test]
     fn test_jf_flat_array_layout() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // Verify the flat array layout matches RPython's [is_minor, jf_ptr] pairs
         clear();
         push_jf(GcRef(0xAAAA));
         push_jf(GcRef(0xBBBB));
         unsafe {
-            let base = JF_ROOT_STACK.data.get() as *const usize;
+            let base = ROOT_STACK_BASE.load(Ordering::Acquire) as *const usize;
             // Entry 0: [1, 0xAAAA]
             assert_eq!(*base, 1);
             assert_eq!(*base.add(1), 0xAAAA);
@@ -627,5 +741,73 @@ mod tests {
             assert_eq!(*base.add(3), 0xBBBB);
         }
         pop_jf_to(0);
+    }
+
+    /// rpython/memory/gctransform/shadowstack.py:351 parity:
+    /// sys.setrecursionlimit(>1000) must resize the jitframe
+    /// shadow-stack backing buffer, not just raise a limit.
+    #[test]
+    fn test_increase_root_stack_depth_grows_backing_buffer() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        // Populate a known jf_ptr that must survive the resize.
+        push_jf(GcRef(0xDEADBEEF));
+        let base_before = ROOT_STACK_BASE.load(Ordering::Acquire);
+        let capacity_before = ROOT_STACK_CAPACITY.load(Ordering::Acquire);
+        assert_eq!(capacity_before, DEFAULT_SHADOW_STACK_DEPTH);
+
+        // Grow to 2x the default. RPython's resize copies the used
+        // portion to the new buffer.
+        let new_cap = DEFAULT_SHADOW_STACK_DEPTH * 2;
+        increase_root_stack_depth(new_cap);
+
+        let base_after = ROOT_STACK_BASE.load(Ordering::Acquire);
+        let capacity_after = ROOT_STACK_CAPACITY.load(Ordering::Acquire);
+        assert_ne!(
+            base_before, base_after,
+            "resize must reallocate the backing buffer"
+        );
+        assert_eq!(
+            capacity_after, new_cap,
+            "capacity atomic must reflect the new size"
+        );
+        // The copied jf_ptr must still be reachable via peek_jf.
+        assert_eq!(peek_jf(0), GcRef(0xDEADBEEF));
+        // Pushing up to the new capacity must not overflow.
+        for i in 1..new_cap {
+            push_jf(GcRef(0x1000 + i));
+        }
+        assert_eq!(jf_depth(), new_cap);
+        pop_jf_to(0);
+    }
+
+    /// Pushing exactly `capacity` entries is OK; push #{capacity+1}
+    /// must trip the overflow assert, not silently corrupt heap.
+    #[test]
+    #[should_panic(expected = "jf shadow stack overflow")]
+    fn test_jf_shadow_stack_overflow_panics() {
+        let lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        // Pre-shrink: the capacity atomic drives the assert; the
+        // backing HEAP buffer is larger than 4 entries, so the
+        // overflow fires before any OOB write.
+        let original_cap = ROOT_STACK_CAPACITY.load(Ordering::Acquire);
+        ROOT_STACK_CAPACITY.store(4, Ordering::Release);
+        let result = std::panic::catch_unwind(|| {
+            for i in 0..4 {
+                push_jf(GcRef(i));
+            }
+            push_jf(GcRef(99)); // MUST panic
+        });
+        // Restore state before dropping the lock so the next test
+        // sees the default capacity. Then release the lock cleanly
+        // before re-raising, so the Mutex doesn't poison.
+        pop_jf_to(0);
+        ROOT_STACK_CAPACITY.store(original_cap, Ordering::Release);
+        drop(lock);
+        match result {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(_) => panic!("jf shadow stack overflow did not fire"),
+        }
     }
 }

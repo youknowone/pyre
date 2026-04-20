@@ -710,6 +710,12 @@ impl Backend for DynasmBackend {
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
+        // assembler.py:1080 `_call_header_with_stack_check` emits the
+        // inline probe at the top of every compiled loop, matching
+        // cranelift's `jit_prologue_stack_check_shim` call in
+        // `compiler.rs:5868`. The prior runner-level `jit_prologue_stack_check`
+        // call only guarded top-level entry and missed compiled-to-
+        // compiled CALL_ASSEMBLER recursion.
         let compiled = Self::get_compiled(token);
         let entry = codebuf::buffer_ptr(&compiled.buffer);
 
@@ -853,6 +859,10 @@ impl Backend for DynasmBackend {
         token: &JitCellToken,
         args: &[i64],
     ) -> majit_backend::RawExecResult {
+        // Same rationale as `execute_token`: the inline probe emitted by
+        // `_call_header` (x86/aarch64 assembler.rs) is now the sole
+        // stack-overflow detection site, so no runner-level probe is
+        // needed here.
         let compiled = Self::get_compiled(token);
         let entry = codebuf::buffer_ptr(&compiled.buffer);
 

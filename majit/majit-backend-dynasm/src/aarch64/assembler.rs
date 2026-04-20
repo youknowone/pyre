@@ -876,12 +876,68 @@ impl AssemblerARM64 {
     /// Save slots: 32 bytes total (fp/lr at [sp,#0], x19/x20 at
     /// [sp,#16]).  Mirrors aarch64/assembler.py:1117-1122 which
     /// iterates `r.callee_saved_registers = [x19, x20]`.
+    ///
+    /// aarch64/assembler.py:1092-1114 `_call_header_with_stack_check`:
+    /// inline SP probe right after the frame pointer is captured,
+    /// before `gen_shadowstack_header`. On overflow, return the
+    /// incoming jf_ptr in x0 without pushing to the shadow stack so
+    /// the JIT glue drains the overflow flag on the way back to the
+    /// interpreter.
+    ///
+    /// Inline probe (aarch64/assembler.py:1099-1114 parity):
+    /// ```text
+    ///   gen_load_int x30, endaddr       ; load endaddr
+    ///   LDR  x30, [x30]                  ; x30 = end
+    ///   gen_load_int x16, lengthaddr
+    ///   LDR  x16, [x16]                  ; x16 = length
+    ///   MOV  x17, sp                     ; x17 = current sp (sp can't be
+    ///                                    ;   the source of SUB_rr directly)
+    ///   SUB  x30, x30, x17               ; x30 = ofs = end - sp
+    ///   CMP  x30, x16
+    ///   B.LS continue                    ; fast path: ofs <= length
+    ///   MOV  x0, sp                      ; arg0 = current sp
+    ///   gen_load_int x17, slowpath
+    ///   BLR  x17                         ; call pyre_stack_too_big_slowpath
+    ///   CBZ  w0, continue                ; slowpath: 0 = OK
+    ///   ; fallthrough = real overflow → return x29 as jf_ptr
+    /// ```
     fn _call_header(&mut self, inputargs: &[InputArg]) {
         dynasm!(self.mc ; .arch aarch64
             ; stp x29, x30, [sp, #-32]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
             ; mov x29, x0
         );
+        if let Some(addrs) = crate::stack_check_addresses() {
+            let continue_label = self.mc.new_dynamic_label();
+            // Fast path: load end, subtract sp, compare with length.
+            self.emit_mov_imm64(30, addrs.end_adr as i64); // lr holds end addr
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x30, [x30]                  // x30 = *end_adr
+            );
+            self.emit_mov_imm64(16, addrs.length_adr as i64); // ip0 holds length addr
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x16, [x16]                  // x16 = *length_adr
+                ; mov x17, sp                     // x17 = sp (can't SUB sp directly)
+                ; sub x30, x30, x17               // x30 = ofs = end - sp
+                ; cmp x30, x16
+                ; b.ls =>continue_label           // fast path OK: ofs <= length
+                // Slow path: call pyre_stack_too_big_slowpath(sp).
+                ; mov x0, sp
+            );
+            self.emit_mov_imm64(17, addrs.slowpath_addr as i64);
+            dynasm!(self.mc ; .arch aarch64
+                ; blr x17
+                ; cbz w0, =>continue_label        // slowpath says OK
+                // Overflow fallthrough: return x29 as jf_ptr.
+                ; mov x0, x29
+                ; ldp x19, x20, [sp, #16]
+                ; ldp x29, x30, [sp], #32
+                ; ret
+                ; =>continue_label
+            );
+        }
+        // When addresses are not registered (tests / early startup), no
+        // stack check is emitted — aarch64/assembler.py:1094-1095 parity.
         self.gen_shadowstack_header();
         self.setup_input_state(inputargs);
     }

@@ -327,6 +327,14 @@ impl MIFrame {
         // reach final code emission.
         let jc = unsafe { &*jitcode_ptr };
         if jc.payload.metadata.pc_map.is_empty() {
+            // Skeleton payload (no `pc_map` yet). Production runs go
+            // through `CallControl.get_jitcode` drain which fills the
+            // payload before any guard capture (audit 2026-04-20: 0
+            // hits across pyre/check.sh), but unit-test entry points
+            // (`PyreSym::new_uninit`) legitimately land here. Fall
+            // back to pyre-jit-trace's LiveVars analysis: it matches
+            // `frame_value_count_at`'s skeleton fallback so the
+            // encoder box count stays in sync with the decoder.
             let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
             let live = if !raw_code_ptr.is_null() {
                 Some(liveness_for(raw_code_ptr))
@@ -334,13 +342,6 @@ impl MIFrame {
                 None
             };
             let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-            // Skeleton encoder: the pyre-jit-trace LiveVars analysis
-            // distinguishes `is_local_live(pc, idx)` vs
-            // `is_stack_live(pc, idx)`, so keep the per-kind iteration
-            // here. The unified register-file view (Phase B) applies
-            // only to the primary all_liveness-byte-stream branch
-            // below, where `live_r_regs` indices already live in
-            // `stack_base=nlocals` register space.
             let locals_len = nlocals.min(registers_r_view.len());
             for (idx, slot) in registers_r_view[..locals_len].iter().enumerate() {
                 let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
@@ -898,22 +899,22 @@ impl MIFrame {
     /// RPython structure:
     ///
     /// ```text
-    ///  def vable_and_vrefs_before_residual_call(self):
-    ///      vrefinfo = self.staticdata.virtualref_info
-    ///      for i in range(1, len(self.virtualref_boxes), 2):
-    ///          vrefbox = self.virtualref_boxes[i]
-    ///          vref = vrefbox.getref_base()
-    ///          vrefinfo.tracing_before_residual_call(vref)
-    ///      #
-    ///      vinfo = self.jitdriver_sd.virtualizable_info
-    ///      if vinfo is not None:
-    ///          virtualizable_box = self.virtualizable_boxes[-1]
-    ///          virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
-    ///          vinfo.tracing_before_residual_call(virtualizable)
-    ///          force_token = self.history.record0(rop.FORCE_TOKEN, ...)
-    ///          self.history.record2(rop.SETFIELD_GC, virtualizable_box,
-    ///                               force_token, None,
-    ///                               descr=vinfo.vable_token_descr)
+    /// def vable_and_vrefs_before_residual_call(self):
+    ///     vrefinfo = self.staticdata.virtualref_info
+    ///     for i in range(1, len(self.virtualref_boxes), 2):
+    ///         vrefbox = self.virtualref_boxes[i]
+    ///         vref = vrefbox.getref_base()
+    ///         vrefinfo.tracing_before_residual_call(vref)
+    ///     #
+    ///     vinfo = self.jitdriver_sd.virtualizable_info
+    ///     if vinfo is not None:
+    ///         virtualizable_box = self.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         vinfo.tracing_before_residual_call(virtualizable)
+    ///         force_token = self.history.record0(rop.FORCE_TOKEN, ...)
+    ///         self.history.record2(rop.SETFIELD_GC, virtualizable_box,
+    ///                              force_token, None,
+    ///                              descr=vinfo.vable_token_descr)
     /// ```
     ///
     /// Key points:
@@ -2164,12 +2165,21 @@ impl MIFrame {
         // guard resumes (the decoder writes a raw i64 where a PyObjectRef
         // is expected).
         //
-        // Temporarily suppress the pre-opcode snapshot for the duration of
-        // the branch guard capture so `flush_to_frame_for_guard`,
-        // `get_list_of_active_boxes`, and `build_virtualizable_boxes` all
-        // read the current (post-pop) `registers_r` / valuestackdepth.
-        let saved_pre_opcode_vsd = self.sym_mut().pre_opcode_vsd.take();
-        let saved_pre_opcode_registers_r = self.sym_mut().pre_opcode_registers_r.take();
+        // pyjitpl.py:2586-2602 capture_resumedata mutates `frame.pc` to
+        // `resumepc` for the duration of the capture and restores it on
+        // exit; RPython has no pre-opcode snapshot because its jitcode is
+        // register-machine and liveness is per-PC. Pyre's pre_opcode_*
+        // fields are a NEW-DEVIATION that will be removed once per-PC
+        // liveness is ported (codewriter/liveness.py). Until then, clear
+        // them here so flush_to_frame_for_guard, get_list_of_active_boxes,
+        // and build_virtualizable_boxes all read the current (post-pop)
+        // `registers_r` / valuestackdepth. The next trace_code_step
+        // re-captures the snapshot, so no restore is needed.
+        {
+            let s = self.sym_mut();
+            s.pre_opcode_vsd = None;
+            s.pre_opcode_registers_r = None;
+        }
 
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
@@ -2255,8 +2265,6 @@ impl MIFrame {
         let s = self.sym_mut();
         s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
-        s.pre_opcode_vsd = saved_pre_opcode_vsd;
-        s.pre_opcode_registers_r = saved_pre_opcode_registers_r;
     }
 
     /// pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity.
@@ -2971,6 +2979,12 @@ impl MIFrame {
             if is_function(concrete_callable) {
                 let w_callee_code = pyre_interpreter::getcode(concrete_callable);
                 let callee_key = crate::driver::make_green_key(w_callee_code, 0);
+                // pyjitpl.py:1396-1401 element-wise greenkey: pyre's
+                // tuple is `(code_ptr, pc)` so structural equality cannot
+                // be fooled by hash collisions the way the derived u64
+                // `callee_key` can (driver.rs:12 make_green_key).
+                let callee_raw: (usize, usize) = (w_callee_code as usize, 0);
+                let caller_raw: (usize, usize) = ((*self.sym().jitcode).code as usize, 0);
                 let callee_code =
                     &*(pyre_interpreter::w_code_get_ptr(w_callee_code as pyre_object::PyObjectRef)
                         as *const CodeObject);
@@ -2984,10 +2998,8 @@ impl MIFrame {
                 // if we know the callee body and it is a small acyclic helper,
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
-                let current_function_key =
-                    crate::driver::make_green_key((*self.sym().jitcode).code, 0);
-                let is_self_recursive = callee_key == current_function_key;
-                let inline_decision = driver.should_inline(callee_key);
+                let is_self_recursive = callee_raw == caller_raw;
+                let inline_decision = driver.should_inline(callee_key, callee_raw);
                 let inline_framestack_active = !self.parent_frames.is_empty();
                 let callee_inline_eligible = driver
                     .meta_interp()
@@ -2995,65 +3007,80 @@ impl MIFrame {
                     .can_inline_callable(callee_key);
                 let max_unroll_recursion =
                     driver.meta_interp().warm_state_ref().max_unroll_recursion() as usize;
-                let recursive_depth = self.with_ctx(|_, ctx| ctx.recursive_depth(callee_key));
+                let recursive_depth = self.with_ctx(|_, ctx| ctx.recursive_depth(callee_raw));
                 let concrete_arg0 = if nargs == 1 {
                     concrete_args.first().copied()
                 } else {
                     None
                 };
-                // pyjitpl.py:1376-1423 _opimpl_recursive_call parity:
-                // Compute assembler_call boolean. Note that self-recursive
-                // InlineDecision::Inline is still NOT true perform_call
-                // parity in pyre: until recursive frame switching is wired,
-                // pyre degrades that case to CALL_ASSEMBLER when a token
-                // exists and residual call otherwise.
-                let assembler_call;
-                if is_self_recursive {
-                    if inline_decision == majit_metainterp::InlineDecision::Inline {
-                        // pyjitpl.py:1414-1416: RPython would perform_call
-                        // (trace-through) here. Pyre's PendingInlineFrame
-                        // doesn't yet support recursive loop detection
-                        // (reached_loop_header pyjitpl.py:2950), so
-                        // self-recursive trace-through produces over-
-                        // specialized traces. Promote to assembler_call
-                        // when a token exists; residual call otherwise.
-                        // Phase 3: replace with perform_call once loop
-                        // detection is ready.
-                        assembler_call = driver
-                            .get_loop_token_number(callee_key)
-                            .or_else(|| driver.get_pending_token_number(callee_key))
-                            .is_some();
-                    } else {
-                        // pyjitpl.py:1404-1413: recursion exceeds limit.
-                        // dont_trace_here(greenboxes) — mark for future calls.
-                        if callee_inline_eligible {
-                            driver
-                                .meta_interp_mut()
-                                .warm_state_mut()
-                                .disable_noninlinable_function(callee_key);
-                        }
-                        // pyjitpl.py:1417: assembler_call = True when token exists
-                        assembler_call =
-                            inline_decision == majit_metainterp::InlineDecision::CallAssembler;
-                    }
-                } else {
-                    assembler_call =
-                        inline_decision == majit_metainterp::InlineDecision::CallAssembler;
+                // pyjitpl.py:1388-1402 element-wise greenkey walk:
+                //   count = 0
+                //   for f in self.metainterp.framestack:
+                //       if f.jitcode is not portal_code: continue
+                //       gk = f.greenkey
+                //       if gk is None: continue
+                //       for i in range(len(gk)):
+                //           if not gk[i].same_constant(greenboxes[i]): break
+                //       else: count += 1
+                //
+                // Pyre's greenkey is `(code_ptr, target_pc)`; matching the
+                // tuple implies `f.jitcode is portal_code`. With
+                // `is_recursive=True` on the single PyPyJitDriver every
+                // framestack entry is a portal frame, so the upstream
+                // filter is automatically satisfied and the count equals
+                // `ctx.recursive_depth(callee_key)` (1 if the root trace's
+                // greenkey matches + number of matching inlined frames).
+                let recursive_count = recursive_depth;
+                let recursion_exceeded =
+                    callee_inline_eligible && recursive_count >= max_unroll_recursion;
+
+                // pyjitpl.py:1413 warmrunnerstate.dont_trace_here(greenboxes).
+                // Upstream calls this unconditionally when the recursion
+                // limit is hit on an inlinable callee; pyre's warm-state
+                // equivalent sets the DONT_TRACE_HERE jitcell flag via
+                // `disable_noninlinable_function` (majit-trace
+                // warmstate.rs:931). Fires for self-recursion *and*
+                // mutual recursion because upstream's count walk does
+                // not distinguish them.
+                if recursion_exceeded {
+                    driver
+                        .meta_interp_mut()
+                        .warm_state_mut()
+                        .disable_noninlinable_function(callee_key);
                 }
 
+                // pyjitpl.py:1376-1423 _opimpl_recursive_call: compute
+                // assembler_call boolean. Self-recursive InlineDecision::
+                // Inline still degrades to CALL_ASSEMBLER in pyre when a
+                // token exists because recursive framestack transitions
+                // (pyjitpl.py:1579-1602 `jit_merge_point(depth > 0)`) are
+                // not modelled yet; promote to assembler_call when
+                // possible, leave residual call otherwise.
+                let assembler_call = if is_self_recursive
+                    && inline_decision == majit_metainterp::InlineDecision::Inline
+                    && !recursion_exceeded
+                {
+                    driver
+                        .get_loop_token_number(callee_key)
+                        .or_else(|| driver.get_pending_token_number(callee_key))
+                        .is_some()
+                } else {
+                    // pyjitpl.py:1417 `assembler_call = True` after the
+                    // inlining path falls through (either dont_trace_here
+                    // fired or can_inline_callable was False). The
+                    // `CallAssembler` variant covers both subcases.
+                    recursion_exceeded
+                        || inline_decision == majit_metainterp::InlineDecision::CallAssembler
+                };
+
                 // pyjitpl.py:1414-1416 / pyjitpl.py:2174-2186 parity:
-                // perform_call when callee is inlinable. RPython does NOT
-                // have a callee_prefers_function_entry heuristic — the
-                // decision is purely can_inline_callable + recursion depth.
+                // perform_call when callee is inlinable and the recursion
+                // count is below `max_unroll_recursion`. Self-recursive
+                // perform_call remains disabled in pyre.
                 let can_trace_through = if is_self_recursive {
-                    // Self-recursive perform_call remains disabled until
-                    // pyre has the corresponding framestack transition.
-                    // RPython would enter the callee and later convert the
-                    // call at the callee's jit_merge_point(depth > 0)
-                    // (pyjitpl.py:1579-1602); pyre does not model that yet.
                     false
                 } else {
-                    callee_inline_eligible && nargs <= 4 && !callee_has_loop
+                    callee_inline_eligible && nargs <= 4 && !callee_has_loop && !recursion_exceeded
                 };
 
                 if majit_metainterp::majit_log_enabled() {
@@ -3122,6 +3149,7 @@ impl MIFrame {
                             args,
                             concrete_callable,
                             callee_key,
+                            callee_raw,
                             frame_helper,
                             concrete_args,
                             assembler_call,
@@ -3536,7 +3564,9 @@ impl MIFrame {
         };
         let globals = unsafe { function_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
-        let is_self_recursive = crate::driver::make_green_key(caller_code, 0) == callee_key;
+        // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
+        // tuple equality is lossless vs the derived u64 hash.
+        let is_self_recursive = caller_code as usize == w_code as usize;
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             w_code,
             &concrete_args,
@@ -3705,6 +3735,12 @@ impl MIFrame {
             concrete_frame: callee_frame,
             drop_frame_opref,
             green_key: callee_key,
+            // Raw greenkey pair for element-wise recursion comparison
+            // (pyjitpl.py:1396-1401). target_pc is 0 for function
+            // entries — matches `make_green_key(w_code, 0)`. `w_code`
+            // and `callee_key` are the same greenkey inputs that built
+            // `callee_key` near the top of this function.
+            green_key_raw: (w_code as usize, 0),
             parent_frames,
             nargs: args.len(),
             caller_result_stack_idx: None,
@@ -3721,6 +3757,7 @@ impl MIFrame {
         args: &[OpRef],
         concrete_callable: PyObjectRef,
         callee_key: u64,
+        callee_raw: (usize, usize),
         frame_helper: *const (),
         passed_concrete_args: &[PyObjectRef],
         assembler_call: bool,
@@ -3740,8 +3777,11 @@ impl MIFrame {
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
-                    let is_self_recursive = callee_key
-                        == crate::driver::make_green_key(unsafe { (*this.sym().jitcode).code }, 0);
+                    // pyjitpl.py:1396-1401 element-wise greenkey.
+                    let _ = callee_key;
+                    let caller_raw: (usize, usize) =
+                        (unsafe { (*this.sym().jitcode).code } as usize, 0);
+                    let is_self_recursive = callee_raw == caller_raw;
                     // RPython parity: an opaque helper-boundary Python CALL
                     // still produces a boxed object result.  Even if the
                     // callee itself can finish with a raw int, the helper

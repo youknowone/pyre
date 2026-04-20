@@ -255,9 +255,19 @@ where
     FBuiltin: FnOnce(PyObjectRef) -> Result<R, PyError>,
     FUser: FnOnce(PyObjectRef) -> Result<R, PyError>,
 {
-    // Grow stack for deep Python call recursion (fib(32+)).
-    // Red zone 512KB ensures growth before guard page hit.
-    stacker::maybe_grow(512 * 1024, 8 * 1024 * 1024, move || unsafe {
+    // Drain any pending JIT-prologue overflow first so a backend
+    // probe that already detected an overflow surfaces here as the
+    // user-visible RecursionError. The pending-exception slot is
+    // populated by the backend slowpath wrapper when the JIT
+    // prologue probe trips — backend raises, glue propagates
+    // (rpython/rlib/rstack.py:68-73 stack_check_slowpath parity).
+    crate::stack_check::drain_jit_pending_exception()?;
+    // rpython/rlib/rstack.py:42 stack_check(): every interpreter call
+    // boundary also checks the native stack synchronously, so deep
+    // interpreter recursion (no JIT involved) raises RecursionError
+    // instead of letting the OS abort on a guard-page hit.
+    crate::stack_check::stack_check()?;
+    unsafe {
         if is_function(callable) {
             // All callables are Function objects. Check code type to distinguish
             // builtins (BuiltinCode) from user functions (W_CodeObject).
@@ -273,7 +283,7 @@ where
                 (*(*callable).ob_type).name
             )))
         }
-    }) // stacker::maybe_grow
+    }
 }
 
 pub fn binary_op_tag(op: BinaryOperator) -> Option<i64> {

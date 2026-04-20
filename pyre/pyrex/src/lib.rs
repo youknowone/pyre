@@ -87,6 +87,10 @@ pub fn main_entry(binary_name: &'static str) {
 }
 
 fn real_main(binary_name: &str) {
+    // Capture the topmost interpreter SP so stack_check measures
+    // recursion depth from a stable base.
+    pyre_interpreter::stack_check::reset_stack_base();
+
     // Suppress panic messages for InvalidLoop — these are caught by
     // catch_unwind in the JIT optimizer but the default panic hook still
     // prints to stderr, making it look like a crash.

@@ -1074,7 +1074,11 @@ where
                 let pc = self.frames.current_mut().pc;
                 let sub_jitcode = self.frames.current_mut().jitcode.sub_jitcodes[sub_idx].clone();
                 let mut sub_frame = MIFrame::new(sub_jitcode, pc);
-                ctx.push_inline_frame(((pc as u64) << 32) | sub_idx as u64, u32::MAX);
+                // dispatch.rs sub-jitcode inline frame (RPython pyjitpl
+                // perform_call for non-portal jitcodes). The structured
+                // greenkey has no pc-component meaning here — use
+                // `(sub_idx, pc)` which still preserves identity.
+                ctx.push_inline_frame((sub_idx, pc), u32::MAX);
                 sub_frame.inline_frame = true;
                 for (kind, caller_src, callee_dst) in arg_triples {
                     match kind {

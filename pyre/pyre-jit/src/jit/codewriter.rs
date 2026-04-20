@@ -2030,11 +2030,32 @@ impl CodeWriter {
                     }
                 }
 
-                Instruction::LoadName { .. }
-                | Instruction::StoreName { .. }
-                | Instruction::MakeFunction { .. } => {
+                // Stack-effect-aware abort_permanent for unsupported ops.
+                // current_depth must track interpreter parity so that
+                // subsequent CALL handlers don't underflow.
+                Instruction::LoadName { .. } => {
+                    // PyPy assemble.py: LOAD_NAME has stack effect +1.
+                    emit_abort_permanent!(ssarepr);
+                    current_depth += 1;
+                }
+                Instruction::StoreName { .. } => {
+                    // PyPy assemble.py: STORE_NAME has stack effect -1.
+                    emit_abort_permanent!(ssarepr);
+                    current_depth = current_depth.saturating_sub(1);
+                }
+                Instruction::MakeFunction { .. } => {
                     // Module-level only: abort_permanent (won't block blackhole).
                     emit_abort_permanent!(ssarepr);
+                }
+                Instruction::LoadAttr { namei } => {
+                    // PyPy assemble.py gives LOAD_ATTR a net-0 stack effect.
+                    // pyre's CPython-3.13 method form pushes an extra
+                    // null/self sentinel, so keep current_depth in sync.
+                    let attr = namei.get(op_arg);
+                    emit_abort_permanent!(ssarepr);
+                    if attr.is_method() {
+                        current_depth += 1;
+                    }
                 }
 
                 // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
@@ -2110,6 +2131,8 @@ impl CodeWriter {
                 }
 
                 // Unsupported instruction: abort_permanent.
+                // BC_ABORT_PERMANENT(14) so has_abort_opcode doesn't
+                // false-positive on functions with only module-level paths.
                 _other => {
                     emit_abort_permanent!(ssarepr);
                 }

@@ -82,13 +82,13 @@ pub fn trace_bytecode(
             ..
         } if *target_pc != start_pc => {
             let target_key = crate::driver::make_green_key(w_code, *target_pc);
-            ctx.set_green_key(target_key);
+            ctx.set_green_key(target_key, (w_code as usize, *target_pc));
             ctx.header_pc = *target_pc;
             ctx.cut_inner_green_key = Some(target_key);
         }
         TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
             let key = crate::driver::make_green_key(w_code, start_pc);
-            ctx.set_green_key(key);
+            ctx.set_green_key(key, (w_code as usize, start_pc));
             ctx.header_pc = start_pc;
         }
         _ => {}

@@ -4,12 +4,13 @@ use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Type,
 
 /// Generic CallDescr for function call operations.
 ///
-/// Replaces per-interpreter boilerplate (IoCallDescr, etc.)
-/// with a single reusable implementation.
+/// Stores per-call-site EffectInfo, matching RPython's
+/// `effectinfo_from_writeanalyze` (call.py:320).
 #[derive(Debug)]
 struct MetaCallDescr {
     arg_types: Vec<Type>,
     result_type: Type,
+    effect_info: EffectInfo,
 }
 
 #[derive(Debug)]
@@ -43,14 +44,7 @@ impl CallDescr for MetaCallDescr {
         0
     }
     fn get_extra_info(&self) -> &EffectInfo {
-        // RPython: effectinfo is per-call-site (call.py:300
-        // effectinfo_from_writeanalyze). Pyre MetaCallDescr is a generic
-        // placeholder. CannotRaise matches RPython's default for helpers
-        // that don't raise or collect. Per-call-site effectinfo requires
-        // porting effectinfo_from_writeanalyze infrastructure.
-        static INFO: EffectInfo =
-            EffectInfo::const_new(ExtraEffect::CannotRaise, OopSpecIndex::None);
-        &INFO
+        &self.effect_info
     }
 }
 
@@ -88,55 +82,45 @@ impl CallDescr for MetaCallAssemblerDescr {
     }
 }
 
+/// Default EffectInfo for call descriptors that lack per-call-site
+/// analysis. CannotRaise until `effectinfo_from_writeanalyze`
+/// (call.py:320) is ported — the optimizer relies on this to keep
+/// heap caches alive across calls.
+const DEFAULT_EFFECT_INFO: EffectInfo =
+    EffectInfo::const_new(ExtraEffect::CannotRaise, OopSpecIndex::None);
+
 /// Create a CallDescr with the given argument types and result type.
 pub fn make_call_descr(arg_types: &[Type], result_type: Type) -> DescrRef {
+    make_call_descr_with_effect(arg_types, result_type, DEFAULT_EFFECT_INFO)
+}
+
+/// call.py:320 `effectinfo_from_writeanalyze` parity. Create a
+/// CallDescr with explicit per-call-site EffectInfo.
+pub fn make_call_descr_with_effect(
+    arg_types: &[Type],
+    result_type: Type,
+    effect_info: EffectInfo,
+) -> DescrRef {
     Arc::new(MetaCallDescr {
         arg_types: arg_types.to_vec(),
         result_type,
+        effect_info,
     })
 }
 
 /// Create a CallDescr for CALL_MAY_FORCE_* operations.
 ///
-/// RPython treats these as may-raise calls guarded by GUARD_NOT_FORCED, not as
-/// generic cannot-raise helpers.
+/// descr.py:456-469 `BaseCallDescr.__init__` stores `extrainfo` per
+/// instance; RPython has no separate CallMayForceDescr type. The
+/// may-force semantics come from the per-call-site effectinfo the
+/// optimizer reads via `get_extra_info()`, so CALL_MAY_FORCE reuses the
+/// single MetaCallDescr with `ExtraEffect::CanRaise`.
 pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> DescrRef {
-    #[derive(Debug)]
-    struct MetaCallMayForceDescr {
-        arg_types: Vec<Type>,
-        result_type: Type,
-    }
-
-    impl majit_ir::Descr for MetaCallMayForceDescr {
-        fn index(&self) -> u32 {
-            u32::MAX
-        }
-        fn as_call_descr(&self) -> Option<&dyn CallDescr> {
-            Some(self)
-        }
-    }
-
-    impl CallDescr for MetaCallMayForceDescr {
-        fn arg_types(&self) -> &[Type] {
-            &self.arg_types
-        }
-        fn result_type(&self) -> Type {
-            self.result_type
-        }
-        fn result_size(&self) -> usize {
-            0
-        }
-        fn get_extra_info(&self) -> &EffectInfo {
-            static INFO: EffectInfo =
-                EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
-            &INFO
-        }
-    }
-
-    Arc::new(MetaCallMayForceDescr {
-        arg_types: arg_types.to_vec(),
+    make_call_descr_with_effect(
+        arg_types,
         result_type,
-    })
+        EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None),
+    )
 }
 
 /// Create a CallDescr for `CALL_ASSEMBLER_*` with the given target token.
