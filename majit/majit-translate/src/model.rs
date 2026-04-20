@@ -1046,18 +1046,16 @@ impl FunctionGraph {
     }
 
     /// Get successor block IDs for a block.
+    ///
+    /// RPython `flowspace/model.py:66-76 FunctionGraph.iterblocks`:
+    /// successor set is derived from `Block.exits` only.  Final blocks
+    /// (`exits == ()`) — returnblock / exceptblock — have no successors.
     pub fn successors(&self, block: BlockId) -> Vec<BlockId> {
-        let block_ref = self.block(block);
-        if !block_ref.exits.is_empty() {
-            return block_ref.exits.iter().map(|link| link.target).collect();
-        }
-        match &block_ref.terminator {
-            Terminator::Goto { target, .. } => vec![*target],
-            Terminator::Branch {
-                if_true, if_false, ..
-            } => vec![*if_true, *if_false],
-            _ => vec![],
-        }
+        self.block(block)
+            .exits
+            .iter()
+            .map(|link| link.target)
+            .collect()
     }
 
     /// Get predecessor block IDs for a block.

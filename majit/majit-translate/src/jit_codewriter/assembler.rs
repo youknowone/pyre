@@ -1529,7 +1529,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v1)));
+        graph.set_return(entry, Some(v1));
 
         let mut value_kinds = HashMap::new();
         value_kinds.insert(v0, RegKind::Int);
@@ -1583,7 +1583,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
         let type_state = resolve_types(&graph, &annotations);
@@ -1642,7 +1642,7 @@ mod tests {
                 true,
             )
             .unwrap();
-            g.set_terminator(g.startblock, Terminator::Return(None));
+            g.set_return(g.startblock, None);
             g
         }
 
@@ -1671,7 +1671,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
         let mut type_state = resolve_types(&graph, &annotations);
@@ -1756,7 +1756,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(graph.startblock, Terminator::Return(Some(result)));
+        graph.set_return(graph.startblock, Some(result));
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);

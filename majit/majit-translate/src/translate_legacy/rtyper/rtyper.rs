@@ -203,7 +203,7 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v)));
+        graph.set_return(entry, Some(v));
 
         let annotations = annotate::annotate(&graph);
         let types = resolve_types(&graph, &annotations);
@@ -227,7 +227,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v)));
+        graph.set_return(entry, Some(v));
 
         let annotations = annotate::annotate(&graph);
         let types = resolve_types(&graph, &annotations);
@@ -248,7 +248,7 @@ mod tests {
                 args: vec![val],
             },
         );
-        graph.set_terminator(target, Terminator::Return(Some(phi)));
+        graph.set_return(target, Some(phi));
 
         let annotations = annotate::annotate(&graph);
         let types = resolve_types(&graph, &annotations);

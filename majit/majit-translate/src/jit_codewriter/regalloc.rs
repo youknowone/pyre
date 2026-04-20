@@ -474,7 +474,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v1)));
+        graph.set_return(entry, Some(v1));
 
         let mut vk = HashMap::new();
         vk.insert(v0, RegKind::Int);
@@ -522,7 +522,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v2)));
+        graph.set_return(entry, Some(v2));
 
         let mut vk = HashMap::new();
         vk.insert(v0, RegKind::Int);
@@ -561,7 +561,7 @@ mod tests {
                 args: vec![v0],
             },
         );
-        graph.set_terminator(block1, Terminator::Return(Some(v1)));
+        graph.set_return(block1, Some(v1));
 
         let mut vk = HashMap::new();
         vk.insert(v0, RegKind::Int);

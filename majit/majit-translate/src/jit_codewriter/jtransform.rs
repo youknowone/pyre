@@ -2458,7 +2458,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let config = GraphTransformConfig {
             vable_fields: vec![VirtualizableFieldDescriptor::new(
@@ -2496,7 +2496,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let config = GraphTransformConfig {
             vable_fields: vec![VirtualizableFieldDescriptor::new(
@@ -2526,7 +2526,7 @@ mod tests {
             },
             false,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let result = rewrite_graph(
             &graph,
@@ -2567,7 +2567,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
@@ -2604,7 +2604,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let result = rewrite_graph(
             &graph,
@@ -2683,7 +2683,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let result = rewrite_graph(
             &graph,
@@ -2735,7 +2735,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let result = rewrite_graph(
             &graph,
@@ -2782,7 +2782,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
         graph
     }
 
@@ -2829,7 +2829,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         // Run the rtyper-equivalent lowering before jtransform — this is
         // what `codewriter.rs::transform_graph_to_jitcode` does for the
@@ -2928,7 +2928,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
         let mut type_state = resolve_types(&graph, &annotations);
@@ -3016,7 +3016,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            g.set_terminator(g.startblock, Terminator::Return(None));
+            g.set_return(g.startblock, None);
             g
         };
 
@@ -3082,7 +3082,7 @@ mod tests {
             },
             has_result,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
         let mut type_state = resolve_types(&graph, &annotations);
@@ -3268,7 +3268,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            g.set_terminator(g.startblock, Terminator::Return(None));
+            g.set_return(g.startblock, None);
             g
         };
 
@@ -3332,7 +3332,7 @@ mod tests {
             },
             has_result,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let annotations = annotate(&graph);
         let mut type_state = resolve_types(&graph, &annotations);
@@ -3493,7 +3493,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
@@ -3563,7 +3563,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);

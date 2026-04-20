@@ -548,17 +548,12 @@ fn make_exception_link(
 }
 
 /// Get successor block IDs from orthodox block exits.
+///
+/// RPython `flowspace/model.py:66-76 FunctionGraph.iterblocks` derives
+/// the successor set from `Block.exits` directly; final blocks
+/// (returnblock / exceptblock with `exits == ()`) have no successors.
 fn successors(block: &crate::model::Block) -> Vec<BlockId> {
-    if !block.exits.is_empty() {
-        return block.exits.iter().map(|link| link.target).collect();
-    }
-    match block.terminator {
-        Terminator::Goto { target, .. } => vec![target],
-        Terminator::Branch {
-            if_true, if_false, ..
-        } => vec![if_true, if_false],
-        Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => vec![],
-    }
+    block.exits.iter().map(|link| link.target).collect()
 }
 
 /// `flatten.py:306-334` `def insert_renamings(self, link)`.
@@ -843,7 +838,7 @@ mod tests {
         let mut graph = FunctionGraph::new("simple");
         let entry = graph.startblock;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v)));
+        graph.set_return(entry, Some(v));
 
         let flat = flatten(&graph, &identity_regallocs(8));
         assert_eq!(flat.name, "simple");
@@ -885,7 +880,7 @@ mod tests {
                 args: vec![],
             },
         );
-        graph.set_terminator(merge, Terminator::Return(None));
+        graph.set_return(merge, None);
 
         let flat = flatten(&graph, &identity_regallocs(8));
         // Should have labels + jumps
@@ -940,7 +935,7 @@ mod tests {
                 args: vec![],
             },
         );
-        graph.set_terminator(exit, Terminator::Return(None));
+        graph.set_return(exit, None);
 
         let flat = flatten(&graph, &identity_regallocs(8));
         // Body should jump back to header label
@@ -999,7 +994,7 @@ mod tests {
         let continuation = graph.create_block();
         let phi = graph.alloc_value();
         graph.block_mut(continuation).inputargs.push(phi);
-        graph.set_terminator(continuation, Terminator::Return(Some(phi)));
+        graph.set_return(continuation, Some(phi));
 
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
         graph.set_terminator(

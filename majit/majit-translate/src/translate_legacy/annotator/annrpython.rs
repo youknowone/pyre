@@ -226,7 +226,7 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v)));
+        graph.set_return(entry, Some(v));
 
         let state = annotate(&graph);
         assert_eq!(state.get(v), &ValueType::Int);
@@ -249,7 +249,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(v)));
+        graph.set_return(entry, Some(v));
 
         let state = annotate(&graph);
         assert_eq!(state.get(v), &ValueType::Int);
@@ -272,7 +272,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(result)));
+        graph.set_return(entry, Some(result));
 
         let state = annotate(&graph);
         assert_eq!(state.get(a), &ValueType::Int);
@@ -297,7 +297,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_terminator(entry, Terminator::Return(Some(result)));
+        graph.set_return(entry, Some(result));
 
         let state = annotate(&graph);
         assert_eq!(state.get(result), &ValueType::Int);
@@ -324,7 +324,7 @@ mod tests {
                 args: vec![val],
             },
         );
-        graph.set_terminator(target, Terminator::Return(Some(phi)));
+        graph.set_return(target, Some(phi));
 
         let state = annotate(&graph);
         // Phi should inherit Int from val via Link propagation

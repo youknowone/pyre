@@ -4435,7 +4435,7 @@ mod tests {
     /// Helper: create a FunctionGraph with just a return.
     fn simple_graph(name: &str) -> FunctionGraph {
         let mut g = FunctionGraph::new(name);
-        g.set_terminator(g.startblock, Terminator::Return(None));
+        g.set_return(g.startblock, None);
         g
     }
 
@@ -4575,7 +4575,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("forcer");
         graph.push_op(graph.startblock, OpKind::VableForce, false);
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["forcer"]);
         cc.register_function_graph(path, graph);
         cc.find_all_graphs_for_tests();
@@ -4640,7 +4640,7 @@ mod tests {
             },
             false,
         );
-        caller.set_terminator(caller.startblock, Terminator::Return(None));
+        caller.set_return(caller.startblock, None);
         let caller_path = CallPath::from_segments(["caller"]);
         cc.register_function_graph(caller_path, caller);
         cc.find_all_graphs_for_tests();
@@ -4706,7 +4706,7 @@ mod tests {
             },
             false,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["accessor"]);
         cc.register_function_graph(path, graph);
         cc.find_all_graphs_for_tests();
@@ -4743,7 +4743,7 @@ mod tests {
             },
             false,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["pure_writer"]);
         cc.register_function_graph(path.clone(), graph);
         cc.mark_elidable(path);
@@ -4818,7 +4818,7 @@ mod tests {
             },
             false,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["rw_same_field"]);
         cc.register_function_graph(path, graph);
         cc.find_all_graphs_for_tests();
@@ -4862,7 +4862,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["divider"]);
         cc.register_function_graph(path, graph);
 

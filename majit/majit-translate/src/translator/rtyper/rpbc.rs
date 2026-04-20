@@ -181,7 +181,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
         graph
     }
 
@@ -267,7 +267,7 @@ mod tests {
             },
             true,
         );
-        graph.set_terminator(graph.startblock, Terminator::Return(None));
+        graph.set_return(graph.startblock, None);
 
         let pre_ops_len = graph.blocks[graph.startblock.0].operations.len();
         let annotations = annotate(&graph);
