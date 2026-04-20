@@ -2077,3 +2077,8 @@ mod tests {
         eprintln!("  has low-level ops after inline: {has_low_level}");
     }
 }
+
+/// `rlib` — Rust port of `rpython/rlib/` helpers pulled in on demand.
+/// Currently only the pieces required by the annotator port are
+/// present (rarithmetic subset for `compute_restype`).
+pub mod rlib;

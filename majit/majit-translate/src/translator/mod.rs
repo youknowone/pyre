@@ -11,3 +11,4 @@
 //! belongs in `translator_legacy/` instead.
 
 pub mod rtyper;
+pub mod translator;

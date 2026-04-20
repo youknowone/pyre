@@ -334,6 +334,13 @@ impl DictDef {
         self.inner.dictkey.borrow().borrow().s_value.clone()
     }
 
+    /// RPython `dictdef.dictkey.custom_eq_hash` read access
+    /// (binaryop.py:528 / 533). Returns `True` for an r_dict, `False`
+    /// otherwise.
+    pub fn custom_eq_hash(&self) -> bool {
+        self.inner.dictkey.borrow().borrow().custom_eq_hash
+    }
+
     pub fn s_value(&self) -> SomeValue {
         self.inner.dictvalue.borrow().borrow().s_value.clone()
     }

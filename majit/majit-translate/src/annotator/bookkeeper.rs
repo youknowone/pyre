@@ -241,9 +241,8 @@ impl Bookkeeper {
         assert!(!self.position_entered.get(), "don't call enter() nestedly");
         self.position_entered.set(true);
         self.position_key.replace(position_key);
-        TLS_BOOKKEEPER.with(|cell| {
-            *cell.borrow_mut() = Some(Rc::clone(self));
-        });
+        // Upstream: `TLS.bookkeeper = self` (bookkeeper.py:89).
+        super::model::TLS.with(|state| state.borrow_mut().bookkeeper = Some(Rc::clone(self)));
     }
 
     /// RPython `Bookkeeper.leave(self)` (bookkeeper.py:91-94).
@@ -253,9 +252,8 @@ impl Bookkeeper {
     pub fn leave(&self) {
         self.position_entered.set(false);
         self.position_key.replace(None);
-        TLS_BOOKKEEPER.with(|cell| {
-            *cell.borrow_mut() = None;
-        });
+        // Upstream: `del TLS.bookkeeper` (bookkeeper.py:93).
+        super::model::TLS.with(|state| state.borrow_mut().bookkeeper = None);
     }
 
     /// RPython `Bookkeeper.at_position(self, pos)` (bookkeeper.py:96-106).
@@ -941,20 +939,17 @@ impl Default for Bookkeeper {
     }
 }
 
-thread_local! {
-    /// RPython `TLS.bookkeeper` (bookkeeper.py:89). Set by
-    /// [`Bookkeeper::enter`] and cleared by [`Bookkeeper::leave`];
-    /// read by [`getbookkeeper`] + [`immutablevalue`] module-level
-    /// helpers used from `binaryop.py` / `unaryop.py`.
-    static TLS_BOOKKEEPER: RefCell<Option<Rc<Bookkeeper>>> = const { RefCell::new(None) };
-}
-
 /// RPython `getbookkeeper()` free function (bookkeeper.py:605-611).
 ///
-/// Returns the thread-local bookkeeper installed by the most recent
-/// [`Bookkeeper::enter`] call — `None` outside an active reflow frame.
+/// ```python
+/// def getbookkeeper():
+///     try:
+///         return TLS.bookkeeper
+///     except AttributeError:
+///         return None
+/// ```
 pub fn getbookkeeper() -> Option<Rc<Bookkeeper>> {
-    TLS_BOOKKEEPER.with(|cell| cell.borrow().clone())
+    super::model::TLS.with(|state| state.borrow().bookkeeper.clone())
 }
 
 /// RPython `immutablevalue(x)` free function (bookkeeper.py:613-614).

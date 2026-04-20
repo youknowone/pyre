@@ -42,7 +42,7 @@ use std::collections::HashSet;
 use std::rc::{Rc, Weak};
 
 use super::bookkeeper::{Bookkeeper, PositionKey};
-use super::model::{AnnotatorError, SomeValue, UnionError};
+use super::model::{AnnotatorError, SomeList, SomeValue, UnionError};
 
 /// RPython `class TooLateForChange(AnnotatorError)` (listdef.py:6-7).
 /// Raised when mutation is attempted on a `dont_change_any_more`
@@ -566,6 +566,22 @@ impl ListDef {
         li_mut.mutate()
     }
 
+    /// RPython `ListDef.resize()` (listdef.py:185-187).
+    ///
+    /// ```python
+    /// def resize(self):
+    ///     self.listitem.mutate()
+    ///     self.listitem.resize()
+    /// ```
+    pub fn resize(&self) -> Result<(), AnnotatorError> {
+        let li = self.inner.listitem.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        li_mut
+            .mutate()
+            .map_err(|_| AnnotatorError::new("TooLateForChange"))?;
+        li_mut.resize()
+    }
+
     /// RPython `ListDef.read_item(position_key)` (listdef.py:132-134).
     ///
     /// Records a read location for eventual `notify_update()` reflow,
@@ -582,6 +598,51 @@ impl ListDef {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
         li_mut.generalize(s_value)
+    }
+
+    /// RPython `ListDef.offspring(bookkeeper, *others)` (listdef.py:154-165).
+    ///
+    /// ```python
+    /// def offspring(self, bookkeeper, *others):
+    ///     position = bookkeeper.position_key
+    ///     s_self_value = self.read_item(position)
+    ///     s_other_values = []
+    ///     for other in others:
+    ///         s_other_values.append(other.read_item(position))
+    ///     s_newlst = bookkeeper.newlist(s_self_value, *s_other_values)
+    ///     s_newvalue = s_newlst.listdef.read_item(position)
+    ///     self.generalize(s_newvalue)
+    ///     for other in others:
+    ///         other.generalize(s_newvalue)
+    ///     return s_newlst
+    /// ```
+    pub fn offspring(
+        &self,
+        bookkeeper: &Rc<Bookkeeper>,
+        others: &[&ListDef],
+    ) -> Result<SomeList, AnnotatorError> {
+        let position = bookkeeper
+            .current_position_key()
+            .expect("offspring: bookkeeper.position_key is None");
+        let s_self_value = self.read_item(position);
+        let mut s_other_values: Vec<SomeValue> = Vec::with_capacity(others.len());
+        for other in others {
+            s_other_values.push(other.read_item(position));
+        }
+        // upstream: `bookkeeper.newlist(s_self_value, *s_other_values)`.
+        let mut all_values = Vec::with_capacity(1 + s_other_values.len());
+        all_values.push(s_self_value);
+        all_values.extend(s_other_values);
+        let s_newlst = bookkeeper.newlist(&all_values, None)?;
+        let s_newvalue = s_newlst.listdef.read_item(position);
+        self.generalize(&s_newvalue)
+            .map_err(|e| AnnotatorError::new(e.msg))?;
+        for other in others {
+            other
+                .generalize(&s_newvalue)
+                .map_err(|e| AnnotatorError::new(e.msg))?;
+        }
+        Ok(s_newlst)
     }
 
     /// RPython `ListDef.generalize_range_step(range_step)`

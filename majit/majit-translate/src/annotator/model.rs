@@ -49,7 +49,56 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::super::flowspace::model::{Constant, Variable};
+use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
+
+// ---------------------------------------------------------------------------
+// State / TLS (model.py:44-49).
+// ---------------------------------------------------------------------------
+
+/// RPython `class State(object)` (model.py:44-48).
+///
+/// ```python
+/// class State(object):
+///     # A global attribute :-(  Patch it with 'True' to enable checking of
+///     # the no_nul attribute...
+///     check_str_without_nul = False
+///     allow_int_to_float = True
+/// TLS = State()
+/// ```
+///
+/// The `bookkeeper` slot is assigned dynamically upstream (bookkeeper.py:89
+/// — `TLS.bookkeeper = self` inside `Bookkeeper.enter`). Rust can't add
+/// attributes at runtime, so the slot is declared explicitly here and
+/// `Bookkeeper::enter` / `leave` set / clear it.
+pub struct State {
+    /// RPython `State.check_str_without_nul` (model.py:47).
+    pub check_str_without_nul: bool,
+    /// RPython `State.allow_int_to_float` (model.py:48).
+    pub allow_int_to_float: bool,
+    /// RPython `TLS.bookkeeper` (set dynamically by `Bookkeeper.enter`).
+    pub bookkeeper: Option<Rc<Bookkeeper>>,
+}
+
+impl State {
+    pub const fn new() -> Self {
+        State {
+            check_str_without_nul: false,
+            allow_int_to_float: true,
+            bookkeeper: None,
+        }
+    }
+}
+
+thread_local! {
+    /// RPython `TLS = State()` (model.py:49).
+    ///
+    /// A single process-wide `State` singleton upstream — modelled as
+    /// a `thread_local!` here because `Rc<Bookkeeper>` is `!Send`. The
+    /// annotator runs single-threaded, so this matches upstream
+    /// semantics exactly.
+    pub static TLS: RefCell<State> = const { RefCell::new(State::new()) };
+}
 
 // ---------------------------------------------------------------------------
 // KnownType — mirror of upstream `SomeObject.knowntype` class attribute.
@@ -397,6 +446,17 @@ impl SomeInteger {
         SomeInteger {
             base: SomeObjectBase::new(knowntype, true),
             // upstream: `self.nonneg = unsigned or nonneg`.
+            nonneg: unsigned || nonneg,
+            unsigned,
+        }
+    }
+
+    /// Construct with an explicit [`KnownType`] — mirrors RPython's
+    /// `SomeInteger(knowntype=...)` keyword call used by binaryop.py's
+    /// `compute_restype(...)` path (binaryop.py:201-202, :218-219).
+    pub fn new_with_knowntype(nonneg: bool, unsigned: bool, knowntype: KnownType) -> Self {
+        SomeInteger {
+            base: SomeObjectBase::new(knowntype, true),
             nonneg: unsigned || nonneg,
             unsigned,
         }
@@ -1698,6 +1758,46 @@ impl SomeValue {
             _ => self.clone(),
         }
     }
+
+    /// RPython `s.const` property (ConstAccessDelegator at model.py
+    /// top-level; resolves to `s.const_box.value`).
+    ///
+    /// Upstream raises `AttributeError` when `const_box` is absent;
+    /// the Rust port returns `None` instead. Callers guard with
+    /// [`SomeObjectTrait::is_constant`] to avoid the miss case —
+    /// mirroring `if s.is_constant(): r = s.const` in the Python
+    /// sources. The trailing underscore in the method name works
+    /// around Rust's reserved `const` keyword.
+    pub fn const_(&self) -> Option<&crate::flowspace::model::ConstValue> {
+        let cb: Option<&Constant> = match self {
+            SomeValue::Impossible => None,
+            SomeValue::Object(s) => s.const_box.as_ref(),
+            SomeValue::Type(s) => s.base.const_box.as_ref(),
+            SomeValue::Float(s) => s.base.const_box.as_ref(),
+            SomeValue::SingleFloat(s) => s.base.const_box.as_ref(),
+            SomeValue::LongFloat(s) => s.base.const_box.as_ref(),
+            SomeValue::Integer(s) => s.base.const_box.as_ref(),
+            SomeValue::Bool(s) => s.base.const_box.as_ref(),
+            SomeValue::String(s) => s.inner.base.const_box.as_ref(),
+            SomeValue::UnicodeString(s) => s.inner.base.const_box.as_ref(),
+            SomeValue::ByteArray(s) => s.inner.base.const_box.as_ref(),
+            SomeValue::Char(s) => s.inner.base.const_box.as_ref(),
+            SomeValue::UnicodeCodePoint(s) => s.inner.base.const_box.as_ref(),
+            SomeValue::List(s) => s.base.const_box.as_ref(),
+            SomeValue::Tuple(s) => s.base.const_box.as_ref(),
+            SomeValue::Dict(s) => s.base.const_box.as_ref(),
+            SomeValue::Iterator(s) => s.base.const_box.as_ref(),
+            SomeValue::Instance(s) => s.base.const_box.as_ref(),
+            SomeValue::Exception(s) => s.base.const_box.as_ref(),
+            SomeValue::PBC(s) => s.base.const_box.as_ref(),
+            SomeValue::None_(s) => s.base.const_box.as_ref(),
+            SomeValue::Builtin(s) => s.base.const_box.as_ref(),
+            SomeValue::BuiltinMethod(s) => s.base.const_box.as_ref(),
+            SomeValue::WeakRef(s) => s.base.const_box.as_ref(),
+            SomeValue::TypeOf(s) => s.base.const_box.as_ref(),
+        };
+        cb.map(|c| &c.value)
+    }
 }
 
 impl SomeObjectTrait for SomeValue {
@@ -2298,6 +2398,27 @@ pub fn contains(a: &SomeValue, b: &SomeValue) -> bool {
     match union(a, b) {
         Ok(u) => &u == a,
         Err(_) => false,
+    }
+}
+
+/// RPython `read_can_only_throw(opimpl, *args)` (model.py:837-841).
+///
+/// ```python
+/// def read_can_only_throw(opimpl, *args):
+///     can_only_throw = getattr(opimpl, "can_only_throw", None)
+///     if can_only_throw is None or isinstance(can_only_throw, list):
+///         return can_only_throw
+///     return can_only_throw(*args)
+/// ```
+pub fn read_can_only_throw(
+    can_only_throw: &crate::flowspace::operation::CanOnlyThrow,
+    args_s: &[SomeValue],
+) -> Option<Vec<crate::flowspace::operation::BuiltinException>> {
+    use crate::flowspace::operation::CanOnlyThrow;
+    match can_only_throw {
+        CanOnlyThrow::Absent => None,
+        CanOnlyThrow::List(xs) => Some(xs.clone()),
+        CanOnlyThrow::Callable(f) => f(args_s),
     }
 }
 

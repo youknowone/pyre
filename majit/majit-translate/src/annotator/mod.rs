@@ -29,16 +29,16 @@
 //! | `signature`       (Phase 5)   | `signature.py`                  |
 //! | `specialize`      (Phase 5)   | `specialize.py`                 |
 
+pub mod annrpython;
 pub mod argument;
 pub mod binaryop;
 pub mod bookkeeper;
 pub mod classdesc;
-pub mod context;
 pub mod description;
 pub mod dictdef;
 pub mod exception;
 pub mod listdef;
 pub mod model;
-pub mod operations;
 pub mod policy;
 pub mod signature;
+pub mod unaryop;

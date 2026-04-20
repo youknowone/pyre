@@ -1130,7 +1130,7 @@ fn host_const_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>
 /// flowspace inputs actually fold. Commit 3 extends this with the
 /// explicit subclasses that have custom `eval()` (Iter, Next, GetAttr,
 /// SimpleCall, CallArgs, Pow).
-fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
+pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
     // --- variadic / ternary ops that fall outside the fixed-arity
     //     match below ---
     match (kind, args.len()) {
@@ -1385,6 +1385,280 @@ fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Ordering> {
         (ConstValue::Str(x), ConstValue::Str(y)) => Some(x.cmp(y)),
         (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(x.cmp(y)),
         _ => None,
+    }
+}
+
+// =====================================================================
+// Dispatcher plumbing (operation.py:66-300 + pairtype.py:75-96).
+// =====================================================================
+//
+// Upstream `class SingleDispatchMixin` / `class DoubleDispatchMixin`
+// store the registration table on the HLOperation subclass itself
+// (`cls._registry`). The Rust port collapses all HLOperation subclasses
+// into `OpKind`, so the per-class registries become a `HashMap<OpKind,
+// ...>` keyed on the op identity.
+
+use std::cell::RefCell;
+
+use crate::tool::pairtype::DoubleDispatchRegistry;
+
+/// RPython `specialized` closure value returned by
+/// `get_specialization` (operation.py:231-236 / 273-278).
+///
+/// Upstream this is a Python closure; it carries an optional
+/// `can_only_throw` attribute that annotator `read_can_only_throw`
+/// (model.py:837-841) consults. Rust packages the callable and the
+/// attribute side-by-side.
+pub struct Specialization {
+    /// The actual annotation handler — `spec(annotator, *self.args)`
+    /// upstream (operation.py:104).
+    pub apply: Box<
+        dyn Fn(
+            &crate::annotator::annrpython::RPythonAnnotator,
+            &HLOperation,
+        ) -> crate::annotator::model::SomeValue,
+    >,
+    /// RPython `specialized.can_only_throw = impl.can_only_throw`
+    /// side-band (operation.py:234).
+    pub can_only_throw: CanOnlyThrow,
+}
+
+/// RPython `getattr(opimpl, 'can_only_throw', None)` polymorphism
+/// (model.py:837-841).
+///
+/// Upstream the attribute is either absent, a list of exception
+/// classes, or a callable that produces one. Rust models the three
+/// branches explicitly.
+pub enum CanOnlyThrow {
+    /// Attribute absent — upstream `None`.
+    Absent,
+    /// `can_only_throw = [Exc, Exc, ...]` — upstream line 839
+    /// `isinstance(can_only_throw, list)` branch.
+    List(Vec<BuiltinException>),
+    /// `can_only_throw = lambda *args: [...]` — upstream line 841
+    /// `return can_only_throw(*args)` branch. Returns `None` to mirror
+    /// `_dict_can_only_throw_*` helpers (binaryop.py:527-535) that
+    /// defer to `op.canraise` for r_dict's unrestricted throw set.
+    Callable(Box<dyn Fn(&[crate::annotator::model::SomeValue]) -> Option<Vec<BuiltinException>>>),
+}
+
+thread_local! {
+    /// RPython `cls._registry` on `SingleDispatchMixin` (operation.py:59).
+    ///
+    /// Upstream: one dict per HLOperation subclass, keyed by the argument
+    /// class (`Some_cls`). Lookup walks `Some_cls.__mro__`
+    /// (operation.py:212-219). Rust collapses "per HLOperation subclass"
+    /// into an outer `HashMap<OpKind, ...>` since OpKind replaces the
+    /// class identity of the HLOperation subclass. The registry is
+    /// `thread_local!` because its contents include non-Send `Rc`
+    /// references and because RPython's annotator is single-threaded.
+    pub static _REGISTRY_SINGLE: RefCell<
+        std::collections::HashMap<
+            OpKind,
+            std::collections::HashMap<
+                crate::annotator::model::SomeValueTag,
+                Specialization,
+            >,
+        >,
+    > = {
+        let mut outer = std::collections::HashMap::new();
+        crate::annotator::unaryop::init(&mut outer);
+        RefCell::new(outer)
+    };
+
+    /// RPython `cls._registry = DoubleDispatchRegistry()` on
+    /// `DoubleDispatchMixin` (operation.py:62). Per-OpKind pair registry
+    /// using the [`DoubleDispatchRegistry`] ported from
+    /// `rpython/tool/pairtype.py`. Initialized on first access by
+    /// calling the module-import-time `init` helpers.
+    pub static _REGISTRY_DOUBLE: RefCell<
+        std::collections::HashMap<
+            OpKind,
+            DoubleDispatchRegistry<
+                crate::annotator::model::SomeValueTag,
+                crate::annotator::model::SomeValueTag,
+                Specialization,
+            >,
+        >,
+    > = {
+        let mut outer = std::collections::HashMap::new();
+        crate::annotator::binaryop::init(&mut outer);
+        RefCell::new(outer)
+    };
+}
+
+/// RPython `@op.<name>.register(Some_cls)` (operation.py:205-210 —
+/// `SingleDispatchMixin.register`).
+pub fn register_single(
+    op: OpKind,
+    tag: crate::annotator::model::SomeValueTag,
+    spec: Specialization,
+) {
+    _REGISTRY_SINGLE.with(|cell| {
+        cell.borrow_mut().entry(op).or_default().insert(tag, spec);
+    });
+}
+
+/// RPython `@op.<name>.register(Some1, Some2)` (operation.py:261-266 —
+/// `DoubleDispatchMixin.register`).
+pub fn register_double(
+    op: OpKind,
+    tag1: crate::annotator::model::SomeValueTag,
+    tag2: crate::annotator::model::SomeValueTag,
+    spec: Specialization,
+) {
+    _REGISTRY_DOUBLE.with(|cell| {
+        cell.borrow_mut()
+            .entry(op)
+            .or_default()
+            .set((tag1, tag2), spec);
+    });
+}
+
+impl HLOperation {
+    /// RPython `HLOperation.consider(self, annotator)` (operation.py:101-104).
+    ///
+    /// ```python
+    /// def consider(self, annotator):
+    ///     args_s = [annotator.annotation(arg) for arg in self.args]
+    ///     spec = type(self).get_specialization(*args_s)
+    ///     return spec(annotator, *self.args)
+    /// ```
+    ///
+    /// The Rust port splits on `self.kind.dispatch()` to pick the
+    /// correct `get_specialization` path — upstream selects the same
+    /// paths via MRO dispatch (`SingleDispatchMixin.get_specialization`
+    /// / `DoubleDispatchMixin.get_specialization`).
+    pub fn consider(
+        &self,
+        annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    ) -> crate::annotator::model::SomeValue {
+        use crate::annotator::model::SomeValue;
+        let args_s: Vec<SomeValue> = self
+            .args
+            .iter()
+            .map(|a| {
+                annotator
+                    .annotation(a)
+                    .unwrap_or_else(|| panic!("consider: unbound arg in {:?}", self.kind))
+            })
+            .collect();
+        match self.kind.dispatch() {
+            Dispatch::Single => {
+                let tag = args_s.first().expect("dispatch=1 op with 0 args").tag();
+                _REGISTRY_SINGLE.with(|cell| {
+                    let reg = cell.borrow();
+                    let entries = reg.get(&self.kind).unwrap_or_else(|| {
+                        panic!("no single-dispatch entries for {:?}", self.kind)
+                    });
+                    // Upstream `SingleDispatchMixin._dispatch` (operation.py:212-219)
+                    // walks `type(s_arg).__mro__`.
+                    for c in tag.mro() {
+                        if let Some(spec) = entries.get(c) {
+                            return (spec.apply)(annotator, self);
+                        }
+                    }
+                    panic!("no unary spec for {:?}({:?})", self.kind, tag);
+                })
+            }
+            Dispatch::Double => {
+                let tag_l = args_s.first().expect("dispatch=2 op with 0 args").tag();
+                let tag_r = args_s.get(1).expect("dispatch=2 op with 1 arg").tag();
+                _REGISTRY_DOUBLE.with(|cell| {
+                    let reg = cell.borrow();
+                    let entries = reg.get(&self.kind).unwrap_or_else(|| {
+                        panic!("no double-dispatch entries for {:?}", self.kind)
+                    });
+                    match entries.get((tag_l, tag_r), tag_l.mro(), tag_r.mro()) {
+                        Some(spec) => (spec.apply)(annotator, self),
+                        None => panic!(
+                            "no binary spec for {:?}({:?}, {:?})",
+                            self.kind, tag_l, tag_r
+                        ),
+                    }
+                })
+            }
+            Dispatch::None => {
+                // operation.py:66-116 — per-class `consider()` overrides
+                // on explicit subclasses (NewDict / NewTuple / NewList /
+                // Pow / SimpleCall / CallArgs / Contains / …). Land with
+                // their own commits.
+                todo!("consider: Dispatch::None special cases land with their own commits")
+            }
+        }
+    }
+
+    /// RPython `HLOperation.transform(self, annotator)` (operation.py:112-115).
+    ///
+    /// ```python
+    /// def transform(self, annotator):
+    ///     args_s = [annotator.annotation(arg) for arg in self.args]
+    ///     transformer = self.get_transformer(*args_s)
+    ///     return transformer(annotator, *self.args)
+    /// ```
+    ///
+    /// `cls._transform` registries are populated lazily; empty registry
+    /// means upstream's `lambda *args: None` default applies.
+    pub fn transform(&self, _annotator: &crate::annotator::annrpython::RPythonAnnotator) {
+        // Transform registries land with the optimizer-facing commits.
+    }
+
+    /// RPython `HLOperation.get_can_only_throw(self, annotator)`
+    /// (operation.py:106-107, SingleDispatchMixin:221-224,
+    /// DoubleDispatchMixin:283-286).
+    pub fn get_can_only_throw(
+        &self,
+        annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    ) -> Option<Vec<BuiltinException>> {
+        use crate::annotator::model::SomeValue;
+        let args_s: Vec<SomeValue> = self
+            .args
+            .iter()
+            .filter_map(|a| annotator.annotation(a))
+            .collect();
+        match self.kind.dispatch() {
+            Dispatch::Single => {
+                if args_s.is_empty() {
+                    return None;
+                }
+                let tag = args_s[0].tag();
+                _REGISTRY_SINGLE.with(|cell| {
+                    let reg = cell.borrow();
+                    let entries = reg.get(&self.kind)?;
+                    for c in tag.mro() {
+                        if let Some(spec) = entries.get(c) {
+                            return crate::annotator::model::read_can_only_throw(
+                                &spec.can_only_throw,
+                                &args_s,
+                            );
+                        }
+                    }
+                    None
+                })
+            }
+            Dispatch::Double => {
+                if args_s.len() < 2 {
+                    return None;
+                }
+                let tag_l = args_s[0].tag();
+                let tag_r = args_s[1].tag();
+                _REGISTRY_DOUBLE.with(|cell| {
+                    let reg = cell.borrow();
+                    let entries = reg.get(&self.kind)?;
+                    entries
+                        .get((tag_l, tag_r), tag_l.mro(), tag_r.mro())
+                        .and_then(|spec| {
+                            crate::annotator::model::read_can_only_throw(
+                                &spec.can_only_throw,
+                                &args_s,
+                            )
+                        })
+                })
+            }
+            // Upstream `HLOperation.get_can_only_throw` default
+            // (operation.py:106-107) returns None.
+            Dispatch::None => None,
+        }
     }
 }
 
