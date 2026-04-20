@@ -48,7 +48,7 @@ use core::fmt;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::super::flowspace::model::Constant;
+use super::super::flowspace::model::{Annotation, Constant, Variable};
 use super::classdesc::ClassDef;
 
 // ---------------------------------------------------------------------------
@@ -428,17 +428,50 @@ impl SomeObjectTrait for SomeInteger {
 ///
 /// Upstream `SomeBool.__init__` takes no args — the class attributes
 /// fix `knowntype = bool`, `nonneg = True`, `unsigned = False`.
-/// `knowntypedata` (set_knowntypedata in model.py:236-242) lands with
-/// A4.7.
+/// RPython `knowntypedata` carrier type — `defaultdict(dict)` keyed by
+/// branch truth value (`True` / `False`), inner dict keyed by
+/// [`Variable`] identity. Populated by [`add_knowntypedata`] and
+/// merged by [`merge_knowntypedata`].
+pub type KnownTypeData =
+    std::collections::HashMap<bool, std::collections::HashMap<Rc<Variable>, SomeValue>>;
+
+/// `knowntypedata` (set_knowntypedata in model.py:236-242) stores the
+/// branch-refinement facts for a bool-valued variable: a map from the
+/// boolean truth value to the variables whose annotation can be
+/// narrowed (and what to narrow to) in that branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeBool {
     pub base: SomeObjectBase,
+    /// RPython `self.knowntypedata` (model.py:236-242). Absent when
+    /// `set_knowntypedata` was never called or when all branches were
+    /// pruned. Upstream uses a `defaultdict(dict)` keyed by `bool`;
+    /// the Rust port keeps the inner map empty when there is nothing
+    /// to refine.
+    pub knowntypedata: Option<KnownTypeData>,
 }
 
 impl SomeBool {
     pub fn new() -> Self {
         SomeBool {
             base: SomeObjectBase::new(KnownType::Bool, true),
+            knowntypedata: None,
+        }
+    }
+
+    /// RPython `SomeBool.set_knowntypedata` (model.py:236-242).
+    ///
+    /// Assertion + falsy-inner-dict pruning: drop any truth key whose
+    /// inner dict is empty, then store only if the outer dict is
+    /// non-empty. Upstream asserts that `knowntypedata` is set at most
+    /// once per SomeBool instance.
+    pub fn set_knowntypedata(&mut self, mut data: KnownTypeData) {
+        assert!(
+            self.knowntypedata.is_none(),
+            "assert not hasattr(self, 'knowntypedata')"
+        );
+        data.retain(|_truth, inner| !inner.is_empty());
+        if !data.is_empty() {
+            self.knowntypedata = Some(data);
         }
     }
 }
@@ -2154,22 +2187,70 @@ pub fn contains(a: &SomeValue, b: &SomeValue) -> bool {
     }
 }
 
+// RPython equivalent: `Variable.annotation = SomeValue`. Downstream
+// flowspace code stores the annotation as a `Rc<dyn Annotation>` trait
+// object to avoid a flowspace → annotator dependency cycle; this impl
+// is the single hook that lets consumers downcast back to `SomeValue`.
+impl Annotation for SomeValue {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// RPython `add_knowntypedata(ktd, truth, vars, s_obj)` (model.py:789-791).
 ///
 /// Populates a boolean-keyed table tracking "if this bool is `truth`,
-/// these variables have annotation `s_obj`". The `vars` collection is
-/// modelled as owned strings (variable name prefixes) since the Phase 4
-/// port has no access to `flowspace::Variable` identity yet.
+/// these variables have annotation `s_obj`".
 pub fn add_knowntypedata(
-    ktd: &mut std::collections::HashMap<bool, std::collections::HashMap<String, SomeValue>>,
+    ktd: &mut KnownTypeData,
     truth: bool,
-    vars: &[String],
+    vars: &[Rc<Variable>],
     s_obj: SomeValue,
 ) {
     let entry = ktd.entry(truth).or_default();
     for v in vars {
-        entry.insert(v.clone(), s_obj.clone());
+        entry.insert(Rc::clone(v), s_obj.clone());
     }
+}
+
+/// RPython `merge_knowntypedata(ktd1, ktd2)` (model.py:794-800).
+///
+/// Intersection of the two tables: a variable survives only if both
+/// branches refined it, and the resulting annotation is the union of
+/// the two refinements.
+pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownTypeData {
+    let mut r: KnownTypeData = std::collections::HashMap::new();
+    for (truth, constraints) in ktd1 {
+        let Some(other) = ktd2.get(truth) else {
+            continue;
+        };
+        for (v, s1) in constraints {
+            let Some(s2) = other.get(v) else { continue };
+            if let Ok(u) = unionof([s1, s2]) {
+                r.entry(*truth).or_default().insert(Rc::clone(v), u);
+            }
+        }
+    }
+    r
+}
+
+/// RPython `typeof(args_v)` (model.py:151-161).
+///
+/// Builds a [`SomeTypeOf`] carrying the provided variables, with a
+/// fast path that pins `.const` when the single argument is a
+/// `SomeException` whose classdefs singleton identifies the type.
+pub fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
+    if args_v.is_empty() {
+        return SomeValue::Type(SomeType::new());
+    }
+    let names: Vec<String> = args_v.iter().map(|v| v.name()).collect();
+    let result = SomeTypeOf::new(names);
+    // TODO(Commit 2+): Exception-const fast path (model.py:154-158)
+    // requires downcasting `v.annotation` to `SomeValue::Exception`
+    // and projecting `classdefs -> classdesc.pyobj` onto `result.const`.
+    // The HostObject plumbing for that path lands with the exception-
+    // handling commits.
+    SomeValue::TypeOf(result)
 }
 
 #[cfg(test)]
@@ -2956,16 +3037,68 @@ mod tests {
 
     #[test]
     fn add_knowntypedata_populates_table() {
-        let mut ktd: std::collections::HashMap<bool, std::collections::HashMap<String, SomeValue>> =
-            std::collections::HashMap::new();
+        let mut ktd: KnownTypeData = std::collections::HashMap::new();
+        let x = Rc::new(Variable::named("x"));
+        let y = Rc::new(Variable::named("y"));
         add_knowntypedata(
             &mut ktd,
             true,
-            &["x".into(), "y".into()],
+            &[Rc::clone(&x), Rc::clone(&y)],
             SomeValue::Integer(SomeInteger::default()),
         );
         assert_eq!(ktd[&true].len(), 2);
-        assert!(ktd[&true].contains_key("x"));
+        assert!(ktd[&true].contains_key(&x));
         assert!(!ktd.contains_key(&false));
+    }
+
+    #[test]
+    fn merge_knowntypedata_intersects_and_unions() {
+        let x = Rc::new(Variable::named("x"));
+        let y = Rc::new(Variable::named("y"));
+        let mut k1: KnownTypeData = std::collections::HashMap::new();
+        add_knowntypedata(
+            &mut k1,
+            true,
+            &[Rc::clone(&x), Rc::clone(&y)],
+            SomeValue::Integer(SomeInteger::default()),
+        );
+        let mut k2: KnownTypeData = std::collections::HashMap::new();
+        add_knowntypedata(
+            &mut k2,
+            true,
+            &[Rc::clone(&x)],
+            SomeValue::Integer(SomeInteger::default()),
+        );
+        let merged = merge_knowntypedata(&k1, &k2);
+        // Only x survives (present in both); y dropped.
+        assert_eq!(merged[&true].len(), 1);
+        assert!(merged[&true].contains_key(&x));
+        assert!(!merged[&true].contains_key(&y));
+    }
+
+    #[test]
+    fn somebool_set_knowntypedata_rejects_empty_inner() {
+        let mut ktd: KnownTypeData = std::collections::HashMap::new();
+        ktd.insert(true, std::collections::HashMap::new()); // empty inner
+        let mut b = SomeBool::new();
+        b.set_knowntypedata(ktd);
+        assert!(
+            b.knowntypedata.is_none(),
+            "empty inner dict should be pruned"
+        );
+    }
+
+    #[test]
+    fn variable_annotation_roundtrip_via_trait_object() {
+        use std::rc::Rc;
+        let mut v = Variable::named("x");
+        let s = SomeValue::Integer(SomeInteger::default());
+        v.annotation = Some(Rc::new(s.clone()) as Rc<dyn Annotation>);
+        let got = v
+            .annotation
+            .as_ref()
+            .and_then(|a| a.as_any().downcast_ref::<SomeValue>())
+            .cloned();
+        assert_eq!(got, Some(s));
     }
 }

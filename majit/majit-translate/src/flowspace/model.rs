@@ -30,12 +30,19 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use super::bytecode::HostCode;
 
-/// Placeholder for `SomeValue` annotations attached by the annotator.
+/// Annotation carrier attached to `Variable`.
 ///
-/// RPython: `annotator/model.py:SomeObject`. Ported in roadmap
-/// Phase 4 as `majit-annotator::SomeValue`; until then every
-/// annotation slot carries `None`.
-pub type AnnotationPlaceholder = ();
+/// RPython's `Variable.annotation` holds a `SomeObject` subclass
+/// instance (`annotator/model.py:SomeObject`). In the Rust port the
+/// annotator crate lives above `flowspace`, so `flowspace` exposes an
+/// object-safe marker trait and annotator-side types
+/// (`annotator::model::SomeValue`) implement it. Consumers downcast
+/// with [`Annotation::as_any`].
+pub trait Annotation: core::fmt::Debug + std::any::Any {
+    /// Runtime downcast hook. Upstream RPython relies on Python's
+    /// dynamic type; Rust ports use `as_any().downcast_ref::<SomeValue>()`.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
 
 /// Placeholder for `Repr.lowleveltype` attached by the rtyper.
 ///
@@ -871,8 +878,10 @@ pub struct Variable {
     id: u64,
     _name: String,
     _nr: std::cell::Cell<i64>,
-    /// RPython `Variable.annotation` (set by the annotator).
-    pub annotation: Option<AnnotationPlaceholder>,
+    /// RPython `Variable.annotation` (set by the annotator). Holds a
+    /// `SomeValue` (via the [`Annotation`] trait object) once the
+    /// annotator binds the variable.
+    pub annotation: Option<Rc<dyn Annotation>>,
     /// RPython `Variable.concretetype` (set by the rtyper).
     pub concretetype: Option<ConcretetypePlaceholder>,
 }
@@ -888,7 +897,7 @@ impl Clone for Variable {
             id: self.id,
             _name: self._name.clone(),
             _nr: std::cell::Cell::new(self._nr.get()),
-            annotation: self.annotation,
+            annotation: self.annotation.clone(),
             concretetype: self.concretetype,
         }
     }
@@ -1027,7 +1036,7 @@ impl Variable {
         let mut newvar = Variable::new();
         newvar._name = self._name.clone();
         newvar._nr.set(-1);
-        newvar.annotation = self.annotation;
+        newvar.annotation = self.annotation.clone();
         newvar.concretetype = self.concretetype;
         newvar
     }
@@ -2548,11 +2557,23 @@ mod tests {
 
     #[test]
     fn variable_copy_preserves_annotation_and_concretetype() {
+        #[derive(Debug)]
+        struct StubAnn;
+        impl Annotation for StubAnn {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
         let mut v = Variable::new();
-        v.annotation = Some(());
+        v.annotation = Some(Rc::new(StubAnn) as Rc<dyn Annotation>);
         v.concretetype = Some(());
         let c = v.copy();
-        assert_eq!(c.annotation, v.annotation);
+        assert!(c.annotation.is_some() && v.annotation.is_some());
+        // Rc shares the same allocation — identity preserved per
+        // RPython parity (copy keeps reference to the same SomeValue).
+        let ca = c.annotation.as_ref().unwrap();
+        let va = v.annotation.as_ref().unwrap();
+        assert!(Rc::ptr_eq(ca, va));
         assert_eq!(c.concretetype, v.concretetype);
     }
 
