@@ -2124,6 +2124,9 @@ impl CallControl {
             None => return true,
         };
         for block in &graph.blocks {
+            if block.canraise() {
+                return true;
+            }
             // RPython: Abort terminator = except block path.
             // canraise.py:27-41: analyze_exceptblock_in_graph.
             if let Terminator::Abort { reason } = &block.terminator {

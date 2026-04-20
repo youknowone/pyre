@@ -591,6 +591,71 @@ pub struct SpaceOperation {
     pub kind: OpKind,
 }
 
+/// RPython `Block.exitswitch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExitSwitch {
+    Value(ValueId),
+    LastException,
+}
+
+/// RPython `Link.exitcase`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExitCase {
+    Bool(bool),
+    TypedException,
+    Exception,
+}
+
+/// RPython `flowspace/model.py:109-168` `Link`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    pub args: Vec<ValueId>,
+    pub target: BlockId,
+    pub exitcase: Option<ExitCase>,
+    /// RPython `Link.prevblock` — the block this Link exits from.
+    pub prevblock: Option<BlockId>,
+    /// RPython `Link.llexitcase` — the low-level value matched by
+    /// `goto_if_exception_mismatch`.  For exception links this is the
+    /// integer/pointer payload the blackhole reads as an `i` argument.
+    pub llexitcase: Option<i64>,
+    pub last_exception: Option<ValueId>,
+    pub last_exc_value: Option<ValueId>,
+}
+
+impl Link {
+    pub fn new(args: Vec<ValueId>, target: BlockId, exitcase: Option<ExitCase>) -> Self {
+        Self {
+            args,
+            target,
+            exitcase,
+            prevblock: None,
+            llexitcase: None,
+            last_exception: None,
+            last_exc_value: None,
+        }
+    }
+
+    pub fn with_prevblock(mut self, prevblock: BlockId) -> Self {
+        self.prevblock = Some(prevblock);
+        self
+    }
+
+    pub fn with_llexitcase(mut self, llexitcase: i64) -> Self {
+        self.llexitcase = Some(llexitcase);
+        self
+    }
+
+    pub fn extravars(
+        mut self,
+        last_exception: Option<ValueId>,
+        last_exc_value: Option<ValueId>,
+    ) -> Self {
+        self.last_exception = last_exception;
+        self.last_exc_value = last_exc_value;
+        self
+    }
+}
+
 /// How control flow leaves a basic block.
 ///
 /// RPython equivalent: `Block.exitswitch` + `Block.exits` (Links).
@@ -610,18 +675,6 @@ pub enum Terminator {
         true_args: Vec<ValueId>,
         if_false: BlockId,
         false_args: Vec<ValueId>,
-    },
-    /// Call whose last op may raise; block has a normal exit and an
-    /// exception exit.  RPython equivalent: `Block.exitswitch =
-    /// c_last_exception` with `block.exits = [normal_link,
-    /// exception_link]` (`rpython/flowspace/model.py:216`
-    /// `Block.canraise`).  The preceding `operations.last()` is the
-    /// raising op.
-    CallWithException {
-        normal_target: BlockId,
-        normal_args: Vec<ValueId>,
-        except_target: BlockId,
-        except_args: Vec<ValueId>,
     },
     Return(Option<ValueId>),
     Abort {
@@ -644,13 +697,83 @@ pub struct Block {
     /// values that map 1:1 to these inputargs.
     pub inputargs: Vec<ValueId>,
     pub operations: Vec<SpaceOperation>,
+    /// RPython `Block.exitswitch`.
+    pub exitswitch: Option<ExitSwitch>,
+    /// RPython `Block.exits`.
+    pub exits: Vec<Link>,
     pub terminator: Terminator,
+}
+
+impl Block {
+    pub fn canraise(&self) -> bool {
+        matches!(self.exitswitch, Some(ExitSwitch::LastException))
+    }
+}
+
+pub fn control_flow_from_terminator(terminator: &Terminator) -> (Option<ExitSwitch>, Vec<Link>) {
+    match terminator {
+        Terminator::Goto { target, args } => (None, vec![Link::new(args.clone(), *target, None)]),
+        Terminator::Branch {
+            cond,
+            if_true,
+            true_args,
+            if_false,
+            false_args,
+        } => (
+            Some(ExitSwitch::Value(*cond)),
+            vec![
+                Link::new(false_args.clone(), *if_false, Some(ExitCase::Bool(false))),
+                Link::new(true_args.clone(), *if_true, Some(ExitCase::Bool(true))),
+            ],
+        ),
+        Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => {
+            (None, Vec::new())
+        }
+    }
+}
+
+pub fn remap_control_flow_metadata<FValue, FBlock>(
+    exitswitch: &Option<ExitSwitch>,
+    exits: &[Link],
+    remap_value: FValue,
+    remap_block: FBlock,
+) -> (Option<ExitSwitch>, Vec<Link>)
+where
+    FValue: Fn(ValueId) -> ValueId,
+    FBlock: Fn(BlockId) -> BlockId,
+{
+    let exitswitch = exitswitch.as_ref().map(|switch| match switch {
+        ExitSwitch::Value(value) => ExitSwitch::Value(remap_value(*value)),
+        ExitSwitch::LastException => ExitSwitch::LastException,
+    });
+    let exits = exits
+        .iter()
+        .map(|link| Link {
+            args: link.args.iter().copied().map(&remap_value).collect(),
+            target: remap_block(link.target),
+            exitcase: link.exitcase.clone(),
+            prevblock: link.prevblock.map(&remap_block),
+            llexitcase: link.llexitcase,
+            last_exception: link.last_exception.map(&remap_value),
+            last_exc_value: link.last_exc_value.map(&remap_value),
+        })
+        .collect();
+    (exitswitch, exits)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionGraph {
     pub name: String,
     pub startblock: BlockId,
+    /// RPython `FunctionGraph.returnblock` — `Block([return_var])`.
+    ///
+    /// The codewriter-side graph still admits direct `Terminator::Return`
+    /// uses during the ongoing port, but keep the canonical final-block
+    /// identity on the graph itself so front-end and later passes can
+    /// converge toward upstream `flowspace/model.py:17-25`.
+    pub returnblock: BlockId,
+    /// RPython `FunctionGraph.exceptblock` — `Block([etype, evalue])`.
+    pub exceptblock: BlockId,
     pub blocks: Vec<Block>,
     #[serde(default)]
     pub notes: Vec<String>,
@@ -658,48 +781,71 @@ pub struct FunctionGraph {
     /// Variable names for debugging (RPython Variable._name).
     #[serde(default)]
     pub value_names: std::collections::HashMap<ValueId, String>,
-    /// Shared exception block for `?` lowering: a single block per
-    /// graph that takes the propagated `PyError` as its inputarg and
-    /// returns it.  Created lazily on the first `Expr::Try`.
-    /// RPython analogue: the codewriter coalesces exception paths into
-    /// a single `raise block` (`rpython/flowspace/model.py:198`) that
-    /// all raising blocks' `exits[1]` point to.
-    #[serde(default)]
-    pub exception_block: Option<BlockId>,
 }
 
 impl FunctionGraph {
     pub fn new(name: impl Into<String>) -> Self {
         let entry = BlockId(0);
+        let returnblock = BlockId(1);
+        let exceptblock = BlockId(2);
+        let return_value = ValueId(0);
+        let last_exception = ValueId(1);
+        let last_exc_value = ValueId(2);
         Self {
             name: name.into(),
             startblock: entry,
-            blocks: vec![Block {
-                id: entry,
-                inputargs: Vec::new(),
-                operations: Vec::new(),
-                terminator: Terminator::Unreachable,
-            }],
+            returnblock,
+            exceptblock,
+            blocks: vec![
+                Block {
+                    id: entry,
+                    inputargs: Vec::new(),
+                    operations: Vec::new(),
+                    exitswitch: None,
+                    exits: Vec::new(),
+                    terminator: Terminator::Unreachable,
+                },
+                Block {
+                    id: returnblock,
+                    inputargs: vec![return_value],
+                    operations: Vec::new(),
+                    exitswitch: None,
+                    exits: Vec::new(),
+                    terminator: Terminator::Return(Some(return_value)),
+                },
+                Block {
+                    id: exceptblock,
+                    inputargs: vec![last_exception, last_exc_value],
+                    operations: Vec::new(),
+                    exitswitch: None,
+                    exits: Vec::new(),
+                    terminator: Terminator::Return(None),
+                },
+            ],
             notes: Vec::new(),
-            next_value: 0,
+            next_value: 3,
             value_names: std::collections::HashMap::new(),
-            exception_block: None,
         }
     }
 
-    /// Get or create the shared exception block for `?` lowering.
-    /// The block takes the propagated `PyError` as its single
-    /// inputarg and returns it.  RPython parity:
-    /// `flowspace/model.py:198` "raise block".
-    pub fn get_or_create_exception_block(&mut self) -> (BlockId, ValueId) {
-        if let Some(id) = self.exception_block {
-            let arg = self.block(id).inputargs[0];
-            return (id, arg);
-        }
-        let (id, args) = self.create_block_with_args(1);
-        self.block_mut(id).terminator = Terminator::Return(Some(args[0]));
-        self.exception_block = Some(id);
-        (id, args[0])
+    /// Return the canonical exception block and its `(etype, evalue)`
+    /// inputargs.
+    ///
+    /// RPython parity: `flowspace/model.py:21-25` `exceptblock` has
+    /// two inputargs, `(etype, evalue)`, and exists eagerly on every
+    /// graph.
+    pub fn exceptblock_args(&self) -> (BlockId, ValueId, ValueId) {
+        let args = &self.block(self.exceptblock).inputargs;
+        (self.exceptblock, args[0], args[1])
+    }
+
+    /// Return the canonical return block and its single inputarg.
+    ///
+    /// RPython parity: `FunctionGraph.getreturnvar()` reads
+    /// `graph.returnblock.inputargs[0]`.
+    pub fn returnblock_arg(&self) -> (BlockId, ValueId) {
+        let args = &self.block(self.returnblock).inputargs;
+        (self.returnblock, args[0])
     }
 
     pub fn create_block(&mut self) -> BlockId {
@@ -708,6 +854,8 @@ impl FunctionGraph {
             id,
             inputargs: Vec::new(),
             operations: Vec::new(),
+            exitswitch: None,
+            exits: Vec::new(),
             terminator: Terminator::Unreachable,
         });
         id
@@ -721,6 +869,8 @@ impl FunctionGraph {
             id,
             inputargs: args.clone(),
             operations: Vec::new(),
+            exitswitch: None,
+            exits: Vec::new(),
             terminator: Terminator::Unreachable,
         });
         (id, args)
@@ -762,6 +912,51 @@ impl FunctionGraph {
 
     pub fn set_terminator(&mut self, block: BlockId, terminator: Terminator) {
         self.blocks[block.0].terminator = terminator;
+        self.resync_block_exits(block);
+    }
+
+    pub fn resync_block_exits(&mut self, block: BlockId) {
+        let (exitswitch, exits) = control_flow_from_terminator(&self.blocks[block.0].terminator);
+        let block_ref = &mut self.blocks[block.0];
+        block_ref.exitswitch = exitswitch;
+        block_ref.exits = exits
+            .into_iter()
+            .map(|link| link.with_prevblock(block))
+            .collect();
+    }
+
+    pub fn set_control_flow_metadata(
+        &mut self,
+        block: BlockId,
+        exitswitch: Option<ExitSwitch>,
+        exits: Vec<Link>,
+    ) {
+        let block_ref = &mut self.blocks[block.0];
+        block_ref.exitswitch = exitswitch;
+        block_ref.exits = exits
+            .into_iter()
+            .map(|link| link.with_prevblock(block))
+            .collect();
+    }
+
+    /// Route a return through the graph's canonical `returnblock` when
+    /// a value is available; declared-void returns still use
+    /// `Terminator::Return(None)` until the front-end carries an
+    /// explicit Void-typed return value.
+    pub fn set_return(&mut self, block: BlockId, value: Option<ValueId>) {
+        match value {
+            Some(value) => {
+                let (returnblock, _) = self.returnblock_arg();
+                self.set_terminator(
+                    block,
+                    Terminator::Goto {
+                        target: returnblock,
+                        args: vec![value],
+                    },
+                );
+            }
+            None => self.set_terminator(block, Terminator::Return(None)),
+        }
     }
 
     pub fn block(&self, block: BlockId) -> &Block {
@@ -798,16 +993,15 @@ impl FunctionGraph {
 
     /// Get successor block IDs for a block.
     pub fn successors(&self, block: BlockId) -> Vec<BlockId> {
-        match &self.block(block).terminator {
+        let block_ref = self.block(block);
+        if !block_ref.exits.is_empty() {
+            return block_ref.exits.iter().map(|link| link.target).collect();
+        }
+        match &block_ref.terminator {
             Terminator::Goto { target, .. } => vec![*target],
             Terminator::Branch {
                 if_true, if_false, ..
             } => vec![*if_true, *if_false],
-            Terminator::CallWithException {
-                normal_target,
-                except_target,
-                ..
-            } => vec![*normal_target, *except_target],
             _ => vec![],
         }
     }
@@ -898,7 +1092,43 @@ mod tests {
                 false_args: vec![],
             },
         );
-        assert_eq!(graph.blocks.len(), 2);
+        assert_eq!(graph.blocks.len(), 4);
         assert_eq!(graph.block(entry).operations.len(), 1);
+        assert_eq!(graph.block(graph.returnblock).inputargs.len(), 1);
+        assert_eq!(graph.block(graph.exceptblock).inputargs.len(), 2);
+    }
+
+    #[test]
+    fn set_control_flow_metadata_stamps_prevblock() {
+        let mut graph = FunctionGraph::new("demo");
+        let entry = graph.startblock;
+        let next = graph.create_block();
+        graph.set_control_flow_metadata(entry, None, vec![Link::new(vec![], next, None)]);
+        assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
+    }
+
+    #[test]
+    fn set_return_routes_non_void_returns_via_returnblock() {
+        let mut graph = FunctionGraph::new("demo");
+        let entry = graph.startblock;
+        let value = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(value));
+        assert_eq!(
+            graph.block(entry).terminator,
+            Terminator::Goto {
+                target: graph.returnblock,
+                args: vec![value],
+            }
+        );
+        assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
     }
 }

@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use majit_translate::front::ast::build_function_graph_pub;
-use majit_translate::model::Terminator;
+use majit_translate::model::{ExitCase, ExitSwitch};
 use syn::{File, Item};
 
 fn pyopcode_rs_path() -> PathBuf {
@@ -55,33 +55,43 @@ struct HandlerGraphStats {
     name: String,
     blocks: usize,
     ops: usize,
-    /// Number of blocks whose terminator is `CallWithException` — the
-    /// pyre equivalent of RPython `Block.exitswitch == c_last_exception`
+    /// Number of blocks whose `exitswitch` is `LastException` — the
+    /// direct port of RPython `Block.canraise`
     /// (`flowspace/model.py:214`). One per Rust `?` operator in the
     /// handler body.
     canraise_blocks: usize,
-    /// Whether the graph allocated a shared exception block for `?`
-    /// propagation (`FunctionGraph::get_or_create_exception_block`).
-    has_exception_block: bool,
+    exception_links_well_formed: usize,
+    /// RPython parity: `FunctionGraph.exceptblock` has two inputargs,
+    /// `(etype, evalue)` (`flowspace/model.py:21-25`).
+    exception_block_arity: usize,
 }
 
 fn lower_handler(func: &syn::ItemFn) -> HandlerGraphStats {
     let sf = build_function_graph_pub(func);
     let blocks = sf.graph.blocks.len();
     let ops: usize = sf.graph.blocks.iter().map(|b| b.operations.len()).sum();
-    let canraise_blocks = sf
+    let canraise_blocks = sf.graph.blocks.iter().filter(|b| b.canraise()).count();
+    let exception_links_well_formed = sf
         .graph
         .blocks
         .iter()
-        .filter(|b| matches!(b.terminator, Terminator::CallWithException { .. }))
+        .filter(|b| matches!(b.exitswitch, Some(ExitSwitch::LastException)))
+        .filter(|b| {
+            b.exits.len() == 2
+                && b.exits[0].exitcase.is_none()
+                && b.exits[1].exitcase == Some(ExitCase::Exception)
+                && b.exits[1].last_exception.is_some()
+                && b.exits[1].last_exc_value.is_some()
+        })
         .count();
-    let has_exception_block = sf.graph.exception_block.is_some();
+    let exception_block_arity = sf.graph.block(sf.graph.exceptblock).inputargs.len();
     HandlerGraphStats {
         name: sf.name,
         blocks,
         ops,
         canraise_blocks,
-        has_exception_block,
+        exception_links_well_formed,
+        exception_block_arity,
     }
 }
 
@@ -103,21 +113,18 @@ fn discover_pyre_opcode_handler_graphs() {
     // Emit the matrix so the phase reviewer can scan it from `cargo test --nocapture`.
     eprintln!("[phase-a.1] pyre-interpreter opcode handler lowering matrix:");
     eprintln!(
-        "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10}",
-        "name", "blocks", "ops", "canraise", "exc_block"
+        "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10} {:>10}",
+        "name", "blocks", "ops", "canraise", "exc_links", "exc_arity"
     );
     for entry in &matrix {
         eprintln!(
-            "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10}",
+            "[phase-a.1]   {:<40} {:>7} {:>7} {:>10} {:>10} {:>10}",
             entry.name,
             entry.blocks,
             entry.ops,
             entry.canraise_blocks,
-            if entry.has_exception_block {
-                "yes"
-            } else {
-                "no"
-            }
+            entry.exception_links_well_formed,
+            entry.exception_block_arity,
         );
     }
 
@@ -152,8 +159,8 @@ fn discover_pyre_opcode_handler_graphs() {
             });
         // Every super-instruction helper uses `?` on each trait method call
         // (load_local_value / push_value / pop_value / store_local_value),
-        // so the graph must contain `Terminator::CallWithException` blocks
-        // (one per `?`) plus a shared exception block.  RPython parity:
+        // so the graph must contain can-raise blocks (one per `?`) plus
+        // a shared exception block. RPython parity:
         // `flowspace/model.py:214 Block.canraise` + the "raise block" at
         // `model.py:198`.  A regression here means `Expr::Try` lowering
         // silently dropped the exception edge, violating RPython parity in
@@ -164,9 +171,14 @@ fn discover_pyre_opcode_handler_graphs() {
             "{} has zero canraise blocks — `?` lowering lost the exception edge",
             entry.name
         );
-        assert!(
-            entry.has_exception_block,
-            "{} has no shared exception block — `?` lowering failed to allocate one",
+        assert_eq!(
+            entry.exception_links_well_formed, entry.canraise_blocks,
+            "{} has malformed can-raise Link metadata",
+            entry.name
+        );
+        assert_eq!(
+            entry.exception_block_arity, 2,
+            "{} exception block must mirror RPython exceptblock arity `(etype, evalue)`",
             entry.name
         );
     }

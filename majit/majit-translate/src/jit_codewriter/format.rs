@@ -46,7 +46,10 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
     };
     for op in &ssarepr.insns {
         match op {
-            FlatOp::Jump(label) | FlatOp::GotoIfNot { target: label, .. } => {
+            FlatOp::Jump(label)
+            | FlatOp::CatchException { target: label }
+            | FlatOp::GotoIfExceptionMismatch { target: label, .. }
+            | FlatOp::GotoIfNot { target: label, .. } => {
                 name_label(*label, &mut seenlabels, &mut next_label);
             }
             _ => {}
@@ -90,6 +93,17 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let num = name_label(*label, &mut seenlabels, &mut next_label);
                 let _ = writeln!(out, "{prefix}goto L{num}");
             }
+            FlatOp::CatchException { target } => {
+                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let _ = writeln!(out, "{prefix}catch_exception L{num}");
+            }
+            FlatOp::GotoIfExceptionMismatch { llexitcase, target } => {
+                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let _ = writeln!(
+                    out,
+                    "{prefix}goto_if_exception_mismatch ${llexitcase}, L{num}"
+                );
+            }
             FlatOp::GotoIfNot { cond, target } => {
                 let num = name_label(*target, &mut seenlabels, &mut next_label);
                 let _ = writeln!(
@@ -129,6 +143,20 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     register_repr(*dst, &ssarepr.value_kinds)
                 );
             }
+            FlatOp::LastException { dst } => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}last_exception -> {}",
+                    register_repr(*dst, &ssarepr.value_kinds)
+                );
+            }
+            FlatOp::LastExcValue { dst } => {
+                let _ = writeln!(
+                    out,
+                    "{prefix}last_exc_value -> {}",
+                    register_repr(*dst, &ssarepr.value_kinds)
+                );
+            }
             FlatOp::Live { live_values } => {
                 let mut names: Vec<String> = live_values
                     .iter()
@@ -137,6 +165,9 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 // format.py:76: `if asm[0] == '-live-': lst.sort()`.
                 names.sort();
                 let _ = writeln!(out, "{prefix}-live- {}", names.join(", "));
+            }
+            FlatOp::Reraise => {
+                let _ = writeln!(out, "{prefix}reraise");
             }
             FlatOp::Unreachable => {
                 let _ = writeln!(out, "{prefix}---");

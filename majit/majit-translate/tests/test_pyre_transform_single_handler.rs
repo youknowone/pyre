@@ -31,9 +31,11 @@ use majit_translate::{
     CallPath, ParsedInterpreter,
     call::CallControl,
     extract_trait_impls,
+    flatten::FlatOp,
     front::{StructFieldRegistry, ast::build_function_graph_pub},
     jitcode::JitCode,
     jtransform::GraphTransformConfig,
+    model::{ExitCase, ExitSwitch},
     parse_source,
 };
 use syn::{Item, ItemFn};
@@ -75,6 +77,24 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
     let handler = find_opcode_handler(&pyopcode.file, "opcode_load_fast_load_fast")
         .expect("opcode_load_fast_load_fast is present in pyopcode.rs");
     let sf = build_function_graph_pub(handler);
+    assert_eq!(
+        sf.graph.block(sf.graph.exceptblock).inputargs.len(),
+        2,
+        "exception block must mirror RPython exceptblock arity `(etype, evalue)`"
+    );
+    let canraise_blocks: Vec<_> = sf.graph.blocks.iter().filter(|b| b.canraise()).collect();
+    assert!(
+        !canraise_blocks.is_empty(),
+        "opcode_load_fast_load_fast should lower `?` to can-raise blocks"
+    );
+    for block in canraise_blocks {
+        assert_eq!(block.exitswitch, Some(ExitSwitch::LastException));
+        assert_eq!(block.exits.len(), 2);
+        assert_eq!(block.exits[0].exitcase, None);
+        assert_eq!(block.exits[1].exitcase, Some(ExitCase::Exception));
+        assert!(block.exits[1].last_exception.is_some());
+        assert!(block.exits[1].last_exc_value.is_some());
+    }
     let path = CallPath::from_segments([sf.name.clone()]);
 
     // Seed a CallControl with the target graph plus every PyFrame trait
@@ -130,6 +150,17 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
          a transform pass dropped operations",
         ssarepr.insns.len(),
         original_ops
+    );
+    assert!(
+        ssarepr
+            .insns
+            .iter()
+            .any(|op| matches!(op, FlatOp::CatchException { .. })),
+        "lowered SSA must keep the can-raise edge as catch_exception"
+    );
+    assert!(
+        ssarepr.insns.iter().any(|op| matches!(op, FlatOp::Reraise)),
+        "lowered SSA must keep the exception arm as reraise"
     );
 
     // The JitCode shell must have been populated with a body.

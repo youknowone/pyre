@@ -303,16 +303,14 @@ fn block_exit_targets(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
         Some(b) => b,
         None => return Vec::new(),
     };
+    if !block.exits.is_empty() {
+        return block.exits.iter().map(|link| link.target.0).collect();
+    }
     match &block.terminator {
         Terminator::Goto { target, .. } => vec![target.0],
         Terminator::Branch {
             if_true, if_false, ..
         } => vec![if_true.0, if_false.0],
-        Terminator::CallWithException {
-            normal_target,
-            except_target,
-            ..
-        } => vec![normal_target.0, except_target.0],
         Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => Vec::new(),
     }
 }

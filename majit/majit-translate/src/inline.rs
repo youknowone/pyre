@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::call::{CallControl, CallKind};
 use crate::model::{
     BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
+    control_flow_from_terminator, remap_control_flow_metadata,
 };
 
 fn remap_call_funcptr<F: Fn(&ValueId) -> ValueId>(funcptr: &CallFuncPtr, remap: &F) -> CallFuncPtr {
@@ -137,11 +138,17 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
                 remap_value_in_terminator(&after_terminator, original_result, args[0]);
             graph.blocks[id.0].operations = remapped_after_ops;
             graph.blocks[id.0].terminator = remapped_after_term;
+            let (exitswitch, exits) = control_flow_from_terminator(&graph.blocks[id.0].terminator);
+            graph.blocks[id.0].exitswitch = exitswitch;
+            graph.blocks[id.0].exits = exits;
             (id, args)
         } else {
             let id = graph.create_block();
             graph.blocks[id.0].operations = after_ops;
             graph.blocks[id.0].terminator = after_terminator;
+            let (exitswitch, exits) = control_flow_from_terminator(&graph.blocks[id.0].terminator);
+            graph.blocks[id.0].exitswitch = exitswitch;
+            graph.blocks[id.0].exits = exits;
             (id, vec![])
         };
 
@@ -206,6 +213,14 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             other => remap_terminator(other, &value_map, &block_map),
         };
         graph.blocks[new_block_id.0].terminator = new_terminator;
+        let (exitswitch, exits) = remap_control_flow_metadata(
+            &callee_block.exitswitch,
+            &callee_block.exits,
+            |v| value_map[&v],
+            |b| block_map[&b],
+        );
+        graph.blocks[new_block_id.0].exitswitch = exitswitch;
+        graph.blocks[new_block_id.0].exits = exits;
     }
 
     // --- Connect caller's before-block to callee entry ---
@@ -237,6 +252,9 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         target: callee_entry,
         args: vec![],
     };
+    let (exitswitch, exits) = control_flow_from_terminator(&graph.blocks[block_id.0].terminator);
+    graph.blocks[block_id.0].exitswitch = exitswitch;
+    graph.blocks[block_id.0].exits = exits;
 }
 
 /// Allocate fresh ValueIds for all values in the callee graph.
@@ -648,17 +666,6 @@ fn remap_terminator(
             if_false: rb(if_false),
             false_args: false_args.iter().map(rv).collect(),
         },
-        Terminator::CallWithException {
-            normal_target,
-            normal_args,
-            except_target,
-            except_args,
-        } => Terminator::CallWithException {
-            normal_target: rb(normal_target),
-            normal_args: normal_args.iter().map(rv).collect(),
-            except_target: rb(except_target),
-            except_args: except_args.iter().map(rv).collect(),
-        },
         Terminator::Return(v) => Terminator::Return(v.as_ref().map(rv)),
         Terminator::Abort { reason } => Terminator::Abort {
             reason: reason.clone(),
@@ -819,15 +826,6 @@ fn terminator_value_refs(term: &Terminator) -> Vec<ValueId> {
             refs.extend(false_args);
             refs
         }
-        Terminator::CallWithException {
-            normal_args,
-            except_args,
-            ..
-        } => {
-            let mut refs = normal_args.clone();
-            refs.extend(except_args);
-            refs
-        }
         Terminator::Return(Some(v)) => vec![*v],
         Terminator::Return(None) | Terminator::Abort { .. } | Terminator::Unreachable => vec![],
     }
@@ -845,6 +843,14 @@ fn remap_value_in_graph(
         let block = &mut graph.blocks[bid.0];
         block.operations = remap_value_in_ops(&block.operations, old, new);
         block.terminator = remap_value_in_terminator(&block.terminator, old, new);
+        let (exitswitch, exits) = remap_control_flow_metadata(
+            &block.exitswitch,
+            &block.exits,
+            |v| if v == old { new } else { v },
+            |b| b,
+        );
+        block.exitswitch = exitswitch;
+        block.exits = exits;
     }
 }
 
@@ -879,17 +885,6 @@ fn remap_value_in_terminator(term: &Terminator, old: ValueId, new: ValueId) -> T
             true_args: true_args.iter().map(rv).collect(),
             if_false: *if_false,
             false_args: false_args.iter().map(rv).collect(),
-        },
-        Terminator::CallWithException {
-            normal_target,
-            normal_args,
-            except_target,
-            except_args,
-        } => Terminator::CallWithException {
-            normal_target: *normal_target,
-            normal_args: normal_args.iter().map(rv).collect(),
-            except_target: *except_target,
-            except_args: except_args.iter().map(rv).collect(),
         },
         Terminator::Return(v) => Terminator::Return(v.as_ref().map(rv)),
         Terminator::Abort { reason } => Terminator::Abort {

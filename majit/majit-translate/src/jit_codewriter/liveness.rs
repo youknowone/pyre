@@ -133,6 +133,18 @@ fn compute_liveness_pass(
                     alive.extend(alive_at_target.iter());
                 }
             }
+            FlatOp::CatchException { target } => {
+                let target = *target;
+                if let Some(alive_at_target) = label2alive.get(&target) {
+                    alive.extend(alive_at_target.iter());
+                }
+            }
+            FlatOp::GotoIfExceptionMismatch { target, .. } => {
+                let target = *target;
+                if let Some(alive_at_target) = label2alive.get(&target) {
+                    alive.extend(alive_at_target.iter());
+                }
+            }
             FlatOp::GotoIfNot { cond, target } => {
                 let cond = *cond;
                 let target = *target;
@@ -157,6 +169,10 @@ fn compute_liveness_pass(
                 // into `w`. Backwards: treat as a pure def of `dst`.
                 alive.remove(dst);
             }
+            FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
+                alive.remove(dst);
+            }
+            FlatOp::Reraise => {}
         }
     }
 

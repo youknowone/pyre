@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::call::CallDescriptor;
 use crate::model::{
     CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, Terminator,
-    ValueId, ValueType,
+    ValueId, ValueType, remap_control_flow_metadata,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -314,6 +314,14 @@ impl<'a> Transformer<'a> {
 
         block.operations = new_ops;
         block.terminator = remap_terminator(&block.terminator, &self.aliases);
+        let (exitswitch, exits) = remap_control_flow_metadata(
+            &block.exitswitch,
+            &block.exits,
+            |v| remap_value(v, &self.aliases),
+            |b| b,
+        );
+        block.exitswitch = exitswitch;
+        block.exits = exits;
 
         if let Terminator::Abort { reason } = &block.terminator {
             self.notes.push(GraphTransformNote {
@@ -2321,25 +2329,6 @@ fn remap_terminator(
                 .collect(),
             if_false: *if_false,
             false_args: false_args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-        },
-        Terminator::CallWithException {
-            normal_target,
-            normal_args,
-            except_target,
-            except_args,
-        } => Terminator::CallWithException {
-            normal_target: *normal_target,
-            normal_args: normal_args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            except_target: *except_target,
-            except_args: except_args
                 .iter()
                 .copied()
                 .map(|v| remap_value(v, aliases))

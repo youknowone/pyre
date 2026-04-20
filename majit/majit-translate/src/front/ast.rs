@@ -9,8 +9,8 @@ use syn::{Item, ItemFn};
 
 use crate::ParsedInterpreter;
 use crate::model::{
-    BlockId, CallTarget, FunctionGraph, ImmutableRank, OpKind, Terminator, UnknownKind, ValueId,
-    ValueType,
+    BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, ImmutableRank, Link, OpKind,
+    Terminator, UnknownKind, ValueId, ValueType,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -588,11 +588,7 @@ pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
         &AstGraphOptions::default(),
         &mut ctx,
     );
-    if let Some(val) = result {
-        graph.set_terminator(block, crate::model::Terminator::Return(Some(val)));
-    } else {
-        graph.set_terminator(block, crate::model::Terminator::Return(None));
-    }
+    graph.set_return(block, result);
 }
 
 pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
@@ -778,7 +774,7 @@ fn build_function_graph(
 
     // Default terminator if none was set
     if graph.block(entry).terminator == Terminator::Unreachable {
-        graph.set_terminator(entry, Terminator::Return(None));
+        graph.set_return(entry, None);
     }
 
     // RPython: op.result.concretetype — module-qualified for exact type identity.
@@ -1248,7 +1244,7 @@ fn lower_expr(
                 .expr
                 .as_ref()
                 .and_then(|e| lower_expr(graph, block, e, options, ctx));
-            graph.set_terminator(*block, Terminator::Return(val));
+            graph.set_return(*block, val);
             None
         }
 
@@ -1543,17 +1539,16 @@ fn lower_expr(
         // + `rpython/translator/exceptiontransform.py`): a call that
         // propagates exceptions leaves its containing block with
         // `exitswitch = c_last_exception` and `exits = [normal_link,
-        // exception_link]`.  We encode the same shape via
-        // `Terminator::CallWithException { normal_target, except_target }`.
+        // exception_link]`. The block's plain terminator stays a normal
+        // fallthrough `Goto`; the raising edge lives in `Block.exits`.
         // The `?`-checked expression lowers as follows:
         //   1. lower inner expression in the current block (this appends
         //      the raising call op at the tail);
         //   2. create a continuation block whose single inputarg carries
         //      the call result forward on the normal path;
-        //   3. route the exception path to the function's shared
-        //      exception block (`FunctionGraph::get_or_create_exception_block`),
-        //      which takes the propagated `PyError` and returns it — the
-        //      Rust `?` semantics of "early return Err(e)";
+        //   3. route the exception path to the function's canonical
+        //      `exceptblock`, whose two inputargs mirror RPython's
+        //      `(etype, evalue)` shape in `flowspace/model.py:21-25`;
         //   4. switch the caller's cursor to the continuation block so
         //      subsequent statements lower after the call.
         syn::Expr::Try(t) => {
@@ -1564,15 +1559,26 @@ fn lower_expr(
                 .block_mut(continuation)
                 .inputargs
                 .push(continuation_arg);
-            let (exc_block, _exc_arg) = graph.get_or_create_exception_block();
+            let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
             graph.set_terminator(
                 *block,
-                Terminator::CallWithException {
-                    normal_target: continuation,
-                    normal_args: vec![inner],
-                    except_target: exc_block,
-                    except_args: vec![inner],
+                Terminator::Goto {
+                    target: continuation,
+                    args: vec![inner],
                 },
+            );
+            graph.set_control_flow_metadata(
+                *block,
+                Some(ExitSwitch::LastException),
+                vec![
+                    Link::new(vec![inner], continuation, None),
+                    Link::new(
+                        vec![last_exception, last_exc_value],
+                        exc_block,
+                        Some(ExitCase::Exception),
+                    )
+                    .extravars(Some(last_exception), Some(last_exc_value)),
+                ],
             );
             *block = continuation;
             Some(continuation_arg)
@@ -2792,5 +2798,31 @@ mod tests {
                 func.graph.block(func.graph.startblock).operations
             );
         }
+    }
+
+    #[test]
+    fn value_return_routes_through_canonical_returnblock() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn returns_one() -> i64 { return 1; }
+            "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let func = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "returns_one")
+            .expect("returns_one present");
+        let entry = func.graph.block(func.graph.startblock);
+        assert_eq!(
+            entry.terminator,
+            Terminator::Goto {
+                target: func.graph.returnblock,
+                args: vec![entry.operations[0].result.expect("const result")],
+            }
+        );
+        assert_eq!(entry.exits.len(), 1);
+        assert_eq!(entry.exits[0].prevblock, Some(func.graph.startblock));
+        assert_eq!(entry.exits[0].target, func.graph.returnblock);
     }
 }

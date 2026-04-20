@@ -275,13 +275,20 @@ fn graph_result_kind(
     value_kinds: &std::collections::HashMap<ValueId, RegKind>,
 ) -> char {
     let mut found: Option<char> = None;
+    let use_canonical_returnblock = !graph.predecessors(graph.returnblock).is_empty();
     // RPython parity: FUNC.RESULT is driven by normal-path returns only.
-    // The shared exception block (`FunctionGraph::exception_block`) is
-    // the equivalent of RPython's "raise block" (`flowspace/model.py:198`),
-    // which terminates the graph by propagating an exception and does
-    // NOT participate in FUNC.RESULT typing.  Skip it explicitly.
+    // `FunctionGraph.exceptblock` is the canonical raise block
+    // (`flowspace/model.py:21-25`) and does NOT participate in
+    // FUNC.RESULT typing.  Skip it explicitly.
     for block in &graph.blocks {
-        if Some(block.id) == graph.exception_block {
+        if block.id == graph.exceptblock {
+            continue;
+        }
+        if use_canonical_returnblock {
+            if block.id != graph.returnblock {
+                continue;
+            }
+        } else if block.id == graph.returnblock {
             continue;
         }
         if let Terminator::Return(Some(vid)) = &block.terminator {

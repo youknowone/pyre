@@ -877,6 +877,17 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             FlatOp::Jump(label) => {
                 writeln!(out, "  goto L{}", label.0).ok();
             }
+            FlatOp::CatchException { target } => {
+                writeln!(out, "  catch_exception L{}", target.0).ok();
+            }
+            FlatOp::GotoIfExceptionMismatch { llexitcase, target } => {
+                writeln!(
+                    out,
+                    "  goto_if_exception_mismatch ${}, L{}",
+                    llexitcase, target.0
+                )
+                .ok();
+            }
             FlatOp::GotoIfNot { cond, target } => {
                 writeln!(
                     out,
@@ -919,6 +930,15 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                     dst.0
                 )
                 .ok();
+            }
+            FlatOp::LastException { dst } => {
+                writeln!(out, "  last_exception -> %i{}", dst.0).ok();
+            }
+            FlatOp::LastExcValue { dst } => {
+                writeln!(out, "  last_exc_value -> %i{}", dst.0).ok();
+            }
+            FlatOp::Reraise => {
+                writeln!(out, "  reraise").ok();
             }
         }
     }

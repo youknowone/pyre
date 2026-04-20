@@ -9,7 +9,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::model::{BlockId, FunctionGraph, SpaceOperation, Terminator, ValueId};
+use crate::model::{
+    BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, SpaceOperation, Terminator, ValueId,
+};
 use crate::regalloc::RegAllocResult;
 
 /// A label in the flattened instruction stream.
@@ -33,6 +35,11 @@ pub enum FlatOp {
     /// There is NO goto_if_true — RPython only uses goto_if_not.
     /// The true path is always the fallthrough.
     GotoIfNot { cond: ValueId, target: Label },
+    /// Exception setup for a can-raise block.
+    /// RPython: `('catch_exception', TLabel(normal_link))`.
+    CatchException { target: Label },
+    /// RPython: `('goto_if_exception_mismatch', Constant(llexitcase), TLabel(next))`.
+    GotoIfExceptionMismatch { llexitcase: i64, target: Label },
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
     ///
     /// RPython `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
@@ -49,6 +56,10 @@ pub enum FlatOp {
     /// RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
     /// Blackhole handler: `blackhole.py:671-679` `bhimpl_{int,ref,float}_pop`.
     Pop(ValueId),
+    /// RPython: `('last_exception', '->', result)`.
+    LastException { dst: ValueId },
+    /// RPython: `('last_exc_value', '->', result)`.
+    LastExcValue { dst: ValueId },
     /// Liveness marker — expanded by `compute_liveness()` to include
     /// all values alive at this point.
     ///
@@ -61,6 +72,9 @@ pub enum FlatOp {
         /// `compute_liveness()` expands this set.
         live_values: Vec<ValueId>,
     },
+    /// Re-raise the current exception.
+    /// RPython: `('reraise',)`.
+    Reraise,
     /// Unreachable marker — marks the end of a code path.
     /// RPython: `---` operation. Resets the alive set in liveness analysis.
     Unreachable,
@@ -139,96 +153,93 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             }
         }
 
-        // Terminator → jumps + moves (Phi resolution)
-        match &block.terminator {
-            Terminator::Goto { target, args } => {
-                // RPython `flatten.py:306` `insert_renamings(link)`.
-                let target_block = graph.block(*target);
-                insert_renamings(args, &target_block.inputargs, regallocs, &mut ops);
-                ops.push(FlatOp::Jump(block_labels[target]));
-            }
-            Terminator::Branch {
-                cond,
-                if_true,
-                true_args,
-                if_false,
-                false_args,
-            } => {
-                // RPython flatten.py:240-267: Two exits with boolean condition.
-                //
-                // Layout:
-                //   -live-
-                //   goto_if_not(cond, TLabel(false_path))
-                //   [true path: phi moves + goto true_block]
-                //   Label(false_path)
-                //   [false path: phi moves + goto false_block]
-                //
-                // The true/false block bodies are emitted separately in
-                // block order. Here we only emit the branch + phi moves.
-                let true_label = block_labels[if_true];
-                let false_label = block_labels[if_false];
-
-                // RPython flatten.py:259: -live- before goto_if_not
-                ops.push(FlatOp::Live {
-                    live_values: Vec::new(),
+        // RPython flatten.py:177-278 `insert_exits()`.
+        if block.exits.len() == 1 {
+            emit_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+        } else if block.canraise() {
+            debug_assert_eq!(block.exits[0].exitcase, None);
+            // RPython flatten.py:205-218: walk the operations tail backward
+            // past `-live-` markers to find the real raising op.  If the last
+            // op is NOT `-live-` (RPython's `index == -1` case), the call at
+            // the tail did not declare `can_raise` and this block cannot
+            // actually raise — emit only the normal link and move on.
+            let last_is_live = matches!(
+                block.operations.last().map(|op| &op.kind),
+                Some(crate::model::OpKind::Live)
+            );
+            if !last_is_live {
+                emit_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+            } else {
+                ops.push(FlatOp::CatchException {
+                    target: Label(next_label),
                 });
-                // Allocate a fresh label for the false-path landing pad.
-                // This avoids re-using the block's own label and creating
-                // a self-jump. RPython uses TLabel(linkfalse) which is
-                // distinct from Label(linkfalse.target).
-                let false_landing = Label(next_label);
+                let normal_landing = Label(next_label);
                 next_label += 1;
-
-                // RPython flatten.py:260: goto_if_not(cond, TLabel(false))
-                ops.push(FlatOp::GotoIfNot {
-                    cond: *cond,
-                    target: false_landing,
-                });
-
-                // RPython flatten.py:264: true path (fallthrough)
-                // insert_renamings(linktrue) + make_bytecode_block(linktrue.target)
-                let true_block = graph.block(*if_true);
-                insert_renamings(true_args, &true_block.inputargs, regallocs, &mut ops);
-                ops.push(FlatOp::Jump(true_label));
-
-                // RPython flatten.py:266-267: false path
-                // Label(linkfalse) then insert_renamings + make_bytecode_block
-                ops.push(FlatOp::Label(false_landing));
-                let false_block = graph.block(*if_false);
-                insert_renamings(false_args, &false_block.inputargs, regallocs, &mut ops);
-                ops.push(FlatOp::Jump(false_label));
-            }
-            Terminator::CallWithException {
-                normal_target,
-                normal_args,
-                ..
-            } => {
-                // RPython parity: a block with `exitswitch =
-                // c_last_exception` produces `-live-` before its
-                // normal-path jump (`rpython/jit/codewriter/
-                // liveness.py:5-20`).  The normal Link carries the
-                // call result into the continuation; the exception
-                // Link is consumed by later passes via the shared
-                // exception block (reachable through
-                // `FunctionGraph::successors`).
-                ops.push(FlatOp::Live {
-                    live_values: Vec::new(),
-                });
-                let target_block = graph.block(*normal_target);
-                for (dst, src) in target_block.inputargs.iter().zip(normal_args.iter()) {
-                    ops.push(FlatOp::Move {
-                        dst: *dst,
-                        src: *src,
+                emit_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+                ops.push(FlatOp::Label(normal_landing));
+                let mut catches_all = false;
+                for link in &block.exits[1..] {
+                    if link.exitcase == Some(ExitCase::Exception) {
+                        emit_exception_link(graph, &mut ops, &block_labels, link, regallocs);
+                        catches_all = true;
+                        break;
+                    }
+                    let mismatch_landing = Label(next_label);
+                    next_label += 1;
+                    ops.push(FlatOp::GotoIfExceptionMismatch {
+                        llexitcase: link
+                            .llexitcase
+                            .expect("typed exception links need llexitcase for parity"),
+                        target: mismatch_landing,
                     });
+                    emit_exception_link(graph, &mut ops, &block_labels, link, regallocs);
+                    ops.push(FlatOp::Label(mismatch_landing));
                 }
-                ops.push(FlatOp::Jump(block_labels[normal_target]));
+                if !catches_all {
+                    ops.push(FlatOp::Reraise);
+                    ops.push(FlatOp::Unreachable);
+                }
             }
-            Terminator::Return(_val) => {
-                // Return is implicit at the end (no jump needed)
-                // Could emit a FlatOp::Return if needed
-            }
-            Terminator::Abort { .. } | Terminator::Unreachable => {
-                // Terminal — no jump
+        } else if block.exits.len() == 2 && matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
+            let cond = match block.exitswitch {
+                Some(ExitSwitch::Value(cond)) => cond,
+                _ => unreachable!(),
+            };
+            let linkfalse = &block.exits[0];
+            let linktrue = &block.exits[1];
+            debug_assert_eq!(linkfalse.exitcase, Some(ExitCase::Bool(false)));
+            debug_assert_eq!(linktrue.exitcase, Some(ExitCase::Bool(true)));
+
+            // RPython flatten.py:259: -live- before goto_if_not.
+            ops.push(FlatOp::Live {
+                live_values: Vec::new(),
+            });
+            // Fresh TLabel for the false-path landing pad (distinct from
+            // `Label(linkfalse.target)`), matching `TLabel(linkfalse)`.
+            let false_landing = Label(next_label);
+            next_label += 1;
+            // RPython flatten.py:260: goto_if_not(cond, TLabel(linkfalse)).
+            ops.push(FlatOp::GotoIfNot {
+                cond,
+                target: false_landing,
+            });
+            // RPython flatten.py:264: true path (fallthrough) — make_link(linktrue).
+            emit_link(graph, &mut ops, &block_labels, linktrue, regallocs);
+            // RPython flatten.py:266-267: false path — Label(linkfalse)
+            // + make_link(linkfalse).
+            ops.push(FlatOp::Label(false_landing));
+            emit_link(graph, &mut ops, &block_labels, linkfalse, regallocs);
+        } else {
+            match &block.terminator {
+                Terminator::Return(_val) => {
+                    // Return is implicit at the end (no jump needed)
+                }
+                Terminator::Abort { .. } | Terminator::Unreachable => {
+                    // Terminal — no jump
+                }
+                Terminator::Goto { .. } | Terminator::Branch { .. } => {
+                    panic!("block has control-flow terminator without synchronized exits metadata");
+                }
             }
         }
     }
@@ -251,6 +262,15 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             }
             FlatOp::Push(ValueId(v)) | FlatOp::Pop(ValueId(v)) => {
                 max_value = max_value.max(*v + 1);
+            }
+            FlatOp::GotoIfNot {
+                cond: ValueId(c), ..
+            } => {
+                max_value = max_value.max(*c + 1);
+            }
+            FlatOp::LastException { dst: ValueId(d) }
+            | FlatOp::LastExcValue { dst: ValueId(d) } => {
+                max_value = max_value.max(*d + 1);
             }
             _ => {}
         }
@@ -291,7 +311,7 @@ fn block_order(graph: &FunctionGraph) -> Vec<BlockId> {
     while let Some(bid) = queue.pop_front() {
         order.push(bid);
         let block = graph.block(bid);
-        for succ in successors(&block.terminator) {
+        for succ in successors(block) {
             if visited.insert(succ) {
                 queue.push_back(succ);
             }
@@ -308,18 +328,63 @@ fn block_order(graph: &FunctionGraph) -> Vec<BlockId> {
     order
 }
 
-/// Get successor block IDs from a terminator.
-fn successors(term: &Terminator) -> Vec<BlockId> {
-    match term {
-        Terminator::Goto { target, .. } => vec![*target],
+/// RPython `flatten.py:140-144` `make_link(link, handling_ovf)`:
+/// `insert_renamings(link)` + `emitline('goto', TLabel(link.target))`.
+fn emit_link(
+    graph: &FunctionGraph,
+    ops: &mut Vec<FlatOp>,
+    block_labels: &std::collections::HashMap<BlockId, Label>,
+    link: &Link,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+) {
+    let target_block = graph.block(link.target);
+    insert_renamings(&link.args, &target_block.inputargs, regallocs, ops);
+    ops.push(FlatOp::Jump(block_labels[&link.target]));
+}
+
+/// RPython `flatten.py:146-175` `make_exception_link(link, handling_ovf)`:
+/// emit `last_exception` / `last_exc_value` defs, optionally collapse a
+/// bare re-raise link, then delegate to `make_link`.
+fn emit_exception_link(
+    graph: &FunctionGraph,
+    ops: &mut Vec<FlatOp>,
+    block_labels: &std::collections::HashMap<BlockId, Label>,
+    link: &Link,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+) {
+    debug_assert!(link.last_exception.is_some());
+    debug_assert!(link.last_exc_value.is_some());
+    let target = graph.block(link.target);
+    if target.operations.is_empty()
+        && link.args == vec![link.last_exception.unwrap(), link.last_exc_value.unwrap()]
+    {
+        ops.push(FlatOp::Reraise);
+        ops.push(FlatOp::Unreachable);
+        return;
+    }
+    if let Some(last_exception) = link.last_exception {
+        ops.push(FlatOp::LastException {
+            dst: last_exception,
+        });
+    }
+    if let Some(last_exc_value) = link.last_exc_value {
+        ops.push(FlatOp::LastExcValue {
+            dst: last_exc_value,
+        });
+    }
+    emit_link(graph, ops, block_labels, link, regallocs);
+}
+
+/// Get successor block IDs from orthodox block exits.
+fn successors(block: &crate::model::Block) -> Vec<BlockId> {
+    if !block.exits.is_empty() {
+        return block.exits.iter().map(|link| link.target).collect();
+    }
+    match block.terminator {
+        Terminator::Goto { target, .. } => vec![target],
         Terminator::Branch {
             if_true, if_false, ..
-        } => vec![*if_true, *if_false],
-        Terminator::CallWithException {
-            normal_target,
-            except_target,
-            ..
-        } => vec![*normal_target, *except_target],
+        } => vec![if_true, if_false],
         Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => vec![],
     }
 }
@@ -735,6 +800,119 @@ mod tests {
             .filter(|op| matches!(op, FlatOp::Move { .. }))
             .collect();
         assert_eq!(moves.len(), 1, "should have 1 Move for Phi resolution");
+    }
+
+    #[test]
+    fn flatten_call_with_exception_emits_catch_and_reraise() {
+        let mut graph = FunctionGraph::new("canraise");
+        let entry = graph.startblock;
+        let call_result = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        graph.push_op(entry, OpKind::Live, false);
+        let continuation = graph.create_block();
+        let phi = graph.alloc_value();
+        graph.block_mut(continuation).inputargs.push(phi);
+        graph.set_terminator(continuation, Terminator::Return(Some(phi)));
+
+        let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
+        graph.set_terminator(
+            entry,
+            Terminator::Goto {
+                target: continuation,
+                args: vec![call_result],
+            },
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(crate::model::ExitSwitch::LastException),
+            vec![
+                crate::model::Link::new(vec![call_result], continuation, None),
+                crate::model::Link::new(
+                    vec![last_exception, last_exc_value],
+                    exc_block,
+                    Some(crate::model::ExitCase::Exception),
+                )
+                .extravars(Some(last_exception), Some(last_exc_value)),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(16));
+        assert!(
+            flat.insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::CatchException { .. })),
+            "canraise block must flatten to catch_exception"
+        );
+        assert!(
+            flat.insns.iter().any(|op| matches!(op, FlatOp::Reraise)),
+            "shared exception block should re-raise in flattened form"
+        );
+    }
+
+    #[test]
+    fn flatten_typed_exception_links_emit_mismatch_and_last_exc_value() {
+        let mut graph = FunctionGraph::new("typed_canraise");
+        let entry = graph.startblock;
+        let call_result = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        graph.push_op(entry, OpKind::Live, false);
+
+        let handler = graph.create_block();
+        let handler_exc_value = graph.alloc_value();
+        graph.block_mut(handler).inputargs.push(handler_exc_value);
+        graph.set_terminator(
+            handler,
+            Terminator::Goto {
+                target: graph.returnblock,
+                args: vec![handler_exc_value],
+            },
+        );
+
+        let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
+        let typed_exc_value = graph.alloc_value();
+        graph.set_terminator(
+            entry,
+            Terminator::Goto {
+                target: graph.returnblock,
+                args: vec![call_result],
+            },
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(crate::model::ExitSwitch::LastException),
+            vec![
+                crate::model::Link::new(vec![call_result], graph.returnblock, None),
+                crate::model::Link::new(
+                    vec![typed_exc_value],
+                    handler,
+                    Some(crate::model::ExitCase::TypedException),
+                )
+                .with_llexitcase(123)
+                .extravars(Some(last_exception), Some(typed_exc_value)),
+                crate::model::Link::new(
+                    vec![last_exception, last_exc_value],
+                    exc_block,
+                    Some(crate::model::ExitCase::Exception),
+                )
+                .extravars(Some(last_exception), Some(last_exc_value)),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(16));
+        assert!(
+            flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: 123,
+                    ..
+                }
+            )),
+            "typed exception link should emit goto_if_exception_mismatch"
+        );
+        assert!(
+            flat.insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::LastExcValue { dst } if *dst == typed_exc_value)),
+            "typed exception link should materialize last_exc_value"
+        );
     }
 
     // `rpython/jit/codewriter/test/test_flatten.py:115-128` `test_reorder_renaming_list`.

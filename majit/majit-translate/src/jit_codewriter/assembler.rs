@@ -262,6 +262,28 @@ impl Assembler {
                 state.code.push(0);
             }
 
+            FlatOp::CatchException { target } => {
+                let opnum = self.get_opnum("catch_exception/L");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.alllabels.insert(state.code.len());
+                state.tlabel_fixups.push((*target, state.code.len()));
+                state.code.push(0);
+                state.code.push(0);
+            }
+
+            FlatOp::GotoIfExceptionMismatch { llexitcase, target } => {
+                let opnum = self.get_opnum("goto_if_exception_mismatch/iL");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                let encoded_llexitcase = self.emit_const_i(*llexitcase, state);
+                state.code.push(encoded_llexitcase);
+                state.alllabels.insert(state.code.len());
+                state.tlabel_fixups.push((*target, state.code.len()));
+                state.code.push(0);
+                state.code.push(0);
+            }
+
             // RPython flatten.py:247-267: goto_if_not(cond, TLabel(false_path))
             // Only goto_if_not exists — no goto_if_true in RPython.
             FlatOp::GotoIfNot { cond, target } => {
@@ -340,6 +362,32 @@ impl Assembler {
                 // `>` present in argcodes → record reskind per upstream
                 // `assembler.py:210-212`.
                 state.resulttypes.insert(state.code.len(), dst_kind);
+            }
+
+            FlatOp::LastException { dst } => {
+                let (reg, kind) = self.lookup_reg_with_kind(*dst, regallocs);
+                debug_assert_eq!(kind, 'i');
+                let opnum = self.get_opnum("last_exception/>i");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+                state.resulttypes.insert(state.code.len(), 'i');
+            }
+
+            FlatOp::LastExcValue { dst } => {
+                let (reg, kind) = self.lookup_reg_with_kind(*dst, regallocs);
+                debug_assert_eq!(kind, 'r');
+                let opnum = self.get_opnum("last_exc_value/>r");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+                state.resulttypes.insert(state.code.len(), 'r');
+            }
+
+            FlatOp::Reraise => {
+                let opnum = self.get_opnum("reraise/");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
             }
         }
     }
