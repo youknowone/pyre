@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
-use super::argument::simple_args;
+use super::argument::{ArgumentsForTranslation, complex_args, simple_args};
 use super::classdesc::{ClassDef, ClassDesc};
 use super::description::{
     CallFamily, ClassDefKey, DescEntry, DescKey, FrozenAttrFamily, FrozenDesc, FunctionDesc,
@@ -36,10 +36,11 @@ use super::description::{
 use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
-    AnnotatorError, Desc, DescKind, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat,
-    SomeInteger, SomeList, SomePBC, SomeString, SomeTuple, SomeValue, s_none,
+    AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
+    SomePBC, SomeString, SomeTuple, SomeValue, s_none,
 };
 use super::policy::AnnotatorPolicy;
+use crate::flowspace::argument::CallShape;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
 use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphRef, HostObject};
@@ -266,8 +267,35 @@ pub struct MethodDescKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EmulatedPbcCallKey {
     Position(PositionKey),
-    RDictCall { item_id: usize, role: &'static str },
+    RDictCall {
+        item_id: usize,
+        role: &'static str,
+    },
     Text(String),
+    /// RPython `('sandboxing', s_func.const)` tuple (policy.py:87). The
+    /// inner identity is the `HostObject` pointer for the external
+    /// callable being sandboxed.
+    Sandboxing {
+        callable_id: usize,
+    },
+}
+
+impl EmulatedPbcCallKey {
+    /// Build the sandbox-trampoline key used by
+    /// `AnnotatorPolicy::no_more_blocks_to_annotate` (policy.py:87).
+    pub fn sandboxing(func_const: &crate::flowspace::model::ConstValue) -> Self {
+        use crate::flowspace::model::ConstValue;
+        let callable_id = match func_const {
+            ConstValue::HostObject(obj) => obj.identity_id(),
+            // Non-HostObject consts reach here only if the policy walker
+            // stumbles over a non-sandboxable callable; fall back to the
+            // pointer of the enum discriminant so two such entries stay
+            // distinct yet the key remains stable for that
+            // call site.
+            _ => std::ptr::addr_of!(*func_const) as usize,
+        };
+        EmulatedPbcCallKey::Sandboxing { callable_id }
+    }
 }
 
 impl Bookkeeper {
@@ -384,16 +412,45 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.check_no_flags_on_instances(self)`
-    /// (bookkeeper.py:~113-120) — post-annotation sanity check invoked
+    /// (bookkeeper.py:120-150) — post-annotation sanity check invoked
     /// by `RPythonAnnotator.validate()`.
     ///
-    /// Not yet ported: the upstream body asserts that no `SomeInstance`
-    /// instance still has `flags` set once annotation is finished. The
-    /// Rust stub is a no-op until Phase 5 wires up the rtyper-facing
-    /// validation suite; keeping it as a named method preserves the
-    /// call site parity.
+    /// Upstream body:
+    ///
+    /// ```python
+    /// def check_no_flags_on_instances(self):
+    ///     seen = set()
+    ///     def check_no_flags(s_value_or_def):
+    ///         if isinstance(s_value_or_def, SomeInstance):
+    ///             assert not s_value_or_def.flags, ...
+    ///             check_no_flags(s_value_or_def.classdef)
+    ///         elif isinstance(s_value_or_def, SomeList):
+    ///             check_no_flags(s_value_or_def.listdef.listitem)
+    ///         elif isinstance(s_value_or_def, SomeDict):
+    ///             check_no_flags(s_value_or_def.dictdef.dictkey)
+    ///             check_no_flags(s_value_or_def.dictdef.dictvalue)
+    ///         elif isinstance(s_value_or_def, SomeTuple):
+    ///             for s_item in s_value_or_def.items:
+    ///                 check_no_flags(s_item)
+    ///         elif isinstance(s_value_or_def, ClassDef):
+    ///             if s_value_or_def in seen: return
+    ///             seen.add(s_value_or_def)
+    ///             for attr in s_value_or_def.attrs.itervalues():
+    ///                 check_no_flags(attr.s_value)
+    ///         elif isinstance(s_value_or_def, ListItem):
+    ///             if s_value_or_def in seen: return
+    ///             seen.add(s_value_or_def)
+    ///             check_no_flags(s_value_or_def.s_value)
+    ///
+    ///     for clsdef in self.classdefs:
+    ///         check_no_flags(clsdef)
+    /// ```
     pub fn check_no_flags_on_instances(&self) {
-        // Stub — see bookkeeper.py:~113-120.
+        let mut seen_classdefs: HashSet<ClassDefKey> = HashSet::new();
+        let mut seen_listitems: HashSet<usize> = HashSet::new();
+        for clsdef in self.classdefs.borrow().iter() {
+            check_no_flags_classdef(clsdef, &mut seen_classdefs, &mut seen_listitems);
+        }
     }
 
     /// RPython `Bookkeeper.compute_at_fixpoint(self)`
@@ -432,9 +489,10 @@ impl Bookkeeper {
         let emulated: Vec<(SomePBC, Vec<SomeValue>)> =
             self.emulated_pbc_calls.borrow().values().cloned().collect();
         for (pbc, args_s) in emulated {
-            let _args = simple_args(args_s);
-            // upstream: `pbc.consider_call_site(args, s_ImpossibleValue, None)`.
-            pbc.consider_call_site();
+            // upstream: `args = simple_args(args_s)`;
+            //            `pbc.consider_call_site(args, s_ImpossibleValue, None)`.
+            let args = simple_args(args_s);
+            let _ = pbc.consider_call_site(&args, &SomeValue::Impossible);
         }
         // upstream: `self.emulated_pbc_calls = {}`.
         self.emulated_pbc_calls.borrow_mut().clear();
@@ -476,17 +534,22 @@ impl Bookkeeper {
         };
         // SomeLLADTMeth path is rtyper-only; not ported.
         if let SomeValue::PBC(pbc) = &s_callable {
-            let _args_s: Vec<SomeValue> = call_op
+            let args_s: Vec<SomeValue> = call_op
                 .args
                 .iter()
                 .skip(1)
                 .filter_map(|a| ann.annotation(a))
                 .collect();
-            let _s_result = ann
+            let s_result = ann
                 .annotation(&call_op.result)
                 .unwrap_or(SomeValue::Impossible);
+            // upstream: `args = call_op.build_args(args_s)` —
+            // opname-sensitive: `simple_call` → `ArgumentsForTranslation
+            // (list(args_s))`, `call_args` → `fromshape(args_s[0].const,
+            // args_s[1:])`.
+            let args = build_args_for_op(&call_op.opname, &args_s)?;
             // upstream: `s_callable.consider_call_site(args, s_result, call_op)`.
-            pbc.consider_call_site();
+            pbc.consider_call_site(&args, &s_result)?;
         }
         Ok(())
     }
@@ -934,25 +997,6 @@ impl Bookkeeper {
         Ok(super::model::SomeException::new(clsdefs))
     }
 
-    fn resolve_stub_desc(&self, desc: &Desc) -> Option<DescEntry> {
-        self.descs
-            .borrow()
-            .values()
-            .find(|entry| match (desc.kind, entry) {
-                (DescKind::Function, DescEntry::Function(fd)) => {
-                    fd.borrow().base.pyobj.as_ref().map(|obj| obj.qualname())
-                        == Some(desc.name.as_str())
-                }
-                (DescKind::Class, DescEntry::Class(cd)) => cd.borrow().name == desc.name,
-                (DescKind::Frozen, DescEntry::Frozen(fd)) => {
-                    fd.borrow().base.pyobj.as_ref().map(|obj| obj.qualname())
-                        == Some(desc.name.as_str())
-                }
-                _ => false,
-            })
-            .cloned()
-    }
-
     fn pbc_call_result_from_entry(
         self: &Rc<Self>,
         entry: &DescEntry,
@@ -1065,14 +1109,8 @@ impl Bookkeeper {
         args_s: &[SomeValue],
     ) -> Result<SomeValue, AnnotatorError> {
         let mut results = Vec::new();
-        for desc in &pbc.descriptions {
-            let entry = self.resolve_stub_desc(desc).ok_or_else(|| {
-                AnnotatorError::new(format!(
-                    "Bookkeeper.pbc_call: unresolved PBC description {:?}",
-                    desc
-                ))
-            })?;
-            results.push(self.pbc_call_result_from_entry(&entry, args_s)?);
+        for entry in pbc.descriptions.values() {
+            results.push(self.pbc_call_result_from_entry(entry, args_s)?);
         }
         let mut iter = results.into_iter();
         let Some(mut acc) = iter.next() else {
@@ -1230,26 +1268,17 @@ impl Bookkeeper {
     }
 
     /// Narrow dispatch for the `ConstValue::HostObject` arm of
-    /// [`Self::immutablevalue`]. Covers the `callable` / `tp is type`
-    /// / `_freeze_` branches at bookkeeper.py:309-333 to the extent
-    /// that the stub `model::Desc` + `SomeBuiltin` surfaces allow.
+    /// [`Self::immutablevalue`]. Mirrors upstream
+    /// `bookkeeper.py:309-333` — builtin-analyser / callable / class /
+    /// frozen fallbacks.
     ///
-    /// The upstream calls route through `self.getdesc(x)` which lives
-    /// in bookkeeper commit 2 (blocked on classdesc.py for
-    /// `ClassDesc`). Until that lands, we emit stub `model::Desc`
-    /// entries into the [`SomePBC.descriptions`] set so callers see a
-    /// typed annotation rather than `AnnotatorError`. Semantic
-    /// differences vs upstream:
-    ///   * `knowntype` of the returned SomePBC is `KnownType::Other`
-    ///     because `commonbase` folding waits for classdesc.py.
-    ///   * `SomeConstantType(x, self)` (bookkeeper.py:315-316) for a
-    ///     class input collapses into `SomePBC([Desc::Class])` with
-    ///     `const_box` set — the PBC-subclass distinction is implicit
-    ///     in `DescKind::Class`.
-    ///   * Bound methods / weakrefs / frozen-PBCs / BUILTIN_ANALYZERS
-    ///     lookup / extregistry / property / symbolic-constant routes
-    ///     stay deferred (each needs its own dep — classdesc.py,
-    ///     weakref table, builtin.py registry, extregistry, specialize).
+    /// The user-function and class branches now route through
+    /// [`Self::getdesc`], which produces the real
+    /// [`DescEntry::Function`] / [`DescEntry::Class`] wrapping the
+    /// shared `Rc<RefCell<…>>` instance from `self.descs`. The
+    /// resulting [`SomePBC`] has `descriptions` populated with actual
+    /// Desc objects (fix for reviewer pre-existing #1: SomePBC
+    /// descriptions were just `kind+name` stubs).
     fn immutablevalue_hostobject(
         self: &Rc<Self>,
         obj: &HostObject,
@@ -1260,7 +1289,13 @@ impl Bookkeeper {
         // bound-method / find_method dispatch (bookkeeper.py:318-329)
         // requires a full descriptor registry that isn't ported yet.
         if obj.is_user_function() {
-            let mut pbc = SomePBC::new(vec![Desc::new(DescKind::Function, obj.qualname())], false);
+            let entry = self.getdesc(obj)?;
+            let mut pbc = SomePBC::new(vec![entry], false);
+            // Keep explicit const_box for parity with upstream
+            // `self.const = x` (bookkeeper.py's SomePBC callers pin
+            // const with the raw HostObject); SomePBC::new's single-
+            // desc hack already sets this to an equivalent value but
+            // we retain the write for clarity when `raw != pyobj`.
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
@@ -1280,12 +1315,11 @@ impl Bookkeeper {
             return Ok(SomeValue::Builtin(sb));
         }
         // upstream bookkeeper.py:315-316 — `tp is type` → SomeConstant
-        // Type(x, self). Implemented as a constant SomePBC over a
-        // Class-kind Desc (SomeConstantType IS a SomePBC subclass
-        // upstream; `const_box` + Class kind captures the same shape
-        // the Rust model can model today).
+        // Type(x, self). Implemented as a constant SomePBC over the
+        // real [`ClassDesc`] returned by [`Self::getdesc`].
         if obj.is_class() {
-            let mut pbc = SomePBC::new(vec![Desc::new(DescKind::Class, obj.qualname())], false);
+            let entry = self.getdesc(obj)?;
+            let mut pbc = SomePBC::new(vec![entry], false);
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
@@ -1301,6 +1335,174 @@ impl Default for Bookkeeper {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// RPython `CallOp.build_args(args_s)` dispatch by opname
+/// (operation.py:678-679 for `simple_call`, 699-701 for `call_args`).
+///
+/// `simple_call` wraps `args_s` in a flat `ArgumentsForTranslation`;
+/// `call_args` reads the encoded call shape out of `args_s[0].const`
+/// (`ConstValue::Tuple([Int(cnt), Tuple([Str(k0), …]), Bool(star)])`,
+/// see `flowcontext::build_call_shape_constant`) and reconstructs a
+/// CallShape + tail `args_s[1..]`.
+// =====================================================================
+// check_no_flags_on_instances walker (bookkeeper.py:124-147)
+// =====================================================================
+
+/// Entry point for the recursive sanity walk — inspects a `ClassDef`
+/// and recurses through its attributes. `seen_classdefs` /
+/// `seen_listitems` break cycles for attrs whose annotation cycles back.
+fn check_no_flags_classdef(
+    clsdef: &Rc<RefCell<ClassDef>>,
+    seen_classdefs: &mut HashSet<ClassDefKey>,
+    seen_listitems: &mut HashSet<usize>,
+) {
+    let key = ClassDefKey::from_classdef(clsdef);
+    if !seen_classdefs.insert(key) {
+        return;
+    }
+    let attrs_snapshot: Vec<SomeValue> = clsdef
+        .borrow()
+        .attrs
+        .values()
+        .map(|a| a.s_value.clone())
+        .collect();
+    for s_attr in attrs_snapshot {
+        check_no_flags_value(&s_attr, seen_classdefs, seen_listitems);
+    }
+}
+
+/// upstream `check_no_flags(SomeInstance | SomeList | SomeDict |
+/// SomeTuple)` arms; recurses into container element types.
+fn check_no_flags_value(
+    s: &SomeValue,
+    seen_classdefs: &mut HashSet<ClassDefKey>,
+    seen_listitems: &mut HashSet<usize>,
+) {
+    match s {
+        SomeValue::Instance(inst) => {
+            assert!(
+                inst.flags.is_empty(),
+                "instance annotation with flags escaped to the heap"
+            );
+            if let Some(classdef) = &inst.classdef {
+                check_no_flags_classdef(classdef, seen_classdefs, seen_listitems);
+            }
+        }
+        SomeValue::List(list) => {
+            let listitem = list.listdef.listitem_rc();
+            check_no_flags_listitem(&listitem, seen_classdefs, seen_listitems);
+        }
+        SomeValue::Dict(dict) => {
+            let dictkey = dict.dictdef.dictkey_rc();
+            check_no_flags_listitem(&dictkey, seen_classdefs, seen_listitems);
+            let dictvalue = dict.dictdef.dictvalue_rc();
+            check_no_flags_listitem(&dictvalue, seen_classdefs, seen_listitems);
+        }
+        SomeValue::Tuple(tup) => {
+            for item in &tup.items {
+                check_no_flags_value(item, seen_classdefs, seen_listitems);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_no_flags_listitem(
+    li: &Rc<RefCell<super::listdef::ListItem>>,
+    seen_classdefs: &mut HashSet<ClassDefKey>,
+    seen_listitems: &mut HashSet<usize>,
+) {
+    let id = Rc::as_ptr(li) as usize;
+    if !seen_listitems.insert(id) {
+        return;
+    }
+    let s_value = li.borrow().s_value.clone();
+    check_no_flags_value(&s_value, seen_classdefs, seen_listitems);
+}
+
+fn build_args_for_op(
+    opname: &str,
+    args_s: &[SomeValue],
+) -> Result<ArgumentsForTranslation, AnnotatorError> {
+    match opname {
+        "simple_call" => Ok(simple_args(args_s.to_vec())),
+        "call_args" => {
+            if args_s.is_empty() {
+                return Err(AnnotatorError::new(
+                    "build_args_for_op(call_args): missing shape argument",
+                ));
+            }
+            let shape_const = args_s[0].const_().ok_or_else(|| {
+                AnnotatorError::new("build_args_for_op(call_args): args_s[0] is not a Constant")
+            })?;
+            let shape = call_shape_from_const(shape_const)?;
+            Ok(complex_args(&shape, args_s[1..].to_vec()))
+        }
+        other => Err(AnnotatorError::new(format!(
+            "build_args_for_op: unsupported call opname {other:?}"
+        ))),
+    }
+}
+
+/// Decode the `CallShape` tuple embedded in `call_args` operations.
+/// Mirrors the encoding produced by
+/// `flowcontext::build_call_shape_constant`:
+/// `Tuple([Int(shape_cnt), Tuple([Str(key)*]), Bool(shape_star)])`.
+fn call_shape_from_const(cv: &ConstValue) -> Result<CallShape, AnnotatorError> {
+    let items = match cv {
+        ConstValue::Tuple(items) => items,
+        _ => {
+            return Err(AnnotatorError::new(
+                "call_shape_from_const: expected ConstValue::Tuple",
+            ));
+        }
+    };
+    if items.len() != 3 {
+        return Err(AnnotatorError::new(
+            "call_shape_from_const: tuple must have 3 elements",
+        ));
+    }
+    let shape_cnt = match &items[0] {
+        ConstValue::Int(n) => *n as usize,
+        _ => {
+            return Err(AnnotatorError::new(
+                "call_shape_from_const: shape_cnt is not Int",
+            ));
+        }
+    };
+    let keys_tuple = match &items[1] {
+        ConstValue::Tuple(k) => k,
+        _ => {
+            return Err(AnnotatorError::new(
+                "call_shape_from_const: shape_keys is not Tuple",
+            ));
+        }
+    };
+    let mut shape_keys = Vec::with_capacity(keys_tuple.len());
+    for k in keys_tuple {
+        match k {
+            ConstValue::Str(s) => shape_keys.push(s.clone()),
+            _ => {
+                return Err(AnnotatorError::new(
+                    "call_shape_from_const: shape_keys element is not Str",
+                ));
+            }
+        }
+    }
+    let shape_star = match &items[2] {
+        ConstValue::Bool(b) => *b,
+        _ => {
+            return Err(AnnotatorError::new(
+                "call_shape_from_const: shape_star is not Bool",
+            ));
+        }
+    };
+    Ok(CallShape {
+        shape_cnt,
+        shape_keys,
+        shape_star,
+    })
 }
 
 /// RPython `getbookkeeper()` free function (bookkeeper.py:605-611).
@@ -1352,6 +1554,50 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    #[test]
+    fn check_no_flags_on_instances_accepts_empty_flags() {
+        use crate::annotator::classdesc::{ClassDef, ClassDesc};
+        let bk = bk();
+        let pyobj = crate::flowspace::model::HostObject::new_class("pkg.A", vec![]);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            pyobj,
+            "pkg.A".into(),
+        )));
+        let classdef = ClassDef::new(&bk, &desc);
+        bk.classdefs.borrow_mut().push(classdef);
+        // No attrs, no SomeInstance carries flags — walker must not panic.
+        bk.check_no_flags_on_instances();
+    }
+
+    #[test]
+    #[should_panic(expected = "instance annotation with flags escaped to the heap")]
+    fn check_no_flags_on_instances_panics_on_non_empty_flags() {
+        use crate::annotator::classdesc::{ClassDef, ClassDesc};
+        use crate::annotator::model::SomeInstance;
+        let bk = bk();
+        let pyobj = crate::flowspace::model::HostObject::new_class("pkg.A", vec![]);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            pyobj,
+            "pkg.A".into(),
+        )));
+        let classdef = ClassDef::new(&bk, &desc);
+        // Plant an attribute whose value is a SomeInstance with
+        // non-empty flags — upstream's assertion must fire.
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("nonneg".to_string(), true);
+        let bad = SomeValue::Instance(SomeInstance::new(Some(classdef.clone()), false, flags));
+        let mut attrs_attr = crate::annotator::classdesc::Attribute::new("x");
+        attrs_attr.s_value = bad;
+        classdef
+            .borrow_mut()
+            .attrs
+            .insert("x".to_string(), attrs_attr);
+        bk.classdefs.borrow_mut().push(classdef);
+        bk.check_no_flags_on_instances();
     }
 
     #[test]
@@ -1491,7 +1737,7 @@ mod tests {
             SomeValue::PBC(pbc) => {
                 assert_eq!(pbc.descriptions.len(), 1);
                 assert_eq!(
-                    pbc.descriptions.iter().next().unwrap().kind,
+                    pbc.descriptions.values().next().unwrap().kind(),
                     DescKind::Class
                 );
                 assert!(pbc.base.const_box.is_some());
@@ -1518,7 +1764,7 @@ mod tests {
             SomeValue::PBC(pbc) => {
                 assert_eq!(pbc.descriptions.len(), 1);
                 assert_eq!(
-                    pbc.descriptions.iter().next().unwrap().kind,
+                    pbc.descriptions.values().next().unwrap().kind(),
                     DescKind::Function
                 );
             }

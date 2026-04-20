@@ -21,7 +21,7 @@ use std::rc::Rc;
 use super::super::flowspace::model::Variable;
 use super::super::flowspace::model::{ConstValue, Constant, Hlvalue};
 use super::super::flowspace::operation::{
-    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization,
+    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation,
 };
 use super::annrpython::RPythonAnnotator;
 use super::model::{
@@ -135,6 +135,26 @@ pub fn init(
     init_none_string_pairtype(reg);
 }
 
+/// Module-import time side effect mirroring
+/// `@op.<name>.register_transform(...)` decorators in binaryop.py. Runs
+/// at `_TRANSFORM_DOUBLE` thread_local initialization; each block below
+/// matches a single upstream `@op.X.register_transform(Y, Z)` decorator.
+pub fn init_transform(
+    reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Transformation>>,
+) {
+    init_instance_object_transform(reg);
+}
+
+fn register_transform(
+    reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Transformation>>,
+    op: OpKind,
+    tag1: SomeValueTag,
+    tag2: SomeValueTag,
+    tx: Transformation,
+) {
+    reg.entry(op).or_default().set((tag1, tag2), tx);
+}
+
 fn register(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
     op: OpKind,
@@ -231,16 +251,46 @@ fn is__default(annotator: &RPythonAnnotator, hlop: &HLOperation) -> SomeValue {
 
     // binaryop.py:39-59.
     let mut knowntypedata: model::KnownTypeData = HashMap::new();
-    let _bk = Rc::clone(&annotator.bookkeeper); // upstream: bk = annotator.bookkeeper
+    let bk = Rc::clone(&annotator.bookkeeper); // upstream: bk = annotator.bookkeeper
 
     // Upstream `def bind(src_obj, tgt_obj):` is a closure over
     // `knowntypedata`, `bk`, `annotator`. Rust inlines the two call
     // sites (bind(obj2, obj1); bind(obj1, obj2)) with explicit
     // parameters.
-    bind_is(&mut knowntypedata, obj1, &s_obj2, &s_obj1);
-    bind_is(&mut knowntypedata, obj2, &s_obj1, &s_obj2);
+    bind_is(&mut knowntypedata, &bk, obj1, &s_obj2, &s_obj1);
+    bind_is(&mut knowntypedata, &bk, obj2, &s_obj1, &s_obj2);
     r.set_knowntypedata(knowntypedata);
     SomeValue::Bool(r)
+}
+
+/// RPython `_annotation_key(t)` + `Bookkeeper.valueoftype` bridge.
+///
+/// Maps a constant's HostObject payload back onto an
+/// [`super::signature::AnnotationSpec`] so the bookkeeper's type-to-
+/// annotation lookup (`bk.valueoftype(t)`) can fire on the `is__default`
+/// `type(x) is T` refinement path (binaryop.py:44-49).
+///
+/// Mirrors upstream's `_annotation_key` (signature.py:15-28) name-based
+/// dispatch: builtin primitive types dispatch by qualname, everything
+/// else (user classes, exception types) routes through
+/// `AnnotationSpec::UserClass`.
+fn host_to_annotation_spec(cv: &ConstValue) -> Option<super::signature::AnnotationSpec> {
+    use super::signature::AnnotationSpec;
+    let obj = match cv {
+        ConstValue::HostObject(obj) => obj,
+        _ => return None,
+    };
+    match obj.qualname() {
+        "bool" => Some(AnnotationSpec::Bool),
+        "int" => Some(AnnotationSpec::Int),
+        "float" => Some(AnnotationSpec::Float),
+        "str" => Some(AnnotationSpec::Str),
+        "unicode" => Some(AnnotationSpec::Unicode),
+        "NoneType" | "types.NoneType" => Some(AnnotationSpec::NoneType),
+        "type" => Some(AnnotationSpec::Type),
+        _ if obj.is_class() => Some(AnnotationSpec::UserClass(obj.clone())),
+        _ => None,
+    }
 }
 
 /// Inlined body of the `bind(src_obj, tgt_obj)` closure
@@ -248,6 +298,7 @@ fn is__default(annotator: &RPythonAnnotator, hlop: &HLOperation) -> SomeValue {
 /// knowntypedata key; `s_src`/`s_tgt` carry the annotations.
 fn bind_is(
     knowntypedata: &mut model::KnownTypeData,
+    bk: &Rc<super::bookkeeper::Bookkeeper>,
     tgt_obj: &Hlvalue,
     s_src: &SomeValue,
     s_tgt: &SomeValue,
@@ -258,23 +309,22 @@ fn bind_is(
     //                           s_tgt.is_type_of,
     //                           bk.valueoftype(s_src.const))
     //
-    // `bk.valueoftype(s_src.const)` requires mapping a HostObject
-    // (Rust `ConstValue::HostObject`) that names a type back onto an
-    // `AnnotationSpec`. That round-trip depends on the host-type
-    // registry that lives with signature.rs + HostEnv, which is still
-    // partial — see reviewer's pre-existing notes. Until that lands,
-    // the best approximation is to widen the `is_type_of` variables
-    // to `s_src` itself (upstream would refine them more precisely
-    // via `valueoftype`, but propagating `s_src` unchanged is at least
-    // monotone — it never over-narrows).
+    // `bk.valueoftype(s_src.const)` takes a host-level type object and
+    // returns its `SomeValue`. The Rust port routes through
+    // `host_to_annotation_spec` (HostObject → AnnotationSpec) then
+    // `bk.valueoftype(&spec)`. When the HostObject isn't a recognised
+    // type (e.g. a non-class constant), we fall back to widening by
+    // `s_src` — monotone-safe and matches the prior Rust behaviour.
     if let SomeValue::TypeOf(t) = s_tgt {
         if s_src.is_constant() && !t.is_type_of.is_empty() {
-            // TODO(bk.valueoftype): replace `s_src.clone()` with
-            // `bk.valueoftype(s_src.const_().expect("constant"))` once
-            // the HostObject-based valueoftype path is wired up.
+            let refined = s_src
+                .const_()
+                .and_then(host_to_annotation_spec)
+                .and_then(|spec| bk.valueoftype(&spec).ok())
+                .unwrap_or_else(|| s_src.clone());
             let vars: Vec<Rc<super::super::flowspace::model::Variable>> =
                 t.is_type_of.iter().map(Rc::clone).collect();
-            super::model::add_knowntypedata(knowntypedata, true, &vars, s_src.clone());
+            super::model::add_knowntypedata(knowntypedata, true, &vars, refined);
         }
     }
 
@@ -2544,10 +2594,12 @@ fn pbc_pbc_is_(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     };
     let mut s = SomeBool::new();
     if !s_pbc1.can_be_none || !s_pbc2.can_be_none {
+        // upstream: `pbc1.descriptions & pbc2.descriptions` — set
+        //   intersection by identity. Rust port keys on DescKey.
         let common = s_pbc1
             .descriptions
-            .iter()
-            .any(|desc| s_pbc2.descriptions.contains(desc));
+            .keys()
+            .any(|k| s_pbc2.descriptions.contains_key(k));
         if !common {
             // upstream: `s.const = False`.
             s.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
@@ -2768,6 +2820,93 @@ fn init_none_string_pairtype(
     );
 }
 
+// =====================================================================
+// binaryop.py:727-747 — pairtype(SomeInstance, SomeObject) transforms
+// =====================================================================
+
+/// Build a new [`HLOperation`] with a fresh result [`Variable`] — the
+/// Rust equivalent of upstream `op.<name>(args...)` inside a transform
+/// handler. Upstream relies on `HLOperation.__init__` allocating a
+/// fresh `Variable()` (operation.py:73-75).
+fn mk_hlop(kind: OpKind, args: Vec<Hlvalue>) -> HLOperation {
+    HLOperation::new(kind, args)
+}
+
+/// RPython `@op.getitem.register_transform(SomeInstance, SomeObject)`
+/// / setitem / delitem / contains (binaryop.py:727-747). All four
+/// rewrite `op(v_ins, ...)` to `[op.getattr(v_ins, '__name__'),
+/// op.simple_call(getattr.result, ...)]`.
+fn init_instance_object_transform(
+    reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Transformation>>,
+) {
+    // binaryop.py:727-730 — getitem
+    register_transform(
+        reg,
+        OpKind::GetItem,
+        SomeValueTag::Instance,
+        SomeValueTag::Object,
+        Box::new(|_ann, args| {
+            let v_ins = args[0].clone();
+            let v_idx = args[1].clone();
+            let get_getitem = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_ins,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__getitem__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_getitem.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
+            Some(vec![get_getitem, call])
+        }),
+    );
+    // binaryop.py:732-736 — setitem
+    register_transform(
+        reg,
+        OpKind::SetItem,
+        SomeValueTag::Instance,
+        SomeValueTag::Object,
+        Box::new(|_ann, args| {
+            let v_ins = args[0].clone();
+            let v_idx = args[1].clone();
+            let v_value = args[2].clone();
+            let get_setitem = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_ins,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__setitem__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_setitem.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx, v_value]);
+            Some(vec![get_setitem, call])
+        }),
+    );
+    // binaryop.py:738-742 — delitem
+    register_transform(
+        reg,
+        OpKind::DelItem,
+        SomeValueTag::Instance,
+        SomeValueTag::Object,
+        Box::new(|_ann, args| {
+            let v_ins = args[0].clone();
+            let v_idx = args[1].clone();
+            let get_delitem = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_ins,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__delitem__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_delitem.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
+            Some(vec![get_delitem, call])
+        }),
+    );
+    // binaryop.py:744-747 — `contains` is Dispatch::Single upstream;
+    // handler lives in unaryop::init_transform below.
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::flowspace::operation::{Dispatch, OpKind};
@@ -2786,6 +2925,49 @@ mod tests {
     fn binary_operations_excludes_unary() {
         assert!(!BINARY_OPERATIONS.contains(&OpKind::Neg));
         assert!(!BINARY_OPERATIONS.contains(&OpKind::Len));
+    }
+
+    #[test]
+    fn host_to_annotation_spec_maps_primitives() {
+        use super::super::super::flowspace::model::HostObject;
+        use super::super::signature::AnnotationSpec;
+        let primitives = [
+            ("bool", AnnotationSpec::Bool),
+            ("int", AnnotationSpec::Int),
+            ("float", AnnotationSpec::Float),
+            ("str", AnnotationSpec::Str),
+            ("unicode", AnnotationSpec::Unicode),
+            ("NoneType", AnnotationSpec::NoneType),
+            ("type", AnnotationSpec::Type),
+        ];
+        for (name, expected) in primitives {
+            let cv = ConstValue::HostObject(HostObject::new_class(name, vec![]));
+            assert_eq!(
+                host_to_annotation_spec(&cv),
+                Some(expected),
+                "primitive {name} must map to AnnotationSpec"
+            );
+        }
+    }
+
+    #[test]
+    fn host_to_annotation_spec_maps_user_class() {
+        use super::super::super::flowspace::model::HostObject;
+        use super::super::signature::AnnotationSpec;
+        let cls = HostObject::new_class("pkg.MyClass", vec![]);
+        let cv = ConstValue::HostObject(cls.clone());
+        let got = host_to_annotation_spec(&cv).expect("user class must map");
+        match got {
+            AnnotationSpec::UserClass(h) => assert_eq!(h.qualname(), "pkg.MyClass"),
+            other => panic!("expected UserClass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_to_annotation_spec_rejects_non_host_constants() {
+        assert!(host_to_annotation_spec(&ConstValue::Int(42)).is_none());
+        assert!(host_to_annotation_spec(&ConstValue::Bool(true)).is_none());
+        assert!(host_to_annotation_spec(&ConstValue::None).is_none());
     }
 
     #[test]

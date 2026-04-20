@@ -31,8 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::argument::{ArgErr, ArgumentsForTranslation};
 use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::model::{
-    AnnotatorError, Desc as ModelDesc, DescKind as ModelDescKind, SomeInstance, SomeObjectTrait,
-    SomePBC, SomeValue, s_impossible_value, union,
+    AnnotatorError, SomeInstance, SomeObjectTrait, SomePBC, SomeValue, s_impossible_value, union,
 };
 use super::policy::Specializer;
 use super::signature::ParamType;
@@ -497,6 +496,19 @@ impl DescEntry {
             DescEntry::Frozen(rc) => rc.borrow().base.pyobj.clone(),
             DescEntry::MethodOfFrozen(_) => None,
             DescEntry::Class(rc) => Some(rc.borrow().pyobj.clone()),
+        }
+    }
+
+    /// RPython `type(desc)` classifier — maps enum variants back to
+    /// the [`super::model::DescKind`] used by
+    /// [`super::model::SomePBC::getKind`] (model.py:560-566).
+    pub fn kind(&self) -> super::model::DescKind {
+        match self {
+            DescEntry::Function(_) => super::model::DescKind::Function,
+            DescEntry::Method(_) => super::model::DescKind::Method,
+            DescEntry::Class(_) => super::model::DescKind::Class,
+            DescEntry::Frozen(_) => super::model::DescKind::Frozen,
+            DescEntry::MethodOfFrozen(_) => super::model::DescKind::MethodOfFrozen,
         }
     }
 
@@ -1603,34 +1615,13 @@ impl MethodOfFrozenDesc {
     ///     return args.prepend(s_self)
     /// ```
     ///
-    /// ## PRE-EXISTING-ADAPTATION
-    ///
-    /// Upstream builds `SomePBC([self.frozendesc])` — a set containing
-    /// exactly the real `FrozenDesc` the method belongs to. The Rust
-    /// port's `SomePBC.descriptions` is typed `HashSet<model::Desc>`
-    /// (a stub `{kind, name}` pair) rather than
-    /// `HashSet<Rc<RefCell<FrozenDesc>>>`, so we can't embed the
-    /// frozendesc identity directly. The identity is preserved via
-    /// `const_box = Some(Constant::new(ConstValue::HostObject(pyobj)))`
-    /// — the HostObject is Arc-based with pointer equality, so downstream
-    /// `resolve_stub_desc` / `bookkeeper.getdesc` round-trips the
-    /// stub back to the real frozendesc via `pyobj` identity.
-    ///
-    /// Blocker: full parity needs the `model::Desc` → real-Desc
-    /// migration (parity finding #3). When that lands, this body
-    /// collapses to the one-liner `args.prepend(SomePBC([self.frozendesc]))`.
     pub fn func_args(
         &self,
         args: &ArgumentsForTranslation,
     ) -> Result<ArgumentsForTranslation, AnnotatorError> {
-        let pyobj = self.frozendesc.borrow().base.pyobj.clone().ok_or_else(|| {
-            AnnotatorError::new("MethodOfFrozenDesc.func_args: missing frozendesc.pyobj")
-        })?;
-        let mut s_self = SomePBC::new(
-            vec![ModelDesc::new(ModelDescKind::Frozen, pyobj.qualname())],
-            false,
-        );
-        s_self.base.const_box = Some(Constant::new(ConstValue::HostObject(pyobj)));
+        // upstream: `s_self = SomePBC([self.frozendesc]);
+        //            return args.prepend(s_self)`.
+        let s_self = SomePBC::new(vec![DescEntry::Frozen(self.frozendesc.clone())], false);
         Ok(args.prepend(SomeValue::PBC(s_self)))
     }
 

@@ -139,6 +139,13 @@ impl HostObject {
         &self.inner.qualname
     }
 
+    /// Pointer-identity handle — used where upstream relies on
+    /// `id(pyobj)` to build a dict key (e.g. sandbox trampoline
+    /// emulation key, policy.py:87).
+    pub fn identity_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub fn is_class(&self) -> bool {
         matches!(self.inner.kind, HostObjectKind::Class { .. })
     }

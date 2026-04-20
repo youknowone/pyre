@@ -23,8 +23,10 @@ use std::rc::Rc;
 
 use super::super::flowspace::model::ConstValue;
 use super::super::flowspace::model::Constant;
+use super::super::flowspace::model::Hlvalue;
 use super::super::flowspace::operation::{
-    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, register_single,
+    BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation,
+    register_single,
 };
 use super::annrpython::RPythonAnnotator;
 use super::model::{
@@ -107,6 +109,20 @@ pub fn init(
     init_someweakref_overrides(reg);
 }
 
+/// Module-import time side effect mirroring
+/// `@op.<name>.register_transform(...)` decorators in unaryop.py. Runs
+/// at `_TRANSFORM_SINGLE` thread_local init; one block per upstream
+/// `@op.X.register_transform(Y)` decorator.
+pub fn init_transform(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Transformation>,
+    >,
+) {
+    init_instance_single_transform(reg);
+    init_object_call_args_transform(reg);
+}
+
 fn register(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -117,6 +133,18 @@ fn register(
     spec: Specialization,
 ) {
     reg.entry(op).or_default().insert(tag, spec);
+}
+
+fn register_transform(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Transformation>,
+    >,
+    op: OpKind,
+    tag: SomeValueTag,
+    tx: Transformation,
+) {
+    reg.entry(op).or_default().insert(tag, tx);
 }
 
 // =====================================================================
@@ -1955,6 +1983,174 @@ fn _keep_imports_live() {
     let _: Option<Rc<()>> = None;
 }
 
+// =====================================================================
+// unaryop.py:120-139 — @op.call_args.register_transform(SomeObject)
+// =====================================================================
+//
+// Upstream rewrites `op.call_args(v_func, v_shape, *data_v)` when the
+// vararg tail is a `SomeTuple`, unpacking the tuple elements to turn
+// the op back into `op.simple_call(...)` (or `op.call_args(...)` if
+// keywords remain). The Rust port requires `CallShape` decoding from
+// the `ConstValue::Tuple` payload on `v_shape` (mirrors
+// `CallSpec.fromshape`).
+
+fn init_object_call_args_transform(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Transformation>,
+    >,
+) {
+    // unaryop.py:120-139. Deferred: requires CallSpec.flatten + tuple
+    // item projection inside a transform. Structural slot preserved
+    // for incremental port; absent registration keeps upstream's
+    // default `lambda *args: None` semantics.
+    let _ = reg;
+}
+
+// =====================================================================
+// unaryop.py:867-892 — @op.{len,iter,next,getslice,setslice}.register_transform(SomeInstance)
+// =====================================================================
+
+/// Helper — build a new [`HLOperation`] with a fresh result variable,
+/// matching upstream `HLOperation.__init__` (operation.py:73-75).
+fn mk_hlop(kind: OpKind, args: Vec<Hlvalue>) -> HLOperation {
+    HLOperation::new(kind, args)
+}
+
+fn init_instance_single_transform(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Transformation>,
+    >,
+) {
+    // unaryop.py:867-870 — len(v_arg) -> [getattr(v_arg, '__len__'), simple_call(getattr.result)]
+    register_transform(
+        reg,
+        OpKind::Len,
+        SomeValueTag::Instance,
+        Box::new(|_ann, args| {
+            let v_arg = args[0].clone();
+            let get_len = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_arg,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__len__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_len.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
+            Some(vec![get_len, call])
+        }),
+    );
+    // unaryop.py:872-875 — iter
+    register_transform(
+        reg,
+        OpKind::Iter,
+        SomeValueTag::Instance,
+        Box::new(|_ann, args| {
+            let v_arg = args[0].clone();
+            let get_iter = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_arg,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__iter__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_iter.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
+            Some(vec![get_iter, call])
+        }),
+    );
+    // unaryop.py:877-880 — next
+    register_transform(
+        reg,
+        OpKind::Next,
+        SomeValueTag::Instance,
+        Box::new(|_ann, args| {
+            let v_arg = args[0].clone();
+            let get_next = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_arg,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("next".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_next.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
+            Some(vec![get_next, call])
+        }),
+    );
+    // unaryop.py:882-885 — getslice
+    register_transform(
+        reg,
+        OpKind::GetSlice,
+        SomeValueTag::Instance,
+        Box::new(|_ann, args| {
+            let v_obj = args[0].clone();
+            let v_start = args[1].clone();
+            let v_stop = args[2].clone();
+            let get_getslice = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_obj,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__getslice__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_getslice.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_start, v_stop]);
+            Some(vec![get_getslice, call])
+        }),
+    );
+    // unaryop.py:888-892 — setslice
+    register_transform(
+        reg,
+        OpKind::SetSlice,
+        SomeValueTag::Instance,
+        Box::new(|_ann, args| {
+            let v_obj = args[0].clone();
+            let v_start = args[1].clone();
+            let v_stop = args[2].clone();
+            let v_iterable = args[3].clone();
+            let get_setslice = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_obj,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__setslice__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_setslice.result.clone());
+            let call = mk_hlop(
+                OpKind::SimpleCall,
+                vec![getattr_result, v_start, v_stop, v_iterable],
+            );
+            Some(vec![get_setslice, call])
+        }),
+    );
+    // binaryop.py:744-747 — contains. `Contains` is Dispatch::Single
+    // upstream; the Rust dispatch table agrees (flowspace/operation.rs
+    // OpKind::Contains => Dispatch::Single). Transform body is the same
+    // getattr+simple_call pair; the second arg is `v_idx`.
+    register_transform(
+        reg,
+        OpKind::Contains,
+        SomeValueTag::Instance,
+        Box::new(|_ann, args| {
+            let v_ins = args[0].clone();
+            let v_idx = args[1].clone();
+            let get_contains = mk_hlop(
+                OpKind::GetAttr,
+                vec![
+                    v_ins,
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("__contains__".into()))),
+                ],
+            );
+            let getattr_result = Hlvalue::Variable(get_contains.result.clone());
+            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
+            Some(vec![get_contains, call])
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::flowspace::model::{Hlvalue, Variable};
@@ -1977,6 +2173,63 @@ mod tests {
         assert!(!UNARY_OPERATIONS.contains(&OpKind::Contains));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Len));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Bool));
+    }
+
+    #[test]
+    fn transform_len_someinstance_rewrites_to_getattr_plus_simple_call() {
+        // unaryop.py:867-870 — `op.len(v_ins)` → [getattr(v_ins, '__len__'), simple_call(r)].
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+
+        let ann = mk_ann();
+        let classdef = ClassDef::new_standalone("pkg.X", None);
+        let mut v = Variable::named("inst");
+        ann.setbinding(
+            &mut v,
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let hl = HLOperation::new(OpKind::Len, vec![Hlvalue::Variable(v)]);
+        let new_ops = hl
+            .transform(&ann)
+            .expect("Len(SomeInstance) must register_transform");
+        assert_eq!(new_ops.len(), 2);
+        assert!(matches!(new_ops[0].kind, OpKind::GetAttr));
+        assert!(matches!(new_ops[1].kind, OpKind::SimpleCall));
+    }
+
+    #[test]
+    fn transform_getitem_someinstance_rewrites_to_getattr_plus_simple_call() {
+        // binaryop.py:727-730 — `op.getitem(v_ins, v_idx)` → getattr + simple_call.
+        use super::super::classdesc::ClassDef;
+        use super::super::model::{SomeInstance, SomeInteger};
+
+        let ann = mk_ann();
+        let classdef = ClassDef::new_standalone("pkg.X", None);
+        let mut v_ins = Variable::named("inst");
+        ann.setbinding(
+            &mut v_ins,
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let mut v_idx = Variable::named("i");
+        ann.setbinding(&mut v_idx, SomeValue::Integer(SomeInteger::default()));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v_ins), Hlvalue::Variable(v_idx)],
+        );
+        let new_ops = hl
+            .transform(&ann)
+            .expect("GetItem(SomeInstance, SomeObject) must register_transform");
+        assert_eq!(new_ops.len(), 2);
+        assert!(matches!(new_ops[0].kind, OpKind::GetAttr));
+        assert!(matches!(new_ops[1].kind, OpKind::SimpleCall));
     }
 
     #[test]

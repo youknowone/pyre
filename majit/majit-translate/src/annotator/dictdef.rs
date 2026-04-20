@@ -345,6 +345,17 @@ impl DictDef {
         self.inner.dictvalue.borrow().borrow().s_value.clone()
     }
 
+    /// RPython `DictDef.dictkey` accessor — shared Rc for identity-based
+    /// walkers (`check_no_flags_on_instances`).
+    pub fn dictkey_rc(&self) -> std::rc::Rc<std::cell::RefCell<super::listdef::ListItem>> {
+        self.inner.dictkey.borrow().clone()
+    }
+
+    /// RPython `DictDef.dictvalue` accessor.
+    pub fn dictvalue_rc(&self) -> std::rc::Rc<std::cell::RefCell<super::listdef::ListItem>> {
+        self.inner.dictvalue.borrow().clone()
+    }
+
     /// RPython `DictDef.read_key(position_key)` (dictdef.py:93-95).
     ///
     /// `position_key` is `Option` to preserve upstream's "no reflow

@@ -155,17 +155,39 @@ impl AnnotatorPolicy {
     ///
     /// Drains pending specialization callbacks, then walks every
     /// `op.simple_call` / `op.call_args` instruction in the annotator's
-    /// added-or-annotated block set. Upstream rewrites sites whose
-    /// callee is flagged `needs_sandboxing` with the sandbox trampoline
-    /// returned by `rpython/translator/sandbox/rsandbox.py`.
+    /// added-or-annotated block set. Call sites whose callee annotation
+    /// carries `needs_sandboxing` are rewritten to invoke a sandbox
+    /// trampoline instead.
     ///
-    /// The Rust port walks the same structure but has no `SomeValue`
-    /// variant carrying `needs_sandboxing` yet, so every inner iteration
-    /// falls through the `continue`. When the sandbox-trampoline port
-    /// lands the `needs_sandboxing` branch will emit the replacement
-    /// op inline.
+    /// ```python
+    /// key = ('sandboxing', s_func.const)
+    /// if key not in bk.emulated_pbc_calls:
+    ///     params_s = s_func.args_s
+    ///     s_result = s_func.s_result
+    ///     sandbox_trampoline = make_sandbox_trampoline(s_func.name, params_s, s_result)
+    ///     sandbox_trampoline._signature_ = [SomeTuple(items=params_s)], s_result
+    ///     bk.emulate_pbc_call(key, bk.immutablevalue(sandbox_trampoline), params_s)
+    /// else:
+    ///     s_trampoline = bk.emulated_pbc_calls[key][0]
+    ///     sandbox_trampoline = s_trampoline.const
+    /// new = instr.replace({instr.args[0]: Constant(sandbox_trampoline)})
+    /// block.operations[i] = new
+    /// ```
+    ///
+    /// Rust port: `needs_sandboxing` lives as an `Option<SandboxingPayload>`
+    /// on `SomeBuiltin` (matches upstream's `setattr` on
+    /// SomeExternalFunction). `make_sandbox_trampoline` is deferred —
+    /// its body lives in `rpython/translator/sandbox/rsandbox.py` and
+    /// depends on rtyper infrastructure — so the Rust branch emits a
+    /// synthesized `HostObject::new_builtin_callable` placeholder and
+    /// performs the `emulate_pbc_call` bookkeeping + instruction
+    /// rewrite. Sandbox-mode translation is not yet end-to-end usable
+    /// regardless, so the placeholder trampoline does not reach a
+    /// backend.
     pub fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator) {
-        use crate::flowspace::model::BlockKey;
+        use super::bookkeeper::EmulatedPbcCallKey;
+        use super::model::{SomePBC, SomeValue};
+        use crate::flowspace::model::{BlockKey, ConstValue, Constant, Hlvalue, HostObject};
         use crate::flowspace::operation::OpKind;
 
         let bk = &ann.bookkeeper;
@@ -191,31 +213,108 @@ impl AnnotatorPolicy {
         };
 
         // upstream: for block in list(all_blocks):
-        let all_blocks_index = ann.all_blocks.borrow();
         for block_key in all_blocks {
-            let Some(block_ref) = all_blocks_index.get(&block_key).cloned() else {
-                continue;
+            let block_ref = {
+                let all_blocks_index = ann.all_blocks.borrow();
+                match all_blocks_index.get(&block_key).cloned() {
+                    Some(b) => b,
+                    None => continue,
+                }
             };
-            let block = block_ref.borrow();
-            // upstream: for i, instr in enumerate(block.operations):
-            for instr in block.operations.iter() {
+
+            // Snapshot length / reify HLOperations so we can mutate the
+            // block.operations slice in place without borrow conflicts.
+            let op_count = block_ref.borrow().operations.len();
+            for i in 0..op_count {
+                let sp = block_ref.borrow().operations[i].clone();
                 //   if not isinstance(instr, (op.simple_call, op.call_args)):
                 //       continue
-                let kind = OpKind::from_opname(&instr.opname);
+                let kind = OpKind::from_opname(&sp.opname);
                 if !matches!(kind, Some(OpKind::SimpleCall | OpKind::CallArgs)) {
                     continue;
                 }
                 //   v_func = instr.args[0]
-                let Some(_v_func) = instr.args.first() else {
+                let Some(v_func) = sp.args.first().cloned() else {
                     continue;
                 };
                 //   s_func = annotator.annotation(v_func)
-                //   if not hasattr(s_func, 'needs_sandboxing'):
-                //       continue
-                // Rust port has no SomeValue variant carrying
-                // `needs_sandboxing`; the rewrite path below is inactive
-                // until the sandbox lattice type lands.
-                continue;
+                let Some(s_func) = ann.annotation(&v_func) else {
+                    continue;
+                };
+                //   if not hasattr(s_func, 'needs_sandboxing'): continue
+                let SomeValue::Builtin(ref builtin) = s_func else {
+                    continue;
+                };
+                let Some(payload) = builtin.needs_sandboxing.clone() else {
+                    continue;
+                };
+                let Some(func_const) = s_func.const_().cloned() else {
+                    continue;
+                };
+
+                // upstream: key = ('sandboxing', s_func.const)
+                let key = EmulatedPbcCallKey::sandboxing(&func_const);
+                // upstream: if key not in bk.emulated_pbc_calls: ... else: ...
+                let trampoline_host: HostObject = {
+                    let existing = bk
+                        .emulated_pbc_calls
+                        .borrow()
+                        .get(&key)
+                        .map(|(pbc, _)| pbc.clone());
+                    match existing {
+                        Some(pbc) => {
+                            //   s_trampoline = bk.emulated_pbc_calls[key][0]
+                            //   sandbox_trampoline = s_trampoline.const
+                            match pbc.base.const_box.as_ref().map(|c| c.value.clone()) {
+                                Some(ConstValue::HostObject(obj)) => obj,
+                                _ => continue,
+                            }
+                        }
+                        None => {
+                            //   sandbox_trampoline = make_sandbox_trampoline(...)
+                            //   bk.emulate_pbc_call(key, bk.immutablevalue(sandbox_trampoline), params_s)
+                            //
+                            // `make_sandbox_trampoline` (rsandbox.py) produces
+                            // a real Python function; deferred — we materialize
+                            // a `HostObject::new_user_function` stand-in so
+                            // `bk.immutablevalue` routes it through the
+                            // user-function path that builds a real SomePBC,
+                            // matching the shape `emulate_pbc_call` expects.
+                            use crate::flowspace::model::GraphFunc;
+                            let trampoline_name = format!("sandbox_trampoline({})", payload.name);
+                            let globals = Constant::new(ConstValue::Dict(Default::default()));
+                            let trampoline = HostObject::new_user_function(GraphFunc::new(
+                                trampoline_name.clone(),
+                                globals,
+                            ));
+                            let pbc_value = match bk
+                                .immutablevalue(&ConstValue::HostObject(trampoline.clone()))
+                            {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let _ = bk.emulate_pbc_call(key, &pbc_value, &payload.args_s, &[]);
+                            trampoline
+                        }
+                    }
+                };
+
+                // upstream:
+                //   new = instr.replace({instr.args[0]: Constant(sandbox_trampoline)})
+                //   block.operations[i] = new
+                let new_arg =
+                    Hlvalue::Constant(Constant::new(ConstValue::HostObject(trampoline_host)));
+                let mut blk_mut = block_ref.borrow_mut();
+                if let Some(op_mut) = blk_mut.operations.get_mut(i) {
+                    if !op_mut.args.is_empty() {
+                        op_mut.args[0] = new_arg;
+                    }
+                }
+
+                // Suppress unused-warning when the SomePBC import above
+                // is structurally expected by upstream but not used on
+                // this path.
+                let _ = std::marker::PhantomData::<SomePBC>;
             }
         }
     }
@@ -344,6 +443,81 @@ mod tests {
         let pol = AnnotatorPolicy::new();
         let bk = Bookkeeper::new();
         pol.event(&bk, "some_event", &["arg1"]);
+    }
+
+    #[test]
+    fn no_more_blocks_to_annotate_rewrites_sandboxed_call_site() {
+        // Stand up a minimal annotator + graph + block containing a
+        // `simple_call` whose callee annotation is a SomeBuiltin with
+        // `needs_sandboxing = Some(payload)`. The policy walker must
+        // rewrite `instr.args[0]` to a Constant(HostObject) carrying
+        // the synthesized sandbox trampoline.
+        use super::super::annrpython::RPythonAnnotator;
+        use super::super::model::{SandboxingPayload, SomeBuiltin, SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            Block, BlockKey, ConstValue, Constant, FunctionGraph, Hlvalue, HostObject,
+            SpaceOperation, Variable,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+
+        // Build a callable HostObject and bind it on a variable as a
+        // sandboxed SomeBuiltin.
+        let callable = HostObject::new_builtin_callable("pkg.extfn");
+        let mut builtin = SomeBuiltin::new("pkg.extfn", None, None);
+        builtin.needs_sandboxing = Some(SandboxingPayload {
+            name: "pkg.extfn".into(),
+            args_s: vec![SomeValue::Integer(SomeInteger::default())],
+            s_result: Box::new(SomeValue::Integer(SomeInteger::default())),
+        });
+        builtin.base.const_box = Some(Constant::new(ConstValue::HostObject(callable.clone())));
+        let s_func = SomeValue::Builtin(builtin);
+
+        let mut v_func = Variable::named("f");
+        ann.setbinding(&mut v_func, s_func);
+        let v_arg = Variable::named("x");
+        let result_v = Variable::named("r");
+
+        // Build a block with one simple_call op.
+        let block = Rc::new(RefCell::new(Block::new(vec![])));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![Hlvalue::Variable(v_func), Hlvalue::Variable(v_arg)],
+            Hlvalue::Variable(result_v),
+        ));
+        let graph = Rc::new(RefCell::new(FunctionGraph::new("caller", block.clone())));
+        let bkey = BlockKey::of(&block);
+        ann.annotated.borrow_mut().insert(bkey.clone(), None);
+        ann.all_blocks.borrow_mut().insert(bkey, block.clone());
+        let _ = graph; // keep the Rc alive for the duration of the test
+
+        // Run the policy walker.
+        ann.policy.borrow().no_more_blocks_to_annotate(&ann);
+
+        // Verify the callee arg was rewritten to a Constant(HostObject).
+        let args0 = block.borrow().operations[0].args[0].clone();
+        match args0 {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(h) => {
+                    assert!(h.qualname().starts_with("sandbox_trampoline("));
+                }
+                other => panic!("expected HostObject, got {other:?}"),
+            },
+            other => panic!("expected Hlvalue::Constant, got {other:?}"),
+        }
+
+        // Verify the sandbox entry landed in emulated_pbc_calls.
+        let key = super::super::bookkeeper::EmulatedPbcCallKey::sandboxing(
+            &ConstValue::HostObject(callable),
+        );
+        assert!(
+            ann.bookkeeper
+                .emulated_pbc_calls
+                .borrow()
+                .contains_key(&key)
+        );
     }
 
     #[test]

@@ -1598,12 +1598,11 @@ impl ClassDef {
         }
         // upstream: return SomePBC([subdef.classdesc for subdef in self.getallsubdefs()])
         let subdefs = Self::getallsubdefs(this);
-        let descriptions: Vec<super::model::Desc> = subdefs
+        let descriptions: Vec<super::description::DescEntry> = subdefs
             .into_iter()
             .map(|sd| {
                 let cd = sd.borrow().classdesc.clone();
-                let cd_ref = cd.borrow();
-                super::model::Desc::new(super::model::DescKind::Class, cd_ref.name.clone())
+                super::description::DescEntry::Class(cd)
             })
             .collect();
         SomeValue::PBC(super::model::SomePBC::new(descriptions, false))
@@ -1709,10 +1708,19 @@ mod tests {
         let result = ClassDef::read_attr__class__(&parent_cd);
         match &result {
             SomeValue::PBC(pbc) => {
-                let names: Vec<_> = pbc.descriptions.iter().map(|d| d.name.as_str()).collect();
-                assert!(names.contains(&"pkg.Parent"));
-                assert!(names.contains(&"pkg.Child"));
-                assert!(pbc.descriptions.iter().all(|d| d.kind == DescKind::Class));
+                let names: Vec<String> = pbc
+                    .descriptions
+                    .values()
+                    .filter_map(|d| d.as_class())
+                    .map(|cd| cd.borrow().name.clone())
+                    .collect();
+                assert!(names.iter().any(|n| n == "pkg.Parent"));
+                assert!(names.iter().any(|n| n == "pkg.Child"));
+                assert!(
+                    pbc.descriptions
+                        .values()
+                        .all(|d| d.kind() == DescKind::Class)
+                );
             }
             _ => panic!("read_attr__class__ must return a SomePBC"),
         }

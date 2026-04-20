@@ -1461,6 +1461,21 @@ pub enum CanOnlyThrow {
     Callable(Box<dyn Fn(&[crate::annotator::model::SomeValue]) -> Option<Vec<BuiltinException>>>),
 }
 
+/// RPython `@op.<name>.register_transform(...)` handler signature.
+///
+/// Upstream transformers take `(annotator, *self.args)` and return
+/// either `None` (no rewrite) or a Python list of `HLOperation`s that
+/// replace the current op. The Rust port mirrors that shape.
+///
+/// Lives on a per-OpKind, per-SomeValue-kind registry (`_TRANSFORM_*`)
+/// that `HLOperation::transform` looks up before returning.
+pub type Transformation = Box<
+    dyn Fn(
+        &crate::annotator::annrpython::RPythonAnnotator,
+        &[crate::flowspace::model::Hlvalue],
+    ) -> Option<Vec<HLOperation>>,
+>;
+
 thread_local! {
     /// RPython `cls._registry` on `SingleDispatchMixin` (operation.py:59).
     ///
@@ -1504,6 +1519,39 @@ thread_local! {
         crate::annotator::binaryop::init(&mut outer);
         RefCell::new(outer)
     };
+
+    /// RPython `cls._transform = {}` on `HLOperationMeta.__init__`
+    /// (operation.py:60 for `dispatch == 1`). Keyed the same way as
+    /// `_REGISTRY_SINGLE` — MRO lookup on `type(args_s[0])`.
+    pub static _TRANSFORM_SINGLE: RefCell<
+        std::collections::HashMap<
+            OpKind,
+            std::collections::HashMap<crate::annotator::model::SomeValueTag, Transformation>,
+        >,
+    > = {
+        let mut outer = std::collections::HashMap::new();
+        crate::annotator::unaryop::init_transform(&mut outer);
+        RefCell::new(outer)
+    };
+
+    /// RPython `cls._transform = DoubleDispatchRegistry()` on
+    /// `HLOperationMeta.__init__` (operation.py:63 for
+    /// `dispatch == 2`). Same MRO cross-product lookup as
+    /// `_REGISTRY_DOUBLE`.
+    pub static _TRANSFORM_DOUBLE: RefCell<
+        std::collections::HashMap<
+            OpKind,
+            DoubleDispatchRegistry<
+                crate::annotator::model::SomeValueTag,
+                crate::annotator::model::SomeValueTag,
+                Transformation,
+            >,
+        >,
+    > = {
+        let mut outer = std::collections::HashMap::new();
+        crate::annotator::binaryop::init_transform(&mut outer);
+        RefCell::new(outer)
+    };
 }
 
 /// RPython `@op.<name>.register(Some_cls)` (operation.py:205-210 —
@@ -1531,6 +1579,34 @@ pub fn register_double(
             .entry(op)
             .or_default()
             .set((tag1, tag2), spec);
+    });
+}
+
+/// RPython `@op.<name>.register_transform(Some_cls)` (operation.py:241-246 —
+/// `SingleDispatchMixin.register_transform`).
+pub fn register_transform_single(
+    op: OpKind,
+    tag: crate::annotator::model::SomeValueTag,
+    tx: Transformation,
+) {
+    _TRANSFORM_SINGLE.with(|cell| {
+        cell.borrow_mut().entry(op).or_default().insert(tag, tx);
+    });
+}
+
+/// RPython `@op.<name>.register_transform(Some1, Some2)`
+/// (operation.py:288-293 — `DoubleDispatchMixin.register_transform`).
+pub fn register_transform_double(
+    op: OpKind,
+    tag1: crate::annotator::model::SomeValueTag,
+    tag2: crate::annotator::model::SomeValueTag,
+    tx: Transformation,
+) {
+    _TRANSFORM_DOUBLE.with(|cell| {
+        cell.borrow_mut()
+            .entry(op)
+            .or_default()
+            .set((tag1, tag2), tx);
     });
 }
 
@@ -1645,19 +1721,51 @@ impl HLOperation {
     ///     return transformer(annotator, *self.args)
     /// ```
     ///
-    /// The transformer either returns `None` (default `lambda *args:
-    /// None`) or a list of replacement ops. `cls._transform` registries
-    /// are populated by the optimizer-facing commits; until any register
-    /// here the return is always `None`, which is what upstream does
-    /// too when no `register_transform` decorator has fired.
+    /// `get_transformer` does an MRO lookup (operation.py:248-255 for
+    /// single-dispatch, 295-300 for double-dispatch) and returns the
+    /// default `lambda *args: None` when no registration matches.
     pub fn transform(
         &self,
-        _annotator: &crate::annotator::annrpython::RPythonAnnotator,
+        annotator: &crate::annotator::annrpython::RPythonAnnotator,
     ) -> Option<Vec<HLOperation>> {
-        // Empty transform registry — matches upstream's default
-        // `lambda *args: None` when no `register_transform(...)` has
-        // been called.
-        None
+        use crate::annotator::model::SomeValue;
+        let args_s: Vec<SomeValue> = self
+            .args
+            .iter()
+            .filter_map(|a| annotator.annotation(a))
+            .collect();
+        match self.kind.dispatch() {
+            Dispatch::Single => {
+                if args_s.is_empty() {
+                    return None;
+                }
+                let tag = args_s[0].tag();
+                _TRANSFORM_SINGLE.with(|cell| {
+                    let reg = cell.borrow();
+                    let entries = reg.get(&self.kind)?;
+                    for c in tag.mro() {
+                        if let Some(tx) = entries.get(c) {
+                            return tx(annotator, &self.args);
+                        }
+                    }
+                    None
+                })
+            }
+            Dispatch::Double => {
+                if args_s.len() < 2 {
+                    return None;
+                }
+                let tag_l = args_s[0].tag();
+                let tag_r = args_s[1].tag();
+                _TRANSFORM_DOUBLE.with(|cell| {
+                    let reg = cell.borrow();
+                    let entries = reg.get(&self.kind)?;
+                    let tx = entries.get((tag_l, tag_r), tag_l.mro(), tag_r.mro())?;
+                    tx(annotator, &self.args)
+                })
+            }
+            Dispatch::None => None,
+        }
     }
 
     /// RPython `HLOperation.get_can_only_throw(self, annotator)`

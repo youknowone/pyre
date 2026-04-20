@@ -968,18 +968,12 @@ fn classdef_vec_contains(v: &[Rc<RefCell<ClassDef>>], needle: &Rc<RefCell<ClassD
     v.iter().any(|c| Rc::ptr_eq(c, needle))
 }
 
-/// RPython `rpython/annotator/description.py:Desc` — the "description"
-/// of a constant callable / class / frozen PBC entry. A4.5 carries
-/// only the kind tag + qualified name; Phase 5's description.py port
-/// (637 LOC) fills in the bookkeeper / specialization hooks.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Desc {
-    pub kind: DescKind,
-    pub name: String,
-}
-
 /// `type(desc)` dispatched on in upstream's `SomePBC.getKind()`
 /// (model.py:558-566). The Rust port closes the set explicitly.
+///
+/// The real [`super::description::DescEntry`] holds the `Rc<RefCell<…>>`
+/// to each Desc subclass; `DescKind` is the enum-of-variants projection
+/// used whenever the annotator needs to branch on `type(desc)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DescKind {
     /// RPython `description.FunctionDesc`.
@@ -992,15 +986,6 @@ pub enum DescKind {
     Frozen,
     /// RPython `description.MethodOfFrozenDesc`.
     MethodOfFrozen,
-}
-
-impl Desc {
-    pub fn new(kind: DescKind, name: impl Into<String>) -> Self {
-        Desc {
-            kind,
-            name: name.into(),
-        }
-    }
 }
 
 /// RPython `class SomeInstance(SomeObject)` (model.py:431-462).
@@ -1179,15 +1164,21 @@ impl SomeObjectTrait for SomeException {
 ///     raises `AnnotatorError` on mixed funcdescs) is **not ported**
 ///     — `new()` only rejects the empty set.
 ///
-/// These gaps are intentional at A4.5 because they depend on Phase 5's
-/// classdesc.py / description.py port (together ~1600 LOC). When that
-/// port lands, this struct keeps the `BTreeSet<Desc>` shape, gains a
-/// real `simplify()` method, and computes `knowntype` via
-/// `commonbase`.
+/// Port rewrite landed with the SomePBC structural fix: `descriptions`
+/// now carries real [`super::description::DescEntry`] values (one per
+/// upstream Desc subclass, each wrapping an `Rc<RefCell<…>>` of the
+/// concrete description instance). The constructor runs [`simplify`]
+/// and the model.py:527-553 kind/knowntype/const branches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomePBC {
     pub base: SomeObjectBase,
-    pub descriptions: std::collections::BTreeSet<Desc>,
+    /// RPython `self.descriptions` (model.py:522): a Python set of
+    /// [`DescEntry`] objects. The Rust port uses
+    /// `BTreeMap<DescKey, DescEntry>` — keyed by pointer identity to
+    /// mirror `set(descriptions)` membership while keeping iteration
+    /// deterministic.
+    pub descriptions:
+        std::collections::BTreeMap<super::description::DescKey, super::description::DescEntry>,
     pub can_be_none: bool,
     /// RPython `self.subset_of` — pointer to a wider PBC; `None` for
     /// the top PBC.
@@ -1197,28 +1188,102 @@ pub struct SomePBC {
 impl SomePBC {
     /// RPython `SomePBC.__init__(descriptions, can_be_None=False,
     /// subset_of=None)` (model.py:519-553).
-    ///
-    /// Skipped upstream steps — see struct docstring for details:
-    ///   * `simplify()` call (model.py:526),
-    ///   * `reduce(commonbase, ...)` knowntype folding (model.py:527-531),
-    ///   * `len(descriptions) > 1` kind-enforcement branch (model.py:538-553).
-    pub fn new(descriptions: impl IntoIterator<Item = Desc>, can_be_none: bool) -> Self {
+    pub fn new(
+        descriptions: impl IntoIterator<Item = super::description::DescEntry>,
+        can_be_none: bool,
+    ) -> Self {
         Self::with_subset(descriptions, can_be_none, None)
     }
 
     pub fn with_subset(
-        descriptions: impl IntoIterator<Item = Desc>,
+        descriptions: impl IntoIterator<Item = super::description::DescEntry>,
         can_be_none: bool,
         subset_of: Option<Box<SomePBC>>,
     ) -> Self {
-        let descriptions: std::collections::BTreeSet<Desc> = descriptions.into_iter().collect();
-        assert!(!descriptions.is_empty(), "SomePBC must be non-empty");
-        SomePBC {
+        let map: std::collections::BTreeMap<
+            super::description::DescKey,
+            super::description::DescEntry,
+        > = descriptions
+            .into_iter()
+            .map(|e| (e.desc_key(), e))
+            .collect();
+        assert!(!map.is_empty(), "SomePBC must be non-empty");
+        let mut pbc = SomePBC {
             base: SomeObjectBase::new(KnownType::Other, true),
-            descriptions,
+            descriptions: map,
             can_be_none,
             subset_of,
+        };
+        // upstream model.py:526 — `self.simplify()`.
+        let _ = pbc.simplify();
+        // upstream model.py:527-531 — `knowntype = reduce(commonbase,
+        // [x.knowntype for x in descriptions])`. Full `commonbase`
+        // folding depends on Python `type` objects; the current Rust
+        // lattice promotes a class-homogeneous PBC to `KnownType::Type`
+        // (upstream `knowntype == type`) and leaves others as `Object`.
+        if let Ok(kind) = pbc.get_kind() {
+            if matches!(kind, DescKind::Class) {
+                pbc.base.knowntype = KnownType::Type;
+            }
         }
+        // upstream model.py:532-537 — single-desc pyobj const hack:
+        //     if len(descriptions) == 1 and not can_be_None:
+        //         desc, = descriptions
+        //         if desc.pyobj is not None:
+        //             self.const = desc.pyobj
+        if pbc.descriptions.len() == 1 && !pbc.can_be_none {
+            let entry = pbc.descriptions.values().next().unwrap();
+            if let Some(pyobj) = entry.pyobj() {
+                pbc.base.const_box = Some(Constant::new(
+                    super::super::flowspace::model::ConstValue::HostObject(pyobj),
+                ));
+            }
+        }
+        // upstream model.py:538-553 — multi-desc kind enforcement.
+        if pbc.descriptions.len() > 1 {
+            if let Ok(kind) = pbc.get_kind() {
+                match kind {
+                    DescKind::Class => {
+                        // upstream: `for desc in descriptions: desc.getuniqueclassdef()`.
+                        //   "a PBC of several classes: enforce them all
+                        //   to be built, without support for specialization."
+                        for entry in pbc.descriptions.values() {
+                            if let Some(cd) = entry.as_class() {
+                                let _ = super::classdesc::ClassDesc::getuniqueclassdef(&cd);
+                            }
+                        }
+                    }
+                    DescKind::MethodOfFrozen => {
+                        // upstream: `funcdescs = set(desc.funcdesc for
+                        //   desc in descriptions)`; mixing funcdescs
+                        //   raises AnnotatorError.
+                        let mut funcdesc_keys: std::collections::BTreeSet<
+                            super::description::DescKey,
+                        > = std::collections::BTreeSet::new();
+                        for entry in pbc.descriptions.values() {
+                            if let Some(mof) = entry.as_method_of_frozen() {
+                                funcdesc_keys.insert(super::description::DescKey::from_rc(
+                                    &mof.borrow().funcdesc,
+                                ));
+                            }
+                        }
+                        if funcdesc_keys.len() > 1 {
+                            panic!(
+                                "AnnotatorError: You can't mix a set of methods on a frozen PBC in \
+                                 RPython that are different underlying functions"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        pbc
+    }
+
+    /// RPython `SomePBC.any_description()` (model.py:555-556).
+    pub fn any_description(&self) -> Option<&super::description::DescEntry> {
+        self.descriptions.values().next()
     }
 
     /// RPython `SomePBC.getKind()` (model.py:558-566).
@@ -1228,8 +1293,8 @@ impl SomePBC {
     /// PBCs: %r")` when the set straddles two subclasses of `Desc`.
     pub fn get_kind(&self) -> Result<DescKind, AnnotatorError> {
         let mut kinds: std::collections::BTreeSet<DescKind> = std::collections::BTreeSet::new();
-        for desc in &self.descriptions {
-            kinds.insert(desc.kind);
+        for entry in self.descriptions.values() {
+            kinds.insert(entry.kind());
         }
         if kinds.len() > 1 {
             return Err(AnnotatorError::new(format!(
@@ -1244,14 +1309,28 @@ impl SomePBC {
 
     /// RPython `SomePBC.simplify()` (model.py:568-574).
     ///
-    /// Upstream has two responsibilities here:
-    ///   1. assert kind-homogeneity via `getKind()` — ported below;
-    ///   2. collapse shadow-MethodDescs via
-    ///      `kind.simplify_desc_set(self.descriptions)` — **blocked on
-    ///      description.py / classdesc.py** (Phase 5 P5.2).
-    /// Until the descriptor machinery lands the second step is a
-    /// no-op; the first step catches the bug upstream's `assert` was
-    /// actually guarding against (see `binaryop.py:782`).
+    /// ```python
+    /// def simplify(self):
+    ///     kind = self.getKind()
+    ///     if len(self.descriptions) > 1:
+    ///         kind.simplify_desc_set(self.descriptions)
+    /// ```
+    ///
+    /// Upstream `Desc.simplify_desc_set` is a `@staticmethod` no-op
+    /// for every subclass except `MethodDesc`, which collapses shadow
+    /// methods (description.py override). Rust port honours the base
+    /// no-op contract; the MethodDesc override lands when method
+    /// shadowing becomes a regression source.
+    pub fn simplify(&mut self) -> Result<(), AnnotatorError> {
+        let _kind = self.get_kind()?;
+        if self.descriptions.len() > 1 {
+            // `Desc.simplify_desc_set(descs)` — base `@staticmethod`
+            // no-op for FunctionDesc / ClassDesc / FrozenDesc /
+            // MethodOfFrozenDesc. MethodDesc override deferred.
+        }
+        Ok(())
+    }
+
     /// RPython `SomePBC.consider_call_site(self, args, s_result, call_op)`
     /// (model.py:576-578).
     ///
@@ -1261,35 +1340,53 @@ impl SomePBC {
     ///     self.getKind().consider_call_site(descs, args, s_result, call_op)
     /// ```
     ///
-    /// The `getKind().consider_call_site(descs, args, s_result, call_op)`
-    /// routes through `FunctionDesc`/`MethodDesc`/`FrozenDesc`'s
-    /// classmethod (description.py:357-363 / 458-465 / 627-634). The
-    /// Rust port has a working `FunctionDesc::consider_call_site` but
-    /// `SomePBC.descriptions` stores `model::Desc` (kind+name only),
-    /// not the `Rc<RefCell<description::FunctionDesc>>` that
-    /// `FunctionDesc::consider_call_site` takes — so a bridge is
-    /// required (descriptor lookup by name via bookkeeper tables, or
-    /// unifying `model::Desc` with `description::Desc`). Until that
-    /// lands, this method is a no-op that preserves the upstream call
-    /// site so `Bookkeeper::consider_call_site` / `compute_at_fixpoint`
-    /// can be structurally faithful.
-    pub fn consider_call_site(&self) {
-        // TODO: bridge `self.descriptions` (model::Desc) to
-        // description::FunctionDesc via bookkeeper.descs, then call
-        // `FunctionDesc::consider_call_site(descs, args, s_result)`.
+    /// Kind dispatch routes through the staticmethod on each Desc
+    /// subclass (description.py:357-363 / 458-465 / 627-634, and
+    /// classdesc.py's ClassDesc.consider_call_site). Rust port
+    /// dispatches via variant match: FunctionDesc is fully ported;
+    /// Method / Class / Frozen / MethodOfFrozen keep structural
+    /// no-op bodies until their own `consider_call_site` methods
+    /// land.
+    pub fn consider_call_site(
+        &self,
+        args: &super::argument::ArgumentsForTranslation,
+        s_result: &SomeValue,
+    ) -> Result<(), AnnotatorError> {
+        let descs: Vec<super::description::DescEntry> =
+            self.descriptions.values().cloned().collect();
+        if descs.is_empty() {
+            return Ok(());
+        }
+        match self.get_kind()? {
+            DescKind::Function => {
+                let fns: Vec<_> = descs.iter().filter_map(|d| d.as_function()).collect();
+                super::description::FunctionDesc::consider_call_site(&fns, args, s_result)?;
+            }
+            DescKind::Method | DescKind::Class | DescKind::Frozen | DescKind::MethodOfFrozen => {
+                // Deferred: MethodDesc / ClassDesc / FrozenDesc /
+                // MethodOfFrozenDesc consider_call_site. Kind dispatch
+                // is wired; each body lands with its own port.
+            }
+        }
+        Ok(())
     }
 
-    pub fn simplify(&mut self) -> Result<(), AnnotatorError> {
-        // upstream: `kind = self.getKind()`.
-        let _kind = self.get_kind()?;
-        // upstream: `if len(self.descriptions) > 1:
-        //                kind.simplify_desc_set(self.descriptions)`.
-        // Blocked on description.py / classdesc.py. Structural call
-        // site preserved as comment for the follow-up port.
-        //   if self.descriptions.len() > 1 {
-        //       kind.simplify_desc_set(&mut self.descriptions);
-        //   }
-        Ok(())
+    /// RPython `SomePBC.nonnoneify()` (model.py:587-589).
+    pub fn nonnoneify(&self) -> SomePBC {
+        SomePBC::with_subset(
+            self.descriptions.values().cloned(),
+            false,
+            self.subset_of.clone(),
+        )
+    }
+
+    /// RPython `SomePBC.noneify()` (model.py:591-593).
+    pub fn noneify(&self) -> SomePBC {
+        SomePBC::with_subset(
+            self.descriptions.values().cloned(),
+            true,
+            self.subset_of.clone(),
+        )
     }
 }
 
@@ -1361,6 +1458,22 @@ impl SomeObjectTrait for SomeNone {
     }
 }
 
+/// RPython `SomeObject.needs_sandboxing` side-attribute payload
+/// (attached by `rtyper/extfunc.py:ExtFuncEntry.compute_annotation`
+/// when `config.translation.sandbox` is on). Upstream uses ad-hoc
+/// Python `setattr`; the Rust lattice carries it as an optional field
+/// on [`SomeBuiltin`]. Populated only when the external-function
+/// registration path flags the callable as sandboxed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxingPayload {
+    /// Matches upstream `s_func.name` (extfunc.py:11).
+    pub name: String,
+    /// Matches upstream `s_func.args_s` — parameter annotations.
+    pub args_s: Vec<SomeValue>,
+    /// Matches upstream `s_func.s_result` — result annotation.
+    pub s_result: Box<SomeValue>,
+}
+
 /// RPython `class SomeBuiltin(SomeObject)` (model.py:629-645).
 ///
 /// Stands for a built-in function or method. `analyser` in upstream is
@@ -1377,6 +1490,11 @@ pub struct SomeBuiltin {
     pub s_self: Option<Box<SomeValue>>,
     /// RPython `self.methodname`.
     pub methodname: Option<String>,
+    /// RPython `hasattr(s_func, 'needs_sandboxing')` payload
+    /// (policy.py:85 gate). Set on external-function annotations when
+    /// `config.translation.sandbox` is enabled (extfunc.py:100).
+    /// `None` for all non-sandboxed callables.
+    pub needs_sandboxing: Option<SandboxingPayload>,
 }
 
 impl SomeBuiltin {
@@ -1390,6 +1508,7 @@ impl SomeBuiltin {
             analyser_name: analyser_name.into(),
             s_self: s_self.map(Box::new),
             methodname,
+            needs_sandboxing: None,
         }
     }
 }
@@ -1764,7 +1883,7 @@ impl SomeValue {
                 s.flags.clone(),
             ))),
             SomeValue::PBC(s) => Ok(SomeValue::PBC(SomePBC::with_subset(
-                s.descriptions.clone(),
+                s.descriptions.values().cloned(),
                 true,
                 s.subset_of.clone(),
             ))),
@@ -1792,7 +1911,7 @@ impl SomeValue {
                 s.flags.clone(),
             )),
             SomeValue::PBC(s) => SomeValue::PBC(SomePBC::with_subset(
-                s.descriptions.clone(),
+                s.descriptions.values().cloned(),
                 false,
                 s.subset_of.clone(),
             )),
@@ -2418,7 +2537,13 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                     msg: format!("mixing several kinds of PBCs: {a_kind:?} and {b_kind:?}"),
                 });
             }
-            let descriptions = a.descriptions.union(&b.descriptions).cloned();
+            // upstream: `descriptions = a.descriptions | b.descriptions`
+            //   (Python set union); keyed-by-identity BTreeMap merge.
+            let mut descriptions_map = a.descriptions.clone();
+            for (k, v) in &b.descriptions {
+                descriptions_map.entry(*k).or_insert_with(|| v.clone());
+            }
+            let descriptions = descriptions_map.into_values();
             let merged = SomePBC::with_subset(descriptions, can_be_none, None);
             Ok(SomeValue::PBC(merged))
         }
@@ -2780,6 +2905,46 @@ mod tests {
         )
     }
 
+    /// Build a stub [`DescEntry::Function`] for SomePBC lattice tests.
+    ///
+    /// RPython tests that exercise `SomePBC` membership build fresh
+    /// `FunctionDesc` instances via `getdesc(pyobj)`. The Rust port
+    /// mirrors that path: each call produces a distinct-identity
+    /// `FunctionDesc`, which is what upstream would also produce for
+    /// fresh pyobjs. Callers that need two PBCs to share a description
+    /// (upstream: pyobj identity round-trips through `getdesc`) should
+    /// `.clone()` the returned `DescEntry`.
+    fn fake_function_entry(
+        bk: &Rc<super::super::bookkeeper::Bookkeeper>,
+        name: &str,
+    ) -> super::super::description::DescEntry {
+        use super::super::super::flowspace::argument::Signature;
+        use super::super::description::{DescEntry, FunctionDesc};
+        use std::cell::RefCell;
+        DescEntry::Function(Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            name,
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))))
+    }
+
+    /// Build a stub [`DescEntry::Class`] for SomePBC lattice tests.
+    fn fake_class_entry(
+        bk: &Rc<super::super::bookkeeper::Bookkeeper>,
+        name: &str,
+    ) -> super::super::description::DescEntry {
+        use super::super::super::flowspace::model::HostObject;
+        use super::super::description::DescEntry;
+        let pyobj = HostObject::new_class(name, vec![]);
+        let classdesc =
+            super::super::classdesc::ClassDesc::new(bk, pyobj, Some(name.to_string()), None, None)
+                .expect("fake_class_entry: ClassDesc::new");
+        DescEntry::Class(classdesc)
+    }
+
     #[test]
     fn someobject_defaults_match_upstream() {
         let s = SomeValue::object();
@@ -3047,11 +3212,9 @@ mod tests {
     #[test]
     fn somepbc_get_kind_detects_single_family() {
         // upstream: `getKind` returns the unique kind of the set.
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
         let pbc = SomePBC::new(
-            vec![
-                Desc::new(DescKind::Function, "a"),
-                Desc::new(DescKind::Function, "b"),
-            ],
+            vec![fake_function_entry(&bk, "a"), fake_function_entry(&bk, "b")],
             false,
         );
         assert_eq!(pbc.get_kind().unwrap(), DescKind::Function);
@@ -3061,11 +3224,9 @@ mod tests {
     fn somepbc_get_kind_errors_on_mixed_set() {
         // upstream: raises AnnotatorError when kinds differ
         // (model.py:565).
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
         let pbc = SomePBC::new(
-            vec![
-                Desc::new(DescKind::Function, "a"),
-                Desc::new(DescKind::Class, "B"),
-            ],
+            vec![fake_function_entry(&bk, "a"), fake_class_entry(&bk, "B")],
             false,
         );
         let err = pbc.get_kind().expect_err("mixed kinds must error");
@@ -3081,20 +3242,24 @@ mod tests {
     fn somepbc_single_desc_without_pyobj_is_not_constant() {
         // upstream: model.py:534-537 — is_constant holds only when
         // `len(descriptions) == 1 and not can_be_None and desc.pyobj
-        // is not None`. `annotator::model::Desc` is the A4.5 stub
-        // flavour (kind + name, no pyobj), so a single-desc SomePBC
-        // built from it has no witnessed Python value and therefore
-        // must NOT claim constant-ness — that was the pyobj gate the
-        // A4.5 approximation was missing.
-        let pbc = SomePBC::new(vec![Desc::new(DescKind::Function, "f")], false);
+        // is not None`. `fake_function_entry` creates a FunctionDesc
+        // with `pyobj = None`, so a single-desc SomePBC built from it
+        // has no witnessed Python value and therefore must NOT claim
+        // constant-ness — that was the pyobj gate the A4.5
+        // approximation was missing.
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let pbc = SomePBC::new(vec![fake_function_entry(&bk, "f")], false);
         assert!(!pbc.is_constant());
-        let pbc_nullable = SomePBC::new(vec![Desc::new(DescKind::Function, "f")], true);
+        let pbc_nullable = SomePBC::new(vec![fake_function_entry(&bk, "f")], true);
         assert!(!pbc_nullable.is_constant());
     }
 
     #[test]
     fn somepbc_constructor_deduplicates_description_set() {
-        let desc = Desc::new(DescKind::Function, "f");
+        // Upstream set membership is by identity (`desc is desc`).
+        // Cloning the `Rc` preserves identity so the BTreeMap dedups.
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let desc = fake_function_entry(&bk, "f");
         let pbc = SomePBC::new(vec![desc.clone(), desc], false);
         assert_eq!(pbc.descriptions.len(), 1);
     }
@@ -3421,14 +3586,9 @@ mod tests {
 
     #[test]
     fn union_pbc_merges_descriptions() {
-        let a = SomeValue::PBC(SomePBC::new(
-            vec![Desc::new(DescKind::Function, "f1")],
-            false,
-        ));
-        let b = SomeValue::PBC(SomePBC::new(
-            vec![Desc::new(DescKind::Function, "f2")],
-            true,
-        ));
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let a = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f1")], false));
+        let b = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f2")], true));
         let u = union(&a, &b).unwrap();
         let SomeValue::PBC(pbc) = u else {
             panic!("expected SomePBC");
@@ -3439,20 +3599,16 @@ mod tests {
 
     #[test]
     fn union_pbc_mixed_kinds_errors() {
-        let a = SomeValue::PBC(SomePBC::new(
-            vec![Desc::new(DescKind::Function, "f")],
-            false,
-        ));
-        let b = SomeValue::PBC(SomePBC::new(vec![Desc::new(DescKind::Class, "C")], false));
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let a = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f")], false));
+        let b = SomeValue::PBC(SomePBC::new(vec![fake_class_entry(&bk, "C")], false));
         assert!(union(&a, &b).is_err());
     }
 
     #[test]
     fn union_none_and_pbc_makes_pbc_nullable() {
-        let pbc = SomeValue::PBC(SomePBC::new(
-            vec![Desc::new(DescKind::Function, "f")],
-            false,
-        ));
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let pbc = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f")], false));
         let none = SomeValue::None_(SomeNone::new());
         let u = union(&none, &pbc).unwrap();
         let SomeValue::PBC(merged) = u else {
@@ -3463,9 +3619,14 @@ mod tests {
 
     #[test]
     fn union_none_and_pbc_preserves_subset_of() {
-        let parent = SomePBC::new(vec![Desc::new(DescKind::Function, "f")], false);
+        // Share identity via Rc::clone so parent and child reference
+        // the same FunctionDesc — matches upstream pyobj → getdesc
+        // identity round-trip.
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let f = fake_function_entry(&bk, "f");
+        let parent = SomePBC::new(vec![f.clone()], false);
         let child = SomeValue::PBC(SomePBC::with_subset(
-            vec![Desc::new(DescKind::Function, "f")],
+            vec![f],
             false,
             Some(Box::new(parent.clone())),
         ));

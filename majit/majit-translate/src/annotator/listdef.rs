@@ -226,20 +226,29 @@ impl ListItem {
 
     /// RPython `ListItem.notify_update()` (listdef.py:104-107).
     ///
-    /// Triggers `self.bookkeeper.annotator.reflowfromposition(pk)` for
-    /// every `pk` in `self.read_locations`. The annotator backlink on
-    /// `Bookkeeper` is Phase 5 P5.2 territory — until bookkeeper.py is
-    /// ported, this method walks `read_locations` but the reflow call
-    /// body stays empty. The structural call sites inside
-    /// [`Self::merge`] match upstream `listdef.py:95,97` exactly so no
-    /// deviation gets introduced at the call-site level.
+    /// ```python
+    /// def notify_update(self):
+    ///     '''Reflow from all reading points'''
+    ///     for position_key in self.read_locations:
+    ///         self.bookkeeper.annotator.reflowfromposition(position_key)
+    /// ```
+    ///
+    /// `self.bookkeeper` is optional on the Rust port (matches upstream's
+    /// `bookkeeper=None` path at listdef.py:34 which sets
+    /// `dont_change_any_more=True`). When the bookkeeper / annotator
+    /// backlink is absent, the loop is structurally preserved but no
+    /// reflow fires — the only way to reach notify_update from that
+    /// state is a guarded path that already errors via
+    /// [`TooLateForChange`].
     pub fn notify_update(&self) {
-        for _position_key in &self.read_locations {
-            // upstream: `self.bookkeeper.annotator.reflowfromposition(pk)`.
-            // Bookkeeper.annotator / Annotator.reflowfromposition are
-            // ported together in Phase 5 P5.2; leaving the loop body
-            // empty preserves upstream's walk order without silently
-            // succeeding on a missing reflow.
+        let Some(bk) = self.bookkeeper.as_ref() else {
+            return;
+        };
+        let Some(ann) = bk.annotator.borrow().upgrade() else {
+            return;
+        };
+        for position_key in &self.read_locations {
+            ann.reflowfromposition(position_key);
         }
     }
 
@@ -559,6 +568,13 @@ impl ListDef {
         self.inner.listitem.borrow().borrow().s_value.clone()
     }
 
+    /// RPython `ListDef.listitem` accessor — returns the shared
+    /// `Rc<RefCell<ListItem>>` so `check_no_flags_on_instances` and
+    /// other walkers can inspect identity.
+    pub fn listitem_rc(&self) -> Rc<RefCell<ListItem>> {
+        self.inner.listitem.borrow().clone()
+    }
+
     /// RPython `ListDef.mutate()` (listdef.py:182-183).
     pub fn mutate(&self) -> Result<(), TooLateForChange> {
         let li = self.inner.listitem.borrow().clone();
@@ -845,5 +861,56 @@ mod tests {
         assert_eq!(merge_range_step(Some(2), Some(3)), Some(0));
         // Same-value / double-None fall back to self.
         assert_eq!(merge_range_step(None, None), None);
+    }
+
+    #[test]
+    fn notify_update_skips_when_annotator_unwired() {
+        // Upstream: reflow is predicated on `self.bookkeeper.annotator`
+        // being a live reference. The Rust port holds it as
+        // `Weak<RPythonAnnotator>` so tests with a bare `Bookkeeper::new`
+        // (no annotator) must silently skip — not panic, not hang.
+        let mut item = ListItem::new(
+            Some(bk()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+        );
+        let pk = super::super::bookkeeper::PositionKey::new(1, 2, 3);
+        item.read_locations.insert(pk);
+        item.notify_update();
+    }
+
+    #[test]
+    fn notify_update_reflows_position_keys_through_annotator_backlink() {
+        // Build an RPythonAnnotator so bk.annotator upgrades to a live
+        // Rc. Seed a block into annotated (as Some(None) = "awaiting
+        // flowin"), register it in all_blocks, then call notify_update
+        // on a ListItem whose read_locations points at that block's
+        // PositionKey. Verify reflowpendingblock queued the block.
+        use super::super::annrpython::RPythonAnnotator;
+        use super::super::bookkeeper::PositionKey;
+        use crate::flowspace::model::{Block, BlockKey, FunctionGraph};
+        use std::cell::RefCell;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Rc::new(RefCell::new(Block::new(vec![])));
+        let graph = Rc::new(RefCell::new(FunctionGraph::new("f", block.clone())));
+        let bkey = BlockKey::of(&block);
+        // Pre-seed annotator tables so reflowpendingblock's asserts pass.
+        ann.annotated.borrow_mut().insert(bkey.clone(), None);
+        ann.all_blocks
+            .borrow_mut()
+            .insert(bkey.clone(), block.clone());
+        let pk = PositionKey::from_refs(&graph, &block, 0);
+
+        let mut item = ListItem::new(
+            Some(ann.bookkeeper.clone()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+        );
+        item.read_locations.insert(pk);
+        item.notify_update();
+
+        // reflowpendingblock -> schedulependingblock inserts into
+        // genpendingblocks[generation]. Verify the block landed there.
+        let pending = ann.genpendingblocks.borrow();
+        assert!(pending[0].contains_key(&bkey));
     }
 }
