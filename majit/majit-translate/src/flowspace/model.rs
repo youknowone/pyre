@@ -951,6 +951,7 @@ impl Hash for ConstValue {
             ConstValue::Function(func) => {
                 func.name.hash(state);
                 func._jit_look_inside_.hash(state);
+                func.relax_sig_check.hash(state);
                 func.globals.hash(state);
                 func.closure.hash(state);
                 func.defaults.hash(state);
@@ -1983,6 +1984,13 @@ pub struct GraphFunc {
     /// can apply the same default as upstream's
     /// `getattr(func, '_jit_look_inside_', True)`.
     pub _jit_look_inside_: Option<bool>,
+    /// Upstream function attribute consulted by
+    /// `description.py:222-224`.
+    ///
+    /// `None` mirrors the common "attribute absent" case so callers
+    /// can apply the same default as upstream's
+    /// `getattr(func, 'relax_sig_check', False)`.
+    pub relax_sig_check: Option<bool>,
     /// Python function `__globals__`, wrapped as a flow-space
     /// constant.
     pub globals: Constant,
@@ -2012,6 +2020,7 @@ impl GraphFunc {
             annspecialcase: None,
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
+            relax_sig_check: None,
             globals,
             closure: Vec::new(),
             defaults: Vec::new(),

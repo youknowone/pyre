@@ -14,7 +14,7 @@
 //!   Python-object-identity semantic `PyGraph(FunctionGraph)`
 //!   inheritance provides upstream.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use super::argument::Signature;
@@ -28,7 +28,10 @@ use super::model::{Constant, FunctionGraph, GraphFunc, GraphRef, Hlvalue, Variab
 /// A flow graph for a Python function. Carries the originating
 /// `GraphFunc`, the code object's call `Signature`, and the Python
 /// `func.__defaults__` tuple alongside the ordinary `FunctionGraph`
-/// fields.
+/// fields. `access_directly` is a mutable per-graph attribute set by
+/// `default_specialize()` after the graph is retrieved from cache; in
+/// Rust that needs a [`Cell`] because the graph is shared behind an
+/// [`Rc`].
 #[derive(Debug)]
 pub struct PyGraph {
     /// Ported `FunctionGraph` base instance. Wrapped in
@@ -42,7 +45,15 @@ pub struct PyGraph {
     /// RPython `PyGraph.signature = code.signature`.
     pub signature: Signature,
     /// RPython `PyGraph.defaults = func.__defaults__ or ()`.
-    pub defaults: Vec<Constant>,
+    ///
+    /// `None` is reserved for the star-arg builder path in
+    /// `specialize.py`, which mutates a freshly-built graph to mean
+    /// "defaults are unavailable for this specialized signature".
+    pub defaults: Option<Vec<Constant>>,
+    /// RPython `graph.access_directly = True` set by
+    /// `default_specialize()` when any argument carries the
+    /// `access_directly` hint and `_jit_look_inside_` allows it.
+    pub access_directly: Cell<bool>,
 }
 
 impl PyGraph {
@@ -72,7 +83,8 @@ impl PyGraph {
         PyGraph {
             graph: Rc::new(RefCell::new(graph)),
             signature: code.signature.clone(),
-            defaults: func.defaults.clone(),
+            defaults: Some(func.defaults.clone()),
+            access_directly: Cell::new(false),
             func,
         }
     }
@@ -139,8 +151,9 @@ mod tests {
         let pygraph = PyGraph::new(func, &code);
 
         assert_eq!(pygraph.graph.borrow().name, "f");
-        assert_eq!(pygraph.defaults.len(), 0);
+        assert_eq!(pygraph.defaults.as_ref().map_or(0, Vec::len), 0);
         assert_eq!(pygraph.signature.num_argnames(), 2);
+        assert!(!pygraph.access_directly.get());
         // startblock.inputargs carries a Variable per formal arg
         // (no None slots leak through).
         let inputargs = pygraph.graph.borrow().startblock.borrow().inputargs.clone();

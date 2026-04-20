@@ -36,7 +36,7 @@ use super::model::{
 use super::policy::Specializer;
 use super::signature::ParamType;
 use crate::flowspace::argument::{CallShape, Signature};
-use crate::flowspace::model::{ConstValue, Constant, HostObject};
+use crate::flowspace::model::{BlockRefExt, ConstValue, Constant, HostObject, checkgraph};
 use crate::flowspace::objspace::build_flow;
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::UnionFindInfo;
@@ -751,14 +751,15 @@ impl FunctionDesc {
         &self,
         key: &str,
         alt_name: Option<&str>,
-        post_build: impl FnOnce(&Rc<PyGraph>) -> Result<(), AnnotatorError>,
+        post_build: impl FnOnce(&mut PyGraph) -> Result<(), AnnotatorError>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         if let Some(existing) = self.cache.borrow().get(key) {
             return Ok(existing.clone());
         }
         let computed_alt_name = alt_name.or_else(|| if key.is_empty() { None } else { Some(key) });
-        let graph = self.buildgraph(computed_alt_name)?;
-        post_build(&graph)?;
+        let mut graph = self.buildgraph(computed_alt_name)?;
+        post_build(&mut graph)?;
+        let graph = Rc::new(graph);
         self.cache
             .borrow_mut()
             .insert(key.to_string(), graph.clone());
@@ -775,30 +776,25 @@ impl FunctionDesc {
     pub fn parse_arguments(
         &self,
         args: &ArgumentsForTranslation,
-        graph_signature: Option<&Signature>,
-        graph_defaults: Option<&[ConstValue]>,
+        graph: Option<&PyGraph>,
     ) -> Result<Vec<SomeValue>, AnnotatorError> {
-        let (signature, defaults_const) = match (graph_signature, graph_defaults) {
-            (Some(sig), Some(d)) => (sig, Some(d)),
-            (None, _) => (&self.signature, None),
-            (Some(sig), None) => (sig, None),
-        };
+        let signature = graph.map_or(&self.signature, |graph| &graph.signature);
         // upstream description.py:256-264 — `if defaults:` walks each
         // Python value through `self.bookkeeper.immutablevalue(x)` at
         // parse time. `graph_defaults` overrides `self.defaults` when
         // the specializer built a `PyGraph` whose `__defaults__` tuple
         // diverged from the bare FunctionDesc's.
         let mut defs_s: Vec<SomeValue> = Vec::new();
-        let defaults_source: Vec<ConstValue> = match defaults_const {
-            Some(ds) => ds.to_vec(),
-            None => self.defaults.iter().map(|c| c.value.clone()).collect(),
-        };
-        for d in &defaults_source {
+        let defaults_source: Option<&[Constant]> = graph
+            .map_or(Some(self.defaults.as_slice()), |graph| {
+                graph.defaults.as_deref()
+            });
+        for d in defaults_source.unwrap_or_default() {
             // upstream: `if x is NODEFAULT: defs_s.append(None)`.
             // We represent NODEFAULT as s_impossible_value, matching
             // the Phase 5 P5.2 representation; a richer "missing"
             // encoding lands when NODEFAULT surfaces as a real enum.
-            let s = self.base.bookkeeper.immutablevalue(d)?;
+            let s = self.base.bookkeeper.immutablevalue(&d.value)?;
             defs_s.push(s);
         }
         args.match_signature(signature, Some(&defs_s))
@@ -852,7 +848,7 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.buildgraph(alt_name=None, builder=None)`
     /// (description.py:205-213).
     ///
-    pub fn buildgraph(&self, alt_name: Option<&str>) -> Result<Rc<PyGraph>, AnnotatorError> {
+    pub fn buildgraph(&self, alt_name: Option<&str>) -> Result<PyGraph, AnnotatorError> {
         let pyobj = self
             .base
             .pyobj
@@ -878,12 +874,13 @@ impl FunctionDesc {
             graph: Rc::new(RefCell::new(flow_graph)),
             func: graph_func,
             signature,
-            defaults: self.defaults.clone(),
+            defaults: Some(self.defaults.clone()),
+            access_directly: std::cell::Cell::new(false),
         };
         if let Some(alt_name) = alt_name {
             pygraph.graph.borrow_mut().name = alt_name.to_string();
         }
-        Ok(Rc::new(pygraph))
+        Ok(pygraph)
     }
 
     /// RPython `FunctionDesc.getuniquegraph()` (description.py:218-226).
@@ -897,11 +894,9 @@ impl FunctionDesc {
     ///
     /// `relax_sig_check` is a function-level attribute on upstream's
     /// Python function object that lowlevel annotator callers set to
-    /// allow signature mismatches. The Rust `HostObject::UserFunction`
-    /// surface doesn't carry arbitrary attributes yet (classdesc.py
-    /// dep), so this port always runs the structural check; once
-    /// that surface lands, a `pyobj.get_bool_attr("relax_sig_check")`
-    /// gate gets added.
+    /// allow signature mismatches. The Rust `GraphFunc` carries this
+    /// as an optional bool mirroring the same "attribute absent"
+    /// default-to-False contract.
     pub fn getuniquegraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
         let cache = self.cache.borrow();
         if cache.len() != 1 {
@@ -916,7 +911,16 @@ impl FunctionDesc {
         // reach these via the composed `FunctionGraph` base (see
         // `pygraph.rs`); `FunctionDesc.defaults` is `Vec<Constant>`
         // specifically so this comparison is a plain value-eq.
-        if graph.signature != self.signature || graph.defaults != self.defaults {
+        let relax_sig_check = self
+            .base
+            .pyobj
+            .as_ref()
+            .and_then(|pyobj| pyobj.user_function())
+            .and_then(|func| func.relax_sig_check)
+            .unwrap_or(false);
+        if (graph.signature != self.signature || graph.defaults.as_ref() != Some(&self.defaults))
+            && !relax_sig_check
+        {
             return Err(AnnotatorError::new(format!(
                 "NoStandardGraph({}): signature/defaults mismatch",
                 self.name
@@ -998,21 +1002,27 @@ impl FunctionDesc {
     /// in the new startblock to reconstruct the expected tuple for the
     /// original code.
     fn apply_star_args_builder(
-        pygraph: &Rc<PyGraph>,
+        pygraph: &mut PyGraph,
         nb_extra_args: usize,
     ) -> Result<(), AnnotatorError> {
         use crate::flowspace::model::{Block, Hlvalue, Link, Variable};
         use crate::flowspace::operation::{HLOperation, OpKind};
 
-        let mut graph = pygraph.graph.borrow_mut();
         // upstream: `argnames, vararg, kwarg = graph.signature; assert vararg`.
         let old_sig = pygraph.signature.clone();
         if old_sig.varargname.is_none() {
             return Err(AnnotatorError::new(format!(
                 "apply_star_args_builder({}): graph signature missing *arg",
-                graph.name
+                pygraph.graph.borrow().name
             )));
         }
+        if old_sig.kwargname.is_some() {
+            return Err(AnnotatorError::new(format!(
+                "apply_star_args_builder({}): graph signature unexpectedly has **arg",
+                pygraph.graph.borrow().name
+            )));
+        }
+        let mut graph = pygraph.graph.borrow_mut();
         // upstream: `argscopy = [Variable(v) for v in graph.getargs()]`.
         let old_args = graph.getargs();
         let argscopy: Vec<Variable> = old_args
@@ -1061,9 +1071,18 @@ impl FunctionDesc {
             Some(graph.startblock.clone()),
             None,
         )));
-        newstartblock.borrow_mut().closeblock(vec![link]);
+        newstartblock.closeblock(vec![link]);
         // upstream: `graph.startblock = newstartblock`.
         graph.startblock = newstartblock;
+        drop(graph);
+
+        let mut argnames = old_sig.argnames;
+        argnames.extend((0..nb_extra_args).map(|i| format!(".star{}", i)));
+        pygraph.signature = Signature::new(argnames, None, None);
+        if nb_extra_args > 0 {
+            pygraph.defaults = None;
+        }
+        checkgraph(&pygraph.graph.borrow());
         Ok(())
     }
 
@@ -1094,15 +1113,19 @@ impl FunctionDesc {
                 // handles the flattening + key-suffix + graph-mutation
                 // builder for the vararg case.
                 let (flattened_cells, star_key) = self.flatten_star_args(inputcells)?;
-                let mut inputcells_vec = flattened_cells;
-                let inputcells = inputcells_vec.as_mut_slice();
+                let mut flattened_cells = flattened_cells;
+                let inputcells: &mut [SomeValue] = if star_key.is_some() {
+                    flattened_cells.as_mut_slice()
+                } else {
+                    inputcells
+                };
 
                 let jit_look_inside = self
                     .base
                     .pyobj
                     .as_ref()
-                    .and_then(|pyobj| pyobj.class_get("_jit_look_inside_"))
-                    .map(|v| !matches!(v, ConstValue::Bool(false)))
+                    .and_then(|pyobj| pyobj.user_function())
+                    .and_then(|func| func._jit_look_inside_)
                     .unwrap_or(true);
                 let mut access_directly = false;
                 for s_obj in inputcells.iter_mut() {
@@ -1113,7 +1136,13 @@ impl FunctionDesc {
                                 access_directly = true;
                                 break;
                             } else {
-                                inst.flags.remove("access_directly");
+                                let mut new_flags = inst.flags.clone();
+                                new_flags.remove("access_directly");
+                                *s_obj = SomeValue::Instance(SomeInstance::new(
+                                    inst.classdef.clone(),
+                                    inst.can_be_none,
+                                    new_flags,
+                                ));
                             }
                         }
                     }
@@ -1129,14 +1158,14 @@ impl FunctionDesc {
                 // `apply_star_args_builder(nb_extra_args)` to rewrite
                 // `startblock` + flatten the *arg tuple. Cached hits
                 // bypass — already rewritten.
-                let post_build = |pg: &Rc<PyGraph>| -> Result<(), AnnotatorError> {
+                let post_build = |pg: &mut PyGraph| -> Result<(), AnnotatorError> {
                     if let Some(n) = nb_extra_args {
                         Self::apply_star_args_builder(pg, n)?;
                     }
                     Ok(())
                 };
 
-                if access_directly {
+                let graph = if access_directly {
                     // upstream `key = (AccessDirect, key)` — tuple key.
                     // Rust encodes as prefix on the cache-name string.
                     let cache_key = match &star_key {
@@ -1151,7 +1180,11 @@ impl FunctionDesc {
                         .as_deref()
                         .map(|sk| format!("{}_{}", self.name, sk));
                     self.cachedgraph_with_builder(key, alt_owned.as_deref(), post_build)
+                }?;
+                if access_directly {
+                    graph.access_directly.set(true);
                 }
+                Ok(graph)
             }
             Specializer::Arg { parms } => {
                 let mut parts = Vec::with_capacity(parms.len());
@@ -1303,7 +1336,7 @@ impl FunctionDesc {
         op_key: Option<PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
         // upstream: `inputcells = self.parse_arguments(args)`.
-        let mut inputcells = self.parse_arguments(args, None, None)?;
+        let mut inputcells = self.parse_arguments(args, None)?;
         // upstream: `graph = self.specialize(inputcells, op)`.
         let graph = self.specialize(&mut inputcells, op_key.clone())?;
         // upstream: `assert isinstance(graph, FunctionGraph)` — Rust
@@ -1317,11 +1350,7 @@ impl FunctionDesc {
                 AnnotatorError::new(format!("{}.unmatch_signature: {}", self.name, e.getmsg()))
             })?;
         // upstream: `inputcells = self.parse_arguments(new_args, graph)`.
-        let graph_sig = graph.signature.clone();
-        let graph_defaults: Vec<ConstValue> =
-            graph.defaults.iter().map(|c| c.value.clone()).collect();
-        let inputcells =
-            self.parse_arguments(&new_args, Some(&graph_sig), Some(&graph_defaults))?;
+        let inputcells = self.parse_arguments(&new_args, Some(graph.as_ref()))?;
 
         // upstream: `annotator = self.bookkeeper.annotator`.
         let annotator = self
@@ -1368,7 +1397,7 @@ impl FunctionDesc {
         args: &ArgumentsForTranslation,
         op_key: Option<PositionKey>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
-        let mut inputs_s = self.parse_arguments(args, None, None)?;
+        let mut inputs_s = self.parse_arguments(args, None)?;
         self.specialize(&mut inputs_s, op_key)
     }
 
@@ -1562,7 +1591,7 @@ impl MemoDesc {
     ) -> Result<SomeValue, AnnotatorError> {
         use super::model::s_impossible_value;
         // upstream: `inputcells = self.parse_arguments(args)`.
-        let mut inputcells = self.base.parse_arguments(args, None, None)?;
+        let mut inputcells = self.base.parse_arguments(args, None)?;
         // upstream: `s_result = self.specialize(inputcells, op)`.
         let graph = self.base.specialize(&mut inputcells, op_key)?;
         // upstream: `if isinstance(s_result, FunctionGraph): s_result =
@@ -2183,6 +2212,8 @@ mod tests {
     use super::*;
     use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
     use crate::flowspace::argument::CallShape;
+    use rustpython_compiler::{Mode, compile as rp_compile};
+    use rustpython_compiler_core::bytecode::ConstantData;
 
     fn desc_key(id: usize) -> DescKey {
         DescKey::from_raw(id)
@@ -2308,6 +2339,27 @@ mod tests {
         Signature::new(names.iter().map(|s| s.to_string()).collect(), None, None)
     }
 
+    fn compiled_graph_func(
+        src: &str,
+        defaults: Vec<Constant>,
+    ) -> crate::flowspace::model::GraphFunc {
+        let code = rp_compile(src, Mode::Exec, "<test>".into(), Default::default())
+            .expect("compile should succeed");
+        let inner = code
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some(&**code),
+                _ => None,
+            })
+            .expect("function body should be a code constant");
+        crate::flowspace::model::GraphFunc::from_host_code(
+            crate::flowspace::bytecode::HostCode::from_code(inner),
+            Constant::new(ConstValue::Dict(Default::default())),
+            defaults,
+        )
+    }
+
     #[test]
     fn desc_new_carries_bookkeeper_and_pyobj() {
         let bk = bk();
@@ -2352,7 +2404,7 @@ mod tests {
     /// getuniquegraph tests. Full `PyGraph::new` requires a HostCode;
     /// we construct the same shape manually so the test stays scoped
     /// to the FunctionDesc / PyGraph field comparison upstream runs.
-    fn make_pygraph(sig: Signature, defaults: Vec<Constant>) -> Rc<PyGraph> {
+    fn make_pygraph(sig: Signature, defaults: Option<Vec<Constant>>) -> Rc<PyGraph> {
         use crate::flowspace::model::{FunctionGraph, GraphFunc};
         let empty_globals = Constant::new(ConstValue::Dict(Default::default()));
         let func = GraphFunc::new("f", empty_globals);
@@ -2364,6 +2416,7 @@ mod tests {
             func,
             signature: sig,
             defaults,
+            access_directly: std::cell::Cell::new(false),
         })
     }
 
@@ -2373,7 +2426,7 @@ mod tests {
         // graph whose signature/defaults match returns that graph.
         let sig = int_sig(&["x"]);
         let fd = FunctionDesc::new(bk(), None, "f", sig.clone(), None, None);
-        let graph = make_pygraph(sig, Vec::new());
+        let graph = make_pygraph(sig, Some(Vec::new()));
         fd.cache.borrow_mut().insert("key".into(), graph.clone());
         let g = fd.getuniquegraph().expect("single matching graph");
         assert!(Rc::ptr_eq(&g, &graph));
@@ -2389,7 +2442,7 @@ mod tests {
         let diverging_sig = int_sig(&["x", "y"]);
         fd.cache
             .borrow_mut()
-            .insert("key".into(), make_pygraph(diverging_sig, Vec::new()));
+            .insert("key".into(), make_pygraph(diverging_sig, Some(Vec::new())));
         let err = fd.getuniquegraph().unwrap_err();
         assert!(
             err.msg
@@ -2406,7 +2459,7 @@ mod tests {
         let fd = FunctionDesc::new(bk(), None, "f", sig.clone(), None, None);
         fd.cache.borrow_mut().insert(
             "key".into(),
-            make_pygraph(sig, vec![Constant::new(ConstValue::Int(10))]),
+            make_pygraph(sig, Some(vec![Constant::new(ConstValue::Int(10))])),
         );
         let err = fd.getuniquegraph().unwrap_err();
         assert!(
@@ -2414,6 +2467,39 @@ mod tests {
                 .unwrap_or_default()
                 .contains("signature/defaults mismatch")
         );
+    }
+
+    #[test]
+    fn function_desc_getuniquegraph_errors_on_graph_defaults_none() {
+        let sig = int_sig(&["x"]);
+        let fd = FunctionDesc::new(bk(), None, "f", sig.clone(), None, None);
+        fd.cache
+            .borrow_mut()
+            .insert("key".into(), make_pygraph(sig, None));
+        let err = fd.getuniquegraph().unwrap_err();
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("signature/defaults mismatch")
+        );
+    }
+
+    #[test]
+    fn function_desc_getuniquegraph_allows_mismatch_when_relax_sig_check() {
+        let mut func = crate::flowspace::model::GraphFunc::new(
+            "f",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func.relax_sig_check = Some(true);
+        let pyobj = HostObject::new_user_function(func);
+        let fd = FunctionDesc::new(bk(), Some(pyobj), "f", int_sig(&["x"]), None, None);
+        let diverging_sig = int_sig(&["x", "y"]);
+        let graph = make_pygraph(diverging_sig, Some(Vec::new()));
+        fd.cache.borrow_mut().insert("key".into(), graph.clone());
+        let got = fd
+            .getuniquegraph()
+            .expect("relax_sig_check must bypass signature/default mismatch");
+        assert!(Rc::ptr_eq(&got, &graph));
     }
 
     #[test]
@@ -2436,7 +2522,7 @@ mod tests {
             None,
             None,
         );
-        let inputs = fd.parse_arguments(&args, None, None).unwrap();
+        let inputs = fd.parse_arguments(&args, None).unwrap();
         assert_eq!(inputs.len(), 2);
     }
 
@@ -2453,7 +2539,31 @@ mod tests {
             None,
             None,
         );
-        let err = fd.parse_arguments(&args, None, None).unwrap_err();
+        let err = fd.parse_arguments(&args, None).unwrap_err();
+        assert!(err.msg.unwrap_or_default().contains("signature mismatch"));
+    }
+
+    #[test]
+    fn function_desc_parse_arguments_with_graph_defaults_none_does_not_fallback() {
+        let sig = Signature::new(vec!["a".into()], Some("rest".into()), None);
+        let fd = FunctionDesc::new(
+            bk(),
+            None,
+            "f",
+            sig,
+            Some(vec![Constant::new(ConstValue::Int(10))]),
+            None,
+        );
+        let graph = make_pygraph(
+            Signature::new(vec!["a".into(), ".star0".into()], None, None),
+            None,
+        );
+        let args = ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::new(true, false))],
+            None,
+            None,
+        );
+        let err = fd.parse_arguments(&args, Some(graph.as_ref())).unwrap_err();
         assert!(err.msg.unwrap_or_default().contains("signature mismatch"));
     }
 
@@ -2546,6 +2656,74 @@ mod tests {
         let (out, key) = fd.flatten_star_args(&args).expect("vararg path");
         assert_eq!(out.len(), 3, "a + 2 flattened star args");
         assert_eq!(key.as_deref(), Some("star_2"));
+    }
+
+    #[test]
+    fn default_specialize_rewrites_access_directly_in_place_when_jit_disabled() {
+        let mut func = compiled_graph_func("def f(a):\n    return a\n", Vec::new());
+        func._jit_look_inside_ = Some(false);
+        let host = HostObject::new_user_function(func.clone());
+        let fd = FunctionDesc::new(
+            bk(),
+            Some(host),
+            "f",
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(func.defaults.clone()),
+            None,
+        );
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("access_directly".into(), true);
+        let mut inputcells = vec![SomeValue::Instance(SomeInstance::new(None, false, flags))];
+
+        let graph = fd.specialize(&mut inputcells, None).unwrap();
+
+        assert!(!graph.access_directly.get());
+        match &inputcells[0] {
+            SomeValue::Instance(inst) => assert!(!inst.flags.contains_key("access_directly")),
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_specialize_vararg_builder_updates_signature_defaults_and_entry_block() {
+        use super::super::model::SomeTuple;
+
+        let defaults = vec![Constant::new(ConstValue::Int(1))];
+        let func = compiled_graph_func("def f(a=1, *rest):\n    return a\n", defaults.clone());
+        let host = HostObject::new_user_function(func.clone());
+        let fd = FunctionDesc::new(
+            bk(),
+            Some(host),
+            "f",
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(defaults),
+            None,
+        );
+        let mut inputcells = vec![
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::Integer(SomeInteger::default()),
+            ])),
+        ];
+
+        let graph = fd.specialize(&mut inputcells, None).unwrap();
+
+        assert_eq!(
+            inputcells.len(),
+            2,
+            "caller inputcells must stay unflattened"
+        );
+        assert_eq!(
+            graph.signature.argnames,
+            vec!["a".to_string(), ".star0".to_string(), ".star1".to_string()]
+        );
+        assert!(graph.signature.varargname.is_none());
+        assert!(graph.signature.kwargname.is_none());
+        assert!(graph.defaults.is_none());
+        let startblock = graph.graph.borrow().startblock.clone();
+        assert_eq!(startblock.borrow().inputargs.len(), 3);
+        assert!(startblock.borrow().exits[0].borrow().prevblock.is_some());
     }
 
     #[test]
