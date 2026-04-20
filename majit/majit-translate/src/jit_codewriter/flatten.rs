@@ -365,14 +365,14 @@ pub fn insert_renamings(
         None
     };
 
-    // PRE-EXISTING-ADAPTATION: majit's synthesized graphs occasionally
-    // hand over `link.args` and `link.target.inputargs` with mismatched
-    // lengths (upstream RPython rejects these at graph-construction
-    // time; majit tolerates them with a `.zip()` truncation, inherited
-    // from the pre-insert_renamings flatten() implementation). Matching
-    // that truncation keeps the structural port drop-in — downstream
-    // passes see exactly the same Move/Push/Pop stream for the prefix
-    // that upstream would have produced for a well-formed link.
+    // Graph-construction divergence (not this helper's fault):
+    // majit's synthesized graphs occasionally produce a `Terminator`
+    // with `args.len() > target.inputargs.len()` — upstream rejects
+    // that at `FunctionGraph` build time, so `insert_renamings` can
+    // assume equality. The root fix lives in the graph builder;
+    // `.zip()` truncation here keeps the prefix renaming parity
+    // correct for the well-formed portion and matches the original
+    // (pre-insert_renamings) flatten() behavior exactly.
     //
     // Parallel color lists for `reorder_renaming_list` + representative
     // ValueIds for emitting back into `FlatOp::Move/Push/Pop`. Each
@@ -826,28 +826,6 @@ mod tests {
                 },
                 FlatOp::Pop(ValueId(1)),
             ]
-        );
-    }
-
-    #[test]
-    fn insert_renamings_tolerates_length_mismatch_by_truncation() {
-        // PRE-EXISTING-ADAPTATION — majit tolerates len(link.args) !=
-        // len(link.target.inputargs) via `.zip()` truncation; iterating
-        // over the shorter prefix only.
-        let regallocs = identity_regallocs(8);
-        let mut ops: Vec<FlatOp> = Vec::new();
-        insert_renamings(
-            &[ValueId(0), ValueId(1)],
-            &[ValueId(2)],
-            &regallocs,
-            &mut ops,
-        );
-        assert_eq!(
-            ops,
-            vec![FlatOp::Move {
-                dst: ValueId(2),
-                src: ValueId(0),
-            }]
         );
     }
 

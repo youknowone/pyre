@@ -832,8 +832,23 @@ impl BhDescr {
 ///     return buf.getvalue()
 /// ```
 pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
-    use crate::flatten::FlatOp;
+    use crate::flatten::{FlatOp, RegKind};
     use std::fmt::Write;
+
+    let kind_char = |v: crate::model::ValueId| -> char {
+        match ssarepr.value_kinds.get(&v).copied().unwrap_or(RegKind::Ref) {
+            RegKind::Int => 'i',
+            RegKind::Ref => 'r',
+            RegKind::Float => 'f',
+        }
+    };
+    let kind_name = |v: crate::model::ValueId| -> &'static str {
+        match ssarepr.value_kinds.get(&v).copied().unwrap_or(RegKind::Ref) {
+            RegKind::Int => "int",
+            RegKind::Ref => "ref",
+            RegKind::Float => "float",
+        }
+    };
 
     let mut out = String::new();
     writeln!(out, "{}", ssarepr.name).ok();
@@ -843,7 +858,10 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                 writeln!(out, "L{}:", label.0).ok();
             }
             FlatOp::Live { live_values } => {
-                let regs: Vec<String> = live_values.iter().map(|v| format!("%i{}", v.0)).collect();
+                let regs: Vec<String> = live_values
+                    .iter()
+                    .map(|v| format!("%{}{}", kind_char(*v), v.0))
+                    .collect();
                 writeln!(out, "  -live- {}", regs.join(", ")).ok();
             }
             FlatOp::Unreachable => {
@@ -852,7 +870,7 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             FlatOp::Op(space_op) => {
                 let result = space_op
                     .result
-                    .map(|v| format!(" -> %i{}", v.0))
+                    .map(|v| format!(" -> %{}{}", kind_char(v), v.0))
                     .unwrap_or_default();
                 writeln!(out, "  {:?}{result}", space_op.kind).ok();
             }
@@ -860,16 +878,47 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                 writeln!(out, "  goto L{}", label.0).ok();
             }
             FlatOp::GotoIfNot { cond, target } => {
-                writeln!(out, "  goto_if_not %i{}, L{}", cond.0, target.0).ok();
+                writeln!(
+                    out,
+                    "  goto_if_not %{}{}, L{}",
+                    kind_char(*cond),
+                    cond.0,
+                    target.0
+                )
+                .ok();
             }
+            // `flatten.py:326-335` kind-prefixed opnames.
             FlatOp::Move { dst, src } => {
-                writeln!(out, "  %i{} = %i{}", dst.0, src.0).ok();
+                writeln!(
+                    out,
+                    "  {}_copy %{}{} -> %{}{}",
+                    kind_name(*src),
+                    kind_char(*src),
+                    src.0,
+                    kind_char(*dst),
+                    dst.0
+                )
+                .ok();
             }
             FlatOp::Push(src) => {
-                writeln!(out, "  push %i{}", src.0).ok();
+                writeln!(
+                    out,
+                    "  {}_push %{}{}",
+                    kind_name(*src),
+                    kind_char(*src),
+                    src.0
+                )
+                .ok();
             }
             FlatOp::Pop(dst) => {
-                writeln!(out, "  pop -> %i{}", dst.0).ok();
+                writeln!(
+                    out,
+                    "  {}_pop -> %{}{}",
+                    kind_name(*dst),
+                    kind_char(*dst),
+                    dst.0
+                )
+                .ok();
             }
         }
     }

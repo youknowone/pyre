@@ -98,25 +98,34 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     register_repr(*cond, &ssarepr.value_kinds)
                 );
             }
+            // `flatten.py:333-335` emits opnames prefixed by kind —
+            // `int_copy`/`ref_copy`/`float_copy`,
+            // `int_push`/`ref_push`/`float_push`,
+            // `int_pop`/`ref_pop`/`float_pop` — so the formatter just
+            // prints `asm[0]` verbatim. Mirror that here by deriving
+            // the kind from the moved register's `value_kinds` entry.
             FlatOp::Move { dst, src } => {
+                let kind = kind_name(*src, &ssarepr.value_kinds);
                 let _ = writeln!(
                     out,
-                    "{prefix}move {} -> {}",
+                    "{prefix}{kind}_copy {} -> {}",
                     register_repr(*src, &ssarepr.value_kinds),
                     register_repr(*dst, &ssarepr.value_kinds)
                 );
             }
             FlatOp::Push(src) => {
+                let kind = kind_name(*src, &ssarepr.value_kinds);
                 let _ = writeln!(
                     out,
-                    "{prefix}push {}",
+                    "{prefix}{kind}_push {}",
                     register_repr(*src, &ssarepr.value_kinds)
                 );
             }
             FlatOp::Pop(dst) => {
+                let kind = kind_name(*dst, &ssarepr.value_kinds);
                 let _ = writeln!(
                     out,
-                    "{prefix}pop -> {}",
+                    "{prefix}{kind}_pop -> {}",
                     register_repr(*dst, &ssarepr.value_kinds)
                 );
             }
@@ -215,6 +224,16 @@ fn register_repr(v: ValueId, kinds: &HashMap<ValueId, RegKind>) -> String {
         RegKind::Float => 'f',
     };
     format!("%{prefix}{}", v.0)
+}
+
+/// `flatten.py:326-335` — the kind prefix used when spelling
+/// `int_copy`/`ref_copy`/`float_copy` (and `*_push`/`*_pop`).
+fn kind_name(v: ValueId, kinds: &HashMap<ValueId, RegKind>) -> &'static str {
+    match kinds.get(&v).copied().unwrap_or(RegKind::Ref) {
+        RegKind::Int => "int",
+        RegKind::Ref => "ref",
+        RegKind::Float => "float",
+    }
 }
 
 /// format.py:26-27 `ListOfKind` formatter.
