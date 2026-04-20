@@ -2772,11 +2772,12 @@ mod tests {
         let mut sym = DummySym::default();
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
 
-        let (finish_args, finish_arg_types) = match action {
+        let (finish_args, finish_arg_types, exit_with_exception) = match action {
             TraceAction::Finish {
                 finish_args,
                 finish_arg_types,
-            } => (finish_args, finish_arg_types),
+                exit_with_exception,
+            } => (finish_args, finish_arg_types, exit_with_exception),
             other => panic!(
                 "expected TraceAction::Finish for handler-less raise, got {:?}",
                 other
@@ -2784,5 +2785,6 @@ mod tests {
         };
         assert_eq!(finish_arg_types, vec![majit_ir::Type::Ref]);
         assert_eq!(finish_args.len(), 1);
+        assert!(exit_with_exception);
     }
 }
