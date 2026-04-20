@@ -2140,24 +2140,6 @@ impl CodeWriter {
         // a front-end gate.
         let mut has_abort = assembler.has_abort_flag();
 
-        // liveness.py:19-80 parity: populate each `-live-` marker in
-        // the SSARepr via SSA backward dataflow, then apply pyre's
-        // runtime-contract filter (Ref-only, in-range, stack-complete,
-        // LiveVars-intersected) to each marker in place. After
-        // `apply_rename` below, the final post-rename `Insn::Live` is
-        // the single source both the assembler (`all_liveness` byte
-        // stream) and runtime consumers (tracer `get_list_of_active_
-        // boxes`, blackhole `consume_one_section`) read. See
-        // `filter_liveness_in_place`.
-        filter_liveness_in_place(
-            &mut ssarepr,
-            &live_patches,
-            code,
-            nlocals,
-            stack_base,
-            &depth_at_pc,
-        );
-
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, site.landing_label);
             let mut exc_slot = stack_base + site.stack_depth;
@@ -2180,9 +2162,14 @@ impl CodeWriter {
 
         // codewriter.py:45-47 `for kind in KINDS:
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
-        // The pyre-side post-pass scans the populated SSARepr to build
-        // per-kind dependency graphs, runs chordal coloring on each,
-        // and returns the rename map applied to the SSARepr in place.
+        //
+        // RPython runs regalloc on the CFG before flatten emits the
+        // SSARepr (`codewriter.py:44` vs `:53-56`). Regalloc uses
+        // `block.operations` + `link.args` for interference; `-live-`
+        // markers don't exist yet. pyre dispatches directly to the
+        // SSARepr, but after Step 4 landed the allocator no longer
+        // reads `Insn::Live` either (see `regalloc.rs`'s `Insn::Live`
+        // arm), so it matches the upstream pre-liveness ordering.
         let max_stack_depth_observed = depth_at_pc.iter().copied().max().unwrap_or(0);
         let inputs = super::regalloc::ExternalInputs {
             portal_frame_reg,
@@ -2198,6 +2185,21 @@ impl CodeWriter {
         let alloc_result =
             super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs);
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
+
+        // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
+        // AFTER regalloc + flatten, so the live-register indices the
+        // pass writes into each `-live-` marker are already the
+        // post-rename colors. pyre's `filter_liveness_in_place` is the
+        // same pass plus the pyre-only runtime-contract filter
+        // (Ref-only, in-range, stack-complete, LiveVars-intersected).
+        filter_liveness_in_place(
+            &mut ssarepr,
+            &live_patches,
+            code,
+            nlocals,
+            stack_base,
+            &depth_at_pc,
+        );
 
         // Fail-fast on a missing `-live-` marker at each patched insn
         // index, mirroring RPython's `jitcode.py:82-100`
