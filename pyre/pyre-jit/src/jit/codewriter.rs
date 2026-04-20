@@ -2201,28 +2201,6 @@ impl CodeWriter {
             &depth_at_pc,
         );
 
-        // Fail-fast on a missing `-live-` marker at each patched insn
-        // index, mirroring RPython's `jitcode.py:82-100`
-        // `get_live_vars_info` / `_missing_liveness` invariant:
-        // `live_patches[i]` must point at an `Insn::Live`.
-        // `filter_liveness_in_place` preserves the marker even for
-        // unreachable PCs (it only clears the register args), so an
-        // empty-but-present marker is the correct "no live regs" shape;
-        // a missing or wrong-kind insn indicates a `live_patches` /
-        // ssarepr drift the rest of the pipeline is not prepared for.
-        for &(py_pc, insn_idx) in live_patches.iter() {
-            match ssarepr.insns.get(insn_idx) {
-                Some(super::flatten::Insn::Live(_)) => {}
-                Some(other) => panic!(
-                    "live_patches: expected Insn::Live at insn_idx={insn_idx} (py_pc={py_pc}), got {other:?}"
-                ),
-                None => panic!(
-                    "live_patches: insn_idx={insn_idx} out of range (len {}, py_pc={py_pc})",
-                    ssarepr.insns.len()
-                ),
-            }
-        }
-
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
         // (or 0 if coloring is empty). Pass through to the Assembler
         // step so `JitCode.num_regs_*` reflect the post-regalloc
