@@ -3032,20 +3032,21 @@ pub(crate) fn decode_and_restore_guard_failure(
             slots.join(", ")
         );
     }
+    let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     // resume.py:1042 rebuild_from_resumedata: decode rd_numb into typed values.
-    let mut typed = {
+    let (typed, mut pending_virtuals_cache) = {
         let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
         let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
         if rd_numb.is_empty() {
-            decode_exit_layout_values(raw_values, exit_layout)
+            (dead_frame_typed.clone(), HashMap::new())
         } else {
-            let (t, rd_numb_pc) =
+            let (t, rd_numb_pc, virtuals_cache) =
                 rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout);
             // blackhole.py:337 parity: setposition(jitcode, pc) before
             // consume_one_section. rd_numb_pc = orgpc used by
             // get_list_of_active_boxes during encoding.
             jit_state.resume_pc = rd_numb_pc;
-            t
+            (t, virtuals_cache)
         }
     };
     if majit_metainterp::majit_log_enabled() {
@@ -3054,9 +3055,12 @@ pub(crate) fn decode_and_restore_guard_failure(
             typed.iter().take(6).collect::<Vec<_>>()
         );
     }
-    // resume.py:945/993: materialize virtuals + replay pending fields.
-    rebuild_state_after_failure_with_exit_layout(&mut typed, raw_values, exit_layout);
-    replay_pending_fields(&typed, exit_layout);
+    // resume.py:924-926 + 993 parity: `_prepare_next_section` already
+    // materializes rd_virtuals lazily via `materialize_virtual_from_rd`.
+    // Replay pending fields against the original exit slots plus that
+    // shared virtual cache; do not run the legacy pyre-only
+    // `recovery_layout` materialization pass here.
+    replay_pending_fields(&dead_frame_typed, exit_layout, &mut pending_virtuals_cache);
 
     // resume.py:1042 rebuild_from_resumedata + pyjitpl.py:3400-3430
     // rebuild_state_after_failure parity: decode rd_numb to reconstruct
@@ -3172,7 +3176,7 @@ fn rebuild_typed_from_rd_numb(
     rd_numb: &[u8],
     rd_consts: &[(i64, majit_ir::Type)],
     exit_layout: &CompiledExitLayout,
-) -> (Vec<Value>, Option<usize>) {
+) -> (Vec<Value>, Option<usize>, HashMap<usize, Value>) {
     use majit_ir::resumedata::rebuild_from_numbering;
 
     let (_num_failargs, vable_values, _vref_values, frames) =
@@ -3278,7 +3282,7 @@ fn rebuild_typed_from_rd_numb(
     // resume.py:1383 parity: liveness PC = frame.pc from rd_numb
     // (the same PC used by get_list_of_active_boxes during encoding).
     let rd_numb_pc = frames.last().map(|f| f.pc as usize);
-    (typed, rd_numb_pc)
+    (typed, rd_numb_pc, virtuals_cache)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3484,9 +3488,9 @@ fn build_resumed_frames(
     }
     // RPython parity: _prepare_next_section + materialize_virtual_from_rd
     // is the authoritative path for virtual materialization.
-    // rebuild_state_after_failure_with_exit_layout (recovery_layout) is a
-    // pyre-specific legacy path that is NOT in RPython and can produce
-    // stale values. Disabled for RPython parity.
+    // Pending-field replay must consume the same deadframe slots and shared
+    // virtual cache; the legacy pyre-only recovery_layout materializer has
+    // been removed.
     // resume.py:993 _prepare_pendingfields: apply ONCE for the whole reader.
     // No header — values = slot registers only.
     if majit_metainterp::majit_log_enabled() {
@@ -3495,9 +3499,7 @@ fn build_resumed_frames(
             all_values.len()
         );
     }
-    if let Some(first_values) = all_values.first() {
-        replay_pending_fields(first_values, exit_layout);
-    }
+    replay_pending_fields(&dead_frame_typed, exit_layout, &mut virtuals_cache);
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[dynasm-debug] after replay_pending_fields");
     }
@@ -3836,12 +3838,13 @@ fn _prepare_next_section(
 /// resume.py:945/993 parity: virtual materialization via rd_virtuals.
 /// Called from Cranelift's guard failure handler via TLS callback.
 /// RPython uses rd_virtuals/rd_pendingfields for precise materialization.
-/// No heuristic pair decode — recovery_layout handles everything.
+/// The backend callback itself stays a no-op; runtime restore goes through
+/// rebuild_from_resumedata + materialize_virtual_from_rd.
 fn rebuild_state_after_failure(_outputs: &mut [i64], _types: &[majit_ir::Type]) {
     // RPython: materialization happens in rebuild_from_resumedata via
     // getvirtual_ptr (resume.py:945) and _prepare_pendingfields (resume.py:993).
-    // The Cranelift callback is a no-op; precise materialization is done in
-    // rebuild_state_after_failure_with_exit_layout using recovery_layout.
+    // The Cranelift callback is a no-op; decode_and_restore_guard_failure
+    // performs the real resume-data rebuild.
 }
 
 /// virtual's slot to NONE and appends field values (ob_type, intval).
@@ -3854,7 +3857,11 @@ fn rebuild_state_after_failure(_outputs: &mut [i64], _types: &[majit_ir::Type]) 
 /// ops stored in rd_pendingfields are replayed on the materialized objects.
 /// This ensures lazy field writes that were deferred during optimization
 /// take effect when the guard fires.
-fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
+fn replay_pending_fields(
+    dead_frame_typed: &[Value],
+    exit_layout: &CompiledExitLayout,
+    virtuals_cache: &mut HashMap<usize, Value>,
+) {
     let Some(ref recovery) = exit_layout.recovery_layout else {
         return;
     };
@@ -3862,18 +3869,33 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
         return;
     }
 
-    let resolve_value = |src: &majit_backend::ExitValueSourceLayout| -> Option<i64> {
+    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+    let rd_virtuals = exit_layout.rd_virtuals.as_deref();
+    let num_failargs = exit_layout.exit_types.len() as i32;
+    let value_to_raw_bits = |value: Value| match value {
+        Value::Int(i) => i,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Ref(r) => r.0 as i64,
+        Value::Void => 0,
+    };
+    let mut resolve_value = |src: &majit_backend::ExitValueSourceLayout| -> Option<i64> {
         match src {
             majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
-                typed.get(*idx).map(|v| match v {
-                    Value::Int(i) => *i,
-                    Value::Float(f) => f.to_bits() as i64,
-                    Value::Ref(r) => r.0 as i64,
-                    _ => 0,
-                })
+                dead_frame_typed.get(*idx).cloned().map(value_to_raw_bits)
             }
             majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
-            _ => None,
+            majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
+                Some(value_to_raw_bits(materialize_virtual_from_rd(
+                    *vidx,
+                    dead_frame_typed,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals,
+                    virtuals_cache,
+                )))
+            }
+            majit_backend::ExitValueSourceLayout::Uninitialized
+            | majit_backend::ExitValueSourceLayout::Unavailable => None,
         }
     };
 
@@ -3936,479 +3958,6 @@ fn replay_pending_fields(typed: &[Value], exit_layout: &CompiledExitLayout) {
             );
         }
     }
-}
-
-/// resume.py:945/993 parity: materialize virtuals via rd_virtuals.
-/// RPython uses recovery_layout (rd_virtuals + rd_pendingfields)
-/// for precise materialization. No heuristic pair decode, no w_none().
-fn rebuild_state_after_failure_with_exit_layout(
-    typed: &mut Vec<Value>,
-    raw_values: &[i64],
-    exit_layout: &CompiledExitLayout,
-) {
-    if let Some(ref recovery) = exit_layout.recovery_layout {
-        if !recovery.virtual_layouts.is_empty() {
-            rebuild_state_after_failure_from_recovery_layout(
-                typed,
-                raw_values,
-                exit_layout,
-                recovery,
-            );
-        }
-    }
-}
-
-/// resume.py parity: materialize virtuals using recovery layout (rd_virtuals).
-/// Field values are read from raw_values (deadframe) since rd_numb-decoded
-/// typed array only contains frame slots, not the appended virtual fields.
-fn rebuild_state_after_failure_from_recovery_layout(
-    typed: &mut Vec<Value>,
-    raw_values: &[i64],
-    exit_layout: &CompiledExitLayout,
-    recovery: &majit_backend::ExitRecoveryLayout,
-) -> bool {
-    let w_int_type = &pyre_object::pyobject::INT_TYPE as *const _ as usize;
-    let w_float_type = &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize;
-    let (driver, _) = driver_pair();
-    let backend = driver.meta_interp().backend();
-
-    // resume.py parity: resolve field values from deadframe (raw_values),
-    // not from rd_numb-decoded typed array. Virtual field values live at
-    // deadframe positions beyond the frame slots.
-    // resume.py:1252 parity: resolve field values, including nested virtuals.
-    let resolve_value = |src: &majit_backend::ExitValueSourceLayout,
-                         materialized: &[usize]|
-     -> Option<i64> {
-        match src {
-            majit_backend::ExitValueSourceLayout::ExitValue(idx) => raw_values.get(*idx).copied(),
-            majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
-            majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
-                materialized.get(*vidx).map(|&ptr| ptr as i64)
-            }
-            _ => None,
-        }
-    };
-
-    // Materialize each virtual described in the recovery layout.
-    let mut materialized: Vec<usize> = Vec::new();
-    for vl in &recovery.virtual_layouts {
-        match vl {
-            majit_backend::ExitVirtualLayout::Object {
-                descr,
-                fields,
-                fielddescrs,
-                descr_size,
-                ..
-            } => {
-                let field_vals: Vec<i64> = fields
-                    .iter()
-                    .map(|(_, src)| resolve_value(src, &materialized).unwrap_or(0))
-                    .collect();
-                let vtable = descr
-                    .as_ref()
-                    .and_then(|d| d.as_size_descr())
-                    .map(|sd| sd.vtable())
-                    .unwrap_or(0);
-                let ob_type_idx = fielddescrs.iter().position(|fd| fd.offset == 0);
-                let ob_type = if vtable != 0 {
-                    vtable
-                } else {
-                    ob_type_idx
-                        .and_then(|idx| field_vals.get(idx).copied())
-                        .unwrap_or(0) as usize
-                };
-                let payload_idx = fielddescrs
-                    .iter()
-                    .position(|fd| fd.offset != 0)
-                    .or_else(|| (!field_vals.is_empty()).then_some(0));
-                let payload_src = payload_idx.and_then(|idx| fields.get(idx).map(|(_, src)| src));
-                let val_raw = payload_idx
-                    .and_then(|idx| field_vals.get(idx).copied())
-                    .unwrap_or(0);
-                // resume.py:617-621 VirtualInfo.allocate + setfields
-                let obj = if ob_type == w_float_type {
-                    pyre_object::floatobject::w_float_new(f64::from_bits(
-                        decode_recovery_float_payload_bits(
-                            val_raw,
-                            payload_src,
-                            typed,
-                            raw_values,
-                            exit_layout,
-                        ) as u64,
-                    )) as usize
-                } else if ob_type == w_int_type {
-                    pyre_object::intobject::w_int_new(decode_recovery_payload_from_source(
-                        val_raw,
-                        payload_src,
-                        typed,
-                        raw_values,
-                        exit_layout,
-                    )) as usize
-                } else if ob_type != 0 || *descr_size > 0 {
-                    // General struct: allocate + setfields using fielddescrs
-                    let size = if *descr_size > 0 { *descr_size } else { 16 };
-                    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
-                    if ob_type != 0 {
-                        unsafe { *(ptr as *mut i64) = ob_type as i64 };
-                    }
-                    // resume.py:597-602 setfields using fielddescrs
-                    for (i, &val) in field_vals.iter().enumerate() {
-                        if let Some(fd) = fielddescrs.get(i) {
-                            if fd.offset == 0 && ob_type != 0 {
-                                continue;
-                            }
-                            let addr = unsafe { ptr.add(fd.offset) };
-                            unsafe {
-                                match fd.field_type {
-                                    majit_ir::Type::Ref => std::ptr::write(addr as *mut i64, val),
-                                    majit_ir::Type::Float => {
-                                        std::ptr::write(addr as *mut u64, val as u64)
-                                    }
-                                    _ => match fd.field_size {
-                                        1 => std::ptr::write(addr, val as u8),
-                                        2 => std::ptr::write(addr as *mut u16, val as u16),
-                                        4 => std::ptr::write(addr as *mut u32, val as u32),
-                                        _ => std::ptr::write(addr as *mut i64, val),
-                                    },
-                                }
-                            }
-                        }
-                    }
-                    ptr as usize
-                } else {
-                    return false;
-                };
-                materialized.push(obj);
-            }
-            majit_backend::ExitVirtualLayout::Struct {
-                typedescr,
-                fields,
-                fielddescrs,
-                descr_size,
-                ..
-            } => {
-                let field_vals: Vec<i64> = fields
-                    .iter()
-                    .map(|(_, src)| resolve_value(src, &materialized).unwrap_or(0))
-                    .collect();
-                let vtable = typedescr
-                    .as_ref()
-                    .and_then(|d| d.as_size_descr())
-                    .map(|sd| sd.vtable())
-                    .unwrap_or(0);
-                let ob_type_idx = fielddescrs.iter().position(|fd| fd.offset == 0);
-                let ob_type = if vtable != 0 {
-                    vtable
-                } else {
-                    ob_type_idx
-                        .and_then(|idx| field_vals.get(idx).copied())
-                        .unwrap_or(0) as usize
-                };
-                let payload_idx = fielddescrs
-                    .iter()
-                    .position(|fd| fd.offset != 0)
-                    .or_else(|| (!field_vals.is_empty()).then_some(0));
-                let payload_src = payload_idx.and_then(|idx| fields.get(idx).map(|(_, src)| src));
-                let val_raw = payload_idx
-                    .and_then(|idx| field_vals.get(idx).copied())
-                    .unwrap_or(0);
-                // resume.py:617-621 VirtualInfo.allocate + setfields
-                let obj = if ob_type == w_float_type {
-                    pyre_object::floatobject::w_float_new(f64::from_bits(
-                        decode_recovery_float_payload_bits(
-                            val_raw,
-                            payload_src,
-                            typed,
-                            raw_values,
-                            exit_layout,
-                        ) as u64,
-                    )) as usize
-                } else if ob_type == w_int_type {
-                    pyre_object::intobject::w_int_new(decode_recovery_payload_from_source(
-                        val_raw,
-                        payload_src,
-                        typed,
-                        raw_values,
-                        exit_layout,
-                    )) as usize
-                } else if ob_type != 0 || *descr_size > 0 {
-                    // General struct: allocate + setfields using fielddescrs
-                    let size = if *descr_size > 0 { *descr_size } else { 16 };
-                    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
-                    if ob_type != 0 {
-                        unsafe { *(ptr as *mut i64) = ob_type as i64 };
-                    }
-                    // resume.py:597-602 setfields using fielddescrs
-                    for (i, &val) in field_vals.iter().enumerate() {
-                        if let Some(fd) = fielddescrs.get(i) {
-                            if fd.offset == 0 && ob_type != 0 {
-                                continue;
-                            }
-                            let addr = unsafe { ptr.add(fd.offset) };
-                            unsafe {
-                                match fd.field_type {
-                                    majit_ir::Type::Ref => std::ptr::write(addr as *mut i64, val),
-                                    majit_ir::Type::Float => {
-                                        std::ptr::write(addr as *mut u64, val as u64)
-                                    }
-                                    _ => match fd.field_size {
-                                        1 => std::ptr::write(addr, val as u8),
-                                        2 => std::ptr::write(addr as *mut u16, val as u16),
-                                        4 => std::ptr::write(addr as *mut u32, val as u32),
-                                        _ => std::ptr::write(addr as *mut i64, val),
-                                    },
-                                }
-                            }
-                        }
-                    }
-                    ptr as usize
-                } else {
-                    return false;
-                };
-                materialized.push(obj);
-            }
-            majit_backend::ExitVirtualLayout::Array {
-                clear, kind, items, ..
-            } => {
-                // resume.py:650-670: allocate_array(len, arraydescr, clear)
-                let arr_kind = match kind {
-                    2 => pyre_object::ArrayKind::Float,
-                    1 => pyre_object::ArrayKind::Int,
-                    _ => pyre_object::ArrayKind::Ref,
-                };
-                let array = pyre_object::allocate_array(items.len(), arr_kind, *clear);
-                for (i, src) in items.iter().enumerate() {
-                    if let Some(val) = resolve_value(src, &materialized) {
-                        // resume.py:656-670: element kind dispatch
-                        match kind {
-                            2 => pyre_object::setarrayitem_float(
-                                array,
-                                i,
-                                f64::from_bits(val as u64),
-                            ),
-                            1 => pyre_object::setarrayitem_int(array, i, val),
-                            _ => pyre_object::setarrayitem_ref(
-                                array,
-                                i,
-                                val as pyre_object::PyObjectRef,
-                            ),
-                        }
-                    }
-                }
-                // resume.py:654: return array GcRef directly
-                materialized.push(array as usize);
-            }
-            majit_backend::ExitVirtualLayout::ArrayStruct {
-                arraydescr,
-                fielddescrs,
-                element_fields,
-                ..
-            } => {
-                // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
-                let size = element_fields.len();
-                // item_size from arraydescr (RPython: self.arraydescr)
-                let item_size = arraydescr
-                    .as_ref()
-                    .and_then(|d| d.as_array_descr())
-                    .map(|ad| ad.item_size())
-                    .unwrap_or_else(|| {
-                        fielddescrs
-                            .first()
-                            .and_then(|fd| fd.as_interior_field_descr())
-                            .map(|ifd| ifd.array_descr().item_size())
-                            .unwrap_or(fielddescrs.len() * 8)
-                    });
-                let array = pyre_object::allocate_array_struct(size, item_size);
-                for (i, ef) in element_fields.iter().enumerate() {
-                    for &(field_idx, ref src) in ef.iter() {
-                        if let Some(val) = resolve_value(src, &materialized) {
-                            // resume.py:757: setinteriorfield(i, array, num, fielddescrs[j])
-                            // field_idx is the canonical position in fielddescrs
-                            if let Some(fd) = fielddescrs.get(field_idx as usize) {
-                                let (fo, fs, ft) = extract_interior_field_info(fd);
-                                pyre_object::setinteriorfield(
-                                    array, i, fo, fs, item_size, ft, val as i64,
-                                );
-                            }
-                        }
-                    }
-                }
-                materialized.push(array as usize);
-            }
-            majit_backend::ExitVirtualLayout::RawBuffer {
-                func,
-                size,
-                offsets,
-                descrs,
-                values,
-            } => {
-                // resume.py:703: buffer = decoder.allocate_raw_buffer(func, size)
-                let calldescr = majit_translate::jitcode::BhCallDescr {
-                    arg_classes: "i".into(),
-                    result_type: 'i',
-                };
-                let buffer =
-                    backend.bh_call_i(*func, Some(&[*size as i64]), None, None, &calldescr);
-                // resume.py:705-708: per-item bh_raw_store_i/f
-                for (i, src) in values.iter().enumerate() {
-                    if let Some(val) = resolve_value(src, &materialized) {
-                        let di = &descrs[i];
-                        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
-                        assert!(
-                            !bh_descr.is_array_of_pointers(),
-                            "raw buffer entry must not be pointer type"
-                        );
-                        let offset = offsets[i] as i64;
-                        if di.item_type == 2 {
-                            backend.bh_raw_store_f(
-                                buffer,
-                                offset,
-                                f64::from_bits(val as u64),
-                                &bh_descr,
-                            );
-                        } else {
-                            backend.bh_raw_store_i(buffer, offset, val, &bh_descr);
-                        }
-                    }
-                }
-                materialized.push(buffer as usize);
-            }
-            majit_backend::ExitVirtualLayout::RawSlice { offset, base } => {
-                // resume.py:723-727: base_buffer + offset
-                let base_val = resolve_value(base, &materialized).unwrap_or(0);
-                materialized.push((base_val + *offset as i64) as usize);
-            }
-        }
-    }
-
-    // resume.py:1042-1057 rebuild_from_resumedata parity:
-    // Replace Virtual(idx) frame slots with materialized pointers.
-    let mut replaced = 0usize;
-    if let Some(frame) = recovery.frames.last() {
-        for (slot_idx, src) in frame.slots.iter().enumerate() {
-            if let majit_backend::ExitValueSourceLayout::Virtual(vidx) = src {
-                if let Some(&ptr) = materialized.get(*vidx) {
-                    if slot_idx < typed.len() {
-                        typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
-                        replaced += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // [pyre-specific deviation] target_slot fallback:
-    // pyre's recovery layout merging (to_exit_recovery_layout_with_caller_prefix)
-    // can lose Virtual(vidx) markers in frame.slots during prefix insertion.
-    // When no Virtual slots are found but materialized objects exist, fall back
-    // to the target_slot field on ExitVirtualLayout to place them.
-    // RPython's resume.py does not need this because its rd_numb encoding
-    // preserves virtual markers through the entire chain. Pyre's exit layout
-    // representation differs, requiring this compensating path.
-    if replaced == 0 && !materialized.is_empty() {
-        for (vidx, vl) in recovery.virtual_layouts.iter().enumerate() {
-            let target = match vl {
-                majit_backend::ExitVirtualLayout::Object { target_slot, .. }
-                | majit_backend::ExitVirtualLayout::Struct { target_slot, .. } => *target_slot,
-                _ => None,
-            };
-            if let Some(slot_idx) = target {
-                if slot_idx < typed.len()
-                    && matches!(typed[slot_idx], Value::Ref(majit_ir::GcRef(0)))
-                {
-                    if let Some(&ptr) = materialized.get(vidx) {
-                        if ptr != 0 {
-                            typed[slot_idx] = Value::Ref(majit_ir::GcRef(ptr));
-                            replaced += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    replaced > 0 || materialized.is_empty()
-}
-
-fn decode_recovery_payload_from_source(
-    raw: i64,
-    src: Option<&majit_backend::ExitValueSourceLayout>,
-    typed: &[Value],
-    raw_values: &[i64],
-    exit_layout: &CompiledExitLayout,
-) -> i64 {
-    match src {
-        Some(majit_backend::ExitValueSourceLayout::ExitValue(_)) => {
-            maybe_unbox_known_int_ref(raw, typed, raw_values, &exit_layout.exit_types)
-        }
-        _ => raw,
-    }
-}
-
-fn decode_recovery_float_payload_bits(
-    raw: i64,
-    src: Option<&majit_backend::ExitValueSourceLayout>,
-    typed: &[Value],
-    raw_values: &[i64],
-    exit_layout: &CompiledExitLayout,
-) -> i64 {
-    match src {
-        Some(majit_backend::ExitValueSourceLayout::ExitValue(_)) => {
-            maybe_unbox_known_float_ref_bits(raw, typed, raw_values, &exit_layout.exit_types)
-        }
-        _ => raw,
-    }
-}
-
-fn maybe_unbox_known_int_ref(
-    raw: i64,
-    typed: &[Value],
-    raw_values: &[i64],
-    exit_types: &[majit_ir::Type],
-) -> i64 {
-    let obj = raw as usize as pyre_object::PyObjectRef;
-    if obj.is_null() || !raw_matches_known_ref(raw, typed, raw_values, exit_types) {
-        return raw;
-    }
-    if unsafe { pyre_object::pyobject::is_int(obj) } {
-        unsafe { pyre_object::intobject::w_int_get_value(obj) }
-    } else {
-        raw
-    }
-}
-
-fn maybe_unbox_known_float_ref_bits(
-    raw: i64,
-    typed: &[Value],
-    raw_values: &[i64],
-    exit_types: &[majit_ir::Type],
-) -> i64 {
-    let obj = raw as usize as pyre_object::PyObjectRef;
-    if obj.is_null() || !raw_matches_known_ref(raw, typed, raw_values, exit_types) {
-        return raw;
-    }
-    if unsafe { pyre_object::pyobject::is_float(obj) } {
-        unsafe { pyre_object::floatobject::w_float_get_value(obj).to_bits() as i64 }
-    } else {
-        raw
-    }
-}
-
-fn raw_matches_known_ref(
-    raw: i64,
-    typed: &[Value],
-    raw_values: &[i64],
-    exit_types: &[majit_ir::Type],
-) -> bool {
-    typed.iter().skip(3).any(|value| match value {
-        Value::Ref(gc) => gc.0 as i64 == raw,
-        _ => false,
-    }) || raw_values
-        .iter()
-        .zip(exit_types.iter())
-        .skip(3)
-        .any(|(value, tp)| matches!(tp, majit_ir::Type::Ref) && *value == raw)
 }
 
 pub(crate) fn build_jit_state(
