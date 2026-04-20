@@ -1517,7 +1517,121 @@ pub enum SomeValue {
     TypeOf(SomeTypeOf),
 }
 
+/// Discriminant-only view of [`SomeValue`]. Parity mirror of RPython's
+/// `type(s_x)` / `isinstance(s_x, SomeInteger)` pattern, which the
+/// dispatch registries (operation.py:226-239, 268-281) use as the
+/// lookup key.
+///
+/// Order matches the [`SomeValue`] variant declaration so the mapping
+/// stays in sync with the enum itself.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SomeValueTag {
+    Impossible,
+    Object,
+    Type,
+    Float,
+    SingleFloat,
+    LongFloat,
+    Integer,
+    Bool,
+    String,
+    UnicodeString,
+    ByteArray,
+    Char,
+    UnicodeCodePoint,
+    List,
+    Tuple,
+    Dict,
+    Iterator,
+    Instance,
+    Exception,
+    PBC,
+    None_,
+    Builtin,
+    BuiltinMethod,
+    WeakRef,
+    TypeOf,
+}
+
+impl SomeValueTag {
+    /// RPython `type(self_cls).__mro__` (operation.py:213-218). Returns
+    /// the dispatch-lookup walk: the tag itself first, then its parent
+    /// annotation tags up to [`SomeValueTag::Object`]. Registries use
+    /// this to emulate RPython's `@register(Some_cls)` MRO fallback.
+    pub fn mro(self) -> &'static [SomeValueTag] {
+        use SomeValueTag as T;
+        match self {
+            // Primitive number chain: SomeBool < SomeInteger < SomeFloat < SomeObject
+            // (model.py:164-242). Object is the root fallback.
+            T::Bool => &[T::Bool, T::Integer, T::Float, T::Object],
+            T::Integer => &[T::Integer, T::Float, T::Object],
+            T::Float => &[T::Float, T::Object],
+            T::SingleFloat => &[T::SingleFloat, T::Object],
+            T::LongFloat => &[T::LongFloat, T::Object],
+            // Type chain: SomeTypeOf < SomeType < SomeObject (model.py:146-149).
+            T::TypeOf => &[T::TypeOf, T::Type, T::Object],
+            T::Type => &[T::Type, T::Object],
+            // String family shares a StringCommon base upstream; dispatch
+            // is flat — each tag resolves to itself then Object.
+            T::String => &[T::String, T::Object],
+            T::UnicodeString => &[T::UnicodeString, T::Object],
+            T::ByteArray => &[T::ByteArray, T::Object],
+            T::Char => &[T::Char, T::Object],
+            T::UnicodeCodePoint => &[T::UnicodeCodePoint, T::Object],
+            T::List => &[T::List, T::Object],
+            T::Tuple => &[T::Tuple, T::Object],
+            T::Dict => &[T::Dict, T::Object],
+            T::Iterator => &[T::Iterator, T::Object],
+            T::Instance => &[T::Instance, T::Object],
+            T::Exception => &[T::Exception, T::Instance, T::Object],
+            T::PBC => &[T::PBC, T::Object],
+            T::None_ => &[T::None_, T::Object],
+            T::Builtin => &[T::Builtin, T::Object],
+            T::BuiltinMethod => &[T::BuiltinMethod, T::Object],
+            T::WeakRef => &[T::WeakRef, T::Object],
+            // SomeImpossibleValue is the lattice bottom; it still
+            // deserves an Object fallback so registries can bind
+            // catch-all defaults keyed on Object.
+            T::Impossible => &[T::Impossible, T::Object],
+            T::Object => &[T::Object],
+        }
+    }
+}
+
 impl SomeValue {
+    /// RPython `type(self)` in dispatch keys — returns a [`SomeValueTag`]
+    /// that identifies the variant without carrying any payload.
+    pub fn tag(&self) -> SomeValueTag {
+        use SomeValueTag as T;
+        match self {
+            SomeValue::Impossible => T::Impossible,
+            SomeValue::Object(_) => T::Object,
+            SomeValue::Type(_) => T::Type,
+            SomeValue::Float(_) => T::Float,
+            SomeValue::SingleFloat(_) => T::SingleFloat,
+            SomeValue::LongFloat(_) => T::LongFloat,
+            SomeValue::Integer(_) => T::Integer,
+            SomeValue::Bool(_) => T::Bool,
+            SomeValue::String(_) => T::String,
+            SomeValue::UnicodeString(_) => T::UnicodeString,
+            SomeValue::ByteArray(_) => T::ByteArray,
+            SomeValue::Char(_) => T::Char,
+            SomeValue::UnicodeCodePoint(_) => T::UnicodeCodePoint,
+            SomeValue::List(_) => T::List,
+            SomeValue::Tuple(_) => T::Tuple,
+            SomeValue::Dict(_) => T::Dict,
+            SomeValue::Iterator(_) => T::Iterator,
+            SomeValue::Instance(_) => T::Instance,
+            SomeValue::Exception(_) => T::Exception,
+            SomeValue::PBC(_) => T::PBC,
+            SomeValue::None_(_) => T::None_,
+            SomeValue::Builtin(_) => T::Builtin,
+            SomeValue::BuiltinMethod(_) => T::BuiltinMethod,
+            SomeValue::WeakRef(_) => T::WeakRef,
+            SomeValue::TypeOf(_) => T::TypeOf,
+        }
+    }
+
     /// Shorthand for [`SomeValue::Object`] with `SomeObjectBase::default()`
     /// — the upstream `SomeObject()` constructor.
     pub fn object() -> Self {

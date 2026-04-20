@@ -30,6 +30,7 @@
 //! | `specialize`      (Phase 5)   | `specialize.py`                 |
 
 pub mod argument;
+pub mod binaryop;
 pub mod bookkeeper;
 pub mod classdesc;
 pub mod context;
