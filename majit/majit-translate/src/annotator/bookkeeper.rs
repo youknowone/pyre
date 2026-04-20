@@ -131,6 +131,13 @@ pub struct Bookkeeper {
     pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
     pub emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
+    /// RPython `hasattr(self, 'position_key')` (bookkeeper.py:99).
+    ///
+    /// Upstream distinguishes "no position entered" (attribute absent)
+    /// from "entered with position_key = None" (attribute present but
+    /// None). Rust carries [`Self::position_key`] as `Option<_>` in both
+    /// cases, so this flag tracks the enter/leave invariant explicitly.
+    pub position_entered: std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -205,6 +212,7 @@ impl Bookkeeper {
                 Rc::new(RefCell::new(CallFamily::new(*desc)))
             })),
             emulated_pbc_calls: RefCell::new(HashMap::new()),
+            position_entered: std::cell::Cell::new(false),
         }
     }
 
@@ -221,6 +229,68 @@ impl Bookkeeper {
     /// `self.position_key = None`).
     pub fn current_position_key(&self) -> Option<PositionKey> {
         *self.position_key.borrow()
+    }
+
+    /// RPython `Bookkeeper.enter(self, position_key)` (bookkeeper.py:84-89).
+    ///
+    /// Installs the position and registers `self` as the thread-local
+    /// bookkeeper so [`getbookkeeper`] returns it. Asserts that no
+    /// `enter` is currently active — matches upstream's `not hasattr`
+    /// check.
+    pub fn enter(self: &Rc<Self>, position_key: Option<PositionKey>) {
+        assert!(!self.position_entered.get(), "don't call enter() nestedly");
+        self.position_entered.set(true);
+        self.position_key.replace(position_key);
+        TLS_BOOKKEEPER.with(|cell| {
+            *cell.borrow_mut() = Some(Rc::clone(self));
+        });
+    }
+
+    /// RPython `Bookkeeper.leave(self)` (bookkeeper.py:91-94).
+    ///
+    /// Clears both the position slot and the thread-local bookkeeper
+    /// hook. Safe to call only after a matching [`Self::enter`].
+    pub fn leave(&self) {
+        self.position_entered.set(false);
+        self.position_key.replace(None);
+        TLS_BOOKKEEPER.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+
+    /// RPython `Bookkeeper.at_position(self, pos)` (bookkeeper.py:96-106).
+    ///
+    /// RAII port of the upstream `@contextmanager`. The `pos=None`
+    /// fast-path (line 99-101) short-circuits the enter/leave pair when
+    /// the bookkeeper is already inside a reflow frame — used by
+    /// `compute_at_fixpoint` to let nested callers reuse the ambient
+    /// position.
+    pub fn at_position(self: &Rc<Self>, pos: Option<PositionKey>) -> PositionGuard {
+        if self.position_entered.get() && pos.is_none() {
+            // Upstream: `if hasattr(self, 'position_key') and pos is None: yield; return`
+            PositionGuard {
+                bk: Rc::clone(self),
+                skip_leave: true,
+            }
+        } else {
+            self.enter(pos);
+            PositionGuard {
+                bk: Rc::clone(self),
+                skip_leave: false,
+            }
+        }
+    }
+
+    /// RPython `Bookkeeper.valueoftype(self, t)` (bookkeeper.py:444-445).
+    ///
+    /// Thin wrapper around [`crate::annotator::signature::annotationoftype`]
+    /// used by `binaryop.is_` and the PBC-call site machinery to seed
+    /// annotations for type-level constants.
+    pub fn valueoftype(
+        self: &Rc<Self>,
+        spec: &crate::annotator::signature::AnnotationSpec,
+    ) -> Result<SomeValue, crate::annotator::signature::SignatureError> {
+        crate::annotator::signature::annotationoftype(spec, Some(self))
     }
 
     /// RPython `Bookkeeper.getlistdef(**flags_if_new)` (bookkeeper.py:178-185).
@@ -871,6 +941,50 @@ impl Default for Bookkeeper {
     }
 }
 
+thread_local! {
+    /// RPython `TLS.bookkeeper` (bookkeeper.py:89). Set by
+    /// [`Bookkeeper::enter`] and cleared by [`Bookkeeper::leave`];
+    /// read by [`getbookkeeper`] + [`immutablevalue`] module-level
+    /// helpers used from `binaryop.py` / `unaryop.py`.
+    static TLS_BOOKKEEPER: RefCell<Option<Rc<Bookkeeper>>> = const { RefCell::new(None) };
+}
+
+/// RPython `getbookkeeper()` free function (bookkeeper.py:605-611).
+///
+/// Returns the thread-local bookkeeper installed by the most recent
+/// [`Bookkeeper::enter`] call — `None` outside an active reflow frame.
+pub fn getbookkeeper() -> Option<Rc<Bookkeeper>> {
+    TLS_BOOKKEEPER.with(|cell| cell.borrow().clone())
+}
+
+/// RPython `immutablevalue(x)` free function (bookkeeper.py:613-614).
+///
+/// Delegates to [`Bookkeeper::immutablevalue`] on the thread-local
+/// bookkeeper. Panics when called without a live bookkeeper — upstream
+/// raises `AttributeError: 'NoneType' object has no attribute
+/// 'immutablevalue'` in the same situation.
+pub fn immutablevalue(x: &ConstValue) -> Result<SomeValue, AnnotatorError> {
+    let bk = getbookkeeper().expect("immutablevalue() called without an active bookkeeper");
+    bk.immutablevalue(x)
+}
+
+/// RAII guard returned by [`Bookkeeper::at_position`]. Mirrors the
+/// upstream `@contextmanager` exit — calls [`Bookkeeper::leave`] on
+/// drop unless the fast-path at bookkeeper.py:99-101 skipped the
+/// initial enter.
+pub struct PositionGuard {
+    bk: Rc<Bookkeeper>,
+    skip_leave: bool,
+}
+
+impl Drop for PositionGuard {
+    fn drop(&mut self) {
+        if !self.skip_leave {
+            self.bk.leave();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,5 +1401,76 @@ mod tests {
         let a = bk.getdesc(&host).unwrap();
         let b = bk.getdesc(&host).unwrap();
         assert_eq!(a.desc_key(), b.desc_key());
+    }
+
+    #[test]
+    fn enter_leave_registers_tls() {
+        let bk = bk();
+        assert!(getbookkeeper().is_none());
+        bk.enter(Some(PositionKey::new(1, 1, 0)));
+        assert!(getbookkeeper().is_some());
+        assert!(bk.position_entered.get());
+        assert_eq!(bk.current_position_key(), Some(PositionKey::new(1, 1, 0)));
+        bk.leave();
+        assert!(getbookkeeper().is_none());
+        assert!(!bk.position_entered.get());
+        assert!(bk.current_position_key().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "don't call enter() nestedly")]
+    fn enter_twice_panics() {
+        let bk = bk();
+        bk.enter(Some(PositionKey::new(1, 1, 0)));
+        // Second enter without leave — matches upstream's `assert not hasattr`.
+        bk.enter(Some(PositionKey::new(2, 2, 0)));
+    }
+
+    #[test]
+    fn at_position_raii_enters_and_leaves() {
+        let bk = bk();
+        {
+            let _guard = bk.at_position(Some(PositionKey::new(3, 4, 0)));
+            assert!(bk.position_entered.get());
+            assert!(getbookkeeper().is_some());
+        }
+        assert!(!bk.position_entered.get());
+        assert!(getbookkeeper().is_none());
+    }
+
+    #[test]
+    fn at_position_none_fast_path_skips_when_entered() {
+        let bk = bk();
+        bk.enter(Some(PositionKey::new(5, 5, 0)));
+        {
+            // Upstream fast-path: hasattr(self, 'position_key') and pos is None
+            let _guard = bk.at_position(None);
+            assert!(bk.position_entered.get(), "outer enter stays active");
+            // Fast-path does not clobber position.
+            assert_eq!(bk.current_position_key(), Some(PositionKey::new(5, 5, 0)));
+        }
+        // Guard drop must NOT leave because we skipped the enter.
+        assert!(bk.position_entered.get());
+        bk.leave();
+    }
+
+    #[test]
+    fn valueoftype_delegates_to_annotationoftype() {
+        use crate::annotator::signature::AnnotationSpec;
+        let bk = bk();
+        let bool_ann = bk.valueoftype(&AnnotationSpec::Bool).unwrap();
+        assert!(matches!(bool_ann, SomeValue::Bool(_)));
+        let int_ann = bk.valueoftype(&AnnotationSpec::Int).unwrap();
+        assert!(matches!(int_ann, SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn immutablevalue_free_function_uses_tls() {
+        use crate::flowspace::model::ConstValue;
+        let bk = bk();
+        bk.enter(Some(PositionKey::new(1, 1, 0)));
+        let s = immutablevalue(&ConstValue::Bool(true)).unwrap();
+        assert!(matches!(s, SomeValue::Bool(_)));
+        bk.leave();
     }
 }
