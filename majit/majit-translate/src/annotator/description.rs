@@ -240,7 +240,7 @@ impl FrozenAttrFamily {
             self.descs.insert(*k, *v);
         }
         for (k, v) in &other.read_locations {
-            self.read_locations.insert(*k, *v);
+            self.read_locations.insert(k.clone(), *v);
         }
         for (k, v) in &other.attrs {
             self.attrs.insert(k.clone(), v.clone());
@@ -310,7 +310,7 @@ impl ClassAttrFamily {
             self.descs.insert(*k, *v);
         }
         for (k, v) in &other.read_locations {
-            self.read_locations.insert(*k, *v);
+            self.read_locations.insert(k.clone(), *v);
         }
         self.s_value = union(&self.s_value, &other.s_value)?;
         Ok(())

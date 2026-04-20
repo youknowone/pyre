@@ -61,6 +61,14 @@ pub struct RPythonAnnotator {
     /// Rust port models the two non-absent states as
     /// `Option<GraphRef>`: `None = False`, `Some = graph`.
     pub annotated: RefCell<HashMap<BlockKey, Option<GraphRef>>>,
+    /// Rust-side identity→BlockRef index. Upstream's `self.annotated`
+    /// dict keys ARE the Python `Block` objects, so iterating the dict
+    /// yields block references directly. The Rust `BlockKey` identity
+    /// indirection loses that, so we maintain this parallel map —
+    /// populated in lockstep with every `annotated.insert` and
+    /// `blocked_blocks.insert` — to let `call_sites()` walk "all seen
+    /// blocks" without hunting through auxiliary tables.
+    pub all_blocks: RefCell<HashMap<BlockKey, BlockRef>>,
     /// RPython `self.added_blocks = None` (annrpython.py:38).
     ///
     /// Upstream sentinel: `None = track nothing`, `{} = start
@@ -153,7 +161,7 @@ impl std::fmt::Debug for BlockedInference {
 
 impl std::fmt::Display for BlockedInference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.break_at {
+        match &self.break_at {
             Some(pk) => write!(
                 f,
                 "<BlockedInference break_at graph={} block={} op={} [{:?}]>",
@@ -184,6 +192,77 @@ enum OpLoopOutcome {
     /// upstream `else: raise` — processblock records the block in
     /// `blocked_blocks`.
     Blocked(BlockedInference),
+}
+
+/// The three exception classes `flowin` (annrpython.py:488-537)
+/// catches during the op loop, ported as a Rust `Result` error type
+/// so the loop can dispatch without `panic!` / `catch_unwind`.
+///
+/// Upstream structure:
+/// ```python
+/// try:
+///     ...
+/// except BlockedInference as e:
+///     ...
+/// except HarmlesslyBlocked:
+///     return
+/// except AnnotatorError as e:
+///     e.source = gather_error(self, graph, block, i)
+///     if self.keepgoing:
+///         self.errors.append(e)
+///         self.failed_blocks.add(block)
+///         return
+///     raise
+/// ```
+pub enum FlowinError {
+    /// upstream `BlockedInference` — transient block, retry later.
+    Blocked(BlockedInference),
+    /// upstream `annmodel.HarmlesslyBlocked` — swallow, return.
+    Harmless(crate::annotator::model::HarmlesslyBlocked),
+    /// upstream `annmodel.AnnotatorError` (incl. `UnionError`) —
+    /// route through gather_error + keepgoing.
+    Annotator(crate::annotator::model::AnnotatorError),
+}
+
+impl From<BlockedInference> for FlowinError {
+    fn from(e: BlockedInference) -> Self {
+        FlowinError::Blocked(e)
+    }
+}
+
+impl From<crate::annotator::model::HarmlesslyBlocked> for FlowinError {
+    fn from(e: crate::annotator::model::HarmlesslyBlocked) -> Self {
+        FlowinError::Harmless(e)
+    }
+}
+
+impl From<crate::annotator::model::AnnotatorError> for FlowinError {
+    fn from(e: crate::annotator::model::AnnotatorError) -> Self {
+        FlowinError::Annotator(e)
+    }
+}
+
+/// RPython `gather_error(self, graph, block, i)` (annrpython.py:~10,
+/// imported from `rpython/annotator/model.py` area). Upstream joins
+/// `source_lines(graph, block, i, long=True)` with newlines; the Rust
+/// port stubs `source_lines` to a diagnostic string. Wired in so the
+/// `except AnnotatorError` path in `flowin_op_loop` has the upstream
+/// control flow.
+pub fn gather_error(
+    _ann: &RPythonAnnotator,
+    graph: &GraphRef,
+    block: &BlockRef,
+    i: usize,
+) -> String {
+    // TODO: port `source_lines(graph, block, i, long=True)` once
+    // flowspace carries enough provenance. For now emit a compact
+    // location string so errors[] has a useful breadcrumb.
+    format!(
+        "source at graph={:?} block={:?} op#{}",
+        graph.borrow().name,
+        BlockKey::of(block),
+        i
+    )
 }
 
 /// RAII guard returned by [`RPythonAnnotator::using_policy`] — mirrors
@@ -226,22 +305,31 @@ impl RPythonAnnotator {
         // upstream annrpython.py:30-34 — default to a fresh
         // TranslationContext when caller passes None.
         let translator = translator.unwrap_or_else(TranslationContext::new);
-        Rc::new(RPythonAnnotator {
-            translator: RefCell::new(translator),
-            genpendingblocks: RefCell::new(vec![HashMap::new()]),
-            annotated: RefCell::new(HashMap::new()),
-            added_blocks: RefCell::new(None),
-            links_followed: RefCell::new(HashSet::new()),
-            notify: RefCell::new(HashMap::new()),
-            fixed_graphs: RefCell::new(HashMap::new()),
-            blocked_blocks: RefCell::new(HashMap::new()),
-            blocked_graphs: RefCell::new(HashMap::new()),
-            frozen: RefCell::new(false),
-            policy: RefCell::new(policy),
-            bookkeeper,
-            keepgoing,
-            failed_blocks: RefCell::new(HashMap::new()),
-            errors: RefCell::new(Vec::new()),
+        // Upstream `Bookkeeper.__init__(self, annotator)` stores
+        // `self.annotator = annotator` — the reverse reference. Rust
+        // uses `Rc::new_cyclic` so the bookkeeper's `Weak<RPythonAnnotator>`
+        // field can be installed with the final `Rc<Self>` before any
+        // caller observes it.
+        Rc::new_cyclic(|weak: &std::rc::Weak<Self>| {
+            bookkeeper.set_annotator(weak.clone());
+            RPythonAnnotator {
+                translator: RefCell::new(translator),
+                genpendingblocks: RefCell::new(vec![HashMap::new()]),
+                annotated: RefCell::new(HashMap::new()),
+                all_blocks: RefCell::new(HashMap::new()),
+                added_blocks: RefCell::new(None),
+                links_followed: RefCell::new(HashSet::new()),
+                notify: RefCell::new(HashMap::new()),
+                fixed_graphs: RefCell::new(HashMap::new()),
+                blocked_blocks: RefCell::new(HashMap::new()),
+                blocked_graphs: RefCell::new(HashMap::new()),
+                frozen: RefCell::new(false),
+                policy: RefCell::new(policy),
+                bookkeeper: Rc::clone(&bookkeeper),
+                keepgoing,
+                failed_blocks: RefCell::new(HashMap::new()),
+                errors: RefCell::new(Vec::new()),
+            }
         })
     }
 
@@ -461,9 +549,12 @@ impl RPythonAnnotator {
                 .update_call_graph(&parent_graph, graph, tag);
             // upstream: `returnpositions = self.notify.setdefault(graph.returnblock, set())`
             let returnblock = graph.borrow().returnblock.clone();
-            let pk = PositionKey::new(
-                GraphKey::of(&parent_graph).as_usize(),
-                BlockKey::of(&parent_block).as_usize(),
+            // upstream: `position_key = (parent_graph, parent_block,
+            // parent_index)`. Use `from_refs` so the weak Graph/Block
+            // refs are retained for downstream consumers (reflowfromposition).
+            let pk = super::bookkeeper::PositionKey::from_refs(
+                &parent_graph,
+                &parent_block,
                 parent_index,
             );
             self.notify
@@ -544,18 +635,13 @@ impl RPythonAnnotator {
         let mut out = Vec::new();
         let added = self.added_blocks.borrow();
         let blocks: Vec<BlockRef> = match added.as_ref() {
+            // upstream: `newblocks = self.added_blocks` (dict/set of Blocks).
             Some(set) => set.values().cloned().collect(),
-            None => self
-                .annotated
-                .borrow()
-                .keys()
-                .filter_map(|k| {
-                    self.blocked_blocks
-                        .borrow()
-                        .get(k)
-                        .map(|(b, _, _)| Rc::clone(b))
-                })
-                .collect(),
+            // upstream: `newblocks = self.annotated  # all of them`.
+            // Iterating a Python dict yields keys (Block objects). The
+            // Rust port keeps an `all_blocks: BlockKey -> BlockRef`
+            // parallel index so every seen block is reachable here.
+            None => self.all_blocks.borrow().values().cloned().collect(),
         };
         drop(added);
         for block in blocks {
@@ -1003,6 +1089,9 @@ impl RPythonAnnotator {
             "reflowpendingblock: block not yet annotated"
         );
         self.annotated.borrow_mut().insert(bkey.clone(), None);
+        self.all_blocks
+            .borrow_mut()
+            .insert(bkey.clone(), Rc::clone(block));
         self.blocked_blocks
             .borrow_mut()
             .insert(bkey, (Rc::clone(block), Rc::clone(graph), None));
@@ -1340,6 +1429,9 @@ impl RPythonAnnotator {
         }
         let bkey = BlockKey::of(block);
         self.annotated.borrow_mut().insert(bkey.clone(), None);
+        self.all_blocks
+            .borrow_mut()
+            .insert(bkey.clone(), Rc::clone(block));
         self.blocked_blocks
             .borrow_mut()
             .insert(bkey, (Rc::clone(block), Rc::clone(graph), None));
@@ -1420,25 +1512,30 @@ impl RPythonAnnotator {
     ///     self.setbinding(op.result, resultcell)
     /// ```
     ///
-    /// Rust returns the result cell (or [`BlockedInference`] on block).
-    /// The caller owns the block borrow and is responsible for writing
-    /// the binding into `op.result` (which lives behind a `RefCell` on
-    /// the block).
+    /// Rust returns the result cell (or [`FlowinError`] on block /
+    /// harmless swallow / annotator error). The caller owns the block
+    /// borrow and is responsible for writing the binding into
+    /// `op.result` (which lives behind a `RefCell` on the block).
     pub fn consider_op(
         &self,
         hlop: &super::super::flowspace::operation::HLOperation,
-    ) -> Result<SomeValue, BlockedInference> {
+    ) -> Result<SomeValue, FlowinError> {
         // upstream: any arg whose annotation is SomeImpossibleValue
         // means the op cannot run — block.
         for arg in &hlop.args {
             if matches!(self.annotation(arg), Some(SomeValue::Impossible)) {
-                return Err(BlockedInference::new(self, hlop.clone(), None));
+                return Err(BlockedInference::new(self, hlop.clone(), None).into());
             }
         }
+        // TODO: `hlop.consider(self)` currently panics on the upstream
+        // `raise AnnotatorError(...)` paths; migrating consider()
+        // itself to `Result<_, AnnotatorError>` is a separate port.
+        // Once that lands, propagate via `?` here; the `FlowinError`
+        // wrapper already covers the downstream variant.
         let resultcell = hlop.consider(self);
         // upstream: None → s_ImpossibleValue; s_ImpossibleValue → block.
         if matches!(resultcell, SomeValue::Impossible) {
-            return Err(BlockedInference::new(self, hlop.clone(), None));
+            return Err(BlockedInference::new(self, hlop.clone(), None).into());
         }
         Ok(resultcell)
     }
@@ -1510,11 +1607,10 @@ impl RPythonAnnotator {
         // mutates the list under the loop pointer.
         while i < block.borrow().operations.len() {
             // upstream: `with self.bookkeeper.at_position((graph, block, i)):`
-            let pk = PositionKey::new(
-                GraphKey::of(graph).as_usize(),
-                BlockKey::of(block).as_usize(),
-                i,
-            );
+            // Upstream's 3-tuple carries the real graph/block refs; use
+            // `from_refs` so `PositionKey::graph()` / `block()` can
+            // upgrade them back (reflowfromposition consumes these).
+            let pk = super::bookkeeper::PositionKey::from_refs(graph, block, i);
             let _pg = self.bookkeeper.at_position(Some(pk));
 
             // Reify `SpaceOperation` (Block storage) into an
@@ -1610,7 +1706,7 @@ impl RPythonAnnotator {
             // Hand off to consider_op.
             let result_cell = match self.consider_op(&hlop) {
                 Ok(sv) => sv,
-                Err(mut e) => {
+                Err(FlowinError::Blocked(mut e)) => {
                     // upstream flowin:504-526 — BlockedInference handling.
                     // Decide whether the blocked op is the block's
                     // raising_op (in which case exits-side proceeds with
@@ -1635,6 +1731,32 @@ impl RPythonAnnotator {
                             return OpLoopOutcome::Blocked(e);
                         }
                     }
+                }
+                Err(FlowinError::Harmless(_)) => {
+                    // upstream: `except annmodel.HarmlesslyBlocked: return`.
+                    return OpLoopOutcome::HarmlesslySwallowed;
+                }
+                Err(FlowinError::Annotator(mut e)) => {
+                    // upstream annrpython.py:531-537:
+                    //     except annmodel.AnnotatorError as e:
+                    //         e.source = gather_error(self, graph, block, i)
+                    //         if self.keepgoing:
+                    //             self.errors.append(e)
+                    //             self.failed_blocks.add(block)
+                    //             return
+                    //         raise
+                    e.source = Some(gather_error(self, graph, block, i));
+                    if self.keepgoing {
+                        self.errors.borrow_mut().push(format!("{e}"));
+                        self.failed_blocks
+                            .borrow_mut()
+                            .insert(BlockKey::of(block), Rc::clone(block));
+                        return OpLoopOutcome::HarmlesslySwallowed;
+                    }
+                    // upstream `raise` — no keepgoing safety net. Panic
+                    // with a structured message until the outer
+                    // AnnotatorError propagation lands.
+                    panic!("AnnotatorError (keepgoing off): {e}");
                 }
             };
 
@@ -1889,6 +2011,9 @@ impl RPythonAnnotator {
         self.annotated
             .borrow_mut()
             .insert(bkey.clone(), Some(Rc::clone(graph)));
+        self.all_blocks
+            .borrow_mut()
+            .insert(bkey.clone(), Rc::clone(block));
         // upstream: `if block in self.failed_blocks: return`.
         if self.failed_blocks.borrow().contains_key(&bkey) {
             return;
@@ -2289,5 +2414,156 @@ mod tests {
         drop(pending);
         let blocked = ann.blocked_blocks.borrow();
         assert!(blocked.contains_key(&bkey));
+    }
+
+    // ------------------------------------------------------------------
+    // Dispatch::None consider() — upstream operation.py:534-565.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn consider_newtuple_builds_sometuple_from_args() {
+        // NewTuple.consider returns SomeTuple(items=[annotator.annotation(a)
+        // for a in args]).  Bind two args to SomeInteger / s_str0 and
+        // confirm the Tuple carries both.
+        use super::super::super::flowspace::operation::{HLOperation, OpKind};
+        use super::super::model::s_str0;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("nt", 2);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::Integer(SomeInteger::default()));
+            }
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[1] {
+                ann.setbinding(v, s_str0());
+            }
+        }
+        let blk = startblock.borrow();
+        let args = blk.inputargs.clone();
+        drop(blk);
+        let hlop = HLOperation::new(OpKind::NewTuple, args);
+        let got = hlop.consider(&ann);
+        if let SomeValue::Tuple(t) = got {
+            assert_eq!(t.items.len(), 2);
+            assert!(matches!(t.items[0], SomeValue::Integer(_)));
+            assert!(matches!(t.items[1], SomeValue::String(_)));
+        } else {
+            panic!("expected SomeValue::Tuple, got {:?}", got);
+        }
+    }
+
+    #[test]
+    fn consider_newlist_routes_through_bookkeeper_newlist() {
+        // NewList.consider defers to bookkeeper.newlist(*args_s); with
+        // a single SomeInteger arg the returned ListDef.s_value must be
+        // SomeInteger.
+        use super::super::super::flowspace::operation::{HLOperation, OpKind};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("nl", 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::Integer(SomeInteger::default()));
+            }
+        }
+        let args = startblock.borrow().inputargs.clone();
+        let hlop = HLOperation::new(OpKind::NewList, args);
+        let got = hlop.consider(&ann);
+        if let SomeValue::List(list) = got {
+            assert!(matches!(list.listdef.s_value(), SomeValue::Integer(_)));
+        } else {
+            panic!("expected SomeValue::List, got {:?}", got);
+        }
+    }
+
+    #[test]
+    fn consider_newdict_returns_empty_somedict() {
+        // NewDict.consider returns bookkeeper.newdict(), an empty dict
+        // whose s_key/s_value start as Impossible (DictDef default).
+        use super::super::super::flowspace::operation::{HLOperation, OpKind};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let hlop = HLOperation::new(OpKind::NewDict, vec![]);
+        let got = hlop.consider(&ann);
+        assert!(matches!(got, SomeValue::Dict(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot use extended slicing in rpython")]
+    fn consider_newslice_raises_annotator_error() {
+        // NewSlice.consider always raises AnnotatorError.
+        use super::super::super::flowspace::operation::{HLOperation, OpKind};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let hlop = HLOperation::new(OpKind::NewSlice, vec![]);
+        let _ = hlop.consider(&ann);
+    }
+
+    // ------------------------------------------------------------------
+    // gather_error / keepgoing — upstream annrpython.py:531-537.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn gather_error_returns_location_string() {
+        // gather_error is a stub that formats a graph/block/op location
+        // breadcrumb; make sure it at least contains the op index.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("gather", 0);
+        let startblock = graph.borrow().startblock.clone();
+        let msg = gather_error(&ann, &graph, &startblock, 3);
+        assert!(msg.contains("op#3"), "got {msg:?}");
+        assert!(msg.contains("gather"), "got {msg:?}");
+    }
+
+    #[test]
+    fn position_key_from_refs_upgrades_graph_and_block() {
+        // Priority #4: PositionKey carries Weak refs to
+        // FunctionGraph / Block so `reflowfromposition` can recover
+        // them. The synthetic `PositionKey::new` path leaves the refs
+        // dangling.
+        let graph = mk_graph("pkrefs", 0);
+        let startblock = graph.borrow().startblock.clone();
+        let pk = super::super::bookkeeper::PositionKey::from_refs(&graph, &startblock, 7);
+        let g = pk.graph().expect("graph weak ref should upgrade");
+        assert!(Rc::ptr_eq(&g, &graph));
+        let b = pk.block().expect("block weak ref should upgrade");
+        assert!(Rc::ptr_eq(&b, &startblock));
+        assert_eq!(pk.op_index, 7);
+
+        // Synthetic constructor leaves refs dangling.
+        let pk2 = super::super::bookkeeper::PositionKey::new(1, 2, 3);
+        assert!(pk2.graph().is_none());
+        assert!(pk2.block().is_none());
+    }
+
+    #[test]
+    fn position_key_equality_on_identity_hashes() {
+        // Two PositionKey values from the same Rc<FunctionGraph> /
+        // Rc<Block> must compare equal regardless of how they were
+        // constructed — matches Python tuple identity via `id()`.
+        let graph = mk_graph("eq", 0);
+        let startblock = graph.borrow().startblock.clone();
+        let pk_a = super::super::bookkeeper::PositionKey::from_refs(&graph, &startblock, 0);
+        let pk_b = super::super::bookkeeper::PositionKey::from_refs(&graph, &startblock, 0);
+        assert_eq!(pk_a, pk_b);
+        // Different op_index → not equal.
+        let pk_c = super::super::bookkeeper::PositionKey::from_refs(&graph, &startblock, 1);
+        assert_ne!(pk_a, pk_c);
+    }
+
+    #[test]
+    fn flowin_error_variants_convert_from() {
+        // From impls on FlowinError matter because consider_op uses
+        // `?` on all three upstream exception classes.
+        use super::super::super::flowspace::operation::{HLOperation, OpKind};
+        use super::super::model::{AnnotatorError, HarmlesslyBlocked};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let hlop = HLOperation::new(OpKind::NewDict, vec![]);
+        let blocked: FlowinError = BlockedInference::new(&ann, hlop, None).into();
+        assert!(matches!(blocked, FlowinError::Blocked(_)));
+        let harmless: FlowinError = HarmlesslyBlocked.into();
+        assert!(matches!(harmless, FlowinError::Harmless(_)));
+        let annerr: FlowinError = AnnotatorError::new("oops").into();
+        assert!(matches!(annerr, FlowinError::Annotator(_)));
     }
 }

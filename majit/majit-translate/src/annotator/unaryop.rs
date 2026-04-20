@@ -1056,7 +1056,7 @@ fn dict_is_empty(
     s_dct: &super::model::SomeDict,
     position: Option<super::bookkeeper::PositionKey>,
 ) -> bool {
-    let s_key = s_dct.dictdef.read_key(position);
+    let s_key = s_dct.dictdef.read_key(position.clone());
     let s_value = s_dct.dictdef.read_value(position);
     matches!(s_key, SomeValue::Impossible) || matches!(s_value, SomeValue::Impossible)
 }

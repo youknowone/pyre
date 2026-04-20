@@ -634,10 +634,10 @@ impl ListDef {
         // reflow frame this is `None`; Python dict/set keys accept it,
         // so the Rust port passes the Option through.
         let position = bookkeeper.current_position_key();
-        let s_self_value = self.read_item(position);
+        let s_self_value = self.read_item(position.clone());
         let mut s_other_values: Vec<SomeValue> = Vec::with_capacity(others.len());
         for other in others {
-            s_other_values.push(other.read_item(position));
+            s_other_values.push(other.read_item(position.clone()));
         }
         // upstream: `bookkeeper.newlist(s_self_value, *s_other_values)`.
         let mut all_values = Vec::with_capacity(1 + s_other_values.len());
@@ -683,7 +683,7 @@ impl ListDef {
     /// frame active) flows through unchanged.
     pub fn agree(&self, bookkeeper: &Bookkeeper, other: &ListDef) -> Result<(), UnionError> {
         let position = bookkeeper.current_position_key();
-        let s_self_value = self.read_item(position);
+        let s_self_value = self.read_item(position.clone());
         let s_other_value = other.read_item(position);
         self.generalize(&s_other_value)?;
         other.generalize(&s_self_value)?;

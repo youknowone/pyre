@@ -1598,11 +1598,40 @@ impl HLOperation {
                 })
             }
             Dispatch::None => {
-                // operation.py:66-116 — per-class `consider()` overrides
-                // on explicit subclasses (NewDict / NewTuple / NewList /
-                // Pow / SimpleCall / CallArgs / Contains / …). Land with
-                // their own commits.
-                todo!("consider: Dispatch::None special cases land with their own commits")
+                // operation.py:534-565 — per-class `consider()`
+                // overrides on explicit `Dispatch::None` subclasses.
+                // NewDict / NewTuple / NewList / NewSlice each override
+                // consider directly; the rest (Pow / Format / Trunc /
+                // Index / InplacePow / DivMod / Get / Set / Delete /
+                // UserDel / Buffer / Yield) are `PureOperation` or
+                // unregistered HLOperation subclasses that either
+                // constfold before reaching the annotator or are not
+                // exercised by valid RPython inputs — panic with an
+                // `AnnotatorError`-style message to surface the gap.
+                use crate::annotator::model::{SomeTuple as AnSomeTuple, SomeValue};
+                match self.kind {
+                    // operation.py:534-539 — NewDict.consider.
+                    OpKind::NewDict => SomeValue::Dict(annotator.bookkeeper.newdict()),
+                    // operation.py:542-548 — NewTuple.consider.
+                    OpKind::NewTuple => SomeValue::Tuple(AnSomeTuple::new(args_s)),
+                    // operation.py:551-557 — NewList.consider.
+                    OpKind::NewList => {
+                        let list = annotator
+                            .bookkeeper
+                            .newlist(&args_s, None)
+                            .unwrap_or_else(|e| panic!("NewList.consider failed: {}", e));
+                        SomeValue::List(list)
+                    }
+                    // operation.py:560-565 — NewSlice.consider raises
+                    // AnnotatorError outright.
+                    OpKind::NewSlice => {
+                        panic!("AnnotatorError: Cannot use extended slicing in rpython")
+                    }
+                    // Unregistered HLOperation subclasses with
+                    // `dispatch=None`. Upstream expects these to have
+                    // been constfolded. Surface the gap clearly.
+                    _ => panic!("consider: no Dispatch::None override for {:?}", self.kind),
+                }
             }
         }
     }

@@ -25,7 +25,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use super::argument::simple_args;
 use super::classdesc::{ClassDef, ClassDesc};
@@ -42,7 +42,7 @@ use super::model::{
 use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
-use crate::flowspace::model::{ConstValue, Constant, HostObject};
+use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphRef, HostObject};
 use crate::tool::algo::unionfind::UnionFind;
 
 /// RPython `bookkeeper.position_key` (bookkeeper.py:147) — the tuple
@@ -59,10 +59,21 @@ use crate::tool::algo::unionfind::UnionFind;
 ///     |= other.read_locations` can merge without loss.
 ///
 /// Callers obtain the identity hashes via
-/// `Rc::as_ptr(&graph) as usize` / `Rc::as_ptr(&block) as usize`.
-/// Full bookkeeper.py port replaces the first two fields with real
-/// `Weak<FunctionGraph>` / `Weak<RefCell<Block>>` refs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// `Rc::as_ptr(&graph) as usize` / `Rc::as_ptr(&block) as usize`. The
+/// `graph_ref` / `block_ref` slots carry the actual `Weak` refs when
+/// production code constructs the key via [`Self::from_refs`];
+/// upstream `reflowfromposition(position_key)` unpacks `graph, block,
+/// index = position_key` and needs those references back.
+///
+/// Test constructors use [`Self::new`] and leave the weak slots
+/// dangling — downstream consumers that need the graph/block refs
+/// detect this via `Weak::upgrade()` returning `None`.
+///
+/// Hash / Eq always use the three integer identities, so synthetic
+/// test keys and production keys with equal hashes are
+/// indistinguishable (mirroring upstream's Python tuple equality via
+/// `id()`).
+#[derive(Clone, Debug)]
 pub struct PositionKey {
     /// Identity hash of the enclosing `FunctionGraph` — upstream
     /// `position_key[0]`.
@@ -72,20 +83,86 @@ pub struct PositionKey {
     pub block_id: usize,
     /// Operation index inside the block — upstream `position_key[2]`.
     pub op_index: usize,
+    /// Weak reference to the enclosing `FunctionGraph`. Populated by
+    /// [`Self::from_refs`]; `None` for test-only synthetic keys.
+    pub graph_ref:
+        Option<std::rc::Weak<std::cell::RefCell<crate::flowspace::model::FunctionGraph>>>,
+    /// Weak reference to the enclosing `Block`. Populated by
+    /// [`Self::from_refs`]; `None` for test-only synthetic keys.
+    pub block_ref: Option<std::rc::Weak<std::cell::RefCell<crate::flowspace::model::Block>>>,
+}
+
+impl PartialEq for PositionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.graph_id == other.graph_id
+            && self.block_id == other.block_id
+            && self.op_index == other.op_index
+    }
+}
+
+impl Eq for PositionKey {}
+
+impl std::hash::Hash for PositionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.graph_id.hash(state);
+        self.block_id.hash(state);
+        self.op_index.hash(state);
+    }
 }
 
 impl PositionKey {
+    /// Synthetic constructor — test-only. Fills the identity triple
+    /// directly and leaves the Weak refs empty.
     pub fn new(graph_id: usize, block_id: usize, op_index: usize) -> Self {
         PositionKey {
             graph_id,
             block_id,
             op_index,
+            graph_ref: None,
+            block_ref: None,
         }
+    }
+
+    /// Production constructor — derives the identity hashes from
+    /// `Rc::as_ptr` (matches upstream's Python tuple identity via
+    /// `id()`), and retains `Weak` refs so consumers like
+    /// `reflowfromposition` can upgrade back to the live
+    /// `FunctionGraph` / `Block`.
+    pub fn from_refs(graph: &GraphRef, block: &BlockRef, op_index: usize) -> Self {
+        PositionKey {
+            graph_id: Rc::as_ptr(graph) as usize,
+            block_id: Rc::as_ptr(block) as usize,
+            op_index,
+            graph_ref: Some(Rc::downgrade(graph)),
+            block_ref: Some(Rc::downgrade(block)),
+        }
+    }
+
+    /// Upgrade the weak graph reference, if the key carries one and
+    /// the target is still alive. Mirrors upstream's `graph, _, _ =
+    /// position_key` tuple unpack.
+    pub fn graph(&self) -> Option<GraphRef> {
+        self.graph_ref.as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// Upgrade the weak block reference. Mirrors upstream's `_, block,
+    /// _ = position_key` unpack.
+    pub fn block(&self) -> Option<BlockRef> {
+        self.block_ref.as_ref().and_then(|w| w.upgrade())
     }
 }
 
 /// RPython `class Bookkeeper` (bookkeeper.py:53).
 pub struct Bookkeeper {
+    /// RPython `self.annotator = annotator` (bookkeeper.py:53). A weak
+    /// backlink to the owning `RPythonAnnotator`; stored as
+    /// `Weak<RPythonAnnotator>` to break the Rc cycle (annotator owns
+    /// the bookkeeper via `Rc`). Upgraded on demand via
+    /// [`Self::annotator`].
+    ///
+    /// Test-only `Bookkeeper::new()` leaves this slot empty (the tests
+    /// never call into annotator-dependent code paths).
+    pub annotator: RefCell<Weak<crate::annotator::annrpython::RPythonAnnotator>>,
     /// RPython `self.policy = annotator.policy` (bookkeeper.py:55).
     pub policy: AnnotatorPolicy,
     /// RPython `self.position_key = None` initial (bookkeeper.py:147).
@@ -198,6 +275,7 @@ impl Bookkeeper {
 
     pub fn new_with_policy(policy: AnnotatorPolicy) -> Self {
         Bookkeeper {
+            annotator: RefCell::new(Weak::new()),
             policy,
             position_key: RefCell::new(None),
             listdefs: RefCell::new(HashMap::new()),
@@ -216,6 +294,25 @@ impl Bookkeeper {
         }
     }
 
+    /// Wire up the `self.annotator` backlink. Invoked from
+    /// [`RPythonAnnotator::new`] via `Rc::new_cyclic` so the
+    /// bookkeeper's weak reference points to the final `Rc<Self>`.
+    pub fn set_annotator(&self, ann: Weak<crate::annotator::annrpython::RPythonAnnotator>) {
+        *self.annotator.borrow_mut() = ann;
+    }
+
+    /// RPython `self.annotator` attribute access — upgrades the weak
+    /// backlink to an `Rc<RPythonAnnotator>`. Panics if the backlink
+    /// is absent or the annotator has been dropped; both are programmer
+    /// errors mirroring upstream's assumption that `self.annotator`
+    /// is always live.
+    pub fn annotator(&self) -> Rc<crate::annotator::annrpython::RPythonAnnotator> {
+        self.annotator
+            .borrow()
+            .upgrade()
+            .expect("Bookkeeper.annotator backlink is absent or dropped")
+    }
+
     /// RPython `bookkeeper.position_key = ...` assignment. Returns the
     /// previous value so callers can restore it around a nested reflow
     /// (matches upstream bookkeeper.py:278 `@contextmanager
@@ -228,7 +325,7 @@ impl Bookkeeper {
     /// reflow frame is active (upstream's initial
     /// `self.position_key = None`).
     pub fn current_position_key(&self) -> Option<PositionKey> {
-        *self.position_key.borrow()
+        self.position_key.borrow().clone()
     }
 
     /// RPython `Bookkeeper.enter(self, position_key)` (bookkeeper.py:84-89).
@@ -293,17 +390,98 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.compute_at_fixpoint(self)`
-    /// (bookkeeper.py:126-132) — invoked at the tail of
+    /// (bookkeeper.py:108-118) — invoked at the tail of
     /// `RPythonAnnotator.simplify()`.
     ///
-    /// Upstream calls `self.thread_local_fields`, iterates
-    /// `self.pending_specializations`, clears deferred listitem-
-    /// mutation/resize records, and tails into
-    /// `self.check_no_flags_on_instances`. The Rust port's stub is a
-    /// no-op until those subsystems land; keeping the call site
-    /// preserves the simplify loop's upstream structure.
-    pub fn compute_at_fixpoint(&self) {
-        // Stub — see bookkeeper.py:126-132.
+    /// ```python
+    /// def compute_at_fixpoint(self):
+    ///     # getbookkeeper() needs to work during this function, so provide
+    ///     # one with a dummy position
+    ///     with self.at_position(None):
+    ///         for call_op in self.annotator.call_sites():
+    ///             self.consider_call_site(call_op)
+    ///         for pbc, args_s in self.emulated_pbc_calls.itervalues():
+    ///             args = simple_args(args_s)
+    ///             pbc.consider_call_site(args, s_ImpossibleValue, None)
+    ///         self.emulated_pbc_calls = {}
+    /// ```
+    ///
+    /// Structural 1:1 port. `SomePBC::consider_call_site` currently
+    /// routes through `DescKind.consider_call_site` with a bridging
+    /// gap (see that method's doc); the outer scaffolding — at_position
+    /// guard, call_sites drain, emulated_pbc_calls drain + clear — is
+    /// parity-faithful.
+    pub fn compute_at_fixpoint(self: &Rc<Self>) {
+        let _guard = self.at_position(None);
+        let ann = self.annotator();
+        for call_op in ann.call_sites() {
+            // Errors surface via annotator.errors in upstream (Priority
+            // #3). For now propagate-by-ignore matches the stub contract.
+            let _ = self.consider_call_site(&call_op);
+        }
+        // Snapshot values so we can mutate emulated_pbc_calls inside the
+        // loop (upstream does `for pbc, args_s in
+        // self.emulated_pbc_calls.itervalues()` while not mutating).
+        let emulated: Vec<(SomePBC, Vec<SomeValue>)> =
+            self.emulated_pbc_calls.borrow().values().cloned().collect();
+        for (pbc, args_s) in emulated {
+            let _args = simple_args(args_s);
+            // upstream: `pbc.consider_call_site(args, s_ImpossibleValue, None)`.
+            pbc.consider_call_site();
+        }
+        // upstream: `self.emulated_pbc_calls = {}`.
+        self.emulated_pbc_calls.borrow_mut().clear();
+    }
+
+    /// RPython `Bookkeeper.consider_call_site(self, call_op)`
+    /// (bookkeeper.py:152-166).
+    ///
+    /// ```python
+    /// def consider_call_site(self, call_op):
+    ///     from rpython.rtyper.llannotation import SomeLLADTMeth, lltype_to_annotation
+    ///     annotation = self.annotator.annotation
+    ///     s_callable = annotation(call_op.args[0])
+    ///     args_s = [annotation(arg) for arg in call_op.args[1:]]
+    ///     if isinstance(s_callable, SomeLLADTMeth):
+    ///         adtmeth = s_callable
+    ///         s_callable = self.immutablevalue(adtmeth.func)
+    ///         args_s = [lltype_to_annotation(adtmeth.ll_ptrtype)] + args_s
+    ///     if isinstance(s_callable, SomePBC):
+    ///         s_result = annotation(call_op.result)
+    ///         if s_result is None:
+    ///             s_result = s_ImpossibleValue
+    ///         args = call_op.build_args(args_s)
+    ///         s_callable.consider_call_site(args, s_result, call_op)
+    /// ```
+    ///
+    /// `SomeLLADTMeth` is an rtyper-side type the annotator never
+    /// constructs; that branch is a no-op here. `call_op.build_args`
+    /// is opname-sensitive (`simple_call` →
+    /// `ArgumentsForTranslation(list(args_s))`, `call_args` →
+    /// `fromshape`); the simple_call path uses [`simple_args`].
+    pub fn consider_call_site(
+        self: &Rc<Self>,
+        call_op: &crate::flowspace::model::SpaceOperation,
+    ) -> Result<(), AnnotatorError> {
+        let ann = self.annotator();
+        let Some(s_callable) = ann.annotation(&call_op.args[0]) else {
+            return Ok(());
+        };
+        // SomeLLADTMeth path is rtyper-only; not ported.
+        if let SomeValue::PBC(pbc) = &s_callable {
+            let _args_s: Vec<SomeValue> = call_op
+                .args
+                .iter()
+                .skip(1)
+                .filter_map(|a| ann.annotation(a))
+                .collect();
+            let _s_result = ann
+                .annotation(&call_op.result)
+                .unwrap_or(SomeValue::Impossible);
+            // upstream: `s_callable.consider_call_site(args, s_result, call_op)`.
+            pbc.consider_call_site();
+        }
+        Ok(())
     }
 
     /// RPython `Bookkeeper.valueoftype(self, t)` (bookkeeper.py:444-445).
@@ -1514,5 +1692,45 @@ mod tests {
         let s = immutablevalue(&ConstValue::Bool(true)).unwrap();
         assert!(matches!(s, SomeValue::Bool(_)));
         bk.leave();
+    }
+
+    #[test]
+    fn annotator_backlink_upgrades_when_alive() {
+        // bookkeeper.py:52-54 — `self.annotator = annotator`. In Rust
+        // the backlink is a Weak<RPythonAnnotator>; while the outer
+        // `Rc<RPythonAnnotator>` is alive, `bookkeeper.annotator()`
+        // must return a live Rc to the same driver.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let got = ann.bookkeeper.annotator();
+        assert!(Rc::ptr_eq(&got, &ann));
+    }
+
+    #[test]
+    #[should_panic(expected = "Bookkeeper.annotator backlink is absent or dropped")]
+    fn annotator_backlink_panics_when_unwired() {
+        // A bare Bookkeeper::new() (test-only constructor) leaves the
+        // annotator slot empty; any attempt to upgrade panics.
+        let bk = Bookkeeper::new();
+        let _ = bk.annotator();
+    }
+
+    #[test]
+    fn compute_at_fixpoint_enters_position_and_clears_emulated() {
+        // bookkeeper.py:108-118 — compute_at_fixpoint wraps the work
+        // in `with self.at_position(None)` and clears
+        // `emulated_pbc_calls` at the end. Both effects are
+        // observable even when the inner loops find no work.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        // Before: no position entered; emulated_pbc_calls starts empty.
+        assert!(!ann.bookkeeper.position_entered.get());
+        assert!(ann.bookkeeper.emulated_pbc_calls.borrow().is_empty());
+
+        // Run — should not panic, should leave position_entered false
+        // (at_position guard exits via Drop).
+        ann.bookkeeper.compute_at_fixpoint();
+        assert!(!ann.bookkeeper.position_entered.get());
+        assert!(ann.bookkeeper.emulated_pbc_calls.borrow().is_empty());
     }
 }

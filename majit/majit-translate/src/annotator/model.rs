@@ -1252,6 +1252,33 @@ impl SomePBC {
     /// Until the descriptor machinery lands the second step is a
     /// no-op; the first step catches the bug upstream's `assert` was
     /// actually guarding against (see `binaryop.py:782`).
+    /// RPython `SomePBC.consider_call_site(self, args, s_result, call_op)`
+    /// (model.py:576-578).
+    ///
+    /// ```python
+    /// def consider_call_site(self, args, s_result, call_op):
+    ///     descs = list(self.descriptions)
+    ///     self.getKind().consider_call_site(descs, args, s_result, call_op)
+    /// ```
+    ///
+    /// The `getKind().consider_call_site(descs, args, s_result, call_op)`
+    /// routes through `FunctionDesc`/`MethodDesc`/`FrozenDesc`'s
+    /// classmethod (description.py:357-363 / 458-465 / 627-634). The
+    /// Rust port has a working `FunctionDesc::consider_call_site` but
+    /// `SomePBC.descriptions` stores `model::Desc` (kind+name only),
+    /// not the `Rc<RefCell<description::FunctionDesc>>` that
+    /// `FunctionDesc::consider_call_site` takes — so a bridge is
+    /// required (descriptor lookup by name via bookkeeper tables, or
+    /// unifying `model::Desc` with `description::Desc`). Until that
+    /// lands, this method is a no-op that preserves the upstream call
+    /// site so `Bookkeeper::consider_call_site` / `compute_at_fixpoint`
+    /// can be structurally faithful.
+    pub fn consider_call_site(&self) {
+        // TODO: bridge `self.descriptions` (model::Desc) to
+        // description::FunctionDesc via bookkeeper.descs, then call
+        // `FunctionDesc::consider_call_site(descs, args, s_result)`.
+    }
+
     pub fn simplify(&mut self) -> Result<(), AnnotatorError> {
         // upstream: `kind = self.getKind()`.
         let _kind = self.get_kind()?;
