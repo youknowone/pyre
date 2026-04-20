@@ -910,6 +910,25 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                 )
                 .ok();
             }
+            FlatOp::IntBinOpJumpIfOvf {
+                op,
+                target,
+                lhs,
+                rhs,
+                dst,
+            } => {
+                let opname = match op {
+                    crate::flatten::IntOvfOp::Add => "int_add_jump_if_ovf",
+                    crate::flatten::IntOvfOp::Sub => "int_sub_jump_if_ovf",
+                    crate::flatten::IntOvfOp::Mul => "int_mul_jump_if_ovf",
+                };
+                writeln!(
+                    out,
+                    "  {opname} L{}, %i{}, %i{} -> %i{}",
+                    target.0, lhs.0, rhs.0, dst.0
+                )
+                .ok();
+            }
             FlatOp::GotoIfNot { cond, target } => {
                 writeln!(
                     out,
@@ -976,6 +995,9 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             }
             FlatOp::Raise(v) => {
                 writeln!(out, "  raise %r{}", v.0).ok();
+            }
+            FlatOp::RaiseConst(value) => {
+                writeln!(out, "  raise ${value}").ok();
             }
         }
     }

@@ -49,6 +49,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             FlatOp::Jump(label)
             | FlatOp::CatchException { target: label }
             | FlatOp::GotoIfExceptionMismatch { target: label, .. }
+            | FlatOp::IntBinOpJumpIfOvf { target: label, .. }
             | FlatOp::GotoIfNot { target: label, .. } => {
                 name_label(*label, &mut seenlabels, &mut next_label);
             }
@@ -110,6 +111,27 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     out,
                     "{prefix}goto_if_not {}, L{num}",
                     register_repr(*cond, &ssarepr.value_kinds)
+                );
+            }
+            FlatOp::IntBinOpJumpIfOvf {
+                op,
+                target,
+                lhs,
+                rhs,
+                dst,
+            } => {
+                let opname = match op {
+                    crate::flatten::IntOvfOp::Add => "int_add_jump_if_ovf",
+                    crate::flatten::IntOvfOp::Sub => "int_sub_jump_if_ovf",
+                    crate::flatten::IntOvfOp::Mul => "int_mul_jump_if_ovf",
+                };
+                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let _ = writeln!(
+                    out,
+                    "{prefix}{opname} L{num}, {}, {} -> {}",
+                    register_repr(*lhs, &ssarepr.value_kinds),
+                    register_repr(*rhs, &ssarepr.value_kinds),
+                    register_repr(*dst, &ssarepr.value_kinds)
                 );
             }
             // `flatten.py:333-335` emits opnames prefixed by kind —
@@ -199,6 +221,9 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     "{prefix}raise {}",
                     register_repr(*v, &ssarepr.value_kinds)
                 );
+            }
+            FlatOp::RaiseConst(value) => {
+                let _ = writeln!(out, "{prefix}raise ${value}");
             }
             FlatOp::Unreachable => {
                 let _ = writeln!(out, "{prefix}---");

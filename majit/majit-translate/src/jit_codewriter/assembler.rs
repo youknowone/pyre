@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::flatten::{FlatOp, Label, RegKind, SSARepr};
+use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
 use crate::model::ValueId;
@@ -115,7 +115,9 @@ impl Assembler {
         let mut state = AssemblyState {
             code: Vec::new(),
             constants_i: Vec::new(),
+            constants_r: Vec::new(),
             num_regs_i,
+            num_regs_r,
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
             startpoints: std::collections::HashSet::new(),
@@ -163,7 +165,7 @@ impl Assembler {
             calldescr: BhCallDescr::default(),
             code: state.code,
             constants_i: state.constants_i,
-            constants_r: Vec::new(),
+            constants_r: state.constants_r,
             constants_f: Vec::new(),
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
@@ -310,6 +312,37 @@ impl Assembler {
                 state.code.push(0);
             }
 
+            FlatOp::IntBinOpJumpIfOvf {
+                op,
+                target,
+                lhs,
+                rhs,
+                dst,
+            } => {
+                let opname = match op {
+                    IntOvfOp::Add => "int_add_jump_if_ovf/Lii>i",
+                    IntOvfOp::Sub => "int_sub_jump_if_ovf/Lii>i",
+                    IntOvfOp::Mul => "int_mul_jump_if_ovf/Lii>i",
+                };
+                let opnum = self.get_opnum(opname);
+                let (lhs_reg, lhs_kind) = self.lookup_reg_with_kind(*lhs, regallocs);
+                let (rhs_reg, rhs_kind) = self.lookup_reg_with_kind(*rhs, regallocs);
+                let (dst_reg, dst_kind) = self.lookup_reg_with_kind(*dst, regallocs);
+                debug_assert_eq!(lhs_kind, 'i');
+                debug_assert_eq!(rhs_kind, 'i');
+                debug_assert_eq!(dst_kind, 'i');
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.alllabels.insert(state.code.len());
+                state.tlabel_fixups.push((*target, state.code.len()));
+                state.code.push(0);
+                state.code.push(0);
+                state.code.push(lhs_reg);
+                state.code.push(rhs_reg);
+                state.code.push(dst_reg);
+                state.resulttypes.insert(state.code.len(), 'i');
+            }
+
             // RPython flatten.py:333 `self.emitline('%s_copy' % kind,
             // v, "->", w)` — argcodes `i>i` (typed src, result marker,
             // typed dst). The `>` bears no byte in the stream; it only
@@ -437,6 +470,13 @@ impl Assembler {
             FlatOp::Raise(v) => {
                 let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
                 debug_assert_eq!(kind, 'r');
+                let opnum = self.get_opnum("raise/r");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+            }
+            FlatOp::RaiseConst(value) => {
+                let reg = self.emit_const_r(value, state);
                 let opnum = self.get_opnum("raise/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -1133,13 +1173,31 @@ impl Assembler {
             }
         }
     }
+
+    fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+        let bits = match value {
+            ConstValue::HostObject(obj) => obj.identity_id() as u64,
+            other => panic!("raise/r constant pool does not support {other:?}"),
+        };
+        if let Some(index) = state
+            .constants_r
+            .iter()
+            .position(|&existing| existing == bits)
+        {
+            return (state.num_regs_r + index) as u8;
+        }
+        state.constants_r.push(bits);
+        (state.num_regs_r + state.constants_r.len() - 1) as u8
+    }
 }
 
 /// Per-assembly state (RPython: Assembler.setup() fields).
 struct AssemblyState {
     code: Vec<u8>,
     constants_i: Vec<i64>,
+    constants_r: Vec<u64>,
     num_regs_i: usize,
+    num_regs_r: usize,
     label_positions: HashMap<Label, usize>,
     tlabel_fixups: Vec<(Label, usize)>,
     startpoints: std::collections::HashSet<usize>,

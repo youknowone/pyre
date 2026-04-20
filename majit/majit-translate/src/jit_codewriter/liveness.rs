@@ -153,6 +153,20 @@ fn compute_liveness_pass(
                     alive.extend(alive_at_target.iter());
                 }
             }
+            FlatOp::IntBinOpJumpIfOvf {
+                target,
+                lhs,
+                rhs,
+                dst,
+                ..
+            } => {
+                alive.remove(dst);
+                alive.insert(*lhs);
+                alive.insert(*rhs);
+                if let Some(alive_at_target) = label2alive.get(target) {
+                    alive.extend(alive_at_target.iter());
+                }
+            }
             FlatOp::Move { dst, src } => {
                 let dst = *dst;
                 let src = *src;
@@ -189,6 +203,9 @@ fn compute_liveness_pass(
                 // `bhimpl_raise(excvalue)` reads the evalue and raises.
                 alive.clear();
                 alive.insert(*v);
+            }
+            FlatOp::RaiseConst(_) => {
+                alive.clear();
             }
         }
     }

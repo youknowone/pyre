@@ -19,6 +19,13 @@ use crate::regalloc::RegAllocResult;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Label(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntOvfOp {
+    Add,
+    Sub,
+    Mul,
+}
+
 /// A flattened instruction (post-CFG).
 ///
 /// RPython equivalent: SSARepr instruction tuples from flatten.py.
@@ -36,6 +43,15 @@ pub enum FlatOp {
     /// There is NO goto_if_true — RPython only uses goto_if_not.
     /// The true path is always the fallthrough.
     GotoIfNot { cond: ValueId, target: Label },
+    /// RPython `flatten.py:190-197`
+    /// `int_add_jump_if_ovf` / `int_sub_jump_if_ovf` / `int_mul_jump_if_ovf`.
+    IntBinOpJumpIfOvf {
+        op: IntOvfOp,
+        target: Label,
+        lhs: ValueId,
+        rhs: ValueId,
+        dst: ValueId,
+    },
     /// Exception setup for a can-raise block.
     /// RPython: `('catch_exception', TLabel(normal_link))`.
     CatchException { target: Label },
@@ -100,6 +116,9 @@ pub enum FlatOp {
     /// final block: emit `raise` on the `evalue` (second inputarg).
     /// Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
     Raise(ValueId),
+    /// RPython `flatten.py:166-173` direct overflow reraises use
+    /// `raise Constant(standard_OverflowError_instance)`.
+    RaiseConst(ConstValue),
     /// Unreachable marker — marks the end of a code path.
     /// RPython: `---` operation. Resets the alive set in liveness analysis.
     Unreachable,
@@ -183,48 +202,89 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
         } else if block.canraise() {
             debug_assert_eq!(block.exits[0].exitcase, None);
-            // RPython flatten.py:205-218: walk the operations tail backward
-            // past `-live-` markers to find the real raising op.  If the last
-            // op is NOT `-live-` (RPython's `index == -1` case), the call at
-            // the tail did not declare `can_raise` and this block cannot
-            // actually raise — emit only the normal link and move on.
-            let last_is_live = matches!(
-                block.operations.last().map(|op| &op.kind),
-                Some(crate::model::OpKind::Live)
-            );
-            if !last_is_live {
-                make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
-            } else {
-                ops.push(FlatOp::CatchException {
-                    target: Label(next_label),
-                });
-                let normal_landing = Label(next_label);
+            if let Some(ovf_op) = block
+                .operations
+                .last()
+                .and_then(|op| overflow_jump_op(op, Label(next_label)))
+            {
+                let ovf_landing = Label(next_label);
                 next_label += 1;
+                let last_flat_op = ops.pop();
+                debug_assert!(matches!(last_flat_op, Some(FlatOp::Op(_))));
+                debug_assert!(block.exits.len() == 2 || block.exits.len() == 3);
+                ops.push(ovf_op);
                 make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
-                ops.push(FlatOp::Label(normal_landing));
-                let mut catches_all = false;
-                for link in &block.exits[1..] {
-                    if link.catches_all_exceptions() {
-                        make_exception_link(graph, &mut ops, &block_labels, link, regallocs);
-                        catches_all = true;
-                        break;
-                    }
-                    let mismatch_landing = Label(next_label);
-                    next_label += 1;
-                    let llexitcase = link
-                        .llexitcase
-                        .clone()
-                        .expect("typed exception links need llexitcase for parity");
-                    ops.push(FlatOp::GotoIfExceptionMismatch {
-                        llexitcase,
-                        target: mismatch_landing,
-                    });
-                    make_exception_link(graph, &mut ops, &block_labels, link, regallocs);
-                    ops.push(FlatOp::Label(mismatch_landing));
+                ops.push(FlatOp::Label(ovf_landing));
+                make_exception_link(
+                    graph,
+                    &mut ops,
+                    &block_labels,
+                    &block.exits[1],
+                    regallocs,
+                    true,
+                );
+                if block.exits.len() == 3 {
+                    debug_assert!(block.exits[2].catches_all_exceptions());
+                    make_exception_link(
+                        graph,
+                        &mut ops,
+                        &block_labels,
+                        &block.exits[2],
+                        regallocs,
+                        false,
+                    );
                 }
-                if !catches_all {
-                    ops.push(FlatOp::Reraise);
-                    ops.push(FlatOp::Unreachable);
+            } else {
+                // RPython flatten.py:205-218: walk the operations tail backward
+                // past `-live-` markers to find the real raising op.  If the last
+                // op is NOT `-live-` (RPython's `index == -1` case), the call at
+                // the tail did not declare `can_raise` and this block cannot
+                // actually raise — emit only the normal link and move on.
+                let last_is_live = matches!(
+                    block.operations.last().map(|op| &op.kind),
+                    Some(crate::model::OpKind::Live)
+                );
+                if !last_is_live {
+                    make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+                } else {
+                    ops.push(FlatOp::CatchException {
+                        target: Label(next_label),
+                    });
+                    let normal_landing = Label(next_label);
+                    next_label += 1;
+                    make_link(graph, &mut ops, &block_labels, &block.exits[0], regallocs);
+                    ops.push(FlatOp::Label(normal_landing));
+                    let mut catches_all = false;
+                    for link in &block.exits[1..] {
+                        if link.catches_all_exceptions() {
+                            make_exception_link(
+                                graph,
+                                &mut ops,
+                                &block_labels,
+                                link,
+                                regallocs,
+                                false,
+                            );
+                            catches_all = true;
+                            break;
+                        }
+                        let mismatch_landing = Label(next_label);
+                        next_label += 1;
+                        let llexitcase = link
+                            .llexitcase
+                            .clone()
+                            .expect("typed exception links need llexitcase for parity");
+                        ops.push(FlatOp::GotoIfExceptionMismatch {
+                            llexitcase,
+                            target: mismatch_landing,
+                        });
+                        make_exception_link(graph, &mut ops, &block_labels, link, regallocs, false);
+                        ops.push(FlatOp::Label(mismatch_landing));
+                    }
+                    if !catches_all {
+                        ops.push(FlatOp::Reraise);
+                        ops.push(FlatOp::Unreachable);
+                    }
                 }
             }
         } else if block.exits.len() == 2 && matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
@@ -301,6 +361,16 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                 cond: ValueId(c), ..
             } => {
                 max_value = max_value.max(*c + 1);
+            }
+            FlatOp::IntBinOpJumpIfOvf {
+                lhs: ValueId(lhs),
+                rhs: ValueId(rhs),
+                dst: ValueId(dst),
+                ..
+            } => {
+                max_value = max_value.max(*lhs + 1);
+                max_value = max_value.max(*rhs + 1);
+                max_value = max_value.max(*dst + 1);
             }
             FlatOp::LastException { dst: ValueId(d) }
             | FlatOp::LastExcValue { dst: ValueId(d) } => {
@@ -517,6 +587,39 @@ fn value_kind(value: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> c
     'v'
 }
 
+fn overflow_jump_op(op: &SpaceOperation, target: Label) -> Option<FlatOp> {
+    let (name, lhs, rhs) = match &op.kind {
+        crate::model::OpKind::BinOp { op, lhs, rhs, .. } => (op.as_str(), *lhs, *rhs),
+        _ => return None,
+    };
+    let opcode = match name {
+        "add_ovf" => IntOvfOp::Add,
+        "sub_ovf" => IntOvfOp::Sub,
+        "mul_ovf" => IntOvfOp::Mul,
+        _ => return None,
+    };
+    let dst = op
+        .result
+        .expect("overflow-checked arithmetic op needs a result for flatten parity");
+    Some(FlatOp::IntBinOpJumpIfOvf {
+        op: opcode,
+        target,
+        lhs,
+        rhs,
+        dst,
+    })
+}
+
+fn overflow_error_instance() -> ConstValue {
+    let overflow_cls = crate::flowspace::model::HOST_ENV
+        .lookup_exception_class("OverflowError")
+        .expect("HOST_ENV missing OverflowError");
+    ConstValue::HostObject(crate::flowspace::model::HostObject::new_instance(
+        overflow_cls,
+        Vec::new(),
+    ))
+}
+
 /// RPython `flatten.py:157-175` `make_exception_link(link, handling_ovf)`.
 ///
 /// Special-cases the bare reraise link (target has no ops and
@@ -532,6 +635,7 @@ fn make_exception_link(
     block_labels: &std::collections::HashMap<BlockId, Label>,
     link: &Link,
     regallocs: &HashMap<RegKind, RegAllocResult>,
+    handling_ovf: bool,
 ) {
     debug_assert!(link.last_exception.is_some());
     debug_assert!(link.last_exc_value.is_some());
@@ -552,7 +656,11 @@ fn make_exception_link(
                 link.last_exc_value.clone().unwrap(),
             ]
     {
-        ops.push(FlatOp::Reraise);
+        if handling_ovf {
+            ops.push(FlatOp::RaiseConst(overflow_error_instance()));
+        } else {
+            ops.push(FlatOp::Reraise);
+        }
         ops.push(FlatOp::Unreachable);
         return;
     }
@@ -1091,6 +1199,134 @@ mod tests {
         assert!(
             matches!(flat.insns.get(raise_idx + 1), Some(FlatOp::Unreachable)),
             "raise should still terminate with ---"
+        );
+    }
+
+    #[test]
+    fn flatten_int_add_ovf_uses_jump_if_ovf() {
+        let mut graph = FunctionGraph::new("add_ovf");
+        let entry = graph.startblock;
+        let lhs = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        graph.push_op(entry, OpKind::Live, false);
+        let sum = graph
+            .push_op(
+                entry,
+                OpKind::BinOp {
+                    op: "add_ovf".into(),
+                    lhs,
+                    rhs,
+                    result_ty: crate::model::ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        let handler = graph.create_block();
+        let handler_exc_type = graph.alloc_value();
+        let handler_exc_value = graph.alloc_value();
+        graph.block_mut(handler).inputargs.push(handler_exc_type);
+        graph.block_mut(handler).inputargs.push(handler_exc_value);
+        let forty_two = graph.push_op(handler, OpKind::ConstInt(42), true).unwrap();
+        graph.set_return(handler, Some(forty_two));
+
+        let (_, _, last_exc_value) = graph.exceptblock_args();
+        let overflow_error = ConstValue::builtin("OverflowError");
+        graph.set_control_flow_metadata(
+            entry,
+            Some(crate::model::ExitSwitch::LastException),
+            vec![
+                crate::model::Link::new(vec![sum], graph.returnblock, None),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::from(overflow_error.clone()),
+                        LinkArg::from(last_exc_value),
+                    ],
+                    handler,
+                    Some(ExitCase::Const(overflow_error.clone())),
+                )
+                .extravars(
+                    Some(LinkArg::from(overflow_error)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(16));
+        assert!(
+            flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::IntBinOpJumpIfOvf {
+                    op: IntOvfOp::Add,
+                    lhs: l,
+                    rhs: r,
+                    dst,
+                    ..
+                } if *l == lhs && *r == rhs && *dst == sum
+            )),
+            "ovf arithmetic should flatten to int_add_jump_if_ovf"
+        );
+        assert!(
+            !flat
+                .insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::CatchException { .. })),
+            "ovf-specialized path should bypass generic catch_exception lowering"
+        );
+    }
+
+    #[test]
+    fn flatten_ovf_reraise_emits_constant_raise() {
+        let mut graph = FunctionGraph::new("ovf_reraise");
+        let entry = graph.startblock;
+        let lhs = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        graph.push_op(entry, OpKind::Live, false);
+        let sum = graph
+            .push_op(
+                entry,
+                OpKind::BinOp {
+                    op: "add_ovf".into(),
+                    lhs,
+                    rhs,
+                    result_ty: crate::model::ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (exc_block, _, last_exc_value) = graph.exceptblock_args();
+        let overflow_error = ConstValue::builtin("OverflowError");
+        graph.set_control_flow_metadata(
+            entry,
+            Some(crate::model::ExitSwitch::LastException),
+            vec![
+                crate::model::Link::new(vec![sum], graph.returnblock, None),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::from(overflow_error.clone()),
+                        LinkArg::from(last_exc_value),
+                    ],
+                    exc_block,
+                    Some(ExitCase::Const(overflow_error.clone())),
+                )
+                .extravars(
+                    Some(LinkArg::from(overflow_error)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(16));
+        assert!(
+            flat.insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::RaiseConst(ConstValue::HostObject(_)))),
+            "overflow direct reraises should emit raise Constant(OverflowError-instance)"
+        );
+        assert!(
+            !flat.insns.iter().any(|op| matches!(op, FlatOp::Reraise)),
+            "overflow direct reraises should not use generic reraise"
         );
     }
 
