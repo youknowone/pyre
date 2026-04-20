@@ -214,7 +214,16 @@ struct RewriteState {
     /// `with_constants` from the passed-in map so newly emitted constants
     /// do not collide with tracer entries.
     next_const_idx: u32,
-    // ── Pending vtable initializations ──
+
+    /// rewrite.py:470-471 `_changed_op` / `_changed_op_to` parity.
+    ///
+    /// When `remove_tested_failarg` rewrites an upcoming guard's failargs
+    /// to substitute the tested box with a fresh `SAME_AS_I`, the
+    /// rewritten guard is stashed here keyed by its position in the
+    /// input op list. The main dispatch loop checks for a substitution
+    /// at iteration `i` and swaps the rewritten op in place of the
+    /// original (rewrite.py:366-367).
+    changed_ops: HashMap<usize, Op>,
 }
 
 impl RewriteState {
@@ -235,6 +244,7 @@ impl RewriteState {
             initialized_indices: HashMap::new(),
             _constant_additions: HashMap::new(),
             next_const_idx: 0,
+            changed_ops: HashMap::new(),
         }
     }
 
@@ -488,6 +498,94 @@ impl GcRewriterImpl {
     /// Can we use the nursery for this allocation size?
     fn can_use_nursery(&self, size: usize) -> bool {
         size <= self.max_nursery_size
+    }
+
+    /// rewrite.py:431-448 `could_merge_with_next_guard` parity.
+    ///
+    /// Returns true when `op` should be kept adjacent to the next guard,
+    /// triggering a `emit_pending_zeros` flush at the top of the iteration
+    /// (rewrite.py:376-377). Two cases:
+    ///   * `op` is an overflow-producing arithmetic op (INT_*_OVF),
+    ///     which pairs with a following GUARD_NO_OVERFLOW / GUARD_OVERFLOW.
+    ///   * `op` is a comparison whose boolean result is tested by the
+    ///     immediately following GUARD_TRUE/GUARD_FALSE/COND_CALL. In that
+    ///     case the tested value appearing in the guard's failargs is
+    ///     hoisted out into a dedicated `SAME_AS_I(0/1)` via
+    ///     `remove_tested_failarg`.
+    fn could_merge_with_next_guard(
+        &self,
+        op: &Op,
+        i: usize,
+        ops: &[Op],
+        st: &mut RewriteState,
+    ) -> bool {
+        if !op.opcode.is_comparison() {
+            // rewrite.py:436 fallback: int_xxx_ovf + guard_{,no_}overflow
+            return op.opcode.is_ovf();
+        }
+        if i + 1 >= ops.len() {
+            return false;
+        }
+        let next_op = &ops[i + 1];
+        // rewrite.py:441-443 — merge only with a directly-consuming guard/cond_call.
+        // RPython's `rop.COND_CALL` is the void-result variant, matching
+        // pyre's `CondCallN`.
+        if !matches!(
+            next_op.opcode,
+            OpCode::GuardTrue | OpCode::GuardFalse | OpCode::CondCallN
+        ) {
+            return false;
+        }
+        // rewrite.py:445 `next_op.getarg(0) is not op` — in pyre OpRef
+        // carries the same identity role as RPython's box object.
+        if next_op.arg(0) != op.pos {
+            return false;
+        }
+        self.remove_tested_failarg(next_op, i + 1, st);
+        true
+    }
+
+    /// rewrite.py:450-471 `remove_tested_failarg` parity.
+    ///
+    /// When a GUARD_TRUE/GUARD_FALSE's tested value is also present in the
+    /// guard's failargs, emit a `SAME_AS_I(value)` (where `value = 0` for
+    /// GUARD_TRUE / `1` for GUARD_FALSE — the constant the tested box would
+    /// hold on the failure path) and rewrite the failargs list so the
+    /// guard points at that SAME_AS_I instead of the boolean. The rewritten
+    /// guard is stashed in `st.changed_ops` keyed by its index so the main
+    /// dispatch loop substitutes it on the next iteration.
+    fn remove_tested_failarg(&self, op: &Op, op_idx: usize, st: &mut RewriteState) {
+        // rewrite.py:452-453: no-op for non-GUARD_{TRUE,FALSE} (e.g. COND_CALL
+        // is merge-eligible via could_merge_with_next_guard but does not
+        // carry failargs in the RPython sense).
+        if !matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
+            return;
+        }
+        let fail_args = match op.fail_args.as_ref() {
+            Some(fa) if !fa.is_empty() => fa,
+            _ => return,
+        };
+        let target = op.arg(0);
+        // rewrite.py:456-459: guard's failargs contain the tested box?
+        let Some(idx) = fail_args.iter().position(|&a| a == target) else {
+            return;
+        };
+        // rewrite.py:463 `value = int(opnum == rop.GUARD_FALSE)`
+        let value: i64 = i64::from(op.opcode == OpCode::GuardFalse);
+        let const_ref = st.const_int(value);
+        let same = Op::new(OpCode::SameAsI, &[const_ref]);
+        let same_pos = st.emit_result(same, OpRef::NONE);
+        st.result_types.insert(same_pos.0, Type::Int);
+
+        // rewrite.py:466-469 — rewrite failargs + stash the copy-and-changed
+        // guard for the next iteration to pick up.
+        let mut new_fail = fail_args.clone();
+        new_fail[idx] = same_pos;
+        let mut new_guard = op.clone();
+        new_guard.fail_args = Some(new_fail);
+        // pos is reassigned when emit/emit_result runs on the substituted op.
+        new_guard.pos = OpRef::NONE;
+        st.changed_ops.insert(op_idx, new_guard);
     }
 
     // ────────────────────────────────────────────────────────
@@ -1133,7 +1231,24 @@ impl GcRewriter for GcRewriterImpl {
         for (&k, &tp) in &self.constant_types {
             st.result_types.entry(k).or_insert(tp);
         }
-        for op in &ops {
+        for (i, orig_op) in ops.iter().enumerate() {
+            // rewrite.py:366-367 — if `remove_tested_failarg` rewrote this
+            // op on a previous iteration, use the stashed replacement.
+            let owned = st.changed_ops.remove(&i);
+            let op: &Op = owned.as_ref().unwrap_or(orig_op);
+
+            // rewrite.py:376-378 — is_guard OR could_merge_with_next_guard
+            // triggers emit_pending_zeros at the top of the iteration.
+            // could_merge_with_next_guard may also emit a SAME_AS_I and
+            // stash a rewritten guard via remove_tested_failarg, so it
+            // must be called regardless of whether the flush path is
+            // taken — the flush only fires when one of the two branches
+            // returns true.
+            let merges = self.could_merge_with_next_guard(op, i, &ops, &mut st);
+            if op.opcode.is_guard() || merges {
+                st.emit_pending_zeros();
+            }
+
             match op.opcode {
                 // Skip debug merge points (they carry no semantics).
                 OpCode::DebugMergePoint => continue,
@@ -1204,9 +1319,12 @@ impl GcRewriter for GcRewriterImpl {
                     st.emit_rewritten_from(op, rewritten);
                 }
 
-                // ── Guards flush pending zeros but do not invalidate WB tracking. ──
+                // ── Guards: emit_pending_zeros was already called at the
+                // top of the iteration per rewrite.py:376-378; here we only
+                // need to emit the (forwarded) guard op itself. Guards do
+                // not clear wb_applied — only emitting_an_operation_that_
+                // can_collect does that (rewrite.py:699-711).
                 _ if op.opcode.is_guard() => {
-                    st.emit_pending_zeros();
                     let rewritten = st.rewrite_op(op);
                     st.emit(rewritten);
                 }
@@ -1835,6 +1953,99 @@ mod tests {
                 .filter(|op| op.opcode == OpCode::SetarrayitemGc)
                 .count(),
             1
+        );
+    }
+
+    // ── could_merge_with_next_guard / remove_tested_failarg tests ──
+
+    #[test]
+    fn test_comparison_guard_true_hoists_tested_failarg() {
+        // rewrite.py:431-471 parity: INT_LT followed by GUARD_TRUE(INT_LT)
+        // with the comparison's result appearing in the guard's failargs.
+        // The rewriter must emit SAME_AS_I(0) before the comparison and
+        // rewrite the guard's failargs to reference the SAME_AS_I output.
+        let rw = make_rewriter();
+
+        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef(0), OpRef(1)]);
+        int_lt.pos = OpRef(2);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
+        guard.store_final_boxes(vec![OpRef(0), OpRef(2), OpRef(1)]);
+        let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        // Expect the rewriter to have emitted SAME_AS_I BEFORE the IntLt.
+        let same_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::SameAsI)
+            .expect("SAME_AS_I must be emitted");
+        let lt_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::IntLt)
+            .expect("IntLt survives");
+        let guard_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::GuardTrue)
+            .expect("GuardTrue survives");
+        assert!(
+            same_idx < lt_idx,
+            "SAME_AS_I must be emitted before the comparison"
+        );
+        assert!(lt_idx < guard_idx, "GuardTrue must follow the comparison");
+
+        // The guard's failargs must now reference the SAME_AS_I output
+        // at the position where OpRef(2) (the IntLt result) used to appear.
+        let same_pos = result[same_idx].pos;
+        let guard_fa = result[guard_idx]
+            .fail_args
+            .as_ref()
+            .expect("guard keeps failargs");
+        assert_eq!(
+            guard_fa.as_slice(),
+            &[OpRef(0), same_pos, OpRef(1)],
+            "OpRef(2) → SAME_AS_I substitution"
+        );
+    }
+
+    #[test]
+    fn test_comparison_guard_false_hoists_with_one_constant() {
+        // GUARD_FALSE: rewrite.py:463 `value = int(opnum == GUARD_FALSE)` ⇒ 1.
+        let rw = make_rewriter();
+        let mut int_eq = Op::new(OpCode::IntEq, &[OpRef(0), OpRef(1)]);
+        int_eq.pos = OpRef(2);
+        let mut guard = Op::new(OpCode::GuardFalse, &[OpRef(2)]);
+        guard.store_final_boxes(vec![OpRef(2)]);
+        let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
+
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        let same = result
+            .iter()
+            .find(|o| o.opcode == OpCode::SameAsI)
+            .expect("SAME_AS_I must be emitted for GUARD_FALSE merge");
+        let const_ref = same.args[0];
+        assert_eq!(
+            consts[&const_ref.0], 1,
+            "GUARD_FALSE hoists SAME_AS_I(1) per rewrite.py:463",
+        );
+    }
+
+    #[test]
+    fn test_comparison_guard_mismatch_is_passthrough() {
+        // Guard that does NOT test the previous op's result: merge does
+        // not fire, no SAME_AS_I is emitted.
+        let rw = make_rewriter();
+        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef(0), OpRef(1)]);
+        int_lt.pos = OpRef(2);
+        // GuardTrue reads some unrelated OpRef(5), not OpRef(2).
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(5)]);
+        guard.store_final_boxes(vec![OpRef(0), OpRef(1)]);
+        let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
+
+        let result = rw.rewrite_for_gc(&ops);
+        assert!(
+            result.iter().all(|o| o.opcode != OpCode::SameAsI),
+            "no merge → no hoisted SAME_AS_I"
         );
     }
 
