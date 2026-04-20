@@ -1,24 +1,25 @@
 //! Phase B.2: callcontrol trait-method resolution over real pyre-interpreter
 //! sources.
 //!
-//! For line-by-line parity with RPython's `rpython/jit/codewriter/call.py` we
-//! need every `executor.method(...)` call in `execute_opcode_step` and its
-//! helper `opcode_*` functions to resolve to a single concrete graph. RPython
-//! achieves this because the annotator's `SomeInstance(classdef)` already
-//! identifies a unique class and `bookkeeper.py:318 methoddesc` tracks the
-//! graph per method. pyre's analogue is `CallControl::resolve_method` combined
-//! with the `extract_trait_impls` / `extract_opcode_dispatch_receiver_traits`
-//! pass.
+//! RPython's `bookkeeper.py:431 MethodDesc` keys method resolution on
+//! `(classdef, method_name)` — i.e. the concrete receiver class must be
+//! known.  pyre's `CallControl::resolve_method(name, Some(receiver_type))`
+//! is the analogue: the caller supplies the concrete receiver and the
+//! resolver finds the unique impl for that `(receiver, name)` pair.
 //!
-//! This test reads `pyre-interpreter/src/pyopcode.rs` (for trait declarations
-//! and the dispatch function) and `pyre-interpreter/src/eval.rs` (for the
-//! `impl <Trait> for PyFrame` blocks), builds a `CallControl`, and asserts
-//! that the method names invoked by the super-instruction helpers
-//! (`opcode_load_fast_load_fast`, `opcode_load_fast_pair_checked`,
-//! `opcode_store_fast_load_fast`, `opcode_store_fast_store_fast`) all resolve
-//! to a concrete PyFrame graph — both when the receiver is the concrete type
-//! `PyFrame` and when it is the generic parameter `E` (the actual dispatch
-//! site in pyopcode.rs).
+//! This test reads `pyre-interpreter/src/pyopcode.rs` (for trait
+//! declarations) and `pyre-interpreter/src/eval.rs` (for
+//! `impl <Trait> for PyFrame` blocks), builds a `CallControl`, and
+//! asserts that the method names invoked by the super-instruction
+//! helpers all resolve to a concrete PyFrame graph when the receiver
+//! is the concrete type `PyFrame`.
+//!
+//! Generic-receiver resolution (e.g. `resolve_method(name, Some("E"))`)
+//! is intentionally NOT tested here: upstream method resolution requires
+//! a concrete classdef key (`bookkeeper.py:431`), and "unique impl
+//! across the entire program" is a pyre-specific closed-world shortcut,
+//! not parity.  That shortcut lives in `CallControl` for now, but test
+//! oracles track upstream's contract — concrete receiver only.
 
 use std::path::PathBuf;
 
@@ -110,9 +111,9 @@ fn resolve_super_inst_method_calls_against_pyframe_impls() {
     }
 
     // Step 4: every method name invoked by the super-instruction helpers
-    // must resolve — both against the concrete PyFrame receiver and against
-    // the generic parameter `E` (which is the actual receiver at the dispatch
-    // site `executor.load_local_value(...)`).
+    // must resolve against the concrete `PyFrame` receiver.  This mirrors
+    // RPython `bookkeeper.py:431 MethodDesc` which keys on
+    // `(classdef, method_name)` — concrete class required.
     //
     // The list below mirrors the trait methods called from the bodies of
     // `opcode_load_fast_load_fast`, `opcode_store_fast_load_fast`,
@@ -137,14 +138,6 @@ fn resolve_super_inst_method_calls_against_pyframe_impls() {
                 .flat_map(|i| i.methods.iter())
                 .filter(|m| m.name == name)
                 .count()
-        );
-        let via_generic = cc.resolve_method(name, Some("E"));
-        assert!(
-            via_generic.is_some(),
-            "`{}` did not resolve against generic receiver `E`; \
-             CallControl should pick the unique concrete impl (PyFrame) \
-             when the receiver is a generic parameter",
-            name
         );
     }
 }
