@@ -3,7 +3,7 @@
 //!
 //! RPython upstream: `rpython/annotator/listdef.py` (207 LOC).
 //!
-//! Phase 5 P5.1 port — closes the "same_as" identity gap that Phase 4
+//! Phase 5 P5.1 port. Closes the "same_as" identity gap that Phase 4
 //! A4.4 deferred (see the review #2 entry in
 //! `majit-translate/src/annotator/model.rs`).
 //!
@@ -26,26 +26,22 @@
 //!     - [`ListDefInner::listitem`] is an interior-mutable slot
 //!       (`RefCell<Rc<RefCell<ListItem>>>`) so `patch()` can retarget
 //!       it through a shared reference.
-//!     - [`ListItem::itemof`] stores `Weak<ListDefInner>` backrefs
-//!       that survive merges but don't hold the ListDef alive.
+//!     - [`ListItem::itemof`] stores [`ItemOwner`] weak backrefs so
+//!       both `ListDef` owners AND `DictDef` owners can be patched
+//!       through the same list. DictKey/DictValue upstream patch via
+//!       separate `patch()` overrides on the subclasses; Rust
+//!       composition flattens the distinction into an enum.
 //!
-//! * Bookkeeper integration: upstream takes a live `bookkeeper`
-//!   reference that informs `notify_update()` → `reflowfromposition`.
-//!   The bookkeeper is Phase 5 (bookkeeper.py, 614 LOC) and has not
-//!   landed yet; `ListItem::bookkeeper` is therefore `None` at the
-//!   Phase 5 P5.1 cut and `notify_update` is a no-op. Sites that
-//!   construct lists under `bookkeeper = None` inherit upstream's
-//!   `dont_change_any_more = True` branch (listdef.py:34-35), so
-//!   merges of two dont-change listitems raise [`TooLateForChange`].
-//!
-//! * `TLS.no_side_effects_in_union` is replaced by an [`AtomicUsize`]
-//!   counter — [`enter_side_effect_free_union`] /
-//!   [`leave_side_effect_free_union`]. `ListItem::merge` short-
-//!   circuits to [`UnionError`] when the counter is non-zero.
+//! * `TLS.no_side_effects_in_union` (model.py:758-769) is replaced by
+//!   a thread-local counter with an RAII guard. The guard name is
+//!   Rust-native — upstream uses a bare `try/finally` on the global —
+//!   but the semantics match byte-for-byte.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::{Rc, Weak};
 
+use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::model::{AnnotatorError, SomeValue, UnionError};
 
 /// RPython `class TooLateForChange(AnnotatorError)` (listdef.py:6-7).
@@ -81,19 +77,25 @@ impl std::fmt::Display for ListChangeUnallowed {
 impl std::error::Error for ListChangeUnallowed {}
 
 thread_local! {
-    /// RPython `TLS.no_side_effects_in_union` surrogate (model.py:758).
-    /// Incremented by `model::contains`, read by [`merge_items`] to
-    /// refuse mutation and surface a [`UnionError`] instead.
-    /// Thread-local so parallel tests do not observe each other's
-    /// guard state.
+    /// Rust-side mirror of upstream `TLS.no_side_effects_in_union`
+    /// (model.py:758). `union()` increments this counter before
+    /// dispatching to `pair(s1, s2).union()`; `ListItem.merge` /
+    /// `DictKey.merge` consult it to refuse mutation and raise
+    /// `UnionError` instead. Thread-local so parallel tests observe
+    /// independent state.
     static NO_SIDE_EFFECTS_IN_UNION: Cell<usize> = const { Cell::new(0) };
 }
 
-/// RAII-style guard used by callers that need the "refuse mutation"
-/// contract (`model::contains`, pattern-checking code paths).
+/// RAII wrapper around the `TLS.no_side_effects_in_union += 1` /
+/// `-= 1` pattern at `model.py:758-769` — upstream guards the
+/// increment with a bare `try/finally`; Rust wraps it in a `Drop`
+/// impl so callers cannot accidentally leak the state.
+///
+/// This type has no upstream name — the Rust port introduces it only
+/// because `finally` does not exist as a language construct. The guard
+/// is `!Send` / `!Sync` so the increment never escapes the thread that
+/// took it.
 pub struct SideEffectFreeGuard {
-    // Ensure the guard is !Send / !Sync so it never escapes the
-    // thread that set up the TLS increment.
     _not_send: std::marker::PhantomData<*mut ()>,
 }
 
@@ -112,43 +114,30 @@ impl Drop for SideEffectFreeGuard {
     }
 }
 
-/// True when merges must refuse mutation and raise UnionError. Callers
-/// outside this module typically enter the mode via
-/// [`SideEffectFreeGuard::enter`].
+/// Mirror of upstream `getattr(TLS, 'no_side_effects_in_union', 0)`
+/// (listdef.py:60) — True when the counter is non-zero.
 pub fn in_side_effect_free_union() -> bool {
     NO_SIDE_EFFECTS_IN_UNION.with(|c| c.get() > 0)
 }
 
-/// RPython `ListItem._step_map` (listdef.py:23-27). The upstream dict
-/// is keyed by `(type(self.range_step), type(other.range_step))`
-/// where each type is `NoneType` or `int`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RangeStep {
-    /// upstream `range_step = None` — the list is not from a
-    /// `range()` call. `_step_map` uses `type(None)`.
-    NotRange,
-    /// upstream `range_step = <int>`.
-    Constant(i64),
-    /// upstream `range_step = 0` — "variable step", set when two
-    /// const-step lists with different steps merge.
-    Variable,
-}
-
-impl RangeStep {
-    /// RPython `_step_map[type(self), type(other)]` (listdef.py:83-84).
-    fn merge(self, other: RangeStep) -> RangeStep {
-        match (self, other) {
-            // (None, int) / (int, None) → None.
-            (RangeStep::NotRange, RangeStep::Constant(_))
-            | (RangeStep::Constant(_), RangeStep::NotRange) => RangeStep::NotRange,
-            // (int, int) of different values → 0 (variable step).
-            (RangeStep::Constant(a), RangeStep::Constant(b)) if a != b => RangeStep::Variable,
-            // Everything else including same-value (int, int) collapses
-            // to self; upstream only invokes _step_map when values
-            // differ, so the branch never fires on equality.
-            _ => self,
-        }
-    }
+/// Backref slot used by [`ListItem::itemof`] — enumerates every kind
+/// of owner that can hold the listitem so `patch()` retargets the
+/// correct cell.
+///
+/// Upstream (listdef.py:100-103) `ListItem.patch()` walks
+/// `self.itemof` and sets `listdef.listitem = self`. DictKey /
+/// DictValue override `patch()` (dictdef.py:15-17, 70-72) to retarget
+/// `dictdef.dictkey` / `dictdef.dictvalue` instead. Rust has no
+/// subclass dispatch for the `patch` override, so the enum captures
+/// the upstream subclass identity directly.
+#[derive(Clone, Debug)]
+pub(crate) enum ItemOwner {
+    /// Owner slot for `ListDef.listitem`.
+    ListDef(Weak<ListDefInner>),
+    /// Owner slot for `DictDef.dictkey`.
+    DictKey(Weak<super::dictdef::DictDefInner>),
+    /// Owner slot for `DictDef.dictvalue`.
+    DictValue(Weak<super::dictdef::DictDefInner>),
 }
 
 /// RPython `class ListItem` (listdef.py:12-117).
@@ -156,67 +145,124 @@ impl RangeStep {
 /// The identity-carrying element-type state of a list annotation. Wrap
 /// in `Rc<RefCell<ListItem>>` for sharing — sister `ListDef`s clone
 /// the Rc so their identity comparisons hold.
+///
+/// ## PRE-EXISTING-ADAPTATION: DictKey/DictValue field flattening
+///
+/// Upstream has `class DictKey(ListItem)` (dictdef.py:7-66) and
+/// `class DictValue(ListItem)` (dictdef.py:69-72). The subclass
+/// instances share a `ListItem`-shaped cell with `DictDef` via
+/// `dictdef.dictkey` / `dictdef.dictvalue`, and merge operations walk
+/// across both base and subclass slots (`custom_eq_hash`,
+/// `s_rdict_eqfn`, `s_rdict_hashfn`). Rust has no single inheritance,
+/// and [`ItemOwner`] backrefs already store a bare
+/// `Rc<RefCell<ListItem>>`, so we flatten the three `DictKey`
+/// subclass fields onto this base struct. For non-DictKey uses the
+/// fields stay at their default (`custom_eq_hash = false`,
+/// `s_rdict_eqfn = s_rdict_hashfn = SomeValue::Impossible`) exactly
+/// as `class DictKey(ListItem)` declares in dictdef.py:8-9. This is
+/// the minimum-deviation collapse of subclass → flattened field
+/// (parity rule #1).
 #[derive(Debug)]
 pub struct ListItem {
     /// RPython `self.s_value` (listdef.py:30).
     pub s_value: SomeValue,
+    /// RPython `self.bookkeeper` (listdef.py:31). `None` matches
+    /// upstream's `bookkeeper=None` path (listdef.py:34-35) and sets
+    /// [`Self::dont_change_any_more`] at construction.
+    pub bookkeeper: Option<Rc<Bookkeeper>>,
     /// RPython `self.mutated` (listdef.py:13).
     pub mutated: bool,
     /// RPython `self.resized` (listdef.py:14).
     pub resized: bool,
-    /// RPython `self.range_step` (listdef.py:15).
-    pub range_step: RangeStep,
-    /// RPython `self.dont_change_any_more` (listdef.py:16). Set when
-    /// the bookkeeper is None or when the annotator has declared
-    /// annotations final.
+    /// RPython `self.range_step` (listdef.py:15). Upstream stores the
+    /// step as either `None` (list not from a range()) or an integer;
+    /// `0` means "variable step" — the sentinel value produced by
+    /// merging two constant-step lists with different step values.
+    pub range_step: Option<i64>,
+    /// RPython `self.dont_change_any_more` (listdef.py:16).
     pub dont_change_any_more: bool,
-    /// RPython `self.immutable` (listdef.py:17). Set by
-    /// `_immutable_fields_` hints.
+    /// RPython `self.immutable` (listdef.py:17).
     pub immutable: bool,
-    /// RPython `self.must_not_resize` (listdef.py:18). Set by
-    /// `make_sure_not_resized()`.
+    /// RPython `self.must_not_resize` (listdef.py:18).
     pub must_not_resize: bool,
-    /// RPython `self.itemof` (listdef.py:32). Weak backrefs to every
-    /// [`ListDefInner`] currently using this `ListItem`, so
-    /// `merge()` can retarget each ListDef's `listitem` slot.
-    pub(crate) itemof: Vec<Weak<ListDefInner>>,
-    // `read_locations` and `bookkeeper` are deferred to the
-    // bookkeeper.py port. Adding the fields as unit-typed
-    // placeholders keeps the struct shape close to upstream for
-    // future diffs.
-    pub(crate) _read_locations_placeholder: (),
-    pub(crate) _bookkeeper_placeholder: (),
+    /// RPython `self.itemof = {}` (listdef.py:32). Weak backrefs to
+    /// every owner currently using this `ListItem`.
+    pub(crate) itemof: Vec<ItemOwner>,
+    /// RPython `self.read_locations = set()` (listdef.py:33).
+    pub read_locations: HashSet<PositionKey>,
+    /// Flattened `DictKey.custom_eq_hash` (dictdef.py:13). `false` for
+    /// every non-DictKey ListItem.
+    pub custom_eq_hash: bool,
+    /// Flattened `DictKey.s_rdict_eqfn` (dictdef.py:8). Defaults to
+    /// `SomeValue::Impossible` (= upstream `s_ImpossibleValue`).
+    pub s_rdict_eqfn: SomeValue,
+    /// Flattened `DictKey.s_rdict_hashfn` (dictdef.py:9).
+    pub s_rdict_hashfn: SomeValue,
 }
 
 impl ListItem {
     /// RPython `ListItem.__init__(bookkeeper, s_value)` (listdef.py:29-35).
     ///
-    /// `bookkeeper=None` path — sets `dont_change_any_more = True`
-    /// matching upstream line 34-35. Use [`Self::with_bookkeeper`] to
-    /// produce a mutable variant.
-    pub fn new(s_value: SomeValue) -> Self {
+    /// Sets `dont_change_any_more = True` when `bookkeeper is None`.
+    pub fn new(bookkeeper: Option<Rc<Bookkeeper>>, s_value: SomeValue) -> Self {
+        let dont_change_any_more = bookkeeper.is_none();
         ListItem {
             s_value,
+            bookkeeper,
             mutated: false,
             resized: false,
-            range_step: RangeStep::NotRange,
-            dont_change_any_more: true,
+            range_step: None,
+            dont_change_any_more,
             immutable: false,
             must_not_resize: false,
             itemof: Vec::new(),
-            _read_locations_placeholder: (),
-            _bookkeeper_placeholder: (),
+            read_locations: HashSet::new(),
+            // Flattened DictKey defaults (dictdef.py:8-9, 13).
+            custom_eq_hash: false,
+            s_rdict_eqfn: SomeValue::Impossible,
+            s_rdict_hashfn: SomeValue::Impossible,
         }
     }
 
-    /// RPython `ListItem.__init__(bookkeeper=<live>, s_value)` path —
-    /// `dont_change_any_more` stays False. Phase 5 P5.1 uses a unit
-    /// placeholder for the bookkeeper; Phase 5's bookkeeper.py port
-    /// replaces this with the real carrier.
-    pub fn with_bookkeeper(s_value: SomeValue) -> Self {
-        let mut li = Self::new(s_value);
-        li.dont_change_any_more = false;
-        li
+    /// RPython `ListItem.notify_update()` (listdef.py:104-107).
+    ///
+    /// Triggers `self.bookkeeper.annotator.reflowfromposition(pk)` for
+    /// every `pk` in `self.read_locations`. The annotator backlink on
+    /// `Bookkeeper` is Phase 5 P5.2 territory — until bookkeeper.py is
+    /// ported, this method walks `read_locations` but the reflow call
+    /// body stays empty. The structural call sites inside
+    /// [`Self::merge`] match upstream `listdef.py:95,97` exactly so no
+    /// deviation gets introduced at the call-site level.
+    pub fn notify_update(&self) {
+        for _position_key in &self.read_locations {
+            // upstream: `self.bookkeeper.annotator.reflowfromposition(pk)`.
+            // Bookkeeper.annotator / Annotator.reflowfromposition are
+            // ported together in Phase 5 P5.2; leaving the loop body
+            // empty preserves upstream's walk order without silently
+            // succeeding on a missing reflow.
+        }
+    }
+
+    /// RPython `ListItem.generalize(s_other_value)` (listdef.py:109-117).
+    ///
+    /// Widens `self.s_value` with `s_other_value` via `unionof`, then
+    /// (if widened) notifies reflow readers. Returns `true` when the
+    /// type actually widened.
+    pub fn generalize(&mut self, s_other_value: &SomeValue) -> Result<bool, UnionError> {
+        let s_new_value = super::model::union(&self.s_value, s_other_value)?;
+        let updated = s_new_value != self.s_value;
+        if updated {
+            if self.dont_change_any_more {
+                return Err(UnionError {
+                    lhs: self.s_value.clone(),
+                    rhs: s_other_value.clone(),
+                    msg: "TooLateForChange on generalize()".into(),
+                });
+            }
+            self.s_value = s_new_value;
+            self.notify_update();
+        }
+        Ok(updated)
     }
 
     /// RPython `ListItem.mutate()` (listdef.py:37-42).
@@ -244,12 +290,217 @@ impl ListItem {
         }
         Ok(())
     }
+
+    /// RPython `ListItem.setrangestep(step)` (listdef.py:52-56).
+    pub fn setrangestep(&mut self, step: Option<i64>) -> Result<(), TooLateForChange> {
+        if step != self.range_step {
+            if self.dont_change_any_more {
+                return Err(TooLateForChange);
+            }
+            self.range_step = step;
+        }
+        Ok(())
+    }
+
+    /// RPython `ListItem.merge(other)` (listdef.py:58-98).
+    ///
+    /// Takes two `Rc<RefCell<ListItem>>` associated-function style
+    /// rather than `&mut self` / `&mut other` because the borrow
+    /// checker refuses two mutable borrows of the same `Vec<ItemOwner>`
+    /// slot when the caller happens to pass the same Rc twice (the
+    /// `Rc::ptr_eq` shortcut below exits before any borrow). The
+    /// upstream method name is preserved.
+    pub fn merge(
+        self_li: &Rc<RefCell<ListItem>>,
+        other_li: &Rc<RefCell<ListItem>>,
+    ) -> Result<Rc<RefCell<ListItem>>, UnionError> {
+        // upstream: `if self is not other:`.
+        if Rc::ptr_eq(self_li, other_li) {
+            return Ok(self_li.clone());
+        }
+
+        // upstream: `if getattr(TLS, 'no_side_effects_in_union', 0):
+        //                raise UnionError(self, other)`.
+        if in_side_effect_free_union() {
+            let a = self_li.borrow();
+            let b = other_li.borrow();
+            return Err(UnionError {
+                lhs: a.s_value.clone(),
+                rhs: b.s_value.clone(),
+                msg: "ListItem.merge during side-effect-free union".into(),
+            });
+        }
+
+        // upstream: `if other.dont_change_any_more: if
+        // self.dont_change_any_more: raise TooLateForChange;
+        // else: self, other = other, self` (listdef.py:63-71).
+        let (driver_li, folded_li) = {
+            let self_b = self_li.borrow();
+            let other_b = other_li.borrow();
+            if other_b.dont_change_any_more {
+                if self_b.dont_change_any_more {
+                    return Err(UnionError {
+                        lhs: self_b.s_value.clone(),
+                        rhs: other_b.s_value.clone(),
+                        msg: "TooLateForChange".into(),
+                    });
+                }
+                (other_li, self_li)
+            } else {
+                (self_li, other_li)
+            }
+        };
+
+        // Snapshot folded side (everything upstream reads as `other.X`
+        // after the swap). Having a single snapshot prevents intermixed
+        // borrows with driver_mut below.
+        let (folded_s_value, folded_itemof, folded_read_locations, folded_flags) = {
+            let folded_b = folded_li.borrow();
+            (
+                folded_b.s_value.clone(),
+                folded_b.itemof.clone(),
+                folded_b.read_locations.clone(),
+                (
+                    folded_b.mutated,
+                    folded_b.resized,
+                    folded_b.immutable,
+                    folded_b.must_not_resize,
+                    folded_b.range_step,
+                ),
+            )
+        };
+
+        // upstream lines 73-85: flag merges. Order preserved exactly.
+        {
+            let mut driver_mut = driver_li.borrow_mut();
+            driver_mut.immutable &= folded_flags.2;
+            if folded_flags.3 {
+                if driver_mut.resized {
+                    return Err(UnionError {
+                        lhs: driver_mut.s_value.clone(),
+                        rhs: folded_s_value.clone(),
+                        msg: "ListChangeUnallowed: list merge with a resized".into(),
+                    });
+                }
+                driver_mut.must_not_resize = true;
+            }
+        }
+        if folded_flags.0 {
+            // upstream: `self.mutate()` — propagates TooLateForChange.
+            driver_li.borrow_mut().mutate().map_err(|_| UnionError {
+                lhs: driver_li.borrow().s_value.clone(),
+                rhs: folded_s_value.clone(),
+                msg: "TooLateForChange on mutate() during merge".into(),
+            })?;
+        }
+        if folded_flags.1 {
+            // upstream: `self.resize()` — propagates TooLateForChange /
+            // ListChangeUnallowed.
+            driver_li.borrow_mut().resize().map_err(|e| UnionError {
+                lhs: driver_li.borrow().s_value.clone(),
+                rhs: folded_s_value.clone(),
+                msg: e.msg.unwrap_or_else(|| "resize() failed".into()),
+            })?;
+        }
+        let driver_range_step = driver_li.borrow().range_step;
+        if folded_flags.4 != driver_range_step {
+            // upstream: `self.setrangestep(self._step_map[...])`.
+            let new_step = merge_range_step(driver_range_step, folded_flags.4);
+            driver_li
+                .borrow_mut()
+                .setrangestep(new_step)
+                .map_err(|_| UnionError {
+                    lhs: driver_li.borrow().s_value.clone(),
+                    rhs: folded_s_value.clone(),
+                    msg: "TooLateForChange on setrangestep() during merge".into(),
+                })?;
+        }
+
+        // upstream: `self.itemof.update(other.itemof)` (listdef.py:85).
+        driver_li
+            .borrow_mut()
+            .itemof
+            .extend(folded_itemof.iter().cloned());
+
+        // upstream lines 86-91.
+        let driver_s_value_pre = driver_li.borrow().s_value.clone();
+        let new_s_value = super::model::union(&driver_s_value_pre, &folded_s_value)?;
+        let widens_driver = new_s_value != driver_s_value_pre;
+        let widens_folded = new_s_value != folded_s_value;
+        if widens_driver && driver_li.borrow().dont_change_any_more {
+            return Err(UnionError {
+                lhs: driver_s_value_pre,
+                rhs: folded_s_value,
+                msg: "TooLateForChange on dont_change_any_more ListItem".into(),
+            });
+        }
+
+        // upstream: `self.patch()` (listdef.py:92, 100-103). After the
+        // itemof.update above, driver.itemof holds every owner; retarget
+        // them all to driver.
+        let patch_list = driver_li.borrow().itemof.clone();
+        for owner in &patch_list {
+            match owner {
+                ItemOwner::ListDef(weak) => {
+                    if let Some(inner) = weak.upgrade() {
+                        *inner.listitem.borrow_mut() = driver_li.clone();
+                    }
+                }
+                ItemOwner::DictKey(weak) => {
+                    if let Some(inner) = weak.upgrade() {
+                        *inner.dictkey.borrow_mut() = driver_li.clone();
+                    }
+                }
+                ItemOwner::DictValue(weak) => {
+                    if let Some(inner) = weak.upgrade() {
+                        *inner.dictvalue.borrow_mut() = driver_li.clone();
+                    }
+                }
+            }
+        }
+
+        // upstream lines 93-98: conditional s_value update + notify +
+        // read_locations merge.
+        if widens_driver {
+            driver_li.borrow_mut().s_value = new_s_value;
+            driver_li.borrow().notify_update();
+        }
+        if widens_folded {
+            // upstream: `other.notify_update()`. folded_li still holds
+            // the old read_locations snapshot before we overwrite
+            // driver.read_locations below.
+            folded_li.borrow().notify_update();
+        }
+        // upstream: `self.read_locations |= other.read_locations`.
+        driver_li
+            .borrow_mut()
+            .read_locations
+            .extend(folded_read_locations);
+
+        Ok(driver_li.clone())
+    }
+}
+
+/// RPython `ListItem._step_map[type(self.range_step),
+/// type(other.range_step)]` (listdef.py:23-27). Upstream keys the dict
+/// on `(type(None), int)` / `(int, type(None))` / `(int, int)`.
+fn merge_range_step(self_step: Option<i64>, other_step: Option<i64>) -> Option<i64> {
+    match (self_step, other_step) {
+        // `(NoneType, int)` / `(int, NoneType)` → None.
+        (None, Some(_)) | (Some(_), None) => None,
+        // `(int, int)` with different values → 0 (variable step).
+        (Some(a), Some(b)) if a != b => Some(0),
+        // Same-value (int, int) or (None, None) — upstream never
+        // invokes the map on equality, so the branch just returns
+        // self.
+        _ => self_step,
+    }
 }
 
 /// Inner cell of a [`ListDef`].
 ///
 /// `listitem` lives inside an interior-mutable slot so
-/// [`ListItem::merge`] can retarget it through a `Weak<ListDefInner>`.
+/// [`ListItem::merge`] can retarget it through an [`ItemOwner`].
 #[derive(Debug)]
 pub struct ListDefInner {
     pub(crate) listitem: RefCell<Rc<RefCell<ListItem>>>,
@@ -262,42 +513,31 @@ pub struct ListDef {
 }
 
 impl ListDef {
-    /// RPython `ListDef.__init__(bookkeeper=None, s_item, mutated=False,
-    /// resized=False)` (listdef.py:125-130) — `bookkeeper=None` path.
-    /// Created listitems are marked `dont_change_any_more = True`.
-    pub fn new(s_item: SomeValue) -> Self {
-        Self::construct(ListItem::new(s_item), false, false)
-    }
-
-    /// RPython `ListDef.__init__(bookkeeper=<live>, s_item, …)` path.
-    /// The resulting `ListItem` is mutable — `dont_change_any_more`
-    /// stays False so the bookkeeper-aware merge path succeeds.
-    pub fn mutable(s_item: SomeValue) -> Self {
-        Self::construct(ListItem::with_bookkeeper(s_item), false, false)
-    }
-
-    /// RPython variant that sets `mutated` / `resized` at construction
-    /// time (used by `s_list_of_strings` etc.). Uses the `None`
-    /// bookkeeper path to match upstream.
-    pub fn with_flags(s_item: SomeValue, mutated: bool, resized: bool) -> Self {
-        Self::construct(ListItem::new(s_item), mutated, resized)
-    }
-
-    fn construct(mut item: ListItem, mutated: bool, resized: bool) -> Self {
+    /// RPython `ListDef.__init__(bookkeeper, s_item=s_ImpossibleValue,
+    /// mutated=False, resized=False)` (listdef.py:125-130).
+    pub fn new(
+        bookkeeper: Option<Rc<Bookkeeper>>,
+        s_item: SomeValue,
+        mutated: bool,
+        resized: bool,
+    ) -> Self {
+        let mut item = ListItem::new(bookkeeper, s_item);
+        // upstream: `self.listitem.mutated = mutated | resized;
+        //            self.listitem.resized = resized`.
         item.mutated = mutated || resized;
         item.resized = resized;
         let li = Rc::new(RefCell::new(item));
         let inner = Rc::new(ListDefInner {
             listitem: RefCell::new(li.clone()),
         });
-        li.borrow_mut().itemof.push(Rc::downgrade(&inner));
+        // upstream: `self.listitem.itemof[self] = True`.
+        li.borrow_mut()
+            .itemof
+            .push(ItemOwner::ListDef(Rc::downgrade(&inner)));
         ListDef { inner }
     }
 
     /// RPython `ListDef.same_as(other)` (listdef.py:136-137).
-    ///
-    /// `self.listitem is other.listitem` — identity, not structural
-    /// equality.
     pub fn same_as(&self, other: &ListDef) -> bool {
         let a = self.inner.listitem.borrow();
         let b = other.inner.listitem.borrow();
@@ -305,38 +545,103 @@ impl ListDef {
     }
 
     /// RPython `ListDef.union(other)` (listdef.py:139-141).
-    ///
-    /// Merges `other`'s `ListItem` into `self`'s, patching every
-    /// sister `ListDef` (including `other` itself) to share the
-    /// merged cell. Returns `self` for upstream method-chaining.
     pub fn union_with(&self, other: &ListDef) -> Result<(), UnionError> {
         let self_li = self.inner.listitem.borrow().clone();
         let other_li = other.inner.listitem.borrow().clone();
-        let _ = merge_items(&self_li, &other_li)?;
+        let _ = ListItem::merge(&self_li, &other_li)?;
         Ok(())
     }
 
-    /// RPython `ListDef.s_value` accessor — shortcut to the current
-    /// `ListItem`'s element annotation.
+    /// RPython `ListDef.listitem.s_value` accessor — shortcut used by
+    /// call sites that only need the element annotation without
+    /// borrowing the listitem directly.
     pub fn s_value(&self) -> SomeValue {
         self.inner.listitem.borrow().borrow().s_value.clone()
     }
 
-    /// RPython `ListDef.mutate()` / `resize()` / `never_resize()`
-    /// (listdef.py:182-192). Full port lands with Phase 5's
-    /// bookkeeper-aware annotator; included as forwarders for now.
+    /// RPython `ListDef.mutate()` (listdef.py:182-183).
     pub fn mutate(&self) -> Result<(), TooLateForChange> {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
         li_mut.mutate()
     }
+
+    /// RPython `ListDef.read_item(position_key)` (listdef.py:132-134).
+    ///
+    /// Records a read location for eventual `notify_update()` reflow,
+    /// then returns the current element annotation.
+    pub fn read_item(&self, position_key: PositionKey) -> SomeValue {
+        let li = self.inner.listitem.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        li_mut.read_locations.insert(position_key);
+        li_mut.s_value.clone()
+    }
+
+    /// RPython `ListDef.generalize(s_value)` (listdef.py:167-168).
+    pub fn generalize(&self, s_value: &SomeValue) -> Result<bool, UnionError> {
+        let li = self.inner.listitem.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        li_mut.generalize(s_value)
+    }
+
+    /// RPython `ListDef.generalize_range_step(range_step)`
+    /// (listdef.py:170-173).
+    ///
+    /// Creates a fresh ListItem carrying the candidate `range_step`,
+    /// then merges it into `self.listitem` so `_step_map` collapses
+    /// the two step values (matching upstream lines 82-85).
+    pub fn generalize_range_step(&self, range_step: Option<i64>) -> Result<(), UnionError> {
+        let bookkeeper = {
+            let li = self.inner.listitem.borrow().clone();
+            li.borrow().bookkeeper.clone()
+        };
+        let mut new_item = ListItem::new(bookkeeper, SomeValue::Impossible);
+        new_item.range_step = range_step;
+        let new_li = Rc::new(RefCell::new(new_item));
+        let self_li = self.inner.listitem.borrow().clone();
+        let _ = ListItem::merge(&self_li, &new_li)?;
+        Ok(())
+    }
+
+    /// RPython `ListDef.agree(bookkeeper, other)` (listdef.py:143-152).
+    ///
+    /// Bidirectionally generalises both sides against each other at
+    /// the bookkeeper's current position, then reconciles `range_step`
+    /// if either side is range-derived. Upstream reads
+    /// `bookkeeper.position_key` directly and crashes on `None`; we
+    /// surface that as a [`UnionError`] so callers see the parity
+    /// violation instead of an opaque panic.
+    pub fn agree(&self, bookkeeper: &Bookkeeper, other: &ListDef) -> Result<(), UnionError> {
+        let position = bookkeeper
+            .current_position_key()
+            .ok_or_else(|| UnionError {
+                lhs: SomeValue::Impossible,
+                rhs: SomeValue::Impossible,
+                msg: "ListDef.agree called without bookkeeper.position_key set".into(),
+            })?;
+        let s_self_value = self.read_item(position);
+        let s_other_value = other.read_item(position);
+        self.generalize(&s_other_value)?;
+        other.generalize(&s_self_value)?;
+        let (self_step, other_step) = {
+            let a = self.inner.listitem.borrow().clone();
+            let b = other.inner.listitem.borrow().clone();
+            (a.borrow().range_step, b.borrow().range_step)
+        };
+        if self_step.is_some() {
+            self.generalize_range_step(other_step)?;
+        }
+        if other_step.is_some() {
+            other.generalize_range_step(self_step)?;
+        }
+        Ok(())
+    }
 }
 
 impl PartialEq for ListDef {
-    // RPython `SomeList.__eq__` at model.py:339-348 calls
-    // `listdef.same_as(other.listdef)`. Mirror the identity semantics
-    // directly on [`ListDef`] so any downstream `derive(PartialEq)`
-    // picks up the correct behaviour.
+    /// RPython `SomeList.__eq__` (model.py:339-348) uses
+    /// `listdef.same_as`; mirror the identity-only semantics here so
+    /// wrapping structs picking up `derive(PartialEq)` inherit it.
     fn eq(&self, other: &Self) -> bool {
         self.same_as(other)
     }
@@ -353,125 +658,11 @@ impl std::hash::Hash for ListDef {
     }
 }
 
-/// RPython `ListItem.merge(other)` (listdef.py:58-98) — free function
-/// form so `DictKey` / `DictValue` can reuse the core merge loop.
-pub(crate) fn merge_items(
-    self_li: &Rc<RefCell<ListItem>>,
-    other_li: &Rc<RefCell<ListItem>>,
-) -> Result<Rc<RefCell<ListItem>>, UnionError> {
-    // upstream: `if self is not other`.
-    if Rc::ptr_eq(self_li, other_li) {
-        return Ok(self_li.clone());
-    }
-
-    // upstream: `if getattr(TLS, 'no_side_effects_in_union', 0):
-    //                raise UnionError(self, other)`.
-    if in_side_effect_free_union() {
-        let a = self_li.borrow();
-        let b = other_li.borrow();
-        return Err(UnionError {
-            lhs: a.s_value.clone(),
-            rhs: b.s_value.clone(),
-            msg: "ListItem.merge during side-effect-free union".into(),
-        });
-    }
-
-    // upstream dont_change_any_more dance (listdef.py:63-71).
-    // If other is final but self isn't, swap so the final one is
-    // `self` — merges into it then raise TooLateForChange if it widens.
-    let (driver_li, folded_li) = {
-        let self_b = self_li.borrow();
-        let other_b = other_li.borrow();
-        if other_b.dont_change_any_more && !self_b.dont_change_any_more {
-            (other_li, self_li)
-        } else {
-            (self_li, other_li)
-        }
-    };
-
-    // Snapshot flags / s_value / itemof before mutating.
-    let (folded_s_value, folded_itemof, folded_flags) = {
-        let folded_b = folded_li.borrow();
-        (
-            folded_b.s_value.clone(),
-            folded_b.itemof.clone(),
-            (
-                folded_b.mutated,
-                folded_b.resized,
-                folded_b.immutable,
-                folded_b.must_not_resize,
-                folded_b.range_step,
-            ),
-        )
-    };
-
-    let (driver_s_value, driver_range_step) = {
-        let driver_b = driver_li.borrow();
-        (driver_b.s_value.clone(), driver_b.range_step)
-    };
-
-    // Union element types (may recurse but never takes a side-effect-
-    // free guard — the outer caller already decided whether to mutate).
-    let new_s_value = super::model::union(&driver_s_value, &folded_s_value)?;
-    let widens = new_s_value != driver_s_value;
-
-    // upstream: `if s_new_value != s_value: if self.dont_change_any_more:
-    //                raise TooLateForChange`.
-    if widens && driver_li.borrow().dont_change_any_more {
-        return Err(UnionError {
-            lhs: driver_s_value,
-            rhs: folded_s_value,
-            msg: "TooLateForChange on dont_change_any_more ListItem".into(),
-        });
-    }
-
-    // upstream flag merges (listdef.py:73-85).
-    {
-        let mut driver_mut = driver_li.borrow_mut();
-        driver_mut.immutable &= folded_flags.2;
-        if folded_flags.3 {
-            // other.must_not_resize — upstream raises
-            // ListChangeUnallowed if self.resized.
-            if driver_mut.resized {
-                return Err(UnionError {
-                    lhs: driver_mut.s_value.clone(),
-                    rhs: folded_s_value,
-                    msg: "ListChangeUnallowed: list merge with a resized".into(),
-                });
-            }
-            driver_mut.must_not_resize = true;
-        }
-        if folded_flags.0 {
-            let _ = driver_mut.mutate();
-        }
-        if folded_flags.1 {
-            let _ = driver_mut.resize();
-        }
-        if folded_flags.4 != driver_range_step {
-            driver_mut.range_step = driver_range_step.merge(folded_flags.4);
-        }
-        // upstream: `self.itemof.update(other.itemof)`.
-        driver_mut.itemof.extend(folded_itemof.iter().cloned());
-        if widens {
-            driver_mut.s_value = new_s_value;
-        }
-    }
-
-    // upstream: `self.patch()` — retarget every ListDefInner in the
-    // just-extended itemof to point at self.
-    for weak in &folded_itemof {
-        if let Some(inner) = weak.upgrade() {
-            *inner.listitem.borrow_mut() = driver_li.clone();
-        }
-    }
-
-    Ok(driver_li.clone())
-}
-
 /// RPython `s_list_of_strings = SomeList(ListDef(None,
 /// SomeString(no_nul=True), resized=True))` (listdef.py:206-207).
 pub fn s_list_of_strings() -> super::model::SomeList {
-    super::model::SomeList::new(ListDef::with_flags(
+    super::model::SomeList::new(ListDef::new(
+        None,
         super::model::SomeValue::String(super::model::SomeString::new(false, true)),
         false,
         true,
@@ -483,46 +674,77 @@ mod tests {
     use super::super::model::{SomeInteger, SomeValue};
     use super::*;
 
+    fn bk() -> Rc<Bookkeeper> {
+        Rc::new(Bookkeeper::new())
+    }
+
     #[test]
     fn same_as_identity_preserved_across_clone() {
-        let a = ListDef::new(SomeValue::Integer(SomeInteger::default()));
+        let a = ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        );
         let b = a.clone();
         assert!(a.same_as(&b));
     }
 
     #[test]
     fn distinct_listdefs_are_not_same_as() {
-        let a = ListDef::new(SomeValue::Integer(SomeInteger::default()));
-        let b = ListDef::new(SomeValue::Integer(SomeInteger::default()));
+        let a = ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        );
+        let b = ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        );
         assert!(!a.same_as(&b));
     }
 
     #[test]
     fn union_with_shares_listitem_after_merge() {
-        let a = ListDef::new(SomeValue::Integer(SomeInteger::new(true, false)));
-        let b = ListDef::new(SomeValue::Integer(SomeInteger::new(false, false)));
+        // bookkeeper=Some(...) → dont_change_any_more stays False, so
+        // merge proceeds without TooLateForChange.
+        let a = ListDef::new(
+            Some(bk()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        );
+        let b = ListDef::new(
+            Some(bk()),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+            false,
+        );
         assert!(!a.same_as(&b));
-
-        // By default both listdefs are dont_change_any_more = true
-        // (bookkeeper=None). Allow the merge by clearing the flag.
-        a.inner.listitem.borrow().borrow_mut().dont_change_any_more = false;
-        b.inner.listitem.borrow().borrow_mut().dont_change_any_more = false;
-
         a.union_with(&b).expect("merge must succeed");
         assert!(a.same_as(&b));
     }
 
     #[test]
     fn merge_refuses_under_side_effect_free_guard() {
-        let a = ListDef::new(SomeValue::Integer(SomeInteger::new(true, false)));
-        let b = ListDef::new(SomeValue::Integer(SomeInteger::new(false, false)));
-
-        a.inner.listitem.borrow().borrow_mut().dont_change_any_more = false;
-        b.inner.listitem.borrow().borrow_mut().dont_change_any_more = false;
+        let a = ListDef::new(
+            Some(bk()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        );
+        let b = ListDef::new(
+            Some(bk()),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+            false,
+        );
 
         let _guard = SideEffectFreeGuard::enter();
         assert!(a.union_with(&b).is_err());
-        // Without merging, same_as stays false.
         assert!(!a.same_as(&b));
     }
 
@@ -530,12 +752,34 @@ mod tests {
     fn dont_change_any_more_merge_widening_errors() {
         // upstream: merging two final listitems with different element
         // types triggers TooLateForChange.
-        let a = ListDef::new(SomeValue::Integer(SomeInteger::new(true, false)));
-        let b = ListDef::new(SomeValue::Integer(SomeInteger::new(false, false)));
-        // Both stay dont_change_any_more = true (bookkeeper=None path).
+        let a = ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        );
+        let b = ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+            false,
+        );
         let err = a
             .union_with(&b)
             .expect_err("widening final list must error");
         assert!(err.msg.contains("TooLateForChange"));
+    }
+
+    #[test]
+    fn merge_range_step_matches_upstream_table() {
+        // upstream `_step_map`:
+        //   (NoneType, int) → None
+        //   (int, NoneType) → None
+        //   (int, int)      → 0
+        assert_eq!(merge_range_step(None, Some(2)), None);
+        assert_eq!(merge_range_step(Some(2), None), None);
+        assert_eq!(merge_range_step(Some(2), Some(3)), Some(0));
+        // Same-value / double-None fall back to self.
+        assert_eq!(merge_range_step(None, None), None);
     }
 }

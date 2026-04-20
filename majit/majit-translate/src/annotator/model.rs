@@ -928,7 +928,7 @@ impl ClassDef {
 /// of a constant callable / class / frozen PBC entry. A4.5 carries
 /// only the kind tag + qualified name; Phase 5's description.py port
 /// (637 LOC) fills in the bookkeeper / specialization hooks.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Desc {
     pub kind: DescKind,
     pub name: String,
@@ -936,7 +936,7 @@ pub struct Desc {
 
 /// `type(desc)` dispatched on in upstream's `SomePBC.getKind()`
 /// (model.py:558-566). The Rust port closes the set explicitly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DescKind {
     /// RPython `description.FunctionDesc`.
     Function,
@@ -969,25 +969,16 @@ pub struct SomeInstance {
     pub can_be_none: bool,
     /// RPython `self.flags = flags` (model.py:438).
     ///
-    /// Upstream is a Python `dict` whose keys and values are
-    /// bookkeeper-defined flag names / flag payloads (typically
-    /// booleans or `None`; see
-    /// `rpython/annotator/classdesc.py::_canbe_immutable_default` and
-    /// `rpython/rtyper/lltypesystem/rclass.py::getflavor`). The Rust
-    /// port models the dict directly as `BTreeMap<String, FlagValue>`
-    /// — `BTreeMap` so the field stays `Eq`-comparable through a
-    /// stable iteration order, and `FlagValue::Bool(bool)` for the
-    /// boolean-flag case bookkeeper sites actually emit. Upstream
-    /// non-boolean flag payloads will land with the bookkeeper port.
-    pub flags: std::collections::BTreeMap<String, FlagValue>,
-}
-
-/// RPython flags carried on `SomeInstance.flags` — currently only the
-/// boolean case is exercised by Phase 4 call sites. Further payload
-/// types (String, None sentinel) land with the bookkeeper.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum FlagValue {
-    Bool(bool),
+    /// Upstream is a Python `dict` whose values are the booleans /
+    /// None sentinels produced by `binaryop.py:679`
+    /// (`ins2.flags[key] != value` comparisons) and
+    /// `description.py:492`. The Rust port stores a
+    /// `BTreeMap<String, bool>` — `BTreeMap` so the field stays
+    /// `Eq`-comparable through a stable iteration order. Upstream
+    /// non-boolean flag payloads (None sentinels observed only at
+    /// classdesc.py:336) will widen this value type when the bookkeeper
+    /// lands.
+    pub flags: std::collections::BTreeMap<String, bool>,
 }
 
 impl SomeInstance {
@@ -995,7 +986,7 @@ impl SomeInstance {
     pub fn new(
         classdef: Option<ClassDef>,
         can_be_none: bool,
-        flags: std::collections::BTreeMap<String, FlagValue>,
+        flags: std::collections::BTreeMap<String, bool>,
     ) -> Self {
         SomeInstance {
             base: SomeObjectBase::new(KnownType::Other, false),
@@ -1088,11 +1079,9 @@ impl SomeObjectTrait for SomeException {
 /// Upstream `SomePBC.__init__` (model.py:519-553) performs substantial
 /// bookkeeping that the Rust port does not yet replicate:
 ///
-///   * `descriptions` is stored as a **Python `set`** (unordered,
-///     identity-hashed `Desc` instances). The Rust port carries a
-///     `Vec<Desc>` with structural equality; downstream `get_kind`
-///     / union merging consumes it as a set but we do not dedup on
-///     insertion.
+///   * `descriptions` is stored as a Python `set`. The Rust port
+///     mirrors that shape with a `BTreeSet<Desc>` so union and
+///     noneify semantics stay set-based and deterministic.
 ///   * `simplify()` — calls `kind.simplify_desc_set(descriptions)` to
 ///     collapse `MethodDesc`s that shadow each other. **Not ported**.
 ///   * `knowntype = reduce(commonbase, [x.knowntype for x in descriptions])`
@@ -1113,13 +1102,13 @@ impl SomeObjectTrait for SomeException {
 ///
 /// These gaps are intentional at A4.5 because they depend on Phase 5's
 /// classdesc.py / description.py port (together ~1600 LOC). When that
-/// port lands, this struct gains a `descriptions: BTreeSet<Desc>`
-/// field, a `simplify()` method, and a `commonbase`-driven
-/// `knowntype` setter.
+/// port lands, this struct keeps the `BTreeSet<Desc>` shape, gains a
+/// real `simplify()` method, and computes `knowntype` via
+/// `commonbase`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomePBC {
     pub base: SomeObjectBase,
-    pub descriptions: Vec<Desc>,
+    pub descriptions: std::collections::BTreeSet<Desc>,
     pub can_be_none: bool,
     /// RPython `self.subset_of` — pointer to a wider PBC; `None` for
     /// the top PBC.
@@ -1134,15 +1123,16 @@ impl SomePBC {
     ///   * `simplify()` call (model.py:526),
     ///   * `reduce(commonbase, ...)` knowntype folding (model.py:527-531),
     ///   * `len(descriptions) > 1` kind-enforcement branch (model.py:538-553).
-    pub fn new(descriptions: Vec<Desc>, can_be_none: bool) -> Self {
+    pub fn new(descriptions: impl IntoIterator<Item = Desc>, can_be_none: bool) -> Self {
         Self::with_subset(descriptions, can_be_none, None)
     }
 
     pub fn with_subset(
-        descriptions: Vec<Desc>,
+        descriptions: impl IntoIterator<Item = Desc>,
         can_be_none: bool,
         subset_of: Option<Box<SomePBC>>,
     ) -> Self {
+        let descriptions: std::collections::BTreeSet<Desc> = descriptions.into_iter().collect();
         assert!(!descriptions.is_empty(), "SomePBC must be non-empty");
         SomePBC {
             base: SomeObjectBase::new(KnownType::Other, true),
@@ -1152,30 +1142,48 @@ impl SomePBC {
         }
     }
 
-    /// RPython `SomePBC.getKind()` (model.py:558-566). Returns the
-    /// unique [`DescKind`] present across every entry; panics if the
-    /// set mixes kinds (upstream: `AnnotatorError`).
-    pub fn get_kind(&self) -> DescKind {
-        let first = self.descriptions[0].kind;
-        for d in &self.descriptions[1..] {
-            assert_eq!(
-                d.kind, first,
-                "mixing several kinds of PBCs — upstream AnnotatorError"
-            );
+    /// RPython `SomePBC.getKind()` (model.py:558-566).
+    ///
+    /// Returns the common [`DescKind`] of every description in the
+    /// PBC. Upstream raises `AnnotatorError("mixing several kinds of
+    /// PBCs: %r")` when the set straddles two subclasses of `Desc`.
+    pub fn get_kind(&self) -> Result<DescKind, AnnotatorError> {
+        let mut kinds: std::collections::BTreeSet<DescKind> = std::collections::BTreeSet::new();
+        for desc in &self.descriptions {
+            kinds.insert(desc.kind);
         }
-        first
+        if kinds.len() > 1 {
+            return Err(AnnotatorError::new(format!(
+                "mixing several kinds of PBCs: {kinds:?}"
+            )));
+        }
+        kinds
+            .into_iter()
+            .next()
+            .ok_or_else(|| AnnotatorError::new("empty SomePBC descriptions"))
     }
 
     /// RPython `SomePBC.simplify()` (model.py:568-574).
     ///
-    /// **Not ported.** Upstream collapses shadow-MethodDescs via
-    /// `kind.simplify_desc_set(self.descriptions)`. Phase 5's
-    /// description.py port provides `FunctionDesc.simplify_desc_set`,
-    /// `MethodDesc.simplify_desc_set`, etc. — until then this function
-    /// is a no-op. Callers that need genuine deduplication should feed
-    /// unique Descs to `new()`.
-    pub fn simplify(&mut self) {
-        // no-op; see docstring.
+    /// Upstream has two responsibilities here:
+    ///   1. assert kind-homogeneity via `getKind()` — ported below;
+    ///   2. collapse shadow-MethodDescs via
+    ///      `kind.simplify_desc_set(self.descriptions)` — **blocked on
+    ///      description.py / classdesc.py** (Phase 5 P5.2).
+    /// Until the descriptor machinery lands the second step is a
+    /// no-op; the first step catches the bug upstream's `assert` was
+    /// actually guarding against (see `binaryop.py:782`).
+    pub fn simplify(&mut self) -> Result<(), AnnotatorError> {
+        // upstream: `kind = self.getKind()`.
+        let _kind = self.get_kind()?;
+        // upstream: `if len(self.descriptions) > 1:
+        //                kind.simplify_desc_set(self.descriptions)`.
+        // Blocked on description.py / classdesc.py. Structural call
+        // site preserved as comment for the follow-up port.
+        //   if self.descriptions.len() > 1 {
+        //       kind.simplify_desc_set(&mut self.descriptions);
+        //   }
+        Ok(())
     }
 }
 
@@ -1188,10 +1196,20 @@ impl SomeObjectTrait for SomePBC {
     }
     fn is_constant(&self) -> bool {
         // upstream: `SomePBC.__init__` sets `self.const` when
-        // `len(descriptions) == 1 and not can_be_None and pyobj is not None`.
-        // The pyobj check requires a live Description; A4.5 approximates
-        // with "single-description + not nullable".
-        self.base.const_box.is_some() || (self.descriptions.len() == 1 && !self.can_be_none)
+        // `len(descriptions) == 1 and not can_be_None and desc.pyobj
+        // is not None` (model.py:534-537). The `pyobj is not None`
+        // guard matters: descriptions that lack a backing Python value
+        // (e.g. forward-referenced classes, specializations without
+        // pyobj) must not be treated as constants.
+        //
+        // `annotator::model::Desc` is the Phase 4 A4.5 stub flavour
+        // (kind + name only) — no `pyobj` field yet. Until
+        // `description::Desc` is unified with `model::Desc` (handoff
+        // gotcha #1), we cannot inspect the per-desc pyobj cheaply, so
+        // we fall back to the explicit `const_box` signal only. A
+        // single-desc PBC that was *never* witnessed with a concrete
+        // pyobj stays non-constant, matching upstream's pyobj gate.
+        self.base.const_box.is_some()
     }
     fn can_be_none(&self) -> bool {
         self.can_be_none
@@ -2015,25 +2033,65 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             Ok(SomeValue::Exception(SomeException::new(classdefs)))
         }
 
+        // `pair(SomeIterator, SomeIterator).union()` in binaryop.py:
+        // container union plus exact variant match.
+        (SomeValue::Iterator(a), SomeValue::Iterator(b)) => {
+            if a.variant != b.variant {
+                return Err(UnionError {
+                    lhs: s1.clone(),
+                    rhs: s2.clone(),
+                    msg: "RPython cannot unify incompatible iterator variants".into(),
+                });
+            }
+            let s_container = union(&a.s_container, &b.s_container)?;
+            Ok(SomeValue::Iterator(SomeIterator::new(
+                s_container,
+                a.variant.clone(),
+            )))
+        }
+
+        // `pair(SomeBuiltinMethod, SomeBuiltinMethod).union()` in
+        // binaryop.py: analyser/methodname must match; `s_self`
+        // widens by union.
+        (SomeValue::BuiltinMethod(a), SomeValue::BuiltinMethod(b)) => {
+            if a.analyser_name != b.analyser_name || a.methodname != b.methodname {
+                return Err(UnionError {
+                    lhs: s1.clone(),
+                    rhs: s2.clone(),
+                    msg: "RPython cannot unify distinct builtin methods".into(),
+                });
+            }
+            let s_self = union(&a.s_self, &b.s_self)?;
+            Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                a.analyser_name.clone(),
+                s_self,
+                a.methodname.clone(),
+            )))
+        }
+
         // SomePBC ∪ SomePBC — description set union, subject to the
         // mixed-kind check (upstream: AnnotatorError if the two PBCs
         // have different `getKind()`). can_be_none OR, subset_of
         // forgotten when the sets no longer agree.
         (SomeValue::PBC(a), SomeValue::PBC(b)) => {
-            let mut descriptions = a.descriptions.clone();
-            for d in &b.descriptions {
-                if !descriptions.contains(d) {
-                    descriptions.push(d.clone());
-                }
-            }
             let can_be_none = a.can_be_none || b.can_be_none;
-            let merged = SomePBC::with_subset(descriptions, can_be_none, None);
-            // Mixed-kind guard — SomePBC::get_kind() panics via
-            // upstream's AnnotatorError contract. Here we return
-            // UnionError explicitly rather than panic so the caller
-            // can choose how to surface the failure.
-            let a_kind = a.get_kind();
-            let b_kind = b.get_kind();
+            // upstream model.py:558-566: `getKind()` raises
+            // `AnnotatorError("mixing several kinds of PBCs")` for a
+            // single PBC whose descriptions span multiple Desc
+            // subclasses. The union also widens across the two sides
+            // — mixed kinds on EITHER side or BETWEEN sides surfaces
+            // as `UnionError` here.
+            let unpack = |s: &SomePBC, orig: &SomeValue| -> Result<DescKind, UnionError> {
+                s.get_kind().map_err(|e| UnionError {
+                    lhs: orig.clone(),
+                    rhs: orig.clone(),
+                    msg: e
+                        .msg
+                        .unwrap_or_else(|| "mixing several kinds of PBCs".into()),
+                })
+            };
+            let a_kind = unpack(a, s1)?;
+            let b_kind = unpack(b, s2)?;
             if a_kind != b_kind {
                 return Err(UnionError {
                     lhs: s1.clone(),
@@ -2041,6 +2099,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                     msg: format!("mixing several kinds of PBCs: {a_kind:?} and {b_kind:?}"),
                 });
             }
+            let descriptions = a.descriptions.union(&b.descriptions).cloned();
+            let merged = SomePBC::with_subset(descriptions, can_be_none, None);
             Ok(SomeValue::PBC(merged))
         }
 
@@ -2131,6 +2191,35 @@ pub fn add_knowntypedata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
+    /// `ListDef::new(None, s_item, false, false)` shortcut — matches
+    /// upstream `ListDef(None, s_item)` signature for test fixtures.
+    fn ld(s_item: SomeValue) -> ListDef {
+        ListDef::new(None, s_item, false, false)
+    }
+
+    /// `ListDef::new(Some(<bk>), s_item, false, false)` shortcut —
+    /// matches upstream `ListDef('dummy', s_item)` signature.
+    fn ld_mutable(s_item: SomeValue) -> ListDef {
+        ListDef::new(
+            Some(Rc::new(super::super::bookkeeper::Bookkeeper::new())),
+            s_item,
+            false,
+            false,
+        )
+    }
+
+    fn dd_mutable(s_key: SomeValue, s_value: SomeValue) -> DictDef {
+        DictDef::new(
+            Some(Rc::new(super::super::bookkeeper::Bookkeeper::new())),
+            s_key,
+            s_value,
+            false,
+            false,
+            false,
+        )
+    }
 
     #[test]
     fn someobject_defaults_match_upstream() {
@@ -2259,7 +2348,7 @@ mod tests {
     fn somelist_matches_upstream_defaults() {
         // upstream: `SomeList.can_be_none() → True`,
         // `SomeList.knowntype = list`, `immutable = False`.
-        let listdef = ListDef::new(SomeValue::Integer(SomeInteger::default()));
+        let listdef = ld(SomeValue::Integer(SomeInteger::default()));
         let s = SomeValue::List(SomeList::new(listdef));
         assert!(!s.immutable());
         assert!(s.can_be_none());
@@ -2274,9 +2363,9 @@ mod tests {
         // so two independently constructed SomeLists compare
         // UN-equal even when their element types agree — matches
         // upstream exactly.
-        let a = SomeList::new(ListDef::new(SomeValue::Integer(SomeInteger::default())));
-        let b = SomeList::new(ListDef::new(SomeValue::Integer(SomeInteger::default())));
-        let c = SomeList::new(ListDef::new(SomeValue::Float(SomeFloat::new())));
+        let a = SomeList::new(ld(SomeValue::Integer(SomeInteger::default())));
+        let b = SomeList::new(ld(SomeValue::Integer(SomeInteger::default())));
+        let c = SomeList::new(ld(SomeValue::Float(SomeFloat::new())));
         // Distinct ListDefs, regardless of element-type equality, are
         // never same_as.
         assert_ne!(a, b);
@@ -2320,8 +2409,12 @@ mod tests {
     #[test]
     fn somedict_matches_upstream_defaults() {
         let dictdef = DictDef::new(
+            None,
             SomeValue::String(SomeString::default()),
             SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
         );
         let s = SomeValue::Dict(SomeDict::new(dictdef));
         assert!(!s.immutable());
@@ -2331,13 +2424,48 @@ mod tests {
     #[test]
     fn someiterator_wraps_container_and_is_not_nullable() {
         let s = SomeValue::Iterator(SomeIterator::new(
-            SomeValue::List(SomeList::new(ListDef::new(SomeValue::Integer(
-                SomeInteger::default(),
-            )))),
+            SomeValue::List(SomeList::new(ld(
+                SomeValue::Integer(SomeInteger::default()),
+            ))),
             vec!["items".to_string()],
         ));
         assert!(!s.can_be_none());
         assert!(!s.immutable());
+    }
+
+    #[test]
+    fn union_iterators_require_matching_variant_and_union_container() {
+        let a = SomeValue::Iterator(SomeIterator::new(
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::new(true, false),
+            )))),
+            vec!["items".to_string()],
+        ));
+        let b = SomeValue::Iterator(SomeIterator::new(
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::new(false, false),
+            )))),
+            vec!["items".to_string()],
+        ));
+        let merged = union(&a, &b).unwrap();
+        let SomeValue::Iterator(iter) = merged else {
+            panic!("expected SomeIterator");
+        };
+        let SomeValue::List(list) = *iter.s_container else {
+            panic!("expected SomeList container");
+        };
+        let SomeValue::Integer(elem) = list.listdef.s_value() else {
+            panic!("expected SomeInteger element");
+        };
+        assert!(!elem.nonneg);
+
+        let keys = SomeValue::Iterator(SomeIterator::new(
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::default(),
+            )))),
+            vec!["keys".to_string()],
+        ));
+        assert!(union(&a, &keys).is_err());
     }
 
     #[test]
@@ -2367,13 +2495,13 @@ mod tests {
             ],
             false,
         );
-        assert_eq!(pbc.get_kind(), DescKind::Function);
+        assert_eq!(pbc.get_kind().unwrap(), DescKind::Function);
     }
 
     #[test]
-    #[should_panic(expected = "mixing several kinds of PBCs")]
-    fn somepbc_get_kind_panics_on_mixed_set() {
-        // upstream: raises AnnotatorError when kinds differ.
+    fn somepbc_get_kind_errors_on_mixed_set() {
+        // upstream: raises AnnotatorError when kinds differ
+        // (model.py:565).
         let pbc = SomePBC::new(
             vec![
                 Desc::new(DescKind::Function, "a"),
@@ -2381,17 +2509,35 @@ mod tests {
             ],
             false,
         );
-        pbc.get_kind();
+        let err = pbc.get_kind().expect_err("mixed kinds must error");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("mixing several kinds of PBCs")
+        );
     }
 
     #[test]
-    fn somepbc_single_desc_is_constant_shortcut() {
-        // upstream: `len(descriptions) == 1 and not can_be_None` sets
-        // `self.const = desc.pyobj`. A4.5 surfaces that via is_constant().
+    fn somepbc_single_desc_without_pyobj_is_not_constant() {
+        // upstream: model.py:534-537 — is_constant holds only when
+        // `len(descriptions) == 1 and not can_be_None and desc.pyobj
+        // is not None`. `annotator::model::Desc` is the A4.5 stub
+        // flavour (kind + name, no pyobj), so a single-desc SomePBC
+        // built from it has no witnessed Python value and therefore
+        // must NOT claim constant-ness — that was the pyobj gate the
+        // A4.5 approximation was missing.
         let pbc = SomePBC::new(vec![Desc::new(DescKind::Function, "f")], false);
-        assert!(pbc.is_constant());
+        assert!(!pbc.is_constant());
         let pbc_nullable = SomePBC::new(vec![Desc::new(DescKind::Function, "f")], true);
         assert!(!pbc_nullable.is_constant());
+    }
+
+    #[test]
+    fn somepbc_constructor_deduplicates_description_set() {
+        let desc = Desc::new(DescKind::Function, "f");
+        let pbc = SomePBC::new(vec![desc.clone(), desc], false);
+        assert_eq!(pbc.descriptions.len(), 1);
     }
 
     #[test]
@@ -2422,14 +2568,52 @@ mod tests {
     fn somebuiltinmethod_is_immutable_and_not_nullable() {
         let s = SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
             "getitem",
-            SomeValue::List(SomeList::new(ListDef::new(SomeValue::Integer(
-                SomeInteger::default(),
-            )))),
+            SomeValue::List(SomeList::new(ld(
+                SomeValue::Integer(SomeInteger::default()),
+            ))),
             "__getitem__",
         ));
         assert!(s.immutable());
         assert!(!s.can_be_none());
         assert_eq!(s.knowntype(), KnownType::BuiltinFunctionOrMethod);
+    }
+
+    #[test]
+    fn union_builtin_methods_require_same_identity_and_union_self() {
+        let a = SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+            "getitem",
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::new(true, false),
+            )))),
+            "__getitem__",
+        ));
+        let b = SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+            "getitem",
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::new(false, false),
+            )))),
+            "__getitem__",
+        ));
+        let merged = union(&a, &b).unwrap();
+        let SomeValue::BuiltinMethod(method) = merged else {
+            panic!("expected SomeBuiltinMethod");
+        };
+        let SomeValue::List(list) = *method.s_self else {
+            panic!("expected SomeList receiver");
+        };
+        let SomeValue::Integer(elem) = list.listdef.s_value() else {
+            panic!("expected SomeInteger element");
+        };
+        assert!(!elem.nonneg);
+
+        let different_name = SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+            "getitem",
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::default(),
+            )))),
+            "__setitem__",
+        ));
+        assert!(union(&a, &different_name).is_err());
     }
 
     #[test]
@@ -2538,10 +2722,10 @@ mod tests {
     fn union_list_element_types_merge() {
         // ListDef::mutable = bookkeeper-present path so merge is
         // allowed (matches upstream `ListDef('dummy', ...)`).
-        let a = SomeValue::List(SomeList::new(ListDef::mutable(SomeValue::Integer(
+        let a = SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
             SomeInteger::new(true, false),
         ))));
-        let b = SomeValue::List(SomeList::new(ListDef::mutable(SomeValue::Integer(
+        let b = SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
             SomeInteger::new(false, false),
         ))));
         let u = union(&a, &b).unwrap();
@@ -2574,10 +2758,10 @@ mod tests {
     #[test]
     fn union_same_classdef_instances_keeps_only_matching_flags() {
         let mut flags_a = std::collections::BTreeMap::new();
-        flags_a.insert("immutable".to_string(), FlagValue::Bool(true));
+        flags_a.insert("immutable".to_string(), true);
         let mut flags_b = std::collections::BTreeMap::new();
-        flags_b.insert("immutable".to_string(), FlagValue::Bool(true));
-        flags_b.insert("pinned".to_string(), FlagValue::Bool(true));
+        flags_b.insert("immutable".to_string(), true);
+        flags_b.insert("pinned".to_string(), true);
 
         let cdef = Some(ClassDef::new("pkg.X"));
         let a = SomeValue::Instance(SomeInstance::new(cdef.clone(), false, flags_a));
@@ -2716,6 +2900,22 @@ mod tests {
             panic!("expected SomePBC");
         };
         assert!(merged.can_be_none);
+    }
+
+    #[test]
+    fn union_none_and_pbc_preserves_subset_of() {
+        let parent = SomePBC::new(vec![Desc::new(DescKind::Function, "f")], false);
+        let child = SomeValue::PBC(SomePBC::with_subset(
+            vec![Desc::new(DescKind::Function, "f")],
+            false,
+            Some(Box::new(parent.clone())),
+        ));
+        let merged = union(&s_none(), &child).unwrap();
+        let SomeValue::PBC(pbc) = merged else {
+            panic!("expected SomePBC");
+        };
+        assert!(pbc.can_be_none);
+        assert_eq!(pbc.subset_of, Some(Box::new(parent)));
     }
 
     #[test]

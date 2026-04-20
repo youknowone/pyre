@@ -31,6 +31,7 @@ use std::sync::LazyLock;
 
 use super::flowcontext::{FlowContext, FlowContextError, FlowingError};
 use super::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
+use super::operation::OpKind;
 
 /// Registered SPECIAL_CASE callable. The variants mirror upstream's
 /// two handler shapes: direct `sc_*` handlers and redirected
@@ -199,11 +200,7 @@ fn sc_locals(_ctx: &mut FlowContext, _args_w: &[Hlvalue]) -> Result<Hlvalue, Flo
 /// present → `ctx.appcall(getattr, w_obj, w_index, w_default)`.
 fn sc_getattr(ctx: &mut FlowContext, args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
     match args_w {
-        [w_obj, w_index] => ctx.record_maybe_raise_op(
-            "getattr",
-            vec![w_obj.clone(), w_index.clone()],
-            FlowContext::common_exception_cases(),
-        ),
+        [w_obj, w_index] => ctx.eval_hlop(OpKind::GetAttr, vec![w_obj.clone(), w_index.clone()]),
         [w_obj, w_index, w_default] => {
             let callee = HOST_ENV.lookup_builtin("getattr").unwrap();
             ctx.appcall(

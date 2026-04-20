@@ -119,6 +119,12 @@ pub struct HostCode {
     pub names: Vec<String>,
     pub co_varnames: Vec<String>,
     pub co_freevars: Vec<String>,
+    /// Upstream `HostCode.co_cellvars` — the tuple of variable names
+    /// that form the function's enclosing cells (`__closure__`). Empty
+    /// for every RPython-legal function; a non-empty tuple is the
+    /// closure-detection signal used by `objspace._assert_rpythonic`
+    /// (objspace.py:25).
+    pub co_cellvars: Vec<String>,
     pub co_filename: String,
     pub co_name: String,
     pub co_firstlineno: u32,
@@ -138,6 +144,7 @@ impl PartialEq for HostCode {
             && self.names == other.names
             && self.co_varnames == other.co_varnames
             && self.co_freevars == other.co_freevars
+            && self.co_cellvars == other.co_cellvars
             && self.co_filename == other.co_filename
             && self.co_name == other.co_name
             && self.co_firstlineno == other.co_firstlineno
@@ -171,6 +178,7 @@ impl HostCode {
         firstlineno: u32,
         lnotab: Vec<u8>,
         freevars: Vec<String>,
+        cellvars: Vec<String>,
         exceptiontable: Box<[u8]>,
     ) -> Self {
         assert!(nlocals as i64 >= 0, "nlocals must be non-negative");
@@ -184,6 +192,7 @@ impl HostCode {
             names,
             co_varnames: varnames,
             co_freevars: freevars,
+            co_cellvars: cellvars,
             co_filename: filename,
             co_name: name,
             co_firstlineno: firstlineno,
@@ -221,6 +230,7 @@ impl HostCode {
             firstlineno,
             code.linetable.iter().copied().collect(),
             code.freevars.iter().cloned().collect(),
+            code.cellvars.iter().cloned().collect(),
             code.exceptiontable.clone(),
         )
     }

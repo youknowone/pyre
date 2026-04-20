@@ -310,12 +310,20 @@ impl HostEnv {
         // BaseException → Exception → …, rpython/rlib/rstackovf.py 의
         // _StackOverflow 까지 upstream 이 flow 중에 참조하는 class 를
         // 미리 materialise.
+        //
+        // rstackovf.py:10-14 — `class StackOverflow(RuntimeError)` 이
+        // 진짜 class 이고, 같은 class object 가 `_StackOverflow` 라는
+        // 이름으로도 바인딩된다. 그 직후 모듈-수준 `StackOverflow` 는
+        // `((RuntimeError, RuntimeError),)` 튜플 sentinel 로 rebind
+        // 되지만, flowspace 에서 참조되는 식별자는 `_StackOverflow`
+        // 쪽이다 (annotator.exception.standard_exceptions 항목 이름과
+        // 일치). Rust 포트는 동일 class object 를 두 lookup key 에
+        // 등록해 upstream 식별자 공유를 재현한다.
         let base = HostObject::new_class("BaseException", vec![]);
         let exc = HostObject::new_class("Exception", vec![base.clone()]);
         let runtime = HostObject::new_class("RuntimeError", vec![exc.clone()]);
-        let stackovf = HostObject::new_class("StackOverflow", vec![exc.clone()]);
+        let stackovf = HostObject::new_class("StackOverflow", vec![runtime.clone()]);
         let not_impl = HostObject::new_class("NotImplementedError", vec![runtime.clone()]);
-        let _stack = HostObject::new_class("_StackOverflow", vec![stackovf.clone()]);
 
         let children = [
             ("AssertionError", &exc),
@@ -339,9 +347,13 @@ impl HostEnv {
         self.insert_builtin("BaseException", base);
         self.insert_builtin("Exception", exc);
         self.insert_builtin("RuntimeError", runtime);
-        self.insert_builtin("StackOverflow", stackovf);
+        // upstream `_StackOverflow = StackOverflow` (rstackovf.py:14) —
+        // 동일 class object 를 두 키에 등록. "StackOverflow" 는 모듈
+        // 수준의 원 class 이름, "_StackOverflow" 는 flow-level 에서
+        // 쓰이는 별칭.
+        self.insert_builtin("StackOverflow", stackovf.clone());
+        self.insert_builtin("_StackOverflow", stackovf);
         self.insert_builtin("NotImplementedError", not_impl);
-        self.insert_builtin("_StackOverflow", _stack);
     }
 
     fn bootstrap_builtin_types(&mut self) {
@@ -1640,6 +1652,11 @@ impl BlockRefExt for BlockRef {
 pub struct GraphFunc {
     /// Python function `__name__`.
     pub name: String,
+    /// Optional method owner, mirroring upstream `func.class_`.
+    pub class_: Option<HostObject>,
+    /// Upstream generator helper attribute populated by
+    /// `attach_next_method()`.
+    pub _generator_next_method_of_: Option<HostObject>,
     /// Python function `__globals__`, wrapped as a flow-space
     /// constant.
     pub globals: Constant,
@@ -1655,12 +1672,18 @@ pub struct GraphFunc {
     pub firstlineno: Option<u32>,
     /// `func.__code__.co_filename`.
     pub filename: Option<String>,
+    /// Upstream `func._not_rpython_` attribute (objspace.py:21). Set
+    /// to `true` by RPython's `@not_rpython` decorator to mark a
+    /// function as flow-space-ineligible.
+    pub not_rpython: bool,
 }
 
 impl GraphFunc {
     pub fn new(name: impl Into<String>, globals: Constant) -> Self {
         GraphFunc {
             name: name.into(),
+            class_: None,
+            _generator_next_method_of_: None,
             globals,
             closure: Vec::new(),
             defaults: Vec::new(),
@@ -1668,6 +1691,7 @@ impl GraphFunc {
             source: None,
             firstlineno: None,
             filename: None,
+            not_rpython: false,
         }
     }
 

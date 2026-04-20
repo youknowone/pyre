@@ -56,6 +56,7 @@ use super::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FSException, FunctionGraph, GraphFunc,
     HOST_ENV, Hlvalue, HostObject, Link, SpaceOperation, Variable, c_last_exception,
 };
+use super::operation::{BuiltinException, HLOperation, OpKind};
 use super::specialcase::{SpecialCaseDispatch, lookup_builtin, lookup_special_case};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -856,6 +857,12 @@ pub enum FlowContextError {
 impl From<BytecodeCorruption> for FlowContextError {
     fn from(value: BytecodeCorruption) -> Self {
         FlowContextError::BytecodeCorruption(value)
+    }
+}
+
+impl From<FlowingError> for FlowContextError {
+    fn from(value: FlowingError) -> Self {
+        FlowContextError::Flowing(value)
     }
 }
 
@@ -1738,9 +1745,9 @@ impl FlowContext {
         // `ctx.do_op()` (operation.py:92-96). Mirror that by running
         // the flowspace-level constant folder over the candidate op;
         // if it folds, skip emitting a SpaceOperation entirely.
-        if let Some(kind) = super::operation::OpKind::from_opname(&opname) {
-            let hlop = super::operation::HLOperation::new(kind, args.clone());
-            if let Some(folded) = hlop.constfold() {
+        if let Some(kind) = OpKind::from_opname(&opname) {
+            let hlop = HLOperation::new(kind, args.clone());
+            if let Some(folded) = hlop.constfold()? {
                 return Ok(folded);
             }
         }
@@ -1759,6 +1766,25 @@ impl FlowContext {
         let result = Hlvalue::Variable(Variable::new());
         self.record(SpaceOperation::new(opname, args, result.clone()))?;
         self.guessexception(&exceptions)?;
+        Ok(result)
+    }
+
+    pub(crate) fn eval_hlop(
+        &mut self,
+        kind: OpKind,
+        args: Vec<Hlvalue>,
+    ) -> Result<Hlvalue, FlowContextError> {
+        self.maybe_merge()?;
+        let hlop = HLOperation::new(kind, args);
+        if let Some(folded) = hlop.constfold()? {
+            return Ok(folded);
+        }
+        let result = Hlvalue::Variable(hlop.result.clone());
+        self.record(hlop.into_space_operation())?;
+        let exceptions = Self::builtin_exception_cases(kind.canraise());
+        if !exceptions.is_empty() {
+            self.guessexception(&exceptions)?;
+        }
         Ok(result)
     }
 
@@ -1876,8 +1902,23 @@ impl FlowContext {
         vec![exception_class_value("Exception")]
     }
 
-    fn stop_iteration_cases() -> Vec<Hlvalue> {
-        vec![exception_class_value("StopIteration")]
+    fn builtin_exception_cases(exceptions: &[BuiltinException]) -> Vec<Hlvalue> {
+        exceptions
+            .iter()
+            .map(|exception| {
+                exception_class_value(match exception {
+                    BuiltinException::ValueError => "ValueError",
+                    BuiltinException::UnicodeDecodeError => "UnicodeDecodeError",
+                    BuiltinException::ZeroDivisionError => "ZeroDivisionError",
+                    BuiltinException::OverflowError => "OverflowError",
+                    BuiltinException::IndexError => "IndexError",
+                    BuiltinException::KeyError => "KeyError",
+                    BuiltinException::StopIteration => "StopIteration",
+                    BuiltinException::RuntimeError => "RuntimeError",
+                    BuiltinException::Exception => "Exception",
+                })
+            })
+            .collect()
     }
 
     fn store_fast(&mut self, varindex: usize, w_newvalue: Hlvalue) {
@@ -2276,11 +2317,7 @@ impl FlowContext {
                 Instruction::LoadAttr { .. } => {
                     let w_obj = self.pop_hlvalue()?;
                     let w_name = self.getname_w(load_attr_name_index(oparg))?;
-                    let w_value = self.record_maybe_raise_op(
-                        "getattr",
-                        vec![w_obj, w_name],
-                        Self::common_exception_cases(),
-                    )?;
+                    let w_value = self.eval_hlop(OpKind::GetAttr, vec![w_obj, w_name])?;
                     if (oparg & 1) != 0 {
                         self.pushvalue(StackElem::Value(null_value()));
                     }
@@ -2627,11 +2664,7 @@ impl FlowContext {
                 }
                 Instruction::GetIter => {
                     let iterable = self.pop_hlvalue()?;
-                    let iterator = self.record_maybe_raise_op(
-                        "iter",
-                        vec![iterable],
-                        Self::common_exception_cases(),
-                    )?;
+                    let iterator = self.eval_hlop(OpKind::Iter, vec![iterable])?;
                     self.pushvalue(StackElem::Value(iterator));
                     Ok(None)
                 }
@@ -2643,11 +2676,7 @@ impl FlowContext {
                         self.stackdepth(),
                         FrameBlockKind::Iter,
                     ));
-                    let w_nextitem = self.record_maybe_raise_op(
-                        "next",
-                        vec![w_iterator],
-                        Self::stop_iteration_cases(),
-                    )?;
+                    let w_nextitem = self.eval_hlop(OpKind::Next, vec![w_iterator])?;
                     self.blockstack.pop();
                     self.pushvalue(StackElem::Value(w_nextitem));
                     Ok(None)
@@ -3893,6 +3922,18 @@ mod test {
     }
 
     #[test]
+    fn builtin_exception_cases_follow_operation_next_table() {
+        let cases = FlowContext::builtin_exception_cases(OpKind::Next.canraise());
+        assert_eq!(
+            cases,
+            vec![
+                exception_class_value("StopIteration"),
+                exception_class_value("RuntimeError"),
+            ]
+        );
+    }
+
+    #[test]
     fn build_flow_handles_try_except_via_exception_table() {
         let mut ctx = flow_context(
             "def f(x):\n    try:\n        return 1 / x\n    except Exception:\n        return 0\n",
@@ -4139,6 +4180,28 @@ mod test {
         assert!(
             ops.iter().any(|op| op == "getattr"),
             "expected sc_getattr to record `getattr` op, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn eval_hlop_getattr_folds_constant_module_member() {
+        let mut ctx = flow_context("def f():\n    return 0\n");
+        let module = HOST_ENV
+            .import_module("rpython.rlib.rfile")
+            .expect("bootstrap module must exist");
+        let folded = ctx
+            .eval_hlop(
+                OpKind::GetAttr,
+                vec![
+                    Hlvalue::Constant(Constant::new(ConstValue::HostObject(module))),
+                    Hlvalue::Constant(Constant::new(ConstValue::Str("create_file".to_string()))),
+                ],
+            )
+            .expect("constant module getattr should fold");
+        assert!(matches!(folded, Hlvalue::Constant(_)));
+        assert!(
+            ctx.graph.iterblockops().is_empty(),
+            "folded getattr must not record a SpaceOperation"
         );
     }
 

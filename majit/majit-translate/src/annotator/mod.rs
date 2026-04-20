@@ -29,7 +29,12 @@
 //! | `signature`       (Phase 5)   | `signature.py`                  |
 //! | `specialize`      (Phase 5)   | `specialize.py`                 |
 
+pub mod argument;
+pub mod bookkeeper;
+pub mod description;
 pub mod dictdef;
 pub mod exception;
 pub mod listdef;
 pub mod model;
+pub mod policy;
+pub mod signature;

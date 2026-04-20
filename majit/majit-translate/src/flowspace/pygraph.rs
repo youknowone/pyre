@@ -72,13 +72,19 @@ impl PyGraph {
     ///
     /// Upstream folds `<`, `>`, `&`, `!` to `_` so the generated name
     /// is safe for identifier-shaped use downstream (graph dumps, C
-    /// symbol generation). The optional `class_` attribute that
-    /// upstream queries is populated by `CallableFactory.pycall`;
-    /// `GraphFunc` does not carry that attribute at this phase, so the
-    /// Rust port omits the `ClassName.method` prefix and documents the
-    /// gap inline.
+    /// symbol generation). If `func.class_` is present, prefix the
+    /// function name with `class_.__name__`.
     pub fn sanitize_funcname(func: &GraphFunc) -> String {
-        let mut name = func.name.clone();
+        let mut name = if let Some(class_) = &func.class_ {
+            let class_name = class_
+                .qualname()
+                .rsplit('.')
+                .next()
+                .unwrap_or(class_.qualname());
+            format!("{class_name}.{}", func.name)
+        } else {
+            func.name.clone()
+        };
         for c in ['<', '>', '&', '!'] {
             name = name.replace(c, "_");
         }
@@ -107,6 +113,7 @@ mod tests {
             co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
             co_varnames: varnames.iter().map(|s| s.to_string()).collect(),
             co_freevars: Vec::new(),
+            co_cellvars: Vec::new(),
             consts: Vec::new(),
             names: Vec::new(),
             co_lnotab: Vec::new(),
@@ -159,5 +166,15 @@ mod tests {
 
         let func = GraphFunc::new("plain_name", empty_globals());
         assert_eq!(PyGraph::sanitize_funcname(&func), "plain_name");
+    }
+
+    #[test]
+    fn sanitize_funcname_prefixes_method_owner_name() {
+        let mut func = GraphFunc::new("method", empty_globals());
+        func.class_ = Some(super::super::model::HostObject::new_class(
+            "pkg.Owner",
+            vec![],
+        ));
+        assert_eq!(PyGraph::sanitize_funcname(&func), "Owner.method");
     }
 }

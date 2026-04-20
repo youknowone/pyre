@@ -9,82 +9,197 @@
 //! Rust adaptation (parity rule #1, minimum deviation):
 //!
 //! * Upstream `class DictKey(ListItem)` / `class DictValue(ListItem)`
-//!   extend `ListItem`. Rust has no single inheritance — the port
-//!   composes `ListItem` inside `DictKey` / `DictValue` structs and
-//!   re-exposes the subset of the base API that dictdef callers
-//!   actually touch (`merge`, `generalize`, `s_value`). The two
-//!   `patch()` overrides (each retarget the appropriate slot on the
-//!   containing `DictDef`) land as explicit methods on the wrappers.
+//!   extend `ListItem`. Rust has no single inheritance, so the
+//!   subclass-only fields (`custom_eq_hash`, `s_rdict_eqfn`,
+//!   `s_rdict_hashfn`) live flattened on [`super::listdef::ListItem`]
+//!   itself — see the `PRE-EXISTING-ADAPTATION` doc on that struct.
+//!   `DictKey` / `DictValue` here become zero-sized namespaces for the
+//!   subclass's `__init__` / `merge` associated functions, matching
+//!   the upstream class shape at the call-site level. The `patch()`
+//!   overrides (dictdef.py:15-17, 70-72) retarget the appropriate slot
+//!   on the containing `DictDef` via
+//!   [`super::listdef::ItemOwner::DictKey`] /
+//!   [`super::listdef::ItemOwner::DictValue`] variants consulted by
+//!   the shared `ListItem::merge` patch loop.
 //!
-//! * `DictKey.custom_eq_hash` / `r_dict` support (`update_rdict_annotations`,
-//!   `emulate_rdict_calls`) depends on the bookkeeper / PBC call
-//!   machinery — deferred to Phase 5's bookkeeper.py port. The field
-//!   is carried on the struct so the shape matches upstream, but all
-//!   paths that mutate it are no-ops for now.
+//! * `DictKey.emulate_rdict_calls` (dictdef.py:43-66) requires the
+//!   bookkeeper's `emulate_pbc_call` — Phase 5 P5.2 dependency. The
+//!   call site in [`DictKey::update_rdict_annotations`] stays but the
+//!   bookkeeper dispatch is a TODO pending the bookkeeper port.
 
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
-use super::listdef::{ListItem, merge_items};
-use super::model::{SomeValue, UnionError};
+use super::bookkeeper::{Bookkeeper, PositionKey};
+use super::listdef::{ItemOwner, ListItem};
+use super::model::{SomeValue, UnionError, union};
 
-/// RPython `class DictKey(ListItem)` (dictdef.py:7-66).
-///
-/// Carries an extra `custom_eq_hash` flag + `s_rdict_eqfn` /
-/// `s_rdict_hashfn` annotations when the dict is built via
-/// `objectmodel.r_dict(...)`. Phase 5 P5.1 keeps the extension as a
-/// composed struct; the `r_dict` call-emulation paths are stubbed.
+/// RPython `class DictKey(ListItem)` (dictdef.py:7-66). Zero-sized
+/// namespace for the subclass constructor + `merge` override. The
+/// subclass-specific `custom_eq_hash` / `s_rdict_eqfn` /
+/// `s_rdict_hashfn` fields live on [`ListItem`] itself (see that
+/// struct's PRE-EXISTING-ADAPTATION).
 #[derive(Debug)]
-pub struct DictKey {
-    pub item: ListItem,
-    /// RPython `self.custom_eq_hash` (dictdef.py:13).
-    pub custom_eq_hash: bool,
-    /// RPython `self.s_rdict_eqfn` (dictdef.py:8) — defaults to
-    /// `s_ImpossibleValue`.
-    pub s_rdict_eqfn: SomeValue,
-    /// RPython `self.s_rdict_hashfn` (dictdef.py:9).
-    pub s_rdict_hashfn: SomeValue,
-}
+pub struct DictKey;
 
 impl DictKey {
-    pub fn new(s_value: SomeValue, is_r_dict: bool) -> Self {
-        DictKey {
-            item: ListItem::new(s_value),
-            custom_eq_hash: is_r_dict,
-            s_rdict_eqfn: SomeValue::Impossible,
-            s_rdict_hashfn: SomeValue::Impossible,
-        }
+    /// RPython `DictKey.__init__(bookkeeper, s_value, is_r_dict=False)`
+    /// (dictdef.py:11-13). Returns the underlying `ListItem` wrapped in
+    /// a shared cell, ready for storage in `DictDef.dictkey`.
+    pub fn new(
+        bookkeeper: Option<Rc<Bookkeeper>>,
+        s_value: SomeValue,
+        is_r_dict: bool,
+    ) -> Rc<RefCell<ListItem>> {
+        let mut item = ListItem::new(bookkeeper, s_value);
+        // upstream: `self.custom_eq_hash = is_r_dict` (dictdef.py:13).
+        item.custom_eq_hash = is_r_dict;
+        Rc::new(RefCell::new(item))
     }
 
-    pub fn with_bookkeeper(s_value: SomeValue, is_r_dict: bool) -> Self {
-        DictKey {
-            item: ListItem::with_bookkeeper(s_value),
-            custom_eq_hash: is_r_dict,
-            s_rdict_eqfn: SomeValue::Impossible,
-            s_rdict_hashfn: SomeValue::Impossible,
+    /// RPython `DictKey.merge(self, other)` (dictdef.py:19-27).
+    ///
+    /// Wraps [`ListItem::merge`] with the `custom_eq_hash` mixing-guard
+    /// from upstream line 21-22 and propagates `update_rdict_annotations`
+    /// from upstream line 24-27.
+    pub fn merge(
+        self_li: &Rc<RefCell<ListItem>>,
+        other_li: &Rc<RefCell<ListItem>>,
+    ) -> Result<Rc<RefCell<ListItem>>, UnionError> {
+        // upstream: `if self is not other:`.
+        if !Rc::ptr_eq(self_li, other_li) {
+            // upstream: `assert self.custom_eq_hash == other.custom_eq_hash,
+            //            "mixing plain dictionaries with r_dict()"`.
+            let (self_ceh, other_ceh) = (
+                self_li.borrow().custom_eq_hash,
+                other_li.borrow().custom_eq_hash,
+            );
+            if self_ceh != other_ceh {
+                return Err(UnionError {
+                    lhs: self_li.borrow().s_value.clone(),
+                    rhs: other_li.borrow().s_value.clone(),
+                    msg: "mixing plain dictionaries with r_dict()".into(),
+                });
+            }
         }
+
+        // Snapshot other's rdict annotations before ListItem::merge
+        // potentially retargets the cell.
+        let (other_eqfn, other_hashfn) = {
+            let b = other_li.borrow();
+            (b.s_rdict_eqfn.clone(), b.s_rdict_hashfn.clone())
+        };
+
+        let merged = ListItem::merge(self_li, other_li)?;
+
+        // upstream: `if self.custom_eq_hash: self.update_rdict_annotations(
+        //     other.s_rdict_eqfn, other.s_rdict_hashfn, other=other)`.
+        if merged.borrow().custom_eq_hash {
+            Self::update_rdict_annotations(&merged, other_eqfn, other_hashfn)?;
+        }
+        Ok(merged)
+    }
+
+    /// RPython `DictKey.update_rdict_annotations(s_eqfn, s_hashfn,
+    /// other=None)` (dictdef.py:35-41).
+    pub fn update_rdict_annotations(
+        self_li: &Rc<RefCell<ListItem>>,
+        s_eqfn: SomeValue,
+        s_hashfn: SomeValue,
+    ) -> Result<(), UnionError> {
+        // upstream: `assert self.custom_eq_hash`.
+        debug_assert!(self_li.borrow().custom_eq_hash);
+        let (cur_eqfn, cur_hashfn) = {
+            let b = self_li.borrow();
+            (b.s_rdict_eqfn.clone(), b.s_rdict_hashfn.clone())
+        };
+        // upstream: `s_eqfn = union(s_eqfn, self.s_rdict_eqfn)`.
+        let new_eqfn = union(&s_eqfn, &cur_eqfn)?;
+        let new_hashfn = union(&s_hashfn, &cur_hashfn)?;
+        {
+            let mut b = self_li.borrow_mut();
+            b.s_rdict_eqfn = new_eqfn;
+            b.s_rdict_hashfn = new_hashfn;
+        }
+        // upstream: `self.emulate_rdict_calls(other=other)` (dictdef.py:41
+        // tail). The call performs two `bookkeeper.emulate_pbc_call` dispatches
+        // — one for eq, one for hash — and validates the return annotations
+        // against `s_Bool` / `SomeInteger` (dictdef.py:56-66), raising
+        // `AnnotatorError` on mismatch. `Bookkeeper.emulate_pbc_call` waits
+        // for Phase 5 P5.2; until then we REFUSE to silently pass so a
+        // broken custom-eq/hash can't slip through unnoticed. See
+        // `dictdef.py:43-66` for the exact shape the port must match.
+        Self::emulate_rdict_calls(self_li)
+    }
+
+    /// RPython `DictKey.generalize(s_other_value)` (dictdef.py:29-33).
+    ///
+    /// Wraps [`ListItem::generalize`] with the rdict eq/hash
+    /// re-validation that upstream runs when the key lattice widens
+    /// under a `custom_eq_hash` (= r_dict) key cell. This is the
+    /// method that `DictDef.generalize_key` must route through — the
+    /// subclass `generalize` override is load-bearing (without it, r_
+    /// dict eq/hash constraints drift silently as keys generalize).
+    pub fn generalize(
+        self_li: &Rc<RefCell<ListItem>>,
+        s_other_value: &SomeValue,
+    ) -> Result<bool, UnionError> {
+        // upstream: `updated = ListItem.generalize(self, s_other_value)`.
+        let updated = {
+            let mut b = self_li.borrow_mut();
+            b.generalize(s_other_value)?
+        };
+        // upstream: `if updated and self.custom_eq_hash:
+        //                self.emulate_rdict_calls()`.
+        if updated && self_li.borrow().custom_eq_hash {
+            Self::emulate_rdict_calls(self_li)?;
+        }
+        Ok(updated)
+    }
+
+    /// RPython `DictKey.emulate_rdict_calls(other=None)` (dictdef.py:43-66).
+    ///
+    /// **Not ported.** Requires `Bookkeeper.emulate_pbc_call` which is
+    /// Phase 5 P5.2 territory (bookkeeper.py:358). Raises a
+    /// distinctive `UnionError` rather than silently succeeding so that
+    /// r_dict annotation bugs surface at merge time instead of
+    /// propagating bad eq/hash annotations through the rest of the
+    /// pipeline.
+    fn emulate_rdict_calls(_self_li: &Rc<RefCell<ListItem>>) -> Result<(), UnionError> {
+        Err(UnionError {
+            lhs: SomeValue::Impossible,
+            rhs: SomeValue::Impossible,
+            msg: "r_dict eq/hash validation requires bookkeeper.emulate_pbc_call \
+                  (Phase 5 P5.2). See rpython/annotator/dictdef.py:43-66."
+                .into(),
+        })
     }
 }
 
-/// RPython `class DictValue(ListItem)` (dictdef.py:69-72). Plain
-/// `ListItem` carrier; the `patch()` override points at the
-/// `DictDef.dictvalue` slot.
+/// RPython `class DictValue(ListItem)` (dictdef.py:69-72). Zero-sized
+/// namespace for the subclass's `patch()` override; retargeting
+/// lands through [`ItemOwner::DictValue`].
 #[derive(Debug)]
-pub struct DictValue {
-    pub item: ListItem,
-}
+pub struct DictValue;
 
 impl DictValue {
-    pub fn new(s_value: SomeValue) -> Self {
-        DictValue {
-            item: ListItem::new(s_value),
-        }
+    /// Upstream has no explicit `DictValue.__init__` — it inherits
+    /// [`ListItem::__init__`] verbatim (dictdef.py:69). Keep the
+    /// factory on the subclass namespace so `DictDef::new` mirrors the
+    /// upstream `DictValue(bookkeeper, s_value)` call shape.
+    pub fn new(bookkeeper: Option<Rc<Bookkeeper>>, s_value: SomeValue) -> Rc<RefCell<ListItem>> {
+        Rc::new(RefCell::new(ListItem::new(bookkeeper, s_value)))
     }
 
-    pub fn with_bookkeeper(s_value: SomeValue) -> Self {
-        DictValue {
-            item: ListItem::with_bookkeeper(s_value),
-        }
+    /// Upstream has no `DictValue.merge` — it inherits
+    /// [`ListItem::merge`]. Thin forwarding wrapper preserves the
+    /// call-site parity of `self.dictvalue.merge(other.dictvalue)`
+    /// (dictdef.py:107).
+    pub fn merge(
+        self_li: &Rc<RefCell<ListItem>>,
+        other_li: &Rc<RefCell<ListItem>>,
+    ) -> Result<Rc<RefCell<ListItem>>, UnionError> {
+        ListItem::merge(self_li, other_li)
     }
 }
 
@@ -108,62 +223,36 @@ pub struct DictDef {
 }
 
 impl DictDef {
-    /// RPython `DictDef.__init__(bookkeeper=None, s_key, s_value, ...)` —
-    /// `bookkeeper=None` path. Both key and value cells inherit
-    /// `dont_change_any_more = True`.
-    pub fn new(s_key: SomeValue, s_value: SomeValue) -> Self {
-        Self::construct(
-            DictKey::new(s_key, false),
-            DictValue::new(s_value),
-            false,
-            false,
-        )
-    }
-
-    /// Mutable-bookkeeper path (analogous to [`super::listdef::ListDef::mutable`]).
-    pub fn mutable(s_key: SomeValue, s_value: SomeValue) -> Self {
-        Self::construct(
-            DictKey::with_bookkeeper(s_key, false),
-            DictValue::with_bookkeeper(s_value),
-            false,
-            false,
-        )
-    }
-
-    fn construct(
-        key: DictKey,
-        value: DictValue,
+    /// RPython `DictDef.__init__(bookkeeper=None,
+    /// s_key=s_ImpossibleValue, s_value=s_ImpossibleValue,
+    /// is_r_dict=False, force_non_null=False, simple_hash_eq=False)`
+    /// (dictdef.py:81-91).
+    pub fn new(
+        bookkeeper: Option<Rc<Bookkeeper>>,
+        s_key: SomeValue,
+        s_value: SomeValue,
+        is_r_dict: bool,
         force_non_null: bool,
         simple_hash_eq: bool,
     ) -> Self {
-        let key_li = Rc::new(RefCell::new(key.item));
-        let value_li = Rc::new(RefCell::new(value.item));
+        let key_li = DictKey::new(bookkeeper.clone(), s_key, is_r_dict);
+        let value_li = DictValue::new(bookkeeper, s_value);
         let inner = Rc::new(DictDefInner {
             dictkey: RefCell::new(key_li.clone()),
             dictvalue: RefCell::new(value_li.clone()),
             force_non_null,
             simple_hash_eq,
         });
-        // Register backrefs on both cells. We use a surrogate weak
-        // reference to the DictDefInner via the shared type
-        // [`ListDefInnerForBackref`] because DictDefInner has two
-        // slots (key and value). The backref weak-ref machinery in
-        // listdef.rs expects `Weak<ListDefInner>`; for the dictdef
-        // port we introduce a thin adapter so both key and value
-        // slots can be patched.
-        //
-        // Implementation detail: the Weak<ListDefInner> slot of
-        // [`ListItem::itemof`] only needs to name *some* cell whose
-        // interior-mutable `listitem` field points at this ListItem.
-        // DictKey's patch() retargets `dictdef.dictkey`; DictValue's
-        // patch() retargets `dictdef.dictvalue`. We surface those via
-        // two hidden ListDefInner surrogates that share memory with
-        // the DictDefInner. This preserves the upstream one-weak-ref-
-        // per-using-def invariant.
-        let key_weak = make_key_backref(&inner);
-        let value_weak = make_value_backref(&inner);
-        key_li.borrow_mut().itemof.push(key_weak);
-        value_li.borrow_mut().itemof.push(value_weak);
+        // upstream: `self.dictkey.itemof[self] = True` (dictdef.py:87).
+        key_li
+            .borrow_mut()
+            .itemof
+            .push(ItemOwner::DictKey(Rc::downgrade(&inner)));
+        // upstream: `self.dictvalue.itemof[self] = True` (dictdef.py:89).
+        value_li
+            .borrow_mut()
+            .itemof
+            .push(ItemOwner::DictValue(Rc::downgrade(&inner)));
         DictDef { inner }
     }
 
@@ -177,20 +266,20 @@ impl DictDef {
         Rc::ptr_eq(&*ak, &*bk) && Rc::ptr_eq(&*av, &*bv)
     }
 
-    /// RPython `DictDef.union(other)` (dictdef.py:105-108) — merges
-    /// both key and value cells.
+    /// RPython `DictDef.union(other)` (dictdef.py:105-108).
+    ///
+    /// Dispatches key / value merges through [`DictKey::merge`] and
+    /// [`DictValue::merge`] so the `custom_eq_hash` mixing guard and
+    /// `update_rdict_annotations` propagation from dictdef.py:19-27
+    /// fire at the correct override layer.
     pub fn union_with(&self, other: &DictDef) -> Result<(), UnionError> {
         let self_k = self.inner.dictkey.borrow().clone();
         let other_k = other.inner.dictkey.borrow().clone();
-        let merged_k = merge_items(&self_k, &other_k)?;
-        *self.inner.dictkey.borrow_mut() = merged_k.clone();
-        *other.inner.dictkey.borrow_mut() = merged_k;
+        DictKey::merge(&self_k, &other_k)?;
 
         let self_v = self.inner.dictvalue.borrow().clone();
         let other_v = other.inner.dictvalue.borrow().clone();
-        let merged_v = merge_items(&self_v, &other_v)?;
-        *self.inner.dictvalue.borrow_mut() = merged_v.clone();
-        *other.inner.dictvalue.borrow_mut() = merged_v;
+        DictValue::merge(&self_v, &other_v)?;
         Ok(())
     }
 
@@ -200,6 +289,41 @@ impl DictDef {
 
     pub fn s_value(&self) -> SomeValue {
         self.inner.dictvalue.borrow().borrow().s_value.clone()
+    }
+
+    /// RPython `DictDef.read_key(position_key)` (dictdef.py:93-95).
+    pub fn read_key(&self, position_key: PositionKey) -> SomeValue {
+        let li = self.inner.dictkey.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        li_mut.read_locations.insert(position_key);
+        li_mut.s_value.clone()
+    }
+
+    /// RPython `DictDef.read_value(position_key)` (dictdef.py:97-99).
+    pub fn read_value(&self, position_key: PositionKey) -> SomeValue {
+        let li = self.inner.dictvalue.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        li_mut.read_locations.insert(position_key);
+        li_mut.s_value.clone()
+    }
+
+    /// RPython `DictDef.generalize_key(s_key)` (dictdef.py:110-111).
+    ///
+    /// Routes through [`DictKey::generalize`] so the subclass override
+    /// (dictdef.py:29-33) fires: when widening a r_dict key cell
+    /// actually updates it, the eq/hash emulate-pbc callback must run
+    /// to re-validate custom eq/hash annotations. Calling
+    /// `ListItem::generalize` directly would bypass that path.
+    pub fn generalize_key(&self, s_key: &SomeValue) -> Result<bool, UnionError> {
+        let li = self.inner.dictkey.borrow().clone();
+        DictKey::generalize(&li, s_key)
+    }
+
+    /// RPython `DictDef.generalize_value(s_value)` (dictdef.py:113-114).
+    pub fn generalize_value(&self, s_value: &SomeValue) -> Result<bool, UnionError> {
+        let li = self.inner.dictvalue.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        li_mut.generalize(s_value)
     }
 }
 
@@ -222,94 +346,24 @@ impl std::hash::Hash for DictDef {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Backref surrogates — see `DictDef::construct` comment.
-// ---------------------------------------------------------------------------
-
-/// Adapter that lets `ListItem::itemof`'s `Weak<ListDefInner>` slot
-/// point at either the key or value slot of a [`DictDefInner`]. The
-/// surrogate holds a strong ref to the DictDefInner while the
-/// ListDefInner itself is a thin shell whose `listitem` slot mirrors
-/// the DictDef slot it represents.
-#[allow(dead_code)] // fields consumed via pointer identity.
-struct DictBackrefShell {
-    // Not used directly; kept alive by the key/value Rc<ListDefInner>.
-    _owner: Rc<DictDefInner>,
-}
-
-/// Allocate a `Weak<super::listdef::ListDefInner>` that, when
-/// upgraded, retargets the key cell of the DictDefInner.
-fn make_key_backref(inner: &Rc<DictDefInner>) -> Weak<super::listdef::ListDefInner> {
-    // The backref needs to point at an Rc<ListDefInner> that can be
-    // upgraded later and whose `listitem` refers to the SAME
-    // RefCell<Rc<RefCell<ListItem>>> as `inner.dictkey`. Rust lets us
-    // share a single `RefCell` between two `Rc`s via
-    // `Rc::new_cyclic` tricks, but the cleaner approach is to let
-    // DictDefInner expose the RefCell through a helper shell.
-    //
-    // For Phase 5 P5.1 we take the simpler route: the backref Weak
-    // resolves to a fresh `ListDefInner` whose `listitem` field is
-    // independently owned. When `merge_items` retargets through the
-    // weak, it mutates THIS shell — not the DictDefInner's own
-    // dictkey/dictvalue slots.  The shell is kept alive by a
-    // dedicated `Rc` stored on `DictDefInner` itself via a side
-    // table (see [`backref_table`] below).
-    //
-    // `DictDef::union_with()` compensates for this shell by rewriting
-    // the real `dictkey` / `dictvalue` slots to the canonical cells
-    // returned from `merge_items()`. That restores upstream
-    // post-merge `same_as` behaviour even though the backref itself is
-    // still indirect.
-    let shell_li = Rc::clone(&*inner.dictkey.borrow());
-    let shell_inner = Rc::new(super::listdef::ListDefInner {
-        listitem: RefCell::new(shell_li),
-    });
-    // Keep the shell alive alongside the DictDefInner. The table is
-    // inside-out: we don't mutate DictDefInner after construction so
-    // we need Rc<Mutex> or similar to add entries. For Phase 5 P5.1
-    // we leak the shell intentionally by storing a strong ref inside
-    // the shell itself (circular Rc); the Weak this function returns
-    // is nonetheless valid for the DictDefInner's lifetime because
-    // the shell's strong count stays ≥ 1 as long as the DictDefInner
-    // Rc is alive.
-    //
-    // This is NOT a memory leak in practice — when the DictDefInner
-    // Rc drops, the shell drops too (it's keyed by value slots on
-    // DictDefInner, but we store it implicitly by upgrading the
-    // backref from the ListItem's itemof list which gets dropped
-    // with the ListItem).
-    let weak = Rc::downgrade(&shell_inner);
-    // Leak the strong ref intentionally — the shell is alive only
-    // while the ListItem.itemof list (holding the Weak) survives.
-    // When that list is finalised (DictDefInner dropped → dictkey
-    // Rc<ListItem> refcount hits 0 → ListItem::itemof Vec dropped →
-    // Weak dropped), upgrade() returns None so the strong stays
-    // orphaned. Next merge won't find a backref to patch; that's
-    // the documented Phase 5 P5.1 gap above.
-    std::mem::forget(shell_inner);
-    weak
-}
-
-fn make_value_backref(inner: &Rc<DictDefInner>) -> Weak<super::listdef::ListDefInner> {
-    let shell_li = Rc::clone(&*inner.dictvalue.borrow());
-    let shell_inner = Rc::new(super::listdef::ListDefInner {
-        listitem: RefCell::new(shell_li),
-    });
-    let weak = Rc::downgrade(&shell_inner);
-    std::mem::forget(shell_inner);
-    weak
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::model::{SomeInteger, SomeString, SomeValue};
     use super::*;
 
+    fn bk() -> Rc<Bookkeeper> {
+        Rc::new(Bookkeeper::new())
+    }
+
     #[test]
     fn same_as_across_clone() {
         let a = DictDef::new(
+            None,
             SomeValue::String(SomeString::default()),
             SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
         );
         let b = a.clone();
         assert!(a.same_as(&b));
@@ -318,25 +372,82 @@ mod tests {
     #[test]
     fn distinct_dictdefs_are_not_same_as() {
         let a = DictDef::new(
+            None,
             SomeValue::String(SomeString::default()),
             SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
         );
         let b = DictDef::new(
+            None,
             SomeValue::String(SomeString::default()),
             SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
         );
         assert!(!a.same_as(&b));
     }
 
     #[test]
+    fn generalize_key_routes_through_dictkey_override_on_rdict() {
+        // upstream dictdef.py:29-33 — on an r_dict (custom_eq_hash=true),
+        // when generalize actually widens the key type, emulate_rdict_
+        // calls must fire. Our emulate_rdict_calls is a fail-fast stub
+        // pending bookkeeper.emulate_pbc_call; the test verifies the
+        // dispatch arrives there (and not that the ListItem::generalize
+        // path silently succeeds).
+        let dd = DictDef::new(
+            Some(bk()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            /* is_r_dict = */ true,
+            false,
+            false,
+        );
+        let err = dd
+            .generalize_key(&SomeValue::Integer(SomeInteger::new(false, false)))
+            .expect_err("rdict key widen must route to emulate_rdict_calls stub");
+        assert!(err.msg.contains("emulate_pbc_call"));
+    }
+
+    #[test]
+    fn generalize_key_on_plain_dict_does_not_trip_rdict_stub() {
+        // upstream dictdef.py:29-33 — custom_eq_hash=false path skips
+        // emulate_rdict_calls entirely. Same widening on a plain dict
+        // succeeds.
+        let dd = DictDef::new(
+            Some(bk()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            /* is_r_dict = */ false,
+            false,
+            false,
+        );
+        let updated = dd
+            .generalize_key(&SomeValue::Integer(SomeInteger::new(false, false)))
+            .expect("plain-dict key widen must not hit rdict stub");
+        assert!(updated);
+    }
+
+    #[test]
     fn union_merges_key_and_value_types() {
-        let a = DictDef::mutable(
+        let a = DictDef::new(
+            Some(bk()),
             SomeValue::String(SomeString::default()),
             SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+            false,
         );
-        let b = DictDef::mutable(
+        let b = DictDef::new(
+            Some(bk()),
             SomeValue::String(SomeString::default()),
             SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+            false,
+            false,
         );
         a.union_with(&b).expect("merge must succeed");
         // Value type widens to signed.
@@ -345,5 +456,7 @@ mod tests {
         } else {
             panic!("expected SomeInteger value type");
         }
+        // Post-merge identity propagates.
+        assert!(a.same_as(&b));
     }
 }

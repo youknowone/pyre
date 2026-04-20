@@ -13,6 +13,7 @@
 pub mod annotator;
 pub mod flowspace;
 pub mod jit_codewriter;
+pub mod tool;
 pub use jit_codewriter::{
     assembler, call, codewriter, flatten, format, jitcode, jtransform, liveness, policy, regalloc,
     support,

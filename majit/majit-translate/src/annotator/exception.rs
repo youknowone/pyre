@@ -36,10 +36,11 @@ pub fn standard_exceptions() -> Vec<ClassDef> {
         "UnicodeDecodeError",
         "UnicodeEncodeError",
         "NotImplementedError",
-        // rpython.rlib.rstackovf._StackOverflow — HOST_ENV exposes
-        // this as the RuntimeError subclass we registered in
+        // rpython.rlib.rstackovf._StackOverflow — underscore prefix
+        // matches upstream exception.py:7 exactly. HOST_ENV exposes
+        // this as the RuntimeError subclass registered in
         // flowspace::model::HostEnv::bootstrap.
-        "StackOverflow",
+        "_StackOverflow",
     ]
     .iter()
     .map(|name| ClassDef::new(*name))
@@ -58,6 +59,6 @@ mod tests {
         let names: Vec<&str> = excs.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"TypeError"));
         assert!(names.contains(&"OverflowError"));
-        assert!(names.contains(&"StackOverflow"));
+        assert!(names.contains(&"_StackOverflow"));
     }
 }

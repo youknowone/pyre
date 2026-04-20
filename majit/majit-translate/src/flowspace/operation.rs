@@ -40,7 +40,36 @@
 
 use std::collections::HashMap;
 
+use super::flowcontext::FlowingError;
 use super::model::{ConstValue, Constant, Hlvalue, SpaceOperation, Variable};
+
+/// RPython `NOT_REALLY_CONST` (operation.py:22-35). Maps a module
+/// qualname to the set of attribute names that are *real* constants
+/// on that module; any other attribute of a listed module is treated
+/// as runtime-variable and [`constfold_getattr`] declines the fold.
+///
+/// Upstream uses `Constant(sys)` as the outer key and `Constant(name)`
+/// as the inner set member; the Rust port flattens to string keys
+/// because our `HostObject::Module` carries a unique qualname that
+/// identifies the hosted module 1:1. Adding a module here is a parity
+/// requirement — without it, `getattr(sys, 'path')` would fold to a
+/// compile-time snapshot, diverging from upstream.
+fn not_really_const_declines(module_qualname: &str, attr: &str) -> bool {
+    static SYS_REAL_CONSTS: &[&str] = &[
+        "maxint",
+        "maxunicode",
+        "api_version",
+        "exit",
+        "exc_info",
+        "getrefcount",
+        "getdefaultencoding",
+    ];
+    if module_qualname == "sys" {
+        return !SYS_REAL_CONSTS.contains(&attr);
+    }
+    // Modules not in NOT_REALLY_CONST fold normally.
+    false
+}
 
 /// RPython `rpython/flowspace/operation.py` — enumerates every
 /// `HLOperation` subclass. Variant order matches the upstream
@@ -814,6 +843,10 @@ impl OpKind {
     pub fn canraise(self) -> &'static [BuiltinException] {
         use BuiltinException::*;
         match self {
+            // Explicit HLOperation subclasses with custom canraise.
+            OpKind::GetAttr | OpKind::Iter => &[],
+            OpKind::Next => &[StopIteration, RuntimeError],
+
             // operation.py:728-731.
             OpKind::GetItem | OpKind::GetItemIdx | OpKind::SetItem | OpKind::DelItem => {
                 &[IndexError, KeyError, Exception]
@@ -919,15 +952,17 @@ impl HLOperation {
     /// Behaviour matches PureOperation upstream: require every arg to
     /// be foldable (`Constant.foldable()`), then apply the pyfunc
     /// equivalent. Non-pure ops and folds that would overflow (RPython
-    /// `type(result) is long` branch at 141-142) return `None` so the
-    /// caller emits a `SpaceOperation` instead.
+    /// `type(result) is long` branch at 141-142) return `Ok(None)` so
+    /// the caller emits a `SpaceOperation` instead. Flow-time hard
+    /// errors (currently the 3-arg `getattr` case and constant module
+    /// attribute misses) surface as [`FlowingError`].
     ///
     /// Commit 2 scope: pure integer / float / bool / tuple / comparison
     /// arithmetic — the subset actually exercised by flowspace on
     /// realistic RPython inputs. Non-covered pure ops fall through to
     /// `None` (no fold attempted), which is a strict subset of upstream
     /// behaviour.
-    pub fn constfold(&self) -> Option<Hlvalue> {
+    pub fn constfold(&self) -> Result<Option<Hlvalue>, FlowingError> {
         // Pure ops go through PureOperation.constfold (operation.py:120-132).
         // A few non-pure ops (`GetAttr`, `Iter`, `Next`) carry their own
         // `constfold()` override upstream and must be allowed past the
@@ -936,12 +971,15 @@ impl HLOperation {
         let eligible =
             self.kind.pure() || matches!(self.kind, OpKind::GetAttr | OpKind::Iter | OpKind::Next);
         if !eligible {
-            return None;
+            return Ok(None);
+        }
+        if self.kind == OpKind::GetAttr {
+            return self.constfold_getattr();
         }
         for arg in &self.args {
             match arg {
                 Hlvalue::Constant(c) if c.foldable() => {}
-                _ => return None,
+                _ => return Ok(None),
             }
         }
         let args: Vec<&ConstValue> = self
@@ -952,8 +990,51 @@ impl HLOperation {
                 _ => unreachable!("foldable() above excludes Variable args"),
             })
             .collect();
-        let result = pyfunc(self.kind, &args)?;
-        Some(Hlvalue::Constant(Constant::new(result)))
+        let Some(result) = pyfunc(self.kind, &args) else {
+            return Ok(None);
+        };
+        Ok(Some(Hlvalue::Constant(Constant::new(result))))
+    }
+
+    fn constfold_getattr(&self) -> Result<Option<Hlvalue>, FlowingError> {
+        match self.args.as_slice() {
+            [_, _, _] => Err(FlowingError::new(format!(
+                "getattr() with three arguments not supported: {self:?}"
+            ))),
+            [Hlvalue::Constant(w_obj), Hlvalue::Constant(w_name)] => {
+                let ConstValue::Str(name) = &w_name.value else {
+                    return Ok(None);
+                };
+                let name_str = name.to_string();
+                match &w_obj.value {
+                    ConstValue::HostObject(obj) if obj.is_module() => {
+                        // upstream operation.py:631-633 — the
+                        // NOT_REALLY_CONST guard. Listed modules hold
+                        // mostly-variable attributes; only the
+                        // explicitly-declared names (`sys.maxint`,
+                        // `sys.exit`, …) are real constants that flow
+                        // space may fold. Anything else declines the
+                        // fold so the annotator sees a runtime-read op.
+                        if not_really_const_declines(obj.qualname(), &name_str) {
+                            return Ok(None);
+                        }
+                        if let Some(value) = obj.module_get(&name_str) {
+                            Ok(Some(Hlvalue::Constant(Constant::new(
+                                ConstValue::HostObject(value),
+                            ))))
+                        } else {
+                            Err(FlowingError::new(format!(
+                                "getattr({}, {:?}) always raises AttributeError",
+                                obj.qualname(),
+                                name_str
+                            )))
+                        }
+                    }
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     /// RPython `OverflowingOperation.ovfchecked()` (operation.py:197-200)
@@ -1045,12 +1126,12 @@ fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         //     returns `Result<Option, FlowingError>` — scheduled
         //     alongside the Phase 5 annotator wiring.
         //  2. `NOT_REALLY_CONST` table (operation.py:22-35) blocks
-        //     folds of `sys.maxint`, `sys.exc_info`, etc. — the Rust
-        //     port has no equivalent table yet; the HostObject
-        //     matcher below only succeeds for module members and
-        //     class attributes that `HOST_ENV` actively exposes, so
-        //     the set of foldable attributes is a strict subset of
-        //     upstream's.
+        //     folds of `sys.path`, `sys.modules`, etc. while keeping
+        //     `sys.maxint`, `sys.exc_info`, etc. foldable — PARITY
+        //     with upstream's sys-attribute allowlist via the
+        //     [`not_really_const_declines`] helper at the top of this
+        //     file. Extra volatile modules gain entries by editing
+        //     that helper.
         //  3. The generic `getattr(obj, name)` fall-through that
         //     upstream wraps in `try/except Exception` covers class
         //     methods / instance attributes that flowspace may see on
@@ -1356,7 +1437,7 @@ mod tests {
 
     fn fold(kind: OpKind, args: Vec<Hlvalue>) -> Option<ConstValue> {
         let op = HLOperation::new(kind, args);
-        op.constfold().map(|v| match v {
+        op.constfold().ok().flatten().map(|v| match v {
             Hlvalue::Constant(c) => c.value,
             _ => unreachable!("constfold must not produce Variables"),
         })
@@ -1376,6 +1457,9 @@ mod tests {
         );
         // operation.py:732.
         assert_eq!(OpKind::Contains.canraise(), &[Exception]);
+        assert_eq!(OpKind::GetAttr.canraise(), &[]);
+        assert_eq!(OpKind::Iter.canraise(), &[]);
+        assert_eq!(OpKind::Next.canraise(), &[StopIteration, RuntimeError]);
         // `add` / `sub` / `mul` — base variants have empty canraise.
         assert_eq!(OpKind::Add.canraise(), &[]);
         assert_eq!(OpKind::Sub.canraise(), &[]);
@@ -1427,6 +1511,80 @@ mod tests {
     fn constfold_declines_variable_args() {
         let v = Hlvalue::Variable(Variable::new());
         assert_eq!(fold(OpKind::Add, vec![v, ci(1)]), None);
+    }
+
+    #[test]
+    fn getattr_constfold_raises_flowing_error_on_three_arg_form() {
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                ci(1),
+                cs("real"),
+                Hlvalue::Constant(Constant::new(ConstValue::None)),
+            ],
+        );
+        let err = op
+            .constfold()
+            .expect_err("3-arg getattr must raise FlowingError");
+        assert!(err.message.contains("three arguments not supported"));
+    }
+
+    #[test]
+    fn getattr_constfold_folds_constant_module_member() {
+        let module = super::super::model::HOST_ENV
+            .import_module("rpython.rlib.rfile")
+            .expect("bootstrap module must exist");
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![c(ConstValue::HostObject(module)), cs("create_file")],
+        );
+        let folded = op
+            .constfold()
+            .expect("module getattr should not error")
+            .expect("module getattr should fold");
+        let Hlvalue::Constant(constant) = folded else {
+            panic!("expected Constant result");
+        };
+        assert!(matches!(constant.value, ConstValue::HostObject(_)));
+    }
+
+    #[test]
+    fn getattr_constfold_declines_volatile_sys_attr() {
+        // upstream operation.py:22-35 — `sys.path` / `sys.modules`
+        // are runtime-variable (mutable state of the interpreter), so
+        // the NOT_REALLY_CONST guard must decline the fold even if
+        // the module exposes the attribute via `module_get`. Matches
+        // the `if w_obj in NOT_REALLY_CONST and w_name not in …`
+        // branch at operation.py:631-633.
+        use crate::flowspace::model::HostObject;
+        let sys = HostObject::new_module("sys");
+        sys.module_set(
+            "path".to_string(),
+            HostObject::new_module("path_placeholder"),
+        );
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![c(ConstValue::HostObject(sys)), cs("path")],
+        );
+        assert!(op.constfold().unwrap().is_none());
+    }
+
+    #[test]
+    fn getattr_constfold_folds_allowlisted_sys_attr() {
+        // upstream operation.py:25 — `sys.maxint` is explicitly
+        // declared as a real constant. Folding must succeed when the
+        // module exposes it.
+        use crate::flowspace::model::HostObject;
+        let sys = HostObject::new_module("sys");
+        sys.module_set(
+            "maxint".to_string(),
+            HostObject::new_module("maxint_placeholder"),
+        );
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![c(ConstValue::HostObject(sys)), cs("maxint")],
+        );
+        assert!(op.constfold().unwrap().is_some());
     }
 
     #[test]

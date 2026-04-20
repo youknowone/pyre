@@ -1,10 +1,10 @@
-//! Port of `rpython/annotator/test/test_model.py` (343 LOC, Phase 4 A4.8).
+//! Port of `rpython/annotator/test/test_model.py` (343 LOC).
 //!
 //! Upstream covers ~22 tests but many require `TranslationContext` /
 //! `buildannotator` / `rpython.annotator.binaryop` side-effect
 //! registration — all of which land in Phase 5.  This file ports the
 //! subset that exercises only the model.py primitives already carried
-//! by Phase 4:
+//! locally:
 //!
 //!   * `test_equality`
 //!   * `test_contains`
@@ -13,14 +13,14 @@
 //!   * `test_list_contains`
 //!   * `test_nan`
 //!
-//! Upstream tests that depend on Phase 5 (`test_commonbase_simple`,
-//! `test_instance_*`, `test_dict_update_*`, `test_iter_*`, the
-//! `@given` Hypothesis property tests, and every annotator-driven
-//! test) are deferred.
+//! Upstream tests that still depend on the unported annotator /
+//! hypothesis machinery (`test_commonbase_simple`, `test_instance_*`,
+//! `test_dict_update_*`, `test_iter_*`, the `@given` property tests,
+//! and every annotator-driven test) remain deferred.
 
 use majit_translate::annotator::model::{
     ListDef, SomeFloat, SomeImpossibleValue, SomeInteger, SomeList, SomeString, SomeTuple,
-    SomeType, SomeValue, contains, union, unionof,
+    SomeType, SomeValue, contains, unionof,
 };
 use majit_translate::flowspace::model::{ConstValue, Constant};
 
@@ -40,25 +40,31 @@ fn s3() -> SomeValue {
 }
 
 fn listdef_tuple_nonneg() -> ListDef {
-    ListDef::new(SomeValue::Tuple(SomeTuple::new(vec![
-        SomeValue::Integer(SomeInteger::new(true, false)),
-        SomeValue::String(SomeString::default()),
-    ])))
+    ListDef::new(
+        None,
+        SomeValue::Tuple(SomeTuple::new(vec![
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            SomeValue::String(SomeString::default()),
+        ])),
+        false,
+        false,
+    )
 }
 
 fn listdef_tuple_signed() -> ListDef {
-    ListDef::new(SomeValue::Tuple(SomeTuple::new(vec![
-        SomeValue::Integer(SomeInteger::new(false, false)),
-        SomeValue::String(SomeString::default()),
-    ])))
+    ListDef::new(
+        None,
+        SomeValue::Tuple(SomeTuple::new(vec![
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            SomeValue::String(SomeString::default()),
+        ])),
+        false,
+        false,
+    )
 }
 
 fn s4() -> SomeValue {
     SomeValue::List(SomeList::new(listdef_tuple_nonneg()))
-}
-
-fn s5() -> SomeValue {
-    SomeValue::List(SomeList::new(listdef_tuple_signed()))
 }
 
 fn s6() -> SomeValue {
@@ -168,7 +174,7 @@ fn test_signedness() {
 }
 
 // ---------------------------------------------------------------------------
-// test_list_union (test_model.py:79-86) — enabled after Phase 5 P5.1.
+// test_list_union (test_model.py:79-86)
 //
 // Upstream body:
 //     s1 = SomeList(ListDef('dummy', SomeInteger(nonneg=True)))
@@ -177,20 +183,30 @@ fn test_signedness() {
 //     s3 = unionof(s1, s2)
 //     assert s1 == s2 == s3
 //
-// Phase 5 P5.1's `ListDef::union_with` walks `ListItem.itemof`
-// backrefs and patches every `ListDefInner::listitem` slot to the
-// merged cell, so `s1.listdef.same_as(s2.listdef)` becomes True
-// post-merge.
+// `ListDef::union_with` walks `ListItem.itemof` backrefs and patches
+// every `ListDefInner::listitem` slot to the merged cell, so
+// `s1.listdef.same_as(s2.listdef)` becomes True post-merge exactly as
+// in upstream.
 #[test]
 fn test_list_union() {
-    // upstream uses `ListDef('dummy', ...)` — mutable-bookkeeper
-    // path. Mirror with `ListDef::mutable`.
-    let s1 = SomeValue::List(SomeList::new(ListDef::mutable(SomeValue::Integer(
-        SomeInteger::new(true, false),
-    ))));
-    let s2 = SomeValue::List(SomeList::new(ListDef::mutable(SomeValue::Integer(
-        SomeInteger::new(false, false),
-    ))));
+    // upstream uses `ListDef('dummy', ...)` — bookkeeper present. Pass
+    // a stub `Bookkeeper` to pick the mutable path.
+    use majit_translate::annotator::bookkeeper::Bookkeeper;
+    use std::rc::Rc;
+    let bk = || Some(Rc::new(Bookkeeper::new()));
+
+    let s1 = SomeValue::List(SomeList::new(ListDef::new(
+        bk(),
+        SomeValue::Integer(SomeInteger::new(true, false)),
+        false,
+        false,
+    )));
+    let s2 = SomeValue::List(SomeList::new(ListDef::new(
+        bk(),
+        SomeValue::Integer(SomeInteger::new(false, false)),
+        false,
+        false,
+    )));
     assert_ne!(s1, s2);
     let s3 = unionof([&s1, &s2]).unwrap();
     // upstream post-condition.
@@ -198,76 +214,39 @@ fn test_list_union() {
     assert_eq!(s2, s3);
 }
 
-/// Rust-weaker variant of `test_list_union`. Asserts the invariant
-/// that Phase 4's non-mutating union DOES preserve: the returned
-/// `SomeList`'s element is the merged SomeInteger bound. Not a
-/// line-by-line port of any upstream test; exists so we have
-/// coverage for the actual Phase 4 behaviour while the upstream
-/// mutation-based assertion is ignored above.
-#[test]
-fn test_list_union_merged_element_shape_phase4() {
-    // Use mutable-bookkeeper ListDef so the merge is allowed.
-    let a = SomeValue::List(SomeList::new(ListDef::mutable(SomeValue::Integer(
-        SomeInteger::new(true, false),
-    ))));
-    let b = SomeValue::List(SomeList::new(ListDef::mutable(SomeValue::Integer(
-        SomeInteger::new(false, false),
-    ))));
-    let merged = union(&a, &b).expect("same-shape lists must union");
-    let SomeValue::List(list) = merged else {
-        panic!("expected merged value to be SomeList");
-    };
-    let SomeValue::Integer(elem) = list.listdef.s_value() else {
-        panic!("expected merged element to be SomeInteger");
-    };
-    assert!(!elem.nonneg);
-    assert!(!elem.unsigned);
-}
-
 // ---------------------------------------------------------------------------
-// test_list_contains (test_model.py:88-97) — IGNORED in Phase 4.
+// test_list_contains (test_model.py:88-97)
 //
-// Upstream asserts BOTH:
-//     assert not s2.contains(s1)
-//     assert not s1.contains(s2)
-//
-// The upstream semantics are identity-based: `ListDef.same_as` at
-// rpython/annotator/listdef.py:124 delegates to
-// `self.listitem.same_as(other.listitem)` which ultimately checks
-// `self is other` (Python object identity) after the bookkeeper's
-// union-find resolves aliasing. Two independently constructed
-// `ListDef`s therefore have DISTINCT `ListItem`s regardless of
-// element-type equality, and neither list subsumes the other.
-//
-// The Rust port's `ListDef::same_as` in
-// majit-translate/src/annotator/model.rs:664 collapses to structural
-// element comparison (no bookkeeper / no ListItem identity yet), so
-// it cannot reproduce upstream's "neither direction contains" result.
-// Phase 5's rpython/annotator/listdef.py port wires the real
-// identity-based semantics; this test switches back on then.
-//
-// The previous revision of this file pinned `assert!(contains(&s2, &s1))`
-// — which is the OPPOSITE of upstream's assertion. The test is
-// gated off until the listdef port lands so we do not ship a test
-// whose intent diverges from upstream.
+// Upstream semantics are identity-based: independently constructed
+// `ListDef(None, ...)` instances have distinct `ListItem`s, and
+// `contains()` must not mutate them because the union is wrapped in a
+// side-effect-free guard.
 
 #[test]
 fn test_list_contains() {
     // upstream uses `ListDef(None, ...)` — bookkeeper-None path with
-    // dont_change_any_more = true. The Rust port's `ListDef::new`
-    // matches that shape by default.
-    let s1 = SomeValue::List(SomeList::new(ListDef::new(SomeValue::Integer(
-        SomeInteger::new(true, false),
-    ))));
-    let s2 = SomeValue::List(SomeList::new(ListDef::new(SomeValue::Integer(
-        SomeInteger::new(false, false),
-    ))));
+    // dont_change_any_more = true. Mirror via
+    // `ListDef::new(None, s_item, false, false)` per upstream signature.
+    let s1 = SomeValue::List(SomeList::new(ListDef::new(
+        None,
+        SomeValue::Integer(SomeInteger::new(true, false)),
+        false,
+        false,
+    )));
+    let s2 = SomeValue::List(SomeList::new(ListDef::new(
+        None,
+        SomeValue::Integer(SomeInteger::new(false, false)),
+        false,
+        false,
+    )));
     assert_ne!(s1, s2);
     // `contains` enters a SideEffectFreeGuard, so SomeList's
     // union_with → ListItem::merge raises UnionError → contains
     // returns False. Matches upstream semantics line-by-line.
     assert!(!contains(&s2, &s1));
+    assert_ne!(s1, s2);
     assert!(!contains(&s1, &s2));
+    assert_ne!(s1, s2);
 }
 
 // ---------------------------------------------------------------------------

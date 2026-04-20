@@ -13,16 +13,16 @@
 //! flowspace and will be ported in Phase 5 alongside the annotator /
 //! translator pipeline.
 //!
-//! Until then the transformation entry points panic with a
-//! parity-preserving message so that any caller that needs generator
-//! flowspace surfaces the gap loudly instead of silently producing a
-//! broken graph.
+//! Until then the transformation entry points return a flow-time error
+//! so callers surface the gap through ordinary `build_flow()` failure
+//! handling instead of panicking mid-translation.
 //!
 //! Parity-critical pieces already landed:
 //! * [`AbstractPosition`] marker trait (upstream `class AbstractPosition`).
 //! * [`get_variable_names`] (upstream `get_variable_names`, a pure
 //!   string helper with no flowspace coupling).
 
+use super::flowcontext::{FlowContextError, FlowingError};
 use super::model::FunctionGraph;
 
 /// RPython `rpython/flowspace/generator.py:14-16` — `class
@@ -65,22 +65,24 @@ pub fn get_variable_names(variables: &[&str]) -> Vec<String> {
 /// Rust port has no runtime class-construction facility; the real port
 /// lands together with the annotator (Phase 5) which also needs to
 /// reason about the synthesised `Entry` / `Resume` classes.
-pub fn make_generator_entry_graph(_func: super::model::GraphFunc) -> FunctionGraph {
-    unimplemented!(
+pub fn make_generator_entry_graph(
+    _func: super::model::GraphFunc,
+) -> Result<FunctionGraph, FlowContextError> {
+    Err(FlowContextError::Flowing(FlowingError::new(
         "generator flowspace requires rpython/translator/simplify.py + \
-         runtime class synthesis (Phase 5). See rpython/flowspace/generator.py:18-34."
-    )
+         runtime class synthesis (Phase 5). See rpython/flowspace/generator.py:18-34.",
+    )))
 }
 
 /// RPython `generator.py:36-39` — `tweak_generator_graph(graph)`.
 ///
 /// **Phase 3 F3.7 gap**: delegates to `tweak_generator_body_graph`
 /// whose port is blocked on `translator/simplify` (see module doc).
-pub fn tweak_generator_graph(_graph: &mut FunctionGraph) {
-    unimplemented!(
+pub fn tweak_generator_graph(_graph: &mut FunctionGraph) -> Result<(), FlowContextError> {
+    Err(FlowContextError::Flowing(FlowingError::new(
         "generator flowspace requires rpython/translator/simplify.py (Phase 5). \
-         See rpython/flowspace/generator.py:36-39."
-    )
+         See rpython/flowspace/generator.py:36-39.",
+    )))
 }
 
 #[cfg(test)]

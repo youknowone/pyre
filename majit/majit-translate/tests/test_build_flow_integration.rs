@@ -97,10 +97,15 @@ fn build_flow_rejects_missing_co_newlocals() {
 
 #[test]
 fn build_flow_rejects_closure_bearing_func() {
+    // upstream `_assert_rpythonic` rejects closures via
+    // `func.__code__.co_cellvars` (objspace.py:25), not via
+    // `func.__closure__`. Mirror that: a non-empty co_cellvars on the
+    // HostCode signals an inner function / generator / lambda —
+    // closure-bearing in upstream's sense.
     let code = compile_first_function("def f():\n    return 1\n");
-    let host = HostCode::from_code(&code);
-    let mut func = GraphFunc::from_host_code(host, empty_globals(), Vec::new());
-    func.closure.push(Constant::new(ConstValue::Int(1)));
+    let mut host = HostCode::from_code(&code);
+    host.co_cellvars.push("x".to_string());
+    let func = GraphFunc::from_host_code(host, empty_globals(), Vec::new());
 
     let err = build_flow(func).expect_err("closure-bearing func must reject");
     assert!(format!("{err:?}").contains("closures"));
