@@ -829,7 +829,7 @@ use crate::frame_layout::{
 use crate::helpers::emit_box_float_inline;
 
 // Re-export liveness items so downstream `pyre_jit_trace::state::*` keeps working.
-pub use crate::liveness::{LiveVars, expand_compact_to_dense, liveness_for};
+pub use crate::liveness::{LiveVars, liveness_for};
 
 /// Interpreter state exposed to the JIT framework.
 ///
