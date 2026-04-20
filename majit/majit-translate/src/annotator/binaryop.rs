@@ -252,10 +252,31 @@ fn bind_is(
     s_src: &SomeValue,
     s_tgt: &SomeValue,
 ) {
-    // binaryop.py:44-49 — `hasattr(s_tgt, 'is_type_of')` fast path
-    // needs `bk.valueoftype(s_src.const)` which depends on host-type →
-    // AnnotationSpec plumbing not yet in place. Placeholder: the
-    // fallback `[tgt_obj]` arm handles the common case.
+    // upstream binaryop.py:44-49:
+    //     if hasattr(s_tgt, 'is_type_of') and s_src.is_constant():
+    //         add_knowntypedata(knowntypedata, True,
+    //                           s_tgt.is_type_of,
+    //                           bk.valueoftype(s_src.const))
+    //
+    // `bk.valueoftype(s_src.const)` requires mapping a HostObject
+    // (Rust `ConstValue::HostObject`) that names a type back onto an
+    // `AnnotationSpec`. That round-trip depends on the host-type
+    // registry that lives with signature.rs + HostEnv, which is still
+    // partial — see reviewer's pre-existing notes. Until that lands,
+    // the best approximation is to widen the `is_type_of` variables
+    // to `s_src` itself (upstream would refine them more precisely
+    // via `valueoftype`, but propagating `s_src` unchanged is at least
+    // monotone — it never over-narrows).
+    if let SomeValue::TypeOf(t) = s_tgt {
+        if s_src.is_constant() && !t.is_type_of.is_empty() {
+            // TODO(bk.valueoftype): replace `s_src.clone()` with
+            // `bk.valueoftype(s_src.const_().expect("constant"))` once
+            // the HostObject-based valueoftype path is wired up.
+            let vars: Vec<Rc<super::super::flowspace::model::Variable>> =
+                t.is_type_of.iter().map(Rc::clone).collect();
+            super::model::add_knowntypedata(knowntypedata, true, &vars, s_src.clone());
+        }
+    }
 
     // binaryop.py:50 — `add_knowntypedata(..., True, [tgt_obj], s_src)`.
     let tgt_var = match tgt_obj {
@@ -770,10 +791,17 @@ fn init_integer_pairtype(
 /// RPython `pairtype(SomeInteger, SomeInteger).union((int1, int2))`
 /// (binaryop.py:178-202). Returns the widening union of two integer
 /// annotations. `_clone(union, …)` arith entries reuse this body.
+///
+/// Upstream raises `UnionError` when the signedness cannot be proven;
+/// the Rust port surfaces that via `panic!` — matching the upstream
+/// `raise` at binaryop.py:191/196/200.
 fn integer_union(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     let s1 = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
-    super::model::union(&s0, &s1).unwrap_or_else(|_| SomeValue::Integer(SomeInteger::default()))
+    match super::model::union(&s0, &s1) {
+        Ok(sv) => sv,
+        Err(e) => panic!("UnionError: {}", e),
+    }
 }
 
 /// RPython `pairtype(SomeInteger, SomeInteger).sub((int1, int2))`
@@ -782,7 +810,7 @@ fn integer_sub(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     let s1 = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
     let kt = crate::rlib::rarithmetic::compute_restype(s0.knowntype(), s1.knowntype());
-    SomeValue::Integer(SomeInteger::new_with_knowntype(false, false, kt))
+    SomeValue::Integer(SomeInteger::new_with_knowntype(false, kt))
 }
 
 /// RPython `pairtype(SomeInteger, SomeInteger).and_((int1, int2))`
@@ -795,7 +823,7 @@ fn integer_and(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
         _ => false,
     };
     let kt = crate::rlib::rarithmetic::compute_restype(s0.knowntype(), s1.knowntype());
-    SomeValue::Integer(SomeInteger::new_with_knowntype(nonneg, false, kt))
+    SomeValue::Integer(SomeInteger::new_with_knowntype(nonneg, kt))
 }
 
 /// RPython `pairtype(SomeInteger, SomeInteger).lshift((int1, int2))`
@@ -805,7 +833,7 @@ fn integer_lshift(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     match &s0 {
         SomeValue::Bool(_) => SomeValue::Integer(SomeInteger::default()),
         SomeValue::Integer(i) => {
-            SomeValue::Integer(SomeInteger::new_with_knowntype(false, false, i.knowntype()))
+            SomeValue::Integer(SomeInteger::new_with_knowntype(false, i.knowntype()))
         }
         _ => SomeValue::Integer(SomeInteger::default()),
     }
@@ -817,11 +845,9 @@ fn integer_rshift(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     match &s0 {
         SomeValue::Bool(_) => SomeValue::Integer(SomeInteger::new(true, false)),
-        SomeValue::Integer(i) => SomeValue::Integer(SomeInteger::new_with_knowntype(
-            i.nonneg,
-            false,
-            i.knowntype(),
-        )),
+        SomeValue::Integer(i) => {
+            SomeValue::Integer(SomeInteger::new_with_knowntype(i.nonneg, i.knowntype()))
+        }
         _ => SomeValue::Integer(SomeInteger::default()),
     }
 }
@@ -978,11 +1004,7 @@ fn cmp_integer(cmp_op: OpKind, annotator: &RPythonAnnotator, hl: &HLOperation) -
                     &mut knowntypedata,
                     case,
                     &[Rc::new(v.clone())],
-                    SomeValue::Integer(SomeInteger::new_with_knowntype(
-                        true,
-                        false,
-                        tointtype(kt2),
-                    )),
+                    SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt2))),
                 );
             }
         }
@@ -996,11 +1018,7 @@ fn cmp_integer(cmp_op: OpKind, annotator: &RPythonAnnotator, hl: &HLOperation) -
                     &mut knowntypedata,
                     case,
                     &[Rc::new(v.clone())],
-                    SomeValue::Integer(SomeInteger::new_with_knowntype(
-                        true,
-                        false,
-                        tointtype(kt1),
-                    )),
+                    SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt1))),
                 );
             }
         }
@@ -1915,10 +1933,10 @@ fn list_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
         Some(SomeValue::List(s)) => s,
         _ => panic!("list_integer_getitem: arg 0 not SomeList"),
     };
-    let position = ann
-        .bookkeeper
-        .current_position_key()
-        .expect("list getitem: position_key is None");
+    // upstream: `position = getbookkeeper().position_key`. `None` is
+    // valid here (no reflow frame active); `read_item` drops the
+    // empty key from its read-locations set.
+    let position = ann.bookkeeper.current_position_key();
     lst1.listdef.read_item(position)
 }
 
@@ -1942,9 +1960,10 @@ fn list_integer_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
         Some(SomeValue::List(s)) => s,
         _ => panic!("list_integer_delitem: arg 0 not SomeList"),
     };
-    // upstream: `lst1.listdef.resize()`.
-    // ListDef::resize is not yet ported; fall back to mutate for now.
-    lst1.listdef.mutate().expect("listdef.mutate failed");
+    // upstream binaryop.py:593-595:
+    //     def delitem((lst1, int2)):
+    //         lst1.listdef.resize()
+    lst1.listdef.resize().expect("listdef.resize failed");
     SomeValue::Impossible
 }
 
@@ -2379,10 +2398,9 @@ fn dict_object_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
         .dictdef
         .generalize_key(&s_key)
         .expect("dict_object_getitem: generalize_key failed");
-    let position = ann
-        .bookkeeper
-        .current_position_key()
-        .expect("dict getitem: position_key is None");
+    // upstream: `position = annotator.bookkeeper.position_key`.
+    // Outside a reflow frame this is `None`; `read_value` handles it.
+    let position = ann.bookkeeper.current_position_key();
     s_dict.dictdef.read_value(position)
 }
 
@@ -3081,6 +3099,36 @@ mod tests {
         );
         let r = hl.consider(&ann);
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_list_integer_getitem_accepts_none_position() {
+        // reviewer parity — upstream allows position_key=None as a dict
+        // key (Python dict accepts None); read_item drops None from
+        // read_locations but still returns the item annotation.
+        let ann = mk_ann();
+        // Do NOT set_position_key — deliberately leave it as None.
+        let mut v0 = Variable::named("lst");
+        let mut v1 = Variable::named("i");
+        let listdef = super::super::listdef::ListDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        );
+        let s_list = super::super::model::SomeList::new(listdef);
+        ann.setbinding(&mut v0, SomeValue::List(s_list));
+        ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+        let r = hl.consider(&ann);
+        assert!(
+            matches!(r, SomeValue::Impossible | SomeValue::Integer(_)),
+            "got {:?}",
+            r
+        );
     }
 
     #[test]

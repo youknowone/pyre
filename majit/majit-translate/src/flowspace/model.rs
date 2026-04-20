@@ -2102,6 +2102,12 @@ impl BlockKey {
     pub fn of(b: &BlockRef) -> Self {
         BlockKey(Rc::as_ptr(b))
     }
+
+    /// Exposes the pointer identity as a `usize` — useful as a
+    /// `PositionKey` payload.
+    pub fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
 }
 
 impl PartialEq for BlockKey {
@@ -2113,6 +2119,69 @@ impl PartialEq for BlockKey {
 impl Eq for BlockKey {}
 
 impl std::hash::Hash for BlockKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+/// RPython `FunctionGraph` container used by the annotator. Upstream
+/// passes `FunctionGraph` instances directly through dicts/sets
+/// (Python identity). The Rust port wraps the graph in `Rc<RefCell<…>>`
+/// so the annotator can mutate per-graph state (tag, entry-point
+/// bookkeeping) without fighting the borrow checker.
+pub type GraphRef = Rc<RefCell<FunctionGraph>>;
+
+/// Identity-keyed wrapper for `GraphRef` — same rationale as
+/// [`BlockKey`]: RPython `dict[FunctionGraph]` uses Python object
+/// identity, which maps to `Rc::as_ptr` on the Rust side.
+#[derive(Clone, Debug)]
+pub struct GraphKey(*const RefCell<FunctionGraph>);
+
+impl GraphKey {
+    pub fn of(g: &GraphRef) -> Self {
+        GraphKey(Rc::as_ptr(g))
+    }
+
+    pub fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl PartialEq for GraphKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for GraphKey {}
+
+impl std::hash::Hash for GraphKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+/// Identity-keyed wrapper for `LinkRef`. Used by `RPythonAnnotator`'s
+/// `links_followed` set — upstream Python stores `Link` objects in a
+/// dict keyed by identity.
+#[derive(Clone, Debug)]
+pub struct LinkKey(*const RefCell<Link>);
+
+impl LinkKey {
+    pub fn of(l: &LinkRef) -> Self {
+        LinkKey(Rc::as_ptr(l))
+    }
+}
+
+impl PartialEq for LinkKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for LinkKey {}
+
+impl std::hash::Hash for LinkKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }

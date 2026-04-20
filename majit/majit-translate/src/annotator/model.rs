@@ -454,7 +454,19 @@ impl SomeInteger {
     /// Construct with an explicit [`KnownType`] — mirrors RPython's
     /// `SomeInteger(knowntype=...)` keyword call used by binaryop.py's
     /// `compute_restype(...)` path (binaryop.py:201-202, :218-219).
-    pub fn new_with_knowntype(nonneg: bool, unsigned: bool, knowntype: KnownType) -> Self {
+    ///
+    /// upstream model.py:211-224 derives `unsigned` from the knowntype
+    /// itself (`knowntype(-1) > 0`) and raises
+    /// `TypeError('Conflicting specification for SomeInteger')` when
+    /// an explicit `unsigned` is passed alongside a non-None
+    /// `knowntype`. The Rust port follows that contract: `unsigned`
+    /// is strictly derived, so callers cannot pin both signedness and
+    /// `KnownType::Ruint` to contradictory values.
+    pub fn new_with_knowntype(nonneg: bool, knowntype: KnownType) -> Self {
+        // upstream: `unsigned = self.knowntype(-1) > 0`. Only r_uint
+        // (KnownType::Ruint) treats -1 as a positive value; all other
+        // integer KnownTypes are signed.
+        let unsigned = matches!(knowntype, KnownType::Ruint);
         SomeInteger {
             base: SomeObjectBase::new(knowntype, true),
             nonneg: unsigned || nonneg,
@@ -1502,17 +1514,20 @@ impl SomeObjectTrait for SomeWeakRef {
 
 /// RPython `class SomeTypeOf(SomeType)` (model.py:146-149). Used by
 /// `typeof(args_v)` to track a type derived from a specific variable.
+///
+/// Upstream stores the actual `args_v` list — `Variable` objects —
+/// so downstream refinement sites (`is__default`, `isinstance`, …) can
+/// dispatch knowntypedata keyed on the underlying variables. The Rust
+/// port matches: `is_type_of: Vec<Rc<Variable>>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeTypeOf {
     pub base: SomeObjectBase,
-    /// RPython `self.is_type_of` — the `args_v` list. Stored as opaque
-    /// variable name tags; the real `Variable` reference is carried by
-    /// the bookkeeper in Phase 5.
-    pub is_type_of: Vec<String>,
+    /// RPython `self.is_type_of` — the `args_v` list.
+    pub is_type_of: Vec<Rc<Variable>>,
 }
 
 impl SomeTypeOf {
-    pub fn new(is_type_of: Vec<String>) -> Self {
+    pub fn new(is_type_of: Vec<Rc<Variable>>) -> Self {
         SomeTypeOf {
             base: SomeObjectBase::new(KnownType::Type, true),
             is_type_of,
@@ -2072,26 +2087,72 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // SomeImpossibleValue is the bottom element: `impossible ∪ X = X`.
         (SomeValue::Impossible, other) | (other, SomeValue::Impossible) => Ok(other.clone()),
 
-        // SomeInteger ∪ SomeInteger — merge nonneg + unsigned flags.
-        // Upstream: `binaryop.py:__union__(SomeInteger, SomeInteger)`
-        // (simplified). The `nonneg` of the union is the logical AND of
-        // both (both must guarantee ≥ 0 for the union to inherit it).
-        // `unsigned` requires both sides to be unsigned (differing
-        // signedness collapses to the wider r_uint).
-        (SomeValue::Integer(a), SomeValue::Integer(b)) => {
-            // upstream semantic, distilled from rpython/annotator/binaryop.py
-            // SomeInteger ∪ SomeInteger dispatch:
-            //   nonneg := a.nonneg AND b.nonneg
-            //   unsigned := r_uint iff at least one side is r_uint AND
-            //   the other side fits (i.e. is also nonneg). Otherwise
-            //   the union widens to a signed int.
-            //
-            // This captures the `test_signedness` invariant that
-            // `SomeInteger(unsigned=True).contains(SomeInteger(nonneg=True))`
-            // holds (test_model.py:52-54).
-            let nonneg = a.nonneg && b.nonneg;
-            let unsigned = (a.unsigned || b.unsigned) && a.nonneg && b.nonneg;
-            Ok(SomeValue::Integer(SomeInteger::new(nonneg, unsigned)))
+        // SomeInteger ∪ SomeInteger — binaryop.py:178-202 signedness-
+        // proof dispatch. Direct port of the upstream body:
+        //
+        //     if int1.unsigned == int2.unsigned:
+        //         knowntype = compute_restype(int1.knowntype, int2.knowntype)
+        //     else:
+        //         t1, t2 = int1.knowntype, int2.knowntype
+        //         if t1 is bool: t1 = int
+        //         if t2 is bool: t2 = int
+        //         if t2 is int:
+        //             if int2.nonneg == False:
+        //                 raise UnionError(int1, int2, "RPython cannot prove …")
+        //             knowntype = t1
+        //         elif t1 is int:
+        //             if int1.nonneg == False:
+        //                 raise UnionError(...)
+        //             knowntype = t2
+        //         else:
+        //             raise UnionError(int1, int2)
+        //     return SomeInteger(nonneg=int1.nonneg and int2.nonneg,
+        //                        knowntype=knowntype)
+        (SomeValue::Integer(int1), SomeValue::Integer(int2)) => {
+            let knowntype = if int1.unsigned == int2.unsigned {
+                crate::rlib::rarithmetic::compute_restype(int1.base.knowntype, int2.base.knowntype)
+            } else {
+                // bool → int promotion before the signedness compare.
+                // SomeInteger itself never carries KnownType::Bool
+                // (SomeBool is a distinct enum variant), so the
+                // promotion is a no-op here. Kept as a comment for
+                // parity visibility.
+                let t1 = int1.base.knowntype;
+                let t2 = int2.base.knowntype;
+                if matches!(t2, KnownType::Int) {
+                    if !int2.nonneg {
+                        return Err(UnionError {
+                            lhs: s1.clone(),
+                            rhs: s2.clone(),
+                            msg:
+                                "RPython cannot prove that these integers are of the same signedness"
+                                    .into(),
+                        });
+                    }
+                    t1
+                } else if matches!(t1, KnownType::Int) {
+                    if !int1.nonneg {
+                        return Err(UnionError {
+                            lhs: s1.clone(),
+                            rhs: s2.clone(),
+                            msg:
+                                "RPython cannot prove that these integers are of the same signedness"
+                                    .into(),
+                        });
+                    }
+                    t2
+                } else {
+                    return Err(UnionError {
+                        lhs: s1.clone(),
+                        rhs: s2.clone(),
+                        msg: "RPython cannot unify these integer types".into(),
+                    });
+                }
+            };
+            Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+                int1.nonneg && int2.nonneg,
+                knowntype,
+            )))
         }
 
         // SomeBool ∪ SomeBool (different constants) — generalise to
@@ -2401,6 +2462,188 @@ pub fn contains(a: &SomeValue, b: &SomeValue) -> bool {
     }
 }
 
+/// RPython `intersection(s_obj1, s_obj2)` (model.py:127-130 +
+/// doubledispatch registrations at 464-512).
+///
+/// ```python
+/// @doubledispatch
+/// def intersection(s_obj1, s_obj2):
+///     """Return the intersection of two annotations, or an over-approximation thereof"""
+///     raise NotImplementedError
+/// ```
+///
+/// The @doubledispatch default raises NotImplementedError; the concrete
+/// overloads in model.py:464-512 cover (SomeInstance, SomeInstance),
+/// (SomeException, SomeInstance), (SomeInstance, SomeException).
+/// The Rust port preserves the strict contract: unregistered pairs
+/// panic rather than silently widen.
+pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
+    match (s_obj1, s_obj2) {
+        // @intersection.register(SomeInstance, SomeInstance) — model.py:464-472.
+        //
+        // can_be_None = s_inst1.can_be_None and s_inst2.can_be_None
+        // if s_inst1.classdef.issubclass(s_inst2.classdef):
+        //     return SomeInstance(s_inst1.classdef, can_be_None=can_be_None)
+        // elif s_inst2.classdef.issubclass(s_inst1.classdef):
+        //     return SomeInstance(s_inst2.classdef, can_be_None=can_be_None)
+        // else:
+        //     return s_ImpossibleValue
+        (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
+            let can_be_none = s_inst1.can_be_none && s_inst2.can_be_none;
+            let (cd1, cd2) = match (&s_inst1.classdef, &s_inst2.classdef) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    // upstream treats None classdef (the "generic SomeInstance")
+                    // as the top — intersect returns the more specific side.
+                    let classdef = s_inst1
+                        .classdef
+                        .clone()
+                        .or_else(|| s_inst2.classdef.clone());
+                    return SomeValue::Instance(SomeInstance::new(
+                        classdef,
+                        can_be_none,
+                        std::collections::BTreeMap::new(),
+                    ));
+                }
+            };
+            if cd1.borrow().issubclass(cd2) {
+                SomeValue::Instance(SomeInstance::new(
+                    Some(Rc::clone(cd1)),
+                    can_be_none,
+                    std::collections::BTreeMap::new(),
+                ))
+            } else if cd2.borrow().issubclass(cd1) {
+                SomeValue::Instance(SomeInstance::new(
+                    Some(Rc::clone(cd2)),
+                    can_be_none,
+                    std::collections::BTreeMap::new(),
+                ))
+            } else {
+                s_impossible_value()
+            }
+        }
+
+        // @intersection.register(SomeException, SomeInstance) — model.py:493-499.
+        //
+        // classdefs = {c for c in s_exc.classdefs if c.issubclass(s_inst.classdef)}
+        // if classdefs:
+        //     return SomeException(classdefs)
+        // else:
+        //     return s_ImpossibleValue
+        (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
+            let Some(target) = &s_inst.classdef else {
+                // Upstream's classdef is always populated for exception exits;
+                // an unclassified SomeInstance degrades to the full set.
+                return SomeValue::Exception(s_exc.clone());
+            };
+            let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
+                .classdefs
+                .iter()
+                .filter(|c| c.borrow().issubclass(target))
+                .cloned()
+                .collect();
+            if classdefs.is_empty() {
+                s_impossible_value()
+            } else {
+                SomeValue::Exception(SomeException::new(classdefs))
+            }
+        }
+
+        // @intersection.register(SomeInstance, SomeException) — model.py:501-503.
+        //
+        // def intersection_Exception_Instance(s_inst, s_exc):
+        //     return intersection(s_exc, s_inst)
+        (SomeValue::Instance(_), SomeValue::Exception(_)) => intersection(s_obj2, s_obj1),
+
+        // @doubledispatch default: `raise NotImplementedError`.
+        _ => panic!(
+            "intersection: NotImplementedError for ({:?}, {:?})",
+            s_obj1.knowntype(),
+            s_obj2.knowntype()
+        ),
+    }
+}
+
+/// RPython `difference(s_obj1, s_obj2)` (model.py:132-135 +
+/// doubledispatch registrations at 474-512).
+///
+/// ```python
+/// @doubledispatch
+/// def difference(s_obj1, s_obj2):
+///     """Return the set difference of two annotations, or an over-approximation thereof"""
+///     raise NotImplementedError
+/// ```
+pub fn difference(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
+    match (s_obj1, s_obj2) {
+        // @difference.register(SomeInstance, SomeInstance) — model.py:474-479.
+        //
+        // if s_inst1.classdef.issubclass(s_inst2.classdef):
+        //     return s_ImpossibleValue
+        // else:
+        //     return s_inst1
+        (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
+            match (&s_inst1.classdef, &s_inst2.classdef) {
+                (Some(cd1), Some(cd2)) if cd1.borrow().issubclass(cd2) => s_impossible_value(),
+                _ => SomeValue::Instance(s_inst1.clone()),
+            }
+        }
+
+        // @difference.register(SomeException, SomeInstance) — model.py:505-512.
+        //
+        // classdefs = {c for c in s_exc.classdefs
+        //     if not c.issubclass(s_inst.classdef)}
+        // if classdefs:
+        //     return SomeException(classdefs)
+        // else:
+        //     return s_ImpossibleValue
+        (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
+            let Some(target) = &s_inst.classdef else {
+                // With no concrete classdef, the exclusion matches nothing.
+                return SomeValue::Exception(s_exc.clone());
+            };
+            let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
+                .classdefs
+                .iter()
+                .filter(|c| !c.borrow().issubclass(target))
+                .cloned()
+                .collect();
+            if classdefs.is_empty() {
+                s_impossible_value()
+            } else {
+                SomeValue::Exception(SomeException::new(classdefs))
+            }
+        }
+
+        _ => panic!(
+            "difference: NotImplementedError for ({:?}, {:?})",
+            s_obj1.knowntype(),
+            s_obj2.knowntype()
+        ),
+    }
+}
+
+/// RPython `class HarmlesslyBlocked(Exception)` (model.py:831-834).
+///
+/// ```python
+/// class HarmlesslyBlocked(Exception):
+///     """Raised by the unaryop/binaryop to signal a harmless kind of
+///     BlockedInference: the current block is blocked, but not in a way
+///     that gives 'Blocked block' errors at the end of annotation."""
+/// ```
+///
+/// Marker type — carries no payload. Used as a zero-sized Result error
+/// so the flowin except-clause can distinguish harmless blocks.
+#[derive(Clone, Debug)]
+pub struct HarmlesslyBlocked;
+
+impl core::fmt::Display for HarmlesslyBlocked {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("HarmlesslyBlocked")
+    }
+}
+
+impl std::error::Error for HarmlesslyBlocked {}
+
 /// RPython `read_can_only_throw(opimpl, *args)` (model.py:837-841).
 ///
 /// ```python
@@ -2468,8 +2711,7 @@ pub fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
     if args_v.is_empty() {
         return SomeValue::Type(SomeType::new());
     }
-    let names: Vec<String> = args_v.iter().map(|v| v.name()).collect();
-    let result = SomeTypeOf::new(names);
+    let result = SomeTypeOf::new(args_v.iter().map(Rc::clone).collect());
     // TODO(Commit 2+): Exception-const fast path (model.py:154-158)
     // requires downcasting `v.annotation` to `SomeValue::Exception`
     // and projecting `classdefs -> classdesc.pyobj` onto `result.const`.
@@ -2925,7 +3167,9 @@ mod tests {
 
     #[test]
     fn sometypeof_keeps_variable_refs() {
-        let t = SomeTypeOf::new(vec!["v1".into(), "v2".into()]);
+        let v1 = Rc::new(Variable::named("v1"));
+        let v2 = Rc::new(Variable::named("v2"));
+        let t = SomeTypeOf::new(vec![v1, v2]);
         assert_eq!(t.is_type_of.len(), 2);
         assert_eq!(t.knowntype(), KnownType::Type);
     }
@@ -3224,6 +3468,33 @@ mod tests {
             panic!("expected SomeWeakRef");
         };
         assert!(w.classdef.is_none());
+    }
+
+    #[test]
+    fn union_integer_signedness_mismatch_with_nonneg_proves_signed() {
+        // binaryop.py:189-193 — signed vs unsigned where the signed
+        // side is proven ≥ 0 → unify as the unsigned type.
+        let signed_nonneg = SomeValue::Integer(SomeInteger::new(true, false));
+        let unsigned = SomeValue::Integer(SomeInteger::new(false, true));
+        let r = union(&signed_nonneg, &unsigned).expect("should unify");
+        match r {
+            SomeValue::Integer(i) => {
+                assert!(i.unsigned, "unsigned side wins when signed is nonneg");
+            }
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn union_integer_signedness_mismatch_without_nonneg_errors() {
+        // binaryop.py:190-192 — signed int with no nonneg proof unioned
+        // against r_uint must raise UnionError.
+        let signed = SomeValue::Integer(SomeInteger::new(false, false));
+        let unsigned = SomeValue::Integer(SomeInteger::new(false, true));
+        assert!(
+            union(&signed, &unsigned).is_err(),
+            "unprovable signedness should error"
+        );
     }
 
     #[test]

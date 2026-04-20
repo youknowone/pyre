@@ -206,6 +206,25 @@ pub enum BuiltinException {
     Exception,
 }
 
+impl BuiltinException {
+    /// Python class name — matches `HOST_ENV.lookup_builtin(...)` keys
+    /// so `Bookkeeper.new_exception([BuiltinException::IndexError, ...])`
+    /// can resolve each entry through the existing HostObject lookup.
+    pub fn host_name(self) -> &'static str {
+        match self {
+            BuiltinException::ValueError => "ValueError",
+            BuiltinException::UnicodeDecodeError => "UnicodeDecodeError",
+            BuiltinException::ZeroDivisionError => "ZeroDivisionError",
+            BuiltinException::OverflowError => "OverflowError",
+            BuiltinException::IndexError => "IndexError",
+            BuiltinException::KeyError => "KeyError",
+            BuiltinException::StopIteration => "StopIteration",
+            BuiltinException::RuntimeError => "RuntimeError",
+            BuiltinException::Exception => "Exception",
+        }
+    }
+}
+
 /// RPython `SingleDispatchMixin.dispatch = 1` /
 /// `DoubleDispatchMixin.dispatch = 2` / `HLOperation.dispatch = None`
 /// (operation.py:70-72, 202-203, 258-259).
@@ -1597,10 +1616,19 @@ impl HLOperation {
     ///     return transformer(annotator, *self.args)
     /// ```
     ///
-    /// `cls._transform` registries are populated lazily; empty registry
-    /// means upstream's `lambda *args: None` default applies.
-    pub fn transform(&self, _annotator: &crate::annotator::annrpython::RPythonAnnotator) {
-        // Transform registries land with the optimizer-facing commits.
+    /// The transformer either returns `None` (default `lambda *args:
+    /// None`) or a list of replacement ops. `cls._transform` registries
+    /// are populated by the optimizer-facing commits; until any register
+    /// here the return is always `None`, which is what upstream does
+    /// too when no `register_transform` decorator has fired.
+    pub fn transform(
+        &self,
+        _annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    ) -> Option<Vec<HLOperation>> {
+        // Empty transform registry — matches upstream's default
+        // `lambda *args: None` when no `register_transform(...)` has
+        // been called.
+        None
     }
 
     /// RPython `HLOperation.get_can_only_throw(self, annotator)`

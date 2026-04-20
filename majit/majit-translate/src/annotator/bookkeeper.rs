@@ -279,6 +279,33 @@ impl Bookkeeper {
         }
     }
 
+    /// RPython `Bookkeeper.check_no_flags_on_instances(self)`
+    /// (bookkeeper.py:~113-120) — post-annotation sanity check invoked
+    /// by `RPythonAnnotator.validate()`.
+    ///
+    /// Not yet ported: the upstream body asserts that no `SomeInstance`
+    /// instance still has `flags` set once annotation is finished. The
+    /// Rust stub is a no-op until Phase 5 wires up the rtyper-facing
+    /// validation suite; keeping it as a named method preserves the
+    /// call site parity.
+    pub fn check_no_flags_on_instances(&self) {
+        // Stub — see bookkeeper.py:~113-120.
+    }
+
+    /// RPython `Bookkeeper.compute_at_fixpoint(self)`
+    /// (bookkeeper.py:126-132) — invoked at the tail of
+    /// `RPythonAnnotator.simplify()`.
+    ///
+    /// Upstream calls `self.thread_local_fields`, iterates
+    /// `self.pending_specializations`, clears deferred listitem-
+    /// mutation/resize records, and tails into
+    /// `self.check_no_flags_on_instances`. The Rust port's stub is a
+    /// no-op until those subsystems land; keeping the call site
+    /// preserves the simplify loop's upstream structure.
+    pub fn compute_at_fixpoint(&self) {
+        // Stub — see bookkeeper.py:126-132.
+    }
+
     /// RPython `Bookkeeper.valueoftype(self, t)` (bookkeeper.py:444-445).
     ///
     /// Thin wrapper around [`crate::annotator::signature::annotationoftype`]
@@ -568,6 +595,26 @@ impl Bookkeeper {
                 cls.qualname()
             ))),
         }
+    }
+
+    /// RPython `Bookkeeper.new_exception(self, exc_classes)`
+    /// (bookkeeper.py:174-176).
+    ///
+    /// ```python
+    /// def new_exception(self, exc_classes):
+    ///     clsdefs = {self.getuniqueclassdef(cls) for cls in exc_classes}
+    ///     return SomeException(clsdefs)
+    /// ```
+    pub fn new_exception(
+        self: &Rc<Self>,
+        exc_classes: &[HostObject],
+    ) -> Result<super::model::SomeException, super::model::AnnotatorError> {
+        let mut clsdefs: Vec<Rc<RefCell<ClassDef>>> = Vec::new();
+        for cls in exc_classes {
+            let cd = self.getuniqueclassdef(cls)?;
+            clsdefs.push(cd);
+        }
+        Ok(super::model::SomeException::new(clsdefs))
     }
 
     fn resolve_stub_desc(&self, desc: &Desc) -> Option<DescEntry> {

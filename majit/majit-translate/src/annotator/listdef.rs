@@ -585,11 +585,20 @@ impl ListDef {
     /// RPython `ListDef.read_item(position_key)` (listdef.py:132-134).
     ///
     /// Records a read location for eventual `notify_update()` reflow,
-    /// then returns the current element annotation.
-    pub fn read_item(&self, position_key: PositionKey) -> SomeValue {
+    /// then returns the current element annotation. `position_key` is
+    /// `Option` — upstream's `bookkeeper.position_key` is `None`
+    /// outside of a reflow frame, and stashing that `None` in
+    /// `listitem.read_locations` is legal (Python dict keys accept
+    /// `None`). The Rust port's `HashSet<PositionKey>` can only hold
+    /// `Some` values, so `None` is dropped from the read-locations set
+    /// — the subsequent `s_value.clone()` return still matches
+    /// upstream behaviour.
+    pub fn read_item(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
-        li_mut.read_locations.insert(position_key);
+        if let Some(pk) = position_key {
+            li_mut.read_locations.insert(pk);
+        }
         li_mut.s_value.clone()
     }
 
@@ -621,9 +630,10 @@ impl ListDef {
         bookkeeper: &Rc<Bookkeeper>,
         others: &[&ListDef],
     ) -> Result<SomeList, AnnotatorError> {
-        let position = bookkeeper
-            .current_position_key()
-            .expect("offspring: bookkeeper.position_key is None");
+        // upstream: `position = bookkeeper.position_key`. Outside of a
+        // reflow frame this is `None`; Python dict/set keys accept it,
+        // so the Rust port passes the Option through.
+        let position = bookkeeper.current_position_key();
         let s_self_value = self.read_item(position);
         let mut s_other_values: Vec<SomeValue> = Vec::with_capacity(others.len());
         for other in others {
@@ -668,18 +678,11 @@ impl ListDef {
     ///
     /// Bidirectionally generalises both sides against each other at
     /// the bookkeeper's current position, then reconciles `range_step`
-    /// if either side is range-derived. Upstream reads
-    /// `bookkeeper.position_key` directly and crashes on `None`; we
-    /// surface that as a [`UnionError`] so callers see the parity
-    /// violation instead of an opaque panic.
+    /// if either side is range-derived. `position_key` is passed as
+    /// `Option` so the upstream None-key caching path (no reflow
+    /// frame active) flows through unchanged.
     pub fn agree(&self, bookkeeper: &Bookkeeper, other: &ListDef) -> Result<(), UnionError> {
-        let position = bookkeeper
-            .current_position_key()
-            .ok_or_else(|| UnionError {
-                lhs: SomeValue::Impossible,
-                rhs: SomeValue::Impossible,
-                msg: "ListDef.agree called without bookkeeper.position_key set".into(),
-            })?;
+        let position = bookkeeper.current_position_key();
         let s_self_value = self.read_item(position);
         let s_other_value = other.read_item(position);
         self.generalize(&s_other_value)?;

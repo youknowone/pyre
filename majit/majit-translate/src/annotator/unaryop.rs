@@ -139,17 +139,19 @@ fn init_type_register(
         SomeValueTag::Object,
         Specialization {
             apply: Box::new(|_ann, hl| {
-                // upstream: `SomeTypeOf([v_arg])`.
-                let v_name = match &hl.args[0] {
-                    super::super::flowspace::model::Hlvalue::Variable(v) => v.name(),
-                    super::super::flowspace::model::Hlvalue::Constant(_) => {
-                        // `type(const)` — upstream still builds SomeTypeOf
-                        // since `args_v` carries the Hlvalue; we preserve
-                        // the same shape with an empty-name marker.
-                        String::new()
+                // upstream unaryop.py:31-33 — `SomeTypeOf([v_arg])`.
+                // Constants are ignored: upstream `type(const)` would
+                // never enter this dispatcher (it lands on the
+                // const-folding path of `Type.constfold`). When the
+                // arg happens to be a constant we fall back to an
+                // empty is_type_of list.
+                let vars: Vec<Rc<super::super::flowspace::model::Variable>> = match &hl.args[0] {
+                    super::super::flowspace::model::Hlvalue::Variable(v) => {
+                        vec![Rc::new(v.clone())]
                     }
+                    super::super::flowspace::model::Hlvalue::Constant(_) => Vec::new(),
                 };
-                SomeValue::TypeOf(SomeTypeOf::new(vec![v_name]))
+                SomeValue::TypeOf(SomeTypeOf::new(vars))
             }),
             can_only_throw: CanOnlyThrow::Absent,
         },
@@ -457,7 +459,7 @@ fn init_someinteger_overrides(
             Some(SomeValue::Integer(i)) => i.base.knowntype,
             _ => panic!("integer op: arg 0 not SomeInteger"),
         };
-        SomeValue::Integer(SomeInteger::new_with_knowntype(false, false, kt))
+        SomeValue::Integer(SomeInteger::new_with_knowntype(false, kt))
     };
     for op in &[OpKind::Invert, OpKind::Pos, OpKind::Int] {
         register(
@@ -495,7 +497,8 @@ fn init_someinteger_overrides(
             Some(SomeValue::Integer(i)) => i.base.knowntype,
             _ => panic!("integer.abs: arg 0 not SomeInteger"),
         };
-        let mut i = SomeInteger::new_with_knowntype(false, false, kt);
+        // upstream: SomeInteger(nonneg=True, knowntype=self.knowntype).
+        let mut i = SomeInteger::new_with_knowntype(true, kt);
         i.nonneg = true;
         SomeValue::Integer(i)
     };
@@ -770,10 +773,7 @@ fn init_somelist_overrides(
                     Some(SomeValue::List(s)) => s,
                     _ => panic!("list.len: arg 0 not SomeList"),
                 };
-                let position = ann
-                    .bookkeeper
-                    .current_position_key()
-                    .expect("list.len: position_key is None");
+                let position = ann.bookkeeper.current_position_key();
                 let s_item = s_list.listdef.read_item(position);
                 if matches!(s_item, SomeValue::Impossible) {
                     // upstream: immutablevalue(0) → SomeInteger with const=0.
@@ -1006,10 +1006,7 @@ pub fn list_method_pop(
 ) -> SomeValue {
     // unaryop.py:381-385 — resize + read_item(position). can_only_throw=[IndexError].
     s_self.listdef.resize().expect("resize");
-    let position = ann
-        .bookkeeper
-        .current_position_key()
-        .expect("list.pop: position_key is None");
+    let position = ann.bookkeeper.current_position_key();
     s_self.listdef.read_item(position)
 }
 
@@ -1040,7 +1037,7 @@ pub fn list_method_index(
 fn dict_contains(
     s_dct: &super::model::SomeDict,
     s_element: &SomeValue,
-    position: super::bookkeeper::PositionKey,
+    position: Option<super::bookkeeper::PositionKey>,
 ) -> SomeValue {
     s_dct
         .dictdef
@@ -1055,7 +1052,10 @@ fn dict_contains(
 }
 
 /// RPython `SomeDict._is_empty(self, position)` (unaryop.py:464-468).
-fn dict_is_empty(s_dct: &super::model::SomeDict, position: super::bookkeeper::PositionKey) -> bool {
+fn dict_is_empty(
+    s_dct: &super::model::SomeDict,
+    position: Option<super::bookkeeper::PositionKey>,
+) -> bool {
     let s_key = s_dct.dictdef.read_key(position);
     let s_value = s_dct.dictdef.read_value(position);
     matches!(s_key, SomeValue::Impossible) || matches!(s_value, SomeValue::Impossible)
@@ -1083,10 +1083,7 @@ fn init_somedict_overrides(
                 let s_elem = ann
                     .annotation(&hl.args[1])
                     .expect("contains(SomeDict): element unbound");
-                let position = ann
-                    .bookkeeper
-                    .current_position_key()
-                    .expect("contains(SomeDict): position_key is None");
+                let position = ann.bookkeeper.current_position_key();
                 dict_contains(&s_dct, &s_elem, position)
             }),
             can_only_throw: CanOnlyThrow::Callable(Box::new(|args_s| {
@@ -1115,10 +1112,7 @@ fn init_somedict_overrides(
                     Some(SomeValue::Dict(d)) => d,
                     _ => panic!("dict.len: arg 0 not SomeDict"),
                 };
-                let position = ann
-                    .bookkeeper
-                    .current_position_key()
-                    .expect("dict.len: position_key is None");
+                let position = ann.bookkeeper.current_position_key();
                 if dict_is_empty(&s_dct, position) {
                     let mut i = SomeInteger::new(true, false);
                     i.base.const_box = Some(Constant::new(ConstValue::Int(0)));
@@ -1157,10 +1151,7 @@ pub fn dict_method_get(
     s_dfl: &SomeValue,
 ) -> SomeValue {
     // unaryop.py:502-506
-    let position = ann
-        .bookkeeper
-        .current_position_key()
-        .expect("dict.get: position_key is None");
+    let position = ann.bookkeeper.current_position_key();
     s_self
         .dictdef
         .generalize_key(s_key)
@@ -1204,10 +1195,7 @@ pub fn dict_method_update(
 #[allow(dead_code)]
 pub fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:521-523 — bk.newlist(self.dictdef.read_key(bk.position_key)).
-    let position = ann
-        .bookkeeper
-        .current_position_key()
-        .expect("dict.keys: position_key is None");
+    let position = ann.bookkeeper.current_position_key();
     let s_key = s_self.dictdef.read_key(position);
     let s_list = ann
         .bookkeeper
@@ -1219,10 +1207,7 @@ pub fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict)
 #[allow(dead_code)]
 pub fn dict_method_values(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:525-527
-    let position = ann
-        .bookkeeper
-        .current_position_key()
-        .expect("dict.values: position_key is None");
+    let position = ann.bookkeeper.current_position_key();
     let s_value = s_self.dictdef.read_value(position);
     let s_list = ann
         .bookkeeper
@@ -1286,10 +1271,7 @@ pub fn dict_method_pop(
             .generalize_value(s)
             .expect("generalize_value");
     }
-    let position = ann
-        .bookkeeper
-        .current_position_key()
-        .expect("dict.pop: position_key is None");
+    let position = ann.bookkeeper.current_position_key();
     s_self.dictdef.read_value(position)
 }
 
@@ -1793,17 +1775,11 @@ fn init_someiterator_overrides(
                         }
                     }
                     SomeValue::List(l) => {
-                        let position = ann
-                            .bookkeeper
-                            .current_position_key()
-                            .expect("iterator.next(list): position_key is None");
+                        let position = ann.bookkeeper.current_position_key();
                         l.listdef.read_item(position)
                     }
                     SomeValue::Dict(d) => {
-                        let position = ann
-                            .bookkeeper
-                            .current_position_key()
-                            .expect("iterator.next(dict): position_key is None");
+                        let position = ann.bookkeeper.current_position_key();
                         // upstream variant-aware branch (keys / values / items /
                         // items_with_hash / keys_with_hash). Minimal port handles
                         // the default (keys) path — the full variant switch

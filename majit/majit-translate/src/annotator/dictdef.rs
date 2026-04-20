@@ -346,18 +346,28 @@ impl DictDef {
     }
 
     /// RPython `DictDef.read_key(position_key)` (dictdef.py:93-95).
-    pub fn read_key(&self, position_key: PositionKey) -> SomeValue {
+    ///
+    /// `position_key` is `Option` to preserve upstream's "no reflow
+    /// frame active → `None` position" flow; `None` is just dropped
+    /// from the read-locations set (Rust `HashSet` cannot carry it
+    /// directly). See [`super::listdef::ListDef::read_item`] for the
+    /// same shape.
+    pub fn read_key(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.dictkey.borrow().clone();
         let mut li_mut = li.borrow_mut();
-        li_mut.read_locations.insert(position_key);
+        if let Some(pk) = position_key {
+            li_mut.read_locations.insert(pk);
+        }
         li_mut.s_value.clone()
     }
 
     /// RPython `DictDef.read_value(position_key)` (dictdef.py:97-99).
-    pub fn read_value(&self, position_key: PositionKey) -> SomeValue {
+    pub fn read_value(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.dictvalue.borrow().clone();
         let mut li_mut = li.borrow_mut();
-        li_mut.read_locations.insert(position_key);
+        if let Some(pk) = position_key {
+            li_mut.read_locations.insert(pk);
+        }
         li_mut.s_value.clone()
     }
 
