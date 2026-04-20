@@ -1049,6 +1049,44 @@ impl CodeWriter {
             }};
         }
 
+        // B6 Phase 3b dual emission for `loop_header`. RPython parity:
+        // `jtransform.py:1714-1718 handle_jit_marker__loop_header` emits
+        // `SpaceOperation('loop_header', [c_index], None)`; `assembler.py:220`
+        // turns it into the single-byte `loop_header/c` opcode. pyre has one
+        // jitdriver so `jdindex` is always 0 — the arg is the
+        // `Constant(jdindex, lltype.Signed)` from upstream.
+        macro_rules! emit_loop_header {
+            ($ssarepr:expr, $asm:expr, $jdindex:expr) => {{
+                let jdindex: u16 = $jdindex;
+                $ssarepr.insns.push(Insn::op(
+                    "loop_header",
+                    vec![Operand::ConstInt(jdindex as i64)],
+                ));
+                $asm.loop_header(jdindex);
+            }};
+        }
+
+        // B6 Phase 3b dual emission for `abort_permanent`. The opname is
+        // a pyre-only runtime construct (`BC_ABORT_PERMANENT`) with no
+        // counterpart in `rpython/jit/codewriter/*` or
+        // `rpython/jit/metainterp/*` — pyre uses it to short-circuit the
+        // translation of unsupported bytecode handlers and permanent
+        // guard-fail edges, which upstream sidesteps via
+        // `rpython/jit/metainterp/policy.py`-driven whitelisting. Because
+        // the opname *already* surfaces at the runtime layer, Phase 3c's
+        // single-SSARepr requirement forces it through the walker-local
+        // `ssarepr` too; the alternative — a hybrid "some ops go through
+        // SSARepr, some don't" dispatch — defeats the purpose of the
+        // switchover. `dispatch_op` in `assembler.rs:510` already routes
+        // `"abort_permanent"` to the builder, so the external push is
+        // an exact mirror of the pre-existing internal behavior.
+        macro_rules! emit_abort_permanent {
+            ($ssarepr:expr, $asm:expr) => {{
+                $ssarepr.insns.push(Insn::op("abort_permanent", Vec::new()));
+                $asm.abort_permanent();
+            }};
+        }
+
         // B6 Phase 3b dual emission for `raise`. RPython parity:
         // `flatten.py` emits `self.emitline("raise", self.getcolor(args[1]))`
         // inside the exception-link handler; `assembler.py:220` turns it
@@ -1323,6 +1361,7 @@ impl CodeWriter {
                     //   greens = ['next_instr', 'is_being_profiled', 'pycode']
                     //   reds = ['frame', 'ec']
                     assembler.emit_portal_jit_merge_point(
+                        &mut ssarepr,
                         py_pc,
                         w_code as i64,
                         portal_frame_reg,
@@ -1330,7 +1369,7 @@ impl CodeWriter {
                     );
                 } else {
                     // pyre has a single jitdriver (PyPyJitDriver), index 0.
-                    assembler.loop_header(0);
+                    emit_loop_header!(ssarepr, assembler, 0);
                 }
             }
 
@@ -1738,7 +1777,7 @@ impl CodeWriter {
                 instr @ Instruction::JumpBackward { .. } => {
                     if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg) {
                         if target_py_pc < num_instrs {
-                            assembler.jump(labels[target_py_pc]);
+                            emit_goto!(ssarepr, assembler, labels, target_py_pc);
                         }
                     }
                 }
@@ -1833,7 +1872,7 @@ impl CodeWriter {
                     // extern "C" fn with that many i64 parameters.
                     // nargs > 8 → abort_permanent (no matching helper).
                     if nargs > 8 {
-                        assembler.abort_permanent();
+                        emit_abort_permanent!(ssarepr, assembler);
                     } else {
                         let fn_idx = match nargs {
                             0 => call_fn_0_idx,
@@ -1914,7 +1953,7 @@ impl CodeWriter {
                 instr @ Instruction::JumpBackwardNoInterrupt { .. } => {
                     if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg) {
                         if target_py_pc < num_instrs {
-                            assembler.jump(labels[target_py_pc]);
+                            emit_goto!(ssarepr, assembler, labels, target_py_pc);
                         }
                     }
                 }
@@ -2030,7 +2069,7 @@ impl CodeWriter {
 
                 Instruction::Reraise { .. } => {
                     // Exception path: abort_permanent.
-                    assembler.abort_permanent();
+                    emit_abort_permanent!(ssarepr, assembler);
                 }
 
                 Instruction::Copy { i } => {
@@ -2044,7 +2083,7 @@ impl CodeWriter {
                         // COPY(d>1): exception handler pattern only.
                         // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
                         // doesn't trigger the has_abort(BC_ABORT=13) check.
-                        assembler.abort_permanent();
+                        emit_abort_permanent!(ssarepr, assembler);
                     }
                 }
 
@@ -2052,7 +2091,7 @@ impl CodeWriter {
                 | Instruction::StoreName { .. }
                 | Instruction::MakeFunction { .. } => {
                     // Module-level only: abort_permanent (won't block blackhole).
-                    assembler.abort_permanent();
+                    emit_abort_permanent!(ssarepr, assembler);
                 }
 
                 // CPython 3.13 superinstruction: STORE_FAST_STORE_FAST.
@@ -2091,7 +2130,7 @@ impl CodeWriter {
                 // underflow.
                 Instruction::UnpackSequence { count } => {
                     let n = count.get(op_arg) as u16;
-                    assembler.abort_permanent();
+                    emit_abort_permanent!(ssarepr, assembler);
                     // Stack effect: pop 1 + push n = net (n - 1)
                     if current_depth > 0 {
                         current_depth -= 1;
@@ -2105,19 +2144,19 @@ impl CodeWriter {
                 // don't underflow.
                 Instruction::GetIter => {
                     // pop iterable, push iterator: net 0
-                    assembler.abort_permanent();
+                    emit_abort_permanent!(ssarepr, assembler);
                 }
 
                 Instruction::ForIter { .. } => {
                     // push next item: net +1
-                    assembler.abort_permanent();
+                    emit_abort_permanent!(ssarepr, assembler);
                     current_depth += 1;
                     emit_vsd!(assembler, current_depth);
                 }
 
                 Instruction::EndFor => {
                     // pop iterator + last value: net -2
-                    assembler.abort_permanent();
+                    emit_abort_permanent!(ssarepr, assembler);
                     current_depth = current_depth.saturating_sub(2);
                     // No emit_vsd: after abort_permanent, depth is
                     // simulation-only for subsequent compile-time tracking.
@@ -2131,7 +2170,7 @@ impl CodeWriter {
 
                 // Unsupported instruction: abort_permanent.
                 _other => {
-                    assembler.abort_permanent();
+                    emit_abort_permanent!(ssarepr, assembler);
                 }
             }
             if let Some(catch_label) = catch_for_pc[py_pc] {

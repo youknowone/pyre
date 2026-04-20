@@ -384,8 +384,13 @@ impl SSAReprEmitter {
     /// upstream shape more closely than open-coding it in the bytecode
     /// walker and preserves the u8 operand invariant at the point where
     /// the indices are formed.
+    ///
+    /// Dual-emits the same three ListOfKind arg shape into the walker-
+    /// local `ssarepr` so Phase 3c can read the same `jit_merge_point`
+    /// Insn from the external accumulator.
     pub fn emit_portal_jit_merge_point(
         &mut self,
+        ssarepr: &mut SSARepr,
         next_instr: usize,
         w_code: i64,
         frame_reg: u16,
@@ -407,11 +412,18 @@ impl SSAReprEmitter {
         let frame_reg =
             u8::try_from(frame_reg).expect("jit_merge_point frame reg exceeds u8 encoding");
         let ec_reg = u8::try_from(ec_reg).expect("jit_merge_point ec reg exceeds u8 encoding");
-        self.jit_merge_point(
-            &[gi_next_instr_reg, gi_is_profiled_reg],
-            &[gr_pycode_reg],
-            &[frame_reg, ec_reg],
-        );
+        let greens_i: &[u8] = &[gi_next_instr_reg, gi_is_profiled_reg];
+        let greens_r: &[u8] = &[gr_pycode_reg];
+        let reds_r: &[u8] = &[frame_reg, ec_reg];
+        ssarepr.insns.push(Insn::op(
+            "jit_merge_point",
+            vec![
+                list_of_regs(Kind::Int, greens_i),
+                list_of_regs(Kind::Ref, greens_r),
+                list_of_regs(Kind::Ref, reds_r),
+            ],
+        ));
+        self.jit_merge_point(greens_i, greens_r, reds_r);
     }
 
     pub fn record_binop_i(&mut self, dst: u16, op: OpCode, lhs: u16, rhs: u16) {
