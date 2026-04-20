@@ -17,7 +17,7 @@ use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 
 use majit_ir::OpCode;
-use majit_metainterp::jitcode::{JitCode, JitCodeBuilder, LivenessInfo};
+use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
 use pyre_jit_trace::{PyJitCode, PyJitCodeMetadata};
 
 use super::assembler::Assembler;
@@ -2194,58 +2194,26 @@ impl CodeWriter {
             super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs);
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
-        // Extract `metadata.liveness` from the post-rename `Insn::Live`
-        // so the `Vec<LivenessInfo>` and the `all_liveness` byte stream
-        // (which `get_liveness_info` / `encode_liveness_info` will
-        // derive from the same `Insn::Live` at assemble time,
-        // assembler.rs:422-437 / 335-376) share a single source of
-        // truth. Matches `get_liveness_info`'s normalisation exactly:
-        // partition by `Register.kind`, sort ascending, dedup. The
-        // `pc` field is the JitCode byte offset from `pc_map[py_pc]`
-        // and is unaffected by register rename.
-        //
-        // Fail-fast on a missing `-live-` marker, mirroring RPython's
-        // `jitcode.py:82-100` `get_live_vars_info` / `_missing_liveness`
-        // invariant: `live_patches[i]` must point at an `Insn::Live`.
+        // Fail-fast on a missing `-live-` marker at each patched insn
+        // index, mirroring RPython's `jitcode.py:82-100`
+        // `get_live_vars_info` / `_missing_liveness` invariant:
+        // `live_patches[i]` must point at an `Insn::Live`.
         // `filter_liveness_in_place` preserves the marker even for
         // unreachable PCs (it only clears the register args), so an
         // empty-but-present marker is the correct "no live regs" shape;
         // a missing or wrong-kind insn indicates a `live_patches` /
         // ssarepr drift the rest of the pipeline is not prepared for.
-        let mut liveness: Vec<LivenessInfo> = Vec::with_capacity(live_patches.len());
         for &(py_pc, insn_idx) in live_patches.iter() {
-            let args = match ssarepr.insns.get(insn_idx) {
-                Some(super::flatten::Insn::Live(args)) => args,
+            match ssarepr.insns.get(insn_idx) {
+                Some(super::flatten::Insn::Live(_)) => {}
                 Some(other) => panic!(
-                    "extract_liveness: expected Insn::Live at insn_idx={insn_idx} (py_pc={py_pc}), got {other:?}"
+                    "live_patches: expected Insn::Live at insn_idx={insn_idx} (py_pc={py_pc}), got {other:?}"
                 ),
                 None => panic!(
-                    "extract_liveness: insn_idx={insn_idx} out of range (len {}, py_pc={py_pc})",
+                    "live_patches: insn_idx={insn_idx} out of range (len {}, py_pc={py_pc})",
                     ssarepr.insns.len()
                 ),
-            };
-            let mut entry = LivenessInfo {
-                pc: pc_map[py_pc] as u16,
-                live_i_regs: Vec::new(),
-                live_r_regs: Vec::new(),
-                live_f_regs: Vec::new(),
-            };
-            for op in args {
-                if let super::flatten::Operand::Register(reg) = op {
-                    match reg.kind {
-                        Kind::Int => entry.live_i_regs.push(reg.index),
-                        Kind::Ref => entry.live_r_regs.push(reg.index),
-                        Kind::Float => entry.live_f_regs.push(reg.index),
-                    }
-                }
             }
-            entry.live_i_regs.sort_unstable();
-            entry.live_i_regs.dedup();
-            entry.live_r_regs.sort_unstable();
-            entry.live_r_regs.dedup();
-            entry.live_f_regs.sort_unstable();
-            entry.live_f_regs.dedup();
-            liveness.push(entry);
         }
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
@@ -2279,7 +2247,6 @@ impl CodeWriter {
             code,
             pc_map,
             depth_at_pc,
-            liveness,
             portal_frame_reg,
             portal_ec_reg,
             has_abort,
@@ -2315,7 +2282,6 @@ impl CodeWriter {
         code: &CodeObject,
         pc_map: Vec<usize>,
         depth_at_pc: Vec<u16>,
-        liveness: Vec<LivenessInfo>,
         portal_frame_reg: u16,
         portal_ec_reg: u16,
         has_abort: bool,
@@ -2368,7 +2334,6 @@ impl CodeWriter {
             portal_frame_reg,
             portal_ec_reg,
             stack_base: frame_stack_base,
-            liveness,
         };
 
         PyJitCode {

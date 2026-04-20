@@ -209,32 +209,51 @@ impl MIFrame {
         // the guard's fail_args. Mirror RPython's invariant by forcing
         // lazy init for each live local via the same `load_local_value`
         // path that LOAD_FAST uses, BEFORE snapshotting registers_r
-        // below. Source for the live indices is
-        // `PyJitCodeMetadata.liveness` (see Step A docstring on the main
-        // path below for the rationale).
+        // below. Source for the live indices is the jitcode's
+        // `all_liveness` byte stream (`jitcode.get_live_vars_info(pc,
+        // op_live)` at `jitcode.py:82-93`), same path the main snapshot
+        // loop below uses.
         let jitcode_ptr_pre = self.sym().jitcode;
         let live_local_idxs: Vec<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
-            // Skeleton payload (no `pc_map` yet, no LivenessInfo) →
-            // skip the lazy-load preamble; the main path's
-            // skeleton-fallback branch handles the same case.
+            // Skeleton payload (no `pc_map` yet) → skip the lazy-load
+            // preamble; the main path's skeleton-fallback branch
+            // handles the same case.
             if jc.payload.metadata.pc_map.is_empty() {
                 Vec::new()
-            } else if let Some(live_info) = jc.payload.metadata.liveness.get(live_pc) {
+            } else {
                 // RPython `pyjitpl.py:218-225` analog: every live
                 // register index in the abstract register file
                 // (locals + stack tail) must resolve to an OpRef by
                 // encoder time. `registers_r` unifies both (Stage 3.4
                 // Phase C), so the prepass iterates the full live set
-                // without an `idx < nlocals` decode.
-                live_info
-                    .live_i_regs
-                    .iter()
-                    .chain(live_info.live_r_regs.iter())
-                    .map(|&reg_idx| reg_idx as usize)
-                    .collect::<Vec<usize>>()
-            } else {
-                Vec::new()
+                // (int + ref banks — Float regs are scratch tmps per
+                // `filter_liveness_in_place`) without an `idx <
+                // nlocals` decode.
+                let jit_pc = jc.payload.metadata.pc_map[live_pc];
+                let op_live = crate::state::op_live();
+                let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
+                let all_liveness = crate::state::liveness_info_snapshot();
+                if off + 2 >= all_liveness.len() {
+                    Vec::new()
+                } else {
+                    let length_i = all_liveness[off] as u32;
+                    let length_r = all_liveness[off + 1] as u32;
+                    let mut cursor = off + 3;
+                    let mut out: Vec<usize> = Vec::with_capacity((length_i + length_r) as usize);
+                    use majit_translate::liveness::LivenessIterator;
+                    for length in [length_i, length_r] {
+                        if length == 0 {
+                            continue;
+                        }
+                        let mut it = LivenessIterator::new(cursor, length, &all_liveness);
+                        while let Some(reg_idx) = it.next() {
+                            out.push(reg_idx as usize);
+                        }
+                        cursor = it.offset;
+                    }
+                    out
+                }
             }
         };
         for idx in live_local_idxs {
@@ -336,50 +355,57 @@ impl MIFrame {
             }
             return boxes;
         }
-        // Read per-PC live register indices from `PyJitCodeMetadata.liveness`.
-        // Both this Vec and the jitcode's `all_liveness` byte stream are
-        // now derived from the same post-rename `Insn::Live` in the
-        // SSARepr (codewriter.rs `filter_liveness_in_place` + post-rename
-        // extraction), so the trace snapshot and the blackhole bridge-
-        // resume decode see identical live sets.
-        //
-        // The Vec is indexed by Python PC, so direct indexing by
-        // `live_pc` is correct (the `LivenessInfo.pc` field holds the
-        // JitCode byte offset, NOT the Python PC — `find()` would
-        // mismatch).
-        //
-        // pyjitpl.py:204-233 parity: iterate live_i, live_r, live_f
-        // banks and snapshot registers_r/stack_values per register
-        // index.
-        let live_info = jc
+        // `pyjitpl.py:199-233` parity: decode the `-live-` offset from
+        // the jitcode byte stream via `jitcode.get_live_vars_info(pc,
+        // op_live)` (`jitcode.py:82-93`), read the `[len_i][len_r]
+        // [len_f]` header in `all_liveness`, then iterate per-bank
+        // register indices with `LivenessIterator` (`liveness.py:168-
+        // 201`). Register indices snapshot into `registers_r_view` in
+        // int → ref → float bank order to match the encoder/decoder
+        // contract (`all_liveness` byte layout).
+        let jit_pc = jc
             .payload
             .metadata
-            .liveness
+            .pc_map
             .get(live_pc)
+            .copied()
             .unwrap_or_else(|| {
                 panic!(
-                    "get_list_of_active_boxes: no LivenessInfo at live_pc={} (metadata.liveness.len={})",
+                    "get_list_of_active_boxes: no pc_map entry for live_pc={} (pc_map.len={})",
                     live_pc,
-                    jc.payload.metadata.liveness.len()
+                    jc.payload.metadata.pc_map.len()
                 )
             });
-        let total = live_info.total_live();
-        let mut boxes = Vec::with_capacity(total);
-        // Stage 3.4 Phase B: unified register-file lookup. `live_*_regs`
-        // indices live in stack_base=nlocals register space, so any
-        // `idx` in [0, nlocals+stack_depth) resolves to a single slot in
-        // `registers_r_view`. Out-of-range reads return NULL.
+        let op_live = crate::state::op_live();
+        let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
+        let all_liveness = crate::state::liveness_info_snapshot();
+        assert!(
+            off + 2 < all_liveness.len(),
+            "get_list_of_active_boxes: liveness offset {} + header 3 bytes exceeds all_liveness length {}",
+            off,
+            all_liveness.len()
+        );
+        let length_i = all_liveness[off] as u32;
+        let length_r = all_liveness[off + 1] as u32;
+        let length_f = all_liveness[off + 2] as u32;
+        let mut cursor = off + 3;
+        let mut boxes = Vec::with_capacity((length_i + length_r + length_f) as usize);
+        // Stage 3.4 Phase B: unified register-file lookup. Bank
+        // indices live in `stack_base=nlocals` register space, so any
+        // `idx` in [0, nlocals+stack_depth) resolves to a single slot
+        // in `registers_r_view`. Out-of-range reads return NULL.
         let snapshot =
             |idx: usize| -> OpRef { registers_r_view.get(idx).copied().unwrap_or(OpRef::NONE) };
-        // pyjitpl.py:216-233 — int / ref / float banks in this order.
-        for &reg_idx in &live_info.live_i_regs {
-            boxes.push(snapshot(reg_idx as usize));
-        }
-        for &reg_idx in &live_info.live_r_regs {
-            boxes.push(snapshot(reg_idx as usize));
-        }
-        for &reg_idx in &live_info.live_f_regs {
-            boxes.push(snapshot(reg_idx as usize));
+        use majit_translate::liveness::LivenessIterator;
+        for length in [length_i, length_r, length_f] {
+            if length == 0 {
+                continue;
+            }
+            let mut it = LivenessIterator::new(cursor, length, &all_liveness);
+            while let Some(reg_idx) = it.next() {
+                boxes.push(snapshot(reg_idx as usize));
+            }
+            cursor = it.offset;
         }
         boxes
     }

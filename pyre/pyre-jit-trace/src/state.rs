@@ -457,11 +457,21 @@ pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
     })
 }
 
-/// resume.py:1049 consume_one_section → enumerate_vars parity:
-/// Returns the number of tagged values encoded for a frame at
-/// (jitcode_index, pc). Uses JitCode liveness (same data as
-/// get_list_of_active_boxes) for RPython-parity multi-frame decode.
-/// Falls back to LiveVars when JitCode liveness is unavailable.
+/// `resume.py:1049` `consume_one_section` → `enumerate_vars` parity:
+/// return the number of tagged values encoded for a frame at
+/// (jitcode_index, pc).
+///
+/// Upstream `pyjitpl.py:199` / `jitcode.py:82-93`: decode the `-live-`
+/// offset from the jitcode byte stream at `jitcode.get_live_vars_info(
+/// pc, op_live)`, then read the three-byte `[len_i][len_r][len_f]`
+/// header in `all_liveness`. Total live value count = `len_i +
+/// len_r + len_f`.
+///
+/// Fallback: when the jitcode is still a skeleton payload (pc_map
+/// empty) or has no backing CodeObject, decode via the pyre-jit-trace
+/// `LiveVars` analysis over the Python bytecode. This path is used
+/// for inlined callee frames whose majit_jitcode has not been built
+/// at trace time.
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -471,25 +481,20 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             Some(jc) => jc,
             None => return 0,
         };
-        // Read the per-PC value count from `PyJitCodeMetadata.liveness`.
-        // Both this Vec and the jitcode's `all_liveness` byte stream
-        // are derived from the same post-rename `Insn::Live` in the
-        // SSARepr (codewriter.rs `filter_liveness_in_place` + post-
-        // rename extraction), so the tracer's encoder and the
-        // blackhole's decoder agree on the live-box count.
-        //
-        // The Vec is indexed by Python PC, matching the `pc` argument
-        // here.
         let payload = &jc.payload;
-        let _ = sd.op_live; // op_live is no longer used; kept for future Insn::Live reads
-        if let Some(info) = payload.metadata.liveness.get(pc as usize) {
-            return info.total_live();
+        if let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) {
+            let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
+            let all_liveness = &sd.liveness_info;
+            if off + 2 < all_liveness.len() {
+                let length_i = all_liveness[off] as usize;
+                let length_r = all_liveness[off + 1] as usize;
+                let length_f = all_liveness[off + 2] as usize;
+                return length_i + length_r + length_f;
+            }
         }
-        // Fallback: LiveVars from CodeObject (backward-compat).
-        // Mirror trace_opcode.rs:get_list_of_active_boxes LiveVars path:
-        // both iterate locals and stack values filtering by
-        // is_local_live / is_stack_live so the encoder box count and
-        // the decoder value count agree even for inlined-function
+        // Skeleton fallback: no pc_map / all_liveness yet for this
+        // CodeObject; count the LiveVars-reported live locals + stack
+        // slots so the encoder-decoder counts still agree for inlined
         // frames whose majit_jitcode has not been built at trace time.
         if !jc.code.is_null() {
             let raw = unsafe { jc.raw_code() };

@@ -24,7 +24,7 @@
 //! mirrors that with shared `Arc` ownership of the unified shape
 //! defined here.
 
-use majit_metainterp::jitcode::{JitCode, LivenessInfo};
+use majit_metainterp::jitcode::JitCode;
 
 /// Pyre-only metadata attached to a Python CodeObject's compiled JitCode.
 ///
@@ -45,11 +45,6 @@ pub struct PyJitCodeMetadata {
     pub portal_ec_reg: u16,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
-    /// Pyre-local decoded liveness view used by `resume_in_blackhole`'s
-    /// per-section register fill. The canonical packed bytes live on
-    /// `MetaInterpStaticData.liveness_info` and are read via inline
-    /// `-live-` offsets embedded in `JitCode.code`.
-    pub liveness: Vec<LivenessInfo>,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -99,7 +94,6 @@ impl PyJitCode {
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 stack_base: 0,
-                liveness: Vec::new(),
             },
             has_abort: false,
             merge_point_pc,
