@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use majit_translate::jitcode::JitCode;
+use majit_translate::jitcode::{BhDescr, JitCode};
 use majit_translate::translate_legacy::pipeline::PipelineOpcodeArm;
 use majit_translate::{CallPath, OpcodeDispatchSelector};
 use pyre_interpreter::bytecode::Instruction;
@@ -226,6 +226,31 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
     &INSNS_BYTE_TO_OPNAME
 }
 
+/// Deserialized `pipeline.descrs` — RPython `Assembler.descrs`
+/// (assembler.py:23). Handed to `BlackholeInterpBuilder.setup_descrs`
+/// at builder construction (blackhole.py:59 `self.setup_descrs(asm.descrs)`,
+/// :102-103 `def setup_descrs(self, descrs): self.descrs = descrs`).
+///
+/// Each 'd'/'j' argcode in a `JitCode.code` byte stream is a 2-byte
+/// little-endian index into this pool. The resolved `BhDescr` is what
+/// every `bhimpl_*` handler reads for field offsets, call descriptors,
+/// sub-JitCodes, and switch dicts.
+static ALL_DESCRS: LazyLock<Vec<BhDescr>> = LazyLock::new(|| {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_descrs.bin"));
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize opcode_descrs.bin \
+             ({} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+});
+
+/// RPython: `metainterp_sd.all_descrs` — full shared descr pool.
+pub fn all_descrs() -> &'static [BhDescr] {
+    &ALL_DESCRS
+}
+
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's
 /// jitcodes.
 ///
@@ -240,14 +265,15 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 /// has an explicit handler. If any remain unwired we panic here
 /// instead of letting dispatch surface a confusing runtime error.
 ///
-/// Descrs are still left empty — RPython populates them from the
-/// assembler alongside insns, but majit's build-time descrs pool is
-/// not yet serialized into the build artifact, so consumers that need
-/// descr-typed opcodes (`d`/`j`) must supply their own via
-/// `builder.setup_descrs(...)`. Tracked as a separate parity item.
+/// The shared descr pool is handed over via `setup_descrs` — same call
+/// order as RPython. Every 'd'/'j' argcode in a `JitCode.code` byte
+/// stream resolves against `builder.descrs[index]`, which matches the
+/// RPython single-store model at `metainterp_sd.descrs`.
 pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+    // blackhole.py:58-59 order: setup_insns, then setup_descrs.
     builder.setup_insns(insns_opname_to_byte());
+    builder.setup_descrs(all_descrs().to_vec());
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired = builder.unwired_opnames();
     if !unwired.is_empty() {

@@ -125,6 +125,18 @@ pub struct ProgramPipelineResult {
     /// Consumed by `BlackholeInterpBuilder::setup_insns` at runtime.
     #[serde(default)]
     pub insns: std::collections::HashMap<String, u8>,
+    /// RPython: `Assembler.descrs` (assembler.py:23), consumed by
+    /// `BlackholeInterpBuilder.setup_descrs(asm.descrs)`
+    /// (blackhole.py:59, 102-103). Each 'd'/'j' argcode in a
+    /// `JitCode.code` byte stream indexes into this shared descr pool
+    /// to read field offsets / call descrs / sub-JitCodes.
+    ///
+    /// Persisted alongside `insns` so `BlackholeInterpBuilder` at
+    /// runtime can call `setup_descrs(descrs)` and dispatch any 'd'/'j'
+    /// argcode opname through the shared pool — matches RPython's
+    /// single-store descr model.
+    #[serde(default)]
+    pub descrs: Vec<crate::jitcode::BhDescr>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
@@ -195,6 +207,7 @@ pub fn analyze_program(
         opcode_dispatch: Vec::new(),
         jitcodes: Vec::new(),
         insns: std::collections::HashMap::new(),
+        descrs: Vec::new(),
         total_blocks,
         total_ops,
         total_vable_rewrites,

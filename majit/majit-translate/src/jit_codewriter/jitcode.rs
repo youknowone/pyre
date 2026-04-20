@@ -609,7 +609,7 @@ impl Default for BhCallDescr {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BhDescr {
     /// Field descriptor: for getfield/setfield.
     /// RPython: `FieldDescr(AbstractDescr)` — carries `offset`, `field_size`.

@@ -665,7 +665,7 @@ fn analyze_pipeline_from_parsed(
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
 
-    let (opcode_dispatch, jitcodes, insns) = build_canonical_opcode_dispatch(
+    let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
         parsed_files,
         &canonical_trait_impls,
         &canonical_inherent_methods,
@@ -676,6 +676,7 @@ fn analyze_pipeline_from_parsed(
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
     pipeline.insns = insns;
+    pipeline.descrs = descrs;
 
     pipeline
 }
@@ -713,6 +714,7 @@ fn build_canonical_opcode_dispatch(
     Vec<pipeline::PipelineOpcodeArm>,
     Vec<std::sync::Arc<jitcode::JitCode>>,
     std::collections::HashMap<String, u8>,
+    Vec<jitcode::BhDescr>,
 ) {
     let mut opcode_arms = Vec::new();
     let mut receiver_traits = parse::ReceiverTraitBindings::default();
@@ -832,7 +834,13 @@ fn build_canonical_opcode_dispatch(
     // opnames — the key consumed by `BlackholeInterpBuilder::setup_insns`.
     let insns = codewriter.assembler.insns().clone();
 
-    (dispatch, jitcodes, insns)
+    // RPython blackhole.py:59 `self.setup_descrs(asm.descrs)` — the
+    // shared descr table every 'd'/'j' argcode indexes into at runtime.
+    // Snapshotted here so the build artifact carries it alongside
+    // `insns`, mirroring RPython's single-store model.
+    let descrs: Vec<jitcode::BhDescr> = codewriter.assembler.descrs().to_vec();
+
+    (dispatch, jitcodes, insns, descrs)
 }
 
 /// Synthetic CallPath for an opcode-dispatch arm body.

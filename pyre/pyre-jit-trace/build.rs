@@ -174,6 +174,16 @@ fn main() {
     let insns_bin = bincode::serialize(&pipeline.insns).unwrap();
     std::fs::write(format!("{out_dir}/opcode_insns.bin"), &insns_bin).unwrap();
 
+    // RPython `blackhole.py:59 self.setup_descrs(asm.descrs)` + `:102-103
+    // def setup_descrs(self, descrs): self.descrs = descrs`. Persists the
+    // build-time assembler's shared descr pool so that 'd'/'j' argcodes
+    // in `JitCode.code` resolve at runtime via
+    // `BlackholeInterpBuilder::setup_descrs(...)` — the single-store
+    // model (same list consumed by every `BlackholeInterpreter` produced
+    // by `acquire_interp`).
+    let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
+    std::fs::write(format!("{out_dir}/opcode_descrs.bin"), &descrs_bin).unwrap();
+
     // Report
     let arms_with_jitcode = pipeline
         .opcode_dispatch
