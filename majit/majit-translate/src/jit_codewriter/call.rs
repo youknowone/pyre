@@ -1572,25 +1572,49 @@ fn return_type_string_to_kind(s: &str) -> char {
 }
 
 /// RPython parity for `call.py:220-221` `FUNC.ARGS` — collect the non-void
-/// argument types of a graph.  Pyre's parser emits one `OpKind::Input`
-/// per function parameter in the startblock (`front/ast.rs:706-748`),
-/// so the parameter list is recovered by walking startblock ops in
-/// declaration order.  Unknown/ambiguous slots default to `Ref`,
-/// matching `resolve_non_void_arg_types`' fallback.
+/// argument types of a graph.  Parameters live on `startblock.inputargs`
+/// (RPython `flowspace/model.py` Block), populated by the front-end at
+/// `front/ast.rs:706-769` parameter registration.  The `OpKind::Input`
+/// ops co-emitted with each parameter carry the declared type which we
+/// recover by chasing each inputarg ValueId back to its defining op.
+/// Unknown/ambiguous slots default to `Ref`, matching
+/// `resolve_non_void_arg_types`' fallback.
+///
+/// PRE-EXISTING-ADAPTATION: when `inputargs` is empty we fall back to
+/// scanning leading `OpKind::Input` ops in the startblock.  Unit tests
+/// under `jit_codewriter::jtransform::tests` build graphs directly via
+/// `FunctionGraph::new` + `push_op` without populating `inputargs`; the
+/// fallback keeps their "all-Input-ops-are-params" convention working
+/// until they are migrated.
 fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
     let start = graph.block(graph.startblock);
+    let map_ty = |ty: &crate::model::ValueType| match ty {
+        crate::model::ValueType::Int => Some(Type::Int),
+        crate::model::ValueType::Ref => Some(Type::Ref),
+        crate::model::ValueType::Float => Some(Type::Float),
+        crate::model::ValueType::Void => None,
+        // Unknown / State — default to Ref.
+        _ => Some(Type::Ref),
+    };
+    if !start.inputargs.is_empty() {
+        return start
+            .inputargs
+            .iter()
+            .filter_map(|&arg_id| {
+                let ty = start.operations.iter().find_map(|op| match &op.kind {
+                    crate::model::OpKind::Input { ty, .. } if op.result == Some(arg_id) => Some(ty),
+                    _ => None,
+                });
+                ty.map(map_ty).unwrap_or(Some(Type::Ref))
+            })
+            .collect();
+    }
     start
         .operations
         .iter()
+        .take_while(|op| matches!(op.kind, crate::model::OpKind::Input { .. }))
         .filter_map(|op| match &op.kind {
-            crate::model::OpKind::Input { ty, .. } => match ty {
-                crate::model::ValueType::Int => Some(Type::Int),
-                crate::model::ValueType::Ref => Some(Type::Ref),
-                crate::model::ValueType::Float => Some(Type::Float),
-                crate::model::ValueType::Void => None,
-                // Unknown / State — default to Ref.
-                _ => Some(Type::Ref),
-            },
+            crate::model::OpKind::Input { ty, .. } => map_ty(ty),
             _ => None,
         })
         .collect()
@@ -2672,10 +2696,15 @@ impl CallControl {
             CallShape::Direct(target) => {
                 // Warn-only for direct because pyre's static-analysis arity
                 // inference is approximate (see test_getcalldescr_rewrites).
+                // Parameter list is recovered from startblock `OpKind::Input`
+                // ops (`front/ast.rs:706-748` convention), not from
+                // `block.inputargs` — the Rust front-end never populates the
+                // latter.  `graph_non_void_arg_types` encapsulates this.
                 if !arg_types.is_empty() {
                     if let Some(path) = self.target_to_path(target) {
                         if let Some(graph) = self.function_graphs.get(&path) {
-                            let expected_arity = graph.block(graph.startblock).inputargs.len();
+                            let expected_arg_types = graph_non_void_arg_types(graph);
+                            let expected_arity = expected_arg_types.len();
                             if arg_types.len() != expected_arity {
                                 eprintln!(
                                     "[getcalldescr] WARNING: {target} expects \

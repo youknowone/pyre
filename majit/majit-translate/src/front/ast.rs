@@ -703,7 +703,18 @@ fn build_function_graph(
         known_trait_names,
     );
 
-    // Register function parameters as Input ops (RPython: Block.inputargs)
+    // Register function parameters as Input ops AND on `Block.inputargs`.
+    //
+    // RPython parity: `Block.inputargs` is the function's formal parameter
+    // list for the startblock (`flowspace/model.py` Block class).  Pyre
+    // originally only emitted `OpKind::Input` ops here — but because body
+    // `Expr::Path` lowering also emits `OpKind::Input` for plain variable
+    // references (`front/ast.rs:1271-1287`), counting startblock `Input`
+    // ops after lowering can no longer tell "parameter" from "body
+    // reference" apart.  Populating `inputargs` during parameter
+    // registration preserves the RPython `startblock.inputargs == params`
+    // invariant and is what `getcalldescr`'s `FUNC.ARGS` check reads
+    // (RPython `call.py:220-221`).
     for param in &func.sig.inputs {
         match param {
             syn::FnArg::Receiver(_) => {
@@ -720,6 +731,7 @@ fn build_function_graph(
                     true,
                 ) {
                     graph.name_value(vid, "self".to_string());
+                    graph.block_mut(entry).inputargs.push(vid);
                 }
             }
             syn::FnArg::Typed(pat_type) => {
@@ -753,6 +765,7 @@ fn build_function_graph(
                     true,
                 ) {
                     graph.name_value(vid, name);
+                    graph.block_mut(entry).inputargs.push(vid);
                 }
             }
         }
