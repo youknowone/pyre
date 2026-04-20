@@ -1,0 +1,66 @@
+name: pyre CI
+
+on:
+  push:
+    branches: [ "main", "py3.[0-9]+" ]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "majit/**/*"
+      - "pyre/**/*"
+      - ".github/workflows/pyre-ci.yml"
+  pull_request:
+    branches: [ "main", "py3.[0-9]+" ]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "majit/**/*"
+      - "pyre/**/*"
+      - ".github/workflows/pyre-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pyre-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-test:
+    name: cargo test (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [dynasm, cranelift]
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Run cargo test for ${{ matrix.backend }}
+      run: |
+        case "${{ matrix.backend }}" in
+          dynasm)
+            cargo test --all --no-default-features --features dynasm
+            ;;
+          cranelift)
+            cargo test --all --no-default-features --features cranelift
+            ;;
+        esac
+
+  pyre-check:
+    name: pyre/check.sh
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Install PyPy
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pypy3
+    - name: Run pyre/check.sh
+      run: ./pyre/check.sh
