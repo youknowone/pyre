@@ -1220,8 +1220,14 @@ impl CodeWriter {
         // is empty until Phase 4's compute_liveness replaces it.
         macro_rules! emit_live_placeholder {
             ($ssarepr:expr, $asm:expr) => {{
+                // Phase 3c Step 3: compute the insn index from the external
+                // SSARepr directly. `$asm.live_placeholder()` is a no-op
+                // holdover kept for compile compatibility until Step 3b
+                // drops the walker's per-op `$asm.XXX()` lines.
+                let idx = $ssarepr.insns.len();
                 $ssarepr.insns.push(Insn::Live(Vec::new()));
-                $asm.live_placeholder()
+                let _ = $asm.live_placeholder();
+                idx
             }};
         }
 
@@ -1392,7 +1398,11 @@ impl CodeWriter {
             }
             // RPython flatten.py: Label(block) at block entry
             emit_mark_label_pc!(ssarepr, assembler, labels, py_pc);
-            pc_map[py_pc] = assembler.current_pos();
+            // Phase 3c Step 2: pc_map records walker-local SSARepr insn
+            // indices. `insn_pos_to_byte_offset` translates them to byte
+            // offsets after `Assembler::assemble` populates
+            // `ssarepr.insns_pos`.
+            pc_map[py_pc] = ssarepr.insns.len();
             let live_patch = emit_live_placeholder!(ssarepr, assembler);
             live_patches.push((py_pc, live_patch));
             depth_at_pc[py_pc] = current_depth;

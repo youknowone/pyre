@@ -138,9 +138,10 @@ impl SSAReprEmitter {
         id
     }
 
-    pub fn mark_label(&mut self, id: u16) {
-        let name = self.label_name(id);
-        self.ssarepr.insns.push(Insn::Label(Label::new(name)));
+    pub fn mark_label(&mut self, _id: u16) {
+        // Phase 3c Step 3: Label push dropped. Walker's
+        // `emit_mark_label_pc!` / `emit_mark_label_catch_landing!`
+        // macros push Insn::Label to the external SSARepr directly.
     }
 
     fn label_name(&self, id: u16) -> String {
@@ -162,8 +163,11 @@ impl SSAReprEmitter {
     /// under SSARepr semantics the live register set is filled by
     /// `compute_liveness` before `Assembler::assemble` runs.
     pub fn live_placeholder(&mut self) -> usize {
-        let idx = self.ssarepr.insns.len();
-        self.ssarepr.insns.push(Insn::Live(Vec::new()));
+        // Phase 3c Step 3: internal SSARepr is no longer populated. The
+        // walker's `emit_live_placeholder!` macro pushes Insn::Live to
+        // the external SSARepr and returns the external index itself;
+        // this method's return value is unused by walker code now.
+        let idx = self.pending_live_positions.len();
         self.pending_live_positions.push(idx);
         idx
     }
@@ -284,10 +288,9 @@ impl SSAReprEmitter {
 
     pub fn ref_return(&mut self, src: u16) {
         self.push_op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
-        // flatten.py:144-146 parity: terminator emits `('---',)` so the
-        // backward liveness pass clears its alive set at block boundaries
-        // and does not propagate through dead fall-through regions.
-        self.ssarepr.insns.push(Insn::Unreachable);
+        // Phase 3c Step 3: Unreachable push dropped. Walker's
+        // `emit_ref_return!` macro pushes Insn::Unreachable to the
+        // external SSARepr directly per flatten.py:144-146.
     }
 
     pub fn abort(&mut self) {
@@ -313,8 +316,9 @@ impl SSAReprEmitter {
 
     pub fn jump(&mut self, label: u16) {
         self.push_op("jump", vec![self.tlabel(label)]);
-        // flatten.py:111-112 parity: unconditional goto emits `('---',)`.
-        self.ssarepr.insns.push(Insn::Unreachable);
+        // Phase 3c Step 3: Unreachable push dropped. Walker's
+        // `emit_goto!` macro pushes Insn::Unreachable to the external
+        // SSARepr directly per flatten.py:111-112.
     }
 
     /// RPython jtransform.py:1714-1718 handle_jit_marker__loop_header.
@@ -673,33 +677,36 @@ impl SSAReprEmitter {
     }
 
     // ---- internals ----
+    //
+    // Phase 3c Step 3: per-op SSARepr pushes that previously fed
+    // `SSAReprEmitter::ssarepr` are no-ops now that
+    // `Assembler::assemble` consumes the walker-local `SSARepr`
+    // directly (Step 2 swap, commit bc0d6a06c4). The method shells
+    // below keep the call sites compiling; the bodies drop their
+    // writes so the internal accumulator stays empty. Per-op method
+    // call sites in the walker become dead and are deleted in
+    // Step 3b, then the methods and the `ssarepr` field are deleted
+    // in Step 3c.
+    #[allow(dead_code)]
+    fn push_op(&mut self, _opname: &'static str, _args: Vec<Operand>) {}
 
-    fn push_op(&mut self, opname: &'static str, args: Vec<Operand>) {
-        self.ssarepr.insns.push(Insn::op(opname, args));
+    #[allow(dead_code)]
+    fn push_op_with_result(
+        &mut self,
+        _opname: &'static str,
+        _args: Vec<Operand>,
+        _result: Register,
+    ) {
     }
 
-    fn push_op_with_result(&mut self, opname: &'static str, args: Vec<Operand>, result: Register) {
-        self.ssarepr
-            .insns
-            .push(Insn::op_with_result(opname, args, result));
-    }
-
+    #[allow(dead_code)]
     fn push_call_like(
         &mut self,
-        opname: &'static str,
-        fn_ptr_idx: u16,
-        arg_regs: &[JitCallArg],
-        result: Option<Register>,
+        _opname: &'static str,
+        _fn_ptr_idx: u16,
+        _arg_regs: &[JitCallArg],
+        _result: Option<Register>,
     ) {
-        let mut args: Vec<Operand> = Vec::with_capacity(1 + arg_regs.len());
-        args.push(Operand::ConstInt(fn_ptr_idx as i64));
-        for a in arg_regs {
-            args.push(call_arg_to_operand(a));
-        }
-        match result {
-            Some(reg) => self.push_op_with_result(opname, args, reg),
-            None => self.push_op(opname, args),
-        }
     }
 }
 
@@ -730,91 +737,12 @@ fn call_arg_to_operand(arg: &JitCallArg) -> Operand {
     Operand::reg(kind, arg.reg)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn emitter_builds_simple_return_sequence() {
-        // Build: move_r r0 <- r1 ; ref_return r0 ; '---'
-        let mut em = SSAReprEmitter::new();
-        em.set_name("trivial");
-        em.ensure_r_regs(2);
-        em.move_r(0, 1);
-        em.ref_return(0);
-
-        assert_eq!(em.ssarepr.insns.len(), 3);
-        match &em.ssarepr.insns[0] {
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } => {
-                assert_eq!(opname, "move_r");
-                // After the push_op_with_result conversion, the
-                // destination lives in `result`, leaving `args = [src]`.
-                assert_eq!(args.len(), 1);
-                let dst = result.expect("move_r must set a result register");
-                assert_eq!(dst.index, 0);
-            }
-            other => panic!("expected Op, got {:?}", other),
-        }
-        match &em.ssarepr.insns[1] {
-            Insn::Op { opname, args, .. } => {
-                assert_eq!(opname, "ref_return");
-                assert_eq!(args.len(), 1);
-            }
-            other => panic!("expected Op, got {:?}", other),
-        }
-        assert!(matches!(em.ssarepr.insns[2], Insn::Unreachable));
-
-        let mut assembler = Assembler::new();
-        let jitcode = em.finish_with(&mut assembler);
-        assert_eq!(jitcode.name, "trivial");
-        assert!(!jitcode.code.is_empty());
-    }
-
-    #[test]
-    fn emitter_labels_bridge_u16_ids_to_tlabel_names() {
-        // Build: L0 ; ref_return r0 ; '---' ; jump L0 ; '---'
-        let mut em = SSAReprEmitter::new();
-        em.set_name("loop");
-        em.ensure_r_regs(1);
-        let loop_label = em.new_label();
-        em.mark_label(loop_label);
-        em.ref_return(0);
-        em.jump(loop_label);
-
-        assert!(matches!(&em.ssarepr.insns[0], Insn::Label(l) if l.name == "L0"));
-        // Index 1: ref_return, 2: '---', 3: jump, 4: '---'
-        match &em.ssarepr.insns[3] {
-            Insn::Op { opname, args, .. } => {
-                assert_eq!(opname, "jump");
-                match &args[0] {
-                    Operand::TLabel(t) => assert_eq!(t.name, "L0"),
-                    other => panic!("expected TLabel, got {:?}", other),
-                }
-            }
-            other => panic!("expected Op, got {:?}", other),
-        }
-        assert!(matches!(em.ssarepr.insns[4], Insn::Unreachable));
-
-        let mut assembler = Assembler::new();
-        let _jitcode = em.finish_with(&mut assembler);
-    }
-
-    #[test]
-    fn emitter_live_placeholder_returns_insn_index() {
-        let mut em = SSAReprEmitter::new();
-        em.set_name("live");
-        em.ensure_r_regs(1);
-        let a = em.live_placeholder();
-        em.ref_return(0);
-        let b = em.live_placeholder();
-        // After the Live at 0 and ref_return + '---' (indices 1 and 2),
-        // the next Live lands at index 3.
-        assert_eq!(a, 0);
-        assert_eq!(b, 3);
-        assert_eq!(em.pending_live_positions, vec![0, 3]);
-    }
-}
+// Phase 3c Step 3 obsoleted the SSAReprEmitter-internal SSARepr
+// unit tests (`emitter_builds_simple_return_sequence`,
+// `emitter_labels_bridge_u16_ids_to_tlabel_names`,
+// `emitter_live_placeholder_returns_insn_index`). They probed
+// `em.ssarepr.insns` directly, which no longer accumulates Insns —
+// the walker-local `SSARepr` has become the authoritative accumulator
+// (commit bc0d6a06c4). Integration coverage for the same ops comes
+// from `pyre/check.sh` plus the `eval::tests` suite, which exercises
+// the walker end-to-end.
