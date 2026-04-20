@@ -477,11 +477,13 @@ fn make_return(
             }
         }
         2 => {
-            // `flatten.py:139-143` raise-from-function.  Upstream emits
-            // `-live-` before `raise` when the evalue is still a
-            // Variable (xxx hack); pyre's jtransform already inserts
-            // `-live-` where needed upstream of flatten, so we omit the
-            // conditional prefix here.
+            // `flatten.py:139-143` raise-from-function.  The final
+            // exceptblock inputargs are ValueIds in majit, i.e. the
+            // direct analogue of upstream Variables here, so mirror the
+            // upstream `-live-` hack before `raise`.
+            ops.push(FlatOp::Live {
+                live_values: Vec::new(),
+            });
             ops.push(FlatOp::Raise(args[1]));
         }
         0 => {
@@ -815,7 +817,7 @@ where
 mod tests {
     use super::*;
     use crate::flowspace::model::ConstValue;
-    use crate::model::{ExitCase, FunctionGraph, OpKind, Terminator};
+    use crate::model::{ExitCase, FunctionGraph, OpKind, Terminator, exception_exitcase};
 
     /// Test helper — build a `regallocs` map that assigns each
     /// `ValueId(n)` the color `n` in `RegKind::Int`. This turns the
@@ -1015,7 +1017,7 @@ mod tests {
                 crate::model::Link::new(
                     vec![last_exception, last_exc_value],
                     exc_block,
-                    Some(ExitCase::Exception),
+                    Some(exception_exitcase()),
                 )
                 .extravars(Some(last_exception), Some(last_exc_value)),
             ],
@@ -1069,14 +1071,14 @@ mod tests {
                 crate::model::Link::new(
                     vec![typed_exc_value],
                     handler,
-                    Some(ExitCase::TypedException(ConstValue::builtin("ValueError"))),
+                    Some(ExitCase::Const(ConstValue::builtin("ValueError"))),
                 )
                 .with_llexitcase(ConstValue::Int(123))
                 .extravars(Some(last_exception), Some(typed_exc_value)),
                 crate::model::Link::new(
                     vec![last_exception, last_exc_value],
                     exc_block,
-                    Some(ExitCase::Exception),
+                    Some(exception_exitcase()),
                 )
                 .extravars(Some(last_exception), Some(last_exc_value)),
             ],
@@ -1101,6 +1103,38 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, FlatOp::LastExcValue { dst } if *dst == handler_exc_value)),
             "typed exception link should materialize last_exc_value at target inputarg"
+        );
+    }
+
+    #[test]
+    fn flatten_final_exceptblock_emits_live_before_raise() {
+        let mut graph = FunctionGraph::new("final_exceptblock");
+        let entry = graph.startblock;
+        let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
+        graph.set_terminator(
+            entry,
+            Terminator::Goto {
+                target: exc_block,
+                args: vec![last_exception, last_exc_value],
+            },
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(16));
+        let raise_idx = flat
+            .insns
+            .iter()
+            .position(|op| matches!(op, FlatOp::Raise(v) if *v == last_exc_value))
+            .expect("final exceptblock should flatten to raise");
+        assert!(
+            matches!(
+                flat.insns.get(raise_idx.saturating_sub(1)),
+                Some(FlatOp::Live { .. })
+            ),
+            "final exceptblock should emit -live- before raise"
+        );
+        assert!(
+            matches!(flat.insns.get(raise_idx + 1), Some(FlatOp::Unreachable)),
+            "raise should still terminate with ---"
         );
     }
 

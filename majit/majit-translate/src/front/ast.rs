@@ -9,8 +9,8 @@ use syn::{Item, ItemFn};
 
 use crate::ParsedInterpreter;
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, ImmutableRank, Link, OpKind,
-    Terminator, UnknownKind, ValueId, ValueType,
+    BlockId, CallTarget, ExitSwitch, FunctionGraph, ImmutableRank, Link, OpKind, Terminator,
+    UnknownKind, ValueId, ValueType, exception_exitcase,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1580,7 +1580,7 @@ fn lower_expr(
                     Link::new(
                         vec![last_exception, last_exc_value],
                         exc_block,
-                        Some(ExitCase::Exception),
+                        Some(exception_exitcase()),
                     )
                     .extravars(Some(last_exception), Some(last_exc_value)),
                 ],

@@ -602,27 +602,15 @@ pub enum ExitSwitch {
 
 /// RPython `Link.exitcase`.
 ///
-/// RPython stores the full Python value here (a bool, a builtin
-/// Exception class, a user exception class, or an integer for switch
-/// arms) and identity-checks it with `link.exitcase is Exception`
-/// (`flowspace/flowcontext.py:141`, `jit/codewriter/flatten.py:224`).
-/// pyre's codewriter never does value-level arithmetic on `exitcase`;
-/// it only distinguishes the three states flatten consumes — bool
-/// branch, catch-all exception, and typed exception subclass — so we
-/// carry them as discrete variants and keep the host class Constant
-/// on `TypedException` for `llexitcase` lowering.
+/// Upstream stores the concrete switch value itself here: `False` /
+/// `True` for boolean branches, the Python `Exception` class object for
+/// catch-all exception links, or a specific exception class object for
+/// typed handlers (`flowspace/model.py:114-120`,
+/// `flowspace/flowcontext.py:127-143`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitCase {
     Bool(bool),
-    /// RPython `link.exitcase is Exception` — the Python `Exception`
-    /// class object itself, used as the catch-all marker in can-raise
-    /// blocks (`flowspace/flowcontext.py:129-132` + `flatten.py:224`).
-    Exception,
-    /// RPython `link.exitcase = <specific ExceptionSubclass>` — an
-    /// exception subclass match, matched at runtime by
-    /// `goto_if_exception_mismatch`.  The low-level class identity is
-    /// stored in `Link.llexitcase`.
-    TypedException(ConstValue),
+    Const(ConstValue),
 }
 
 /// RPython `flowspace/model.py:109-168` `Link`.
@@ -681,8 +669,12 @@ impl Link {
 
     /// RPython `flatten.py:224` `if link.exitcase is Exception`.
     pub fn catches_all_exceptions(&self) -> bool {
-        matches!(self.exitcase, Some(ExitCase::Exception))
+        self.exitcase == Some(exception_exitcase())
     }
+}
+
+pub fn exception_exitcase() -> ExitCase {
+    ExitCase::Const(ConstValue::builtin("Exception"))
 }
 
 /// How control flow leaves a basic block.

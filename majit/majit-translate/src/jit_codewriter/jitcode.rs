@@ -935,7 +935,7 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                 writeln!(out, "  last_exception -> %i{}", dst.0).ok();
             }
             FlatOp::LastExcValue { dst } => {
-                writeln!(out, "  last_exc_value -> %i{}", dst.0).ok();
+                writeln!(out, "  last_exc_value -> %r{}", dst.0).ok();
             }
             FlatOp::Reraise => {
                 writeln!(out, "  reraise").ok();
