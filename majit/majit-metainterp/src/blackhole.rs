@@ -5406,6 +5406,39 @@ fn handler_getarrayitem_gc_v_ird_i_pyre(
     Ok(pos + 1)
 }
 
+// pyre: `setfield_gc_v/iid` — struct base colored into Int register (tagged-
+// int path documented on `bhhandler_ri_i`), value also Int, descr. Same
+// `bh_setfield_gc_i` primitive as the canonical `setfield_gc_i/rid`.
+fn handler_setfield_gc_v_iid_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let value = bh.registers_i[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
+    Ok(pos)
+}
+
+// pyre: `setarrayitem_gc_v/iiid` — array base colored into Int register
+// (tagged-int path), index int, value int, descr. Same primitive as the
+// canonical `setarrayitem_gc_i/riid`.
+fn handler_setarrayitem_gc_v_iiid_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_i[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let value = bh.registers_i[code[position + 2] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 3);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setarrayitem_gc_i(array, index, value, descr);
+    Ok(pos)
+}
+
 // ── setarrayitem_gc (blackhole.py:1350-1358) ────────────────────────
 // @arguments("cpu", "r", "i", "X", "d")
 
@@ -6073,6 +6106,14 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // pyre `_v` opname alias: byte layout `riid` matches canonical
     // `setarrayitem_gc_i/riid`. Same comment as above.
     builder.wire_handler("setarrayitem_gc_v/riid", handler_setarrayitem_gc_i);
+    // pyre tagged-int base variants: struct/array pointer sits in an Int
+    // register (same tagged-int deviation documented on `bhhandler_ri_i`).
+    // Distinct handlers read the base from `registers_i`.
+    builder.wire_handler("setfield_gc_v/iid", handler_setfield_gc_v_iid_pyre);
+    builder.wire_handler(
+        "setarrayitem_gc_v/iiid",
+        handler_setarrayitem_gc_v_iiid_pyre,
+    );
 
     // Raw field operations (blackhole.py:1464-1502)
     builder.wire_handler("getfield_raw_i/id>i", handler_getfield_raw_i);
