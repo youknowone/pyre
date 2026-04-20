@@ -106,6 +106,24 @@ pub struct JitFrameDescrs {
     pub sign_size: usize,
 }
 
+impl JitFrameDescrs {
+    /// llmodel.py:97-104 getarraydescr_for_frame + unpack_arraydescr_size
+    /// parity — itemsize of the per-arg-type frame arraydescr.
+    ///
+    /// RPython has three distinct frame array descriptors
+    /// (floatarraydescr / refarraydescr / signedarraydescr); majit's
+    /// JitFrame layout stores every slot as a Signed-sized machine word
+    /// regardless of box type, so all three resolve to `sign_size`. The
+    /// per-type dispatch is kept so the lookup follows the upstream
+    /// route rather than inlining a constant.
+    fn frame_itemsize(&self, ty: Type) -> i64 {
+        match ty {
+            Type::Int | Type::Ref | Type::Float => self.sign_size as i64,
+            Type::Void => panic!("CALL_ASSEMBLER arg must have a concrete type"),
+        }
+    }
+}
+
 /// rewrite.py:719-758 last_zero_arrays parity.
 ///
 /// A ZERO_ARRAY op already emitted into `out` whose start/length will
@@ -962,13 +980,18 @@ impl GcRewriterImpl {
         // (where frame_info is pre-allocated with [0,0] and updated
         // after compilation).
         let llfi = st.const_int(callee_locs.frame_info_ptr as i64);
-        let word_size = st.const_int(8);
+        // jitframe.py:30-36 — JITFRAMEINFO.jfi_frame_depth and
+        // jfi_frame_size are both lltype.Signed, so the unpack_fielddescr
+        // size read by emit_getfield is sign_size (the Signed word width).
+        let signed_size = st.const_int(descrs.sign_size as i64);
 
-        // rewrite.py:628-632 — GC_LOAD_I(frame_info, jfi_frame_size_ofs, 8)
+        // rewrite.py:628-632 — GC_LOAD_I(frame_info, jfi_frame_size_ofs,
+        // sign_size) where (ofs, sign_size, sign) = unpack_fielddescr(
+        // descrs.jfi_frame_size).
         let jfi_frame_size_ofs = st.const_int(std::mem::size_of::<isize>() as i64);
         let size = st.emit(Op::new(
             OpCode::GcLoadI,
-            &[llfi, jfi_frame_size_ofs, word_size],
+            &[llfi, jfi_frame_size_ofs, signed_size],
         ));
         // rewrite.py:634 — gen_malloc_nursery_varsize_frame(size)
         st.emitting_an_operation_that_can_collect();
@@ -979,7 +1002,13 @@ impl GcRewriterImpl {
         // rewrite.py:635 — gen_initialize_tid(frame, descrs.arraydescr.tid)
         self.gen_initialize_tid(frame, descrs.jitframe_tid, st);
 
-        // rewrite.py:636-650 — zero GC fields
+        // rewrite.py:641-650 — emit_setfield(frame, c_null, descr=jf_*)
+        // with (_, size, _) = unpack_fielddescr(descr). jitframe.py:63-81
+        // every zeroed field (jf_descr / jf_force_descr / jf_savedata /
+        // jf_guard_exc / jf_forward) is a GCREF or Ptr, i.e. pointer-
+        // sized. majit's homogeneous JitFrame layout keeps all six at
+        // sign_size; route through sign_size to mirror the per-descr
+        // read.
         let zero = st.const_int(0);
         for &ofs in &[
             descrs.jf_descr_ofs,
@@ -989,34 +1018,58 @@ impl GcRewriterImpl {
             descrs.jf_forward_ofs,
         ] {
             let ofs_ref = st.const_int(ofs as i64);
-            st.emit(Op::new(OpCode::GcStore, &[frame, ofs_ref, zero, word_size]));
+            st.emit(Op::new(
+                OpCode::GcStore,
+                &[frame, ofs_ref, zero, signed_size],
+            ));
         }
 
-        // rewrite.py:639-640,651-652 — load depth, set length
+        // rewrite.py:639-640 — emit_getfield(frame_info, descrs.jfi_frame_depth),
+        // rewrite.py:651-652 — gen_initialize_len(frame, length, ...).
+        // Both read/write lltype.Signed values (jfi_frame_depth and the
+        // jf_frame length field).
         let jfi_frame_depth_ofs = st.const_int(0);
         let length = st.emit(Op::new(
             OpCode::GcLoadI,
-            &[llfi, jfi_frame_depth_ofs, word_size],
+            &[llfi, jfi_frame_depth_ofs, signed_size],
         ));
         let len_ofs = st.const_int(descrs.jf_frame_lengthofs as i64);
         st.emit(Op::new(
             OpCode::GcStore,
-            &[frame, len_ofs, length, word_size],
+            &[frame, len_ofs, length, signed_size],
         ));
 
-        // rewrite.py:671 — emit_setfield(frame, ConstInt(llfi), descr=descrs.jf_frame_info)
+        // rewrite.py:671 — emit_setfield(frame, ConstInt(llfi),
+        // descr=descrs.jf_frame_info). jf_frame_info is Ptr(JITFRAMEINFO)
+        // (jitframe.py:63) so the field size is the pointer width, which
+        // in majit's layout coincides with sign_size.
         let fi_ofs = st.const_int(descrs.jf_frame_info_ofs as i64);
-        st.emit(Op::new(OpCode::GcStore, &[frame, fi_ofs, llfi, word_size]));
+        st.emit(Op::new(
+            OpCode::GcStore,
+            &[frame, fi_ofs, llfi, signed_size],
+        ));
 
-        // rewrite.py:672-683 — store each arg at _ll_initial_locs[i]
+        // rewrite.py:672-683 — store each arg at _ll_initial_locs[i] with
+        // per-arg itemsize from getarraydescr_for_frame(arg.type).
         let arglist: Vec<OpRef> = op.args.iter().map(|&a| st.resolve(a)).collect();
         let index_list = &callee_locs._ll_initial_locs;
         for (i, &arg) in arglist.iter().enumerate() {
-            // rewrite.py:678 — array_offset = index_list[i]
-            // rewrite.py:681 — offset = basesize + array_offset
+            // rewrite.py:675-677 — descr = cpu.getarraydescr_for_frame(arg.type);
+            //                      _, itemsize, _ = unpack_arraydescr_size(descr)
+            let arg_ty = st
+                .result_type_of(arg)
+                .expect("CALL_ASSEMBLER arg lacks a typed producer");
+            let itemsize = descrs.frame_itemsize(arg_ty);
+            let itemsize_ref = st.const_int(itemsize);
+            // rewrite.py:678-681 — array_offset = index_list[i] (bytes);
+            //                      _, basesize, _ = unpack_arraydescr(descr);
+            //                      offset = basesize + array_offset.
             let offset = descrs.jf_frame_baseitemofs as i32 + index_list[i];
             let ofs_ref = st.const_int(offset as i64);
-            st.emit(Op::new(OpCode::GcStore, &[frame, ofs_ref, arg, word_size]));
+            st.emit(Op::new(
+                OpCode::GcStore,
+                &[frame, ofs_ref, arg, itemsize_ref],
+            ));
         }
 
         // rewrite.py:685-695 — replace multi-arg with [frame] or
