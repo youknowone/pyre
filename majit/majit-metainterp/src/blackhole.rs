@@ -6040,6 +6040,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
+    // pyre-specific `_v` opname alias: `OpKind::FieldWrite { ty }` emits
+    // `setfield_gc_{kind}` with `_v` when the graph-level result type
+    // slot is Unknown/Void (assembler.rs op_kind_to_opname). The byte
+    // layout `rid` matches the canonical `setfield_gc_i/rid`, so the same
+    // handler reads the bytecode stream without change. Drops away once
+    // the emitter stops synthesizing `_v` opnames.
+    builder.wire_handler("setfield_gc_v/rid", handler_setfield_gc_i);
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
     // Array item operations (blackhole.py:1329-1365)
@@ -6058,8 +6065,14 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "getarrayitem_gc_v/ird>i",
         handler_getarrayitem_gc_v_ird_i_pyre,
     );
+    // pyre `_v` opname alias: byte layout `rid>i` matches the canonical
+    // `getarrayitem_gc_i/rid>i`. Same comment as `setfield_gc_v/rid`.
+    builder.wire_handler("getarrayitem_gc_v/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);
     builder.wire_handler("setarrayitem_gc_r/rird", handler_setarrayitem_gc_r);
+    // pyre `_v` opname alias: byte layout `riid` matches canonical
+    // `setarrayitem_gc_i/riid`. Same comment as above.
+    builder.wire_handler("setarrayitem_gc_v/riid", handler_setarrayitem_gc_i);
 
     // Raw field operations (blackhole.py:1464-1502)
     builder.wire_handler("getfield_raw_i/id>i", handler_getfield_raw_i);
