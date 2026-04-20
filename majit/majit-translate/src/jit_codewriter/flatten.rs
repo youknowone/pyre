@@ -850,30 +850,9 @@ mod tests {
         let else_block = graph.create_block();
         let merge = graph.create_block();
 
-        graph.set_terminator(
-            entry,
-            Terminator::Branch {
-                cond,
-                if_true: then_block,
-                true_args: vec![],
-                if_false: else_block,
-                false_args: vec![],
-            },
-        );
-        graph.set_terminator(
-            then_block,
-            Terminator::Goto {
-                target: merge,
-                args: vec![],
-            },
-        );
-        graph.set_terminator(
-            else_block,
-            Terminator::Goto {
-                target: merge,
-                args: vec![],
-            },
-        );
+        graph.set_branch(entry, cond, then_block, vec![], else_block, vec![]);
+        graph.set_goto(then_block, merge, vec![]);
+        graph.set_goto(else_block, merge, vec![]);
         graph.set_return(merge, None);
 
         let flat = flatten(&graph, &identity_regallocs(8));
@@ -904,31 +883,10 @@ mod tests {
         let body = graph.create_block();
         let exit = graph.create_block();
 
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target: header,
-                args: vec![],
-            },
-        );
+        graph.set_goto(entry, header, vec![]);
         let cond = graph.push_op(header, OpKind::ConstInt(1), true).unwrap();
-        graph.set_terminator(
-            header,
-            Terminator::Branch {
-                cond,
-                if_true: body,
-                true_args: vec![],
-                if_false: exit,
-                false_args: vec![],
-            },
-        );
-        graph.set_terminator(
-            body,
-            Terminator::Goto {
-                target: header,
-                args: vec![],
-            },
-        );
+        graph.set_branch(header, cond, body, vec![], exit, vec![]);
+        graph.set_goto(body, header, vec![]);
         graph.set_return(exit, None);
 
         let flat = flatten(&graph, &identity_regallocs(8));
@@ -962,13 +920,7 @@ mod tests {
         // is installed).
         graph.set_return(target, Some(phi));
 
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target,
-                args: vec![val],
-            },
-        );
+        graph.set_goto(entry, target, vec![val]);
 
         let flat = flatten(&graph, &identity_regallocs(8));
         let moves: Vec<_> = flat
@@ -991,13 +943,7 @@ mod tests {
         graph.set_return(continuation, Some(phi));
 
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target: continuation,
-                args: vec![call_result],
-            },
-        );
+        graph.set_goto(entry, continuation, vec![call_result]);
         graph.set_control_flow_metadata(
             entry,
             Some(crate::model::ExitSwitch::LastException),
@@ -1035,23 +981,11 @@ mod tests {
         let handler = graph.create_block();
         let handler_exc_value = graph.alloc_value();
         graph.block_mut(handler).inputargs.push(handler_exc_value);
-        graph.set_terminator(
-            handler,
-            Terminator::Goto {
-                target: graph.returnblock,
-                args: vec![handler_exc_value],
-            },
-        );
+        graph.set_goto(handler, graph.returnblock, vec![handler_exc_value]);
 
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
         let typed_exc_value = graph.alloc_value();
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target: graph.returnblock,
-                args: vec![call_result],
-            },
-        );
+        graph.set_goto(entry, graph.returnblock, vec![call_result]);
         graph.set_control_flow_metadata(
             entry,
             Some(crate::model::ExitSwitch::LastException),
@@ -1100,13 +1034,7 @@ mod tests {
         let mut graph = FunctionGraph::new("final_exceptblock");
         let entry = graph.startblock;
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target: exc_block,
-                args: vec![last_exception, last_exc_value],
-            },
-        );
+        graph.set_goto(entry, exc_block, vec![last_exception, last_exc_value]);
 
         let flat = flatten(&graph, &identity_regallocs(16));
         let raise_idx = flat

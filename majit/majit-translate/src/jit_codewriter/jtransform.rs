@@ -319,7 +319,6 @@ impl<'a> Transformer<'a> {
         }
 
         block.operations = new_ops;
-        block.terminator = remap_terminator(&block.terminator, &self.aliases);
         let (exitswitch, exits) = remap_control_flow_metadata(
             &block.exitswitch,
             &block.exits,
@@ -2323,44 +2322,6 @@ fn remap_op(
     SpaceOperation {
         result: op.result,
         kind,
-    }
-}
-
-fn remap_terminator(
-    term: &Terminator,
-    aliases: &std::collections::HashMap<ValueId, ValueId>,
-) -> Terminator {
-    match term {
-        Terminator::Goto { target, args } => Terminator::Goto {
-            target: *target,
-            args: args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-        },
-        Terminator::Branch {
-            cond,
-            if_true,
-            true_args,
-            if_false,
-            false_args,
-        } => Terminator::Branch {
-            cond: remap_value(*cond, aliases),
-            if_true: *if_true,
-            true_args: true_args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            if_false: *if_false,
-            false_args: false_args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-        },
-        Terminator::Unreachable => Terminator::Unreachable,
     }
 }
 

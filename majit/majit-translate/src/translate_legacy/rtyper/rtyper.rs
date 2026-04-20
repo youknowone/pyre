@@ -222,13 +222,7 @@ mod tests {
         let val = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let (target, phi_args) = graph.create_block_with_args(1);
         let phi = phi_args[0];
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target,
-                args: vec![val],
-            },
-        );
+        graph.set_goto(entry, target, vec![val]);
         graph.set_return(target, Some(phi));
 
         let annotations = annotate::annotate(&graph);

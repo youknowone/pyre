@@ -288,13 +288,7 @@ mod tests {
         let phi = phi_args[0];
 
         // Link: entry → target, passing val as the Phi arg
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target,
-                args: vec![val],
-            },
-        );
+        graph.set_goto(entry, target, vec![val]);
         graph.set_return(target, Some(phi));
 
         let state = annotate(&graph);

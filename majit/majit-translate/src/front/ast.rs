@@ -1159,16 +1159,7 @@ fn lower_expr(
             let mut then_block = graph.create_block();
             let mut else_block = graph.create_block();
 
-            graph.set_terminator(
-                *block,
-                Terminator::Branch {
-                    cond,
-                    if_true: then_block,
-                    true_args: vec![],
-                    if_false: else_block,
-                    false_args: vec![],
-                },
-            );
+            graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
 
             // Lower then branch — collect result value
             let mut then_result = None;
@@ -1193,43 +1184,19 @@ fn lower_expr(
                 let (merge, phi_args) = graph.create_block_with_args(1);
                 // Link args: then → merge(then_result), else → merge(else_result)
                 if graph.block(then_block).is_open() {
-                    graph.set_terminator(
-                        then_block,
-                        Terminator::Goto {
-                            target: merge,
-                            args: vec![then_result.unwrap()],
-                        },
-                    );
+                    graph.set_goto(then_block, merge, vec![then_result.unwrap()]);
                 }
                 if graph.block(else_block).is_open() {
-                    graph.set_terminator(
-                        else_block,
-                        Terminator::Goto {
-                            target: merge,
-                            args: vec![else_result.unwrap()],
-                        },
-                    );
+                    graph.set_goto(else_block, merge, vec![else_result.unwrap()]);
                 }
                 (merge, Some(phi_args[0]))
             } else {
                 let merge = graph.create_block();
                 if graph.block(then_block).is_open() {
-                    graph.set_terminator(
-                        then_block,
-                        Terminator::Goto {
-                            target: merge,
-                            args: vec![],
-                        },
-                    );
+                    graph.set_goto(then_block, merge, vec![]);
                 }
                 if graph.block(else_block).is_open() {
-                    graph.set_terminator(
-                        else_block,
-                        Terminator::Goto {
-                            target: merge,
-                            args: vec![],
-                        },
-                    );
+                    graph.set_goto(else_block, merge, vec![]);
                 }
                 (merge, None)
             };
@@ -1356,39 +1323,18 @@ fn lower_expr(
                 arm_results.push((arm_block, result));
                 if graph.block(arm_block).is_open() {
                     let goto_args = result.map_or(vec![], |v| vec![v]);
-                    graph.set_terminator(
-                        arm_block,
-                        Terminator::Goto {
-                            target: merge,
-                            args: goto_args,
-                        },
-                    );
+                    graph.set_goto(arm_block, merge, goto_args);
                 }
             }
 
             // First arm as default branch (simplified)
             if m.arms.len() == 1 {
-                graph.set_terminator(
-                    *block,
-                    Terminator::Goto {
-                        target: arm_results[0].0,
-                        args: vec![],
-                    },
-                );
+                graph.set_goto(*block, arm_results[0].0, vec![]);
             } else {
                 // Binary branch on scrutinee for first arm, else second
                 let first_block = arm_results[0].0;
                 let second_block = arm_results.get(1).map(|a| a.0).unwrap_or(merge);
-                graph.set_terminator(
-                    *block,
-                    Terminator::Branch {
-                        cond: scrutinee,
-                        if_true: first_block,
-                        true_args: vec![],
-                        if_false: second_block,
-                        false_args: vec![],
-                    },
-                );
+                graph.set_branch(*block, scrutinee, first_block, vec![], second_block, vec![]);
             }
 
             *block = merge;
@@ -1402,40 +1348,19 @@ fn lower_expr(
             let exit = graph.create_block();
 
             // Current block → header
-            graph.set_terminator(
-                *block,
-                Terminator::Goto {
-                    target: header,
-                    args: vec![],
-                },
-            );
+            graph.set_goto(*block, header, vec![]);
 
             // Header: evaluate condition, branch to body or exit
             let cond = lower_expr(graph, &mut header, &w.cond, options, ctx)
                 .unwrap_or_else(|| graph.alloc_value());
-            graph.set_terminator(
-                header,
-                Terminator::Branch {
-                    cond,
-                    if_true: body,
-                    true_args: vec![],
-                    if_false: exit,
-                    false_args: vec![],
-                },
-            );
+            graph.set_branch(header, cond, body, vec![], exit, vec![]);
 
             // Body → back to header
             for stmt in &w.body.stmts {
                 lower_stmt(graph, &mut body, stmt, options, ctx);
             }
             if graph.block(body).is_open() {
-                graph.set_terminator(
-                    body,
-                    Terminator::Goto {
-                        target: header,
-                        args: vec![],
-                    },
-                );
+                graph.set_goto(body, header, vec![]);
             }
 
             *block = exit;
@@ -1445,25 +1370,13 @@ fn lower_expr(
             let mut body = graph.create_block();
             let exit = graph.create_block();
 
-            graph.set_terminator(
-                *block,
-                Terminator::Goto {
-                    target: body,
-                    args: vec![],
-                },
-            );
+            graph.set_goto(*block, body, vec![]);
 
             for stmt in &l.body.stmts {
                 lower_stmt(graph, &mut body, stmt, options, ctx);
             }
             if graph.block(body).is_open() {
-                graph.set_terminator(
-                    body,
-                    Terminator::Goto {
-                        target: body,
-                        args: vec![],
-                    },
-                );
+                graph.set_goto(body, body, vec![]);
             }
 
             *block = exit;
@@ -1474,38 +1387,17 @@ fn lower_expr(
             let mut body = graph.create_block();
             let exit = graph.create_block();
 
-            graph.set_terminator(
-                *block,
-                Terminator::Goto {
-                    target: header,
-                    args: vec![],
-                },
-            );
+            graph.set_goto(*block, header, vec![]);
 
             lower_expr(graph, &mut header, &f.expr, options, ctx);
             let iter_cond = graph.alloc_value();
-            graph.set_terminator(
-                header,
-                Terminator::Branch {
-                    cond: iter_cond,
-                    if_true: body,
-                    true_args: vec![],
-                    if_false: exit,
-                    false_args: vec![],
-                },
-            );
+            graph.set_branch(header, iter_cond, body, vec![], exit, vec![]);
 
             for stmt in &f.body.stmts {
                 lower_stmt(graph, &mut body, stmt, options, ctx);
             }
             if graph.block(body).is_open() {
-                graph.set_terminator(
-                    body,
-                    Terminator::Goto {
-                        target: header,
-                        args: vec![],
-                    },
-                );
+                graph.set_goto(body, header, vec![]);
             }
 
             *block = exit;
@@ -1560,13 +1452,7 @@ fn lower_expr(
             let last_exception = graph.alloc_value();
             let last_exc_value = graph.alloc_value();
             let exc_block = graph.exceptblock;
-            graph.set_terminator(
-                *block,
-                Terminator::Goto {
-                    target: continuation,
-                    args: vec![inner],
-                },
-            );
+            graph.set_goto(*block, continuation, vec![inner]);
             graph.set_control_flow_metadata(
                 *block,
                 Some(ExitSwitch::LastException),

@@ -1010,6 +1010,71 @@ impl FunctionGraph {
             .collect();
     }
 
+    /// RPython `flowspace/model.py:250 recloseblock(*exits)` — stamp
+    /// `link.prevblock` on each exit and install them as the block's
+    /// exits, overwriting any previous contents.  In pyre, exitswitch
+    /// is kept in step: callers wanting to set a branch pass the
+    /// exitswitch alongside via `set_branch`; a bare `recloseblock`
+    /// defaults to `exitswitch = None`, matching upstream single-exit
+    /// fall-through.
+    pub fn recloseblock(&mut self, block: BlockId, exits: Vec<Link>) {
+        self.set_control_flow_metadata(block, None, exits);
+    }
+
+    /// RPython `flowspace/model.py:246 closeblock(*exits)` —
+    /// `assert self.exits == [], "block already closed"` before
+    /// delegating to `recloseblock`.  pyre mirrors the pre-closure
+    /// invariant on the `Block.exits` vector.
+    pub fn closeblock(&mut self, block: BlockId, exits: Vec<Link>) {
+        debug_assert!(
+            self.blocks[block.0].exits.is_empty(),
+            "block {:?} already closed",
+            block
+        );
+        self.recloseblock(block, exits);
+    }
+
+    /// Shorthand for the single-exit fall-through shape — one Link to
+    /// `target` carrying `args`, `exitswitch = None`.  Upstream
+    /// equivalent: `block.closeblock(Link(args, target))`
+    /// (`flowspace/model.py:304`).
+    ///
+    /// While the pyre-only `Terminator` dual still coexists with
+    /// `Block.exits`, this helper routes through `set_terminator` so the
+    /// two representations stay synced for readers that have not yet
+    /// migrated off `block.terminator`.
+    pub fn set_goto(&mut self, block: BlockId, target: BlockId, args: Vec<ValueId>) {
+        self.set_terminator(block, Terminator::Goto { target, args });
+    }
+
+    /// Shorthand for the boolean-branch shape — two Links with
+    /// `Bool(false)` / `Bool(true)` exitcases, `exitswitch =
+    /// ExitSwitch::Value(cond)`.  Upstream equivalent:
+    /// `block.exitswitch = cond;
+    ///  block.closeblock(Link(false_args, if_false, False),
+    ///                   Link(true_args,  if_true,  True))`
+    /// (`flowspace/model.py:175-180` + `:304`).
+    pub fn set_branch(
+        &mut self,
+        block: BlockId,
+        cond: ValueId,
+        if_true: BlockId,
+        true_args: Vec<ValueId>,
+        if_false: BlockId,
+        false_args: Vec<ValueId>,
+    ) {
+        self.set_terminator(
+            block,
+            Terminator::Branch {
+                cond,
+                if_true,
+                true_args,
+                if_false,
+                false_args,
+            },
+        );
+    }
+
     /// Route a return through the graph's canonical `returnblock`.
     ///
     /// RPython `flowcontext.py` return handling produces a fresh
@@ -1023,13 +1088,7 @@ impl FunctionGraph {
     pub fn set_return(&mut self, block: BlockId, value: Option<ValueId>) {
         let (returnblock, _) = self.returnblock_arg();
         let value = value.unwrap_or_else(|| self.alloc_value());
-        self.set_terminator(
-            block,
-            Terminator::Goto {
-                target: returnblock,
-                args: vec![value],
-            },
-        );
+        self.set_goto(block, returnblock, vec![value]);
     }
 
     /// Route `block` to the graph's canonical `exceptblock` — the
@@ -1052,13 +1111,7 @@ impl FunctionGraph {
         let (exceptblock, _, _) = self.exceptblock_args();
         let etype = self.alloc_value();
         let evalue = self.alloc_value();
-        self.set_terminator(
-            block,
-            Terminator::Goto {
-                target: exceptblock,
-                args: vec![etype, evalue],
-            },
-        );
+        self.set_goto(block, exceptblock, vec![etype, evalue]);
     }
 
     pub fn block(&self, block: BlockId) -> &Block {
@@ -1192,16 +1245,7 @@ mod tests {
             )
             .unwrap();
         let next = graph.create_block();
-        graph.set_terminator(
-            entry,
-            Terminator::Branch {
-                cond,
-                if_true: next,
-                true_args: vec![],
-                if_false: next,
-                false_args: vec![],
-            },
-        );
+        graph.set_branch(entry, cond, next, vec![], next, vec![]);
         assert_eq!(graph.blocks.len(), 4);
         assert_eq!(graph.block(entry).operations.len(), 1);
         assert_eq!(graph.block(graph.returnblock).inputargs.len(), 1);

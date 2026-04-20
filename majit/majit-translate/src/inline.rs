@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::call::{CallControl, CallKind};
 use crate::model::{
-    BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, Terminator, ValueId,
+    BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, ValueId,
     remap_control_flow_metadata,
 };
 
@@ -110,15 +110,11 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         _ => unreachable!("InlineSite should point to a Call op"),
     };
 
-    // Separate ops into before-call and after-call.  The caller block's
-    // full CFG metadata (terminator + exitswitch + exits) must follow
-    // the `after_ops` into the merge block so the original control-flow
-    // shape (including any can-raise exits) is preserved.  Upstream
-    // `rpython/flowspace/model.py:174` treats `Block.exitswitch` +
+    // Separate ops into before-call and after-call.  Upstream
+    // `rpython/flowspace/model.py:171-180` treats `Block.exitswitch` +
     // `Block.exits` as the single CFG source of truth, so they move
-    // together with the ops they guard.
+    // together with the ops they guard into the merge block.
     let after_ops: Vec<SpaceOperation> = block.operations[op_index + 1..].to_vec();
-    let after_terminator = block.terminator.clone();
     let after_exitswitch = block.exitswitch.clone();
     let after_exits = block.exits.clone();
 
@@ -130,48 +126,37 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     let block_map = remap_callee_blocks(graph, &callee);
 
     // --- Create merge block for after-call ops ---
-    // If the call has a result, the merge block has one inputarg (Phi node)
-    // that receives the callee's return value.
-    let merge_block_id = if !after_ops.is_empty()
-        || !matches!(after_terminator, Terminator::Unreachable)
-        || call_result.is_some()
-    {
+    // Upstream `backendopt/inline.py:253-264` copies caller-block-after
+    // ops + exits into a fresh afterblock whenever there is something
+    // to preserve.  Pyre creates the merge block when (a) after-call
+    // ops exist, (b) the caller block was already closed with exits or
+    // an exitswitch, or (c) the call produced a result that downstream
+    // code consumes.  (Order matches upstream's `(exits) or (stmts)`
+    // guard.)
+    let caller_was_closed = !after_exits.is_empty() || after_exitswitch.is_some();
+    let merge_block_id = if !after_ops.is_empty() || caller_was_closed || call_result.is_some() {
         let (merge_id, merge_args) = if let Some(original_result) = call_result {
             let (id, args) = graph.create_block_with_args(1);
             // The merge block's inputarg replaces the original call result.
-            // We need to remap all references to original_result → merge_args[0]
-            // in the after_ops, the after_terminator, and the exit metadata.
+            // Remap every reference to `original_result` → `args[0]` in
+            // after-call ops and exit metadata so the phi-node-style
+            // merge carries the callee's return value forward.
             let remapped_after_ops = remap_value_in_ops(&after_ops, original_result, args[0]);
-            let remapped_after_term =
-                remap_value_in_terminator(&after_terminator, original_result, args[0]);
             graph.blocks[id.0].operations = remapped_after_ops;
-            // `set_terminator` resyncs `exits`/`exitswitch` from the new
-            // terminator and stamps `prevblock = id` on the derived links
-            // (`model.rs::resync_block_exits`).  `set_control_flow_metadata`
-            // then overwrites with the caller block's original exits
-            // (remapped), so the can-raise/typed-exception shape survives
-            // the split even when `control_flow_from_terminator` would
-            // produce a bare goto.
-            graph.set_terminator(id, remapped_after_term);
             let (remapped_switch, remapped_exits) = remap_control_flow_metadata(
                 &after_exitswitch,
                 &after_exits,
                 |v| if v == original_result { args[0] } else { v },
                 |b| b,
             );
-            if !remapped_exits.is_empty() || remapped_switch.is_some() {
-                graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
-            }
+            graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
             (id, args)
         } else {
             let id = graph.create_block();
             graph.blocks[id.0].operations = after_ops;
-            graph.set_terminator(id, after_terminator);
             let (remapped_switch, remapped_exits) =
                 remap_control_flow_metadata(&after_exitswitch, &after_exits, |v| v, |b| b);
-            if !remapped_exits.is_empty() || remapped_switch.is_some() {
-                graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
-            }
+            graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
             (id, vec![])
         };
 
@@ -202,64 +187,45 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             .collect();
         graph.blocks[new_block_id.0].operations = new_ops;
 
-        // Identify the callee's canonical returnblock by ID rather than
-        // by Terminator::Return variant, matching upstream
-        // rpython/translator/backendopt/inline.py:289 rewire_returnblock
-        // which locates the returnblock as graph_to_inline.returnblock
+        // Identify the callee's canonical returnblock by ID, matching
+        // upstream `rpython/translator/backendopt/inline.py:289
+        // rewire_returnblock` which reads `graph_to_inline.returnblock`
         // and rewires its exits to point at the caller's afterblock.
         let is_returnblock = callee_block.id == callee.returnblock;
-        let new_terminator = if is_returnblock {
-            let ret_val = callee_block.inputargs.first().map(|v| value_map[v]);
-            // When the caller had an afterblock (merge_block_id), wire
-            // the callee returnblock to it per upstream
-            // rewire_returnblock (`backendopt/inline.py:289-296`).
+        if is_returnblock {
+            // Upstream `backendopt/inline.py:289-296`:
+            //   copiedreturnblock = copy_block(self.graph_to_inline.returnblock)
+            //   linkargs = ([copiedreturnblock.inputargs[0]] + passon_vars)
+            //   linkfrominlined = Link(linkargs, afterblock)
+            //   copiedreturnblock.exitswitch = None
+            //   copiedreturnblock.recloseblock(linkfrominlined)
             // When there is no afterblock (the call was the caller
-            // block's only statement and the block terminates in
-            // Unreachable), forward to the caller graph's canonical
-            // returnblock so the inlined function's return value becomes
-            // the caller's return value — still a Goto into a final
-            // block, matching upstream's exits=[Link(..., returnblock)]
-            // shape rather than a separate Terminator::Return variant.
+            // block's only statement and the block terminates unclosed),
+            // forward to the caller graph's canonical returnblock so
+            // the inlined function's return value becomes the caller's
+            // return value — still a Goto into a final block, matching
+            // upstream's `exits=[Link(..., returnblock)]` shape.
+            let ret_val = callee_block.inputargs.first().map(|v| value_map[v]);
             let caller_returnblock = graph.returnblock;
-            match (&merge_block_id, ret_val) {
+            let (target, args) = match (&merge_block_id, ret_val) {
                 (Some((merge_id, merge_args)), Some(remapped_ret)) => {
                     if merge_args.is_empty() {
-                        Terminator::Goto {
-                            target: *merge_id,
-                            args: vec![],
-                        }
+                        (*merge_id, vec![])
                     } else {
-                        Terminator::Goto {
-                            target: *merge_id,
-                            args: vec![remapped_ret],
-                        }
+                        (*merge_id, vec![remapped_ret])
                     }
                 }
-                (Some((merge_id, _)), None) => Terminator::Goto {
-                    target: *merge_id,
-                    args: vec![],
-                },
-                (None, Some(remapped_ret)) => Terminator::Goto {
-                    target: caller_returnblock,
-                    args: vec![remapped_ret],
-                },
-                (None, None) => Terminator::Goto {
-                    target: caller_returnblock,
-                    args: vec![],
-                },
-            }
+                (Some((merge_id, _)), None) => (*merge_id, vec![]),
+                (None, Some(remapped_ret)) => (caller_returnblock, vec![remapped_ret]),
+                (None, None) => (caller_returnblock, vec![]),
+            };
+            graph.set_goto(new_block_id, target, args);
         } else {
-            remap_terminator(&callee_block.terminator, &value_map, &block_map)
-        };
-        // `set_terminator` resyncs `exitswitch`/`exits` from the
-        // terminator and stamps `prevblock = new_block_id` on each
-        // derived link (`model.rs::resync_block_exits`).
-        graph.set_terminator(new_block_id, new_terminator);
-        if !is_returnblock {
-            // Preserve the callee block's upstream CFG shape (can-raise,
-            // typed-exception, bool-branch metadata) with renamed
-            // values and blocks.  `set_control_flow_metadata` stamps
-            // `prevblock` on every link.
+            // Preserve the callee block's upstream CFG shape (single
+            // goto, can-raise, typed-exception, bool-branch) with
+            // renamed values and blocks.  `set_control_flow_metadata`
+            // stamps `prevblock` on every link per
+            // `flowspace/model.py:120`.
             let (exitswitch, exits) = remap_control_flow_metadata(
                 &callee_block.exitswitch,
                 &callee_block.exits,
@@ -299,13 +265,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // link with `prevblock = block_id`, replacing the caller block's
     // original exits (which have already been moved to the merge block
     // above).
-    graph.set_terminator(
-        block_id,
-        Terminator::Goto {
-            target: callee_entry,
-            args: vec![],
-        },
-    );
+    graph.set_goto(block_id, callee_entry, vec![]);
 }
 
 /// Allocate fresh ValueIds for all values in the callee graph.
@@ -327,8 +287,18 @@ fn remap_callee_values(
                 map.entry(v).or_insert_with(|| graph.alloc_value());
             }
         }
-        for v in terminator_value_refs(&block.terminator) {
-            map.entry(v).or_insert_with(|| graph.alloc_value());
+        // Upstream `rpython/flowspace/model.py:224-229 getvariables`
+        // walks `link.args` for every exit in addition to ops.  The
+        // exitswitch variable is always a block-local value referenced
+        // by the raising op / branch condition, so it is already in
+        // `op_value_refs` — but the per-link args must be copied here.
+        for link in &block.exits {
+            for &v in &link.args {
+                map.entry(v).or_insert_with(|| graph.alloc_value());
+            }
+        }
+        if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
+            map.entry(*cond).or_insert_with(|| graph.alloc_value());
         }
     }
     map
@@ -691,36 +661,6 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
     }
 }
 
-/// Remap a terminator's values and block targets.
-fn remap_terminator(
-    term: &Terminator,
-    value_map: &HashMap<ValueId, ValueId>,
-    block_map: &HashMap<BlockId, BlockId>,
-) -> Terminator {
-    let rv = |v: &ValueId| *value_map.get(v).unwrap_or(v);
-    let rb = |b: &BlockId| *block_map.get(b).unwrap_or(b);
-    match term {
-        Terminator::Goto { target, args } => Terminator::Goto {
-            target: rb(target),
-            args: args.iter().map(rv).collect(),
-        },
-        Terminator::Branch {
-            cond,
-            if_true,
-            true_args,
-            if_false,
-            false_args,
-        } => Terminator::Branch {
-            cond: rv(cond),
-            if_true: rb(if_true),
-            true_args: true_args.iter().map(rv).collect(),
-            if_false: rb(if_false),
-            false_args: false_args.iter().map(rv).collect(),
-        },
-        Terminator::Unreachable => Terminator::Unreachable,
-    }
-}
-
 /// Collect all ValueId references used in an OpKind (not including result).
 pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
     match kind {
@@ -858,25 +798,6 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
     }
 }
 
-/// Collect all ValueId references in a Terminator.
-fn terminator_value_refs(term: &Terminator) -> Vec<ValueId> {
-    match term {
-        Terminator::Goto { args, .. } => args.clone(),
-        Terminator::Branch {
-            cond,
-            true_args,
-            false_args,
-            ..
-        } => {
-            let mut refs = vec![*cond];
-            refs.extend(true_args);
-            refs.extend(false_args);
-            refs
-        }
-        Terminator::Unreachable => vec![],
-    }
-}
-
 /// Replace all occurrences of `old` with `new` in ops within the specified blocks.
 fn remap_value_in_graph(
     graph: &mut FunctionGraph,
@@ -888,7 +809,6 @@ fn remap_value_in_graph(
     for &bid in &target_blocks {
         let block = &mut graph.blocks[bid.0];
         block.operations = remap_value_in_ops(&block.operations, old, new);
-        block.terminator = remap_value_in_terminator(&block.terminator, old, new);
         let (exitswitch, exits) = remap_control_flow_metadata(
             &block.exitswitch,
             &block.exits,
@@ -911,36 +831,11 @@ fn remap_value_in_ops(ops: &[SpaceOperation], old: ValueId, new: ValueId) -> Vec
         .collect()
 }
 
-/// Replace all occurrences of `old` with `new` in a terminator.
-fn remap_value_in_terminator(term: &Terminator, old: ValueId, new: ValueId) -> Terminator {
-    let rv = |v: &ValueId| if *v == old { new } else { *v };
-    match term {
-        Terminator::Goto { target, args } => Terminator::Goto {
-            target: *target,
-            args: args.iter().map(rv).collect(),
-        },
-        Terminator::Branch {
-            cond,
-            if_true,
-            true_args,
-            if_false,
-            false_args,
-        } => Terminator::Branch {
-            cond: rv(cond),
-            if_true: *if_true,
-            true_args: true_args.iter().map(rv).collect(),
-            if_false: *if_false,
-            false_args: false_args.iter().map(rv).collect(),
-        },
-        Terminator::Unreachable => Terminator::Unreachable,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::call::CallControl;
-    use crate::model::{CallTarget, FunctionGraph, OpKind, Terminator, ValueType};
+    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
     use crate::parse::CallPath;
 
     fn make_simple_callee() -> FunctionGraph {
@@ -1160,16 +1055,19 @@ mod tests {
         assert!(count >= 1, "callee should inline at least once");
 
         for block in &caller.blocks {
-            match &block.terminator {
-                Terminator::Goto { .. } | Terminator::Branch { .. } => {
-                    assert!(
-                        !block.exits.is_empty(),
-                        "block {:?} has control-flow terminator but empty exits",
-                        block.id
-                    );
-                }
-                _ => {}
-            }
+            // Upstream `flowspace/model.py:171-180` — a closed block (one
+            // with `exitswitch.is_some()` or at least one exit) always
+            // carries both: the exitswitch names the branch condition,
+            // the exits hold every outgoing `Link`.  An unclosed block
+            // (startblock before its first closeblock, or a freshly
+            // created merge block with no afterblock payload) has
+            // `exits=()` and `exitswitch=None`, matching the initial
+            // state in `FunctionGraph.__init__`.
+            assert!(
+                block.is_closed() || !block.exits.is_empty() || block.exitswitch.is_none(),
+                "block {:?} exits/exitswitch out of sync after inline",
+                block.id
+            );
             for link in &block.exits {
                 assert_eq!(
                     link.prevblock,

@@ -525,13 +525,7 @@ mod tests {
             .unwrap();
         let (block1, block1_args) = graph.create_block_with_args(1);
         let v1 = block1_args[0];
-        graph.set_terminator(
-            entry,
-            Terminator::Goto {
-                target: block1,
-                args: vec![v0],
-            },
-        );
+        graph.set_goto(entry, block1, vec![v0]);
         graph.set_return(block1, Some(v1));
 
         let mut vk = HashMap::new();

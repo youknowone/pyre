@@ -386,13 +386,7 @@ mod tests {
         // Build a graph with a self-loop on block 0.
         let mut g = FunctionGraph::new("loopy");
         let entry = g.startblock;
-        g.set_terminator(
-            entry,
-            crate::model::Terminator::Goto {
-                target: entry,
-                args: Vec::new(),
-            },
-        );
+        g.set_goto(entry, entry, Vec::new());
         let loopy = SemanticFunction {
             name: "loopy".into(),
             graph: g.clone(),
@@ -462,13 +456,7 @@ mod tests {
     fn find_backedges_detects_self_loop() {
         let mut g = FunctionGraph::new("loop");
         let entry = g.startblock;
-        g.set_terminator(
-            entry,
-            crate::model::Terminator::Goto {
-                target: entry,
-                args: Vec::new(),
-            },
-        );
+        g.set_goto(entry, entry, Vec::new());
         let edges = find_backedges(&g);
         assert_eq!(edges, vec![(entry.0, entry.0)]);
     }
