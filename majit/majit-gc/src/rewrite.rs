@@ -1187,7 +1187,9 @@ impl GcRewriter for GcRewriterImpl {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    st.emit_pending_zeros();
+                    // rewrite.py:379-380 can_malloc → emitting_an_operation_that_can_collect.
+                    // That helper itself calls emit_pending_zeros (rewrite.py:707), so do not
+                    // call it twice.
                     st.emitting_an_operation_that_can_collect();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
@@ -1195,7 +1197,8 @@ impl GcRewriter for GcRewriterImpl {
 
                 // ── Operations that can trigger GC ──
                 _ if op.opcode.can_malloc() => {
-                    st.emit_pending_zeros();
+                    // rewrite.py:379-380 — emitting_an_operation_that_can_collect
+                    // already flushes pending zeros (rewrite.py:707).
                     st.emitting_an_operation_that_can_collect();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
