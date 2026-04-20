@@ -355,14 +355,8 @@ impl Bookkeeper {
     ///     return self.annotator.warning(msg)
     /// ```
     pub fn warning(&self, msg: impl Into<String>) {
-        if let Some(ann) = self.annotator.borrow().upgrade() {
-            ann.warning(&msg.into());
-        } else {
-            // No annotator backlink — fall back to stderr so the
-            // message is not lost. Matches the spirit of upstream,
-            // which asserts annotator is always live.
-            eprintln!("[bookkeeper warning, no annotator] {}", msg.into());
-        }
+        let msg = msg.into();
+        self.annotator().warning(&msg);
     }
 
     /// RPython `bookkeeper.position_key = ...` assignment. Returns the
