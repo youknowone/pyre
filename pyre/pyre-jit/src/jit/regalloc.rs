@@ -590,10 +590,14 @@ fn follow_label(
 
 /// Apply the rename table to the `SSARepr` in place.
 ///
-/// Walks every `Insn::Op` and `Insn::Live`, rewriting `Register`
-/// operands and `result` registers through the rename table. Leaves
-/// constants, labels, descrs, and indirect-call-target operands
-/// untouched.
+/// Walks every `Insn::Op`, rewriting `Register` operands and `result`
+/// registers through the rename table. Leaves constants, labels,
+/// descrs, and indirect-call-target operands untouched.
+///
+/// `Insn::Live` markers have empty args at this point in the pipeline
+/// (dispatch emits placeholders, `filter_liveness_in_place` only runs
+/// AFTER this function per `codewriter.py:44-56` parity), so they
+/// don't need rewriting here.
 pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), u16>) {
     if rename.is_empty() {
         return;
@@ -609,9 +613,11 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), 
                 }
             }
             Insn::Live(args) => {
-                for op in args.iter_mut() {
-                    rename_operand(op, rename);
-                }
+                debug_assert!(
+                    args.is_empty(),
+                    "apply_rename: expected Insn::Live args to be empty at this pipeline stage, got {:?}",
+                    args,
+                );
             }
             Insn::Label(_) | Insn::Unreachable | Insn::PcAnchor(_) => {}
         }
