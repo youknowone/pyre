@@ -2255,11 +2255,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         );
     }
     driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
-    if driver.is_tracing() {
-        // RPython warmstate.py:429 decay_all_counters:
-        // called once after tracing starts to prevent burst compilation.
-        driver.meta_interp_mut().warm_state_mut().decay_counters();
-    }
     None
 }
 
