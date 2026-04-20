@@ -220,66 +220,25 @@ fn register_helper_fn_pointers(
     }
 }
 
-/// Patch the per-`-live-` slots in `assembler` with the
-/// register-byte vectors derived from `liveness`.
-///
-/// RPython: `assembler.py:fill_live_args` is called inline by
-/// `assembler.assemble`'s `Insn::Live` branch.
-///
-/// Note: the caller previously checked PRE-rename register indices
-/// against the 256-byte cap in `liveness.py:139` and routed overflow
-/// through a pyre-only `has_abort` fallback. After the post-pass
-/// register allocator (`super::regalloc::allocate_registers`) lands,
-/// the encoded indices are POST-rename and the cap fires only on
-/// pathological functions whose `nlocals` alone already exceeds 256
-/// — the same condition that crashes the RPython translator at
-/// `encode_liveness`'s `assert 0 <= char < 256`. We adopt the
-/// RPython-orthodox behavior (panic on overflow) by deleting the
-/// fallback path.
-fn fill_assembler_liveness(
-    ssarepr: &mut super::flatten::SSARepr,
-    liveness: &[LivenessInfo],
-    live_patches: &[(usize, usize)],
-) {
-    use super::flatten::{Insn, Operand};
-    for (entry, &(_, insn_idx)) in liveness.iter().zip(live_patches.iter()) {
-        let mut args: Vec<Operand> = Vec::with_capacity(
-            entry.live_i_regs.len() + entry.live_r_regs.len() + entry.live_f_regs.len(),
-        );
-        for &r in &entry.live_i_regs {
-            args.push(Operand::reg(Kind::Int, r));
-        }
-        for &r in &entry.live_r_regs {
-            args.push(Operand::reg(Kind::Ref, r));
-        }
-        for &r in &entry.live_f_regs {
-            args.push(Operand::reg(Kind::Float, r));
-        }
-        match ssarepr.insns.get_mut(insn_idx) {
-            Some(Insn::Live(existing)) => *existing = args,
-            Some(other) => panic!(
-                "fill_assembler_liveness: expected Insn::Live at index {insn_idx}, got {other:?}"
-            ),
-            None => panic!(
-                "fill_assembler_liveness: insn index {insn_idx} out of range (len {})",
-                ssarepr.insns.len()
-            ),
-        }
-    }
-}
-
 /// RPython: `liveness.py:19-80` `compute_liveness(ssarepr)` —
-/// backward dataflow over the populated `SSARepr` that produces the
-/// per-PC `LivenessInfo` triple consumed by both
-/// `get_list_of_active_boxes` (pyjitpl.py:177) and
-/// `consume_one_section` (resume.py:1381).
+/// backward dataflow over the populated `SSARepr` that fills each
+/// `-live-` marker with the set of registers alive across it.
 ///
 /// Phase 4: the dataflow now runs on the walker's SSARepr via
 /// `liveness::compute_liveness_preserve_positions`, which skips
 /// `remove_repeated_live` so `live_patches` insn indices stay valid
-/// offsets into `ssarepr.insns`.
+/// offsets into `ssarepr.insns`. After the dataflow, pyre applies an
+/// in-place post-filter to each `Insn::Live` so the args carry only
+/// the subset of registers the runtime contract is currently wired
+/// to consume (see comment below). `apply_rename` then rewrites the
+/// remaining register indices; `get_liveness_info` at assemble time
+/// (`assembler.rs:422-437`) partitions by kind and emits the
+/// `all_liveness` byte stream, and the Vec<LivenessInfo> for
+/// `metadata.liveness` is re-extracted from the same Insn::Live after
+/// rename (see the dispatch finaliser). All three downstream consumers
+/// share one source.
 ///
-/// Post-filters on the SSA output:
+/// Post-filter rules (pyre-only adaptation on top of SSA output):
 ///   - Only Ref-kind registers: pyre Int/Float regs are scratch
 ///     tmps (int_tmp0/1, op_code_reg) or constant-as-reg encodings
 ///     inside `jit_merge_point`; they never carry a Python box
@@ -294,59 +253,73 @@ fn fill_assembler_liveness(
 ///     range (obj_tmp0/1, arg_regs_start, null_ref_reg,
 ///     portal_{frame,ec}_reg) are correctly dead across py_pcs and
 ///     would desynchronise box layout if leaked.
-///
-/// Intersecting with LiveVars narrows SSA's superset back to the
-/// live set pyre's runtime contract currently assumes: symbolic
-/// locals / blackhole resume are built on LiveVars' answer, which
-/// omits function parameters at pc=0. Making SSA authoritative
-/// requires teaching the runtime to handle SSA-extra live params —
-/// see `phase4_ssa_liveness_blocker_2026_04_18.md`.
+///   - Every in-depth stack slot `stack_base + d` for
+///     `d in 0..depth_at_pc[py_pc]` is force-added even if SSA
+///     didn't mark it alive, because pyre's runtime invariant at
+///     every `-live-` marker is "all stack slots up to the current
+///     depth hold a live box".
+///   - Intersect with LiveVars: RPython's SSA liveness is the
+///     authoritative live set, but pyre's tracer + blackhole are
+///     still wired to Python's per-bytecode LiveVars answer (which
+///     omits function parameters at pc=0). Narrowing SSA back to
+///     LV∩SSA restores that contract; see
+///     `phase4_ssa_liveness_blocker_2026_04_18.md` for the rework
+///     required to drop this intersection.
 ///
 /// Unreachable PCs (the `LiveVars` dataflow leaves `usize::MAX`
-/// sentinels from `liveness.rs:150`) get an empty entry so the
-/// downstream `liveness.zip(live_patches)` alignment in dispatch
-/// finalisation stays one-to-one.
-fn compute_liveness_table(
+/// sentinels from `liveness.rs:150`) get emptied so the downstream
+/// `live_patches.iter()` alignment stays one-to-one.
+fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     live_patches: &[(usize, usize)],
     code: &CodeObject,
-    num_instrs: usize,
     nlocals: usize,
     stack_base: u16,
     depth_at_pc: &[u16],
-    pc_map: &[usize],
-) -> Vec<LivenessInfo> {
+) {
     use super::flatten::{Insn, Kind as SsaKind, Operand as SsaOperand};
     super::liveness::compute_liveness_preserve_positions(ssarepr);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
-    let mut liveness = Vec::with_capacity(num_instrs);
     for &(py_pc, insn_idx) in live_patches.iter() {
-        let jit_pc = pc_map[py_pc];
+        let existing = match ssarepr.insns.get_mut(insn_idx) {
+            Some(Insn::Live(args)) => args,
+            Some(other) => panic!(
+                "filter_liveness_in_place: expected Insn::Live at index {insn_idx}, got {other:?}"
+            ),
+            None => panic!(
+                "filter_liveness_in_place: insn index {insn_idx} out of range (len {})",
+                ssarepr.insns.len()
+            ),
+        };
+        // Preserve non-Register operands (TLabel) exactly as RPython
+        // `liveness.py:52` keeps them alongside the `alive` set.
+        let mut non_register: Vec<SsaOperand> = Vec::new();
+        for op in existing.iter() {
+            if !matches!(op, SsaOperand::Register(_)) {
+                non_register.push(op.clone());
+            }
+        }
+
         if !live_vars.is_reachable(py_pc) {
-            liveness.push(LivenessInfo {
-                pc: jit_pc as u16,
-                live_i_regs: Vec::new(),
-                live_r_regs: Vec::new(),
-                live_f_regs: Vec::new(),
-            });
+            existing.clear();
+            existing.extend(non_register);
             continue;
         }
+
         let depth = depth_at_pc[py_pc];
         let stack_limit = stack_base as usize + depth as usize;
         let mut seen: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
         let mut live_r: Vec<u16> = Vec::new();
-        if let Some(Insn::Live(args)) = ssarepr.insns.get(insn_idx) {
-            for op in args {
-                if let SsaOperand::Register(reg) = op {
-                    if reg.kind != SsaKind::Ref {
-                        continue;
-                    }
-                    let idx = reg.index as usize;
-                    let in_locals = idx < nlocals;
-                    let in_stack = idx >= stack_base as usize && idx < stack_limit;
-                    if (in_locals || in_stack) && seen.insert(reg.index) {
-                        live_r.push(reg.index);
-                    }
+        for op in existing.iter() {
+            if let SsaOperand::Register(reg) = op {
+                if reg.kind != SsaKind::Ref {
+                    continue;
+                }
+                let idx = reg.index as usize;
+                let in_locals = idx < nlocals;
+                let in_stack = idx >= stack_base as usize && idx < stack_limit;
+                if (in_locals || in_stack) && seen.insert(reg.index) {
+                    live_r.push(reg.index);
                 }
             }
         }
@@ -367,14 +340,16 @@ fn compute_liveness_table(
             s
         };
         live_r.retain(|idx| lv_live.contains(idx));
-        liveness.push(LivenessInfo {
-            pc: jit_pc as u16,
-            live_i_regs: Vec::new(),
-            live_r_regs: live_r,
-            live_f_regs: Vec::new(),
-        });
+
+        existing.clear();
+        for &idx in &live_r {
+            existing.push(SsaOperand::Register(super::flatten::Register::new(
+                SsaKind::Ref,
+                idx,
+            )));
+        }
+        existing.extend(non_register);
     }
-    liveness
 }
 
 /// Decode `code.exceptiontable` into the structures the dispatch loop
@@ -2159,29 +2134,24 @@ impl CodeWriter {
         // a front-end gate.
         let mut has_abort = assembler.has_abort_flag();
 
-        // liveness.py:19-80 parity: generate LivenessInfo at each
-        // bytecode PC via SSA backward dataflow over the populated
-        // SSARepr, with a LiveVars intersection at each pc to match
-        // the runtime contract. See `compute_liveness_table`.
-        let liveness = compute_liveness_table(
+        // liveness.py:19-80 parity: populate each `-live-` marker in
+        // the SSARepr via SSA backward dataflow, then apply pyre's
+        // runtime-contract filter (Ref-only, in-range, stack-complete,
+        // LiveVars-intersected) to each marker in place. After this
+        // call `Insn::Live` carries the final live-register set that
+        // both the assembler (`all_liveness` byte stream) and the
+        // post-rename `metadata.liveness` extraction will consume —
+        // one source replaces the previous `compute_liveness_table` +
+        // `fill_assembler_liveness` round-trip. See
+        // `filter_liveness_in_place`.
+        filter_liveness_in_place(
             &mut ssarepr,
             &live_patches,
             code,
-            num_instrs,
             nlocals,
             stack_base,
             &depth_at_pc,
-            &pc_map,
         );
-
-        // liveness.py:19-23 parity: patch each SSARepr `-live-` slot
-        // with the per-PC register triple. The post-pass register
-        // allocator below renames these registers to colors that fit
-        // in `encode_liveness`'s 8-bit precondition; the legacy
-        // pyre-only `has_abort` fallback for `register index ≥ 256`
-        // is gone (RPython parity: `liveness.py:147-166` panics if a
-        // post-regalloc register exceeds 256, and so do we).
-        fill_assembler_liveness(&mut ssarepr, &liveness, &live_patches);
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, site.landing_label);
@@ -2224,40 +2194,58 @@ impl CodeWriter {
             super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs);
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
-        // Keep `liveness: Vec<LivenessInfo>` in sync with the post-rename
-        // register indices that `get_liveness_info` (assembler.rs:422-437)
-        // will encode into the `all_liveness` byte stream: apply the same
-        // rename table to each per-PC register list, then sort + dedup to
-        // match the encoder's normalisation. Runtime consumers
-        // (`get_list_of_active_boxes`, `frame_value_count_at`) read from
-        // this Vec, so both data sources must agree on the final indices
-        // and counts.
-        let mut liveness = liveness;
-        if !alloc_result.rename.is_empty() {
-            let rename = &alloc_result.rename;
-            let apply = |regs: &mut Vec<u16>, kind: Kind| {
-                for r in regs.iter_mut() {
-                    if let Some(&new) = rename.get(&(kind, *r)) {
-                        *r = new;
+        // Extract `metadata.liveness` from the post-rename `Insn::Live`
+        // so the `Vec<LivenessInfo>` and the `all_liveness` byte stream
+        // (which `get_liveness_info` / `encode_liveness_info` will
+        // derive from the same `Insn::Live` at assemble time,
+        // assembler.rs:422-437 / 335-376) share a single source of
+        // truth. Matches `get_liveness_info`'s normalisation exactly:
+        // partition by `Register.kind`, sort ascending, dedup. The
+        // `pc` field is the JitCode byte offset from `pc_map[py_pc]`
+        // and is unaffected by register rename.
+        //
+        // Fail-fast on a missing `-live-` marker, mirroring RPython's
+        // `jitcode.py:82-100` `get_live_vars_info` / `_missing_liveness`
+        // invariant: `live_patches[i]` must point at an `Insn::Live`.
+        // `filter_liveness_in_place` preserves the marker even for
+        // unreachable PCs (it only clears the register args), so an
+        // empty-but-present marker is the correct "no live regs" shape;
+        // a missing or wrong-kind insn indicates a `live_patches` /
+        // ssarepr drift the rest of the pipeline is not prepared for.
+        let mut liveness: Vec<LivenessInfo> = Vec::with_capacity(live_patches.len());
+        for &(py_pc, insn_idx) in live_patches.iter() {
+            let args = match ssarepr.insns.get(insn_idx) {
+                Some(super::flatten::Insn::Live(args)) => args,
+                Some(other) => panic!(
+                    "extract_liveness: expected Insn::Live at insn_idx={insn_idx} (py_pc={py_pc}), got {other:?}"
+                ),
+                None => panic!(
+                    "extract_liveness: insn_idx={insn_idx} out of range (len {}, py_pc={py_pc})",
+                    ssarepr.insns.len()
+                ),
+            };
+            let mut entry = LivenessInfo {
+                pc: pc_map[py_pc] as u16,
+                live_i_regs: Vec::new(),
+                live_r_regs: Vec::new(),
+                live_f_regs: Vec::new(),
+            };
+            for op in args {
+                if let super::flatten::Operand::Register(reg) = op {
+                    match reg.kind {
+                        Kind::Int => entry.live_i_regs.push(reg.index),
+                        Kind::Ref => entry.live_r_regs.push(reg.index),
+                        Kind::Float => entry.live_f_regs.push(reg.index),
                     }
                 }
-                regs.sort_unstable();
-                regs.dedup();
-            };
-            for info in liveness.iter_mut() {
-                apply(&mut info.live_i_regs, Kind::Int);
-                apply(&mut info.live_r_regs, Kind::Ref);
-                apply(&mut info.live_f_regs, Kind::Float);
             }
-        } else {
-            for info in liveness.iter_mut() {
-                info.live_i_regs.sort_unstable();
-                info.live_i_regs.dedup();
-                info.live_r_regs.sort_unstable();
-                info.live_r_regs.dedup();
-                info.live_f_regs.sort_unstable();
-                info.live_f_regs.dedup();
-            }
+            entry.live_i_regs.sort_unstable();
+            entry.live_i_regs.dedup();
+            entry.live_r_regs.sort_unstable();
+            entry.live_r_regs.dedup();
+            entry.live_f_regs.sort_unstable();
+            entry.live_f_regs.dedup();
+            liveness.push(entry);
         }
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1

@@ -359,39 +359,32 @@ impl RegAllocator {
                         // RPython's regalloc runs BEFORE
                         // `compute_liveness` (`codewriter.py:44`
                         // vs `:55`), so `-live-` markers do not yet
-                        // exist at allocation time. pyre's
-                        // dispatch loop emits EMPTY `Insn::Live`
-                        // placeholders, then `fill_assembler_liveness`
-                        // (`codewriter.rs:237-249`) populates each
-                        // with the per-Python-PC `(live_i, live_r,
-                        // live_f)` triple from the Python-bytecode
-                        // LiveVars analysis. By the time this walk
-                        // runs the args contain only `Register`
-                        // operands (never `TLabel`), and the
-                        // `alive.insert(reg.index)` extension
-                        // preserves their lifetime through the
-                        // resume point — pyre's analog of RPython's
-                        // `link.args` keeping block-exit live vars
-                        // alive (`regalloc.py:46-48`).
+                        // exist at allocation time. In pyre, the
+                        // dispatch loop emits empty `Insn::Live`
+                        // placeholders, then `filter_liveness_in_place`
+                        // (`codewriter.rs`) runs the RPython
+                        // backward SSA walk and installs the
+                        // post-filter register set (Ref-only,
+                        // in-range, LiveVars-intersected) into each
+                        // marker. By the time this allocator walk
+                        // runs, those registers are the only source
+                        // of cross-guard liveness pyre has — pyre's
+                        // GUARD ops do not carry `fail_args` yet
+                        // (reviewer Step 4 blocker), so extending
+                        // `alive` with the `-live-` contents is the
+                        // analog of RPython's `link.args` keeping
+                        // block-exit live vars alive
+                        // (`regalloc.py:46-48`).
                         //
                         // Reviewer Item 1 (remove this branch) is
-                        // gated on Stage 3.4 (abstract register
-                        // file). The blocking coupling is
-                        // encoder-side: `get_list_of_active_boxes`
-                        // iterates `metadata.liveness` (Python
-                        // LiveVars indexed by pre-regalloc PyFrame
-                        // slot) and the blackhole decoder iterates
-                        // the jitcode's `-live-` bytes (indexed by
-                        // post-regalloc register color). Only after
-                        // both consumers read a single SSARepr-
-                        // backward source (Stage 3.4) can
-                        // `compute_liveness` subsume
-                        // `fill_assembler_liveness` and this branch
-                        // become dead code. Empirically verified:
-                        // swapping to `compute_liveness` post-rename
-                        // while leaving the encoder on LiveVars
-                        // crashes `test_recursive_global_reads`
-                        // (diverging sets of live registers).
+                        // blocked on porting `fail_args` to pyre
+                        // guards + dropping the LiveVars
+                        // intersection (so SSA is the sole live
+                        // set). Until that lands, stripping this
+                        // branch misassembles nested_loop /
+                        // test_recursive_global_reads (diverging
+                        // sets of live registers between encoder
+                        // and decoder).
                         for x in args {
                             if let Operand::Register(reg) = x {
                                 if reg.kind == kind {

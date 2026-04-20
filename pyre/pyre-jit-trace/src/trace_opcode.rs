@@ -336,44 +336,21 @@ impl MIFrame {
             }
             return boxes;
         }
-        let jit_pc = jc
-            .payload
-            .metadata
-            .pc_map
-            .get(live_pc)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "get_list_of_active_boxes: no pc_map entry for live_pc={}",
-                    live_pc
-                )
-            });
-        // Step A of the regalloc-parity refactor: read the per-PC live
-        // register indices from `PyJitCodeMetadata.liveness` (the
-        // canonical pyre-side LivenessInfo store) instead of from the
-        // packed `Insn::Live` bytes embedded in the JitCode. Both stores
-        // currently carry the same data — `fill_assembler_liveness`
-        // patches `Insn::Live` slots with the same `LivenessInfo`
-        // contents — but the `Insn::Live` byte path also has a second
-        // consumer (regalloc's `make_dependencies`, which expects the
-        // RPython `compute_liveness` semantics: SSARepr-level register
-        // interference). Splitting the two consumers is the precondition
-        // for Step B (replace `fill_assembler_liveness` with the RPython
-        // `compute_liveness(&mut ssarepr)` line-by-line port).
+        // Read per-PC live register indices from `PyJitCodeMetadata.liveness`.
+        // Both this Vec and the jitcode's `all_liveness` byte stream are
+        // now derived from the same post-rename `Insn::Live` in the
+        // SSARepr (codewriter.rs `filter_liveness_in_place` + post-rename
+        // extraction), so the trace snapshot and the blackhole bridge-
+        // resume decode see identical live sets.
         //
-        // The `metadata.liveness` Vec is built by
-        // `compute_liveness_table` (codewriter.rs:267-298) with one
-        // entry per Python PC in `0..num_instrs`, so direct indexing by
-        // `live_pc` is correct (the `LivenessInfo.pc` field is a
-        // codewriter-side insn index that's NOT comparable to
-        // `metadata.pc_map[live_pc]`'s byte offset — `find()` would
+        // The Vec is indexed by Python PC, so direct indexing by
+        // `live_pc` is correct (the `LivenessInfo.pc` field holds the
+        // JitCode byte offset, NOT the Python PC — `find()` would
         // mismatch).
         //
         // pyjitpl.py:204-233 parity: iterate live_i, live_r, live_f
         // banks and snapshot registers_r/stack_values per register
-        // index. Same body as before; only the source of the index list
-        // changed.
-        let _ = jit_pc; // jit_pc is unused; lookup uses live_pc directly
+        // index.
         let live_info = jc
             .payload
             .metadata

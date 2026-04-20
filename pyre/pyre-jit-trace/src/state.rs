@@ -471,21 +471,15 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
             Some(jc) => jc,
             None => return 0,
         };
-        // Step A.3 of the regalloc-parity refactor: read the per-PC
-        // value count from `PyJitCodeMetadata.liveness` (the canonical
-        // pyre-side LivenessInfo store) instead of from the packed
-        // `Insn::Live` bytes embedded in the JitCode. Same data — both
-        // are populated by `compute_liveness_table` /
-        // `fill_assembler_liveness` — but reading the structured Vec
-        // avoids the byte-offset round-trip and removes one of the
-        // `Insn::Live` byte consumers ahead of Step B (where
-        // `fill_assembler_liveness` is replaced by RPython's
-        // `compute_liveness(&mut ssarepr)` line-by-line port; after
-        // that, the `Insn::Live` slot will carry register-interference
-        // semantics, NOT this Python-LiveVars view).
+        // Read the per-PC value count from `PyJitCodeMetadata.liveness`.
+        // Both this Vec and the jitcode's `all_liveness` byte stream
+        // are derived from the same post-rename `Insn::Live` in the
+        // SSARepr (codewriter.rs `filter_liveness_in_place` + post-
+        // rename extraction), so the tracer's encoder and the
+        // blackhole's decoder agree on the live-box count.
         //
-        // The `metadata.liveness` Vec is indexed by Python PC
-        // (codewriter.rs:267-298), matching the `pc` argument here.
+        // The Vec is indexed by Python PC, matching the `pc` argument
+        // here.
         let payload = &jc.payload;
         let _ = sd.op_live; // op_live is no longer used; kept for future Insn::Live reads
         if let Some(info) = payload.metadata.liveness.get(pc as usize) {
