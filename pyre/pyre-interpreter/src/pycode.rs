@@ -15,7 +15,10 @@ pub struct BytecodeCorruption;
 
 impl From<BytecodeCorruption> for crate::PyError {
     fn from(_: BytecodeCorruption) -> Self {
-        crate::PyError::runtime_error("bytecode corruption")
+        crate::PyError::new(
+            crate::PyErrorKind::BytecodeCorruption,
+            "bytecode corruption",
+        )
     }
 }
 

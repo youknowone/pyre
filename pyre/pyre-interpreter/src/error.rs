@@ -90,6 +90,10 @@ pub enum PyErrorKind {
     /// Internal: RETURN_GENERATOR unwind signal (not a real exception).
     /// Carries the generator PyObjectRef as message.
     GeneratorReturn,
+    /// Internal parity marker for pypy/interpreter/pycode.py:25
+    /// `BytecodeCorruption`. This should not be raised as a user-level
+    /// Python exception; it signals malformed bytecode in the interpreter.
+    BytecodeCorruption,
     /// Base class for all operating-system errors.
     /// pypy/module/exceptions/interp_exceptions.py W_OSError.
     OSError,
@@ -246,6 +250,9 @@ impl PyError {
             PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
             PyErrorKind::RecursionError => ExcKind::RecursionError,
             PyErrorKind::GeneratorReturn => ExcKind::RuntimeError,
+            // Internal-only marker. If it escapes to object-space conversion,
+            // degrade to RuntimeError rather than inventing a new exception type.
+            PyErrorKind::BytecodeCorruption => ExcKind::RuntimeError,
             PyErrorKind::OSError => ExcKind::OSError,
             PyErrorKind::FileNotFoundError => ExcKind::FileNotFoundError,
             // DescrMismatch is a control-flow exception caught by

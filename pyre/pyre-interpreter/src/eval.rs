@@ -139,8 +139,11 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
 /// Returns `true` if a handler was found (resume PC updated to handler),
 /// `false` if the exception should propagate to the caller.
 pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usize) -> bool {
-    // GeneratorReturn is not a real exception — always propagate it.
-    if err.kind == crate::PyErrorKind::GeneratorReturn {
+    // Internal control-flow / corruption markers are not real Python
+    // exceptions and must never be dispatched via bytecode handlers.
+    if err.kind == crate::PyErrorKind::GeneratorReturn
+        || err.kind == crate::PyErrorKind::BytecodeCorruption
+    {
         return false;
     }
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
@@ -2307,7 +2310,7 @@ r = acc",
         }
         let mut frame = PyFrame::new(code);
         let err = eval_frame_plain(&mut frame).expect_err("expected bytecode corruption");
-        assert_eq!(err.kind, PyErrorKind::RuntimeError);
+        assert_eq!(err.kind, PyErrorKind::BytecodeCorruption);
         assert_eq!(err.message, "bytecode corruption");
     }
 
