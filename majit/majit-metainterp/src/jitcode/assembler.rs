@@ -31,10 +31,10 @@ pub struct JitCodeBuilder {
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
     /// Runtime descriptor pool emitted into `JitCodeExecState.descrs`
-    /// on `finish()`. Each `BC_INLINE_CALL` operand is a 2-byte index
-    /// into this pool (RPython `j` argcode → `descrs[idx] → JitCode`).
+    /// on `finish()`. Every `BC_INLINE_CALL` / `BC_CALL_*` /
+    /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
+    /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
-    fn_ptrs: Vec<JitCallTarget>,
     assembler_targets: Vec<JitCallAssemblerTarget>,
     has_abort: bool,
 }
@@ -1260,13 +1260,23 @@ impl JitCodeBuilder {
         self.add_call_target(ptr, ptr)
     }
 
+    /// Append a function target descriptor and return its runtime
+    /// `descrs` index. Mirrors RPython `Assembler._encode_descr(calldescr)`
+    /// (assembler.py:140) where the 2-byte operand downstream resolves
+    /// to `self.descrs[idx]` at dispatch time. pyre dedups identical
+    /// `(trace_ptr, concrete_ptr)` pairs to match
+    /// `Assembler._encode_descr` memoisation.
     pub fn add_call_target(&mut self, trace_ptr: *const (), concrete_ptr: *const ()) -> u16 {
         let target = JitCallTarget::new(trace_ptr, concrete_ptr);
-        if let Some(index) = self.fn_ptrs.iter().position(|existing| *existing == target) {
-            return index as u16;
+        for (idx, entry) in self.descrs.iter().enumerate() {
+            if let RuntimeBhDescr::Call(existing) = entry {
+                if *existing == target {
+                    return idx as u16;
+                }
+            }
         }
-        let idx = self.fn_ptrs.len() as u16;
-        self.fn_ptrs.push(target);
+        let idx = self.descrs.len() as u16;
+        self.descrs.push(RuntimeBhDescr::Call(target));
         idx
     }
 
@@ -1312,7 +1322,6 @@ impl JitCodeBuilder {
             calldescr: majit_translate::jitcode::BhCallDescr::default(),
             exec: super::JitCodeExecState {
                 opcodes: self.opcodes,
-                fn_ptrs: self.fn_ptrs,
                 descrs: self.descrs,
                 assembler_targets: self.assembler_targets,
             },

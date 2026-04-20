@@ -1155,7 +1155,7 @@ where
                     ctx.call_assembler_void_typed(&token, &args, &arg_types);
                     call_void_function(concrete_ptr, &concrete_args);
                 } else {
-                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
+                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {
@@ -1233,7 +1233,7 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
+                let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
                 let trace_ptr = if target.trace_ptr.is_null() {
                     target.concrete_ptr
                 } else {
@@ -1353,7 +1353,7 @@ where
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                 } else {
-                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
+                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {
@@ -1477,7 +1477,7 @@ where
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                 } else {
-                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
+                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {
@@ -1599,7 +1599,7 @@ where
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 } else {
-                    let target = self.frames.current_mut().jitcode.exec.fn_ptrs[fn_ptr_idx];
+                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
                     let trace_ptr = if target.trace_ptr.is_null() {
                         target.concrete_ptr
                     } else {

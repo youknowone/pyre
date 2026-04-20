@@ -980,13 +980,12 @@ pub fn resume_in_blackhole(
                         jitcode_bytes[bh.last_opcode_position + 1],
                         jitcode_bytes[bh.last_opcode_position + 2],
                     ]) as usize;
-                    if fn_idx < bh.jitcode.exec.fn_ptrs.len() {
-                        format!(
-                            "fn_ptr={:#x}",
-                            bh.jitcode.exec.fn_ptrs[fn_idx].concrete_ptr as usize
-                        )
-                    } else {
-                        format!("fn_idx={} (out of range)", fn_idx)
+                    match bh.jitcode.exec.descrs.get(fn_idx) {
+                        Some(majit_metainterp::jitcode::RuntimeBhDescr::Call(target)) => {
+                            format!("fn_ptr={:#x}", target.concrete_ptr as usize)
+                        }
+                        Some(other) => format!("descrs[{fn_idx}]={other:?}"),
+                        None => format!("fn_idx={fn_idx} (out of range)"),
                     }
                 } else {
                     String::new()

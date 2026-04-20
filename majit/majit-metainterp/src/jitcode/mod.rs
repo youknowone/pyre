@@ -239,6 +239,15 @@ pub enum RuntimeBhDescr {
     /// inline because the runtime-generated JitCodes have no global
     /// allocation index into `metainterp_sd.all_jitcodes`.
     JitCode(std::sync::Arc<JitCode>),
+    /// Target function for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
+    /// RPython `blackhole.py:1225-1256` reads the function address
+    /// from an int register (`i` argcode) and the calling convention
+    /// from a descr (`d` argcode); pyre keeps the two together in
+    /// `JitCallTarget` because the runtime emitter wires trace-side
+    /// and blackhole-side function pointers in a single indirection
+    /// slot. Once pyre emits the function address via an int register
+    /// this variant can split into the RPython-shaped pair.
+    Call(JitCallTarget),
 }
 
 impl RuntimeBhDescr {
@@ -247,6 +256,15 @@ impl RuntimeBhDescr {
     pub fn as_jitcode(&self) -> Option<&std::sync::Arc<JitCode>> {
         match self {
             Self::JitCode(arc) => Some(arc),
+            _ => None,
+        }
+    }
+
+    /// Extract the `Call` target for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
+    pub fn as_call(&self) -> Option<&JitCallTarget> {
+        match self {
+            Self::Call(target) => Some(target),
+            _ => None,
         }
     }
 }
@@ -275,23 +293,19 @@ pub struct JitCodeExecState {
     /// Placed first because it's the hottest adapter pool in tight arithmetic
     /// loops; other fields follow in frequency order.
     pub opcodes: Vec<OpCode>,
-    /// Function pointers resolved by 18 `BC_CALL_*` / `BC_RESIDUAL_CALL_*`
-    /// variants. RPython stores the same information in `BhDescr::Call`
-    /// + `CallDescr.fnaddr` (call.py:get_jitcode_calldescr) threaded
-    /// through `BlackholeInterpBuilder.descrs`; pyre's runtime resolves
-    /// via a per-JitCode pool until the dispatch path migrates to
-    /// insns-table + `d` argcode decode.
-    pub fn_ptrs: Vec<JitCallTarget>,
     /// Descriptor pool — indexed by the 2-byte `j`/`d` argcode operand.
     /// Naming mirrors RPython `BlackholeInterpBuilder.descrs`
     /// (blackhole.py:103) / `BlackholeInterpreter.descrs`
     /// (blackhole.py:288). Build-time pyre routes the shared pool via
     /// `BlackholeInterpBuilder.descrs`; runtime pyre keeps the
     /// equivalent list per-JitCode because each Python-frame JitCode is
-    /// generated on demand. For `BC_INLINE_CALL` (`j` argcode) pyre
-    /// stores a `RuntimeBhDescr::JitCode(Arc<JitCode>)` — the `Arc` is
-    /// the runtime analogue of RPython's direct `JitCode` instance in
-    /// the shared pool.
+    /// generated on demand. Heterogeneous entries discriminated by the
+    /// `RuntimeBhDescr` variant tag:
+    /// - `JitCode(Arc<JitCode>)` for `j` argcode (`BC_INLINE_CALL`).
+    /// - `Call(JitCallTarget)` for `d` argcode (`BC_CALL_*` /
+    ///   `BC_RESIDUAL_CALL_*`) — pyre bundles trace + concrete fn
+    ///   pointers in one slot; RPython keeps the function address in
+    ///   an int register and only the calling convention in the descr.
     pub descrs: Vec<RuntimeBhDescr>,
     /// CALL_ASSEMBLER target metadata keyed by loop token number. Cold
     /// field: only consulted when a portal re-enters an assembled loop
@@ -384,6 +398,21 @@ impl JitCode {
     pub(crate) fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
         let target = self.exec.assembler_targets[index];
         (target.token_number, target.concrete_ptr)
+    }
+
+    /// Resolve `BC_CALL_*` / `BC_RESIDUAL_CALL_*` function-target
+    /// descr. Mirrors RPython `blackhole.py:1225-1256` where the
+    /// calling-convention descr travels through `descrs[idx]`; pyre
+    /// additionally bundles the trace and concrete fn pointers in
+    /// the `Call` variant because the call encoding pre-dates the
+    /// RPython-orthodox register-fed function address.
+    pub fn call_target(&self, index: usize) -> &JitCallTarget {
+        match self.exec.descrs.get(index) {
+            Some(RuntimeBhDescr::Call(target)) => target,
+            other => {
+                panic!("BC_CALL_*/RESIDUAL_CALL_*: descrs[{index}] is not a Call entry: {other:?}",)
+            }
+        }
     }
 
     /// RPython `jitcode.py:56-57` `def num_regs_and_consts_i(self): return ord(self.c_num_regs_i) + len(self.constants_i)`.

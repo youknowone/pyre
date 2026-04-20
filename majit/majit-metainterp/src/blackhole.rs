@@ -2158,7 +2158,7 @@ impl BlackholeInterpreter {
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
-                let target = &self.jitcode.exec.fn_ptrs[fn_ptr_idx];
+                let target = self.jitcode.call_target(fn_ptr_idx);
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 let result = call_int_function(target.concrete_ptr, &args);
                 // Check if call raised an exception (TLS set by helper).
@@ -2184,7 +2184,7 @@ impl BlackholeInterpreter {
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
-                let target = &self.jitcode.exec.fn_ptrs[fn_ptr_idx];
+                let target = self.jitcode.call_target(fn_ptr_idx);
                 // Clear stale exception before call to prevent false positives.
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 if crate::majit_log_enabled() {
@@ -2232,7 +2232,7 @@ impl BlackholeInterpreter {
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
-                let target = &self.jitcode.exec.fn_ptrs[fn_ptr_idx];
+                let target = self.jitcode.call_target(fn_ptr_idx);
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 let result = call_int_function(target.concrete_ptr, &args);
                 let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
@@ -2255,7 +2255,7 @@ impl BlackholeInterpreter {
                 // void calls have no dst field in bytecode (call_void_like encoding)
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
-                let target = &self.jitcode.exec.fn_ptrs[fn_ptr_idx];
+                let target = self.jitcode.call_target(fn_ptr_idx);
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 call_int_function(target.concrete_ptr, &args);
                 let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
@@ -2272,7 +2272,7 @@ impl BlackholeInterpreter {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
-                let target = &self.jitcode.exec.fn_ptrs[fn_ptr_idx];
+                let target = self.jitcode.call_target(fn_ptr_idx);
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 call_int_function(target.concrete_ptr, &args);
                 let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
