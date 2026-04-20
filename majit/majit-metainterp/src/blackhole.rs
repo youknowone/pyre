@@ -994,10 +994,6 @@ pub struct BlackholeInterpreter {
     /// (`portal_runner_ptr`/`mainjitcode_calldescr`) so multi-driver
     /// dispatch matches upstream line-by-line.
     pub jitdrivers_sd: Vec<BhJitDriverSd>,
-    /// Packed all_liveness bytes. RPython stores this on metainterp_sd;
-    /// majit's blackhole receives it from the pyre resolver until the
-    /// surrounding MetaInterpStaticData object is fully ported.
-    pub liveness_info: Vec<u8>,
     /// Pyre: absolute start index of the operand stack in
     /// PyFrame.locals_cells_stack_w. RPython does not need this because
     /// its JitCode already operates in register space.
@@ -1141,7 +1137,6 @@ impl BlackholeInterpreter {
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
             jitdrivers_sd: Vec::new(),
-            liveness_info: Vec::new(),
             virtualizable_stack_base: 0,
         }
     }
@@ -3062,7 +3057,6 @@ impl BlackholeInterpBuilder {
         interp.aborted = false;
         interp.got_exception = false;
         interp.virtualizable_stack_base = 0;
-        interp.liveness_info.clear();
         self.pool.push(interp);
     }
 
@@ -3314,6 +3308,7 @@ pub fn resume_in_blackhole(
     resolve_jitcode: &dyn Fn(i32, i32) -> Option<crate::resume::ResolvedJitCode>,
     rd_numb: &[u8],
     rd_consts: &[i64],
+    all_liveness: &[u8],
     deadframe: &[i64],
     deadframe_exc: i64,
 ) -> JitException {
@@ -3324,6 +3319,7 @@ pub fn resume_in_blackhole(
         resolve_jitcode,
         rd_numb,
         rd_consts,
+        all_liveness,
         deadframe,
         None, // deadframe_types
         None, // rd_virtuals

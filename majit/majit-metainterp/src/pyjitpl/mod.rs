@@ -6856,9 +6856,11 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let allocator = crate::resume::NullAllocator;
+        let all_liveness = self.staticdata.liveness_info.as_bytes();
         let (all_virtuals_ptr, all_virtuals_int) = crate::resume::force_from_resumedata(
             rd_numb,
             &rd_consts,
+            all_liveness,
             fail_values,
             None, // deadframe_types
             Some(&self.virtualref_info as &dyn crate::resume::VRefInfo),

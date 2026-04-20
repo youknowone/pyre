@@ -700,6 +700,11 @@ pub fn resume_in_blackhole(
     // pointing to the caller.
     let mut prev_bh: Option<majit_metainterp::blackhole::BlackholeInterpreter> = None;
 
+    // pyjitpl.py:2264: metainterp_sd.liveness_info — one shared pool for
+    // every jitcode. Snapshot once per call so per-section enumerate_vars
+    // borrows a stable slice.
+    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+
     // resume.py:1333-1343 parity: virtualizable_ptr is chain-level (one
     // for the whole blackhole chain). RPython doesn't have a per-frame
     // frame_ptr — the `vable` argument is passed to each `bhimpl_*_vable_*`
@@ -781,8 +786,6 @@ pub fn resume_in_blackhole(
 
         let mut bh = acquire_bh();
         bh.setposition(pyjitcode.jitcode.clone(), jitcode_pc);
-        // pyjitpl.py:2264: metainterp_sd.liveness_info — global pool.
-        bh.liveness_info = pyre_jit_trace::state::liveness_info_snapshot();
         // blackhole.py:1095-1099 get_portal_runner parity:
         //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
         //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
@@ -836,14 +839,13 @@ pub fn resume_in_blackhole(
         // Each callback: value = self.next_TYPE(); write_a_TYPE(reg, value)
         // Values are consumed in order: all ints, then all refs, then floats.
         assert!(
-            !bh.liveness_info.is_empty(),
+            !all_liveness.is_empty(),
             "resume_in_blackhole: missing liveness_info for jitcode at py_pc={} jit_pc={}",
             section.py_pc,
             bh.position
         );
         // jitcode.py:82 get_live_vars_info(pc, op_live)
         let liveness_offset = bh.get_current_position_info();
-        let all_liveness = bh.liveness_info.clone();
         // jitcode.py:146-167 enumerate_vars: collect live register indices
         let mut live_i: Vec<u32> = Vec::new();
         let mut live_r: Vec<u32> = Vec::new();
@@ -1547,8 +1549,7 @@ pub fn blackhole_resume_via_rd_numb(
         // single JitCode object graph end-to-end.
         Some(
             resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), jitcode_pc)
-                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base)
-                .with_liveness_metadata(pyre_jit_trace::state::liveness_info_snapshot()),
+                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
         )
     };
 
@@ -1570,6 +1571,9 @@ pub fn blackhole_resume_via_rd_numb(
     // resume.py:1314: vrefinfo = metainterp_sd.virtualref_info
     // resume.py:1316: ginfo = jitdriver_sd.greenfield_info
     let allocator = crate::eval::PyreBlackholeAllocator;
+    // pyjitpl.py:2264: metainterp_sd.liveness_info — single shared pool.
+    // Snapshot once per call so the slice outlives ResumeDataDirectReader.
+    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
     // Scope the &mut to chain construction; the run() loop below uses
     // release_bh_rd to drop and re-acquire the borrow.
     let bh = BH_BUILDER_RD.with(|cell| unsafe {
@@ -1579,6 +1583,7 @@ pub fn blackhole_resume_via_rd_numb(
             &resolve_jitcode,
             rd_numb,
             rd_consts,
+            &all_liveness,
             deadframe,
             deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
             rd_virtuals_slice,      // rd_virtuals
