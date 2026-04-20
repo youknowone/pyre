@@ -1332,9 +1332,51 @@ impl MethodDesc {
         self.funcdesc.borrow().base.identity
     }
 
-    // `MethodDesc.consider_call_site` (description.py:458-465) is
-    // deferred alongside `FunctionDesc.consider_call_site` (both
-    // require `build_calltable_row` + `getcallfamily`).
+    /// RPython `MethodDesc.consider_call_site(descs, args, s_result, op)`
+    /// (description.py:458-465).
+    ///
+    /// ```python
+    /// @staticmethod
+    /// def consider_call_site(descs, args, s_result, op):
+    ///     cnt, keys, star = rawshape(args)
+    ///     shape = cnt + 1, keys, star  # account for the extra 'self'
+    ///     row = build_calltable_row(descs, args, op)
+    ///     family = descs[0].getcallfamily()
+    ///     family.calltable_add_row(shape, row)
+    ///     descs[0].mergecallfamilies(*descs[1:])
+    /// ```
+    ///
+    /// Structural mirror of [`FunctionDesc::consider_call_site`] with
+    /// `shape.shape_cnt += 1` for the implicit `self` argument that
+    /// `MethodDesc.get_graph` prepends via `func_args`.
+    pub fn consider_call_site(
+        descs: &[Rc<RefCell<MethodDesc>>],
+        args: &ArgumentsForTranslation,
+        _s_result: &SomeValue,
+    ) -> Result<(), AnnotatorError> {
+        if descs.is_empty() {
+            return Ok(());
+        }
+        let family = descs[0].borrow().base.getcallfamily()?;
+        let mut shape = args.rawshape();
+        shape.shape_cnt += 1;
+        let mut row = CallTableRow::new();
+        for desc in descs {
+            // upstream: `build_calltable_row(descs, args, op)` iterates
+            // `desc.get_graph(args, None)` per-desc; MethodDesc.get_graph
+            // delegates to funcdesc.get_graph after func_args prepends
+            // `self`. `rowkey` returns funcdesc.identity so the family
+            // is keyed by the underlying FunctionDesc (description.py:
+            // 467-471).
+            let graph = desc.borrow().get_graph(args, None)?;
+            row.insert(DescKey::from_rc(&desc.borrow().funcdesc), graph);
+        }
+        family.borrow_mut().calltable_add_row(shape, row);
+        let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
+        let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
+        descs[0].borrow().base.mergecallfamilies(&others)?;
+        Ok(())
+    }
 
     // `MethodDesc.simplify_desc_set` (description.py:473-519) — the
     // selfclassdef / flags collapse — is deferred until classdesc.py
@@ -1651,8 +1693,34 @@ impl MethodOfFrozenDesc {
         self.funcdesc.borrow().base.identity
     }
 
-    // `consider_call_site` (description.py:627-634) is deferred
-    // together with the FunctionDesc/MethodDesc counterparts.
+    /// RPython `MethodOfFrozenDesc.consider_call_site(descs, args,
+    /// s_result, op)` (description.py:627-634).
+    ///
+    /// Identical structure to [`MethodDesc::consider_call_site`] —
+    /// `shape.shape_cnt += 1` for the bound frozen instance that
+    /// `func_args` prepends via `SomePBC([self.frozendesc])`.
+    pub fn consider_call_site(
+        descs: &[Rc<RefCell<MethodOfFrozenDesc>>],
+        args: &ArgumentsForTranslation,
+        _s_result: &SomeValue,
+    ) -> Result<(), AnnotatorError> {
+        if descs.is_empty() {
+            return Ok(());
+        }
+        let family = descs[0].borrow().base.getcallfamily()?;
+        let mut shape = args.rawshape();
+        shape.shape_cnt += 1;
+        let mut row = CallTableRow::new();
+        for desc in descs {
+            let graph = desc.borrow().get_graph(args, None)?;
+            row.insert(DescKey::from_rc(&desc.borrow().funcdesc), graph);
+        }
+        family.borrow_mut().calltable_add_row(shape, row);
+        let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
+        let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
+        descs[0].borrow().base.mergecallfamilies(&others)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -20,13 +20,24 @@
 //!   `rpython/rtyper/annlowlevel.py:LowLevelAnnotatorPolicy` —
 //!   deferred until the rtyper's annlowlevel lands.
 //! * `no_more_blocks_to_annotate(annotator)` (policy.py:69-100) —
-//!   structurally ported. Drains `bk.pending_specializations` and
-//!   iterates `added_blocks` / `annotated`, matching upstream
-//!   line-by-line. The inner sandbox-trampoline rewrite branch
-//!   (`needs_sandboxing` check) walks to `continue` because no
-//!   `SomeValue` variant carries that attribute yet; the `s_func.args_s
-//!   / s_result / const` rewrite activates when the sandbox lattice
-//!   type (RPython `SomeSandboxedCallable`) lands.
+//!   fully structurally ported. Drains `bk.pending_specializations`
+//!   and iterates `added_blocks` / `annotated`, then rewrites call
+//!   sites whose callee annotation carries `needs_sandboxing`
+//!   (`SomeBuiltin::needs_sandboxing: Option<SandboxingPayload>`).
+//!
+//!   **Deferred**: upstream's `make_sandbox_trampoline` (rsandbox.py:
+//!   see `rpython/translator/sandbox/rsandbox.py`) produces a real
+//!   Python function carrying `_signature_ = ([SomeTuple(items=params_s
+//!   )], s_result)` and a `functionptr` lltype stub. Porting it
+//!   requires rtyper infrastructure (`lltype.FuncType`, `functionptr`,
+//!   `ll_ptrtype`) which is not yet ported. The Rust port substitutes
+//!   a `HostObject::new_user_function` stand-in so the
+//!   `emulated_pbc_calls` bookkeeping + instr rewrite are upstream-
+//!   faithful even though the synthesized trampoline itself is an
+//!   empty placeholder.  When rtyper + rsandbox land, the
+//!   `trampoline_name`/`GraphFunc` construction inside
+//!   `no_more_blocks_to_annotate` is the single point to wire into
+//!   real `make_sandbox_trampoline(name, params_s, s_result)`.
 
 use crate::annotator::bookkeeper::Bookkeeper;
 

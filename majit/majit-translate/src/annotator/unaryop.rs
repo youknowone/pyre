@@ -120,6 +120,7 @@ pub fn init_transform(
     >,
 ) {
     init_instance_single_transform(reg);
+    init_instance_attr_transform(reg);
     init_object_call_args_transform(reg);
 }
 
@@ -1774,12 +1775,14 @@ fn init_someiterator_overrides(
         },
     );
     // unaryop.py:818-830 — next(self):
-    //   StopIteration-throwable iteration step. Full body depends on
-    //   SomeValue.getanyitem (List/Dict/Tuple variant-aware), which will
-    //   land with the iterator-body commit. Until then register a
-    //   minimal implementation that returns the container's canonical
-    //   item type — enough for Tuple/List; Dict variants need the
-    //   variant-aware branch.
+    //   position = getbookkeeper().position_key
+    //   if s_None.contains(self.s_container): return s_ImpossibleValue
+    //   if self.variant and self.variant[0] == "enumerate":
+    //       s_item = self.s_container.getanyitem(position)
+    //       return SomeTuple((SomeInteger(nonneg=True), s_item))
+    //   variant = self.variant
+    //   if variant == ("reversed",): variant = ()
+    //   return self.s_container.getanyitem(position, *variant)
     register(
         reg,
         OpKind::Next,
@@ -1791,44 +1794,27 @@ fn init_someiterator_overrides(
                     SomeValue::Iterator(i) => i,
                     _ => panic!("iterator.next: arg 0 not SomeIterator"),
                 };
-                match &*it.s_container {
-                    // upstream: `if s_None.contains(self.s_container): return s_ImpossibleValue`.
-                    SomeValue::None_(_) => s_impossible_value(),
-                    SomeValue::Tuple(t) => {
-                        if t.items.is_empty() {
-                            s_impossible_value()
-                        } else {
-                            super::model::unionof(t.items.iter())
-                                .expect("iterator.next(tuple): unionof failed")
-                        }
-                    }
-                    SomeValue::List(l) => {
-                        let position = ann.bookkeeper.current_position_key();
-                        l.listdef.read_item(position)
-                    }
-                    SomeValue::Dict(d) => {
-                        let position = ann.bookkeeper.current_position_key();
-                        // upstream variant-aware branch (keys / values / items /
-                        // items_with_hash / keys_with_hash). Minimal port handles
-                        // the default (keys) path — the full variant switch
-                        // needs SomeDict.getanyitem and lands with the
-                        // dict-iterator commit.
-                        match it.variant.first().map(String::as_str) {
-                            None | Some("keys") => d.dictdef.read_key(position),
-                            Some("values") => d.dictdef.read_value(position),
-                            Some(other) => panic!(
-                                "iterator.next(dict variant={}): lands with dict-iterator commit",
-                                other
-                            ),
-                        }
-                    }
-                    SomeValue::String(_)
-                    | SomeValue::UnicodeString(_)
-                    | SomeValue::ByteArray(_) => {
-                        panic!("iterator.next(string): lands with string-iterator commit")
-                    }
-                    other => panic!("iterator.next: unsupported container {:?}", other),
+                let position = ann.bookkeeper.current_position_key();
+                // upstream: `if s_None.contains(self.s_container): return s_ImpossibleValue`.
+                if matches!(&*it.s_container, SomeValue::None_(_)) {
+                    return s_impossible_value();
                 }
+                // upstream: `if self.variant and self.variant[0] == "enumerate": ...`.
+                if it.variant.first().map(String::as_str) == Some("enumerate") {
+                    let s_item = container_getanyitem(&it.s_container, None, position.clone());
+                    return SomeValue::Tuple(SomeTuple::new(vec![
+                        SomeValue::Integer(SomeInteger::new(true, false)),
+                        s_item,
+                    ]));
+                }
+                // upstream: `if variant == ("reversed",): variant = ()`.
+                let variant: Option<&str> = if it.variant.len() == 1 && it.variant[0] == "reversed"
+                {
+                    None
+                } else {
+                    it.variant.first().map(String::as_str)
+                };
+                container_getanyitem(&it.s_container, variant, position)
             }),
             can_only_throw: CanOnlyThrow::Callable(Box::new(|args_s| {
                 // upstream `_can_only_throw` (unaryop.py:812-816):
@@ -1846,6 +1832,102 @@ fn init_someiterator_overrides(
             })),
         },
     );
+}
+
+/// RPython `container.getanyitem(position, *variant)` dispatch —
+/// pulled out into a free function so [`SomeIterator.next`] can call
+/// it once for the enumerate branch (with variant forced to `()`) and
+/// once for the default branch (variant = `it.variant`).
+///
+/// Upstream definitions:
+/// * SomeTuple (unaryop.py:341-342): `unionof(*self.items)`.
+/// * SomeList (unaryop.py:402-403):  `self.listdef.read_item(position)`.
+/// * SomeDict (unaryop.py:480-500):  variant-dispatched.
+/// * SomeStringOrUnicode (unaryop.py:664-665): `self.basecharclass()`.
+fn container_getanyitem(
+    s_container: &SomeValue,
+    variant: Option<&str>,
+    position: Option<super::bookkeeper::PositionKey>,
+) -> SomeValue {
+    use super::super::flowspace::argument::Signature;
+    let _ = Signature::new; // silence dead-imports on cold paths
+    match s_container {
+        SomeValue::Tuple(t) => {
+            if t.items.is_empty() {
+                s_impossible_value()
+            } else {
+                super::model::unionof(t.items.iter()).expect("getanyitem(tuple): unionof failed")
+            }
+        }
+        SomeValue::List(l) => l.listdef.read_item(position),
+        SomeValue::Dict(d) => {
+            // unaryop.py:480-500 — per-variant dispatch.
+            match variant.unwrap_or("keys") {
+                "keys" => d.dictdef.read_key(position),
+                "values" => d.dictdef.read_value(position),
+                "items" => {
+                    let s_key = d.dictdef.read_key(position.clone());
+                    let s_value = d.dictdef.read_value(position);
+                    if matches!(s_key, SomeValue::Impossible)
+                        || matches!(s_value, SomeValue::Impossible)
+                    {
+                        s_impossible_value()
+                    } else {
+                        SomeValue::Tuple(SomeTuple::new(vec![s_key, s_value]))
+                    }
+                }
+                "items_with_hash" => {
+                    let s_key = d.dictdef.read_key(position.clone());
+                    let s_value = d.dictdef.read_value(position);
+                    if matches!(s_key, SomeValue::Impossible)
+                        || matches!(s_value, SomeValue::Impossible)
+                    {
+                        s_impossible_value()
+                    } else {
+                        SomeValue::Tuple(SomeTuple::new(vec![
+                            s_key,
+                            s_value,
+                            SomeValue::Integer(SomeInteger::default()),
+                        ]))
+                    }
+                }
+                "keys_with_hash" => {
+                    let s_key = d.dictdef.read_key(position);
+                    if matches!(s_key, SomeValue::Impossible) {
+                        s_impossible_value()
+                    } else {
+                        SomeValue::Tuple(SomeTuple::new(vec![
+                            s_key,
+                            SomeValue::Integer(SomeInteger::default()),
+                        ]))
+                    }
+                }
+                other => panic!("getanyitem(dict): unknown variant {other:?}"),
+            }
+        }
+        // unaryop.py:664-665 — `SomeStringOrUnicode.getanyitem` returns
+        // the basecharclass. model.py:326-329:
+        //   SomeString.basecharclass = SomeChar
+        //   SomeUnicodeString.basecharclass = SomeUnicodeCodePoint
+        SomeValue::String(s) => SomeValue::Char(super::model::SomeChar::new(s.inner.no_nul)),
+        SomeValue::UnicodeString(s) => {
+            SomeValue::UnicodeCodePoint(super::model::SomeUnicodeCodePoint::new(s.inner.no_nul))
+        }
+        SomeValue::ByteArray(_) => {
+            // Python-3 semantics: iterating a bytearray yields ints in
+            // 0..256. Upstream model.py has no basecharclass on
+            // SomeByteArray; the Rust port matches that omission by
+            // widening to SomeInteger(nonneg=True).
+            SomeValue::Integer(SomeInteger::new(true, false))
+        }
+        SomeValue::Char(_) | SomeValue::UnicodeCodePoint(_) => {
+            // Iterating a single character is not meaningful upstream;
+            // widen to the char itself so a degenerate iterator does
+            // not panic.
+            s_container.clone()
+        }
+        other => panic!("getanyitem: unsupported container {other:?}"),
+    }
 }
 
 // =====================================================================
@@ -2000,11 +2082,147 @@ fn init_object_call_args_transform(
         std::collections::HashMap<SomeValueTag, Transformation>,
     >,
 ) {
-    // unaryop.py:120-139. Deferred: requires CallSpec.flatten + tuple
-    // item projection inside a transform. Structural slot preserved
-    // for incremental port; absent registration keeps upstream's
-    // default `lambda *args: None` semantics.
-    let _ = reg;
+    use super::super::flowspace::argument::CallSpec;
+
+    // unaryop.py:120-139 — @op.call_args.register_transform(SomeObject).
+    // ```python
+    // def transform_varargs(annotator, v_func, v_shape, *data_v):
+    //     callspec = CallSpec.fromshape(v_shape.value, list(data_v))
+    //     v_vararg = callspec.w_stararg
+    //     if callspec.w_stararg:
+    //         s_vararg = annotator.annotation(callspec.w_stararg)
+    //         if not isinstance(s_vararg, SomeTuple):
+    //             raise AnnotatorError(...)
+    //         n_items = len(s_vararg.items)
+    //         ops = [op.getitem(v_vararg, const(i)) for i in range(n_items)]
+    //         new_args = callspec.arguments_w + [hlop.result for hlop in ops]
+    //         if callspec.keywords:
+    //             newspec = CallSpec(new_args, callspec.keywords)
+    //             shape, data_v = newspec.flatten()
+    //             call_op = op.call_args(v_func, const(shape), *data_v)
+    //         else:
+    //             call_op = op.simple_call(v_func, *new_args)
+    //         ops.append(call_op)
+    //         return ops
+    // ```
+    register_transform(
+        reg,
+        OpKind::CallArgs,
+        SomeValueTag::Object,
+        Box::new(|ann, args| {
+            // args = [v_func, v_shape, *data_v]
+            if args.len() < 2 {
+                return None;
+            }
+            let v_func = args[0].clone();
+            let v_shape = &args[1];
+            // upstream: `CallSpec.fromshape(v_shape.value, list(data_v))`.
+            let shape_const = match v_shape {
+                Hlvalue::Constant(c) => &c.value,
+                _ => return None,
+            };
+            let shape = decode_call_shape(shape_const)?;
+            let data_v: Vec<Hlvalue> = args[2..].to_vec();
+            let callspec = CallSpec::fromshape(&shape, data_v);
+            // upstream: `v_vararg = callspec.w_stararg; if callspec.w_stararg: ...`.
+            let Some(v_vararg) = callspec.w_stararg.clone() else {
+                return None;
+            };
+            // upstream: `s_vararg = annotator.annotation(v_vararg)`.
+            let s_vararg = ann.annotation(&v_vararg)?;
+            // upstream: `if not isinstance(s_vararg, SomeTuple): raise AnnotatorError`.
+            let super::model::SomeValue::Tuple(ref tup) = s_vararg else {
+                panic!("AnnotatorError: Calls like f(..., *arg) require 'arg' to be a tuple");
+            };
+            let n_items = tup.items.len();
+            // upstream: `ops = [op.getitem(v_vararg, const(i)) for i in range(n_items)]`.
+            let mut ops: Vec<HLOperation> = Vec::with_capacity(n_items + 1);
+            let mut unpacked: Vec<Hlvalue> = Vec::with_capacity(n_items);
+            for i in 0..n_items {
+                let getitem = mk_hlop(
+                    OpKind::GetItem,
+                    vec![
+                        v_vararg.clone(),
+                        Hlvalue::Constant(Constant::new(ConstValue::Int(i as i64))),
+                    ],
+                );
+                unpacked.push(Hlvalue::Variable(getitem.result.clone()));
+                ops.push(getitem);
+            }
+            // upstream: `new_args = callspec.arguments_w + [hlop.result for ...]`.
+            let mut new_args: Vec<Hlvalue> = callspec.arguments_w.clone();
+            new_args.extend(unpacked.into_iter());
+            // upstream: `if callspec.keywords: newspec = CallSpec(new_args, callspec.keywords);
+            //            shape, data_v = newspec.flatten(); op.call_args(v_func, const(shape), *data_v)`
+            //           else: `op.simple_call(v_func, *new_args)`.
+            let call_op = if !callspec.keywords.is_empty() {
+                let newspec = CallSpec::new(new_args, Some(callspec.keywords), None);
+                let (new_shape, new_data_v) = newspec.flatten();
+                let mut call_args = vec![
+                    v_func,
+                    Hlvalue::Constant(Constant::new(encode_call_shape(&new_shape))),
+                ];
+                call_args.extend(new_data_v.into_iter());
+                mk_hlop(OpKind::CallArgs, call_args)
+            } else {
+                let mut simple_args = vec![v_func];
+                simple_args.extend(new_args.into_iter());
+                mk_hlop(OpKind::SimpleCall, simple_args)
+            };
+            ops.push(call_op);
+            Some(ops)
+        }),
+    );
+}
+
+/// Decode the `CallShape` triple encoded in a `call_args` shape
+/// constant (see `flowcontext::build_call_shape_constant` for the
+/// encoder — ConstValue::Tuple([Int(cnt), Tuple([Str(key), …]), Bool(star)])).
+fn decode_call_shape(cv: &ConstValue) -> Option<super::super::flowspace::argument::CallShape> {
+    let items = match cv {
+        ConstValue::Tuple(items) if items.len() == 3 => items,
+        _ => return None,
+    };
+    let shape_cnt = match &items[0] {
+        ConstValue::Int(n) => *n as usize,
+        _ => return None,
+    };
+    let shape_keys: Vec<String> = match &items[1] {
+        ConstValue::Tuple(keys) => keys
+            .iter()
+            .map(|k| match k {
+                ConstValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?,
+        _ => return None,
+    };
+    let shape_star = match &items[2] {
+        ConstValue::Bool(b) => *b,
+        _ => return None,
+    };
+    Some(super::super::flowspace::argument::CallShape {
+        shape_cnt,
+        shape_keys,
+        shape_star,
+    })
+}
+
+/// Encode a `CallShape` as the `ConstValue::Tuple` payload expected by
+/// `call_args` — mirrors `flowcontext::build_call_shape_constant`.
+fn encode_call_shape(shape: &super::super::flowspace::argument::CallShape) -> ConstValue {
+    ConstValue::Tuple(vec![
+        ConstValue::Int(shape.shape_cnt as i64),
+        ConstValue::Tuple(
+            shape
+                .shape_keys
+                .iter()
+                .cloned()
+                .map(ConstValue::Str)
+                .collect(),
+        ),
+        ConstValue::Bool(shape.shape_star),
+    ])
 }
 
 // =====================================================================
@@ -2015,6 +2233,55 @@ fn init_object_call_args_transform(
 /// matching upstream `HLOperation.__init__` (operation.py:73-75).
 fn mk_hlop(kind: OpKind, args: Vec<Hlvalue>) -> HLOperation {
     HLOperation::new(kind, args)
+}
+
+/// RPython `_find_property_meth(s_obj, attr, meth)` (unaryop.py:895-906).
+///
+/// Walks `s_obj.classdef.getmro()` and collects the `property` descriptor's
+/// `fget` / `fset` method reference for `attr`. Returns `None` if the
+/// attribute appears in any classdict entry but isn't a `property`
+/// (mirrors upstream's `return` without a result).
+///
+/// Rust port does not yet model `property` descriptors as a distinct
+/// `HostObjectKind`, so this helper always returns `None` on a
+/// classdict hit — structurally identical to upstream's "attribute
+/// exists but not a property" branch. When property descriptors land
+/// as a `HostObjectKind::Property { fget, fset, fdel }` variant, the
+/// `ClassDictEntry::Constant` branch below will produce real
+/// `Some(HostObject)` entries.
+fn find_property_meth(
+    s_obj: &super::model::SomeInstance,
+    attr: &str,
+    _meth: &str,
+) -> Option<Vec<Option<super::super::flowspace::model::HostObject>>> {
+    let classdef = s_obj.classdef.as_ref()?;
+    let mro = super::classdesc::ClassDef::getmro(classdef);
+    let mut result: Vec<Option<super::super::flowspace::model::HostObject>> = Vec::new();
+    for clsdef in &mro {
+        let classdesc = clsdef.borrow().classdesc.clone();
+        let entry = classdesc.borrow().classdict.get(attr).cloned();
+        let Some(entry) = entry else { continue };
+        match entry {
+            super::classdesc::ClassDictEntry::Constant(_c) => {
+                // upstream unaryop.py:902-904:
+                //   if (not isinstance(obj, Constant) or
+                //           not isinstance(obj.value, property)):
+                //       return
+                //   result.append(getattr(obj.value, meth))
+                //
+                // Rust HostObject has no `Property { fget, fset, fdel }`
+                // variant yet; every classdict Constant here is treated
+                // as "non-property" and triggers the early return.
+                return None;
+            }
+            super::classdesc::ClassDictEntry::Desc(_) => return None,
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 fn init_instance_single_transform(
@@ -2151,6 +2418,107 @@ fn init_instance_single_transform(
     );
 }
 
+// =====================================================================
+// unaryop.py:909-936 — @op.{getattr,setattr}.register_transform(SomeInstance)
+// =====================================================================
+
+/// RPython `getattr_SomeInstance` / `setattr_SomeInstance`
+/// (unaryop.py:909-936) — property descriptor dispatch.
+///
+/// Upstream rewrites `getattr(v_obj, 'prop')` into
+/// `[getattr(v_obj, 'prop__getter__'), simple_call(getter.result)]`
+/// when every classdef in the MRO has `prop` bound as a `property`
+/// descriptor, and raises `AnnotatorError` when none of them do (the
+/// "mixed property/non-property" case falls through with no rewrite).
+/// `setattr` is the setter analogue — three-arg `simple_call(setter,
+/// v_value)` instead.
+fn init_instance_attr_transform(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Transformation>,
+    >,
+) {
+    // unaryop.py:909-921 — getattr
+    register_transform(
+        reg,
+        OpKind::GetAttr,
+        SomeValueTag::Instance,
+        Box::new(|ann, args| {
+            let v_obj = args[0].clone();
+            let v_attr = &args[1];
+            // upstream: `s_attr = annotator.annotation(v_attr)`.
+            let s_attr = ann.annotation(v_attr)?;
+            // upstream: `if not s_attr.is_constant() or not isinstance(s_attr.const, str): return`.
+            let attr = match s_attr.const_() {
+                Some(ConstValue::Str(s)) => s.clone(),
+                _ => return None,
+            };
+            // upstream: `getters = _find_property_meth(annotator.annotation(v_obj), attr, 'fget')`.
+            let s_obj = ann.annotation(&v_obj)?;
+            let super::model::SomeValue::Instance(ref s_inst) = s_obj else {
+                return None;
+            };
+            let getters = find_property_meth(s_inst, &attr, "fget")?;
+            // upstream: `if all(getters): … elif not any(getters): raise`.
+            if getters.iter().all(|g| g.is_some()) {
+                let getter_name = format!("{attr}__getter__");
+                let get_getter = mk_hlop(
+                    OpKind::GetAttr,
+                    vec![
+                        v_obj,
+                        Hlvalue::Constant(Constant::new(ConstValue::Str(getter_name))),
+                    ],
+                );
+                let getter_result = Hlvalue::Variable(get_getter.result.clone());
+                let call = mk_hlop(OpKind::SimpleCall, vec![getter_result]);
+                Some(vec![get_getter, call])
+            } else if !getters.iter().any(|g| g.is_some()) {
+                panic!("AnnotatorError: Attribute {attr:?} is unreadable");
+            } else {
+                None
+            }
+        }),
+    );
+    // unaryop.py:924-936 — setattr
+    register_transform(
+        reg,
+        OpKind::SetAttr,
+        SomeValueTag::Instance,
+        Box::new(|ann, args| {
+            let v_obj = args[0].clone();
+            let v_attr = &args[1];
+            let v_value = args[2].clone();
+            let s_attr = ann.annotation(v_attr)?;
+            let attr = match s_attr.const_() {
+                Some(ConstValue::Str(s)) => s.clone(),
+                _ => return None,
+            };
+            let s_obj = ann.annotation(&v_obj)?;
+            let super::model::SomeValue::Instance(ref s_inst) = s_obj else {
+                return None;
+            };
+            let setters = find_property_meth(s_inst, &attr, "fset")?;
+            if setters.iter().all(|s| s.is_some()) {
+                let setter_name = format!("{attr}__setter__");
+                let get_setter = mk_hlop(
+                    OpKind::GetAttr,
+                    vec![
+                        v_obj,
+                        Hlvalue::Constant(Constant::new(ConstValue::Str(setter_name))),
+                    ],
+                );
+                let setter_result = Hlvalue::Variable(get_setter.result.clone());
+                let call = mk_hlop(OpKind::SimpleCall, vec![setter_result, v_value]);
+                Some(vec![get_setter, call])
+            } else if !setters.iter().any(|s| s.is_some()) {
+                panic!("AnnotatorError: Attribute {attr:?} is unwritable");
+            } else {
+                None
+            }
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::flowspace::model::{Hlvalue, Variable};
@@ -2199,6 +2567,129 @@ mod tests {
         assert_eq!(new_ops.len(), 2);
         assert!(matches!(new_ops[0].kind, OpKind::GetAttr));
         assert!(matches!(new_ops[1].kind, OpKind::SimpleCall));
+    }
+
+    #[test]
+    fn transform_call_args_unpacks_tuple_stararg_to_simple_call() {
+        // unaryop.py:120-139 — `f(*tup)` where tup has 3 items and no
+        // keywords should rewrite to 3 getitem ops + one simple_call.
+        use super::super::model::{SomeInteger, SomeTuple};
+        let ann = mk_ann();
+        let mut v_func = Variable::named("f");
+        ann.setbinding(&mut v_func, SomeValue::object());
+        let mut v_tup = Variable::named("tup");
+        ann.setbinding(
+            &mut v_tup,
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::Integer(SomeInteger::default()),
+            ])),
+        );
+        // `f(*tup)` encodes as: call_args(f, shape, tup) where shape =
+        // (shape_cnt=0, shape_keys=(), shape_star=True).
+        let shape_const = Hlvalue::Constant(Constant::new(ConstValue::Tuple(vec![
+            ConstValue::Int(0),
+            ConstValue::Tuple(vec![]),
+            ConstValue::Bool(true),
+        ])));
+        let hl = HLOperation::new(
+            OpKind::CallArgs,
+            vec![
+                Hlvalue::Variable(v_func),
+                shape_const,
+                Hlvalue::Variable(v_tup),
+            ],
+        );
+        let new_ops = hl
+            .transform(&ann)
+            .expect("call_args(SomeObject, *SomeTuple) must transform");
+        // 3 getitem + 1 simple_call = 4 ops
+        assert_eq!(new_ops.len(), 4);
+        assert!(matches!(new_ops[0].kind, OpKind::GetItem));
+        assert!(matches!(new_ops[1].kind, OpKind::GetItem));
+        assert!(matches!(new_ops[2].kind, OpKind::GetItem));
+        assert!(matches!(new_ops[3].kind, OpKind::SimpleCall));
+        // simple_call receives v_func + 3 unpacked values
+        assert_eq!(new_ops[3].args.len(), 4);
+    }
+
+    #[test]
+    fn transform_call_args_without_stararg_is_noop() {
+        // upstream: if callspec.w_stararg is None, transform_varargs
+        // falls through without returning ops.
+        let ann = mk_ann();
+        let mut v_func = Variable::named("f");
+        ann.setbinding(&mut v_func, SomeValue::object());
+        let shape_const = Hlvalue::Constant(Constant::new(ConstValue::Tuple(vec![
+            ConstValue::Int(0),
+            ConstValue::Tuple(vec![]),
+            ConstValue::Bool(false),
+        ])));
+        let hl = HLOperation::new(
+            OpKind::CallArgs,
+            vec![Hlvalue::Variable(v_func), shape_const],
+        );
+        assert!(hl.transform(&ann).is_none());
+    }
+
+    #[test]
+    fn transform_getattr_someinstance_without_property_is_noop() {
+        // unaryop.py:909-921 — when the target attribute isn't a
+        // property descriptor in any classdef, `_find_property_meth`
+        // returns None and the transform leaves the op alone.
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+        let ann = mk_ann();
+        let classdef = ClassDef::new_standalone("pkg.X", None);
+        let mut v_obj = Variable::named("obj");
+        ann.setbinding(
+            &mut v_obj,
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::Str("prop".into())));
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![Hlvalue::Variable(v_obj), v_attr_const],
+        );
+        // Registered but returns None because the classdict carries no
+        // `property` descriptor (Rust HostObject property variant not
+        // yet modelled).
+        assert!(hl.transform(&ann).is_none());
+    }
+
+    #[test]
+    fn transform_setattr_someinstance_without_property_is_noop() {
+        // unaryop.py:924-936 setter analogue.
+        use super::super::classdesc::ClassDef;
+        use super::super::model::{SomeInstance, SomeInteger};
+        let ann = mk_ann();
+        let classdef = ClassDef::new_standalone("pkg.X", None);
+        let mut v_obj = Variable::named("obj");
+        ann.setbinding(
+            &mut v_obj,
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let mut v_value = Variable::named("val");
+        ann.setbinding(&mut v_value, SomeValue::Integer(SomeInteger::default()));
+        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::Str("prop".into())));
+        let hl = HLOperation::new(
+            OpKind::SetAttr,
+            vec![
+                Hlvalue::Variable(v_obj),
+                v_attr_const,
+                Hlvalue::Variable(v_value),
+            ],
+        );
+        assert!(hl.transform(&ann).is_none());
     }
 
     #[test]
@@ -2457,6 +2948,84 @@ mod tests {
             ])),
             vec![],
         );
+        let mut v = Variable::named("it");
+        ann.setbinding(&mut v, SomeValue::Iterator(it));
+        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann);
+        assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_someiterator_next_enumerate_returns_tuple_int_item() {
+        // upstream unaryop.py:822-824 — enumerate variant yields
+        // SomeTuple((SomeInteger(nonneg=True), getanyitem(container))).
+        let ann = mk_ann();
+        let it = SomeIterator::new(
+            SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
+                SomeInteger::default(),
+            )])),
+            vec!["enumerate".to_string()],
+        );
+        let mut v = Variable::named("it");
+        ann.setbinding(&mut v, SomeValue::Iterator(it));
+        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann);
+        let SomeValue::Tuple(t) = r else {
+            panic!("expected SomeTuple");
+        };
+        assert_eq!(t.items.len(), 2);
+        assert!(matches!(t.items[0], SomeValue::Integer(_)));
+        assert!(matches!(t.items[1], SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn consider_someiterator_next_reversed_acts_as_default() {
+        // upstream unaryop.py:826-827 — `("reversed",)` collapses to ().
+        let ann = mk_ann();
+        let it = SomeIterator::new(
+            SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
+                SomeInteger::default(),
+            )])),
+            vec!["reversed".to_string()],
+        );
+        let mut v = Variable::named("it");
+        ann.setbinding(&mut v, SomeValue::Iterator(it));
+        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann);
+        assert!(matches!(r, SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn consider_someiterator_next_on_string_returns_char() {
+        use super::super::model::SomeString;
+        let ann = mk_ann();
+        let it = SomeIterator::new(SomeValue::String(SomeString::new(false, true)), vec![]);
+        let mut v = Variable::named("it");
+        ann.setbinding(&mut v, SomeValue::Iterator(it));
+        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann);
+        assert!(matches!(r, SomeValue::Char(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_someiterator_next_on_unicode_returns_codepoint() {
+        let ann = mk_ann();
+        let it = SomeIterator::new(
+            SomeValue::UnicodeString(SomeUnicodeString::new(false, true)),
+            vec![],
+        );
+        let mut v = Variable::named("it");
+        ann.setbinding(&mut v, SomeValue::Iterator(it));
+        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann);
+        assert!(matches!(r, SomeValue::UnicodeCodePoint(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_someiterator_next_on_bytearray_returns_integer() {
+        use super::super::model::SomeByteArray;
+        let ann = mk_ann();
+        let it = SomeIterator::new(SomeValue::ByteArray(SomeByteArray::new(false)), vec![]);
         let mut v = Variable::named("it");
         ann.setbinding(&mut v, SomeValue::Iterator(it));
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);

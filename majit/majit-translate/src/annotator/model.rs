@@ -1362,10 +1362,32 @@ impl SomePBC {
                 let fns: Vec<_> = descs.iter().filter_map(|d| d.as_function()).collect();
                 super::description::FunctionDesc::consider_call_site(&fns, args, s_result)?;
             }
-            DescKind::Method | DescKind::Class | DescKind::Frozen | DescKind::MethodOfFrozen => {
-                // Deferred: MethodDesc / ClassDesc / FrozenDesc /
-                // MethodOfFrozenDesc consider_call_site. Kind dispatch
-                // is wired; each body lands with its own port.
+            DescKind::Method => {
+                // description.py:458-465.
+                let mds: Vec<_> = descs.iter().filter_map(|d| d.as_method()).collect();
+                super::description::MethodDesc::consider_call_site(&mds, args, s_result)?;
+            }
+            DescKind::Class => {
+                // classdesc.py:853-902 (phase 1 only — __init__
+                // recursion deferred, see ClassDesc::consider_call_site
+                // for the full story).
+                let cds: Vec<_> = descs.iter().filter_map(|d| d.as_class()).collect();
+                super::classdesc::ClassDesc::consider_call_site(&cds, args, s_result)?;
+            }
+            DescKind::MethodOfFrozen => {
+                // description.py:627-634.
+                let mofds: Vec<_> = descs
+                    .iter()
+                    .filter_map(|d| d.as_method_of_frozen())
+                    .collect();
+                super::description::MethodOfFrozenDesc::consider_call_site(&mofds, args, s_result)?;
+            }
+            DescKind::Frozen => {
+                // Upstream `Desc` base has no `consider_call_site`; a
+                // FrozenDesc PBC call site would raise AttributeError
+                // in Python. Rust port keeps this branch as a no-op to
+                // match the implicit rejection without aborting the
+                // annotator.
             }
         }
         Ok(())

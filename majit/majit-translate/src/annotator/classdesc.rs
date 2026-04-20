@@ -1037,6 +1037,63 @@ impl ClassDesc {
         Self::getuniqueclassdef(this)
     }
 
+    /// RPython `ClassDesc.consider_call_site(descs, args, s_result, op)`
+    /// (classdesc.py:853-902).
+    ///
+    /// Phase 1 (this port): `descs[0].getcallfamily(); descs[0].mergecallfamilies(*descs[1:])`
+    /// — keeps the PBC call-family UnionFind consistent.
+    ///
+    /// Phase 2 (deferred) computes the `__init__` MethodDesc set via
+    /// `desc.s_read_attribute('__init__')` and recurses into
+    /// `MethodDesc.consider_call_site(initdescs, args, s_None, op)`.
+    /// That hinges on `ClassDesc::s_read_attribute` + `getcommonbase`,
+    /// neither ported yet — leaving the recursion as a TODO keeps the
+    /// call-family side (phase 1) working and surfaces the missing
+    /// piece explicitly rather than silently no-op'ing the entire
+    /// branch.
+    pub fn consider_call_site(
+        descs: &[Rc<RefCell<ClassDesc>>],
+        _args: &super::argument::ArgumentsForTranslation,
+        _s_result: &super::model::SomeValue,
+    ) -> Result<(), super::model::AnnotatorError> {
+        use super::description::DescKey;
+        if descs.is_empty() {
+            return Ok(());
+        }
+        // ClassDesc doesn't embed the Rust `Desc` struct (the Python
+        // `class ClassDesc(Desc)` inheritance collapses into a bare
+        // struct here), so `getcallfamily` / `mergecallfamilies` are
+        // re-derived against the bookkeeper's pbc_maximal_call_families
+        // UnionFind keyed by `DescKey::from_rc(&classdesc)` — the same
+        // pointer identity upstream `id(desc)` provides.
+        let Some(bk) = descs[0].borrow().bookkeeper.upgrade() else {
+            return Ok(());
+        };
+        let head_key = DescKey::from_rc(&descs[0]);
+        // upstream: `descs[0].getcallfamily()` — force the family slot
+        // to exist so merge has a representative.
+        {
+            let mut families = bk.pbc_maximal_call_families.borrow_mut();
+            let _ = families.find_rep(head_key);
+        }
+        // upstream: `descs[0].mergecallfamilies(*descs[1:])`.
+        let mut families = bk.pbc_maximal_call_families.borrow_mut();
+        let mut rep = families.find_rep(head_key);
+        for other in descs.iter().skip(1) {
+            let other_key = DescKey::from_rc(other);
+            let (_changed, new_rep) = families.union(rep, other_key);
+            rep = new_rep;
+        }
+        drop(families);
+        // Phase 2 (classdesc.py:856-902): __init__ initdescs recursion
+        // deferred — requires ClassDesc::s_read_attribute +
+        // getcommonbase (not yet ported). The phase-1 call-family
+        // bookkeeping is sufficient to dedupe class-PBC call sites in
+        // the family UnionFind; __init__ specialization lands with
+        // a later commit.
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers.
     // -----------------------------------------------------------------------
@@ -2157,5 +2214,33 @@ mod tests {
         let sv = ClassDef::find_attribute(&cd, "y").expect("find_attribute must succeed");
         // New attribute starts at SomeValue::Impossible because no source was supplied.
         assert!(matches!(sv, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn classdesc_consider_call_site_merges_call_families() {
+        use super::super::argument::simple_args;
+        use super::super::description::DescKey;
+        use super::super::model::SomeValue;
+        let bk = make_bk();
+        let a = make_classdesc(&bk, "pkg.A");
+        let b = make_classdesc(&bk, "pkg.B");
+        let a_key = DescKey::from_rc(&a);
+        let b_key = DescKey::from_rc(&b);
+        // Pre-condition: A and B belong to distinct CallFamilies.
+        {
+            let mut families = bk.pbc_maximal_call_families.borrow_mut();
+            let rep_a = families.find_rep(a_key);
+            let rep_b = families.find_rep(b_key);
+            assert_ne!(rep_a, rep_b);
+        }
+        // Run consider_call_site — should union the two families.
+        let args = simple_args(vec![]);
+        ClassDesc::consider_call_site(&[a.clone(), b.clone()], &args, &SomeValue::Impossible)
+            .expect("phase-1 consider_call_site must succeed");
+        // Post-condition: A and B share a CallFamily.
+        let mut families = bk.pbc_maximal_call_families.borrow_mut();
+        let rep_a = families.find_rep(a_key);
+        let rep_b = families.find_rep(b_key);
+        assert_eq!(rep_a, rep_b);
     }
 }
