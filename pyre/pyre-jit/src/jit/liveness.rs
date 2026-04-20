@@ -190,10 +190,10 @@ fn _compute_liveness_must_continue(
                             follow_label(&mut alive, label2alive, label);
                         }
                     }
-                    DescrOperand::Bh(_) | DescrOperand::CallFlavor(_) => {
+                    DescrOperand::Bh(_) | DescrOperand::CallDescrStub(_) => {
                         // RPython `liveness.py:59-78` ignores non-`SwitchDictDescr`
                         // descrs — they contribute no control-flow edges.
-                        // `CallFlavor` is a pyre-only dispatch tag at the
+                        // `CallDescrStub` is a pyre-only dispatch tag at the
                         // calldescr slot and likewise carries no edges.
                     }
                 },

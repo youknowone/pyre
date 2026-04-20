@@ -897,9 +897,187 @@ fn dispatch_op(
                 .builder
                 .record_known_result_ref_typed_args(fn_idx, result_reg, &call_args);
         }
+        // `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` shape.
+        // 12 opname combinations: residual_call_{r,ir,irf}_{i,r,f,v}. Only
+        // the subset the walker currently emits is routed; unused arms
+        // panic with a pointer to emit_residual_call.
+        opname if opname.starts_with("residual_call_") => {
+            dispatch_residual_call(state, opname, args, result);
+        }
         other => panic!(
             "assemble(): unimplemented opname {:?} — add a builder mapping in jit/assembler.rs",
             other
+        ),
+    }
+}
+
+/// Phase 3c consumer for the `residual_call_{kinds}_{reskind}` shape
+/// emitted by `codewriter::emit_residual_call_shape`.
+///
+/// SSARepr arg layout (as produced by `emit_residual_call_shape`):
+/// ```text
+/// [Const(fn_idx),
+///  ListOfKind(int,   [...])?,   # present iff 'i' in kinds
+///  ListOfKind(ref,   [...])?,   # present iff 'r' in kinds
+///  ListOfKind(float, [...])?,   # present iff 'f' in kinds
+///  Descr(CallDescrStub{flavor, arg_kinds})]
+/// ```
+///
+/// pyre's `JitCodeBuilder::call_*_typed` takes a single flat
+/// `&[JitCallArg]` in C-function parameter order. `arg_kinds` carries
+/// that order; this helper reassembles by pulling one entry at a time
+/// from the appropriate per-kind sublist in upstream's `bh_call_*`
+/// pool layout.
+fn dispatch_residual_call(
+    state: &mut AssemblyState,
+    opname: &str,
+    args: &[Operand],
+    result: Option<&Register>,
+) {
+    // opname suffix = `{kinds}_{reskind}`, kinds ∈ {r, ir, irf}.
+    let tail = &opname["residual_call_".len()..];
+    let (kinds, reskind_ch) = tail
+        .rsplit_once('_')
+        .unwrap_or_else(|| panic!("malformed residual_call opname: {opname:?}"));
+
+    let fn_idx = expect_small_u16(&args[0]);
+
+    // Walk `args[1..]`: per-kind ListOfKind sublists come first in
+    // (int, ref, float) order per the `kinds` string, then the final
+    // Descr operand carrying `CallDescrStub`.
+    let mut cursor = 1usize;
+    let mut int_list: &[Operand] = &[];
+    let mut ref_list: &[Operand] = &[];
+    let mut float_list: &[Operand] = &[];
+    if kinds.contains('i') {
+        match &args[cursor] {
+            Operand::ListOfKind(ListOfKind {
+                kind: Kind::Int,
+                content,
+            }) => int_list = content,
+            other => {
+                panic!("residual_call: expected ListOfKind(int) at index {cursor}, got {other:?}")
+            }
+        }
+        cursor += 1;
+    }
+    if kinds.contains('r') {
+        match &args[cursor] {
+            Operand::ListOfKind(ListOfKind {
+                kind: Kind::Ref,
+                content,
+            }) => ref_list = content,
+            other => {
+                panic!("residual_call: expected ListOfKind(ref) at index {cursor}, got {other:?}")
+            }
+        }
+        cursor += 1;
+    }
+    if kinds.contains('f') {
+        match &args[cursor] {
+            Operand::ListOfKind(ListOfKind {
+                kind: Kind::Float,
+                content,
+            }) => float_list = content,
+            other => {
+                panic!("residual_call: expected ListOfKind(float) at index {cursor}, got {other:?}")
+            }
+        }
+        cursor += 1;
+    }
+    // CallDescrStub slot.
+    let stub = match &args[cursor] {
+        Operand::Descr(rc) => match &**rc {
+            DescrOperand::CallDescrStub(stub) => stub,
+            other => panic!(
+                "residual_call: expected CallDescrStub descr at index {cursor}, got {other:?}"
+            ),
+        },
+        other => panic!("residual_call: expected Descr operand at index {cursor}, got {other:?}"),
+    };
+
+    // Reassemble flat `&[JitCallArg]` in C-function parameter order.
+    let mut call_args: Vec<JitCallArg> = Vec::with_capacity(stub.arg_kinds.len());
+    let mut i_cursor = 0usize;
+    let mut r_cursor = 0usize;
+    let mut f_cursor = 0usize;
+    for &ak in &stub.arg_kinds {
+        match ak {
+            Kind::Int => {
+                let reg = expect_reg(&int_list[i_cursor], Kind::Int);
+                call_args.push(JitCallArg::int(reg));
+                i_cursor += 1;
+            }
+            Kind::Ref => {
+                let reg = expect_reg(&ref_list[r_cursor], Kind::Ref);
+                call_args.push(JitCallArg::reference(reg));
+                r_cursor += 1;
+            }
+            Kind::Float => {
+                let reg = expect_reg(&float_list[f_cursor], Kind::Float);
+                call_args.push(JitCallArg::float(reg));
+                f_cursor += 1;
+            }
+        }
+    }
+
+    use super::flatten::{CallFlavor, ResKind};
+    let reskind = match reskind_ch {
+        "i" => ResKind::Int,
+        "r" => ResKind::Ref,
+        "f" => ResKind::Float,
+        "v" => ResKind::Void,
+        other => panic!("residual_call: unknown reskind {other:?}"),
+    };
+
+    // Pick the same builder method the optimizeopt layer resolves from
+    // `EffectInfo.extraeffect`. Reskind drives the return-value kind;
+    // flavor drives the effect branch.
+    match (stub.flavor, reskind) {
+        (CallFlavor::Plain, ResKind::Int) => {
+            let dst = expect_result_reg(result, Kind::Int, "residual_call int needs result");
+            state.builder.call_int_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Plain, ResKind::Ref) => {
+            let dst = expect_result_reg(result, Kind::Ref, "residual_call ref needs result");
+            state.builder.call_ref_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Plain, ResKind::Void) => {
+            state
+                .builder
+                .residual_call_void_typed_args(fn_idx, &call_args);
+        }
+        (CallFlavor::MayForce, ResKind::Int) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Int,
+                "residual_call may_force int needs result",
+            );
+            state
+                .builder
+                .call_may_force_int_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::MayForce, ResKind::Ref) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Ref,
+                "residual_call may_force ref needs result",
+            );
+            state
+                .builder
+                .call_may_force_ref_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::MayForce, ResKind::Void) => {
+            state
+                .builder
+                .call_may_force_void_typed_args(fn_idx, &call_args);
+        }
+        // Remaining (flavor, reskind) combinations are reachable once more
+        // bytecode handlers use them. Add arms as needed; the panic keeps
+        // the pyre-jit walker in sync with this dispatch table.
+        (flavor, reskind) => panic!(
+            "dispatch_residual_call: unsupported (flavor, reskind) = ({:?}, {:?})",
+            flavor, reskind
         ),
     }
 }
@@ -927,14 +1105,15 @@ fn record_descr_operand(state: &mut AssemblyState, descr: &DescrOperand) -> usiz
             });
             state.switch_descrs.push((index, switch.labels.clone()));
         }
-        DescrOperand::CallFlavor(_) => {
-            // `CallFlavor` stands in for the codewriter-layer `calldescr`
-            // at the SSARepr level but does not correspond to a runtime
-            // `BhDescr`. The `residual_call_*` dispatch arms consume the
-            // flavor directly (`dispatch_op` below) to pick the builder
-            // method, so the argcode `d` emission path must never see it.
+        DescrOperand::CallDescrStub(_) => {
+            // `CallDescrStub` stands in for the codewriter-layer
+            // `calldescr` at the SSARepr level but does not correspond to
+            // a runtime `BhDescr`. The `residual_call_*` dispatch arms
+            // consume the stub directly (`dispatch_op` below) to pick the
+            // builder method and reassemble per-arg kinds, so the argcode
+            // `d` emission path must never see it.
             panic!(
-                "record_descr_operand: CallFlavor must be consumed by dispatch_op, not encoded as 'd'"
+                "record_descr_operand: CallDescrStub must be consumed by dispatch_op, not encoded as 'd'"
             );
         }
     }

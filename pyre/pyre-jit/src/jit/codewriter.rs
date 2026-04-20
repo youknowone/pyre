@@ -520,15 +520,29 @@ fn emit_residual_call_shape(
 ) {
     use majit_metainterp::jitcode::JitArgKind;
 
-    // `rpython/jit/codewriter/jtransform.py:437-445 make_three_lists`.
+    // `rpython/jit/codewriter/jtransform.py:437-445 make_three_lists` —
+    // project parameter-ordered `call_args` into per-kind sublists for the
+    // SSARepr shape. The original per-parameter kind sequence is preserved
+    // in `arg_kinds` below so the assembler dispatch can reassemble the
+    // flat `&[JitCallArg]` list pyre's builder expects.
     let mut args_i: Vec<u16> = Vec::new();
     let mut args_r: Vec<u16> = Vec::new();
     let mut args_f: Vec<u16> = Vec::new();
+    let mut arg_kinds: Vec<Kind> = Vec::with_capacity(call_args.len());
     for arg in call_args {
         match arg.kind {
-            JitArgKind::Int => args_i.push(arg.reg),
-            JitArgKind::Ref => args_r.push(arg.reg),
-            JitArgKind::Float => args_f.push(arg.reg),
+            JitArgKind::Int => {
+                args_i.push(arg.reg);
+                arg_kinds.push(Kind::Int);
+            }
+            JitArgKind::Ref => {
+                args_r.push(arg.reg);
+                arg_kinds.push(Kind::Ref);
+            }
+            JitArgKind::Float => {
+                args_f.push(arg.reg);
+                arg_kinds.push(Kind::Float);
+            }
         }
     }
 
@@ -561,7 +575,9 @@ fn emit_residual_call_shape(
     if kinds.contains('f') {
         args.push(reg_list(Kind::Float, &args_f));
     }
-    args.push(Operand::descr(DescrOperand::CallFlavor(flavor)));
+    args.push(Operand::descr(DescrOperand::CallDescrStub(
+        super::flatten::CallDescrStub { flavor, arg_kinds },
+    )));
 
     let insn = match (reskind.to_kind(), dst) {
         (Some(kind), Some(d)) => Insn::op_with_result(opname, args, Register::new(kind, d)),

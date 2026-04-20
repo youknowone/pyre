@@ -266,15 +266,36 @@ pub enum DescrOperand {
     /// `EffectInfo` that downstream (`rpython/jit/metainterp/optimizeopt/
     /// rewrite.py`) consults to pick between `call_may_force_*`,
     /// `call_release_gil_*`, `call_loopinvariant_*`, `call_pure_*`, and
-    /// `call_assembler_*`.
+    /// `call_assembler_*`, plus `arg_types` that `bh_call_*` reads to
+    /// reconstruct the C-function parameter order.
     ///
     /// pyre does not (yet) thread `EffectInfo` through the codewriter
     /// layer, so this variant stands in for the calldescr and carries the
-    /// flavor directly. The assembler dispatch consumes it to pick the
-    /// same builder method the optimizeopt layer would have selected.
-    /// SSARepr shape still matches upstream 1:1: one descr operand per
-    /// residual call, final argument position.
-    CallFlavor(CallFlavor),
+    /// flavor plus per-arg kind sequence directly. The assembler dispatch
+    /// consumes both: flavor picks the same builder method the optimizeopt
+    /// layer would have selected; `arg_kinds` lets `dispatch_op` re-
+    /// interleave the kind-separated `ListOfKind` sublists into pyre's
+    /// flat `&[JitCallArg]` call order (pyre helpers have varied param
+    /// sequences — `ref,int`, `int,ref,ref`, `ref,ref,int` etc.). SSARepr
+    /// shape still matches upstream 1:1: one descr operand per residual
+    /// call, final argument position.
+    CallDescrStub(CallDescrStub),
+}
+
+/// Pyre-local stand-in for `rpython/jit/codewriter/effectinfo.py
+/// AbstractDescr` on a residual call. Upstream's calldescr carries both
+/// the flavor (EffectInfo) and the ordered arg-types used by `bh_call_*`
+/// to rebuild the C-function parameter list from `args_i` / `args_r` /
+/// `args_f` pools (`rpython/jit/backend/llsupport/llmodel.py:816-839
+/// bh_call_*` + `calldescr.call_stub_*`). pyre needs both pieces at
+/// dispatch time.
+#[derive(Debug, Clone)]
+pub struct CallDescrStub {
+    pub flavor: CallFlavor,
+    /// Per-arg kind sequence in C-function parameter order. Exact length
+    /// equals the sum of the int/ref/float `ListOfKind` sublists for the
+    /// same residual_call Insn.
+    pub arg_kinds: Vec<Kind>,
 }
 
 /// `rpython/jit/metainterp/optimizeopt/rewrite.py` `Rewrite.optimize_CALL_XXX`
