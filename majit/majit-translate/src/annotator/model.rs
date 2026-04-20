@@ -48,7 +48,7 @@ use core::fmt;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::super::flowspace::model::{Annotation, Constant, Variable};
+use super::super::flowspace::model::{Constant, Variable};
 use super::classdesc::ClassDef;
 
 // ---------------------------------------------------------------------------
@@ -2301,16 +2301,6 @@ pub fn contains(a: &SomeValue, b: &SomeValue) -> bool {
     }
 }
 
-// RPython equivalent: `Variable.annotation = SomeValue`. Downstream
-// flowspace code stores the annotation as a `Rc<dyn Annotation>` trait
-// object to avoid a flowspace → annotator dependency cycle; this impl
-// is the single hook that lets consumers downcast back to `SomeValue`.
-impl Annotation for SomeValue {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 /// RPython `add_knowntypedata(ktd, truth, vars, s_obj)` (model.py:789-791).
 ///
 /// Populates a boolean-keyed table tracking "if this bool is `truth`,
@@ -3203,16 +3193,12 @@ mod tests {
     }
 
     #[test]
-    fn variable_annotation_roundtrip_via_trait_object() {
+    fn variable_annotation_roundtrip() {
         use std::rc::Rc;
         let mut v = Variable::named("x");
         let s = SomeValue::Integer(SomeInteger::default());
-        v.annotation = Some(Rc::new(s.clone()) as Rc<dyn Annotation>);
-        let got = v
-            .annotation
-            .as_ref()
-            .and_then(|a| a.as_any().downcast_ref::<SomeValue>())
-            .cloned();
+        v.annotation = Some(Rc::new(s.clone()));
+        let got = v.annotation.as_ref().map(|rc| (**rc).clone());
         assert_eq!(got, Some(s));
     }
 }

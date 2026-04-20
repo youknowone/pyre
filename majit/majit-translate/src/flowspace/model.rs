@@ -29,20 +29,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use super::bytecode::HostCode;
+use crate::annotator::model::SomeValue;
 
-/// Annotation carrier attached to `Variable`.
-///
-/// RPython's `Variable.annotation` holds a `SomeObject` subclass
-/// instance (`annotator/model.py:SomeObject`). In the Rust port the
-/// annotator crate lives above `flowspace`, so `flowspace` exposes an
-/// object-safe marker trait and annotator-side types
-/// (`annotator::model::SomeValue`) implement it. Consumers downcast
-/// with [`Annotation::as_any`].
-pub trait Annotation: core::fmt::Debug + std::any::Any {
-    /// Runtime downcast hook. Upstream RPython relies on Python's
-    /// dynamic type; Rust ports use `as_any().downcast_ref::<SomeValue>()`.
-    fn as_any(&self) -> &dyn std::any::Any;
-}
+// RPython `Variable.annotation` holds a `SomeObject` subclass instance
+// (annotator/model.py:SomeObject). Rust stores `Option<Rc<SomeValue>>`
+// directly — `flowspace` and `annotator` are sibling modules inside
+// `majit-translate`, so the cross-module reference is just a `use`.
 
 /// Placeholder for `Repr.lowleveltype` attached by the rtyper.
 ///
@@ -879,9 +871,10 @@ pub struct Variable {
     _name: String,
     _nr: std::cell::Cell<i64>,
     /// RPython `Variable.annotation` (set by the annotator). Holds a
-    /// `SomeValue` (via the [`Annotation`] trait object) once the
-    /// annotator binds the variable.
-    pub annotation: Option<Rc<dyn Annotation>>,
+    /// shared [`SomeValue`] handle once the annotator binds the
+    /// variable — upstream Python uses reference semantics so one
+    /// lattice instance can back many `Variable`s.
+    pub annotation: Option<Rc<SomeValue>>,
     /// RPython `Variable.concretetype` (set by the rtyper).
     pub concretetype: Option<ConcretetypePlaceholder>,
 }
@@ -2557,22 +2550,15 @@ mod tests {
 
     #[test]
     fn variable_copy_preserves_annotation_and_concretetype() {
-        #[derive(Debug)]
-        struct StubAnn;
-        impl Annotation for StubAnn {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
+        use crate::annotator::model::{SomeInteger, SomeValue};
         let mut v = Variable::new();
-        v.annotation = Some(Rc::new(StubAnn) as Rc<dyn Annotation>);
+        v.annotation = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
         v.concretetype = Some(());
         let c = v.copy();
-        assert!(c.annotation.is_some() && v.annotation.is_some());
-        // Rc shares the same allocation — identity preserved per
-        // RPython parity (copy keeps reference to the same SomeValue).
         let ca = c.annotation.as_ref().unwrap();
         let va = v.annotation.as_ref().unwrap();
+        // Rc shares the same allocation — identity preserved per
+        // RPython parity (copy keeps reference to the same SomeValue).
         assert!(Rc::ptr_eq(ca, va));
         assert_eq!(c.concretetype, v.concretetype);
     }
