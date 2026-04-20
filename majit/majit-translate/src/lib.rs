@@ -60,7 +60,9 @@ pub use model::{
     ValueType,
 };
 pub use parse::{
-    CallPath, OpcodeDispatchSelector, ParsedInterpreter, find_opcode_dispatch_match, parse_source,
+    CallPath, ExtractedHandlerCall, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,
+    ReceiverTraitBindings, extract_opcode_dispatch_arms, extract_opcode_dispatch_receiver_traits,
+    extract_trait_impls, find_opcode_dispatch_match, parse_source,
 };
 pub use translate_legacy::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
 pub use translate_legacy::pipeline::{

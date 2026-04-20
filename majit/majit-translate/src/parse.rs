@@ -679,10 +679,23 @@ fn extract_receiver_trait_bindings(func: &ItemFn) -> ReceiverTraitBindings {
     let mut generic_bounds: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
-    for param in &func.sig.generics.params {
-        if let syn::GenericParam::Type(ty) = param {
-            let bounds = ty
-                .bounds
+    let push_bounds = |generic_bounds: &mut std::collections::HashMap<String, Vec<String>>,
+                       name: String,
+                       bounds: Vec<String>| {
+        if bounds.is_empty() {
+            return;
+        }
+        let entry = generic_bounds.entry(name).or_default();
+        for b in bounds {
+            if !entry.iter().any(|existing| existing == &b) {
+                entry.push(b);
+            }
+        }
+    };
+
+    let collect_trait_names =
+        |bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>| {
+            bounds
                 .iter()
                 .filter_map(|bound| match bound {
                     syn::TypeParamBound::Trait(trait_bound) => {
@@ -691,10 +704,26 @@ fn extract_receiver_trait_bindings(func: &ItemFn) -> ReceiverTraitBindings {
                     _ => None,
                 })
                 .filter(|name| !name.is_empty())
-                .collect::<Vec<_>>();
-            if !bounds.is_empty() {
-                generic_bounds.insert(ty.ident.to_string(), bounds);
-            }
+                .collect::<Vec<_>>()
+        };
+
+    for param in &func.sig.generics.params {
+        if let syn::GenericParam::Type(ty) = param {
+            let bounds = collect_trait_names(&ty.bounds);
+            push_bounds(&mut generic_bounds, ty.ident.to_string(), bounds);
+        }
+    }
+
+    if let Some(where_clause) = &func.sig.generics.where_clause {
+        for predicate in &where_clause.predicates {
+            let syn::WherePredicate::Type(pred) = predicate else {
+                continue;
+            };
+            let Some(name) = type_root_ident(&pred.bounded_ty) else {
+                continue;
+            };
+            let bounds = collect_trait_names(&pred.bounds);
+            push_bounds(&mut generic_bounds, name, bounds);
         }
     }
 
@@ -839,6 +868,75 @@ mod tests {
             bindings.traits_by_receiver.get("executor"),
             Some(&vec!["OpcodeStepExecutor".to_string()])
         );
+    }
+
+    /// The pyre-interpreter `execute_opcode_step` signature uses a single
+    /// direct bound (`<E: OpcodeStepExecutor>`) plus a `where E: Trait + Trait
+    /// + ...` clause listing every handler trait. The extractor must collect
+    /// both sources so downstream resolution (callcontrol) can map trait
+    /// method calls to impl graphs.
+    #[test]
+    fn extract_receiver_trait_bindings_handles_where_clause_bounds() {
+        let parsed = parse_source(
+            r#"
+            pub trait OpcodeStepExecutor {}
+            pub trait SharedOpcodeHandler {}
+            pub trait ConstantOpcodeHandler {}
+            pub trait LocalOpcodeHandler {}
+            pub trait NamespaceOpcodeHandler {}
+            pub trait StackOpcodeHandler {}
+            pub trait IterOpcodeHandler {}
+            pub trait TruthOpcodeHandler {}
+            pub trait ControlFlowOpcodeHandler {}
+            pub trait BranchOpcodeHandler {}
+            pub trait ArithmeticOpcodeHandler {}
+
+            pub fn execute_opcode_step<E: OpcodeStepExecutor>(
+                executor: &mut E,
+            ) -> ()
+            where
+                E: SharedOpcodeHandler
+                    + ConstantOpcodeHandler
+                    + LocalOpcodeHandler
+                    + NamespaceOpcodeHandler
+                    + StackOpcodeHandler
+                    + IterOpcodeHandler
+                    + TruthOpcodeHandler
+                    + ControlFlowOpcodeHandler
+                    + BranchOpcodeHandler
+                    + ArithmeticOpcodeHandler,
+            {
+                let _ = executor;
+            }
+        "#,
+        );
+
+        let bindings = extract_opcode_dispatch_receiver_traits(&parsed);
+        let traits = bindings
+            .traits_by_receiver
+            .get("executor")
+            .expect("executor receiver binding");
+        let expected = [
+            "OpcodeStepExecutor",
+            "SharedOpcodeHandler",
+            "ConstantOpcodeHandler",
+            "LocalOpcodeHandler",
+            "NamespaceOpcodeHandler",
+            "StackOpcodeHandler",
+            "IterOpcodeHandler",
+            "TruthOpcodeHandler",
+            "ControlFlowOpcodeHandler",
+            "BranchOpcodeHandler",
+            "ArithmeticOpcodeHandler",
+        ];
+        for name in expected {
+            assert!(
+                traits.iter().any(|t| t == name),
+                "expected trait `{}` in executor bindings, got {:?}",
+                name,
+                traits
+            );
+        }
     }
 
     #[test]
