@@ -924,9 +924,9 @@ pub struct PyreSym {
     pub(crate) vable_array_base: Option<u32>,
     // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
     // Concrete Python object values for locals and stack, tracked in
-    // parallel with registers_r/symbolic_stack. Each opcode handler
-    // updates these alongside the symbolic OpRefs so that guard decisions,
-    // branch directions, and call results use internally tracked values
+    // parallel with `registers_r`. Each opcode handler updates these
+    // alongside the symbolic OpRefs so that guard decisions, branch
+    // directions, and call results use internally tracked values
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
     pub concrete_stack: Vec<ConcreteValue>,
@@ -942,10 +942,23 @@ pub struct PyreSym {
     pub(crate) concrete_vable_ptr: *mut u8,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
-    /// RPython capture_resumedata(resumepc=orgpc) parity: pre-opcode
-    /// snapshot of valuestackdepth + symbolic_stack so guards capture
-    /// the state at opcode START. On guard failure the interpreter
-    /// re-executes the opcode from orgpc.
+    /// RPython `capture_resumedata(resumepc=orgpc)`
+    /// (`pyjitpl.py:2586-2602`) swaps `frame.pc` to `orgpc` while
+    /// snapshotting resume data, because a guard firing mid-opcode
+    /// must resume at the opcode's start on failure. In RPython that
+    /// one pc swap is enough: each jitcode instruction writes its
+    /// result AFTER the guard it might fire, so `registers_{i,r,f}`
+    /// still carry the pre-opcode values at guard time.
+    ///
+    /// Pyre dispatches a single Python bytecode into multiple SSA ops,
+    /// some of which may write `registers_r` BEFORE a mid-opcode
+    /// guard fires. That makes register state at guard time diverge
+    /// from orgpc state, so pyre additionally snapshots
+    /// `valuestackdepth` (`pre_opcode_vsd`) and the full `registers_r`
+    /// (`pre_opcode_registers_r` below) at opcode start. Encoder
+    /// consumers read through these snapshots. PRE-EXISTING-
+    /// ADAPTATION for the stack-machine → register-machine dispatch
+    /// difference.
     pub(crate) pre_opcode_vsd: Option<usize>,
     /// Stage 3.4 Phase B: full snapshot of `registers_r` at opcode
     /// start. Encoder consumers (`get_list_of_active_boxes`,
@@ -977,27 +990,20 @@ pub struct PyreSym {
     //   self.registers_r = [history.CONST_NULL] * jitcode.num_regs_r()
     //   self.registers_f = [history.CONST_NULL] * jitcode.num_regs_f()
     //
-    // TRANSITIONAL STATE (Stage 3.1 landed, Stage 3.4 pending):
-    // `registers_r` is currently sized to `nlocals` and indexed by
-    // pre-regalloc PyFrame local slot — NOT yet the abstract-register-
-    // file shape that RPython describes. Stack slots still live in
-    // `symbolic_stack` indexed by depth; Int / Float register banks
-    // (`registers_i` / `registers_f`) are allocated-but-unused
-    // placeholders for the same Stage 3.4 refactor.
+    // `registers_r` is the abstract register file: index `[0, nlocals)`
+    // holds local slots, index `[nlocals, nlocals+stack_only)` holds the
+    // operand-stack tail. The tracer and the blackhole bridge-resume
+    // decoder index this single Vec — Stage 3.4 Phase A/B/C collapsed
+    // the legacy `symbolic_stack` side-Vec into the tail.
     //
-    // Stage 3.4 will:
-    //   - resize `registers_r` to `num_regs_r()` (post-regalloc
-    //     coloring) so it holds BOTH locals and stack slots under a
-    //     single indexing scheme
-    //   - collapse `symbolic_stack` into the unified register file
-    //   - retire the `idx < nlocals` encoder decode in
-    //     `get_list_of_active_boxes` (trace_opcode.rs:354-363)
-    //
-    // Until Stage 3.4 lands, the pre-regalloc identity invariant
-    // enforced by `enforce_input_args` in `pyre-jit/src/jit/regalloc.rs`
-    // keeps local colors in `0..nlocals` — which is what lets the
-    // encoder's `idx < nlocals` split between locals and stack
-    // continue to work.
+    // `registers_i` / `registers_f` are placeholders for the same
+    // abstract-register-file shape per kind (RPython's int/float
+    // register banks). They are currently unused because
+    // `filter_liveness_in_place` (`pyre-jit/src/jit/codewriter.rs`)
+    // drops non-Ref registers from the live set — extending these
+    // banks is part of the tracer rework required to drop the
+    // LiveVars intersection and make SSA authoritative (see
+    // `phase4_ssa_liveness_blocker_2026_04_18.md`).
     pub(crate) registers_i: Vec<OpRef>,
     #[vable(locals)]
     pub(crate) registers_r: Vec<OpRef>,

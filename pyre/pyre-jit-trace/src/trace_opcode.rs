@@ -177,15 +177,15 @@ impl MIFrame {
         fail_arg_opref_for_typed_value(ctx, typed_value)
     }
 
-    /// pyjitpl.py:177 get_list_of_active_boxes parity.
-    /// Returns compact register boxes for live registers only.
+    /// `pyjitpl.py:177` `get_list_of_active_boxes` parity. Returns
+    /// compact register boxes for live registers only.
     ///
-    /// RPython: both capture (here) and resume (consume_one_section,
-    /// resume.py:1381) use the SAME `all_liveness` data, iterating
-    /// via LivenessIterator over the same register indices in the
-    /// same order. In pyre, both use PyJitCodeMetadata-derived LivenessInfo,
-    /// which now has precise per-local liveness from LiveVars::compute
-    /// (RPython liveness.py backward analysis parity).
+    /// Both the tracer (here) and the blackhole bridge-resume decoder
+    /// (`consume_one_section`, `resume.py:1381`) read the same
+    /// `all_liveness` byte stream via `jitcode.get_live_vars_info(pc,
+    /// op_live)` (`jitcode.py:82-93`) and iterate the per-bank register
+    /// indices with `LivenessIterator` (`liveness.py:168-201`). One
+    /// source, same order.
     fn get_list_of_active_boxes(
         &mut self,
         ctx: &mut TraceCtx,
@@ -337,9 +337,9 @@ impl MIFrame {
             // distinguishes `is_local_live(pc, idx)` vs
             // `is_stack_live(pc, idx)`, so keep the per-kind iteration
             // here. The unified register-file view (Phase B) applies
-            // only to the primary `metadata.liveness` branch below,
-            // where `live_r_regs` indices already live in
-            // stack_base=nlocals register space.
+            // only to the primary all_liveness-byte-stream branch
+            // below, where `live_r_regs` indices already live in
+            // `stack_base=nlocals` register space.
             let locals_len = nlocals.min(registers_r_view.len());
             for (idx, slot) in registers_r_view[..locals_len].iter().enumerate() {
                 let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));

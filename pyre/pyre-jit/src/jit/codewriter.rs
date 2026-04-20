@@ -224,19 +224,25 @@ fn register_helper_fn_pointers(
 /// backward dataflow over the populated `SSARepr` that fills each
 /// `-live-` marker with the set of registers alive across it.
 ///
-/// Phase 4: the dataflow now runs on the walker's SSARepr via
+/// The dataflow runs on the walker's SSARepr via
 /// `liveness::compute_liveness_preserve_positions`, which skips
 /// `remove_repeated_live` so `live_patches` insn indices stay valid
-/// offsets into `ssarepr.insns`. After the dataflow, pyre applies an
-/// in-place post-filter to each `Insn::Live` so the args carry only
-/// the subset of registers the runtime contract is currently wired
-/// to consume (see comment below). `apply_rename` then rewrites the
-/// remaining register indices; `get_liveness_info` at assemble time
-/// (`assembler.rs:422-437`) partitions by kind and emits the
-/// `all_liveness` byte stream, and the Vec<LivenessInfo> for
-/// `metadata.liveness` is re-extracted from the same Insn::Live after
-/// rename (see the dispatch finaliser). All three downstream consumers
-/// share one source.
+/// offsets into `ssarepr.insns`. (The full `compute_liveness` would
+/// call `remove_repeated_live`'s `res.extend(labels); res.push(live)`
+/// reorder loop, which swaps `Live, Label` into `Label, Live` even
+/// when nothing is merged — `live_patches[i].1` then points at the
+/// moved `Label` instead of the `-live-` marker.)
+///
+/// After the dataflow, pyre applies an in-place post-filter to each
+/// `Insn::Live` so the args carry only the subset of registers the
+/// runtime contract is currently wired to consume (see rules below).
+/// `apply_rename` then rewrites the remaining register indices, and
+/// `get_liveness_info` at assemble time (`assembler.rs:422-437`)
+/// partitions by kind and emits the `all_liveness` byte stream. Both
+/// the tracer's `get_list_of_active_boxes` and the blackhole's
+/// bridge-resume `consume_one_section` read `all_liveness` via
+/// `LivenessIterator`, so the single post-rename `Insn::Live` is the
+/// sole source.
 ///
 /// Post-filter rules (pyre-only adaptation on top of SSA output):
 ///   - Only Ref-kind registers: pyre Int/Float regs are scratch
@@ -2137,12 +2143,11 @@ impl CodeWriter {
         // liveness.py:19-80 parity: populate each `-live-` marker in
         // the SSARepr via SSA backward dataflow, then apply pyre's
         // runtime-contract filter (Ref-only, in-range, stack-complete,
-        // LiveVars-intersected) to each marker in place. After this
-        // call `Insn::Live` carries the final live-register set that
-        // both the assembler (`all_liveness` byte stream) and the
-        // post-rename `metadata.liveness` extraction will consume —
-        // one source replaces the previous `compute_liveness_table` +
-        // `fill_assembler_liveness` round-trip. See
+        // LiveVars-intersected) to each marker in place. After
+        // `apply_rename` below, the final post-rename `Insn::Live` is
+        // the single source both the assembler (`all_liveness` byte
+        // stream) and runtime consumers (tracer `get_list_of_active_
+        // boxes`, blackhole `consume_one_section`) read. See
         // `filter_liveness_in_place`.
         filter_liveness_in_place(
             &mut ssarepr,
