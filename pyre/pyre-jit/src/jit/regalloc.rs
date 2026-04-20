@@ -430,11 +430,6 @@ impl RegAllocator {
     /// effect is a strict subset of RPython's because pyre never
     /// sees the cross-block link representation.
     fn coalesce_variables(&mut self, ssarepr: &SSARepr, kind: Kind) {
-        let move_op = match kind {
-            Kind::Int => "move_i",
-            Kind::Ref => "move_r",
-            Kind::Float => "move_f",
-        };
         let copy_op = match kind {
             Kind::Int => "int_copy",
             Kind::Ref => "ref_copy",
@@ -447,7 +442,7 @@ impl RegAllocator {
                 result,
             } = insn
             {
-                if opname != move_op && opname != copy_op {
+                if opname != copy_op {
                     continue;
                 }
                 let dst = match result {
@@ -739,8 +734,8 @@ mod tests {
     /// and target into the same color when they don't interfere.
     #[test]
     fn move_source_and_target_coalesce_to_same_color() {
-        // r5 = produce; move_r r6 <- r5; use r6
-        // r5 dies at the move; r6 takes over. With coalescing they
+        // r5 = produce; ref_copy r6 <- r5; use r6
+        // r5 dies at the copy; r6 takes over. With coalescing they
         // should share a color.
         let mut ssarepr = SSARepr::new("t");
         ssarepr
@@ -748,7 +743,7 @@ mod tests {
             .push(op_def("produce", vec![], r(Kind::Ref, 5)));
         ssarepr
             .insns
-            .push(op_def("move_r", vec![reg(Kind::Ref, 5)], r(Kind::Ref, 6)));
+            .push(op_def("ref_copy", vec![reg(Kind::Ref, 5)], r(Kind::Ref, 6)));
         ssarepr
             .insns
             .push(op_use("ref_return", vec![reg(Kind::Ref, 6)]));
@@ -765,7 +760,7 @@ mod tests {
         let new6 = result.rename.get(&(Kind::Ref, 6)).copied().unwrap_or(6);
         assert_eq!(
             new5, new6,
-            "coalesce_variables should give move_r src and dst the same color (got {} vs {})",
+            "coalesce_variables should give ref_copy src and dst the same color (got {} vs {})",
             new5, new6
         );
         assert_eq!(

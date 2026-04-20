@@ -520,13 +520,11 @@ fn dispatch_op(
         "abort_permanent" => state.builder.abort_permanent(),
         // `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
         // `v` is either a `Register` or a `Constant`. Register source
-        // lowers to `move_{i,r,f}`; Constant source lowers to
-        // `load_const_{i,r,f}_value`, matching the two argcode variants
-        // emitted by `assembler.py:162-174` (`i` for Register, `c` for
-        // Constant). The `move_*` aliases are the pyre-only pre-parity
-        // names that the B6 Phase 3b migration replaces with
-        // `{kind}_copy`.
-        "move_i" | "int_copy" => match source_operand(args, result) {
+        // lowers to the primitive `move_{i,r,f}` builder method;
+        // Constant source lowers to `load_const_{i,r,f}_value`,
+        // matching the two argcode variants emitted by
+        // `assembler.py:162-174` (`i` for Register, `c` for Constant).
+        "int_copy" => match source_operand(args, result) {
             MoveSource::Reg(src) => {
                 let dst = expect_result_or_first_reg(args, result, Kind::Int);
                 let src = expect_reg(src, Kind::Int);
@@ -538,7 +536,7 @@ fn dispatch_op(
             }
             other => panic!("int_copy expects Register or ConstInt, got {:?}", other),
         },
-        "move_r" | "ref_copy" => match source_operand(args, result) {
+        "ref_copy" => match source_operand(args, result) {
             MoveSource::Reg(src) => {
                 let dst = expect_result_or_first_reg(args, result, Kind::Ref);
                 let src = expect_reg(src, Kind::Ref);
@@ -550,7 +548,7 @@ fn dispatch_op(
             }
             other => panic!("ref_copy expects Register or ConstRef, got {:?}", other),
         },
-        "move_f" | "float_copy" => match source_operand(args, result) {
+        "float_copy" => match source_operand(args, result) {
             MoveSource::Reg(src) => {
                 let dst = expect_result_or_first_reg(args, result, Kind::Float);
                 let src = expect_reg(src, Kind::Float);
