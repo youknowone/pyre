@@ -806,11 +806,8 @@ impl RPythonAnnotator {
         use super::model::{SomeObjectTrait, s_impossible_value};
         loop {
             self.complete_pending_blocks();
-            // Upstream: `self.policy.no_more_blocks_to_annotate(self)`.
-            // Rust stub returns `Err(PolicyError)` until annrpython is
-            // wired to the sandbox trampoline — silently continue for
-            // now (the real side effect will land with that port).
-            let _ = self.policy.borrow().no_more_blocks_to_annotate();
+            // upstream: `self.policy.no_more_blocks_to_annotate(self)`.
+            self.policy.borrow().no_more_blocks_to_annotate(self);
             let any_pending = self.genpendingblocks.borrow().iter().any(|d| !d.is_empty());
             if !any_pending {
                 break;
@@ -1398,12 +1395,19 @@ impl RPythonAnnotator {
     ///     self.reflowpendingblock(graph, block)
     /// ```
     ///
-    /// The `PositionKey` payload here only carries the three u64
-    /// pointers. The caller must provide the live `GraphRef`/`BlockRef`
-    /// separately; a lookup-through-position helper is expected when
-    /// the bookkeeper starts tracking positions by `(graph, block)`.
-    pub fn reflowfromposition(&self, graph: &GraphRef, block: &BlockRef) {
-        self.reflowpendingblock(graph, block);
+    /// `PositionKey` now carries `Weak<FunctionGraph>` + `Weak<Block>`;
+    /// if either has been dropped since the position was recorded the
+    /// reflow is silently skipped (the block's owner graph is already
+    /// gone).
+    pub fn reflowfromposition(&self, position_key: &PositionKey) {
+        // upstream: `graph, block, index = position_key`
+        let Some(graph) = position_key.graph() else {
+            return;
+        };
+        let Some(block) = position_key.block() else {
+            return;
+        };
+        self.reflowpendingblock(&graph, &block);
     }
 
     /// RPython `bindinputargs(self, graph, block, inputcells)`
@@ -1968,13 +1972,9 @@ impl RPythonAnnotator {
                 .map(|set| set.into_iter().collect())
                 .unwrap_or_default()
         };
-        for _position in positions {
-            // `reflowfromposition` requires the live (graph, block)
-            // refs. The full lookup table from PositionKey → (graph,
-            // block) lands when PositionKey carries the real tuple;
-            // until then the notify dispatch re-queues the current
-            // block as a fallback.
-            self.reflowfromposition(graph, block);
+        for position in positions {
+            // upstream: `self.reflowfromposition(position)`
+            self.reflowfromposition(&position);
         }
 
         Ok(())

@@ -24,7 +24,7 @@
 //!   on `annrpython.py` driver.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use super::argument::simple_args;
@@ -208,6 +208,12 @@ pub struct Bookkeeper {
     pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
     pub emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
+    /// RPython `self.pending_specializations = []` (bookkeeper.py:69).
+    ///
+    /// List of callbacks drained by
+    /// `AnnotatorPolicy.no_more_blocks_to_annotate` before the final
+    /// annotation fixpoint.
+    pub pending_specializations: RefCell<Vec<Box<dyn Fn()>>>,
     /// RPython `hasattr(self, 'position_key')` (bookkeeper.py:99).
     ///
     /// Upstream distinguishes "no position entered" (attribute absent)
@@ -290,6 +296,7 @@ impl Bookkeeper {
                 Rc::new(RefCell::new(CallFamily::new(*desc)))
             })),
             emulated_pbc_calls: RefCell::new(HashMap::new()),
+            pending_specializations: RefCell::new(Vec::new()),
             position_entered: std::cell::Cell::new(false),
         }
     }
@@ -480,6 +487,138 @@ impl Bookkeeper {
                 .unwrap_or(SomeValue::Impossible);
             // upstream: `s_callable.consider_call_site(args, s_result, call_op)`.
             pbc.consider_call_site();
+        }
+        Ok(())
+    }
+
+    /// RPython `Bookkeeper.getattr_locations(self, clsdesc, attrname)`
+    /// (bookkeeper.py:498-500).
+    ///
+    /// ```python
+    /// def getattr_locations(self, clsdesc, attrname):
+    ///     attrdef = clsdesc.classdef.find_attribute(attrname)
+    ///     return attrdef.read_locations
+    /// ```
+    ///
+    /// Returns a snapshot of the attribute's read locations — callers
+    /// iterate + reflow outside the borrow so [`ClassDef::find_attribute`]
+    /// can reacquire the RefCell if it generalizes the attribute.
+    pub fn getattr_locations(
+        &self,
+        classdesc: &Rc<RefCell<ClassDesc>>,
+        attrname: &str,
+    ) -> Result<HashSet<PositionKey>, AnnotatorError> {
+        // upstream: `attrdef = clsdesc.classdef.find_attribute(attrname)`
+        let classdef = classdesc
+            .borrow()
+            .classdef
+            .clone()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| {
+                AnnotatorError::new(
+                    "Bookkeeper.getattr_locations: classdesc.classdef is not set \
+                     (requires ClassDesc.getuniqueclassdef — classdesc.py:699-702)"
+                        .to_string(),
+                )
+            })?;
+        // `find_attribute` may `generalize_attr` as a side effect; run
+        // it outside any borrow of `classdef`.
+        let _ = ClassDef::find_attribute(&classdef, attrname)?;
+        // Now re-lookup the attribute to read its read_locations.
+        let attr = classdef.borrow();
+        let attrdef = attr.attrs.get(attrname).ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "Bookkeeper.getattr_locations: attribute {:?} missing on {:?}",
+                attrname, attr.name
+            ))
+        })?;
+        Ok(attrdef.read_locations.clone())
+    }
+
+    /// RPython `Bookkeeper.record_getattr(self, clsdesc, attrname)`
+    /// (bookkeeper.py:502-504).
+    ///
+    /// ```python
+    /// def record_getattr(self, clsdesc, attrname):
+    ///     locations = self.getattr_locations(clsdesc, attrname)
+    ///     locations.add(self.position_key)
+    /// ```
+    ///
+    /// The Rust port cannot return the mutable set by reference without
+    /// extending the RefCell borrow across the caller's chain, so it
+    /// inserts directly into the attribute's `read_locations`.
+    pub fn record_getattr(
+        &self,
+        classdesc: &Rc<RefCell<ClassDesc>>,
+        attrname: &str,
+    ) -> Result<(), AnnotatorError> {
+        let classdef = classdesc
+            .borrow()
+            .classdef
+            .clone()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| {
+                AnnotatorError::new(
+                    "Bookkeeper.record_getattr: classdesc.classdef is not set".to_string(),
+                )
+            })?;
+        // Ensure the attribute exists (upstream's
+        // `clsdesc.classdef.find_attribute(attrname)` side effect).
+        let _ = ClassDef::find_attribute(&classdef, attrname)?;
+        // upstream: `locations.add(self.position_key)`
+        if let Some(pk) = self.current_position_key() {
+            let mut classdef_mut = classdef.borrow_mut();
+            if let Some(attrdef) = classdef_mut.attrs.get_mut(attrname) {
+                attrdef.read_locations.insert(pk);
+            }
+        }
+        Ok(())
+    }
+
+    /// RPython `Bookkeeper.update_attr(self, clsdef, attrdef)`
+    /// (bookkeeper.py:506-510).
+    ///
+    /// ```python
+    /// def update_attr(self, clsdef, attrdef):
+    ///     locations = self.getattr_locations(clsdef.classdesc, attrdef.name)
+    ///     for position in locations:
+    ///         self.annotator.reflowfromposition(position)
+    ///     attrdef.validate(homedef=clsdef)
+    /// ```
+    ///
+    /// Rust signature takes the attribute name (rather than an
+    /// `&mut Attribute`) because the attribute lives inside
+    /// `clsdef.borrow_mut().attrs`; validate is executed after a
+    /// `remove`/`insert` cycle so the attribute is the exclusive mutator
+    /// while the `homedef` is borrowed read-only.
+    pub fn update_attr(
+        &self,
+        clsdef: &Rc<RefCell<ClassDef>>,
+        attr_name: &str,
+    ) -> Result<(), AnnotatorError> {
+        let classdesc = clsdef.borrow().classdesc.clone();
+        // upstream: `locations = self.getattr_locations(clsdef.classdesc, attrdef.name)`
+        let locations = self.getattr_locations(&classdesc, attr_name)?;
+        // upstream: `for position in locations: self.annotator.reflowfromposition(position)`
+        let Some(ann) = self.annotator.borrow().upgrade() else {
+            // upstream always has `self.annotator`; if the backlink is
+            // not wired yet (tests constructing a Bookkeeper without an
+            // annotator) skip reflow silently — same effect as upstream
+            // when the pending-block queue is empty.
+            return Ok(());
+        };
+        for position in locations {
+            ann.reflowfromposition(&position);
+        }
+        // upstream: `attrdef.validate(homedef=clsdef)`
+        let taken = clsdef.borrow_mut().attrs.remove(attr_name);
+        if let Some(mut attrdef) = taken {
+            let result = attrdef.validate(clsdef);
+            clsdef
+                .borrow_mut()
+                .attrs
+                .insert(attr_name.to_string(), attrdef);
+            result.map_err(|e| AnnotatorError::new(e.to_string()))?;
         }
         Ok(())
     }

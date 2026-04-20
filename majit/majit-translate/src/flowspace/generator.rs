@@ -400,7 +400,13 @@ fn tweak_generator_body_graph(
     }
 
     let blocks = graph.iterblocks();
-    let mut mapping_count = 1usize;
+    // upstream generator.py:114 — `mappings = [Entry]`.
+    // Each entry pairs the Resume-class HostObject with the target
+    // block the dispatcher will jump to when `isinstance(entry, Resume)`
+    // is true. The Entry mapping's target is the graph's startblock
+    // (after `_insert_reads`, i.e. the block now owning the entry var).
+    let mut mappings: Vec<(HostObject, Rc<RefCell<Block>>)> =
+        vec![(entry.clone(), graph.startblock.clone())];
     for block in blocks {
         for exit_ref in block.borrow().exits.clone() {
             let mut exit = exit_ref.borrow_mut();
@@ -436,11 +442,15 @@ fn tweak_generator_body_graph(
                     .collect::<Vec<_>>(),
             )?;
             let resume = HostObject::new_class_with_members(
-                format!("Resume{mapping_count}"),
+                format!("Resume{}", mappings.len()),
                 vec![],
                 HashMap::from([("_attrs_".to_string(), tuple_of_strings(&resume_varnames))]),
             );
-            mapping_count += 1;
+            // upstream generator.py:140-142 — `Resume.block = newblock;
+            // mappings.append(Resume)`. Carry both into our list so the
+            // regular-entry dispatcher below can route each branch to
+            // the matching resume block.
+            mappings.push((resume.clone(), newblock.clone()));
             insert_reads(&newblock, &resume_varnames)?;
 
             let mut block_ops = block.borrow().operations.clone();
@@ -481,21 +491,12 @@ fn tweak_generator_body_graph(
         }
     }
 
+    // upstream generator.py:157-169 — `regular_entry_block` cascade of
+    // `isinstance(entry, Resume)` dispatchers, routing to each
+    // Resume.block in turn.
     let regular_entry_block = Block::shared(vec![Hlvalue::Variable(Variable::named("entry"))]);
     let mut current = regular_entry_block.clone();
-    let mut resumes = Vec::new();
-    resumes.push(entry.clone());
-    for block in graph.iterblocks() {
-        if let Some(prev) = block.borrow().inputargs.first() {
-            if matches!(prev, Hlvalue::Variable(v) if v.name_prefix() == "entry_") {
-                resumes.push(HostObject::new_class(
-                    format!("ResumeBlock{}", resumes.len()),
-                    vec![],
-                ));
-            }
-        }
-    }
-    for resume in resumes {
+    for (resume, target_block) in &mappings {
         let input = current.borrow().inputargs[0].clone();
         let op_check = SpaceOperation::new(
             "isinstance",
@@ -505,12 +506,13 @@ fn tweak_generator_body_graph(
         let check_result = op_check.result.clone();
         current.borrow_mut().operations.push(op_check);
         current.borrow_mut().exitswitch = Some(check_result.clone());
-        let target = if resume == *entry {
-            graph.startblock.clone()
-        } else {
-            graph.startblock.clone()
-        };
-        let yes = Link::new(vec![input.clone()], Some(target), Some(const_str("True"))).into_ref();
+        // upstream: `link1 = Link([input], Resume.block); link1.exitcase = True`
+        let yes = Link::new(
+            vec![input.clone()],
+            Some(target_block.clone()),
+            Some(const_str("True")),
+        )
+        .into_ref();
         let nextblock = Block::shared(vec![Hlvalue::Variable(Variable::named("entry"))]);
         let no = Link::new(
             vec![input],

@@ -20,11 +20,13 @@
 //!   `rpython/rtyper/annlowlevel.py:LowLevelAnnotatorPolicy` —
 //!   deferred until the rtyper's annlowlevel lands.
 //! * `no_more_blocks_to_annotate(annotator)` (policy.py:69-100) —
-//!   the sandbox-trampoline rewriting pass. Requires
-//!   `annotator.bookkeeper.emulated_pbc_calls`, the
-//!   `translator/sandbox/rsandbox.py` trampoline factory, and the
-//!   `op.simple_call` / `op.call_args` instance shape. Deferred
-//!   until annrpython.py / sandbox land.
+//!   structurally ported. Drains `bk.pending_specializations` and
+//!   iterates `added_blocks` / `annotated`, matching upstream
+//!   line-by-line. The inner sandbox-trampoline rewrite branch
+//!   (`needs_sandboxing` check) walks to `continue` because no
+//!   `SomeValue` variant carries that attribute yet; the `s_func.args_s
+//!   / s_result / const` rewrite activates when the sandbox lattice
+//!   type (RPython `SomeSandboxedCallable`) lands.
 
 use crate::annotator::bookkeeper::Bookkeeper;
 
@@ -148,19 +150,74 @@ impl AnnotatorPolicy {
         }
     }
 
-    /// RPython `AnnotatorPolicy.no_more_blocks_to_annotate(pol,
-    /// annotator)` (policy.py:69-100).
+    /// RPython `AnnotatorPolicy.no_more_blocks_to_annotate(pol, annotator)`
+    /// (policy.py:69-100).
     ///
-    /// **Not ported.** Requires the annotator driver, the
-    /// `emulated_pbc_calls` table, and the sandbox trampoline
-    /// factory. Returns [`PolicyError`] so callers discover the
-    /// missing dep rather than silently skipping the sandbox rewrite.
-    pub fn no_more_blocks_to_annotate(&self) -> Result<(), PolicyError> {
-        Err(PolicyError(
-            "AnnotatorPolicy.no_more_blocks_to_annotate requires annrpython.py + \
-             translator/sandbox/rsandbox.py (Phase 5 P5.2+ dep — see policy.py:69-100)"
-                .into(),
-        ))
+    /// Drains pending specialization callbacks, then walks every
+    /// `op.simple_call` / `op.call_args` instruction in the annotator's
+    /// added-or-annotated block set. Upstream rewrites sites whose
+    /// callee is flagged `needs_sandboxing` with the sandbox trampoline
+    /// returned by `rpython/translator/sandbox/rsandbox.py`.
+    ///
+    /// The Rust port walks the same structure but has no `SomeValue`
+    /// variant carrying `needs_sandboxing` yet, so every inner iteration
+    /// falls through the `continue`. When the sandbox-trampoline port
+    /// lands the `needs_sandboxing` branch will emit the replacement
+    /// op inline.
+    pub fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator) {
+        use crate::flowspace::model::BlockKey;
+        use crate::flowspace::operation::OpKind;
+
+        let bk = &ann.bookkeeper;
+        // upstream: for callback in bk.pending_specializations: callback()
+        let callbacks: Vec<Box<dyn Fn()>> =
+            bk.pending_specializations.borrow_mut().drain(..).collect();
+        for callback in &callbacks {
+            callback();
+        }
+        // upstream: del bk.pending_specializations[:]  (already drained)
+
+        // upstream:
+        //   if annotator.added_blocks is not None:
+        //       all_blocks = annotator.added_blocks
+        //   else:
+        //       all_blocks = annotator.annotated
+        let all_blocks: Vec<BlockKey> = {
+            let added = ann.added_blocks.borrow();
+            match added.as_ref() {
+                Some(added_set) => added_set.keys().cloned().collect(),
+                None => ann.annotated.borrow().keys().cloned().collect(),
+            }
+        };
+
+        // upstream: for block in list(all_blocks):
+        let all_blocks_index = ann.all_blocks.borrow();
+        for block_key in all_blocks {
+            let Some(block_ref) = all_blocks_index.get(&block_key).cloned() else {
+                continue;
+            };
+            let block = block_ref.borrow();
+            // upstream: for i, instr in enumerate(block.operations):
+            for instr in block.operations.iter() {
+                //   if not isinstance(instr, (op.simple_call, op.call_args)):
+                //       continue
+                let kind = OpKind::from_opname(&instr.opname);
+                if !matches!(kind, Some(OpKind::SimpleCall | OpKind::CallArgs)) {
+                    continue;
+                }
+                //   v_func = instr.args[0]
+                let Some(_v_func) = instr.args.first() else {
+                    continue;
+                };
+                //   s_func = annotator.annotation(v_func)
+                //   if not hasattr(s_func, 'needs_sandboxing'):
+                //       continue
+                // Rust port has no SomeValue variant carrying
+                // `needs_sandboxing`; the rewrite path below is inactive
+                // until the sandbox lattice type lands.
+                continue;
+            }
+        }
     }
 }
 
@@ -290,9 +347,32 @@ mod tests {
     }
 
     #[test]
-    fn no_more_blocks_to_annotate_is_deferred() {
-        let pol = AnnotatorPolicy::new();
-        let err = pol.no_more_blocks_to_annotate().unwrap_err();
-        assert!(err.0.contains("Phase 5 P5.2+ dep"));
+    fn no_more_blocks_to_annotate_drains_pending_specializations() {
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ann = super::super::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let counter = Rc::new(AtomicUsize::new(0));
+        {
+            let c = Rc::clone(&counter);
+            ann.bookkeeper
+                .pending_specializations
+                .borrow_mut()
+                .push(Box::new(move || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }));
+        }
+        {
+            let c = Rc::clone(&counter);
+            ann.bookkeeper
+                .pending_specializations
+                .borrow_mut()
+                .push(Box::new(move || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }));
+        }
+        ann.policy.borrow().no_more_blocks_to_annotate(&ann);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert!(ann.bookkeeper.pending_specializations.borrow().is_empty());
     }
 }

@@ -469,13 +469,38 @@ impl Attribute {
     ) -> Result<(), AnnotatorError> {
         self.readonly = false;
         if !self.attr_allowed {
+            // upstream:
+            //   from rpython.annotator.bookkeeper import getbookkeeper
+            //   bk = getbookkeeper()
+            //   classdesc = classdef.classdesc
+            //   locations = bk.getattr_locations(classdesc, self.name)
+            //   raise NoSuchAttrError(...formatted message...)
             let name = classdef
                 .map(|c| c.borrow().name.clone())
                 .unwrap_or_else(|| "?".to_string());
+            let locations_str = match classdef {
+                Some(cd) => {
+                    let bk_opt = cd.borrow().bookkeeper.upgrade();
+                    let classdesc = cd.borrow().classdesc.clone();
+                    match bk_opt {
+                        Some(bk) => match bk.getattr_locations(&classdesc, &self.name) {
+                            Ok(locs) => locs
+                                .iter()
+                                .map(|l| format!("{:?}", l))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            Err(_) => String::new(),
+                        },
+                        None => String::new(),
+                    }
+                }
+                None => String::new(),
+            };
             return Err(AnnotatorError::new(format!(
-                "Attribute {:?} on {:?} should be read-only (classdesc.py:129-134 \
-                 requires bookkeeper.getattr_locations — Phase 5 P5.2+ bookkeeper-c2 dep)",
-                self.name, name
+                "Attribute {:?} on {:?} should be read-only.\n\
+                 This error can be caused by another 'getattr' that promoted\n\
+                 the attribute here; the list of read locations is:\n{}",
+                self.name, name, locations_str
             )));
         }
         Ok(())
@@ -1332,32 +1357,6 @@ impl ClassDef {
         None
     }
 
-    /// RPython `ClassDef.read_attr__class__(self)` (classdesc.py:424-427).
-    ///
-    /// The body requires `bookkeeper.position_key` + the `SomePBC`
-    /// constructor taking ClassDesc entries. Both are available in c1;
-    /// the port writes the read-location and returns the PBC. If the
-    /// bookkeeper's position_key is unset we still record the read
-    /// under a `None` key (matches upstream's dict.setdefault semantics
-    /// with a `None`-typed position).
-    ///
-    /// Returns [`AnnotatorError`] when no ClassDesc descriptions can be
-    /// produced (would violate `SomePBC::new`'s non-empty invariant).
-    /// c3 will replace this stub with a SomePBC over the subdef
-    /// ClassDescs; until then callers get a citation-bearing error.
-    pub fn read_attr_class(start: &Rc<RefCell<ClassDef>>) -> Result<SomeValue, AnnotatorError> {
-        let bk = start.borrow().bookkeeper.upgrade().ok_or_else(|| {
-            AnnotatorError::new("ClassDef.read_attr__class__: bookkeeper dropped")
-        })?;
-        if let Some(pk) = bk.current_position_key() {
-            start.borrow_mut().read_locations_of_class.insert(pk, true);
-        }
-        Err(AnnotatorError::new(
-            "ClassDef.read_attr__class__ requires SomePBC over subdef ClassDescs \
-             (Phase 5 P5.2 classdesc c3 dep — see classdesc.py:424-427)",
-        ))
-    }
-
     /// RPython `ClassDef._freeze_(self)` (classdesc.py:429-431).
     ///
     /// Upstream raises to prevent `immutablevalue(classdef)` from
@@ -1391,10 +1390,8 @@ impl ClassDef {
     /// RPython `ClassDef.add_source_for_attribute(self, attr, source)`
     /// (classdesc.py:189-220).
     ///
-    /// The `bookkeeper.update_attr` reflow is a Phase 5 P5.2+
-    /// bookkeeper-c2 dependency; c1 skips it with a comment but
-    /// preserves the control-flow + attribute-propagation structure so
-    /// the c2 patch is additive.
+    /// The `bookkeeper.update_attr(cdef, attrdef)` call site drives
+    /// [`Bookkeeper::update_attr`] for reflow + validation.
     pub fn add_source_for_attribute(
         this: &Rc<RefCell<ClassDef>>,
         attr: &str,
@@ -1404,14 +1401,25 @@ impl ClassDef {
         for cdef in Self::getmro(this) {
             let has_attr = cdef.borrow().attrs.contains_key(attr);
             if has_attr {
-                let mut cdef_mut = cdef.borrow_mut();
-                let attrdef = cdef_mut.attrs.get_mut(attr).unwrap();
-                let s_prev = attrdef.s_value.clone();
-                attrdef.add_constant_source(this, &source)?;
+                let s_prev = {
+                    let cdef_ref = cdef.borrow();
+                    cdef_ref.attrs.get(attr).unwrap().s_value.clone()
+                };
+                {
+                    let mut cdef_mut = cdef.borrow_mut();
+                    let attrdef = cdef_mut.attrs.get_mut(attr).unwrap();
+                    attrdef.add_constant_source(this, &source)?;
+                }
+                let s_new = {
+                    let cdef_ref = cdef.borrow();
+                    cdef_ref.attrs.get(attr).unwrap().s_value.clone()
+                };
                 // upstream: if attrdef.s_value != s_prev_value:
                 //     self.bookkeeper.update_attr(cdef, attrdef)
-                if attrdef.s_value != s_prev {
-                    // bookkeeper.update_attr stub — c2 dep.
+                if s_new != s_prev {
+                    if let Some(bk) = cdef.borrow().bookkeeper.upgrade() {
+                        bk.update_attr(&cdef, attr)?;
+                    }
                 }
                 return Ok(());
             }
@@ -1430,12 +1438,23 @@ impl ClassDef {
             for subdef in Self::getallsubdefs(this) {
                 let has_attr = subdef.borrow().attrs.contains_key(attr);
                 if has_attr {
-                    let mut subdef_mut = subdef.borrow_mut();
-                    let attrdef = subdef_mut.attrs.get_mut(attr).unwrap();
-                    let s_prev = attrdef.s_value.clone();
-                    attrdef.add_constant_source(this, &source)?;
-                    if attrdef.s_value != s_prev {
-                        // bookkeeper.update_attr stub — c2 dep.
+                    let s_prev = {
+                        let s_ref = subdef.borrow();
+                        s_ref.attrs.get(attr).unwrap().s_value.clone()
+                    };
+                    {
+                        let mut subdef_mut = subdef.borrow_mut();
+                        let attrdef = subdef_mut.attrs.get_mut(attr).unwrap();
+                        attrdef.add_constant_source(this, &source)?;
+                    }
+                    let s_new = {
+                        let s_ref = subdef.borrow();
+                        s_ref.attrs.get(attr).unwrap().s_value.clone()
+                    };
+                    if s_new != s_prev {
+                        if let Some(bk) = subdef.borrow().bookkeeper.upgrade() {
+                            bk.update_attr(&subdef, attr)?;
+                        }
                     }
                 }
             }
@@ -1548,24 +1567,73 @@ impl ClassDef {
         }
 
         // upstream: self.bookkeeper.update_attr(self, newattr).
-        // bookkeeper.update_attr lands with c2; stub here.
+        if let Some(bk) = this.borrow().bookkeeper.upgrade() {
+            bk.update_attr(this, attr)?;
+        }
         Ok(())
     }
 
     /// RPython `ClassDef.see_new_subclass(self, classdef)`
     /// (classdesc.py:418-422).
     ///
-    /// The `bookkeeper.annotator.reflowfromposition` call is a Phase 5
-    /// P5.2+ annrpython-c1 dependency; c1 records the position-key
-    /// walk structurally but does not reflow. Callers (base's __init__)
-    /// invoke this via [`Self::see_new_subclass_recursive`].
-    fn see_new_subclass_recursive(base: &Rc<RefCell<ClassDef>>, _child: &Rc<RefCell<ClassDef>>) {
+    /// RPython `ClassDef.read_attr__class__(self)` (classdesc.py:424-427).
+    ///
+    /// ```python
+    /// def read_attr__class__(self):
+    ///     position = self.bookkeeper.position_key
+    ///     self.read_locations_of__class__[position] = True
+    ///     return SomePBC([subdef.classdesc for subdef in self.getallsubdefs()])
+    /// ```
+    #[allow(non_snake_case)]
+    pub fn read_attr__class__(this: &Rc<RefCell<ClassDef>>) -> SomeValue {
+        // upstream: position = self.bookkeeper.position_key
+        let pk_opt = this
+            .borrow()
+            .bookkeeper
+            .upgrade()
+            .and_then(|bk| bk.current_position_key());
+        // upstream: self.read_locations_of__class__[position] = True
+        if let Some(pk) = pk_opt {
+            this.borrow_mut().read_locations_of_class.insert(pk, true);
+        }
+        // upstream: return SomePBC([subdef.classdesc for subdef in self.getallsubdefs()])
+        let subdefs = Self::getallsubdefs(this);
+        let descriptions: Vec<super::model::Desc> = subdefs
+            .into_iter()
+            .map(|sd| {
+                let cd = sd.borrow().classdesc.clone();
+                let cd_ref = cd.borrow();
+                super::model::Desc::new(super::model::DescKind::Class, cd_ref.name.clone())
+            })
+            .collect();
+        SomeValue::PBC(super::model::SomePBC::new(descriptions, false))
+    }
+
+    /// Walks `base` up through its `basedef` chain, firing
+    /// `bookkeeper.annotator.reflowfromposition(position)` for every
+    /// position previously recorded in `read_locations_of__class__`.
+    /// Called from `ClassDef::__init__` after a fresh subclass attaches
+    /// itself via `basedef.subdefs.append(self)`.
+    fn see_new_subclass_recursive(base: &Rc<RefCell<ClassDef>>, child: &Rc<RefCell<ClassDef>>) {
         // upstream: for position in self.read_locations_of__class__:
         //     self.bookkeeper.annotator.reflowfromposition(position)
-        // reflowfromposition lands with annrpython c1; skip here.
+        let (positions, bk_opt) = {
+            let base_ref = base.borrow();
+            let positions: Vec<PositionKey> =
+                base_ref.read_locations_of_class.keys().cloned().collect();
+            let bk_opt = base_ref.bookkeeper.upgrade();
+            (positions, bk_opt)
+        };
+        if let Some(bk) = bk_opt {
+            if let Some(ann) = bk.annotator.borrow().upgrade() {
+                for position in positions {
+                    ann.reflowfromposition(&position);
+                }
+            }
+        }
         let parent = base.borrow().basedef.clone();
         if let Some(parent_rc) = parent {
-            Self::see_new_subclass_recursive(&parent_rc, _child);
+            Self::see_new_subclass_recursive(&parent_rc, child);
         }
     }
 }
@@ -1621,12 +1689,33 @@ mod tests {
         a.attr_allowed = false;
         a.readonly = false; // already modified path
         let err = a.modified(None).unwrap_err();
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap()
-                .contains("bookkeeper.getattr_locations")
-        );
+        let msg = err.msg.as_deref().unwrap();
+        // upstream classdesc.py:129-134 error prefix:
+        //   "Attribute %r on %r should be read-only."
+        assert!(msg.contains("should be read-only"), "got: {msg}");
+        assert!(msg.contains("\"x\""), "got: {msg}");
+    }
+
+    #[test]
+    fn classdef_read_attr_class_returns_subclass_pbc() {
+        use crate::annotator::model::{DescKind, SomeValue};
+        let bk = make_bk();
+        let parent = make_classdesc(&bk, "pkg.Parent");
+        let parent_cd = ClassDef::new(&bk, &parent);
+        let child = make_classdesc(&bk, "pkg.Child");
+        child.borrow_mut().basedesc = Some(parent.clone());
+        let _child_cd = ClassDef::new(&bk, &child);
+        // upstream: SomePBC([subdef.classdesc for subdef in self.getallsubdefs()])
+        let result = ClassDef::read_attr__class__(&parent_cd);
+        match &result {
+            SomeValue::PBC(pbc) => {
+                let names: Vec<_> = pbc.descriptions.iter().map(|d| d.name.as_str()).collect();
+                assert!(names.contains(&"pkg.Parent"));
+                assert!(names.contains(&"pkg.Child"));
+                assert!(pbc.descriptions.iter().all(|d| d.kind == DescKind::Class));
+            }
+            _ => panic!("read_attr__class__ must return a SomePBC"),
+        }
     }
 
     #[test]
@@ -1685,15 +1774,6 @@ mod tests {
                 .unwrap()
                 .contains("cannot be used as immutablevalue")
         );
-    }
-
-    #[test]
-    fn classdef_read_attr_class_cites_phase5_dep() {
-        let bk = make_bk();
-        let desc = make_classdesc(&bk, "pkg.Foo");
-        let cd = ClassDef::new(&bk, &desc);
-        let err = ClassDef::read_attr_class(&cd).unwrap_err();
-        assert!(err.msg.as_deref().unwrap().contains("classdesc c3 dep"));
     }
 
     #[test]
