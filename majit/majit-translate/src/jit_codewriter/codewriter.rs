@@ -229,6 +229,23 @@ impl CodeWriter {
                 break;
             };
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
+                // Phase I3 diagnostic — kept env-gated (MAJIT_PHASE_I3_PROBE=1)
+                // to report body-less shell leaks without breaking builds.
+                // Upstream RPython `enum_pending_graphs` never yields a
+                // jitcode whose graph is missing; when this branch fires, a
+                // producer allocated a shell under a path that
+                // `function_graphs` does not contain. The known root cause
+                // is `handle_regular_call` routing through the stateless
+                // bare-name `target_to_call_path` instead of the qualified
+                // `CallControl::target_to_path`. Fix tracked in Phase I3 of
+                // the eval-loop automation plan; currently blocked on Phase
+                // J (cascading 17 op-shape handler / emit-side fixes).
+                if std::env::var_os("MAJIT_PHASE_I3_PROBE").is_some() {
+                    eprintln!(
+                        "[phase-i3-probe] drain: body-less shell path={:?} idx={}",
+                        path.segments, jitcode.index
+                    );
+                }
                 continue;
             };
             let _ssarepr = self.transform_graph_to_jitcode(&graph, callcontrol, config, &jitcode);
