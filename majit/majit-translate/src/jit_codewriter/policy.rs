@@ -303,16 +303,10 @@ fn block_exit_targets(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
         Some(b) => b,
         None => return Vec::new(),
     };
-    if !block.exits.is_empty() {
-        return block.exits.iter().map(|link| link.target.0).collect();
-    }
-    match &block.terminator {
-        Terminator::Goto { target, .. } => vec![target.0],
-        Terminator::Branch {
-            if_true, if_false, ..
-        } => vec![if_true.0, if_false.0],
-        Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => Vec::new(),
-    }
+    // RPython `flowspace/model.py:66-76` FunctionGraph.iterblocks derives
+    // the successor set from `Block.exits` only; final blocks
+    // (`exits == ()`) have no outgoing targets.
+    block.exits.iter().map(|link| link.target.0).collect()
 }
 
 /// `rpython.jit.metainterp.history.getkind(TYPE, ...)`.
@@ -393,10 +387,13 @@ mod tests {
         // Build a graph with a self-loop on block 0.
         let mut g = FunctionGraph::new("loopy");
         let entry = g.startblock;
-        g.blocks[entry.0].terminator = crate::model::Terminator::Goto {
-            target: entry,
-            args: Vec::new(),
-        };
+        g.set_terminator(
+            entry,
+            crate::model::Terminator::Goto {
+                target: entry,
+                args: Vec::new(),
+            },
+        );
         let loopy = SemanticFunction {
             name: "loopy".into(),
             graph: g.clone(),
@@ -466,10 +463,13 @@ mod tests {
     fn find_backedges_detects_self_loop() {
         let mut g = FunctionGraph::new("loop");
         let entry = g.startblock;
-        g.blocks[entry.0].terminator = crate::model::Terminator::Goto {
-            target: entry,
-            args: Vec::new(),
-        };
+        g.set_terminator(
+            entry,
+            crate::model::Terminator::Goto {
+                target: entry,
+                args: Vec::new(),
+            },
+        );
         let edges = find_backedges(&g);
         assert_eq!(edges, vec![(entry.0, entry.0)]);
     }

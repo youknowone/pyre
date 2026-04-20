@@ -2347,7 +2347,6 @@ fn remap_terminator(
                 .map(|v| remap_value(v, aliases))
                 .collect(),
         },
-        Terminator::Return(val) => Terminator::Return(val.map(|v| remap_value(v, aliases))),
         Terminator::Abort { reason } => Terminator::Abort {
             reason: reason.clone(),
         },

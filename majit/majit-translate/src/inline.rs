@@ -202,51 +202,60 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             .collect();
         graph.blocks[new_block_id.0].operations = new_ops;
 
-        // Remap terminator, replacing Return with Goto to merge block.
-        // A callee `Return` has no exits metadata, so when we rewrite it
-        // to a merge-block Goto the exits must be derived from the NEW
-        // terminator; otherwise the merged block would end up with a
-        // control-flow terminator and an empty `exits`, violating
-        // upstream's "`Block.exitswitch`/`Block.exits` is the single
-        // CFG source of truth" invariant (`flowspace/model.py:174`).
-        let was_return = matches!(&callee_block.terminator, Terminator::Return(_));
-        let new_terminator = match &callee_block.terminator {
-            Terminator::Return(Some(ret_val)) => {
-                let remapped_ret = value_map[ret_val];
-                if let Some((merge_id, ref merge_args)) = merge_block_id {
+        // Identify the callee's canonical returnblock by ID rather than
+        // by Terminator::Return variant, matching upstream
+        // rpython/translator/backendopt/inline.py:289 rewire_returnblock
+        // which locates the returnblock as graph_to_inline.returnblock
+        // and rewires its exits to point at the caller's afterblock.
+        let is_returnblock = callee_block.id == callee.returnblock;
+        let new_terminator = if is_returnblock {
+            let ret_val = callee_block.inputargs.first().map(|v| value_map[v]);
+            // When the caller had an afterblock (merge_block_id), wire
+            // the callee returnblock to it per upstream
+            // rewire_returnblock (`backendopt/inline.py:289-296`).
+            // When there is no afterblock (the call was the caller
+            // block's only statement and the block terminates in
+            // Unreachable), forward to the caller graph's canonical
+            // returnblock so the inlined function's return value becomes
+            // the caller's return value — still a Goto into a final
+            // block, matching upstream's exits=[Link(..., returnblock)]
+            // shape rather than a separate Terminator::Return variant.
+            let caller_returnblock = graph.returnblock;
+            match (&merge_block_id, ret_val) {
+                (Some((merge_id, merge_args)), Some(remapped_ret)) => {
                     if merge_args.is_empty() {
                         Terminator::Goto {
-                            target: merge_id,
+                            target: *merge_id,
                             args: vec![],
                         }
                     } else {
                         Terminator::Goto {
-                            target: merge_id,
+                            target: *merge_id,
                             args: vec![remapped_ret],
                         }
                     }
-                } else {
-                    // No after ops — callee return becomes caller return
-                    Terminator::Return(Some(remapped_ret))
                 }
+                (Some((merge_id, _)), None) => Terminator::Goto {
+                    target: *merge_id,
+                    args: vec![],
+                },
+                (None, Some(remapped_ret)) => Terminator::Goto {
+                    target: caller_returnblock,
+                    args: vec![remapped_ret],
+                },
+                (None, None) => Terminator::Goto {
+                    target: caller_returnblock,
+                    args: vec![],
+                },
             }
-            Terminator::Return(None) => {
-                if let Some((merge_id, _)) = merge_block_id {
-                    Terminator::Goto {
-                        target: merge_id,
-                        args: vec![],
-                    }
-                } else {
-                    Terminator::Return(None)
-                }
-            }
-            other => remap_terminator(other, &value_map, &block_map),
+        } else {
+            remap_terminator(&callee_block.terminator, &value_map, &block_map)
         };
         // `set_terminator` resyncs `exitswitch`/`exits` from the
         // terminator and stamps `prevblock = new_block_id` on each
         // derived link (`model.rs::resync_block_exits`).
         graph.set_terminator(new_block_id, new_terminator);
-        if !was_return {
+        if !is_returnblock {
             // Preserve the callee block's upstream CFG shape (can-raise,
             // typed-exception, bool-branch metadata) with renamed
             // values and blocks.  `set_control_flow_metadata` stamps
@@ -708,7 +717,6 @@ fn remap_terminator(
             if_false: rb(if_false),
             false_args: false_args.iter().map(rv).collect(),
         },
-        Terminator::Return(v) => Terminator::Return(v.as_ref().map(rv)),
         Terminator::Abort { reason } => Terminator::Abort {
             reason: reason.clone(),
         },
@@ -868,8 +876,7 @@ fn terminator_value_refs(term: &Terminator) -> Vec<ValueId> {
             refs.extend(false_args);
             refs
         }
-        Terminator::Return(Some(v)) => vec![*v],
-        Terminator::Return(None) | Terminator::Abort { .. } | Terminator::Unreachable => vec![],
+        Terminator::Abort { .. } | Terminator::Unreachable => vec![],
     }
 }
 
@@ -928,7 +935,6 @@ fn remap_value_in_terminator(term: &Terminator, old: ValueId, new: ValueId) -> T
             if_false: *if_false,
             false_args: false_args.iter().map(rv).collect(),
         },
-        Terminator::Return(v) => Terminator::Return(v.as_ref().map(rv)),
         Terminator::Abort { reason } => Terminator::Abort {
             reason: reason.clone(),
         },
@@ -966,7 +972,7 @@ mod tests {
             },
             true,
         );
-        g.set_terminator(entry, Terminator::Return(result));
+        g.set_return(entry, result);
         g
     }
 
@@ -992,7 +998,7 @@ mod tests {
             },
             true,
         );
-        caller.set_terminator(entry, Terminator::Return(result));
+        caller.set_return(entry, result);
 
         let callee = make_simple_callee();
 
@@ -1036,7 +1042,7 @@ mod tests {
             },
             true,
         );
-        caller.set_terminator(entry, Terminator::Return(result));
+        caller.set_return(entry, result);
 
         let cc = CallControl::new(); // empty — no graphs registered
         let count = inline_graph(&mut caller, &cc, 3);
@@ -1076,7 +1082,7 @@ mod tests {
             },
             true,
         );
-        outer.set_terminator(entry, Terminator::Return(result));
+        outer.set_return(entry, result);
 
         // caller: fn caller(x) -> Call("outer", [x])
         let mut caller = FunctionGraph::new("caller");
@@ -1098,7 +1104,7 @@ mod tests {
             },
             true,
         );
-        caller.set_terminator(centry, Terminator::Return(result));
+        caller.set_return(centry, result);
 
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), inner);
@@ -1150,7 +1156,7 @@ mod tests {
             },
             true,
         );
-        caller.set_terminator(entry, Terminator::Return(result));
+        caller.set_return(entry, result);
 
         let mut cc = CallControl::new();
         cc.register_function_graph(CallPath::from_segments(["callee"]), callee);

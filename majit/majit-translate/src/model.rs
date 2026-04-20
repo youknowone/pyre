@@ -687,10 +687,7 @@ pub fn exception_exitcase() -> ExitCase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Terminator {
     /// Unconditional jump. `args` → target.inputargs.
-    Goto {
-        target: BlockId,
-        args: Vec<ValueId>,
-    },
+    Goto { target: BlockId, args: Vec<ValueId> },
     /// Conditional branch. Each arm carries its own args.
     Branch {
         cond: ValueId,
@@ -699,10 +696,15 @@ pub enum Terminator {
         if_false: BlockId,
         false_args: Vec<ValueId>,
     },
-    Return(Option<ValueId>),
-    Abort {
-        reason: String,
-    },
+    /// PRE-EXISTING-ADAPTATION (Gap B — to be removed) — pyre-only
+    /// terminator for unrecoverable exception paths.  Upstream routes
+    /// every raise through `graph.exceptblock` via a `Link(..., exceptblock)`.
+    /// See `front/ast.rs::build_call_graph` for the last producer.
+    Abort { reason: String },
+    /// "No terminator yet" placeholder.  Upstream never produces this
+    /// variant; it marks blocks before the front-end has filled in a
+    /// concrete `exits`, and final blocks (returnblock / exceptblock)
+    /// whose canonical upstream shape is `operations=()` + `exits=()`.
     Unreachable,
 }
 
@@ -757,9 +759,7 @@ pub fn control_flow_from_terminator(terminator: &Terminator) -> (Option<ExitSwit
                 Link::new(true_args.clone(), *if_true, Some(ExitCase::Bool(true))),
             ],
         ),
-        Terminator::Return(_) | Terminator::Abort { .. } | Terminator::Unreachable => {
-            (None, Vec::new())
-        }
+        Terminator::Abort { .. } | Terminator::Unreachable => (None, Vec::new()),
     }
 }
 
@@ -841,13 +841,19 @@ impl FunctionGraph {
                     exits: Vec::new(),
                     terminator: Terminator::Unreachable,
                 },
+                // RPython `flowspace/model.py:17-25` `FunctionGraph.__init__`:
+                // returnblock and exceptblock are final blocks with empty
+                // operations and `exits = ()`.  There is no upstream
+                // terminator variant; pyre tracks "no terminator" with the
+                // `Unreachable` placeholder until the field itself is
+                // removed (Gap B).
                 Block {
                     id: returnblock,
                     inputargs: vec![return_value],
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
-                    terminator: Terminator::Return(Some(return_value)),
+                    terminator: Terminator::Unreachable,
                 },
                 Block {
                     id: exceptblock,
@@ -855,7 +861,7 @@ impl FunctionGraph {
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
-                    terminator: Terminator::Return(None),
+                    terminator: Terminator::Unreachable,
                 },
             ],
             notes: Vec::new(),

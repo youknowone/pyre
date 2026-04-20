@@ -284,7 +284,7 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                 Terminator::Abort { .. } | Terminator::Unreachable => {
                     // Terminal — no jump
                 }
-                Terminator::Return(_) | Terminator::Goto { .. } | Terminator::Branch { .. } => {
+                Terminator::Goto { .. } | Terminator::Branch { .. } => {
                     panic!("block has control-flow terminator without synchronized exits metadata");
                 }
             }
