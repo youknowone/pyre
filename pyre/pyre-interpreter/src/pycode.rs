@@ -32,7 +32,7 @@ pub struct W_CodeObject {
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
     /// PyPy: `PyCode.w_globals`.
-    pub w_globals: *mut crate::PyNamespace,
+    pub w_globals: *mut crate::DictStorage,
 }
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
@@ -119,7 +119,7 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
 
 /// PyPy: `PyCode.w_globals`.
 #[inline]
-pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> *mut crate::PyNamespace {
+pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> *mut crate::DictStorage {
     if obj.is_null() {
         return std::ptr::null_mut();
     }
@@ -128,7 +128,7 @@ pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> *mut crate::PyNamespace 
 
 /// PyPy: `PyCode.w_globals = w_globals`.
 #[inline]
-pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::PyNamespace) {
+pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::DictStorage) {
     if obj.is_null() {
         return;
     }
@@ -141,7 +141,7 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::PyNa
 #[inline]
 pub unsafe fn w_code_frame_stores_global(
     obj: PyObjectRef,
-    w_globals: *mut crate::PyNamespace,
+    w_globals: *mut crate::DictStorage,
 ) -> bool {
     if obj.is_null() {
         return false;

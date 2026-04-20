@@ -52,12 +52,12 @@ pub struct PyreMetaInterp {
     pub framestack: Vec<MetaInterpFrame>,
     pub portal_call_depth: i32,
     pub jitcode: *const (),
-    pub namespace: *mut pyre_interpreter::PyNamespace,
+    pub namespace: *mut pyre_interpreter::DictStorage,
     inline_trace_base: usize,
 }
 
 impl PyreMetaInterp {
-    pub fn new(jitcode: *const (), namespace: *mut pyre_interpreter::PyNamespace) -> Self {
+    pub fn new(jitcode: *const (), namespace: *mut pyre_interpreter::DictStorage) -> Self {
         Self {
             framestack: Vec::new(),
             portal_call_depth: -1,

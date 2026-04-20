@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::{CodeFlags, CodeObject};
-use crate::{PyExecutionContext, PyNamespace};
+use crate::{DictStorage, PyExecutionContext};
 use pyre_object::FixedObjectArray;
 use pyre_object::*;
 
@@ -72,7 +72,7 @@ pub struct PyFrame {
     /// Virtualizable static field (interp_jit.py:29).
     pub lastblock: *mut FrameBlock,
     /// pyframe.py:49 / interp_jit.py:31 w_globals.
-    pub w_globals: *mut PyNamespace,
+    pub w_globals: *mut DictStorage,
     /// Virtualizable token — set by JIT when this frame is virtualized.
     /// 0 = not virtualized, nonzero = pointer to JIT state.
     pub vable_token: usize,
@@ -233,9 +233,9 @@ pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
 #[derive(Clone)]
 pub struct FrameDebugData {
     /// pyframe.py:44
-    pub w_locals: *mut PyNamespace,
+    pub w_locals: *mut DictStorage,
     /// pyframe.py:49 — set in __init__ from pycode.w_globals
-    pub w_globals: *mut PyNamespace,
+    pub w_globals: *mut DictStorage,
     /// pyframe.py:37
     pub w_f_trace: PyObjectRef,
     /// pyframe.py:40
@@ -436,7 +436,7 @@ impl PyFrame {
 
     /// pyframe.py:129-133 get_w_globals
     #[inline]
-    pub fn get_w_globals(&self) -> *mut PyNamespace {
+    pub fn get_w_globals(&self) -> *mut DictStorage {
         match self.getdebug_data() {
             Some(data) => data.w_globals,
             None => unsafe { crate::w_code_get_w_globals(self.pycode as PyObjectRef) },
@@ -460,14 +460,14 @@ impl PyFrame {
 
     /// pyframe.py:147 get_w_locals
     #[inline]
-    pub fn get_w_locals(&self) -> *mut PyNamespace {
+    pub fn get_w_locals(&self) -> *mut DictStorage {
         self.getdebug_data()
             .map_or(std::ptr::null_mut(), |data| data.w_locals)
     }
 
     /// pyframe.py:583-588 getdictscope
     #[inline]
-    pub fn getdictscope(&mut self) -> *mut PyNamespace {
+    pub fn getdictscope(&mut self) -> *mut DictStorage {
         self.fast2locals();
         self.get_w_locals()
     }
@@ -477,7 +477,7 @@ impl PyFrame {
     pub fn __init__(
         &mut self,
         code: *const (),
-        w_globals: *mut PyNamespace,
+        w_globals: *mut DictStorage,
         outer_func: PyObjectRef,
     ) {
         let _ = outer_func;
@@ -528,13 +528,13 @@ impl PyFrame {
 
     /// PyPy-compatible `fget_getdictscope`.
     #[inline]
-    pub fn fget_getdictscope(&mut self) -> *mut PyNamespace {
+    pub fn fget_getdictscope(&mut self) -> *mut DictStorage {
         self.getdictscope()
     }
 
     /// PyPy-compatible `fget_w_globals`.
     #[inline]
-    pub fn fget_w_globals(&self) -> *mut PyNamespace {
+    pub fn fget_w_globals(&self) -> *mut DictStorage {
         self.get_w_globals()
     }
 
@@ -561,7 +561,7 @@ impl PyFrame {
         let flags = code.flags;
         if !flags.contains(CodeFlags::OPTIMIZED) {
             let w_locals = if flags.contains(CodeFlags::NEWLOCALS) {
-                Box::into_raw(Box::new(PyNamespace::new()))
+                Box::into_raw(Box::new(DictStorage::new()))
             } else {
                 self.get_w_globals()
             };
@@ -607,13 +607,13 @@ impl PyFrame {
 
     /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
     #[inline]
-    pub fn setdictscope(&mut self, w_locals: *mut PyNamespace) {
+    pub fn setdictscope(&mut self, w_locals: *mut DictStorage) {
         self.setdictscope_with_options(w_locals, false);
     }
 
     /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
     #[inline]
-    pub fn setdictscope_with_options(&mut self, w_locals: *mut PyNamespace, skip_free_vars: bool) {
+    pub fn setdictscope_with_options(&mut self, w_locals: *mut DictStorage, skip_free_vars: bool) {
         self.getorcreate_debug_data(-1).w_locals = w_locals;
         self.locals2fast(skip_free_vars);
     }
@@ -622,7 +622,7 @@ impl PyFrame {
     /// Used by MIFrame Box tracking when concrete_frame is unavailable.
     pub fn new_minimal(
         code: *const (),
-        w_globals: *mut crate::PyNamespace,
+        w_globals: *mut crate::DictStorage,
         execution_context: *const PyExecutionContext,
     ) -> Self {
         let raw =
@@ -671,10 +671,10 @@ impl PyFrame {
     /// The `Rc` is leaked via `Rc::into_raw` — consistent with pyre's
     /// memory model where code objects and namespaces are also leaked.
     pub fn new_with_context(code: CodeObject, execution_context: Rc<PyExecutionContext>) -> Self {
-        let mut w_globals = Box::new(execution_context.fresh_namespace());
+        let mut w_globals = Box::new(execution_context.fresh_dict_storage());
         w_globals.fix_ptr();
         // Set __name__ — PyPy: Module.__init__ sets __name__ in w_dict
-        crate::namespace_store(
+        crate::dict_storage_store(
             &mut w_globals,
             "__name__",
             pyre_object::w_str_new("__main__"),
@@ -693,7 +693,7 @@ impl PyFrame {
     pub fn new_with_namespace(
         code: *const (),
         execution_context: *const PyExecutionContext,
-        w_globals: *mut PyNamespace,
+        w_globals: *mut DictStorage,
     ) -> Self {
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
@@ -1393,7 +1393,7 @@ impl PyFrame {
         let mut w_locals = d.w_locals;
         let mut write = false;
         if w_locals.is_null() {
-            w_locals = Box::into_raw(Box::new(PyNamespace::new()));
+            w_locals = Box::into_raw(Box::new(DictStorage::new()));
             write = true;
         }
         let w_locals_ref = unsafe { &mut *w_locals };
@@ -1494,7 +1494,7 @@ impl PyFrame {
     pub fn new_for_call(
         code: *const (),
         args: &[PyObjectRef],
-        globals: *mut PyNamespace,
+        globals: *mut DictStorage,
         execution_context: *const PyExecutionContext,
     ) -> Self {
         Self::new_for_call_with_closure(code, args, globals, execution_context, PY_NULL)
@@ -1504,7 +1504,7 @@ impl PyFrame {
     pub fn new_for_call_with_closure(
         code: *const (),
         args: &[PyObjectRef],
-        globals: *mut PyNamespace,
+        globals: *mut DictStorage,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
     ) -> Self {

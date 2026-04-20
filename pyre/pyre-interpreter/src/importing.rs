@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::{CodeObject, Mode, compile_source_with_filename};
-use crate::{PyExecutionContext, PyNamespace, namespace_load, namespace_store};
+use crate::{DictStorage, PyExecutionContext, dict_storage_load, dict_storage_store};
 use pyre_object::*;
 
 use crate::eval::eval_frame_plain;
@@ -33,9 +33,9 @@ thread_local! {
     static SYS_PATH: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
     /// Builtin modules registry — PyPy equivalent: space.builtin_modules
     ///
-    /// Maps module name → initializer function that populates a PyNamespace.
+    /// Maps module name → initializer function that populates a DictStorage.
     /// Each builtin module is lazily created on first import.
-    static BUILTIN_MODULES: RefCell<HashMap<&'static str, fn(&mut PyNamespace)>> =
+    static BUILTIN_MODULES: RefCell<HashMap<&'static str, fn(&mut DictStorage)>> =
         RefCell::new(HashMap::new());
 }
 
@@ -45,7 +45,7 @@ thread_local! {
 /// Register a builtin module initializer.
 ///
 /// PyPy equivalent: Module.install() → space.builtin_modules[name] = mod
-pub fn register_builtin_module(name: &'static str, init: fn(&mut PyNamespace)) {
+pub fn register_builtin_module(name: &'static str, init: fn(&mut DictStorage)) {
     BUILTIN_MODULES.with(|m| {
         m.borrow_mut().insert(name, init);
     });
@@ -148,51 +148,51 @@ pub fn install_builtin_modules() {
 }
 
 /// Empty module initializer for C-extension stubs.
-fn empty_module_init(_ns: &mut PyNamespace) {}
+fn empty_module_init(_ns: &mut DictStorage) {}
 
 /// gc module stub — enough to let `import gc` succeed.
-fn init_gc(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_gc(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "collect",
         crate::make_builtin_function("collect", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "disable",
         crate::make_builtin_function("disable", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "enable",
         crate::make_builtin_function("enable", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "isenabled",
         crate::make_builtin_function("isenabled", |_| Ok(pyre_object::w_bool_from(false))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_objects",
         crate::make_builtin_function("get_objects", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_referrers",
         crate::make_builtin_function("get_referrers", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_referents",
         crate::make_builtin_function("get_referents", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "set_threshold",
         crate::make_builtin_function("set_threshold", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_threshold",
         crate::make_builtin_function("get_threshold", |_| {
@@ -203,7 +203,7 @@ fn init_gc(ns: &mut PyNamespace) {
             ]))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_count",
         crate::make_builtin_function("get_count", |_| {
@@ -214,34 +214,34 @@ fn init_gc(ns: &mut PyNamespace) {
             ]))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "is_tracked",
         crate::make_builtin_function("is_tracked", |_| Ok(pyre_object::w_bool_from(false))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "is_finalized",
         crate::make_builtin_function("is_finalized", |_| Ok(pyre_object::w_bool_from(false))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "freeze",
         crate::make_builtin_function("freeze", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(ns, "callbacks", pyre_object::w_list_new(vec![]));
-    crate::namespace_store(ns, "garbage", pyre_object::w_list_new(vec![]));
-    crate::namespace_store(ns, "DEBUG_STATS", pyre_object::w_int_new(1));
-    crate::namespace_store(ns, "DEBUG_COLLECTABLE", pyre_object::w_int_new(2));
-    crate::namespace_store(ns, "DEBUG_UNCOLLECTABLE", pyre_object::w_int_new(4));
-    crate::namespace_store(ns, "DEBUG_SAVEALL", pyre_object::w_int_new(32));
-    crate::namespace_store(ns, "DEBUG_LEAK", pyre_object::w_int_new(38));
+    crate::dict_storage_store(ns, "callbacks", pyre_object::w_list_new(vec![]));
+    crate::dict_storage_store(ns, "garbage", pyre_object::w_list_new(vec![]));
+    crate::dict_storage_store(ns, "DEBUG_STATS", pyre_object::w_int_new(1));
+    crate::dict_storage_store(ns, "DEBUG_COLLECTABLE", pyre_object::w_int_new(2));
+    crate::dict_storage_store(ns, "DEBUG_UNCOLLECTABLE", pyre_object::w_int_new(4));
+    crate::dict_storage_store(ns, "DEBUG_SAVEALL", pyre_object::w_int_new(32));
+    crate::dict_storage_store(ns, "DEBUG_LEAK", pyre_object::w_int_new(38));
 }
 
 /// unicodedata module stub — provides normalize() and category().
-fn init_unicodedata(ns: &mut PyNamespace) {
+fn init_unicodedata(ns: &mut DictStorage) {
     // unicodedata.normalize(form, unistr) → unistr (stub: returns input unchanged)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "normalize",
         crate::make_builtin_function("normalize", |args| {
@@ -253,13 +253,13 @@ fn init_unicodedata(ns: &mut PyNamespace) {
         }),
     );
     // unicodedata.category(chr) → str (stub: returns "Cn" = unassigned)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "category",
         crate::make_builtin_function("category", |_| Ok(pyre_object::w_str_new("Cn"))),
     );
     // unicodedata.name(chr, default=None) → str
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "name",
         crate::make_builtin_function("name", |args| {
@@ -271,7 +271,7 @@ fn init_unicodedata(ns: &mut PyNamespace) {
         }),
     );
     // unicodedata.lookup(name) → chr
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "lookup",
         crate::make_builtin_function("lookup", |_| {
@@ -279,7 +279,7 @@ fn init_unicodedata(ns: &mut PyNamespace) {
         }),
     );
     // unicodedata.decimal(chr, default=None) → int
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "decimal",
         crate::make_builtin_function("decimal", |args| {
@@ -291,7 +291,7 @@ fn init_unicodedata(ns: &mut PyNamespace) {
         }),
     );
     // unicodedata.numeric(chr, default=None) → float
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "numeric",
         crate::make_builtin_function("numeric", |args| {
@@ -303,7 +303,7 @@ fn init_unicodedata(ns: &mut PyNamespace) {
         }),
     );
     // unicodedata.unidata_version
-    crate::namespace_store(ns, "unidata_version", pyre_object::w_str_new("15.1.0"));
+    crate::dict_storage_store(ns, "unidata_version", pyre_object::w_str_new("15.1.0"));
     // unicodedata.ucd_3_2_0 — alias for the module itself (used by IDNA)
     // We store a sentinel; os_helper only checks that the module imported.
 }
@@ -313,7 +313,7 @@ fn init_unicodedata(ns: &mut PyNamespace) {
 /// Implements just enough to let `struct.py` load: `pack`, `unpack`,
 /// `calcsize`, `_clearcache`, and the `error` type. Each packer handles
 /// the format codes pyre actually uses during import (`<q`, `<d`, etc.).
-fn init_struct(ns: &mut PyNamespace) {
+fn init_struct(ns: &mut DictStorage) {
     fn parse_format(fmt: &str) -> (char, Vec<char>) {
         // Returns (byte_order, codes).
         let chars = fmt.chars();
@@ -338,13 +338,13 @@ fn init_struct(ns: &mut PyNamespace) {
             _ => 0,
         }
     }
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_clearcache",
         crate::make_builtin_function("_clearcache", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(ns, "error", crate::typedef::w_object());
-    crate::namespace_store(
+    crate::dict_storage_store(ns, "error", crate::typedef::w_object());
+    crate::dict_storage_store(
         ns,
         "calcsize",
         crate::make_builtin_function("calcsize", |args| {
@@ -366,7 +366,7 @@ fn init_struct(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(total as i64))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "pack",
         crate::make_builtin_function("pack", |args| {
@@ -453,7 +453,7 @@ fn init_struct(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bytes_from_bytes(&out))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "unpack",
         crate::make_builtin_function("unpack", |args| {
@@ -554,19 +554,19 @@ fn init_struct(ns: &mut PyNamespace) {
             Ok(pyre_object::w_tuple_new(out))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "unpack_from",
         crate::make_builtin_function("unpack_from", |_| Ok(pyre_object::w_tuple_new(vec![]))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "iter_unpack",
         crate::make_builtin_function("iter_unpack", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
     // Struct class — minimal constructor returning instance with format
     // attribute. Used by struct.Struct(fmt).pack/unpack.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "Struct",
         crate::make_builtin_function("Struct", |args| {
@@ -584,7 +584,7 @@ fn init_struct(ns: &mut PyNamespace) {
 /// congruential generator. Good enough for `random.py` to construct a
 /// `random._inst` at module import time; real tests can then use the
 /// Python `random.Random` subclass as a drop-in.
-fn init_random(ns: &mut PyNamespace) {
+fn init_random(ns: &mut DictStorage) {
     fn random_type() -> PyObjectRef {
         thread_local! {
             static RANDOM_TYPE: std::cell::OnceCell<PyObjectRef> = const { std::cell::OnceCell::new() };
@@ -595,7 +595,7 @@ fn init_random(ns: &mut PyNamespace) {
                     // random_method_* are defined in importing.rs; routing
                     // through make_builtin_function binds them as unbound
                     // methods so `rand.random()` calls pass `self` as args[0].
-                    crate::namespace_store(
+                    crate::dict_storage_store(
                         ns,
                         "__init__",
                         crate::make_builtin_function("__init__", |args| {
@@ -618,7 +618,7 @@ fn init_random(ns: &mut PyNamespace) {
                             Ok(pyre_object::w_none())
                         }),
                     );
-                    crate::namespace_store(
+                    crate::dict_storage_store(
                         ns,
                         "seed",
                         crate::make_builtin_function("seed", |args| {
@@ -641,7 +641,7 @@ fn init_random(ns: &mut PyNamespace) {
                             Ok(pyre_object::w_none())
                         }),
                     );
-                    crate::namespace_store(
+                    crate::dict_storage_store(
                         ns,
                         "random",
                         crate::make_builtin_function("random", |args| {
@@ -663,7 +663,7 @@ fn init_random(ns: &mut PyNamespace) {
                             Ok(pyre_object::w_float_new((x as f64) / (u64::MAX as f64)))
                         }),
                     );
-                    crate::namespace_store(
+                    crate::dict_storage_store(
                         ns,
                         "getrandbits",
                         crate::make_builtin_function("getrandbits", |args| {
@@ -689,7 +689,7 @@ fn init_random(ns: &mut PyNamespace) {
                             Ok(pyre_object::w_int_new((x & mask) as i64))
                         }),
                     );
-                    crate::namespace_store(
+                    crate::dict_storage_store(
                         ns,
                         "getstate",
                         crate::make_builtin_function("getstate", |args| {
@@ -698,7 +698,7 @@ fn init_random(ns: &mut PyNamespace) {
                             Ok(pyre_object::w_tuple_new(vec![state]))
                         }),
                     );
-                    crate::namespace_store(
+                    crate::dict_storage_store(
                         ns,
                         "setstate",
                         crate::make_builtin_function("setstate", |args| {
@@ -728,7 +728,7 @@ fn init_random(ns: &mut PyNamespace) {
             })
         })
     }
-    crate::namespace_store(ns, "Random", random_type());
+    crate::dict_storage_store(ns, "Random", random_type());
 }
 
 /// `_locale` C-extension stub — PyPy: pypy/module/_locale/.
@@ -738,23 +738,23 @@ fn init_random(ns: &mut PyNamespace) {
 /// This mirrors the `except ImportError` fallback in the stdlib's
 /// `locale` module, but routed through pyre's builtin-module registry
 /// so a single import succeeds.
-fn init_locale(ns: &mut PyNamespace) {
+fn init_locale(ns: &mut DictStorage) {
     // Locale category constants — match POSIX values.
-    crate::namespace_store(ns, "LC_CTYPE", pyre_object::w_int_new(0));
-    crate::namespace_store(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
-    crate::namespace_store(ns, "LC_TIME", pyre_object::w_int_new(2));
-    crate::namespace_store(ns, "LC_COLLATE", pyre_object::w_int_new(3));
-    crate::namespace_store(ns, "LC_MONETARY", pyre_object::w_int_new(4));
-    crate::namespace_store(ns, "LC_MESSAGES", pyre_object::w_int_new(5));
-    crate::namespace_store(ns, "LC_ALL", pyre_object::w_int_new(6));
-    crate::namespace_store(ns, "CHAR_MAX", pyre_object::w_int_new(127));
+    crate::dict_storage_store(ns, "LC_CTYPE", pyre_object::w_int_new(0));
+    crate::dict_storage_store(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
+    crate::dict_storage_store(ns, "LC_TIME", pyre_object::w_int_new(2));
+    crate::dict_storage_store(ns, "LC_COLLATE", pyre_object::w_int_new(3));
+    crate::dict_storage_store(ns, "LC_MONETARY", pyre_object::w_int_new(4));
+    crate::dict_storage_store(ns, "LC_MESSAGES", pyre_object::w_int_new(5));
+    crate::dict_storage_store(ns, "LC_ALL", pyre_object::w_int_new(6));
+    crate::dict_storage_store(ns, "CHAR_MAX", pyre_object::w_int_new(127));
     // Error alias — locale.py does `Error = ValueError` when _locale is
     // missing; here we expose a real placeholder that is a str so that
     // `except _locale.Error` still compiles (match falls through).
-    crate::namespace_store(ns, "Error", pyre_object::w_str_new("Error"));
+    crate::dict_storage_store(ns, "Error", pyre_object::w_str_new("Error"));
 
     // localeconv() — returns the 'C' locale parameters as a dict.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "localeconv",
         crate::make_builtin_function("localeconv", |_| {
@@ -786,17 +786,17 @@ fn init_locale(ns: &mut PyNamespace) {
             Ok(d)
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "setlocale",
         crate::make_builtin_function("setlocale", |_| Ok(pyre_object::w_str_new("C"))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "nl_langinfo",
         crate::make_builtin_function("nl_langinfo", |_| Ok(pyre_object::w_str_new(""))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "strcoll",
         crate::make_builtin_function("strcoll", |args| {
@@ -813,14 +813,14 @@ fn init_locale(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(0))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "strxfrm",
         crate::make_builtin_function("strxfrm", |args| {
             Ok(args.first().copied().unwrap_or(pyre_object::w_str_new("")))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getencoding",
         crate::make_builtin_function("getencoding", |_| Ok(pyre_object::w_str_new("utf-8"))),
@@ -830,13 +830,13 @@ fn init_locale(ns: &mut PyNamespace) {
 /// `_sysconfigdata_*` stub — sysconfig imports this generated module to
 /// read the CPython build variables. We expose a minimal `build_time_vars`
 /// dict that lets sysconfig initialize without crashing.
-fn init_sysconfigdata_empty(ns: &mut PyNamespace) {
+fn init_sysconfigdata_empty(ns: &mut DictStorage) {
     let vars = pyre_object::w_dict_new();
     // A few keys are load-bearing — sysconfig.get_config_vars() populates
     // them, but an import-time crash hits on 'Py_GIL_DISABLED' and
     // similar. Leave the dict empty; .get('X') returns None for unknown
     // keys which every caller already handles.
-    crate::namespace_store(ns, "build_time_vars", vars);
+    crate::dict_storage_store(ns, "build_time_vars", vars);
 }
 
 /// Shared `posix.stat_result` builtin type — a plain instance bag with
@@ -862,7 +862,7 @@ fn stat_result_type() -> PyObjectRef {
 /// libc's getpwuid(3) / getpwnam(3). The result has the same layout as
 /// CPython's pwd.struct_passwd: (pw_name, pw_passwd, pw_uid, pw_gid,
 /// pw_gecos, pw_dir, pw_shell).
-fn init_pwd(ns: &mut PyNamespace) {
+fn init_pwd(ns: &mut DictStorage) {
     #[cfg(unix)]
     unsafe extern "C" {
         fn getpwuid(uid: u32) -> *mut Passwd;
@@ -907,7 +907,7 @@ fn init_pwd(ns: &mut PyNamespace) {
             ])
         }
     }
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getpwuid",
         crate::make_builtin_function("getpwuid", |args| {
@@ -935,7 +935,7 @@ fn init_pwd(ns: &mut PyNamespace) {
             Err(crate::PyError::key_error("getpwuid(): uid not found"))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getpwnam",
         crate::make_builtin_function("getpwnam", |args| {
@@ -966,7 +966,7 @@ fn init_pwd(ns: &mut PyNamespace) {
             Err(crate::PyError::key_error("getpwnam(): name not found"))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getpwall",
         crate::make_builtin_function("getpwall", |_| Ok(pyre_object::w_list_new(vec![]))),
@@ -976,8 +976,8 @@ fn init_pwd(ns: &mut PyNamespace) {
 /// atexit stub — PyPy: pypy/module/atexit/. Single-threaded pyre doesn't
 /// actually run the registered callbacks on shutdown yet; `register` accepts
 /// any callable and returns it so `@atexit.register` decorators work.
-fn init_atexit(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_atexit(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "register",
         crate::make_builtin_function("register", |args| {
@@ -985,22 +985,22 @@ fn init_atexit(ns: &mut PyNamespace) {
             Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "unregister",
         crate::make_builtin_function("unregister", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_run_exitfuncs",
         crate::make_builtin_function("_run_exitfuncs", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_clear",
         crate::make_builtin_function("_clear", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_ncallbacks",
         crate::make_builtin_function("_ncallbacks", |_| Ok(pyre_object::w_int_new(0))),
@@ -1009,8 +1009,8 @@ fn init_atexit(ns: &mut PyNamespace) {
 
 /// _signal module stub — PyPy: pypy/module/signal/. Provides the signal()
 /// function and SIG_DFL/SIG_IGN constants that signal.py wraps.
-fn init_signal_stub(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_signal_stub(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "signal",
         crate::make_builtin_function("signal", |args| {
@@ -1018,42 +1018,42 @@ fn init_signal_stub(ns: &mut PyNamespace) {
             Ok(args.get(1).copied().unwrap_or(pyre_object::w_none()))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getsignal",
         crate::make_builtin_function("getsignal", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "default_int_handler",
         crate::make_builtin_function("default_int_handler", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "set_wakeup_fd",
         crate::make_builtin_function("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1))),
     );
-    crate::namespace_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
-    crate::namespace_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
+    crate::dict_storage_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
+    crate::dict_storage_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
     // Common signal numbers (POSIX subset).
-    crate::namespace_store(ns, "SIGINT", pyre_object::w_int_new(2));
-    crate::namespace_store(ns, "SIGTERM", pyre_object::w_int_new(15));
-    crate::namespace_store(ns, "SIGHUP", pyre_object::w_int_new(1));
-    crate::namespace_store(ns, "SIGQUIT", pyre_object::w_int_new(3));
-    crate::namespace_store(ns, "SIGKILL", pyre_object::w_int_new(9));
-    crate::namespace_store(ns, "SIGUSR1", pyre_object::w_int_new(30));
-    crate::namespace_store(ns, "SIGUSR2", pyre_object::w_int_new(31));
-    crate::namespace_store(ns, "SIGPIPE", pyre_object::w_int_new(13));
-    crate::namespace_store(ns, "SIGALRM", pyre_object::w_int_new(14));
-    crate::namespace_store(ns, "SIGCHLD", pyre_object::w_int_new(20));
-    crate::namespace_store(ns, "NSIG", pyre_object::w_int_new(64));
+    crate::dict_storage_store(ns, "SIGINT", pyre_object::w_int_new(2));
+    crate::dict_storage_store(ns, "SIGTERM", pyre_object::w_int_new(15));
+    crate::dict_storage_store(ns, "SIGHUP", pyre_object::w_int_new(1));
+    crate::dict_storage_store(ns, "SIGQUIT", pyre_object::w_int_new(3));
+    crate::dict_storage_store(ns, "SIGKILL", pyre_object::w_int_new(9));
+    crate::dict_storage_store(ns, "SIGUSR1", pyre_object::w_int_new(30));
+    crate::dict_storage_store(ns, "SIGUSR2", pyre_object::w_int_new(31));
+    crate::dict_storage_store(ns, "SIGPIPE", pyre_object::w_int_new(13));
+    crate::dict_storage_store(ns, "SIGALRM", pyre_object::w_int_new(14));
+    crate::dict_storage_store(ns, "SIGCHLD", pyre_object::w_int_new(20));
+    crate::dict_storage_store(ns, "NSIG", pyre_object::w_int_new(64));
 }
 
 /// _collections_abc stub — provides _check_methods for io.py etc.
 /// The real _collections_abc.py requires ABCMeta (metaclass support).
-fn init_collections_abc(ns: &mut PyNamespace) {
+fn init_collections_abc(ns: &mut DictStorage) {
     // _check_methods(C, *methods) — check if class C has all methods
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_check_methods",
         crate::make_builtin_function("_check_methods", |args| {
@@ -1078,38 +1078,38 @@ fn init_collections_abc(ns: &mut PyNamespace) {
         }),
     );
     // Stub ABC classes
-    crate::namespace_store(ns, "Hashable", crate::typedef::w_object());
-    crate::namespace_store(ns, "Awaitable", crate::typedef::w_object());
-    crate::namespace_store(ns, "Coroutine", crate::typedef::w_object());
-    crate::namespace_store(ns, "Iterator", crate::typedef::w_object());
-    crate::namespace_store(ns, "Generator", crate::typedef::w_object());
-    crate::namespace_store(ns, "Iterable", crate::typedef::w_object());
-    crate::namespace_store(ns, "Callable", crate::typedef::w_object());
-    crate::namespace_store(ns, "Sized", crate::typedef::w_object());
-    crate::namespace_store(ns, "Container", crate::typedef::w_object());
-    crate::namespace_store(ns, "Collection", crate::typedef::w_object());
-    crate::namespace_store(ns, "Sequence", crate::typedef::w_object());
-    crate::namespace_store(ns, "MutableSequence", crate::typedef::w_object());
-    crate::namespace_store(ns, "Mapping", crate::typedef::w_object());
-    crate::namespace_store(ns, "MutableMapping", crate::typedef::w_object());
-    crate::namespace_store(ns, "Set", crate::typedef::w_object());
-    crate::namespace_store(ns, "MutableSet", crate::typedef::w_object());
-    crate::namespace_store(ns, "ByteString", crate::typedef::w_object());
-    crate::namespace_store(ns, "Buffer", crate::typedef::w_object());
-    crate::namespace_store(ns, "Reversible", crate::typedef::w_object());
-    crate::namespace_store(ns, "MappingView", crate::typedef::w_object());
-    crate::namespace_store(ns, "KeysView", crate::typedef::w_object());
-    crate::namespace_store(ns, "ItemsView", crate::typedef::w_object());
-    crate::namespace_store(ns, "ValuesView", crate::typedef::w_object());
-    crate::namespace_store(ns, "AsyncIterator", crate::typedef::w_object());
-    crate::namespace_store(ns, "AsyncGenerator", crate::typedef::w_object());
-    crate::namespace_store(ns, "AsyncIterable", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Hashable", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Awaitable", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Coroutine", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Iterator", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Generator", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Iterable", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Callable", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Sized", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Container", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Collection", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Sequence", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "MutableSequence", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Mapping", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "MutableMapping", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Set", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "MutableSet", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "ByteString", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Buffer", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "Reversible", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "MappingView", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "KeysView", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "ItemsView", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "ValuesView", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "AsyncIterator", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "AsyncGenerator", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "AsyncIterable", crate::typedef::w_object());
 }
 
 /// itertools stub
-fn init_itertools(ns: &mut PyNamespace) {
+fn init_itertools(ns: &mut DictStorage) {
     // chain(*iterables) → flat iterator
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "chain",
         crate::make_builtin_function("chain", |args| {
@@ -1123,7 +1123,7 @@ fn init_itertools(ns: &mut PyNamespace) {
         }),
     );
     // starmap stub
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "starmap",
         crate::make_builtin_function("starmap", |_| Ok(pyre_object::w_list_new(vec![]))),
@@ -1132,7 +1132,7 @@ fn init_itertools(ns: &mut PyNamespace) {
     //
     //     def W_Count___new__(space, w_subtype, w_start=0, w_step=1):
     //         return W_Count(space, w_start, w_step)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "count",
         crate::make_builtin_function("count", |args| {
@@ -1145,7 +1145,7 @@ fn init_itertools(ns: &mut PyNamespace) {
     //
     //     def W_Repeat___new__(space, w_subtype, w_obj, w_times=None):
     //         return W_Repeat(space, w_obj, w_times)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "repeat",
         crate::make_builtin_function("repeat", |args| {
@@ -1170,19 +1170,19 @@ fn init_itertools(ns: &mut PyNamespace) {
         }),
     );
     // islice
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "islice",
         crate::make_builtin_function("islice", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
     // groupby
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "groupby",
         crate::make_builtin_function("groupby", |_| Ok(pyre_object::w_none())),
     );
     // permutations(iterable, r=None) — PyPy: pypy/module/itertools/interp_itertools.py
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "permutations",
         crate::make_builtin_function("permutations", |args| {
@@ -1233,7 +1233,7 @@ fn init_itertools(ns: &mut PyNamespace) {
         }),
     );
     // combinations(iterable, r)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "combinations",
         crate::make_builtin_function("combinations", |args| {
@@ -1271,7 +1271,7 @@ fn init_itertools(ns: &mut PyNamespace) {
         }),
     );
     // product(*iterables, repeat=1)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "product",
         crate::make_builtin_function("product", |args| {
@@ -1298,7 +1298,7 @@ fn init_itertools(ns: &mut PyNamespace) {
         }),
     );
     // zip_longest(*iterables, fillvalue=None)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "zip_longest",
         crate::make_builtin_function("zip_longest", |args| {
@@ -1322,7 +1322,7 @@ fn init_itertools(ns: &mut PyNamespace) {
         }),
     );
     // accumulate(iterable) — sums only, PyPy interp_itertools W_Accumulate.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "accumulate",
         crate::make_builtin_function("accumulate", |args| {
@@ -1345,7 +1345,7 @@ fn init_itertools(ns: &mut PyNamespace) {
         }),
     );
     // compress(data, selectors)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "compress",
         crate::make_builtin_function("compress", |args| {
@@ -1368,9 +1368,9 @@ fn init_itertools(ns: &mut PyNamespace) {
 }
 
 /// _contextvars stub
-fn init_contextvars(ns: &mut PyNamespace) {
+fn init_contextvars(ns: &mut DictStorage) {
     // ContextVar(name, *, default=_MISSING) — context variable
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "ContextVar",
         crate::make_builtin_function("ContextVar", |args| {
@@ -1400,17 +1400,17 @@ fn init_contextvars(ns: &mut PyNamespace) {
             Ok(obj)
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "Context",
         crate::make_builtin_function("Context", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "Token",
         crate::make_builtin_function("Token", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "copy_context",
         crate::make_builtin_function("copy_context", |_| Ok(pyre_object::w_none())),
@@ -1418,18 +1418,18 @@ fn init_contextvars(ns: &mut PyNamespace) {
 }
 
 /// _abc stub — PyPy: pypy/module/_abc/
-fn init_abc(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_abc(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "get_cache_token",
         crate::make_builtin_function("get_cache_token", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_abc_init",
         crate::make_builtin_function("_abc_init", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_abc_register",
         crate::make_builtin_function("_abc_register", |_| Ok(pyre_object::w_none())),
@@ -1442,7 +1442,7 @@ fn init_abc(ns: &mut PyNamespace) {
     // registered via `cls.register(subclass)`. Our previous stub
     // unconditionally returned False, which broke
     // `isinstance(Fraction(1,2), numbers.Rational)`.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_abc_instancecheck",
         crate::make_builtin_function("_abc_instancecheck", |args| {
@@ -1459,7 +1459,7 @@ fn init_abc(ns: &mut PyNamespace) {
         }),
     );
     // _abc_subclasscheck(cls, subclass) — CPython: Modules/_abc.c _abc__abc_subclasscheck.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_abc_subclasscheck",
         crate::make_builtin_function("_abc_subclasscheck", |args| {
@@ -1482,17 +1482,17 @@ fn init_abc(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bool_from(false))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_get_dump",
         crate::make_builtin_function("_get_dump", |_| Ok(pyre_object::w_tuple_new(vec![]))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_reset_registry",
         crate::make_builtin_function("_reset_registry", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_reset_caches",
         crate::make_builtin_function("_reset_caches", |_| Ok(pyre_object::w_none())),
@@ -1500,8 +1500,8 @@ fn init_abc(ns: &mut PyNamespace) {
 }
 
 /// _functools stub
-fn init_functools(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_functools(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "reduce",
         crate::make_builtin_function("reduce", |_| {
@@ -1512,7 +1512,7 @@ fn init_functools(ns: &mut PyNamespace) {
     // an opaque key. For sorting str / int / tuple of those (the only paths
     // pyre's stdlib actually exercises), the items are already comparable,
     // so an identity key gives the same ordering as `cmp(a, b)` would.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "cmp_to_key",
         crate::make_builtin_function("cmp_to_key", |_args| {
@@ -1528,8 +1528,8 @@ fn init_functools(ns: &mut PyNamespace) {
 /// Single-threaded pyre: state lives in the instance dict as `_locked_count`.
 /// Methods increment/decrement this counter so Condition/RLock ownership
 /// checks see the correct state.
-fn init_lock_type(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_lock_type(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "__enter__",
         crate::make_builtin_function("__enter__", |args| {
@@ -1539,7 +1539,7 @@ fn init_lock_type(ns: &mut PyNamespace) {
             Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__exit__",
         crate::make_builtin_function("__exit__", |args| {
@@ -1550,7 +1550,7 @@ fn init_lock_type(ns: &mut PyNamespace) {
         }),
     );
     // descr_lock_acquire — PyPy: os_lock.Lock.descr_lock_acquire
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "acquire",
         crate::make_builtin_function("acquire", |args| {
@@ -1560,7 +1560,7 @@ fn init_lock_type(ns: &mut PyNamespace) {
         }),
     );
     // descr_lock_release — PyPy: os_lock.Lock.descr_lock_release
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "release",
         crate::make_builtin_function("release", |args| {
@@ -1570,7 +1570,7 @@ fn init_lock_type(ns: &mut PyNamespace) {
         }),
     );
     // descr_lock_locked — PyPy: os_lock.Lock.descr_lock_locked
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "locked",
         crate::make_builtin_function("locked", |args| {
@@ -1579,7 +1579,7 @@ fn init_lock_type(ns: &mut PyNamespace) {
         }),
     );
     // _is_owned — used by RLock/Condition in threading.py
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_is_owned",
         crate::make_builtin_function("_is_owned", |args| {
@@ -1588,7 +1588,7 @@ fn init_lock_type(ns: &mut PyNamespace) {
         }),
     );
     // _at_fork_reinit — PyPy: os_lock.Lock._at_fork_reinit (reset to unlocked)
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_at_fork_reinit",
         crate::make_builtin_function("_at_fork_reinit", |args| {
@@ -1660,22 +1660,22 @@ fn thread_handle_type() -> PyObjectRef {
     THREAD_HANDLE_TYPE_OBJ.with(|c| {
         *c.get_or_init(|| {
             crate::typedef::make_builtin_type("_ThreadHandle", |ns| {
-                crate::namespace_store(
+                crate::dict_storage_store(
                     ns,
                     "is_done",
                     crate::make_builtin_function("is_done", |_| Ok(pyre_object::w_bool_from(true))),
                 );
-                crate::namespace_store(
+                crate::dict_storage_store(
                     ns,
                     "join",
                     crate::make_builtin_function("join", |_| Ok(pyre_object::w_none())),
                 );
-                crate::namespace_store(
+                crate::dict_storage_store(
                     ns,
                     "set_result",
                     crate::make_builtin_function("set_result", |_| Ok(pyre_object::w_none())),
                 );
-                crate::namespace_store(
+                crate::dict_storage_store(
                     ns,
                     "_set_done",
                     crate::make_builtin_function("_set_done", |_| Ok(pyre_object::w_none())),
@@ -1686,72 +1686,72 @@ fn thread_handle_type() -> PyObjectRef {
 }
 
 /// _thread stub
-fn init_thread(ns: &mut PyNamespace) {
+fn init_thread(ns: &mut DictStorage) {
     let lock_tp = lock_type();
-    crate::namespace_store(ns, "LockType", lock_tp);
-    crate::namespace_store(
+    crate::dict_storage_store(ns, "LockType", lock_tp);
+    crate::dict_storage_store(
         ns,
         "RLock",
         crate::make_builtin_function("RLock", |_| Ok(pyre_object::w_instance_new(lock_type()))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "allocate_lock",
         crate::make_builtin_function("allocate_lock", |_| {
             Ok(pyre_object::w_instance_new(lock_type()))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_ident",
         crate::make_builtin_function("get_ident", |_| Ok(pyre_object::w_int_new(1))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_count",
         crate::make_builtin_function("_count", |_| Ok(pyre_object::w_int_new(1))),
     );
-    crate::namespace_store(ns, "TIMEOUT_MAX", pyre_object::w_float_new(f64::MAX));
-    crate::namespace_store(ns, "error", crate::typedef::w_object());
-    crate::namespace_store(
+    crate::dict_storage_store(ns, "TIMEOUT_MAX", pyre_object::w_float_new(f64::MAX));
+    crate::dict_storage_store(ns, "error", crate::typedef::w_object());
+    crate::dict_storage_store(
         ns,
         "start_joinable_thread",
         crate::make_builtin_function("start_joinable_thread", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_set_sentinel",
         crate::make_builtin_function("_set_sentinel", |_| {
             Ok(pyre_object::w_instance_new(lock_type()))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "stack_size",
         crate::make_builtin_function("stack_size", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_is_main_interpreter",
         crate::make_builtin_function("_is_main_interpreter", |_| {
             Ok(pyre_object::w_bool_from(true))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "daemon_threads_allowed",
         crate::make_builtin_function("daemon_threads_allowed", |_| {
             Ok(pyre_object::w_bool_from(true))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_shutdown",
         crate::make_builtin_function("_shutdown", |_| Ok(pyre_object::w_none())),
     );
     // _make_thread_handle / _ThreadHandle — threading.py:40-41
-    crate::namespace_store(ns, "_ThreadHandle", thread_handle_type());
-    crate::namespace_store(
+    crate::dict_storage_store(ns, "_ThreadHandle", thread_handle_type());
+    crate::dict_storage_store(
         ns,
         "_make_thread_handle",
         crate::make_builtin_function("_make_thread_handle", |_| {
@@ -1759,32 +1759,32 @@ fn init_thread(ns: &mut PyNamespace) {
         }),
     );
     // _get_main_thread_ident — threading.py:43
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_get_main_thread_ident",
         crate::make_builtin_function("_get_main_thread_ident", |_| Ok(pyre_object::w_int_new(1))),
     );
     // get_native_id — threading.py:46
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_native_id",
         crate::make_builtin_function("get_native_id", |_| Ok(pyre_object::w_int_new(1))),
     );
     // set_name — threading.py:52
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "set_name",
         crate::make_builtin_function("set_name", |_| Ok(pyre_object::w_none())),
     );
     // _excepthook — threading.py:1262
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_excepthook",
         crate::make_builtin_function("_excepthook", |_| Ok(pyre_object::w_none())),
     );
     // _local — PyPy: pypy/module/thread/os_local.py Local
     // Thread-local data. Single-threaded: equivalent to a plain object with dict.
-    crate::namespace_store(ns, "_local", local_type());
+    crate::dict_storage_store(ns, "_local", local_type());
 }
 
 fn local_type() -> PyObjectRef {
@@ -1806,7 +1806,7 @@ fn local_type() -> PyObjectRef {
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
-fn init_posix(ns: &mut PyNamespace) {
+fn init_posix(ns: &mut DictStorage) {
     // environ — dict populated from the host environment.
     // PyPy equivalent: posix.State.startup → _convertenviron copies
     // os.environ.items() into w_environ at interpreter startup.
@@ -1828,12 +1828,12 @@ fn init_posix(ns: &mut PyNamespace) {
             }
         }
     }
-    crate::namespace_store(ns, "environ", w_environ);
+    crate::dict_storage_store(ns, "environ", w_environ);
     // _have_functions — list of HAVE_* macro names that were defined at
     // build time. os.py uses this to populate the supports_* capability
     // sets. Advertising a representative subset lets os.py module init
     // complete successfully.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_have_functions",
         pyre_object::w_list_new(vec![
@@ -1886,7 +1886,7 @@ fn init_posix(ns: &mut PyNamespace) {
         ("SEEK_CUR", libc::SEEK_CUR as i64),
         ("SEEK_END", libc::SEEK_END as i64),
     ] {
-        crate::namespace_store(ns, name, pyre_object::w_int_new(val));
+        crate::dict_storage_store(ns, name, pyre_object::w_int_new(val));
     }
     // Non-critical constants — zero stubs are fine for os.py init.
     for name in [
@@ -1930,7 +1930,7 @@ fn init_posix(ns: &mut PyNamespace) {
         "PRIO_PGRP",
         "PRIO_USER",
     ] {
-        crate::namespace_store(ns, name, pyre_object::w_int_new(0));
+        crate::dict_storage_store(ns, name, pyre_object::w_int_new(0));
     }
     // Remaining noop stubs — functions os.py references at module level.
     // Functions with real implementations are registered individually below.
@@ -2050,7 +2050,7 @@ fn init_posix(ns: &mut PyNamespace) {
         "system",
         "popen",
     ] {
-        crate::namespace_store(
+        crate::dict_storage_store(
             ns,
             name,
             crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
@@ -2088,7 +2088,7 @@ fn init_posix(ns: &mut PyNamespace) {
     }
 
     // ── posix.open(path, flags, mode=0o777) → fd ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "open",
         crate::make_builtin_function("open", |args| {
@@ -2115,7 +2115,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.close(fd) ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "close",
         crate::make_builtin_function("close", |args| {
@@ -2132,7 +2132,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.read(fd, n) → bytes ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "read",
         crate::make_builtin_function("read", |args| {
@@ -2152,7 +2152,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.write(fd, data) → nbytes ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "write",
         crate::make_builtin_function("write", |args| {
@@ -2180,7 +2180,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.lseek(fd, offset, whence) → position ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "lseek",
         crate::make_builtin_function("lseek", |args| {
@@ -2214,19 +2214,19 @@ fn init_posix(ns: &mut PyNamespace) {
         }
         Ok(pyre_object::w_none())
     }
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "unlink",
         crate::make_builtin_function("unlink", posix_unlink),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "remove",
         crate::make_builtin_function("remove", posix_unlink),
     );
 
     // ── posix.mkdir(path, mode=0o777) ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "mkdir",
         crate::make_builtin_function("mkdir", |args| {
@@ -2250,7 +2250,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.rmdir(path) ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "rmdir",
         crate::make_builtin_function("rmdir", |args| {
@@ -2269,7 +2269,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.rename(src, dst) ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "rename",
         crate::make_builtin_function("rename", |args| {
@@ -2284,7 +2284,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.listdir(path=".") → list of str ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "listdir",
         crate::make_builtin_function("listdir", |args| {
@@ -2305,7 +2305,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.isatty(fd) → bool ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "isatty",
         crate::make_builtin_function("isatty", |args| {
@@ -2319,7 +2319,7 @@ fn init_posix(ns: &mut PyNamespace) {
     );
 
     // ── posix.urandom(n) → bytes ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "urandom",
         crate::make_builtin_function("urandom", |args| {
@@ -2348,7 +2348,7 @@ fn init_posix(ns: &mut PyNamespace) {
         instance
     }
     let terminal_size_type = crate::typedef::make_builtin_type("terminal_size", |ns| {
-        crate::namespace_store(
+        crate::dict_storage_store(
             ns,
             "__new__",
             crate::make_builtin_function("__new__", |args| {
@@ -2374,10 +2374,10 @@ fn init_posix(ns: &mut PyNamespace) {
             }),
         );
     });
-    crate::namespace_store(ns, "terminal_size", terminal_size_type);
+    crate::dict_storage_store(ns, "terminal_size", terminal_size_type);
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_terminal_size",
         crate::make_builtin_function("get_terminal_size", |_args| {
@@ -2412,7 +2412,7 @@ fn init_posix(ns: &mut PyNamespace) {
     // unchanged for str/bytes/bytearray (the protocol's identity case);
     // any other object would normally trigger __fspath__ but we don't
     // model that protocol yet.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "fspath",
         crate::make_builtin_function("fspath", |args| {
@@ -2569,7 +2569,7 @@ fn init_posix(ns: &mut PyNamespace) {
         }
     }
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "uname",
         crate::make_builtin_function("uname", |_| {
@@ -2586,17 +2586,17 @@ fn init_posix(ns: &mut PyNamespace) {
             Ok(wrapper)
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "stat",
         crate::make_builtin_function("stat", |args| stat_impl(args, true)),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "lstat",
         crate::make_builtin_function("lstat", |args| stat_impl(args, false)),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "fstat",
         crate::make_builtin_function("fstat", |args| {
@@ -2627,9 +2627,9 @@ fn init_posix(ns: &mut PyNamespace) {
     );
     // stat_result type — simple instance with hasdict so setattr works.
     // Exported so that `posix.stat_result` can be looked up.
-    crate::namespace_store(ns, "stat_result", stat_result_type());
+    crate::dict_storage_store(ns, "stat_result", stat_result_type());
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getcwd",
         crate::make_builtin_function("getcwd", |_| {
@@ -2643,7 +2643,7 @@ fn init_posix(ns: &mut PyNamespace) {
         }),
     );
     // os.getcwdb() — bytes form of getcwd.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getcwdb",
         crate::make_builtin_function("getcwdb", |_| {
@@ -2666,7 +2666,7 @@ fn init_posix(ns: &mut PyNamespace) {
         fn getgid() -> u32;
         fn getegid() -> u32;
     }
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getuid",
         crate::make_builtin_function("getuid", |_| {
@@ -2678,7 +2678,7 @@ fn init_posix(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(0))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "geteuid",
         crate::make_builtin_function("geteuid", |_| {
@@ -2690,7 +2690,7 @@ fn init_posix(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(0))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getgid",
         crate::make_builtin_function("getgid", |_| {
@@ -2702,7 +2702,7 @@ fn init_posix(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(0))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getegid",
         crate::make_builtin_function("getegid", |_| {
@@ -2715,7 +2715,7 @@ fn init_posix(ns: &mut PyNamespace) {
         }),
     );
     // os.getpid — std::process::id.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getpid",
         crate::make_builtin_function("getpid", |_| {
@@ -2725,7 +2725,7 @@ fn init_posix(ns: &mut PyNamespace) {
     // os.environ lookups from setenv / unsetenv / putenv / getenv — mutate
     // posix.environ (the dict) rather than calling libc; os.py writes back
     // into that dict in its _Environ wrapper.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getenv",
         crate::make_builtin_function("getenv", |args| {
@@ -2752,31 +2752,31 @@ fn init_posix(ns: &mut PyNamespace) {
             }
         }),
     );
-    crate::namespace_store(ns, "error", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "error", crate::typedef::w_object());
 }
 
 /// _collections C-extension stub — PyPy: pypy/module/_collections/
 /// Provides the C-accelerated deque/defaultdict/OrderedDict types.
 /// Our stubs are backed by lists/dicts, which is correct semantically
 /// but not performant. PyPy's W_Deque is a doubly-linked block list.
-fn init_collections_c(ns: &mut PyNamespace) {
+fn init_collections_c(ns: &mut DictStorage) {
     // deque(iterable=(), maxlen=None) — returns a list that we alias as deque.
     // Sufficient for collections.py's MutableSequence.register(deque).
     let deque_type = crate::typedef::make_builtin_type("deque", init_deque_type);
-    crate::namespace_store(ns, "deque", deque_type);
+    crate::dict_storage_store(ns, "deque", deque_type);
     // _deque_iterator — reuse object (just a type sentinel)
-    crate::namespace_store(ns, "_deque_iterator", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "_deque_iterator", crate::typedef::w_object());
     // defaultdict — returns a dict-like instance
     let defaultdict_type = crate::typedef::make_builtin_type("defaultdict", init_defaultdict_type);
-    crate::namespace_store(ns, "defaultdict", defaultdict_type);
+    crate::dict_storage_store(ns, "defaultdict", defaultdict_type);
     // OrderedDict — same as dict for our purposes
-    crate::namespace_store(ns, "OrderedDict", crate::typedef::w_type());
+    crate::dict_storage_store(ns, "OrderedDict", crate::typedef::w_type());
 }
 
 /// deque methods — PyPy: pypy/module/_collections/interp_deque.py W_Deque
-fn init_deque_type(ns: &mut PyNamespace) {
+fn init_deque_type(ns: &mut DictStorage) {
     // __init__(self, iterable=(), maxlen=None) — store items as __data__ list
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__init__",
         crate::make_builtin_function("__init__", |args| {
@@ -2803,7 +2803,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "append",
         crate::make_builtin_function("append", |args| {
@@ -2815,7 +2815,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "appendleft",
         crate::make_builtin_function("appendleft", |args| {
@@ -2835,7 +2835,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "pop",
         crate::make_builtin_function("pop", |args| {
@@ -2860,7 +2860,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "popleft",
         crate::make_builtin_function("popleft", |args| {
@@ -2885,7 +2885,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "clear",
         crate::make_builtin_function("clear", |args| {
@@ -2899,7 +2899,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "extend",
         crate::make_builtin_function("extend", |args| {
@@ -2914,7 +2914,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__len__",
         crate::make_builtin_function("__len__", |args| {
@@ -2929,7 +2929,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(0))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__iter__",
         crate::make_builtin_function("__iter__", |args| {
@@ -2948,7 +2948,7 @@ fn init_deque_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__getitem__",
         crate::make_builtin_function("__getitem__", |args| {
@@ -2964,8 +2964,8 @@ fn init_deque_type(ns: &mut PyNamespace) {
 }
 
 /// defaultdict — PyPy: pypy/module/_collections/interp_defaultdict.py
-fn init_defaultdict_type(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_defaultdict_type(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "__init__",
         crate::make_builtin_function("__init__", |args| {
@@ -2983,7 +2983,7 @@ fn init_defaultdict_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__getitem__",
         crate::make_builtin_function("__getitem__", |args| {
@@ -3011,7 +3011,7 @@ fn init_defaultdict_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__setitem__",
         crate::make_builtin_function("__setitem__", |args| {
@@ -3029,8 +3029,8 @@ fn init_defaultdict_type(ns: &mut PyNamespace) {
 /// opcode.py requires stack_effect + has_arg/has_const/has_name/has_jump and
 /// related classifiers. Our stubs return neutral values; full implementations
 /// would mirror CPython Python/compile.c.
-fn init_opcode_c(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_opcode_c(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "stack_effect",
         crate::make_builtin_function("stack_effect", |_| Ok(pyre_object::w_int_new(0))),
@@ -3046,18 +3046,18 @@ fn init_opcode_c(ns: &mut PyNamespace) {
         "has_local",
         "has_exc",
     ] {
-        crate::namespace_store(
+        crate::dict_storage_store(
             ns,
             name,
             crate::make_builtin_function(name, |_| Ok(pyre_object::w_bool_from(false))),
         );
     }
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_executor",
         crate::make_builtin_function("get_executor", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_specialization_stats",
         crate::make_builtin_function(
@@ -3065,21 +3065,21 @@ fn init_opcode_c(ns: &mut PyNamespace) {
             |_| Ok(pyre_object::w_dict_new()),
         ),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_intrinsic1_descs",
         crate::make_builtin_function("get_intrinsic1_descs", |_| {
             Ok(pyre_object::w_list_new(vec![]))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_intrinsic2_descs",
         crate::make_builtin_function("get_intrinsic2_descs", |_| {
             Ok(pyre_object::w_list_new(vec![]))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_opname",
         crate::make_builtin_function("get_opname", |args| {
@@ -3090,12 +3090,12 @@ fn init_opcode_c(ns: &mut PyNamespace) {
             Ok(pyre_object::w_str_new(&format!("<{code}>")))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_nb_ops",
         crate::make_builtin_function("get_nb_ops", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_special_method_names",
         crate::make_builtin_function("get_special_method_names", |_| {
@@ -3107,12 +3107,12 @@ fn init_opcode_c(ns: &mut PyNamespace) {
             ]))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_executor_count",
         crate::make_builtin_function("get_executor_count", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_hot_code",
         crate::make_builtin_function("get_hot_code", |_| Ok(pyre_object::w_list_new(vec![]))),
@@ -3121,7 +3121,7 @@ fn init_opcode_c(ns: &mut PyNamespace) {
 
 /// _opcode_metadata stub — module used by opcode.py for opmap / specializations.
 /// PyPy does not have this module; it is CPython 3.13+ specific.
-fn init_opcode_metadata(ns: &mut PyNamespace) {
+fn init_opcode_metadata(ns: &mut DictStorage) {
     // opmap — map opcode name → integer. opcode.py requires at least
     // EXTENDED_ARG. We provide a minimal baseline.
     let opmap = pyre_object::w_dict_new();
@@ -3183,22 +3183,22 @@ fn init_opcode_metadata(ns: &mut PyNamespace) {
             );
         }
     }
-    crate::namespace_store(ns, "opmap", opmap);
-    crate::namespace_store(ns, "_specializations", pyre_object::w_dict_new());
-    crate::namespace_store(ns, "_specialized_opmap", pyre_object::w_dict_new());
-    crate::namespace_store(ns, "HAVE_ARGUMENT", pyre_object::w_int_new(90));
-    crate::namespace_store(ns, "MIN_INSTRUMENTED_OPCODE", pyre_object::w_int_new(237));
+    crate::dict_storage_store(ns, "opmap", opmap);
+    crate::dict_storage_store(ns, "_specializations", pyre_object::w_dict_new());
+    crate::dict_storage_store(ns, "_specialized_opmap", pyre_object::w_dict_new());
+    crate::dict_storage_store(ns, "HAVE_ARGUMENT", pyre_object::w_int_new(90));
+    crate::dict_storage_store(ns, "MIN_INSTRUMENTED_OPCODE", pyre_object::w_int_new(237));
 }
 
 /// importlib stub — PyPy: pypy/module/importlib/
 /// Avoid loading the real importlib.__init__ since it drags in
 /// _bootstrap and _bootstrap_external.
-fn init_importlib_pkg(ns: &mut PyNamespace) {
+fn init_importlib_pkg(ns: &mut DictStorage) {
     // importlib.import_module(name, package=None) — return an imported
     // module by name. PyPy: Lib/importlib/__init__.py import_module →
     // _bootstrap._gcd_import. We defer to the interpreter's importhook
     // since it handles both builtins and source modules.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "import_module",
         crate::make_builtin_function("import_module", |args| {
@@ -3220,12 +3220,12 @@ fn init_importlib_pkg(ns: &mut PyNamespace) {
             }
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "invalidate_caches",
         crate::make_builtin_function("invalidate_caches", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "reload",
         crate::make_builtin_function("reload", |args| {
@@ -3233,38 +3233,38 @@ fn init_importlib_pkg(ns: &mut PyNamespace) {
         }),
     );
     // Mark as a package so dotted imports treat it as such.
-    crate::namespace_store(ns, "__path__", pyre_object::w_list_new(vec![]));
+    crate::dict_storage_store(ns, "__path__", pyre_object::w_list_new(vec![]));
 }
 
 /// importlib.util stub — minimal subset.
-fn init_importlib_util(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_importlib_util(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "spec_from_file_location",
         crate::make_builtin_function("spec_from_file_location", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "module_from_spec",
         crate::make_builtin_function("module_from_spec", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "find_spec",
         crate::make_builtin_function("find_spec", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "resolve_name",
         crate::make_builtin_function("resolve_name", |args| {
             Ok(args.first().copied().unwrap_or(pyre_object::w_str_new("")))
         }),
     );
-    crate::namespace_store(ns, "MAGIC_NUMBER", pyre_object::w_int_new(0));
+    crate::dict_storage_store(ns, "MAGIC_NUMBER", pyre_object::w_int_new(0));
 }
 
 /// importlib.abc stub — abstract base classes.
-fn init_importlib_abc(ns: &mut PyNamespace) {
+fn init_importlib_abc(ns: &mut DictStorage) {
     for name in [
         "Loader",
         "Finder",
@@ -3276,40 +3276,40 @@ fn init_importlib_abc(ns: &mut PyNamespace) {
         "FileLoader",
         "SourceLoader",
     ] {
-        crate::namespace_store(ns, name, crate::typedef::w_object());
+        crate::dict_storage_store(ns, name, crate::typedef::w_object());
     }
 }
 
 /// importlib.machinery stub — provides the names inspect.py references.
 /// PyPy ships the real importlib; we shortcut it with a stub so pyre does
 /// not have to execute _bootstrap_external.
-fn init_importlib_machinery(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_importlib_machinery(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "SOURCE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".py")]),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "BYTECODE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".pyc")]),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "EXTENSION_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".so")]),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "DEBUG_BYTECODE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".pyc")]),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "OPTIMIZED_BYTECODE_SUFFIXES",
         pyre_object::w_list_new(vec![pyre_object::w_str_new(".pyc")]),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "all_suffixes",
         crate::make_builtin_function("all_suffixes", |_| {
@@ -3320,17 +3320,17 @@ fn init_importlib_machinery(ns: &mut PyNamespace) {
             ]))
         }),
     );
-    crate::namespace_store(ns, "ModuleSpec", crate::typedef::w_object());
-    crate::namespace_store(ns, "BuiltinImporter", crate::typedef::w_object());
-    crate::namespace_store(ns, "FrozenImporter", crate::typedef::w_object());
-    crate::namespace_store(ns, "PathFinder", crate::typedef::w_object());
-    crate::namespace_store(ns, "FileFinder", crate::typedef::w_object());
-    crate::namespace_store(ns, "SourceFileLoader", crate::typedef::w_object());
-    crate::namespace_store(ns, "SourcelessFileLoader", crate::typedef::w_object());
-    crate::namespace_store(ns, "ExtensionFileLoader", crate::typedef::w_object());
-    crate::namespace_store(ns, "AppleFrameworkLoader", crate::typedef::w_object());
-    crate::namespace_store(ns, "NamespaceLoader", crate::typedef::w_object());
-    crate::namespace_store(ns, "WindowsRegistryFinder", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "ModuleSpec", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "BuiltinImporter", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "FrozenImporter", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "PathFinder", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "FileFinder", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "SourceFileLoader", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "SourcelessFileLoader", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "ExtensionFileLoader", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "AppleFrameworkLoader", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "NamespaceLoader", crate::typedef::w_object());
+    crate::dict_storage_store(ns, "WindowsRegistryFinder", crate::typedef::w_object());
 }
 
 /// _imp stub — PyPy: pypy/module/imp/
@@ -3338,8 +3338,8 @@ fn init_importlib_machinery(ns: &mut PyNamespace) {
 /// Minimal subset required by importlib._bootstrap to decide which loader
 /// handles a name. We report every name we know about as a builtin so
 /// pyre's own registrations remain authoritative.
-fn init_imp(ns: &mut PyNamespace) {
-    crate::namespace_store(
+fn init_imp(ns: &mut DictStorage) {
+    crate::dict_storage_store(
         ns,
         "is_builtin",
         crate::make_builtin_function("is_builtin", |args| {
@@ -3357,22 +3357,22 @@ fn init_imp(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(if is_builtin { 1 } else { 0 }))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "is_frozen",
         crate::make_builtin_function("is_frozen", |_| Ok(pyre_object::w_bool_from(false))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "is_frozen_package",
         crate::make_builtin_function("is_frozen_package", |_| Ok(pyre_object::w_bool_from(false))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "get_frozen_object",
         crate::make_builtin_function("get_frozen_object", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "create_builtin",
         crate::make_builtin_function("create_builtin", |args| {
@@ -3382,54 +3382,54 @@ fn init_imp(ns: &mut PyNamespace) {
             Ok(args[0])
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "exec_builtin",
         crate::make_builtin_function("exec_builtin", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "exec_dynamic",
         crate::make_builtin_function("exec_dynamic", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "acquire_lock",
         crate::make_builtin_function("acquire_lock", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "release_lock",
         crate::make_builtin_function("release_lock", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "lock_held",
         crate::make_builtin_function("lock_held", |_| Ok(pyre_object::w_bool_from(false))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_fix_co_filename",
         crate::make_builtin_function("_fix_co_filename", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "extension_suffixes",
         crate::make_builtin_function("extension_suffixes", |_| {
             Ok(pyre_object::w_list_new(vec![]))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "source_hash",
         crate::make_builtin_function("source_hash", |_| Ok(pyre_object::w_int_new(0))),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "check_hash_based_pycs",
         pyre_object::w_str_new("default"),
     );
-    crate::namespace_store(ns, "pyc_magic_number_token", pyre_object::w_int_new(3495));
+    crate::dict_storage_store(ns, "pyc_magic_number_token", pyre_object::w_int_new(3495));
 }
 
 /// _ast stub — PyPy: pypy/module/_ast/
@@ -3438,7 +3438,7 @@ fn init_imp(ns: &mut PyNamespace) {
 /// enough to satisfy `from _ast import *` in `ast.py` and class body
 /// references like `class slice(AST)`. Actual AST construction is not
 /// supported because pyre uses RustPython's compiler.
-fn init_ast(ns: &mut PyNamespace) {
+fn init_ast(ns: &mut DictStorage) {
     let ast_names: &[&str] = &[
         "AST",
         "mod",
@@ -3572,15 +3572,15 @@ fn init_ast(ns: &mut PyNamespace) {
     ];
     for name in ast_names {
         if name.starts_with("PyCF") {
-            crate::namespace_store(ns, name, pyre_object::w_int_new(0));
+            crate::dict_storage_store(ns, name, pyre_object::w_int_new(0));
         } else {
-            crate::namespace_store(ns, name, crate::typedef::make_builtin_type(name, |_| {}));
+            crate::dict_storage_store(ns, name, crate::typedef::make_builtin_type(name, |_| {}));
         }
     }
 }
 
 /// errno stub — PyPy: pypy/module/errno/
-fn init_errno(ns: &mut PyNamespace) {
+fn init_errno(ns: &mut DictStorage) {
     for (name, value) in [
         ("EPERM", 1),
         ("ENOENT", 2),
@@ -3639,21 +3639,21 @@ fn init_errno(ns: &mut PyNamespace) {
         ("EALREADY", 37),
         ("EDQUOT", 69),
     ] {
-        crate::namespace_store(ns, name, pyre_object::w_int_new(value));
+        crate::dict_storage_store(ns, name, pyre_object::w_int_new(value));
     }
-    crate::namespace_store(ns, "errorcode", pyre_object::w_dict_new());
+    crate::dict_storage_store(ns, "errorcode", pyre_object::w_dict_new());
 }
 
 /// _codecs stub — PyPy: pypy/module/_codecs/
 ///
 /// Provides lookup_error/register_error and encode/decode no-op stubs so
 /// codecs.py module init runs to completion.
-fn init_codecs(ns: &mut PyNamespace) {
+fn init_codecs(ns: &mut DictStorage) {
     // lookup_error(name) — returns an error handler for the given error
     // strategy. Pyre returns a pass-through lambda that never fires because
     // we don't encounter encoding errors in the pure-Python stdlib paths
     // we exercise so far.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "lookup_error",
         crate::make_builtin_function("lookup_error", |_| {
@@ -3666,17 +3666,17 @@ fn init_codecs(ns: &mut PyNamespace) {
             }))
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "register_error",
         crate::make_builtin_function("register_error", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "register",
         crate::make_builtin_function("register", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "lookup",
         crate::make_builtin_function("lookup", |_| Ok(pyre_object::w_none())),
@@ -3690,10 +3690,10 @@ fn init_codecs(ns: &mut PyNamespace) {
             args[0]
         })
     });
-    crate::namespace_store(ns, "encode", identity);
-    crate::namespace_store(ns, "decode", identity);
-    crate::namespace_store(ns, "_forget_codec", identity);
-    crate::namespace_store(
+    crate::dict_storage_store(ns, "encode", identity);
+    crate::dict_storage_store(ns, "decode", identity);
+    crate::dict_storage_store(ns, "_forget_codec", identity);
+    crate::dict_storage_store(
         ns,
         "charmap_build",
         crate::make_builtin_function("charmap_build", |_| Ok(pyre_object::w_dict_new())),
@@ -3701,15 +3701,15 @@ fn init_codecs(ns: &mut PyNamespace) {
 }
 
 /// copyreg stub — PyPy: pypy/module/copyreg/
-fn init_copyreg(ns: &mut PyNamespace) {
+fn init_copyreg(ns: &mut DictStorage) {
     // copyreg.pickle(type, reduce_func, constructor=None) — register a
     // pickle reducer. Stub: ignore (pyre doesn't support pickle).
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "pickle",
         crate::make_builtin_function("pickle", |_| Ok(pyre_object::w_none())),
     );
-    crate::namespace_store(ns, "dispatch_table", pyre_object::w_dict_new());
+    crate::dict_storage_store(ns, "dispatch_table", pyre_object::w_dict_new());
 }
 
 /// Try to load a builtin module by name.
@@ -3719,12 +3719,12 @@ fn init_copyreg(ns: &mut PyNamespace) {
 fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let init_fn = BUILTIN_MODULES.with(|m| m.borrow().get(name).copied())?;
 
-    let mut namespace = Box::new(PyNamespace::new());
+    let mut namespace = Box::new(DictStorage::new());
     namespace.fix_ptr();
 
     // Set __name__ (PyPy: Module.__init__ sets __name__)
     let name_obj = pyre_object::w_str_new(name);
-    namespace_store(&mut namespace, "__name__", name_obj);
+    dict_storage_store(&mut namespace, "__name__", name_obj);
 
     // Run module-specific initializer (PyPy: interpleveldefs)
     init_fn(&mut namespace);
@@ -3972,7 +3972,7 @@ fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, Strin
 
 fn exec_code_module(
     code: CodeObject,
-    namespace: *mut PyNamespace,
+    namespace: *mut DictStorage,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     let code_ptr = Box::into_raw(Box::new(code));
@@ -4011,16 +4011,16 @@ fn load_source_module(
     // PyPy equivalent: Module.__init__ creates w_dict = space.newdict()
     // then exec_code_module sets __builtins__ and runs code in w_dict.
     let ctx = unsafe { &*execution_context };
-    let mut namespace = Box::new(ctx.fresh_namespace());
+    let mut namespace = Box::new(ctx.fresh_dict_storage());
     namespace.fix_ptr();
 
     // Set __name__ in the module namespace (PyPy: Module.__init__ sets __name__)
     let name_obj = pyre_object::w_str_new(modulename);
-    crate::namespace_store(&mut namespace, "__name__", name_obj);
+    crate::dict_storage_store(&mut namespace, "__name__", name_obj);
 
     // Set __file__ (PyPy: _prepare_module sets __file__)
     let file_obj = pyre_object::w_str_new(&pathname_str);
-    crate::namespace_store(&mut namespace, "__file__", file_obj);
+    crate::dict_storage_store(&mut namespace, "__file__", file_obj);
 
     // Set __package__ — PyPy: _prepare_module sets __package__
     // For "a.b.c" → __package__ = "a.b"; for "a" → __package__ = "a"
@@ -4029,7 +4029,7 @@ fn load_source_module(
     } else {
         modulename
     };
-    crate::namespace_store(&mut namespace, "__package__", pyre_object::w_str_new(pkg));
+    crate::dict_storage_store(&mut namespace, "__package__", pyre_object::w_str_new(pkg));
 
     let ns_ptr = Box::into_raw(namespace);
 
@@ -4072,12 +4072,12 @@ fn load_package(
     let module = load_source_module(modulename, &init_path, execution_context)?;
 
     // Set __path__ and __package__ on the module namespace
-    let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
+    let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
     let path_str = pyre_object::w_str_new(&dirpath.to_string_lossy());
     let path_list = pyre_object::w_list_new(vec![path_str]);
     unsafe {
-        crate::namespace_store(&mut *ns_ptr, "__path__", path_list);
-        crate::namespace_store(
+        crate::dict_storage_store(&mut *ns_ptr, "__path__", path_list);
+        crate::dict_storage_store(
             &mut *ns_ptr,
             "__package__",
             pyre_object::w_str_new(modulename),
@@ -4278,7 +4278,7 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Option<String> {
     if w_globals.is_null() {
         return None;
     }
-    let ns = w_globals as *const crate::PyNamespace;
+    let ns = w_globals as *const crate::DictStorage;
     let ns = unsafe { &*ns };
 
     // Try __package__ first (PyPy: space.finditem_str(w_globals, '__package__'))
@@ -4321,10 +4321,10 @@ pub fn import_from(
 ) -> Result<PyObjectRef, crate::PyError> {
     // First try the module's namespace dict (PyPy: space.getattr → w_dict lookup)
     if unsafe { is_module(module) } {
-        let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
+        let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
         if !ns_ptr.is_null() {
             let ns = unsafe { &*ns_ptr };
-            if let Ok(value) = namespace_load(ns, name) {
+            if let Ok(value) = dict_storage_load(ns, name) {
                 return Ok(value);
             }
         }
@@ -4338,7 +4338,7 @@ pub fn import_from(
     // PyPy: pyopcode.py _import_from — try importing as a submodule.
     // Build fullname = module.__name__ + "." + name and import it.
     if unsafe { is_module(module) } {
-        let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
+        let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
         if !ns_ptr.is_null() {
             let ns = unsafe { &*ns_ptr };
             if let Some(&modname_obj) = ns.get("__name__") {
@@ -4359,7 +4359,7 @@ pub fn import_from(
                         // module from sys.modules.
                         if let Some(submod) = check_sys_modules(&fullname) {
                             unsafe {
-                                crate::namespace_store(&mut *ns_ptr, name, submod);
+                                crate::dict_storage_store(&mut *ns_ptr, name, submod);
                             }
                             return Ok(submod);
                         }
@@ -4381,12 +4381,12 @@ pub fn import_from(
 // Merge all public names from a module into the current namespace.
 // If __all__ exists, use it; otherwise copy all names not starting with '_'.
 
-pub fn import_all_from(module: PyObjectRef, into_namespace: *mut PyNamespace) {
+pub fn import_all_from(module: PyObjectRef, into_namespace: *mut DictStorage) {
     if !unsafe { is_module(module) } {
         return;
     }
 
-    let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut PyNamespace;
+    let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
     if ns_ptr.is_null() {
         return;
     }
@@ -4409,7 +4409,7 @@ pub fn import_all_from(module: PyObjectRef, into_namespace: *mut PyNamespace) {
         }
         if let Some(&value) = src_ns.get(name) {
             if !value.is_null() {
-                namespace_store(dst_ns, name, value);
+                dict_storage_store(dst_ns, name, value);
             }
         }
     }

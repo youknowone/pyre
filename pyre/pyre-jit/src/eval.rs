@@ -955,7 +955,7 @@ fn register_quasi_immutable_deps(green_key: u64) {
     };
     let flag = token.invalidation_flag();
     for (ns_ptr, slot) in deps {
-        let ns = unsafe { &mut *(ns_ptr as *mut pyre_interpreter::PyNamespace) };
+        let ns = unsafe { &mut *(ns_ptr as *mut pyre_interpreter::DictStorage) };
         ns.register_slot_watcher(slot as usize, &flag);
     }
 }

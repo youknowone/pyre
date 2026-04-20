@@ -2981,13 +2981,13 @@ pub fn delweakref(obj: PyObjectRef) {
     }
 }
 
-fn namespace_to_dict(ns_ptr: *const crate::PyNamespace) -> PyObjectRef {
+fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
     if ns_ptr.is_null() {
         return pyre_object::w_dict_new();
     }
-    // Create a dict backed by the namespace so that dict.update() etc.
-    // can sync changes back to the original namespace.
-    let dict = pyre_object::dictobject::w_dict_new_with_namespace(ns_ptr as *mut u8);
+    // Create a dict backed by the storage so that dict.update() etc.
+    // can sync changes back to the original globals/type/module dict state.
+    let dict = pyre_object::dictobject::w_dict_new_with_dict_storage(ns_ptr as *mut u8);
     unsafe {
         for (key, &value) in (*ns_ptr).entries() {
             if !value.is_null() {
@@ -3047,7 +3047,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     if is_type(t) {
                         // Look in this class's own dict only (not its MRO),
                         // since we are already iterating the full MRO ourselves.
-                        let ns_ptr = w_type_get_dict_ptr(t) as *mut crate::PyNamespace;
+                        let ns_ptr = w_type_get_dict_ptr(t) as *mut crate::DictStorage;
                         let found = if !ns_ptr.is_null() {
                             (*ns_ptr).get(name).copied()
                         } else {
@@ -3182,10 +3182,10 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if is_module(obj) {
             if name == "__dict__" {
-                let ns_ptr = w_module_get_dict_ptr(obj) as *const crate::PyNamespace;
-                return Ok(namespace_to_dict(ns_ptr));
+                let ns_ptr = w_module_get_dict_ptr(obj) as *const crate::DictStorage;
+                return Ok(dict_storage_to_dict(ns_ptr));
             }
-            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !ns_ptr.is_null() {
                 if let Some(&value) = (*ns_ptr).get(name) {
                     if !value.is_null() {
@@ -3310,8 +3310,8 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
             if name == "__dict__" {
                 // Return the type's namespace as a dict
-                let dict_ptr = w_type_get_dict_ptr(obj) as *const crate::PyNamespace;
-                return Ok(namespace_to_dict(dict_ptr));
+                let dict_ptr = w_type_get_dict_ptr(obj) as *const crate::DictStorage;
+                return Ok(dict_storage_to_dict(dict_ptr));
             }
             if name == "__bases__" {
                 return Ok(w_type_get_bases(obj));
@@ -3488,7 +3488,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                     return Ok(if closure.is_null() { w_none() } else { closure });
                 }
                 "__globals__" => {
-                    return Ok(namespace_to_dict(crate::function_get_globals(obj)));
+                    return Ok(dict_storage_to_dict(crate::function_get_globals(obj)));
                 }
                 "__defaults__" => {
                     let defaults = crate::function_get_defaults(obj);
@@ -3730,7 +3730,7 @@ unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObje
         if (*cls).is_null() || !is_type(*cls) {
             continue;
         }
-        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::PyNamespace;
+        let ns_ptr = w_type_get_dict_ptr(*cls) as *mut crate::DictStorage;
         if !ns_ptr.is_null() {
             let ns = &*ns_ptr;
             if let Some(&value) = ns.get(name) {
@@ -4313,9 +4313,9 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     // and similar interactive mutations are visible through module getattr/import.
     unsafe {
         if is_module(obj) {
-            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !ns_ptr.is_null() {
-                crate::namespace_store(&mut *ns_ptr, name, value);
+                crate::dict_storage_store(&mut *ns_ptr, name, value);
                 return Ok(w_none());
             }
         }
@@ -4347,9 +4347,9 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     // PyPy: typeobject.py type.__setattr__ → w_type.dict_w[name] = w_value
     unsafe {
         if is_type(obj) {
-            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
-                crate::namespace_store(&mut *dict_ptr, name, value);
+                crate::dict_storage_store(&mut *dict_ptr, name, value);
                 return Ok(w_none());
             }
         }
@@ -4445,20 +4445,20 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
     unsafe {
         if is_module(obj) {
-            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !ns_ptr.is_null() {
-                crate::namespace_store(&mut *ns_ptr, name, PY_NULL);
+                crate::dict_storage_store(&mut *ns_ptr, name, PY_NULL);
                 return Ok(w_none());
             }
         }
     }
     // Type objects: set to PY_NULL in class dict
-    // (PyNamespace doesn't support removal, null slot acts as deleted)
+    // (DictStorage doesn't support removal, null slot acts as deleted)
     unsafe {
         if is_type(obj) {
-            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::PyNamespace;
+            let dict_ptr = w_type_get_dict_ptr(obj) as *mut crate::DictStorage;
             if !dict_ptr.is_null() {
-                crate::namespace_store(&mut *dict_ptr, name, PY_NULL);
+                crate::dict_storage_store(&mut *dict_ptr, name, PY_NULL);
                 return Ok(w_none());
             }
         }
@@ -5438,7 +5438,7 @@ mod tests {
 
     #[test]
     fn test_module_setattr_getattr() {
-        let mut namespace = Box::new(crate::PyNamespace::default());
+        let mut namespace = Box::new(crate::DictStorage::default());
         namespace.fix_ptr();
         let module = pyre_object::moduleobject::w_module_new(
             "test_module",
@@ -5452,7 +5452,7 @@ mod tests {
 
     #[test]
     fn test_module_delattr() {
-        let mut namespace = Box::new(crate::PyNamespace::default());
+        let mut namespace = Box::new(crate::DictStorage::default());
         namespace.fix_ptr();
         let module = pyre_object::moduleobject::w_module_new(
             "test_module",
@@ -5534,16 +5534,16 @@ mod tests {
     fn test_issubclass_pseudo_class_via_bases() {
         crate::typedef::init_typeobjects();
         let inner_type = crate::typedef::make_builtin_type("PseudoInner", |ns| {
-            crate::namespace_store(ns, "__bases__", w_tuple_new(vec![]));
+            crate::dict_storage_store(ns, "__bases__", w_tuple_new(vec![]));
         });
         let inner = pyre_object::instanceobject::w_instance_new(inner_type);
         let outer_type = crate::typedef::make_builtin_type("PseudoOuter", |_ns| {
             // closure capture is fine — make_builtin_type runs init eagerly.
         });
         // Stash __bases__ on outer's type dict pointing at the inner instance.
-        crate::namespace_store(
+        crate::dict_storage_store(
             unsafe {
-                &mut *(pyre_object::w_type_get_dict_ptr(outer_type) as *mut crate::PyNamespace)
+                &mut *(pyre_object::w_type_get_dict_ptr(outer_type) as *mut crate::DictStorage)
             },
             "__bases__",
             w_tuple_new(vec![inner]),

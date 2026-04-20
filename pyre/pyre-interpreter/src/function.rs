@@ -5,7 +5,7 @@
 //! When called, the interpreter creates a new PyFrame that *shares*
 //! the globals pointer (no clone).
 
-use crate::executioncontext::PyNamespace;
+use crate::executioncontext::DictStorage;
 use pyre_object::pyobject::*;
 
 /// Type descriptor for user-defined functions.
@@ -35,7 +35,7 @@ pub struct Function {
     /// Function name (leaked Box<String>).
     pub name: *const String,
     /// PyPy: W_Function.w_func_globals
-    pub w_func_globals: *mut PyNamespace,
+    pub w_func_globals: *mut DictStorage,
     /// Closure: tuple of cell objects from the enclosing scope,
     /// or PY_NULL if this function has no free variables.
     pub closure: PyObjectRef,
@@ -74,7 +74,7 @@ pub const FUNCTION_CLOSURE_OFFSET: usize = std::mem::offset_of!(Function, closur
 pub fn function_new(
     code: *const (),
     name: String,
-    w_func_globals: *mut PyNamespace,
+    w_func_globals: *mut DictStorage,
 ) -> PyObjectRef {
     function_new_with_closure(code, name, w_func_globals, PY_NULL)
 }
@@ -85,7 +85,7 @@ pub fn function_new(
 pub fn function_new_with_closure(
     code: *const (),
     name: String,
-    w_func_globals: *mut PyNamespace,
+    w_func_globals: *mut DictStorage,
     closure: PyObjectRef,
 ) -> PyObjectRef {
     function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals, closure, true)
@@ -95,7 +95,7 @@ fn function_new_impl(
     ob_type: &'static PyType,
     code: *const (),
     name: String,
-    w_func_globals: *mut PyNamespace,
+    w_func_globals: *mut DictStorage,
     closure: PyObjectRef,
     can_change_code: bool,
 ) -> PyObjectRef {
@@ -122,7 +122,7 @@ fn function_new_impl(
 pub fn function_new_with_fixed_code(
     code: *const (),
     name: String,
-    w_func_globals: *mut PyNamespace,
+    w_func_globals: *mut DictStorage,
 ) -> PyObjectRef {
     function_new_impl(&FUNCTION_TYPE, code, name, w_func_globals, PY_NULL, false)
 }
@@ -132,7 +132,7 @@ pub fn function_new_with_fixed_code(
 pub fn function_new_builtin(
     code: *const (),
     name: String,
-    w_func_globals: *mut PyNamespace,
+    w_func_globals: *mut DictStorage,
 ) -> PyObjectRef {
     function_new_impl(
         &BUILTIN_FUNCTION_TYPE,
@@ -261,7 +261,7 @@ pub unsafe fn fget_func_name(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `Function`.
 #[inline]
-pub unsafe fn function_get_globals(obj: PyObjectRef) -> *mut PyNamespace {
+pub unsafe fn function_get_globals(obj: PyObjectRef) -> *mut DictStorage {
     unsafe { (*(obj as *const Function)).w_func_globals }
 }
 
@@ -539,13 +539,13 @@ pub unsafe fn fset_func_name(obj: PyObjectRef, name: PyObjectRef) -> Result<(), 
 
 /// PyPy-compatible `__globals__` getter alias.
 #[inline]
-pub unsafe fn function_get_w_globals(obj: PyObjectRef) -> *mut PyNamespace {
+pub unsafe fn function_get_w_globals(obj: PyObjectRef) -> *mut DictStorage {
     unsafe { function_get_globals(obj) }
 }
 
 /// PyPy-compatible `__globals__` setter alias.
 #[inline]
-pub unsafe fn function_set_w_globals(obj: PyObjectRef, globals: *mut PyNamespace) {
+pub unsafe fn function_set_w_globals(obj: PyObjectRef, globals: *mut DictStorage) {
     unsafe {
         (*(obj as *mut Function)).w_func_globals = globals;
     }
@@ -623,7 +623,7 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn descr_function__new__(
     code: *const (),
-    w_globals: *mut PyNamespace,
+    w_globals: *mut DictStorage,
     w_name: PyObjectRef,
     _argdefs: PyObjectRef,
     w_closure: PyObjectRef,
@@ -675,7 +675,7 @@ pub unsafe fn _cleanup_(_obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn descr_builtinfunction__new__(
     code: *const (),
-    w_globals: *mut PyNamespace,
+    w_globals: *mut DictStorage,
     w_name: PyObjectRef,
     _argdefs: PyObjectRef,
     w_closure: PyObjectRef,
@@ -1020,14 +1020,14 @@ mod tests {
         // Function.code now stores a Code-level wrapper (W_CodeObject).
         let raw_code = 0xDEAD_BEEF as *const ();
         let w_code = crate::w_code_new(raw_code);
-        let mut ns = PyNamespace::new();
+        let mut ns = DictStorage::new();
         let obj = function_new(w_code as *const (), "myfunc".to_string(), &mut ns);
         unsafe {
             assert!(is_function(obj));
             assert!(!is_int(obj));
             assert_eq!(function_get_code(obj), w_code as *const ());
             assert_eq!(function_get_name(obj), "myfunc");
-            assert_eq!(function_get_globals(obj), &mut ns as *mut PyNamespace);
+            assert_eq!(function_get_globals(obj), &mut ns as *mut DictStorage);
             assert!(function_get_closure(obj).is_null());
         }
     }

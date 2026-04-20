@@ -816,7 +816,7 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
     }
 }
 
-use pyre_interpreter::{PyNamespace, decode_instruction_at};
+use pyre_interpreter::{DictStorage, decode_instruction_at};
 
 use crate::descr::{
     float_floatval_descr, int_intval_descr, make_array_descr, make_size_descr, w_float_size_descr,
@@ -934,7 +934,7 @@ pub struct PyreSym {
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
     /// Namespace for global lookups.
-    pub(crate) concrete_namespace: *mut pyre_interpreter::PyNamespace,
+    pub(crate) concrete_namespace: *mut pyre_interpreter::DictStorage,
     /// Execution context pointer (for creating callee frames).
     pub(crate) concrete_execution_context: *const pyre_interpreter::PyExecutionContext,
     /// Virtualizable object pointer (PyFrame).
@@ -1135,8 +1135,8 @@ pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
     crate::descr::pyframe_locals_cells_stack_descr()
 }
 
-pub(crate) fn frame_namespace_descr() -> DescrRef {
-    crate::descr::pyframe_namespace_descr()
+pub(crate) fn frame_dict_storage_descr() -> DescrRef {
+    crate::descr::pyframe_dict_storage_descr()
 }
 
 pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
@@ -1508,7 +1508,7 @@ pub(crate) fn trace_raw_float_array_setitem_value(
 }
 
 pub(crate) fn frame_get_namespace(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], frame_namespace_descr())
+    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], frame_dict_storage_descr())
 }
 
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
@@ -1565,14 +1565,14 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
     Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
 }
 
-pub(crate) fn namespace_slot_direct(ns: *mut PyNamespace, name: &str) -> Option<usize> {
+pub(crate) fn dict_storage_slot_direct(ns: *mut DictStorage, name: &str) -> Option<usize> {
     if ns.is_null() {
         return None;
     }
     unsafe { &*ns }.slot_of(name)
 }
 
-pub(crate) fn namespace_value_direct(ns: *mut PyNamespace, idx: usize) -> Option<PyObjectRef> {
+pub(crate) fn dict_storage_value_direct(ns: *mut DictStorage, idx: usize) -> Option<PyObjectRef> {
     if ns.is_null() {
         return None;
     }
@@ -2154,10 +2154,10 @@ impl PyreJitState {
         self.frame_array_mut(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
     }
 
-    fn namespace_ptr(&self) -> Option<*mut PyNamespace> {
+    fn namespace_ptr(&self) -> Option<*mut DictStorage> {
         let frame_ptr = self.frame_ptr()?;
         let namespace_ptr =
-            unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut PyNamespace) };
+            unsafe { *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const *mut DictStorage) };
         (!namespace_ptr.is_null()).then_some(namespace_ptr)
     }
 

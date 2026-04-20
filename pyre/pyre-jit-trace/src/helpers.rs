@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_callable_call_helper_dispatches_builtin_without_trace_side_branching() {
-        let namespace = PyExecutionContext::default().fresh_namespace();
+        let namespace = PyExecutionContext::default().fresh_dict_storage();
         let abs = *namespace.get("abs").expect("abs builtin must exist");
         let result = jit_call_callable_1(0, abs as i64, w_int_new(-11) as i64);
         unsafe {

@@ -55,7 +55,7 @@ pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
 }
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
-    OpcodeStepExecutor, PyError, PyNamespace, SharedOpcodeHandler, decode_instruction_at,
+    DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, decode_instruction_at,
     execute_opcode_step, function_get_globals, is_builtin_code, is_function, range_iter_continues,
 };
 
@@ -72,9 +72,10 @@ use pyre_object::{
 };
 
 use crate::descr::{
-    float_floatval_descr, int_intval_descr, list_items_len_descr, list_items_ptr_descr,
-    list_strategy_descr, namespace_values_len_descr, namespace_values_ptr_descr, ob_type_descr,
-    tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr, w_int_size_descr,
+    dict_storage_values_len_descr, dict_storage_values_ptr_descr, float_floatval_descr,
+    int_intval_descr, list_items_len_descr, list_items_ptr_descr, list_strategy_descr,
+    ob_type_descr, tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr,
+    w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
@@ -764,13 +765,13 @@ impl MIFrame {
         let len = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
-            namespace_values_len_descr(),
+            dict_storage_values_len_descr(),
         );
         self.guard_len_gt_index(ctx, len, idx);
         let values = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
-            namespace_values_ptr_descr(),
+            dict_storage_values_ptr_descr(),
         );
         let idx_const = ctx.const_int(idx as i64);
         Ok(trace_raw_array_getitem_value(ctx, values, idx_const))
@@ -787,13 +788,13 @@ impl MIFrame {
         let len = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
-            namespace_values_len_descr(),
+            dict_storage_values_len_descr(),
         );
         self.guard_len_gt_index(ctx, len, idx);
         let values = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
-            namespace_values_ptr_descr(),
+            dict_storage_values_ptr_descr(),
         );
         let idx_const = ctx.const_int(idx as i64);
         trace_raw_array_setitem_value(ctx, values, idx_const, value);
@@ -3572,7 +3573,7 @@ impl MIFrame {
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
             sym.jitcode = jitcode_for(w_code);
-            sym.concrete_namespace = callee_globals as *mut PyNamespace;
+            sym.concrete_namespace = callee_globals as *mut DictStorage;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             let (
                 vable_last_instr,
@@ -3650,7 +3651,7 @@ impl MIFrame {
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
             sym.jitcode = jitcode_for(w_code);
-            sym.concrete_namespace = callee_globals as *mut PyNamespace;
+            sym.concrete_namespace = callee_globals as *mut DictStorage;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))
         };

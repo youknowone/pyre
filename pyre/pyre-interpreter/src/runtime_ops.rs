@@ -10,13 +10,13 @@ use pyre_object::{
 };
 
 use crate::{
-    PyError, PyErrorKind, PyNamespace, builtin_code_get, function_get_code, function_new,
+    DictStorage, PyError, PyErrorKind, builtin_code_get, function_get_code, function_new,
     is_builtin_code, is_function, w_code_get_ptr,
 };
 
 pub fn make_function_from_code_obj(
     code_obj: PyObjectRef,
-    globals: *mut PyNamespace,
+    globals: *mut DictStorage,
 ) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
@@ -35,7 +35,7 @@ fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
 
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) -> i64 {
-    make_function_from_code_obj(code_obj as PyObjectRef, globals as *mut PyNamespace) as i64
+    make_function_from_code_obj(code_obj as PyObjectRef, globals as *mut DictStorage) as i64
 }
 
 #[majit_macros::dont_look_inside]
@@ -44,7 +44,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     name_ptr: i64,
     name_len: i64,
 ) -> i64 {
-    let namespace_ptr = namespace_ptr as *mut PyNamespace;
+    let namespace_ptr = namespace_ptr as *mut DictStorage;
     let Some(namespace) = (!namespace_ptr.is_null()).then_some(unsafe { &mut *namespace_ptr })
     else {
         return 0;
@@ -52,7 +52,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
-    namespace_get(namespace, name).unwrap_or(std::ptr::null_mut()) as i64
+    dict_storage_get(namespace, name).unwrap_or(std::ptr::null_mut()) as i64
 }
 
 #[majit_macros::dont_look_inside]
@@ -62,7 +62,7 @@ pub extern "C" fn jit_store_name_to_namespace(
     name_len: i64,
     value: i64,
 ) -> i64 {
-    let namespace_ptr = namespace_ptr as *mut PyNamespace;
+    let namespace_ptr = namespace_ptr as *mut DictStorage;
     let Some(namespace) = (!namespace_ptr.is_null()).then_some(unsafe { &mut *namespace_ptr })
     else {
         return 0;
@@ -70,7 +70,7 @@ pub extern "C" fn jit_store_name_to_namespace(
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
-    namespace_store(namespace, name, value as PyObjectRef);
+    dict_storage_store(namespace, name, value as PyObjectRef);
     0
 }
 
@@ -621,12 +621,12 @@ pub fn flat_build_helper(kind: FlatBuildKind, count: usize) -> Option<*const ()>
     }
 }
 
-pub fn namespace_get(namespace: &PyNamespace, name: &str) -> Option<PyObjectRef> {
+pub fn dict_storage_get(namespace: &DictStorage, name: &str) -> Option<PyObjectRef> {
     namespace.get(name).copied()
 }
 
-pub fn namespace_load(namespace: &PyNamespace, name: &str) -> Result<PyObjectRef, PyError> {
-    namespace_get(namespace, name).ok_or_else(|| {
+pub fn dict_storage_load(namespace: &DictStorage, name: &str) -> Result<PyObjectRef, PyError> {
+    dict_storage_get(namespace, name).ok_or_else(|| {
         PyError::new(
             PyErrorKind::NameError,
             format!("name '{name}' is not defined"),
@@ -634,11 +634,11 @@ pub fn namespace_load(namespace: &PyNamespace, name: &str) -> Result<PyObjectRef
     })
 }
 
-pub fn namespace_store(namespace: &mut PyNamespace, name: &str, value: PyObjectRef) {
+pub fn dict_storage_store(namespace: &mut DictStorage, name: &str, value: PyObjectRef) {
     namespace.insert(name.to_string(), value);
 }
 
-pub fn namespace_delete(namespace: &mut PyNamespace, name: &str) -> bool {
+pub fn dict_storage_delete(namespace: &mut DictStorage, name: &str) -> bool {
     namespace.remove(name).is_some()
 }
 
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_callable_runs_builtin_branch() {
-        let namespace = PyExecutionContext::default().fresh_namespace();
+        let namespace = PyExecutionContext::default().fresh_dict_storage();
         let abs = *namespace.get("abs").expect("abs builtin must exist");
         let result = dispatch_callable(
             abs,

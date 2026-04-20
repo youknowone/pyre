@@ -1,6 +1,6 @@
 use pyre_object::{PYOBJECT_ARRAY_LEN_OFFSET, PyObjectArray, PyObjectRef};
 
-use crate::{PyFrame, new_builtin_namespace};
+use crate::{PyFrame, new_builtin_dict_storage};
 
 /// Python-level entrypoint for profiling callback compatibility.
 /// The PyPy implementation calls through to `space.call_function()` with
@@ -15,20 +15,25 @@ pub fn app_profile_call(
     let _ = (_space, _w_callable, _frame, _event, _w_arg);
 }
 
-/// Byte offset of the value-array storage inside `PyNamespace`.
-pub const PYNAMESPACE_VALUES_OFFSET: usize = std::mem::offset_of!(PyNamespace, values);
+/// Byte offset of the value-array storage inside `DictStorage`.
+pub const DICT_STORAGE_VALUES_OFFSET: usize = std::mem::offset_of!(DictStorage, values);
 
-/// Byte offset of the live namespace slot count inside `PyNamespace`.
-pub const PYNAMESPACE_VALUES_LEN_OFFSET: usize =
-    PYNAMESPACE_VALUES_OFFSET + PYOBJECT_ARRAY_LEN_OFFSET;
+/// Byte offset of the live dict slot count inside `DictStorage`.
+pub const DICT_STORAGE_VALUES_LEN_OFFSET: usize =
+    DICT_STORAGE_VALUES_OFFSET + PYOBJECT_ARRAY_LEN_OFFSET;
 
-/// Name-based Python namespace used by the current interpreter subset.
+/// Internal dict backing used for globals, module dicts, and type dicts.
+///
+/// PyPy correspondence: this is not `cpyext._PyNamespace_New()` or
+/// `types.SimpleNamespace`. It is pyre's internal storage used where PyPy keeps
+/// string-keyed dict state such as `w_globals`, module dictionaries backed by
+/// `W_DictMultiObject`/`ModuleDictStrategy`, and type-level `dict_w`.
 ///
 /// Names are stored in insertion order and values live in a pointer-backed
 /// `PyObjectArray`, giving the JIT a stable slot model for hot global loads and
 /// stores.
 #[repr(C)]
-pub struct PyNamespace {
+pub struct DictStorage {
     names: Vec<String>,
     values: PyObjectArray,
     /// Per-slot JIT invalidation watchers.
@@ -38,35 +43,35 @@ pub struct PyNamespace {
     slot_watchers: Vec<Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>>,
 }
 
-impl Clone for PyNamespace {
+impl Clone for DictStorage {
     fn clone(&self) -> Self {
-        let mut namespace = Self {
+        let mut dict_storage = Self {
             names: self.names.clone(),
             values: PyObjectArray::from_vec(self.values.to_vec()),
-            // Cloned namespaces start with no registered invalidation watchers,
+            // Cloned storages start with no registered invalidation watchers,
             // but the per-slot shape must stay aligned with names/values.
             slot_watchers: vec![Vec::new(); self.names.len()],
         };
-        namespace.fix_ptr();
-        namespace
+        dict_storage.fix_ptr();
+        dict_storage
     }
 }
 
-impl Default for PyNamespace {
+impl Default for DictStorage {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PyNamespace {
+impl DictStorage {
     pub fn new() -> Self {
-        let mut namespace = Self {
+        let mut dict_storage = Self {
             names: Vec::new(),
             values: PyObjectArray::from_vec(Vec::new()),
             slot_watchers: Vec::new(),
         };
-        namespace.fix_ptr();
-        namespace
+        dict_storage.fix_ptr();
+        dict_storage
     }
 
     #[inline]
@@ -134,7 +139,7 @@ impl PyNamespace {
         }
     }
 
-    /// Remove a key from the namespace (PyPy: space.delitem).
+    /// Remove a key from the backing dict storage (PyPy: space.delitem).
     /// This performs a real deletion rather than leaving a tombstone.
     pub fn remove(&mut self, name: &str) -> Option<PyObjectRef> {
         if let Some(idx) = self.slot_of(name) {
@@ -221,8 +226,8 @@ impl WRootFinalizerQueue {
 
 /// Shared execution context for all frames in one interpreter run.
 ///
-/// Holds the builtin namespace seed.  Module-level frames call
-/// `fresh_namespace()` once to create a leaked globals dict;
+/// Holds the builtin dict storage seed. Module-level frames call
+/// `fresh_dict_storage()` once to create a leaked globals dict;
 /// function calls share the globals pointer without cloning.
 #[derive(Clone)]
 pub struct ExecutionContext {
@@ -237,7 +242,7 @@ pub struct ExecutionContext {
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
     pub actionflag: ActionFlag,
-    builtins: PyNamespace,
+    builtins: DictStorage,
     /// Cached dict wrapper over `self.builtins` — pyframe.py:200-204
     /// `space.builtin` returns the same object every call.
     builtin_dict_cache: std::cell::Cell<PyObjectRef>,
@@ -267,7 +272,7 @@ impl ExecutionContext {
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
             actionflag: ActionFlag::new(),
-            builtins: new_builtin_namespace(),
+            builtins: new_builtin_dict_storage(),
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
         }
@@ -576,11 +581,11 @@ impl ExecutionContext {
         if !self.topframeref.is_null() {}
     }
 
-    /// Create a fresh module/global namespace seeded with builtins.
+    /// Create a fresh module/global dict storage seeded with builtins.
     ///
     /// The caller is responsible for leaking it via `Box::into_raw`
     /// so it can be shared across frames as a raw pointer.
-    pub fn fresh_namespace(&self) -> PyNamespace {
+    pub fn fresh_dict_storage(&self) -> DictStorage {
         self.builtins.clone()
     }
 
@@ -592,8 +597,8 @@ impl ExecutionContext {
         if !cached.is_null() {
             return cached;
         }
-        let ns_ptr = &self.builtins as *const PyNamespace as *mut u8;
-        let dict = pyre_object::dictobject::w_dict_new_with_namespace(ns_ptr);
+        let ns_ptr = &self.builtins as *const DictStorage as *mut u8;
+        let dict = pyre_object::dictobject::w_dict_new_with_dict_storage(ns_ptr);
         self.builtin_dict_cache.set(dict);
         dict
     }
@@ -882,9 +887,9 @@ mod tests {
     use crate::is_function;
 
     #[test]
-    fn test_fresh_namespace_starts_with_builtins() {
+    fn test_fresh_dict_storage_starts_with_builtins() {
         let ctx = PyExecutionContext::new();
-        let namespace = ctx.fresh_namespace();
+        let namespace = ctx.fresh_dict_storage();
 
         let print = *namespace.get("print").unwrap();
         let range = *namespace.get("range").unwrap();
@@ -898,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_namespace_slots_stay_stable_when_appending_names() {
-        let mut namespace = PyNamespace::new();
+        let mut namespace = DictStorage::new();
         namespace.insert("x".to_string(), pyre_object::w_int_new(1));
         assert_eq!(namespace.slot_of("x"), Some(0));
 
@@ -910,7 +915,7 @@ mod tests {
     #[test]
     fn test_cloned_namespace_keeps_slot_watchers_aligned_for_removal() {
         let ctx = PyExecutionContext::new();
-        let mut namespace = ctx.fresh_namespace();
+        let mut namespace = ctx.fresh_dict_storage();
 
         assert!(namespace.remove("len").is_some());
         assert!(namespace.get("len").is_none());

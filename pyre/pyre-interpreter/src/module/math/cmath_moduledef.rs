@@ -6,20 +6,20 @@
 //! Functions are registered so `import cmath` succeeds, but complex
 //! arithmetic requires W_ComplexObject (future work).
 
-use crate::{PyNamespace, make_builtin_function, namespace_store};
+use crate::{DictStorage, dict_storage_store, make_builtin_function};
 use pyre_object::*;
 
-pub fn init(ns: &mut PyNamespace) {
+pub fn init(ns: &mut DictStorage) {
     // Constants
-    namespace_store(ns, "pi", floatobject::w_float_new(pymath::math::PI));
-    namespace_store(ns, "e", floatobject::w_float_new(pymath::math::E));
-    namespace_store(ns, "tau", floatobject::w_float_new(pymath::math::TAU));
-    namespace_store(ns, "inf", floatobject::w_float_new(pymath::math::INF));
-    namespace_store(ns, "nan", floatobject::w_float_new(pymath::math::NAN));
+    dict_storage_store(ns, "pi", floatobject::w_float_new(pymath::math::PI));
+    dict_storage_store(ns, "e", floatobject::w_float_new(pymath::math::E));
+    dict_storage_store(ns, "tau", floatobject::w_float_new(pymath::math::TAU));
+    dict_storage_store(ns, "inf", floatobject::w_float_new(pymath::math::INF));
+    dict_storage_store(ns, "nan", floatobject::w_float_new(pymath::math::NAN));
     // infj, nanj would need complex type
 
     // Real-valued functions (work on float, stub for complex)
-    namespace_store(
+    dict_storage_store(
         ns,
         "phase",
         make_builtin_function("phase", |args| {
@@ -28,7 +28,7 @@ pub fn init(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "polar",
         make_builtin_function("polar", |args| {
@@ -39,7 +39,7 @@ pub fn init(ns: &mut PyNamespace) {
             ]))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "rect",
         make_builtin_function("rect", |args| {
@@ -48,7 +48,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(floatobject::w_float_new(r * phi.cos()))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isfinite",
         make_builtin_function("isfinite", |args| {
@@ -57,7 +57,7 @@ pub fn init(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isinf",
         make_builtin_function("isinf", |args| {
@@ -66,7 +66,7 @@ pub fn init(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isnan",
         make_builtin_function("isnan", |args| {
@@ -98,6 +98,6 @@ pub fn init(ns: &mut PyNamespace) {
         ("acosh", super::interp_math::acosh),
         ("atanh", super::interp_math::atanh),
     ] {
-        namespace_store(ns, name, make_builtin_function(name, func));
+        dict_storage_store(ns, name, make_builtin_function(name, func));
     }
 }

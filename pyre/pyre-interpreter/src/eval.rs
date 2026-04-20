@@ -11,9 +11,9 @@ use crate::{
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_at,
-    ensure_range_iter, execute_opcode_step, make_function_from_code_obj, namespace_load,
-    namespace_store, range_iter_continues, range_iter_next_or_null, stack_underflow_error,
-    unpack_sequence_exact, w_code_new,
+    dict_storage_load, dict_storage_store, ensure_range_iter, execute_opcode_step,
+    make_function_from_code_obj, range_iter_continues, range_iter_next_or_null,
+    stack_underflow_error, unpack_sequence_exact, w_code_new,
 };
 use pyre_object::*;
 
@@ -382,18 +382,18 @@ impl NamespaceOpcodeHandler for PyFrame {
         let w_locals = self.get_w_locals();
         if !w_locals.is_null() {
             let locals = unsafe { &*w_locals };
-            if let Ok(value) = namespace_load(locals, name) {
+            if let Ok(value) = dict_storage_load(locals, name) {
                 return Ok(value);
             }
         }
         let ns = unsafe { &*self.get_w_globals() };
-        namespace_load(ns, name)
+        dict_storage_load(ns, name)
     }
 
     /// PyPy: STORE_NAME writes to locals (class body) or globals.
     fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
         let ns = unsafe { &mut *self.getdictscope() };
-        namespace_store(ns, name, value);
+        dict_storage_store(ns, name, value);
         Ok(())
     }
 
@@ -774,8 +774,8 @@ impl OpcodeStepExecutor for PyFrame {
             return Ok(());
         }
         let ns = unsafe { &mut *ns };
-        if namespace_load(ns, "__annotations__").is_err() {
-            namespace_store(ns, "__annotations__", pyre_object::w_dict_new());
+        if dict_storage_load(ns, "__annotations__").is_err() {
+            dict_storage_store(ns, "__annotations__", pyre_object::w_dict_new());
         }
         Ok(())
     }
@@ -1430,7 +1430,7 @@ impl OpcodeStepExecutor for PyFrame {
         if ns.is_null() {
             ns = self.get_w_globals();
         }
-        let found = unsafe { crate::namespace_delete(&mut *ns, name) };
+        let found = unsafe { crate::dict_storage_delete(&mut *ns, name) };
         if !found {
             return Err(PyError::new(
                 PyErrorKind::NameError,
@@ -1445,7 +1445,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
         let ns = self.get_w_globals();
         unsafe {
-            crate::namespace_delete(&mut *ns, name);
+            crate::dict_storage_delete(&mut *ns, name);
         }
         Ok(())
     }

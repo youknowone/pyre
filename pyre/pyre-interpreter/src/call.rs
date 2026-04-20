@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use crate::{
-    PyError, PyNamespace, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
+    DictStorage, PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
     function_get_globals,
 };
 
@@ -886,10 +886,10 @@ pub fn register_build_class() {
     // `globals()[name] = value` stays visible after the globals() dict
     // is discarded. PyPy: the module dict IS the namespace in PyPy,
     // so there is no separate hook; pyre keeps the namespace as a
-    // flat PyNamespace and syncs via this callback.
-    pyre_object::dictobject::register_namespace_store_hook(|ns_ptr, name, value| unsafe {
-        let ns = &mut *(ns_ptr as *mut crate::PyNamespace);
-        crate::namespace_store(ns, name, value);
+    // flat DictStorage and syncs via this callback.
+    pyre_object::dictobject::register_dict_storage_store_hook(|ns_ptr, name, value| unsafe {
+        let ns = &mut *(ns_ptr as *mut crate::DictStorage);
+        crate::dict_storage_store(ns, name, value);
     });
 }
 
@@ -1395,14 +1395,14 @@ fn build_class_inner(
     // __prepare__ may return a dict subclass (e.g. EnumDict).
     // dict subclass instances created by w_instance_new store entries in
     // ATTR_TABLE, not in W_DictObject.entries. We handle both cases.
-    let mut class_ns = Box::new(PyNamespace::new());
+    let mut class_ns = Box::new(DictStorage::new());
     if let Some(w_prepared_dict) = w_namespace {
         if unsafe { pyre_object::is_dict(w_prepared_dict) } {
             let dict =
                 unsafe { &*(w_prepared_dict as *const pyre_object::dictobject::W_DictObject) };
             for &(key, value) in unsafe { &*dict.entries } {
                 if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                    crate::namespace_store(
+                    crate::dict_storage_store(
                         &mut class_ns,
                         unsafe { pyre_object::w_str_get_value(key) },
                         value,
@@ -1417,7 +1417,7 @@ fn build_class_inner(
                 let dict = unsafe { &*(backing as *const pyre_object::dictobject::W_DictObject) };
                 for &(key, value) in unsafe { &*dict.entries } {
                     if !value.is_null() && unsafe { pyre_object::is_str(key) } {
-                        crate::namespace_store(
+                        crate::dict_storage_store(
                             &mut class_ns,
                             unsafe { pyre_object::w_str_get_value(key) },
                             value,
@@ -1778,7 +1778,7 @@ unsafe fn copy_flags_from_bases(
 /// `w_type` must be a valid W_TypeObject pointer.
 pub unsafe fn create_all_slots(
     w_type: pyre_object::PyObjectRef,
-    ns: &crate::PyNamespace,
+    ns: &crate::DictStorage,
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
@@ -1838,7 +1838,7 @@ pub unsafe fn create_all_slots(
             newslotnames.sort();
 
             // typeobject.py:1183-1189: create_slot loop
-            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::DictStorage;
             let type_name = pyre_object::w_type_get_name(w_type);
             let mut slot_index = base_nslots;
             let mut i = 0;
@@ -1916,7 +1916,7 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
         if !pyre_object::w_type_get_hasdict(w_type) {
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
-            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::DictStorage;
             if !type_ns.is_null() && (*type_ns).get("__dict__").is_none() {
                 (*type_ns).insert("__dict__".to_string(), descr);
             }
@@ -1939,7 +1939,7 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
         if !pyre_object::w_type_get_weakrefable(w_type) {
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
-            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::PyNamespace;
+            let type_ns = pyre_object::w_type_get_dict_ptr(w_type) as *mut crate::DictStorage;
             if !type_ns.is_null() && (*type_ns).get("__weakref__").is_none() {
                 (*type_ns).insert("__weakref__".to_string(), descr);
             }

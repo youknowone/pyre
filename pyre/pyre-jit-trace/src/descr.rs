@@ -577,15 +577,15 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-static PYNAMESPACE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group(
-        std::mem::size_of::<pyre_interpreter::PyNamespace>(),
+        std::mem::size_of::<pyre_interpreter::DictStorage>(),
         0,
         0,
         &[
             (
-                "PyNamespace.values.ptr",
-                PYNAMESPACE_VALUES_OFFSET,
+                "DictStorage.values.ptr",
+                DICT_STORAGE_VALUES_OFFSET,
                 8,
                 Type::Int,
                 false,
@@ -593,8 +593,8 @@ static PYNAMESPACE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 false,
             ),
             (
-                "PyNamespace.values.len",
-                PYNAMESPACE_VALUES_LEN_OFFSET,
+                "DictStorage.values.len",
+                DICT_STORAGE_VALUES_LEN_OFFSET,
                 8,
                 Type::Int,
                 false,
@@ -734,7 +734,7 @@ pub fn make_array_descr(
 
 // ── Range iterator field descriptors ─────────────────────────────────
 
-use pyre_interpreter::{PYNAMESPACE_VALUES_LEN_OFFSET, PYNAMESPACE_VALUES_OFFSET};
+use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::OB_TYPE_OFFSET;
@@ -851,12 +851,12 @@ pub fn dict_len_descr() -> DescrRef {
     make_field_descr(DICT_LEN_OFFSET, 8, Type::Int, false)
 }
 
-pub fn namespace_values_ptr_descr() -> DescrRef {
-    field_descr_from_group(&PYNAMESPACE_DESCR_GROUP, 0)
+pub fn dict_storage_values_ptr_descr() -> DescrRef {
+    field_descr_from_group(&DICT_STORAGE_DESCR_GROUP, 0)
 }
 
-pub fn namespace_values_len_descr() -> DescrRef {
-    field_descr_from_group(&PYNAMESPACE_DESCR_GROUP, 1)
+pub fn dict_storage_values_len_descr() -> DescrRef {
+    field_descr_from_group(&DICT_STORAGE_DESCR_GROUP, 1)
 }
 
 // ── Object header & allocation descriptors ──────────────────────────
@@ -905,7 +905,7 @@ pub fn pyframe_code_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 3)
 }
 
-pub fn pyframe_namespace_descr() -> DescrRef {
+pub fn pyframe_dict_storage_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
 }
 

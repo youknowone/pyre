@@ -2,7 +2,7 @@
 //!
 //! Uses sre-engine crate (RustPython's SRE bytecode interpreter).
 
-use crate::{PyNamespace, make_builtin_function, make_module_builtin_function, namespace_store};
+use crate::{DictStorage, dict_storage_store, make_builtin_function, make_module_builtin_function};
 use pyre_object::*;
 use sre_engine::engine::{Request, State};
 use std::cell::RefCell;
@@ -14,19 +14,19 @@ thread_local! {
     static SRE_MATCH_TYPE: RefCell<PyObjectRef> = const { RefCell::new(pyre_object::PY_NULL) };
 }
 
-pub fn init(ns: &mut PyNamespace) {
-    namespace_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
-    namespace_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
-    namespace_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
-    namespace_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));
+pub fn init(ns: &mut DictStorage) {
+    dict_storage_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
+    dict_storage_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
+    dict_storage_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
+    dict_storage_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));
     // _sre module-level functions: PyPy mixedmodule.py:111-116 wraps these
     // as BuiltinFunction so storing them on a user class does not bind self.
-    namespace_store(
+    dict_storage_store(
         ns,
         "compile",
         make_module_builtin_function("compile", sre_compile),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "ascii_iscased",
         make_module_builtin_function("ascii_iscased", |args| {
@@ -37,7 +37,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_bool_from(ch.is_ascii_alphabetic()))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "unicode_iscased",
         make_module_builtin_function("unicode_iscased", |args| {
@@ -48,7 +48,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_bool_from(ch.is_alphabetic()))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "ascii_tolower",
         make_module_builtin_function("ascii_tolower", |args| {
@@ -60,7 +60,7 @@ pub fn init(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "unicode_tolower",
         make_module_builtin_function("unicode_tolower", |args| {
@@ -71,14 +71,14 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_int_new(c.to_lowercase().next().unwrap_or(c) as i64))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "getcodesize",
         make_module_builtin_function("getcodesize", |_| {
             Ok(w_int_new(sre_engine::CODESIZE as i64))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "getlower",
         make_module_builtin_function("getlower", |args| {
@@ -103,42 +103,42 @@ pub fn init(ns: &mut PyNamespace) {
 /// Register Pattern instance methods on the type so that `pat.match(s)`
 /// goes through the descriptor protocol and binds `pat` as `self`. Each
 /// per-pattern data lives in `ATTR_TABLE` keyed by the instance address.
-fn init_sre_pattern_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_sre_pattern_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "match",
         make_builtin_function("match", sre_pattern_match),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "fullmatch",
         make_builtin_function("fullmatch", sre_pattern_fullmatch),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "search",
         make_builtin_function("search", sre_pattern_search),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "findall",
         make_builtin_function("findall", sre_pattern_findall),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "finditer",
         make_builtin_function("finditer", sre_pattern_finditer),
     );
-    namespace_store(ns, "sub", make_builtin_function("sub", sre_pattern_sub));
-    namespace_store(ns, "subn", make_builtin_function("subn", sre_pattern_sub));
-    namespace_store(
+    dict_storage_store(ns, "sub", make_builtin_function("sub", sre_pattern_sub));
+    dict_storage_store(ns, "subn", make_builtin_function("subn", sre_pattern_sub));
+    dict_storage_store(
         ns,
         "split",
         make_builtin_function("split", sre_pattern_split),
     );
 }
 
-fn init_sre_match_type(ns: &mut PyNamespace) {
+fn init_sre_match_type(ns: &mut DictStorage) {
     // Register methods on the type so `m.group()` goes through the descriptor
     // protocol and binds `m` as the first positional argument. PyPy:
     // interp_sre.W_SRE_Match typedef — same layout.
@@ -149,7 +149,7 @@ fn init_sre_match_type(ns: &mut PyNamespace) {
         ("end", sre_match_end),
         ("span", sre_match_span),
     ] {
-        namespace_store(ns, name, make_builtin_function(name, func));
+        dict_storage_store(ns, name, make_builtin_function(name, func));
     }
 }
 

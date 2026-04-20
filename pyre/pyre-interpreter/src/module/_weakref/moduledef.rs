@@ -17,10 +17,10 @@
 //!     }
 //! ```
 
-use crate::PyNamespace;
+use crate::DictStorage;
 use crate::module::_weakref::interp_weakref;
 
-pub fn init(ns: &mut PyNamespace) {
+pub fn init(ns: &mut DictStorage) {
     // pypy/module/_weakref/moduledef.py:6-13 interpleveldefs:
     //   'ref'                : 'interp__weakref.W_Weakref',
     //   'getweakrefcount'    : 'interp__weakref.getweakrefcount',
@@ -32,21 +32,21 @@ pub fn init(ns: &mut PyNamespace) {
     let weakref_type = interp_weakref::weakref_type();
     let proxy_type = interp_weakref::proxy_type();
     let callable_proxy_type = interp_weakref::callable_proxy_type();
-    crate::namespace_store(ns, "ref", weakref_type);
-    crate::namespace_store(ns, "ReferenceType", weakref_type);
-    crate::namespace_store(ns, "ProxyType", proxy_type);
-    crate::namespace_store(ns, "CallableProxyType", callable_proxy_type);
-    crate::namespace_store(
+    crate::dict_storage_store(ns, "ref", weakref_type);
+    crate::dict_storage_store(ns, "ReferenceType", weakref_type);
+    crate::dict_storage_store(ns, "ProxyType", proxy_type);
+    crate::dict_storage_store(ns, "CallableProxyType", callable_proxy_type);
+    crate::dict_storage_store(
         ns,
         "proxy",
         crate::make_builtin_function("proxy", interp_weakref::proxy),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getweakrefcount",
         crate::make_builtin_function("getweakrefcount", interp_weakref::getweakrefcount),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "getweakrefs",
         crate::make_builtin_function("getweakrefs", interp_weakref::getweakrefs),
@@ -54,7 +54,7 @@ pub fn init(ns: &mut PyNamespace) {
     // CPython-specific helper used by weakref.py to clean up dead refs
     // from WeakValueDictionary. PyPy doesn't expose it because PyPy's
     // weakrefs auto-clean. pyre stubs it as a no-op.
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "_remove_dead_weakref",
         crate::make_builtin_function("_remove_dead_weakref", |_| Ok(pyre_object::w_none())),

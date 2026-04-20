@@ -5,9 +5,9 @@
 //! `import builtins` gives access to all builtin names.
 //! This module re-uses the default builtins namespace.
 
-use crate::PyNamespace;
+use crate::DictStorage;
 
-pub fn init(ns: &mut PyNamespace) {
+pub fn init(ns: &mut DictStorage) {
     // Seed with all default builtins — same as the module-level namespace.
     // PyPy: __builtin__ module exposes the same names.
     crate::install_default_builtins(ns);

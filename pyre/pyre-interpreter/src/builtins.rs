@@ -1,12 +1,12 @@
 use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
 
-use crate::executioncontext::PyNamespace;
+use crate::executioncontext::DictStorage;
 use crate::{PyDisplay, make_builtin_function, make_module_builtin_function};
 use pyre_object::*;
 
 /// Install the default builtins into a namespace.
-pub fn install_default_builtins(namespace: &mut PyNamespace) {
+pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("print", || {
         make_module_builtin_function("print", builtin_print)
     });
@@ -128,7 +128,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     // little-endian unpack inline.
     namespace.get_or_insert_with("memoryview", || {
         let tp = crate::typedef::make_builtin_type("memoryview", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__new__",
                 make_builtin_function("__new__", |args| {
@@ -142,7 +142,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
                     Ok(inst)
                 }),
             );
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "cast",
                 make_builtin_function("cast", |args| {
@@ -168,7 +168,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
                     Ok(inst)
                 }),
             );
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "tolist",
                 make_builtin_function("tolist", |args| {
@@ -194,7 +194,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
                     Ok(w_list_new(items))
                 }),
             );
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__len__",
                 make_builtin_function("__len__", |args| {
@@ -212,7 +212,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             );
             // memoryview.itemsize attribute — read from the per-instance
             // __pyre_itemsize__ slot via property descriptor.
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "itemsize",
                 pyre_object::w_property_new(
@@ -290,63 +290,63 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         exc_base_exception_new,
         crate::typedef::w_object(),
     );
-    crate::namespace_store(namespace, "BaseException", base_exc);
+    crate::dict_storage_store(namespace, "BaseException", base_exc);
 
     let exception = make_exc_type("Exception", exc_exception_new, base_exc);
-    crate::namespace_store(namespace, "Exception", exception);
+    crate::dict_storage_store(namespace, "Exception", exception);
 
     let arithmetic = make_exc_type("ArithmeticError", exc_arithmetic_error_new, exception);
-    crate::namespace_store(namespace, "ArithmeticError", arithmetic);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "ArithmeticError", arithmetic);
+    crate::dict_storage_store(
         namespace,
         "ZeroDivisionError",
         make_exc_type("ZeroDivisionError", exc_zero_division_new, arithmetic),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "OverflowError",
         make_exc_type("OverflowError", exc_overflow_error_new, arithmetic),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "FloatingPointError",
         make_exc_type("FloatingPointError", exc_arithmetic_error_new, arithmetic),
     );
 
     let lookup_error = make_exc_type("LookupError", exc_exception_new, exception);
-    crate::namespace_store(namespace, "LookupError", lookup_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "LookupError", lookup_error);
+    crate::dict_storage_store(
         namespace,
         "IndexError",
         make_exc_type("IndexError", exc_index_error_new, lookup_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "KeyError",
         make_exc_type("KeyError", exc_key_error_new, lookup_error),
     );
 
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "AttributeError",
         make_exc_type("AttributeError", exc_attribute_error_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "TypeError",
         make_exc_type("TypeError", exc_type_error_new, exception),
     );
     let value_error = make_exc_type("ValueError", exc_value_error_new, exception);
-    crate::namespace_store(namespace, "ValueError", value_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "ValueError", value_error);
+    crate::dict_storage_store(
         namespace,
         "NameError",
         make_exc_type("NameError", exc_name_error_new, exception),
     );
 
     let runtime_error = make_exc_type("RuntimeError", exc_runtime_error_new, exception);
-    crate::namespace_store(namespace, "RuntimeError", runtime_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "RuntimeError", runtime_error);
+    crate::dict_storage_store(
         namespace,
         "NotImplementedError",
         make_exc_type(
@@ -355,82 +355,82 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             runtime_error,
         ),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "RecursionError",
         make_exc_type("RecursionError", exc_runtime_error_new, runtime_error),
     );
 
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "StopIteration",
         make_exc_type("StopIteration", exc_stop_iteration_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "StopAsyncIteration",
         make_exc_type("StopAsyncIteration", exc_exception_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "GeneratorExit",
         make_exc_type("GeneratorExit", exc_base_exception_new, base_exc),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "SystemExit",
         make_exc_type("SystemExit", exc_base_exception_new, base_exc),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "KeyboardInterrupt",
         make_exc_type("KeyboardInterrupt", exc_base_exception_new, base_exc),
     );
 
     let import_error = make_exc_type("ImportError", exc_import_error_new, exception);
-    crate::namespace_store(namespace, "ImportError", import_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "ImportError", import_error);
+    crate::dict_storage_store(
         namespace,
         "ModuleNotFoundError",
         make_exc_type("ModuleNotFoundError", exc_import_error_new, import_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "AssertionError",
         make_exc_type("AssertionError", exc_assertion_error_new, exception),
     );
 
     let os_error = make_exc_type("OSError", exc_exception_new, exception);
-    crate::namespace_store(namespace, "OSError", os_error);
-    crate::namespace_store(namespace, "IOError", os_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "OSError", os_error);
+    crate::dict_storage_store(namespace, "IOError", os_error);
+    crate::dict_storage_store(
         namespace,
         "FileNotFoundError",
         make_exc_type("FileNotFoundError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "FileExistsError",
         make_exc_type("FileExistsError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "PermissionError",
         make_exc_type("PermissionError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "NotADirectoryError",
         make_exc_type("NotADirectoryError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "IsADirectoryError",
         make_exc_type("IsADirectoryError", exc_exception_new, os_error),
     );
 
     let warning = make_exc_type("Warning", exc_exception_new, exception);
-    crate::namespace_store(namespace, "Warning", warning);
+    crate::dict_storage_store(namespace, "Warning", warning);
     for warn_name in [
         "UserWarning",
         "DeprecationWarning",
@@ -444,7 +444,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
         "SyntaxWarning",
         "EncodingWarning",
     ] {
-        crate::namespace_store(
+        crate::dict_storage_store(
             namespace,
             warn_name,
             make_exc_type(warn_name, exc_exception_new, warning),
@@ -452,75 +452,75 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
     }
 
     let unicode_error = make_exc_type("UnicodeError", exc_value_error_new, value_error);
-    crate::namespace_store(namespace, "UnicodeError", unicode_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "UnicodeError", unicode_error);
+    crate::dict_storage_store(
         namespace,
         "UnicodeDecodeError",
         make_exc_type("UnicodeDecodeError", exc_value_error_new, unicode_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "UnicodeEncodeError",
         make_exc_type("UnicodeEncodeError", exc_value_error_new, unicode_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "UnicodeTranslateError",
         make_exc_type("UnicodeTranslateError", exc_value_error_new, unicode_error),
     );
 
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "BufferError",
         make_exc_type("BufferError", exc_exception_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "MemoryError",
         make_exc_type("MemoryError", exc_exception_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "ReferenceError",
         make_exc_type("ReferenceError", exc_exception_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "SystemError",
         make_exc_type("SystemError", exc_exception_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "EOFError",
         make_exc_type("EOFError", exc_exception_new, exception),
     );
     let syntax_error = make_exc_type("SyntaxError", exc_exception_new, exception);
-    crate::namespace_store(namespace, "SyntaxError", syntax_error);
+    crate::dict_storage_store(namespace, "SyntaxError", syntax_error);
     let indentation_error = make_exc_type("IndentationError", exc_exception_new, syntax_error);
-    crate::namespace_store(namespace, "IndentationError", indentation_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "IndentationError", indentation_error);
+    crate::dict_storage_store(
         namespace,
         "TabError",
         make_exc_type("TabError", exc_exception_new, indentation_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "BlockingIOError",
         make_exc_type("BlockingIOError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "ChildProcessError",
         make_exc_type("ChildProcessError", exc_exception_new, os_error),
     );
     let connection_error = make_exc_type("ConnectionError", exc_exception_new, os_error);
-    crate::namespace_store(namespace, "ConnectionError", connection_error);
-    crate::namespace_store(
+    crate::dict_storage_store(namespace, "ConnectionError", connection_error);
+    crate::dict_storage_store(
         namespace,
         "BrokenPipeError",
         make_exc_type("BrokenPipeError", exc_exception_new, connection_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "ConnectionAbortedError",
         make_exc_type(
@@ -529,7 +529,7 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             connection_error,
         ),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "ConnectionRefusedError",
         make_exc_type(
@@ -538,37 +538,37 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
             connection_error,
         ),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "ConnectionResetError",
         make_exc_type("ConnectionResetError", exc_exception_new, connection_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "InterruptedError",
         make_exc_type("InterruptedError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "ProcessLookupError",
         make_exc_type("ProcessLookupError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "TimeoutError",
         make_exc_type("TimeoutError", exc_exception_new, os_error),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "BaseExceptionGroup",
         make_exc_type("BaseExceptionGroup", exc_base_exception_new, base_exc),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "ExceptionGroup",
         make_exc_type("ExceptionGroup", exc_exception_new, exception),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         namespace,
         "PythonFinalizationError",
         make_exc_type(
@@ -615,9 +615,9 @@ pub fn install_default_builtins(namespace: &mut PyNamespace) {
 }
 
 /// Create a fresh namespace seeded with the default builtins.
-pub fn new_builtin_namespace() -> PyNamespace {
+pub fn new_builtin_dict_storage() -> DictStorage {
     crate::typedef::init_typeobjects();
-    let mut namespace = PyNamespace::new();
+    let mut namespace = DictStorage::new();
     install_default_builtins(&mut namespace);
     namespace
 }
@@ -903,15 +903,15 @@ fn type_descr_new_with_metaclass(
             }
         }
 
-        // Convert dict to PyNamespace
-        let mut class_ns = Box::new(crate::PyNamespace::new());
+        // Convert dict to DictStorage
+        let mut class_ns = Box::new(crate::DictStorage::new());
         class_ns.fix_ptr();
         if unsafe { is_dict(w_namespace_dict) } {
             let d = unsafe { &*(w_namespace_dict as *const pyre_object::dictobject::W_DictObject) };
             for &(k, v) in unsafe { &*d.entries } {
                 if unsafe { is_str(k) } {
                     let key = unsafe { pyre_object::w_str_get_value(k) };
-                    crate::namespace_store(&mut class_ns, key, v);
+                    crate::dict_storage_store(&mut class_ns, key, v);
                 }
             }
         }
@@ -1153,7 +1153,7 @@ fn make_exc_type(
     let cls = crate::typedef::make_builtin_type_with_base(
         name,
         move |ns| {
-            crate::namespace_store(ns, "__new__", make_builtin_function("__new__", new_fn));
+            crate::dict_storage_store(ns, "__new__", make_builtin_function("__new__", new_fn));
         },
         base,
     );
@@ -1986,7 +1986,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 ///
 /// Compiles `source` if necessary, then runs the resulting code object in
 /// the supplied namespaces.  When the namespaces are dicts, pyre converts
-/// them into `PyNamespace`s before invocation and copies the post-run
+/// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
 fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -2042,41 +2042,42 @@ fn exec_or_eval(
         crate::w_code_get_ptr(code_obj_ref as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
 
-    // Build a PyNamespace from the supplied globals dict (or fall back to
+    // Build a DictStorage from the supplied globals dict (or fall back to
     // the caller's frame globals when None / missing). Mutations made by
     // the executed code propagate back to the original dict via the
     // dict-namespace sync helpers.
-    let (ns_box, sync_back_dict) =
-        if !globals_arg.is_null() && unsafe { pyre_object::is_dict(globals_arg) } {
-            let mut ns = Box::new(crate::PyNamespace::new());
-            unsafe {
-                for (key, value) in pyre_object::w_dict_items(globals_arg) {
-                    if !value.is_null() && pyre_object::is_str(key) {
-                        crate::namespace_store(&mut ns, pyre_object::w_str_get_value(key), value);
-                    }
+    let (ns_box, sync_back_dict) = if !globals_arg.is_null()
+        && unsafe { pyre_object::is_dict(globals_arg) }
+    {
+        let mut ns = Box::new(crate::DictStorage::new());
+        unsafe {
+            for (key, value) in pyre_object::w_dict_items(globals_arg) {
+                if !value.is_null() && pyre_object::is_str(key) {
+                    crate::dict_storage_store(&mut ns, pyre_object::w_str_get_value(key), value);
                 }
             }
-            ns.fix_ptr();
-            (ns, Some(globals_arg))
-        } else {
-            // Inherit caller globals.
-            let mut ns = Box::new(crate::PyNamespace::new());
-            crate::eval::CURRENT_FRAME.with(|current| {
-                let frame = current.get();
-                if !frame.is_null() {
-                    let parent_ns = unsafe { (*frame).get_w_globals() };
-                    if !parent_ns.is_null() {
-                        for (k, &v) in unsafe { &*parent_ns }.entries() {
-                            if !v.is_null() {
-                                crate::namespace_store(&mut ns, k, v);
-                            }
+        }
+        ns.fix_ptr();
+        (ns, Some(globals_arg))
+    } else {
+        // Inherit caller globals.
+        let mut ns = Box::new(crate::DictStorage::new());
+        crate::eval::CURRENT_FRAME.with(|current| {
+            let frame = current.get();
+            if !frame.is_null() {
+                let parent_ns = unsafe { (*frame).get_w_globals() };
+                if !parent_ns.is_null() {
+                    for (k, &v) in unsafe { &*parent_ns }.entries() {
+                        if !v.is_null() {
+                            crate::dict_storage_store(&mut ns, k, v);
                         }
                     }
                 }
-            });
-            ns.fix_ptr();
-            (ns, None)
-        };
+            }
+        });
+        ns.fix_ptr();
+        (ns, None)
+    };
     // If a separate `locals` dict was passed, layer its bindings on top
     // of the globals namespace. Module-level execs in dataclasses pass
     // the same dict for both, so this also covers `exec(src, g, l)` where
@@ -2089,7 +2090,11 @@ fn exec_or_eval(
         unsafe {
             for (key, value) in pyre_object::w_dict_items(locals_arg) {
                 if !value.is_null() && pyre_object::is_str(key) {
-                    crate::namespace_store(&mut ns_box, pyre_object::w_str_get_value(key), value);
+                    crate::dict_storage_store(
+                        &mut ns_box,
+                        pyre_object::w_str_get_value(key),
+                        value,
+                    );
                 }
             }
         }
@@ -2154,7 +2159,7 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // Create a dict backed by the live namespace. Mutations (update,
         // __setitem__) are synced back to the namespace so that patterns
         // like `globals().update({...})` work correctly.
-        let dict = pyre_object::w_dict_new_with_namespace(namespace as *mut u8);
+        let dict = pyre_object::w_dict_new_with_dict_storage(namespace as *mut u8);
         for (k, &v) in unsafe { &*namespace }.entries() {
             unsafe { pyre_object::w_dict_store(dict, pyre_object::w_str_new(k), v) };
         }
@@ -2245,7 +2250,7 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if pyre_object::is_module(obj) {
             let ns_ptr = pyre_object::moduleobject::w_module_get_dict_ptr(obj);
             if !ns_ptr.is_null() {
-                let ns = &*(ns_ptr as *const PyNamespace);
+                let ns = &*(ns_ptr as *const DictStorage);
                 for (name, _) in ns.entries() {
                     names.push(name.to_string());
                 }
@@ -2253,7 +2258,7 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         } else if pyre_object::is_type(obj) {
             let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(obj);
             if !ns_ptr.is_null() {
-                let ns = &*(ns_ptr as *const PyNamespace);
+                let ns = &*(ns_ptr as *const DictStorage);
                 for (name, _) in ns.entries() {
                     names.push(name.to_string());
                 }
@@ -2284,7 +2289,7 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if !w_type.is_null() && pyre_object::is_type(w_type) {
                 let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(w_type);
                 if !ns_ptr.is_null() {
-                    let ns = &*(ns_ptr as *const PyNamespace);
+                    let ns = &*(ns_ptr as *const DictStorage);
                     for (name, _) in ns.entries() {
                         names.push(name.to_string());
                     }
@@ -2625,39 +2630,39 @@ pub fn file_wrapper_type() -> PyObjectRef {
 }
 
 /// PyPy: pypy/module/_io/interp_iobase.py W_IOBase.
-fn init_file_wrapper_type(ns: &mut PyNamespace) {
-    crate::namespace_store(ns, "read", make_builtin_function("read", file_method_read));
-    crate::namespace_store(
+fn init_file_wrapper_type(ns: &mut DictStorage) {
+    crate::dict_storage_store(ns, "read", make_builtin_function("read", file_method_read));
+    crate::dict_storage_store(
         ns,
         "readline",
         make_builtin_function("readline", file_method_readline),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "readlines",
         make_builtin_function("readlines", file_method_readlines),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "write",
         make_builtin_function("write", file_method_write),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "close",
         make_builtin_function("close", file_method_close),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "flush",
         make_builtin_function("flush", file_method_close),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__enter__",
         make_builtin_function("__enter__", |args| Ok(args[0])),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__exit__",
         make_builtin_function("__exit__", |args| {
@@ -2666,12 +2671,12 @@ fn init_file_wrapper_type(ns: &mut PyNamespace) {
             Ok(w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__iter__",
         make_builtin_function("__iter__", |args| Ok(args[0])),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "__next__",
         make_builtin_function("__next__", |args| {
@@ -2685,7 +2690,7 @@ fn init_file_wrapper_type(ns: &mut PyNamespace) {
             Ok(line)
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "seek",
         make_builtin_function("seek", |args| {
@@ -2695,7 +2700,7 @@ fn init_file_wrapper_type(ns: &mut PyNamespace) {
             Ok(w_none())
         }),
     );
-    crate::namespace_store(
+    crate::dict_storage_store(
         ns,
         "tell",
         make_builtin_function("tell", |args| {
@@ -3213,7 +3218,7 @@ mod tests {
     fn test_builtin_divmod_allows_lhs_dunder_before_dead_proxy_rhs() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("DivmodLhs", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__divmod__",
                 make_builtin_function("__divmod__", |_| {
@@ -3254,7 +3259,7 @@ mod tests {
     fn test_builtin_pow_three_arg_allows_lhs_dunder_before_dead_proxy_exp() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__pow__",
                 make_builtin_function("__pow__", |_| Ok(w_int_new(99))),

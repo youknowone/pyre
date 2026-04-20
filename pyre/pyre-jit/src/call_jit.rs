@@ -340,7 +340,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         let p = frame_ptr as *const u8;
         let code = *(p.add(PYFRAME_PYCODE_OFFSET) as *const *const ());
         let ns = *(p.add(std::mem::offset_of!(PyFrame, w_globals))
-            as *const *mut pyre_interpreter::PyNamespace);
+            as *const *mut pyre_interpreter::DictStorage);
         let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
             as *const *const pyre_interpreter::PyExecutionContext);
         (code, ns, ec)
@@ -2594,7 +2594,7 @@ pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, w_code_ptr: i64, namei: 
     }
 
     let name = code.names[idx].as_ref();
-    let ns = unsafe { &*(namespace_ptr as *const pyre_interpreter::PyNamespace) };
+    let ns = unsafe { &*(namespace_ptr as *const pyre_interpreter::DictStorage) };
     match ns.get(name) {
         Some(&value) => value as i64,
         None => {

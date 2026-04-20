@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: pypy/module/sys/
 
-use crate::{PyNamespace, namespace_store};
+use crate::{DictStorage, dict_storage_store};
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -25,7 +25,7 @@ fn sys_namespace_type() -> PyObjectRef {
             // typedef.rs:541/554). The value itself is never read; PyPy
             // stores a `GetSetProperty` there, but the Rust port only needs
             // the key to light up the per-instance attribute store.
-            namespace_store(ns, "__dict__", w_none());
+            dict_storage_store(ns, "__dict__", w_none());
         });
         tp as usize
     });
@@ -38,11 +38,11 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
-pub fn init(ns: &mut PyNamespace) {
-    namespace_store(ns, "maxsize", w_int_new(i64::MAX));
-    namespace_store(ns, "maxunicode", w_int_new(0x10FFFF));
-    namespace_store(ns, "version", w_str_new("3.13.0 (pyre 0.0.1)"));
-    namespace_store(
+pub fn init(ns: &mut DictStorage) {
+    dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
+    dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
+    dict_storage_store(ns, "version", w_str_new("3.13.0 (pyre 0.0.1)"));
+    dict_storage_store(
         ns,
         "platform",
         w_str_new(if cfg!(target_os = "macos") {
@@ -55,7 +55,7 @@ pub fn init(ns: &mut PyNamespace) {
             "unknown"
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "byteorder",
         w_str_new(if cfg!(target_endian = "little") {
@@ -64,7 +64,7 @@ pub fn init(ns: &mut PyNamespace) {
             "big"
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "version_info",
         w_tuple_new(vec![
@@ -78,21 +78,21 @@ pub fn init(ns: &mut PyNamespace) {
     // sys.modules — live dict synced with the import cache.
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
-    namespace_store(ns, "modules", modules_dict);
+    dict_storage_store(ns, "modules", modules_dict);
     // sys.path — empty list placeholder
-    namespace_store(ns, "path", w_list_new(vec![]));
+    dict_storage_store(ns, "path", w_list_new(vec![]));
     // sys.stdout/stderr/stdin — stub file-like objects.  Real CPython
     // wires these through io.TextIOWrapper around sys.__stdout__; pyre
     // exposes a tiny object with the bare minimum surface so anything
     // that writes status (unittest, traceback, warnings) keeps working.
-    namespace_store(ns, "stdout", make_std_stream("<stdout>", false));
-    namespace_store(ns, "stderr", make_std_stream("<stderr>", true));
-    namespace_store(ns, "stdin", make_std_stream("<stdin>", false));
-    namespace_store(ns, "__stdout__", make_std_stream("<stdout>", false));
-    namespace_store(ns, "__stderr__", make_std_stream("<stderr>", true));
-    namespace_store(ns, "__stdin__", make_std_stream("<stdin>", false));
+    dict_storage_store(ns, "stdout", make_std_stream("<stdout>", false));
+    dict_storage_store(ns, "stderr", make_std_stream("<stderr>", true));
+    dict_storage_store(ns, "stdin", make_std_stream("<stdin>", false));
+    dict_storage_store(ns, "__stdout__", make_std_stream("<stdout>", false));
+    dict_storage_store(ns, "__stderr__", make_std_stream("<stderr>", true));
+    dict_storage_store(ns, "__stdin__", make_std_stream("<stdin>", false));
     // sys._getframe — returns a stub frame object with f_locals/f_globals
-    namespace_store(
+    dict_storage_store(
         ns,
         "_getframe",
         crate::make_builtin_function("_getframe", |_| {
@@ -106,7 +106,7 @@ pub fn init(ns: &mut PyNamespace) {
         }),
     );
     // sys.exc_info() → (type, value, traceback)
-    namespace_store(
+    dict_storage_store(
         ns,
         "exc_info",
         crate::make_builtin_function("exc_info", |_| {
@@ -141,48 +141,48 @@ pub fn init(ns: &mut PyNamespace) {
     // structseq port is tracked separately.
     {
         let flags_type = crate::typedef::make_builtin_type("sys.flags", |fns| {
-            namespace_store(fns, "debug", w_int_new(0));
-            namespace_store(fns, "inspect", w_int_new(0));
-            namespace_store(fns, "interactive", w_int_new(0));
-            namespace_store(fns, "optimize", w_int_new(0));
-            namespace_store(fns, "dont_write_bytecode", w_int_new(0));
-            namespace_store(fns, "no_user_site", w_int_new(0));
-            namespace_store(fns, "no_site", w_int_new(0));
-            namespace_store(fns, "ignore_environment", w_int_new(0));
-            namespace_store(fns, "verbose", w_int_new(0));
-            namespace_store(fns, "bytes_warning", w_int_new(0));
-            namespace_store(fns, "quiet", w_int_new(0));
-            namespace_store(fns, "hash_randomization", w_int_new(0));
-            namespace_store(fns, "isolated", w_int_new(0));
-            namespace_store(fns, "dev_mode", w_bool_from(false));
-            namespace_store(fns, "utf8_mode", w_int_new(1));
-            namespace_store(fns, "warn_default_encoding", w_int_new(0));
-            namespace_store(fns, "safe_path", w_bool_from(false));
-            namespace_store(fns, "int_max_str_digits", w_int_new(4300));
-            namespace_store(fns, "context_aware_warnings", w_bool_from(false));
+            dict_storage_store(fns, "debug", w_int_new(0));
+            dict_storage_store(fns, "inspect", w_int_new(0));
+            dict_storage_store(fns, "interactive", w_int_new(0));
+            dict_storage_store(fns, "optimize", w_int_new(0));
+            dict_storage_store(fns, "dont_write_bytecode", w_int_new(0));
+            dict_storage_store(fns, "no_user_site", w_int_new(0));
+            dict_storage_store(fns, "no_site", w_int_new(0));
+            dict_storage_store(fns, "ignore_environment", w_int_new(0));
+            dict_storage_store(fns, "verbose", w_int_new(0));
+            dict_storage_store(fns, "bytes_warning", w_int_new(0));
+            dict_storage_store(fns, "quiet", w_int_new(0));
+            dict_storage_store(fns, "hash_randomization", w_int_new(0));
+            dict_storage_store(fns, "isolated", w_int_new(0));
+            dict_storage_store(fns, "dev_mode", w_bool_from(false));
+            dict_storage_store(fns, "utf8_mode", w_int_new(1));
+            dict_storage_store(fns, "warn_default_encoding", w_int_new(0));
+            dict_storage_store(fns, "safe_path", w_bool_from(false));
+            dict_storage_store(fns, "int_max_str_digits", w_int_new(4300));
+            dict_storage_store(fns, "context_aware_warnings", w_bool_from(false));
         });
         let flags = w_instance_new(flags_type);
-        namespace_store(ns, "flags", flags);
+        dict_storage_store(ns, "flags", flags);
     }
     // sys.getdefaultencoding
-    namespace_store(
+    dict_storage_store(
         ns,
         "getdefaultencoding",
         crate::make_builtin_function("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
     );
     // sys.getrecursionlimit / setrecursionlimit
-    namespace_store(
+    dict_storage_store(
         ns,
         "getrecursionlimit",
         crate::make_builtin_function("getrecursionlimit", |_| Ok(w_int_new(1000))),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "setrecursionlimit",
         crate::make_builtin_function("setrecursionlimit", |_| Ok(w_none())),
     );
     // sys.intern
-    namespace_store(
+    dict_storage_store(
         ns,
         "intern",
         crate::make_builtin_function("intern", |args| {
@@ -211,7 +211,7 @@ pub fn init(ns: &mut PyNamespace) {
         let _ = crate::baseobjspace::setattr(impl_obj, "hexversion", w_int_new(0x030d00f0));
         let _ = crate::baseobjspace::setattr(impl_obj, "cache_tag", w_str_new("pyre-3.13"));
         let _ = crate::baseobjspace::setattr(impl_obj, "_multiarch", w_str_new(""));
-        namespace_store(ns, "implementation", impl_obj);
+        dict_storage_store(ns, "implementation", impl_obj);
     }
     // sys.hash_info — structseq with width/modulus/... fields.
     // PyPy: pypy/module/sys/state.py W_HashInfoStructSeq.
@@ -226,7 +226,7 @@ pub fn init(ns: &mut PyNamespace) {
         let _ = crate::baseobjspace::setattr(hash_info, "hash_bits", w_int_new(64));
         let _ = crate::baseobjspace::setattr(hash_info, "seed_bits", w_int_new(128));
         let _ = crate::baseobjspace::setattr(hash_info, "cutoff", w_int_new(0));
-        namespace_store(ns, "hash_info", hash_info);
+        dict_storage_store(ns, "hash_info", hash_info);
     }
     // sys.float_info — structseq with IEEE 754 double metadata.
     // PyPy: pypy/module/sys/state.py W_FloatInfoStructSeq.
@@ -243,7 +243,7 @@ pub fn init(ns: &mut PyNamespace) {
         let _ = crate::baseobjspace::setattr(fi, "epsilon", w_float_new(f64::EPSILON));
         let _ = crate::baseobjspace::setattr(fi, "radix", w_int_new(2));
         let _ = crate::baseobjspace::setattr(fi, "rounds", w_int_new(1));
-        namespace_store(ns, "float_info", fi);
+        dict_storage_store(ns, "float_info", fi);
     }
     // sys.int_info — structseq with int implementation details.
     {
@@ -252,17 +252,17 @@ pub fn init(ns: &mut PyNamespace) {
         let _ = crate::baseobjspace::setattr(ii, "sizeof_digit", w_int_new(4));
         let _ = crate::baseobjspace::setattr(ii, "default_max_str_digits", w_int_new(4300));
         let _ = crate::baseobjspace::setattr(ii, "str_digits_check_threshold", w_int_new(640));
-        namespace_store(ns, "int_info", ii);
+        dict_storage_store(ns, "int_info", ii);
     }
     // sys.executable
-    namespace_store(ns, "executable", w_str_new("pyre"));
+    dict_storage_store(ns, "executable", w_str_new("pyre"));
     // sys.prefix / exec_prefix
-    namespace_store(ns, "prefix", w_str_new(""));
-    namespace_store(ns, "exec_prefix", w_str_new(""));
-    namespace_store(ns, "base_prefix", w_str_new(""));
-    namespace_store(ns, "base_exec_prefix", w_str_new(""));
+    dict_storage_store(ns, "prefix", w_str_new(""));
+    dict_storage_store(ns, "exec_prefix", w_str_new(""));
+    dict_storage_store(ns, "base_prefix", w_str_new(""));
+    dict_storage_store(ns, "base_exec_prefix", w_str_new(""));
     // sys._framework — macOS framework name (empty string on non-framework builds)
-    namespace_store(ns, "_framework", w_str_new(""));
+    dict_storage_store(ns, "_framework", w_str_new(""));
     // sys._jit — namespace with is_enabled/is_available methods.
     // Python 3.14+ introduced sys._jit for CPython tier-2 JIT support checks.
     {
@@ -277,13 +277,13 @@ pub fn init(ns: &mut PyNamespace) {
             "is_available",
             crate::make_builtin_function("is_available", |_| Ok(w_bool_from(false))),
         );
-        namespace_store(ns, "_jit", jit);
+        dict_storage_store(ns, "_jit", jit);
     }
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
-    namespace_store(ns, "platlibdir", w_str_new("lib"));
+    dict_storage_store(ns, "platlibdir", w_str_new("lib"));
     // sys.exit(code=0) — raise SystemExit
-    namespace_store(
+    dict_storage_store(
         ns,
         "exit",
         crate::make_builtin_function("exit", |args| {
@@ -309,7 +309,7 @@ pub fn init(ns: &mut PyNamespace) {
         }),
     );
     // sys.abiflags
-    namespace_store(ns, "abiflags", w_str_new(""));
+    dict_storage_store(ns, "abiflags", w_str_new(""));
     // sys.argv — pick up pending argv from set_sys_argv if available.
     let pending = crate::importing::take_pending_sys_argv();
     let argv = if pending.is_null() {
@@ -317,13 +317,13 @@ pub fn init(ns: &mut PyNamespace) {
     } else {
         pending
     };
-    namespace_store(ns, "argv", argv);
+    dict_storage_store(ns, "argv", argv);
     // sys.warnoptions
-    namespace_store(ns, "warnoptions", w_list_new(vec![]));
+    dict_storage_store(ns, "warnoptions", w_list_new(vec![]));
     // sys.builtin_module_names — tuple of names of modules compiled into
     // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names.
     // Pyre: include all stub/native built-ins from importing.rs.
-    namespace_store(
+    dict_storage_store(
         ns,
         "builtin_module_names",
         w_tuple_new(vec![
@@ -384,46 +384,46 @@ pub fn init(ns: &mut PyNamespace) {
         ]),
     );
     // sys.exception — returns the currently handled exception or None
-    namespace_store(
+    dict_storage_store(
         ns,
         "exception",
         crate::make_builtin_function("exception", |_| Ok(w_none())),
     );
     // sys.exc_clear — no-op
-    namespace_store(
+    dict_storage_store(
         ns,
         "exc_clear",
         crate::make_builtin_function("exc_clear", |_| Ok(w_none())),
     );
     // sys.gettrace / settrace — no-op
-    namespace_store(
+    dict_storage_store(
         ns,
         "gettrace",
         crate::make_builtin_function("gettrace", |_| Ok(w_none())),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "settrace",
         crate::make_builtin_function("settrace", |_| Ok(w_none())),
     );
     // sys.getprofile / setprofile — no-op
-    namespace_store(
+    dict_storage_store(
         ns,
         "getprofile",
         crate::make_builtin_function("getprofile", |_| Ok(w_none())),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "setprofile",
         crate::make_builtin_function("setprofile", |_| Ok(w_none())),
     );
     // sys.getfilesystemencoding
-    namespace_store(
+    dict_storage_store(
         ns,
         "getfilesystemencoding",
         crate::make_builtin_function("getfilesystemencoding", |_| Ok(w_str_new("utf-8"))),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "getfilesystemencodeerrors",
         crate::make_builtin_function("getfilesystemencodeerrors", |_| {
@@ -431,37 +431,37 @@ pub fn init(ns: &mut PyNamespace) {
         }),
     );
     // sys.audit — no-op
-    namespace_store(
+    dict_storage_store(
         ns,
         "audit",
         crate::make_builtin_function("audit", |_| Ok(w_none())),
     );
     // sys.is_finalizing
-    namespace_store(
+    dict_storage_store(
         ns,
         "is_finalizing",
         crate::make_builtin_function("is_finalizing", |_| Ok(w_bool_from(false))),
     );
     // sys.displayhook / excepthook
-    namespace_store(
+    dict_storage_store(
         ns,
         "displayhook",
         crate::make_builtin_function("displayhook", |_| Ok(w_none())),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "excepthook",
         crate::make_builtin_function("excepthook", |_| Ok(w_none())),
     );
     // sys.path_hooks / path_importer_cache
-    namespace_store(ns, "path_hooks", w_list_new(vec![]));
-    namespace_store(ns, "path_importer_cache", w_dict_new());
+    dict_storage_store(ns, "path_hooks", w_list_new(vec![]));
+    dict_storage_store(ns, "path_importer_cache", w_dict_new());
     // sys.meta_path — empty
-    namespace_store(ns, "meta_path", w_list_new(vec![]));
+    dict_storage_store(ns, "meta_path", w_list_new(vec![]));
     // sys.dont_write_bytecode
-    namespace_store(ns, "dont_write_bytecode", w_bool_from(true));
+    dict_storage_store(ns, "dont_write_bytecode", w_bool_from(true));
     // sys.addaudithook
-    namespace_store(
+    dict_storage_store(
         ns,
         "addaudithook",
         crate::make_builtin_function("addaudithook", |_| Ok(w_none())),

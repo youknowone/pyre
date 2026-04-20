@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use pyre_object::pyobject::*;
 use pyre_object::*;
 
-use crate::{PyNamespace, make_builtin_function, namespace_store};
+use crate::{DictStorage, dict_storage_store, make_builtin_function};
 
 /// Compatibility stand-ins for PyPy `typedef.py` API (type descriptor helpers).
 #[derive(Debug, Default)]
@@ -502,8 +502,8 @@ pub fn w_object() -> PyObjectRef {
 }
 
 /// Create the root `object` type. MRO = [object].
-fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
-    let mut ns = Box::new(PyNamespace::new());
+fn new_root_typeobject(name: &str, init: fn(&mut DictStorage)) -> PyObjectRef {
+    let mut ns = Box::new(DictStorage::new());
     ns.fix_ptr();
     init(&mut ns);
     let ns_ptr = Box::into_raw(ns);
@@ -535,7 +535,7 @@ fn new_root_typeobject(name: &str, init: fn(&mut PyNamespace)) -> PyObjectRef {
 /// Layout defaults to INSTANCE_TYPE (general object layout).
 fn new_typeobject_with_base(
     name: &str,
-    init: impl FnOnce(&mut PyNamespace),
+    init: impl FnOnce(&mut DictStorage),
     base: PyObjectRef,
 ) -> PyObjectRef {
     new_typeobject_with_base_and_layout(name, init, base, &INSTANCE_TYPE as *const PyType)
@@ -548,11 +548,11 @@ fn new_typeobject_with_base(
 /// the same typedef as their base reuse the parent's Layout object.
 fn new_typeobject_with_base_and_layout(
     name: &str,
-    init: impl FnOnce(&mut PyNamespace),
+    init: impl FnOnce(&mut DictStorage),
     base: PyObjectRef,
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
-    let mut ns = Box::new(PyNamespace::new());
+    let mut ns = Box::new(DictStorage::new());
     ns.fix_ptr();
     init(&mut ns);
     let ns_ptr = Box::into_raw(ns);
@@ -609,14 +609,14 @@ fn new_typeobject_with_base_and_layout(
 ///
 /// Used by extension modules (e.g. _sre) to define their own types.
 /// typeobject.py:174 `is_heaptype=False` — builtin type.
-pub fn make_builtin_type(name: &str, init: impl FnOnce(&mut PyNamespace)) -> PyObjectRef {
+pub fn make_builtin_type(name: &str, init: impl FnOnce(&mut DictStorage)) -> PyObjectRef {
     new_typeobject_with_base(name, init, w_object())
 }
 
 /// Create a named builtin type inheriting from `base`.
 pub fn make_builtin_type_with_base(
     name: &str,
-    init: impl FnOnce(&mut PyNamespace),
+    init: impl FnOnce(&mut DictStorage),
     base: PyObjectRef,
 ) -> PyObjectRef {
     new_typeobject_with_base(name, init, base)
@@ -723,14 +723,14 @@ fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(pyre_object::noneobject::w_ellipsis())
 }
 
-fn init_ellipsis_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(ellipsis_descr_new));
-    namespace_store(
+fn init_ellipsis_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(ellipsis_descr_new));
+    dict_storage_store(
         ns,
         "__repr__",
         make_builtin_function("__repr__", |_args| Ok(w_str_new("Ellipsis"))),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__reduce__",
         make_builtin_function("__reduce__", |_args| Ok(w_str_new("Ellipsis"))),
@@ -747,20 +747,20 @@ fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// typedef.py:948-954 NotImplemented.typedef
-fn init_notimplemented_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(notimplemented_descr_new));
-    namespace_store(
+fn init_notimplemented_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(notimplemented_descr_new));
+    dict_storage_store(
         ns,
         "__repr__",
         make_builtin_function("__repr__", |_args| Ok(w_str_new("NotImplemented"))),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__reduce__",
         make_builtin_function("__reduce__", |_args| Ok(w_str_new("NotImplemented"))),
     );
     // special.py:28-33 descr_bool
-    namespace_store(
+    dict_storage_store(
         ns,
         "__bool__",
         make_builtin_function("__bool__", |_args| {
@@ -1083,59 +1083,59 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // ── List TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/listobject.py TypeDef("list", ...)
 
-fn init_list_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(list_descr_new));
-    namespace_store(
+fn init_list_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(list_descr_new));
+    dict_storage_store(
         ns,
         "append",
         make_builtin_function("append", crate::type_methods::list_method_append),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "extend",
         make_builtin_function("extend", crate::type_methods::list_method_extend),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "copy",
         make_builtin_function("copy", crate::type_methods::list_method_copy),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "insert",
         make_builtin_function("insert", crate::type_methods::list_method_insert),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "pop",
         make_builtin_function("pop", crate::type_methods::list_method_pop),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "clear",
         make_builtin_function("clear", crate::type_methods::list_method_clear),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "reverse",
         make_builtin_function("reverse", crate::type_methods::list_method_reverse),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "sort",
         make_builtin_function("sort", crate::type_methods::list_method_sort),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "index",
         make_builtin_function("index", crate::type_methods::list_method_index),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "count",
         make_builtin_function("count", crate::type_methods::list_method_count),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "remove",
         make_builtin_function("remove", crate::type_methods::list_method_remove),
@@ -1145,215 +1145,215 @@ fn init_list_type(ns: &mut PyNamespace) {
 // ── Str TypeDef ──────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/unicodeobject.py TypeDef("str", ...)
 
-fn init_str_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(str_descr_new));
-    namespace_store(
+fn init_str_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(str_descr_new));
+    dict_storage_store(
         ns,
         "join",
         make_builtin_function("join", crate::type_methods::str_method_join),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "split",
         make_builtin_function("split", crate::type_methods::str_method_split),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "strip",
         make_builtin_function("strip", crate::type_methods::str_method_strip),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "lstrip",
         make_builtin_function("lstrip", crate::type_methods::str_method_lstrip),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "rstrip",
         make_builtin_function("rstrip", crate::type_methods::str_method_rstrip),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "startswith",
         make_builtin_function("startswith", crate::type_methods::str_method_startswith),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "endswith",
         make_builtin_function("endswith", crate::type_methods::str_method_endswith),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "replace",
         make_builtin_function("replace", crate::type_methods::str_method_replace),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "find",
         make_builtin_function("find", crate::type_methods::str_method_find),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "rfind",
         make_builtin_function("rfind", crate::type_methods::str_method_rfind),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "upper",
         make_builtin_function("upper", crate::type_methods::str_method_upper),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "lower",
         make_builtin_function("lower", crate::type_methods::str_method_lower),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "format",
         make_builtin_function("format", crate::type_methods::str_method_format),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "encode",
         make_builtin_function("encode", crate::type_methods::str_method_encode),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isdigit",
         make_builtin_function("isdigit", crate::type_methods::str_method_isdigit),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isdecimal",
         make_builtin_function("isdecimal", crate::type_methods::str_method_isdecimal),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isnumeric",
         make_builtin_function("isnumeric", crate::type_methods::str_method_isnumeric),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "istitle",
         make_builtin_function("istitle", crate::type_methods::str_method_istitle),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isalpha",
         make_builtin_function("isalpha", crate::type_methods::str_method_isalpha),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isidentifier",
         make_builtin_function("isidentifier", crate::type_methods::str_method_isidentifier),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "zfill",
         make_builtin_function("zfill", crate::type_methods::str_method_zfill),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "count",
         make_builtin_function("count", crate::type_methods::str_method_count),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "index",
         make_builtin_function("index", crate::type_methods::str_method_index),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "title",
         make_builtin_function("title", crate::type_methods::str_method_title),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "capitalize",
         make_builtin_function("capitalize", crate::type_methods::str_method_capitalize),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "swapcase",
         make_builtin_function("swapcase", crate::type_methods::str_method_swapcase),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "center",
         make_builtin_function("center", crate::type_methods::str_method_center),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "ljust",
         make_builtin_function("ljust", crate::type_methods::str_method_ljust),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "rjust",
         make_builtin_function("rjust", crate::type_methods::str_method_rjust),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isspace",
         make_builtin_function("isspace", crate::type_methods::str_method_isspace),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isupper",
         make_builtin_function("isupper", crate::type_methods::str_method_isupper),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "islower",
         make_builtin_function("islower", crate::type_methods::str_method_islower),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isalnum",
         make_builtin_function("isalnum", crate::type_methods::str_method_isalnum),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isascii",
         make_builtin_function("isascii", crate::type_methods::str_method_isascii),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "partition",
         make_builtin_function("partition", crate::type_methods::str_method_partition),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "rpartition",
         make_builtin_function("rpartition", crate::type_methods::str_method_rpartition),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "splitlines",
         make_builtin_function("splitlines", crate::type_methods::str_method_splitlines),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "removeprefix",
         make_builtin_function("removeprefix", crate::type_methods::str_method_removeprefix),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "removesuffix",
         make_builtin_function("removesuffix", crate::type_methods::str_method_removesuffix),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "expandtabs",
         make_builtin_function("expandtabs", crate::type_methods::str_method_expandtabs),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "translate",
         make_builtin_function("translate", crate::type_methods::str_method_translate),
     );
     // str dunder methods
-    namespace_store(
+    dict_storage_store(
         ns,
         "__contains__",
         make_builtin_function("__contains__", |args| {
@@ -1365,7 +1365,7 @@ fn init_str_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__len__",
         make_builtin_function("__len__", |args| {
@@ -1375,7 +1375,7 @@ fn init_str_type(ns: &mut PyNamespace) {
             crate::baseobjspace::len(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__getitem__",
         make_builtin_function("__getitem__", |args| {
@@ -1385,7 +1385,7 @@ fn init_str_type(ns: &mut PyNamespace) {
             crate::baseobjspace::getitem(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iter__",
         make_builtin_function("__iter__", |args| {
@@ -1395,7 +1395,7 @@ fn init_str_type(ns: &mut PyNamespace) {
             crate::baseobjspace::iter(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__add__",
         make_builtin_function("__add__", |args| {
@@ -1405,7 +1405,7 @@ fn init_str_type(ns: &mut PyNamespace) {
             crate::baseobjspace::add(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__mul__",
         make_builtin_function("__mul__", |args| {
@@ -1415,7 +1415,7 @@ fn init_str_type(ns: &mut PyNamespace) {
             crate::baseobjspace::mul(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__mod__",
         make_builtin_function("__mod__", |args| {
@@ -1426,7 +1426,7 @@ fn init_str_type(ns: &mut PyNamespace) {
         }),
     );
     // maketrans — PyPy: unicodeobject.py descr_maketrans
-    namespace_store(
+    dict_storage_store(
         ns,
         "maketrans",
         make_builtin_function("maketrans", |args| {
@@ -1497,11 +1497,11 @@ fn init_str_type(ns: &mut PyNamespace) {
 // ── Dict TypeDef ─────────────────────────────────────────────────────
 // PyPy: pypy/objspace/std/dictobject.py TypeDef("dict", ...)
 
-fn init_dict_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(dict_descr_new));
+fn init_dict_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(dict_descr_new));
     // dict.__init__(self, mapping_or_iterable=None, **kwargs)
     // PyPy: W_DictMultiObject.descr_init
-    namespace_store(
+    dict_storage_store(
         ns,
         "__init__",
         make_builtin_function("__init__", |args| {
@@ -1549,42 +1549,42 @@ fn init_dict_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "get",
         make_builtin_function("get", crate::type_methods::dict_method_get),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "keys",
         make_builtin_function("keys", crate::type_methods::dict_method_keys),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "values",
         make_builtin_function("values", crate::type_methods::dict_method_values),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "items",
         make_builtin_function("items", crate::type_methods::dict_method_items),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "update",
         make_builtin_function("update", crate::type_methods::dict_method_update),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "pop",
         make_builtin_function("pop", crate::type_methods::dict_method_pop),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "setdefault",
         make_builtin_function("setdefault", crate::type_methods::dict_method_setdefault),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__setitem__",
         make_builtin_function("__setitem__", |args| {
@@ -1607,7 +1607,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__getitem__",
         make_builtin_function("__getitem__", |args| {
@@ -1629,7 +1629,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             crate::baseobjspace::getitem(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__contains__",
         make_builtin_function("__contains__", |args| {
@@ -1648,7 +1648,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__len__",
         make_builtin_function("__len__", |args| {
@@ -1664,7 +1664,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             crate::baseobjspace::len(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iter__",
         make_builtin_function("__iter__", |args| {
@@ -1679,7 +1679,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             crate::baseobjspace::iter(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__delitem__",
         make_builtin_function("__delitem__", |args| {
@@ -1690,7 +1690,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__eq__",
         make_builtin_function("__eq__", |args| {
@@ -1700,7 +1700,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__or__",
         make_builtin_function("__or__", |args| {
@@ -1711,7 +1711,7 @@ fn init_dict_type(ns: &mut PyNamespace) {
             Ok(args[0]) // stub
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "copy",
         make_builtin_function("copy", |args| {
@@ -1733,13 +1733,13 @@ fn init_dict_type(ns: &mut PyNamespace) {
             Ok(dst)
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "clear",
         make_builtin_function("clear", |_args| Ok(pyre_object::w_none())),
     );
     // dict.fromkeys(iterable, value=None) — classmethod
-    namespace_store(
+    dict_storage_store(
         ns,
         "fromkeys",
         make_builtin_function("fromkeys", |args| {
@@ -1763,19 +1763,19 @@ fn init_dict_type(ns: &mut PyNamespace) {
 
 // ── Tuple TypeDef ────────────────────────────────────────────────────
 
-fn init_tuple_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(tuple_descr_new));
-    namespace_store(
+fn init_tuple_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(tuple_descr_new));
+    dict_storage_store(
         ns,
         "index",
         make_builtin_function("index", crate::type_methods::tuple_method_index),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "count",
         make_builtin_function("count", crate::type_methods::tuple_method_count),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__contains__",
         make_builtin_function("__contains__", |args| {
@@ -1787,7 +1787,7 @@ fn init_tuple_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__len__",
         make_builtin_function("__len__", |args| {
@@ -1799,7 +1799,7 @@ fn init_tuple_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iter__",
         make_builtin_function("__iter__", |args| {
@@ -1817,9 +1817,9 @@ fn init_tuple_type(ns: &mut PyNamespace) {
 // PyPy: pypy/objspace/std/typeobject.py TypeDef("type", ...)
 
 /// types.UnionType — PyPy: _pypy_generic_alias.py UnionType
-fn init_union_type(ns: &mut PyNamespace) {
+fn init_union_type(ns: &mut DictStorage) {
     // UnionType.__args__ — returns the tuple of union member types
-    namespace_store(
+    dict_storage_store(
         ns,
         "__args__",
         make_builtin_function("__args__", |args| {
@@ -1832,7 +1832,7 @@ fn init_union_type(ns: &mut PyNamespace) {
         }),
     );
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
-    namespace_store(
+    dict_storage_store(
         ns,
         "__or__",
         make_builtin_function("__or__", |args| {
@@ -1843,7 +1843,7 @@ fn init_union_type(ns: &mut PyNamespace) {
         }),
     );
     // UnionType.__ror__
-    namespace_store(
+    dict_storage_store(
         ns,
         "__ror__",
         make_builtin_function("__ror__", |args| {
@@ -1900,7 +1900,7 @@ fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
 }
 
 /// typedef.py:308-415 GetSetProperty.typedef = TypeDef("getset_descriptor", ...)
-fn init_getset_descriptor_type(ns: &mut PyNamespace) {
+fn init_getset_descriptor_type(ns: &mut DictStorage) {
     // typedef.py:347-365 GetSetProperty.descr_property_get
     //
     // ```python
@@ -1924,7 +1924,7 @@ fn init_getset_descriptor_type(ns: &mut PyNamespace) {
     //                 self.reqcls, Arguments(space, [w_obj,
     //                                                space.newtext(self.name)]))
     // ```
-    namespace_store(
+    dict_storage_store(
         ns,
         "__get__",
         make_builtin_function("__get__", |args| {
@@ -1993,7 +1993,7 @@ fn init_getset_descriptor_type(ns: &mut PyNamespace) {
     //                                            space.newtext(self.name),
     //                                            w_value]))
     // ```
-    namespace_store(
+    dict_storage_store(
         ns,
         "__set__",
         make_builtin_function("__set__", |args| {
@@ -2041,7 +2041,7 @@ fn init_getset_descriptor_type(ns: &mut PyNamespace) {
     //             self.reqcls, Arguments(space, [w_obj,
     //                                            space.newtext(self.name)]))
     // ```
-    namespace_store(
+    dict_storage_store(
         ns,
         "__delete__",
         make_builtin_function("__delete__", |args| {
@@ -2128,15 +2128,15 @@ fn make_getset_property_full(
     obj
 }
 
-fn init_type_type(ns: &mut PyNamespace) {
+fn init_type_type(ns: &mut DictStorage) {
     // type.__new__(metatype, name, bases, dict) — creates new type
-    namespace_store(
+    dict_storage_store(
         ns,
         "__new__",
         make_new_descr(crate::builtins::type_descr_new),
     );
     // type.__init__ — no-op for now
-    namespace_store(
+    dict_storage_store(
         ns,
         "__init__",
         make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
@@ -2181,7 +2181,7 @@ fn init_type_type(ns: &mut PyNamespace) {
         }
         Ok(pyre_object::w_dict_new())
     });
-    namespace_store(
+    dict_storage_store(
         ns,
         "__annotations__",
         make_getset_descriptor(annotations_getter),
@@ -2197,7 +2197,7 @@ fn init_type_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_tuple_new((*mro_ptr).clone()))
         }
     });
-    namespace_store(ns, "__mro__", make_getset_descriptor(mro_getter));
+    dict_storage_store(ns, "__mro__", make_getset_descriptor(mro_getter));
 
     let dict_getter = make_builtin_function("__dict__", |args| {
         let cls = args[1];
@@ -2206,21 +2206,21 @@ fn init_type_type(ns: &mut PyNamespace) {
             if ns_ptr.is_null() {
                 return Ok(pyre_object::w_dict_new());
             }
-            let dict = pyre_object::w_dict_new_with_namespace(ns_ptr);
-            let ns = &*(ns_ptr as *const PyNamespace);
+            let dict = pyre_object::w_dict_new_with_dict_storage(ns_ptr);
+            let ns = &*(ns_ptr as *const DictStorage);
             for (name, &value) in ns.entries() {
                 pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
             }
             Ok(dict)
         }
     });
-    namespace_store(ns, "__dict__", make_getset_descriptor(dict_getter));
+    dict_storage_store(ns, "__dict__", make_getset_descriptor(dict_getter));
 
     let name_getter = make_builtin_function("__name__", |args| unsafe {
         let name = pyre_object::w_type_get_name(args[1]);
         Ok(pyre_object::w_str_new(name))
     });
-    namespace_store(ns, "__name__", make_getset_descriptor(name_getter));
+    dict_storage_store(ns, "__name__", make_getset_descriptor(name_getter));
 
     let bases_getter = make_builtin_function("__bases__", |args| unsafe {
         let bases = pyre_object::w_type_get_bases(args[1]);
@@ -2229,7 +2229,7 @@ fn init_type_type(ns: &mut PyNamespace) {
         }
         Ok(bases)
     });
-    namespace_store(ns, "__bases__", make_getset_descriptor(bases_getter));
+    dict_storage_store(ns, "__bases__", make_getset_descriptor(bases_getter));
 }
 
 /// function/builtin_function_or_method — PyPy: function.py Function typedef
@@ -2242,7 +2242,7 @@ fn init_type_type(ns: &mut PyNamespace) {
 /// `**rawdict` pattern. Function-only slots (currently just `__get__`) and
 /// BuiltinFunction-only overrides (`__new__`, `__self__`, `__repr__`,
 /// `__doc__`) live in their respective wrappers.
-fn init_function_type_common(_ns: &mut PyNamespace) {
+fn init_function_type_common(_ns: &mut DictStorage) {
     // Pyre does not yet model the rest of Function.typedef
     // (`__call__`, `__name__`, `__qualname__`, `__doc__`, `__module__`,
     // `__globals__`, `__closure__`, `__defaults__`, `__kwdefaults__`,
@@ -2251,9 +2251,9 @@ fn init_function_type_common(_ns: &mut PyNamespace) {
     // propagate to BuiltinFunction.typedef.
 }
 
-fn init_function_type(ns: &mut PyNamespace) {
+fn init_function_type(ns: &mut DictStorage) {
     init_function_type_common(ns);
-    namespace_store(
+    dict_storage_store(
         ns,
         "__get__",
         make_builtin_function("__get__", |args| {
@@ -2302,12 +2302,12 @@ fn init_function_type(ns: &mut PyNamespace) {
 /// ```
 ///
 /// `init_function_type_common` provides the shared `**rawdict` slots; the
-/// missing `namespace_store(ns, "__get__", ...)` call after it expresses the
+/// missing `dict_storage_store(ns, "__get__", ...)` call after it expresses the
 /// `del rawdict['__get__']` step. The `update({...})` overrides go below as
 /// pyre starts modeling them.
-fn init_builtin_function_type(ns: &mut PyNamespace) {
+fn init_builtin_function_type(ns: &mut DictStorage) {
     init_function_type_common(ns);
-    namespace_store(
+    dict_storage_store(
         ns,
         "__new__",
         make_new_descr(|_args| {
@@ -2325,9 +2325,9 @@ fn init_builtin_function_type(ns: &mut PyNamespace) {
     // resolved here; `patch_builtin_function_descriptors` runs after the
     // type cache is populated and writes the missing reqcls.
     let self_getter = make_builtin_function("__self__", |_args| Ok(pyre_object::w_none()));
-    namespace_store(ns, "__self__", make_getset_descriptor(self_getter));
+    dict_storage_store(ns, "__self__", make_getset_descriptor(self_getter));
 
-    namespace_store(
+    dict_storage_store(
         ns,
         "__repr__",
         make_builtin_function("__repr__", |args| {
@@ -2368,7 +2368,7 @@ fn init_builtin_function_type(ns: &mut PyNamespace) {
         unsafe { crate::function::fdel_func_doc(func)? };
         Ok(pyre_object::w_none())
     });
-    namespace_store(
+    dict_storage_store(
         ns,
         "__doc__",
         make_getset_property(doc_getter, doc_setter, doc_deleter),
@@ -2386,7 +2386,7 @@ fn patch_builtin_function_descriptors() {
     if bf_type.is_null() {
         return;
     }
-    let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(bf_type) } as *mut PyNamespace;
+    let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(bf_type) } as *mut DictStorage;
     if dict_ptr.is_null() {
         return;
     }
@@ -2405,8 +2405,8 @@ fn patch_builtin_function_descriptors() {
 ///
 /// PyPy exposes co_name, co_varnames, co_argcount, co_flags, co_consts.
 /// No __get__ — BuiltinCode is a code object, not a descriptor.
-fn init_builtin_code_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_builtin_code_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "co_name",
         make_builtin_function("co_name", |args| {
@@ -2420,8 +2420,8 @@ fn init_builtin_code_type(ns: &mut PyNamespace) {
     );
 }
 
-fn init_method_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_method_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__func__",
         make_builtin_function("__func__", |args| {
@@ -2431,7 +2431,7 @@ fn init_method_type(ns: &mut PyNamespace) {
                 .unwrap_or(pyre_object::w_none()))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__self__",
         make_builtin_function("__self__", |args| {
@@ -2443,12 +2443,12 @@ fn init_method_type(ns: &mut PyNamespace) {
     );
 }
 
-fn init_code_type(ns: &mut PyNamespace) {
+fn init_code_type(ns: &mut DictStorage) {
     // code.replace(**kwargs) — PyPy: interpreter/pycode.py W_PyCode.descr_replace.
     // The full method creates a new code object with the given fields
     // replaced; pyre's code objects are immutable, so replace() with no
     // kwargs returns the code itself (enough for reset_code / tests).
-    namespace_store(
+    dict_storage_store(
         ns,
         "replace",
         make_builtin_function("replace", |args| {
@@ -2458,9 +2458,9 @@ fn init_code_type(ns: &mut PyNamespace) {
 }
 
 /// typedef.py:492-500 Member.typedef
-fn init_member_descriptor_type(ns: &mut PyNamespace) {
+fn init_member_descriptor_type(ns: &mut DictStorage) {
     // typedef.py:494 __get__ = interp2app(Member.descr_member_get)
-    namespace_store(
+    dict_storage_store(
         ns,
         "__get__",
         make_builtin_function("__get__", |args| {
@@ -2507,7 +2507,7 @@ fn init_member_descriptor_type(ns: &mut PyNamespace) {
         }),
     );
     // typedef.py:495 __set__ = interp2app(Member.descr_member_set)
-    namespace_store(
+    dict_storage_store(
         ns,
         "__set__",
         make_builtin_function("__set__", |args| {
@@ -2546,7 +2546,7 @@ fn init_member_descriptor_type(ns: &mut PyNamespace) {
         }),
     );
     // typedef.py:496 __delete__ = interp2app(Member.descr_member_del)
-    namespace_store(
+    dict_storage_store(
         ns,
         "__delete__",
         make_builtin_function("__delete__", |args| {
@@ -2590,7 +2590,7 @@ fn init_member_descriptor_type(ns: &mut PyNamespace) {
         }),
     );
     // typedef.py:497 __name__ = interp_attrproperty('name', ...)
-    namespace_store(
+    dict_storage_store(
         ns,
         "__name__",
         make_builtin_function("__name__", |args| {
@@ -2604,7 +2604,7 @@ fn init_member_descriptor_type(ns: &mut PyNamespace) {
         }),
     );
     // typedef.py:498 __objclass__ = interp_attrproperty_w('w_cls', ...)
-    namespace_store(
+    dict_storage_store(
         ns,
         "__objclass__",
         make_builtin_function("__objclass__", |args| {
@@ -2618,8 +2618,8 @@ fn init_member_descriptor_type(ns: &mut PyNamespace) {
 }
 
 /// `staticmethod.__new__(cls, func)` — PyPy: function.py StaticMethod.descr__new__
-fn init_staticmethod_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_staticmethod_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__new__",
         make_builtin_function("__new__", |args| {
@@ -2635,8 +2635,8 @@ fn init_staticmethod_type(ns: &mut PyNamespace) {
 }
 
 /// `classmethod.__new__(cls, func)` — PyPy: function.py ClassMethod.descr__new__
-fn init_classmethod_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_classmethod_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__new__",
         make_builtin_function("__new__", |args| {
@@ -2652,8 +2652,8 @@ fn init_classmethod_type(ns: &mut PyNamespace) {
 
 /// `property.__new__(cls, fget=None, fset=None, fdel=None, doc=None)`
 /// — descriptor.py W_Property.descr_new
-fn init_property_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_property_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__new__",
         make_builtin_function("__new__", |args| {
@@ -2666,9 +2666,9 @@ fn init_property_type(ns: &mut PyNamespace) {
     );
 }
 
-fn init_int_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(int_descr_new));
-    namespace_store(
+fn init_int_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(int_descr_new));
+    dict_storage_store(
         ns,
         "bit_length",
         make_builtin_function("bit_length", |args| {
@@ -2685,7 +2685,7 @@ fn init_int_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(bits as i64))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "bit_count",
         make_builtin_function("bit_count", |args| {
@@ -2701,7 +2701,7 @@ fn init_int_type(ns: &mut PyNamespace) {
     );
     // int.to_bytes(length=1, byteorder='big', *, signed=False)
     // PyPy: longobject.py descr_to_bytes
-    namespace_store(
+    dict_storage_store(
         ns,
         "to_bytes",
         make_builtin_function("to_bytes", |args| {
@@ -2730,7 +2730,7 @@ fn init_int_type(ns: &mut PyNamespace) {
         }),
     );
     // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod in CPython
-    namespace_store(
+    dict_storage_store(
         ns,
         "from_bytes",
         make_builtin_function("from_bytes", |args| {
@@ -2780,7 +2780,7 @@ fn init_int_type(ns: &mut PyNamespace) {
     );
     // int.__index__ / __int__ / __trunc__ — identity
     for method in ["__index__", "__int__", "__trunc__"] {
-        namespace_store(
+        dict_storage_store(
             ns,
             method,
             make_builtin_function(method, |args| {
@@ -2789,7 +2789,7 @@ fn init_int_type(ns: &mut PyNamespace) {
         );
     }
     // int.conjugate — identity
-    namespace_store(
+    dict_storage_store(
         ns,
         "conjugate",
         make_builtin_function("conjugate", |args| {
@@ -2798,7 +2798,7 @@ fn init_int_type(ns: &mut PyNamespace) {
     );
     // int.real / int.imag / int.numerator — properties
     // True.real → 1 (int, not bool), False.real → 0
-    namespace_store(
+    dict_storage_store(
         ns,
         "real",
         pyre_object::w_property_new(
@@ -2817,7 +2817,7 @@ fn init_int_type(ns: &mut PyNamespace) {
             pyre_object::PY_NULL,
         ),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "imag",
         pyre_object::w_property_new(
@@ -2826,7 +2826,7 @@ fn init_int_type(ns: &mut PyNamespace) {
             pyre_object::PY_NULL,
         ),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "numerator",
         pyre_object::w_property_new(
@@ -2837,18 +2837,18 @@ fn init_int_type(ns: &mut PyNamespace) {
             pyre_object::PY_NULL,
         ),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "denominator",
         make_builtin_function("denominator", |_| Ok(pyre_object::w_int_new(1))),
     );
 }
-fn init_float_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(float_descr_new));
+fn init_float_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(float_descr_new));
     // float.__getformat__(kind) → returns the format string for the
     // given kind. PyPy: floatobject.py W_FloatObject.descr__getformat__.
     // Both 'double' and 'float' are IEEE 754 little-endian on x86/ARM.
-    namespace_store(
+    dict_storage_store(
         ns,
         "__getformat__",
         make_builtin_function("__getformat__", |args| {
@@ -2877,7 +2877,7 @@ fn init_float_type(ns: &mut PyNamespace) {
             }
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "hex",
         make_builtin_function("hex", |args| {
@@ -2896,7 +2896,7 @@ fn init_float_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_str_new(&format!("{v:e}")))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "fromhex",
         make_builtin_function("fromhex", |args| {
@@ -2970,7 +2970,7 @@ fn init_float_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_float_new(sign_s * mantissa * 2f64.powi(exp)))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "is_integer",
         make_builtin_function("is_integer", |args| {
@@ -2981,7 +2981,7 @@ fn init_float_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bool_from(v.is_finite() && v == v.trunc()))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "as_integer_ratio",
         make_builtin_function("as_integer_ratio", |args| {
@@ -3018,7 +3018,7 @@ fn init_float_type(ns: &mut PyNamespace) {
     );
     // floatobject.py:713: __int__ = interp2app(W_FloatObject.descr_trunc)
     for method in ["__trunc__", "__int__"] {
-        namespace_store(
+        dict_storage_store(
             ns,
             method,
             make_builtin_function(method, |args| {
@@ -3046,8 +3046,8 @@ fn integer_decode(v: f64) -> (u64, i16, i8) {
     exponent -= 1023 + 52;
     (mantissa, exponent, sign)
 }
-fn init_bool_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(bool_descr_new));
+fn init_bool_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(bool_descr_new));
 }
 
 // ── Object TypeDef ───────────────────────────────────────────────────
@@ -3075,15 +3075,15 @@ fn object_descr_init(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(w_none())
 }
 
-fn init_object_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(object_descr_new));
-    namespace_store(
+fn init_object_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(object_descr_new));
+    dict_storage_store(
         ns,
         "__init__",
         make_builtin_function("__init__", object_descr_init),
     );
     // PyPy: objectobject.py — default comparison/hash/repr for all objects
-    namespace_store(
+    dict_storage_store(
         ns,
         "__eq__",
         make_builtin_function("__eq__", |args| {
@@ -3092,7 +3092,7 @@ fn init_object_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__ne__",
         make_builtin_function("__ne__", |args| {
@@ -3101,7 +3101,7 @@ fn init_object_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__hash__",
         make_builtin_function("__hash__", |args| {
@@ -3112,7 +3112,7 @@ fn init_object_type(ns: &mut PyNamespace) {
             }))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__repr__",
         // PyPy: objectobject.py descr___repr__ — base __repr__ for all objects
@@ -3134,7 +3134,7 @@ fn init_object_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_str_new(&format!("<object at {:?}>", obj)))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__str__",
         make_builtin_function("__str__", |args| {
@@ -3147,7 +3147,7 @@ fn init_object_type(ns: &mut PyNamespace) {
         }),
     );
     // PyPy: objectobject.py descr___format__
-    namespace_store(
+    dict_storage_store(
         ns,
         "__format__",
         make_builtin_function("__format__", |args| {
@@ -3158,24 +3158,24 @@ fn init_object_type(ns: &mut PyNamespace) {
         }),
     );
     // PyPy: objectobject.py descr___reduce_ex__
-    namespace_store(
+    dict_storage_store(
         ns,
         "__reduce_ex__",
         make_builtin_function("__reduce_ex__", |_| Ok(pyre_object::w_none())),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__init_subclass__",
         make_builtin_function("__init_subclass__", |_| Ok(pyre_object::w_none())),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__subclasshook__",
         make_builtin_function("__subclasshook__", |_| Ok(pyre_object::w_not_implemented())),
     );
     // PyPy: objectobject.py descr___setattr__
     // object.__setattr__(self, name, value) → setattr dispatch
-    namespace_store(
+    dict_storage_store(
         ns,
         "__setattr__",
         make_builtin_function("__setattr__", |args| {
@@ -3189,7 +3189,7 @@ fn init_object_type(ns: &mut PyNamespace) {
         }),
     );
     // PyPy: objectobject.py descr___delattr__
-    namespace_store(
+    dict_storage_store(
         ns,
         "__delattr__",
         make_builtin_function("__delattr__", |args| {
@@ -3203,7 +3203,7 @@ fn init_object_type(ns: &mut PyNamespace) {
         }),
     );
     // PyPy: objectobject.py descr___getattribute__
-    namespace_store(
+    dict_storage_store(
         ns,
         "__getattribute__",
         make_builtin_function("__getattribute__", |args| {
@@ -3261,19 +3261,19 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 /// PyPy: bytesobject.py W_BytesObject.typedef
-fn init_bytes_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(bytes_descr_new));
-    namespace_store(
+fn init_bytes_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(bytes_descr_new));
+    dict_storage_store(
         ns,
         "decode",
         make_builtin_function("decode", bytes_method_decode),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__repr__",
         make_builtin_function("__repr__", bytes_method_repr),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__str__",
         make_builtin_function("__str__", bytes_method_repr),
@@ -3380,9 +3380,9 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// PyPy: bytearrayobject.py W_BytearrayObject.typedef
-fn init_bytearray_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(bytearray_descr_new));
-    namespace_store(
+fn init_bytearray_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(bytearray_descr_new));
+    dict_storage_store(
         ns,
         "find",
         make_builtin_function("find", |args| {
@@ -3402,7 +3402,7 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
             }
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__add__",
         make_builtin_function("__add__", |args| {
@@ -3424,7 +3424,7 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
             }
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iadd__",
         make_builtin_function("__iadd__", |args| {
@@ -3440,7 +3440,7 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
             Ok(ba)
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "translate",
         make_builtin_function("translate", |args| {
@@ -3479,8 +3479,8 @@ fn init_bytearray_type(ns: &mut PyNamespace) {
 // pyre splits the shared methods through `init_setlike_common` so the
 // frozenset typedef can omit the in-place mutators.
 
-fn init_setlike_common(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_setlike_common(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__contains__",
         make_builtin_function("__contains__", |args| {
@@ -3497,7 +3497,7 @@ fn init_setlike_common(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bool_from(false))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__len__",
         make_builtin_function("__len__", |args| {
@@ -3514,7 +3514,7 @@ fn init_setlike_common(ns: &mut PyNamespace) {
             Ok(pyre_object::w_int_new(0))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iter__",
         make_builtin_function("__iter__", |args| {
@@ -3524,7 +3524,7 @@ fn init_setlike_common(ns: &mut PyNamespace) {
             crate::baseobjspace::iter(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__bool__",
         make_builtin_function("__bool__", |args| {
@@ -3541,30 +3541,30 @@ fn init_setlike_common(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bool_from(true))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__or__",
         make_builtin_function("__or__", set_method_union),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__and__",
         make_builtin_function("__and__", set_method_intersection),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__sub__",
         make_builtin_function("__sub__", set_method_difference),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__xor__",
         make_builtin_function("__xor__", set_method_symmetric_difference),
     );
-    namespace_store(ns, "__eq__", make_builtin_function("__eq__", set_method_eq));
-    namespace_store(ns, "__le__", make_builtin_function("__le__", set_method_le));
-    namespace_store(ns, "__ge__", make_builtin_function("__ge__", set_method_ge));
-    namespace_store(
+    dict_storage_store(ns, "__eq__", make_builtin_function("__eq__", set_method_eq));
+    dict_storage_store(ns, "__le__", make_builtin_function("__le__", set_method_le));
+    dict_storage_store(ns, "__ge__", make_builtin_function("__ge__", set_method_ge));
+    dict_storage_store(
         ns,
         "__lt__",
         make_builtin_function("__lt__", |args| {
@@ -3576,7 +3576,7 @@ fn init_setlike_common(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bool_from(le && !eq))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__gt__",
         make_builtin_function("__gt__", |args| {
@@ -3588,37 +3588,37 @@ fn init_setlike_common(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bool_from(ge && !eq))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "union",
         make_builtin_function("union", set_method_union),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "intersection",
         make_builtin_function("intersection", set_method_intersection),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "difference",
         make_builtin_function("difference", set_method_difference),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "symmetric_difference",
         make_builtin_function("symmetric_difference", set_method_symmetric_difference),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "issubset",
         make_builtin_function("issubset", set_method_le),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "issuperset",
         make_builtin_function("issuperset", set_method_ge),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "isdisjoint",
         make_builtin_function("isdisjoint", |args| {
@@ -3636,7 +3636,7 @@ fn init_setlike_common(ns: &mut PyNamespace) {
             Ok(pyre_object::w_bool_from(true))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "copy",
         make_builtin_function("copy", |args| {
@@ -3807,15 +3807,15 @@ fn set_method_ge(
     Ok(pyre_object::w_bool_from(true))
 }
 
-fn init_set_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(set_descr_new));
-    namespace_store(
+fn init_set_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(set_descr_new));
+    dict_storage_store(
         ns,
         "__init__",
         make_builtin_function("__init__", set_descr_init),
     );
     init_setlike_common(ns);
-    namespace_store(
+    dict_storage_store(
         ns,
         "add",
         make_builtin_function("add", |args| {
@@ -3825,7 +3825,7 @@ fn init_set_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "discard",
         make_builtin_function("discard", |args| {
@@ -3835,7 +3835,7 @@ fn init_set_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "remove",
         make_builtin_function("remove", |args| {
@@ -3852,7 +3852,7 @@ fn init_set_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "pop",
         make_builtin_function("pop", |args| {
@@ -3873,7 +3873,7 @@ fn init_set_type(ns: &mut PyNamespace) {
             ))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "clear",
         make_builtin_function("clear", |args| {
@@ -3886,7 +3886,7 @@ fn init_set_type(ns: &mut PyNamespace) {
             Ok(pyre_object::w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "update",
         make_builtin_function("update", |args| {
@@ -3904,8 +3904,8 @@ fn init_set_type(ns: &mut PyNamespace) {
     );
 }
 
-fn init_frozenset_type(ns: &mut PyNamespace) {
-    namespace_store(ns, "__new__", make_new_descr(frozenset_descr_new));
+fn init_frozenset_type(ns: &mut DictStorage) {
+    dict_storage_store(ns, "__new__", make_new_descr(frozenset_descr_new));
     init_setlike_common(ns);
 }
 

@@ -9,7 +9,7 @@ use rustpython_compiler::{
 use pyre_interpreter::call;
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
-use pyre_interpreter::{PyDisplay, PyError, PyExecutionContext, PyNamespace, namespace_store};
+use pyre_interpreter::{DictStorage, PyDisplay, PyError, PyExecutionContext, dict_storage_store};
 use pyre_jit::eval::eval_with_jit;
 
 use crate::repl_readline::{Readline, ReadlineResult};
@@ -35,7 +35,7 @@ enum ShellExecResult {
 
 struct ReplRuntime {
     ctx_ptr: *const PyExecutionContext,
-    namespace: *mut PyNamespace,
+    namespace: *mut DictStorage,
     sys_module: pyre_object::PyObjectRef,
 }
 
@@ -51,9 +51,9 @@ pub fn run_repl(quiet: bool) {
     call::register_build_class();
     call::set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
 
-    let mut namespace = Box::new(execution_context.fresh_namespace());
+    let mut namespace = Box::new(execution_context.fresh_dict_storage());
     namespace.fix_ptr();
-    namespace_store(
+    dict_storage_store(
         &mut namespace,
         "__name__",
         pyre_object::w_str_new("__main__"),
@@ -347,9 +347,9 @@ mod tests {
 
     #[test]
     fn reads_prompt_from_sys_module() {
-        let mut namespace = Box::new(pyre_interpreter::PyNamespace::default());
+        let mut namespace = Box::new(pyre_interpreter::DictStorage::default());
         namespace.fix_ptr();
-        pyre_interpreter::namespace_store(&mut namespace, "ps1", pyre_object::w_str_new("py> "));
+        pyre_interpreter::dict_storage_store(&mut namespace, "ps1", pyre_object::w_str_new("py> "));
         let sys_module =
             pyre_object::moduleobject::w_module_new("sys", Box::into_raw(namespace) as *mut u8);
 

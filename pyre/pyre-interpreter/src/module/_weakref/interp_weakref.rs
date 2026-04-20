@@ -11,7 +11,7 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-use crate::{PyError, PyNamespace, make_builtin_function, namespace_store};
+use crate::{DictStorage, PyError, dict_storage_store, make_builtin_function};
 use pyre_object::*;
 
 use std::sync::OnceLock;
@@ -88,30 +88,30 @@ fn weakref_lifeline_type() -> PyObjectRef {
 ///     __repr__ = interp2app(W_WeakrefBase.descr__repr__),
 /// )
 /// ```
-fn init_weakref_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_weakref_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__new__",
         make_builtin_function("__new__", descr__new__weakref_typecall),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__init__",
         make_builtin_function("__init__", descr__init__weakref),
     );
-    namespace_store(ns, "__eq__", make_builtin_function("__eq__", descr__eq__));
-    namespace_store(ns, "__ne__", make_builtin_function("__ne__", descr__ne__));
-    namespace_store(
+    dict_storage_store(ns, "__eq__", make_builtin_function("__eq__", descr__eq__));
+    dict_storage_store(ns, "__ne__", make_builtin_function("__ne__", descr__ne__));
+    dict_storage_store(
         ns,
         "__hash__",
         make_builtin_function("__hash__", descr_hash),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__call__",
         make_builtin_function("__call__", descr_call),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__repr__",
         make_builtin_function("__repr__", descr__repr__),
@@ -138,18 +138,18 @@ pub fn weakref_type() -> PyObjectRef {
 ///     **proxy_typedef_dict)
 /// W_Proxy.typedef.acceptable_as_base_class = False
 /// ```
-fn init_proxy_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_proxy_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__new__",
         make_builtin_function("__new__", descr__new__proxy),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__hash__",
         make_builtin_function("__hash__", proxy_descr__hash__),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__repr__",
         make_builtin_function("__repr__", descr__repr__),
@@ -182,23 +182,23 @@ pub fn proxy_type() -> PyObjectRef {
 ///     **callable_proxy_typedef_dict)
 /// W_CallableProxy.typedef.acceptable_as_base_class = False
 /// ```
-fn init_callable_proxy_type(ns: &mut PyNamespace) {
-    namespace_store(
+fn init_callable_proxy_type(ns: &mut DictStorage) {
+    dict_storage_store(
         ns,
         "__new__",
         make_builtin_function("__new__", descr__new__callableproxy),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__hash__",
         make_builtin_function("__hash__", proxy_descr__hash__),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__repr__",
         make_builtin_function("__repr__", descr__repr__),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__call__",
         make_builtin_function("__call__", callable_proxy_descr__call__),
@@ -1280,258 +1280,258 @@ pub fn proxy_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// Called from `init_proxy_type` (`include_comparisons=true`) and
 /// `init_callable_proxy_type` (`include_comparisons=false`) so the two
 /// typedefs end up with the same set of methods PyPy generates.
-fn register_proxy_typedef_dict(ns: &mut PyNamespace, include_comparisons: bool) {
+fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) {
     // Forward + reflected binary arithmetic — interp__weakref.py:376-389.
-    namespace_store(ns, "__add__", make_builtin_function("__add__", proxy_add));
-    namespace_store(
+    dict_storage_store(ns, "__add__", make_builtin_function("__add__", proxy_add));
+    dict_storage_store(
         ns,
         "__radd__",
         make_builtin_function("__radd__", proxy_radd),
     );
-    namespace_store(ns, "__sub__", make_builtin_function("__sub__", proxy_sub));
-    namespace_store(
+    dict_storage_store(ns, "__sub__", make_builtin_function("__sub__", proxy_sub));
+    dict_storage_store(
         ns,
         "__rsub__",
         make_builtin_function("__rsub__", proxy_rsub),
     );
-    namespace_store(ns, "__mul__", make_builtin_function("__mul__", proxy_mul));
-    namespace_store(
+    dict_storage_store(ns, "__mul__", make_builtin_function("__mul__", proxy_mul));
+    dict_storage_store(
         ns,
         "__rmul__",
         make_builtin_function("__rmul__", proxy_rmul),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__truediv__",
         make_builtin_function("__truediv__", proxy_truediv),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__rtruediv__",
         make_builtin_function("__rtruediv__", proxy_rtruediv),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__floordiv__",
         make_builtin_function("__floordiv__", proxy_floordiv),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__rfloordiv__",
         make_builtin_function("__rfloordiv__", proxy_rfloordiv),
     );
-    namespace_store(ns, "__mod__", make_builtin_function("__mod__", proxy_mod));
-    namespace_store(
+    dict_storage_store(ns, "__mod__", make_builtin_function("__mod__", proxy_mod));
+    dict_storage_store(
         ns,
         "__rmod__",
         make_builtin_function("__rmod__", proxy_rmod),
     );
-    namespace_store(ns, "__pow__", make_builtin_function("__pow__", proxy_pow));
-    namespace_store(
+    dict_storage_store(ns, "__pow__", make_builtin_function("__pow__", proxy_pow));
+    dict_storage_store(
         ns,
         "__rpow__",
         make_builtin_function("__rpow__", proxy_rpow),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__lshift__",
         make_builtin_function("__lshift__", proxy_lshift),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__rlshift__",
         make_builtin_function("__rlshift__", proxy_rlshift),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__rshift__",
         make_builtin_function("__rshift__", proxy_rshift),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__rrshift__",
         make_builtin_function("__rrshift__", proxy_rrshift),
     );
-    namespace_store(ns, "__and__", make_builtin_function("__and__", proxy_and));
-    namespace_store(
+    dict_storage_store(ns, "__and__", make_builtin_function("__and__", proxy_and));
+    dict_storage_store(
         ns,
         "__rand__",
         make_builtin_function("__rand__", proxy_rand),
     );
-    namespace_store(ns, "__or__", make_builtin_function("__or__", proxy_or));
-    namespace_store(ns, "__ror__", make_builtin_function("__ror__", proxy_ror));
-    namespace_store(ns, "__xor__", make_builtin_function("__xor__", proxy_xor));
-    namespace_store(
+    dict_storage_store(ns, "__or__", make_builtin_function("__or__", proxy_or));
+    dict_storage_store(ns, "__ror__", make_builtin_function("__ror__", proxy_ror));
+    dict_storage_store(ns, "__xor__", make_builtin_function("__xor__", proxy_xor));
+    dict_storage_store(
         ns,
         "__rxor__",
         make_builtin_function("__rxor__", proxy_rxor),
     );
     // baseobjspace.py:2159 divmod row — forward + reflected.
-    namespace_store(
+    dict_storage_store(
         ns,
         "__divmod__",
         make_builtin_function("__divmod__", proxy_divmod),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__rdivmod__",
         make_builtin_function("__rdivmod__", proxy_rdivmod),
     );
 
     // Inplace ops — interp__weakref.py:367-369.
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iadd__",
         make_builtin_function("__iadd__", proxy_iadd),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__isub__",
         make_builtin_function("__isub__", proxy_isub),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__imul__",
         make_builtin_function("__imul__", proxy_imul),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__itruediv__",
         make_builtin_function("__itruediv__", proxy_itruediv),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__ifloordiv__",
         make_builtin_function("__ifloordiv__", proxy_ifloordiv),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__imod__",
         make_builtin_function("__imod__", proxy_imod),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__ipow__",
         make_builtin_function("__ipow__", proxy_ipow),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__ilshift__",
         make_builtin_function("__ilshift__", proxy_ilshift),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__irshift__",
         make_builtin_function("__irshift__", proxy_irshift),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iand__",
         make_builtin_function("__iand__", proxy_iand),
     );
-    namespace_store(ns, "__ior__", make_builtin_function("__ior__", proxy_ior));
-    namespace_store(
+    dict_storage_store(ns, "__ior__", make_builtin_function("__ior__", proxy_ior));
+    dict_storage_store(
         ns,
         "__ixor__",
         make_builtin_function("__ixor__", proxy_ixor),
     );
 
     // Single-dunder rows — interp__weakref.py:393-395.
-    namespace_store(
+    dict_storage_store(
         ns,
         "__format__",
         make_builtin_function("__format__", proxy_format),
     );
-    namespace_store(ns, "__str__", make_builtin_function("__str__", proxy_str));
-    namespace_store(ns, "__len__", make_builtin_function("__len__", proxy_len));
-    namespace_store(
+    dict_storage_store(ns, "__str__", make_builtin_function("__str__", proxy_str));
+    dict_storage_store(ns, "__len__", make_builtin_function("__len__", proxy_len));
+    dict_storage_store(
         ns,
         "__getattribute__",
         make_builtin_function("__getattribute__", proxy_getattribute),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__setattr__",
         make_builtin_function("__setattr__", proxy_setattr),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__delattr__",
         make_builtin_function("__delattr__", proxy_delattr),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__getitem__",
         make_builtin_function("__getitem__", proxy_getitem),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__setitem__",
         make_builtin_function("__setitem__", proxy_setitem),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__delitem__",
         make_builtin_function("__delitem__", proxy_delitem),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__trunc__",
         make_builtin_function("__trunc__", proxy_trunc),
     );
-    namespace_store(ns, "__pos__", make_builtin_function("__pos__", proxy_pos));
-    namespace_store(ns, "__neg__", make_builtin_function("__neg__", proxy_neg));
-    namespace_store(
+    dict_storage_store(ns, "__pos__", make_builtin_function("__pos__", proxy_pos));
+    dict_storage_store(ns, "__neg__", make_builtin_function("__neg__", proxy_neg));
+    dict_storage_store(
         ns,
         "__bool__",
         make_builtin_function("__bool__", proxy_bool),
     );
-    namespace_store(ns, "__abs__", make_builtin_function("__abs__", proxy_abs));
-    namespace_store(
+    dict_storage_store(ns, "__abs__", make_builtin_function("__abs__", proxy_abs));
+    dict_storage_store(
         ns,
         "__invert__",
         make_builtin_function("__invert__", proxy_invert),
     );
-    namespace_store(ns, "__int__", make_builtin_function("__int__", proxy_int));
-    namespace_store(
+    dict_storage_store(ns, "__int__", make_builtin_function("__int__", proxy_int));
+    dict_storage_store(
         ns,
         "__index__",
         make_builtin_function("__index__", proxy_index),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__float__",
         make_builtin_function("__float__", proxy_float),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__contains__",
         make_builtin_function("__contains__", proxy_contains),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__iter__",
         make_builtin_function("__iter__", proxy_iter),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__next__",
         make_builtin_function("__next__", proxy_next),
     );
-    namespace_store(ns, "__get__", make_builtin_function("__get__", proxy_get));
-    namespace_store(ns, "__set__", make_builtin_function("__set__", proxy_set));
-    namespace_store(
+    dict_storage_store(ns, "__get__", make_builtin_function("__get__", proxy_get));
+    dict_storage_store(ns, "__set__", make_builtin_function("__set__", proxy_set));
+    dict_storage_store(
         ns,
         "__delete__",
         make_builtin_function("__delete__", proxy_delete),
     );
     // baseobjspace.py:2127-2128 isinstance / issubtype rows.
-    namespace_store(
+    dict_storage_store(
         ns,
         "__instancecheck__",
         make_builtin_function("__instancecheck__", proxy_instancecheck),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "__subclasscheck__",
         make_builtin_function("__subclasscheck__", proxy_subclasscheck),
@@ -1540,12 +1540,12 @@ fn register_proxy_typedef_dict(ns: &mut PyNamespace, include_comparisons: bool) 
     // interp__weakref.py:390-391 — comparison ops are registered only on
     // `proxy_typedef_dict`, not `callable_proxy_typedef_dict`.
     if include_comparisons {
-        namespace_store(ns, "__lt__", make_builtin_function("__lt__", proxy_lt));
-        namespace_store(ns, "__le__", make_builtin_function("__le__", proxy_le));
-        namespace_store(ns, "__gt__", make_builtin_function("__gt__", proxy_gt));
-        namespace_store(ns, "__ge__", make_builtin_function("__ge__", proxy_ge));
-        namespace_store(ns, "__eq__", make_builtin_function("__eq__", proxy_eq));
-        namespace_store(ns, "__ne__", make_builtin_function("__ne__", proxy_ne));
+        dict_storage_store(ns, "__lt__", make_builtin_function("__lt__", proxy_lt));
+        dict_storage_store(ns, "__le__", make_builtin_function("__le__", proxy_le));
+        dict_storage_store(ns, "__gt__", make_builtin_function("__gt__", proxy_gt));
+        dict_storage_store(ns, "__ge__", make_builtin_function("__ge__", proxy_ge));
+        dict_storage_store(ns, "__eq__", make_builtin_function("__eq__", proxy_eq));
+        dict_storage_store(ns, "__ne__", make_builtin_function("__ne__", proxy_ne));
     }
 }
 
@@ -1729,7 +1729,7 @@ mod tests {
     fn test_isinstance_user_instancecheck_override() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("Checker", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__instancecheck__",
                 crate::make_builtin_function("__instancecheck__", |_args| {
@@ -1747,7 +1747,7 @@ mod tests {
     fn test_issubclass_user_subclasscheck_override() {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("ClassChecker", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__subclasscheck__",
                 crate::make_builtin_function("__subclasscheck__", |_args| {
@@ -1770,7 +1770,7 @@ mod tests {
     fn test_proxy_pow_falls_through_to_rpow() {
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("PowLhs", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__pow__",
                 crate::make_builtin_function("__pow__", |_args| {
@@ -1779,7 +1779,7 @@ mod tests {
             );
         });
         let rhs_type = crate::typedef::make_builtin_type("PowRhs", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__rpow__",
                 crate::make_builtin_function("__rpow__", |_args| Ok(pyre_object::w_int_new(7777))),
@@ -1801,7 +1801,7 @@ mod tests {
     fn test_proxy_pow_three_arg_falls_through_to_rpow() {
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("Pow3Lhs", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__pow__",
                 crate::make_builtin_function("__pow__", |_args| {
@@ -1810,7 +1810,7 @@ mod tests {
             );
         });
         let rhs_type = crate::typedef::make_builtin_type("Pow3Rhs", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__rpow__",
                 crate::make_builtin_function("__rpow__", |args| {
@@ -1834,7 +1834,7 @@ mod tests {
     fn test_proxy_divmod_falls_through_to_rdivmod() {
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("DivmodLhsNI", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__divmod__",
                 crate::make_builtin_function("__divmod__", |_args| {
@@ -1843,7 +1843,7 @@ mod tests {
             );
         });
         let rhs_type = crate::typedef::make_builtin_type("DivmodRhs", |ns| {
-            crate::namespace_store(
+            crate::dict_storage_store(
                 ns,
                 "__rdivmod__",
                 crate::make_builtin_function("__rdivmod__", |_args| {

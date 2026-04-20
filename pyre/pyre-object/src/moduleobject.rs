@@ -2,8 +2,8 @@
 //!
 //! PyPy equivalent: pypy/interpreter/module.py → Module
 //!
-//! A module holds a name (str) and a namespace dict (PyNamespace pointer).
-//! The namespace stores all names defined in the module after execution.
+//! A module holds a name (str) and a pointer to its backing dict storage.
+//! The storage holds all names defined in the module after execution.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -13,21 +13,22 @@ use crate::pyobject::*;
 ///
 /// Layout: `[ob_type | name: *mut String | dict: *mut u8]`
 ///
-/// `dict` is a raw pointer to a `PyNamespace` (from pyre-interpreter).
+/// `dict` is a raw pointer to `pyre_interpreter::DictStorage`, the internal
+/// storage pyre uses where PyPy would expose a string-keyed module dict.
 /// We store it as `*mut u8` to avoid a circular dependency on pyre-interpreter.
 #[repr(C)]
 pub struct W_ModuleObject {
     pub ob_header: PyObject,
     /// Heap-allocated module name string.
     pub name: *mut String,
-    /// Raw pointer to the module's PyNamespace (globals after execution).
+    /// Raw pointer to the module's backing dict storage (globals after execution).
     pub dict: *mut u8,
 }
 
 /// Allocate a new W_ModuleObject.
 ///
 /// `name` — the module name (e.g. "math", "os.path")
-/// `dict_ptr` — raw pointer to the module's PyNamespace
+/// `dict_ptr` — raw pointer to the module's backing dict storage
 pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
     let obj = Box::new(W_ModuleObject {
         ob_header: PyObject {

@@ -1,4 +1,3 @@
-
 impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
     fn fallthrough_target(&mut self) -> usize {
         self.fallthrough_pc()
@@ -142,17 +141,14 @@ impl pyre_interpreter::BranchOpcodeHandler for crate::state::MIFrame {
 }
 
 impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
-    fn load_name_value(
-        &mut self,
-        name: &str,
-    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+    fn load_name_value(&mut self, name: &str) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         let ns = self.sym().concrete_namespace;
-        let Some(slot) = crate::state::namespace_slot_direct(ns, name) else {
+        let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             let opref = self.trace_load_name(name)?;
             return Ok(crate::state::FrontendOp::opref_only(opref));
         };
-        let concrete_cv = crate::state::namespace_value_direct(ns, slot);
+        let concrete_cv = crate::state::dict_storage_value_direct(ns, slot);
         let result_concrete = concrete_cv
             .map(crate::state::ConcreteValue::from_pyobj)
             .unwrap_or(crate::state::ConcreteValue::Null);
@@ -181,9 +177,8 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 return Ok(crate::state::FrontendOp::new(opref, result_concrete));
             }
         }
-        let opref = self.with_ctx(|this, ctx| {
-            crate::state::MIFrame::load_namespace_value(this, ctx, slot)
-        })?;
+        let opref = self
+            .with_ctx(|this, ctx| crate::state::MIFrame::load_namespace_value(this, ctx, slot))?;
         Ok(crate::state::FrontendOp::new(opref, result_concrete))
     }
 
@@ -194,7 +189,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
     ) -> Result<(), pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         let ns = self.sym().concrete_namespace;
-        let Some(slot) = crate::state::namespace_slot_direct(ns, name) else {
+        let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             return self.trace_store_name(name, value.opref);
         };
         self.with_ctx(|this, ctx| {
@@ -273,8 +268,7 @@ impl pyre_interpreter::ArithmeticOpcodeHandler for crate::state::MIFrame {
             let v = unsafe { pyre_object::w_int_get_value(concrete_val) };
             result_concrete = crate::state::ConcreteValue::Int(v.wrapping_neg());
         }
-        let opref =
-            self.unary_int_value(value.opref, majit_ir::OpCode::IntNeg, concrete_val)?;
+        let opref = self.unary_int_value(value.opref, majit_ir::OpCode::IntNeg, concrete_val)?;
         Ok(crate::state::FrontendOp::new(opref, result_concrete))
     }
 
@@ -288,8 +282,7 @@ impl pyre_interpreter::ArithmeticOpcodeHandler for crate::state::MIFrame {
             let v = unsafe { pyre_object::w_int_get_value(concrete_val) };
             result_concrete = crate::state::ConcreteValue::Int(!v);
         }
-        let opref =
-            self.unary_int_value(value.opref, majit_ir::OpCode::IntInvert, concrete_val)?;
+        let opref = self.unary_int_value(value.opref, majit_ir::OpCode::IntInvert, concrete_val)?;
         Ok(crate::state::FrontendOp::new(opref, result_concrete))
     }
 }

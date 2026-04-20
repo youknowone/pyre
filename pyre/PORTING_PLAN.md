@@ -150,7 +150,7 @@ Current status:
   `current` in-place, and only leave boxed-result allocation as a residual
   seam.
 - Done: hot `LoadName` / `StoreName` for already-materialized globals no longer
-  route through namespace helpers. `PyNamespace` now has a stable slot/value
+  route through dict-storage helpers. `DictStorage` now has a stable slot/value
   array layout, and the tracer reads or writes known name slots directly from
   the frame's namespace object.
 - Done: hot concrete builtin and Python-function calls no longer have to go

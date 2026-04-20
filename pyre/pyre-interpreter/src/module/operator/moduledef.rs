@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: pypy/module/operator/
 
-use crate::{PyNamespace, make_builtin_function, namespace_store};
+use crate::{DictStorage, dict_storage_store, make_builtin_function};
 use pyre_object::*;
 
 fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -59,12 +59,12 @@ fn op_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )
 }
 
-pub fn init(ns: &mut PyNamespace) {
-    namespace_store(ns, "index", make_builtin_function("index", op_index));
-    namespace_store(ns, "add", make_builtin_function("add", op_add));
-    namespace_store(ns, "sub", make_builtin_function("sub", op_sub));
-    namespace_store(ns, "mul", make_builtin_function("mul", op_mul));
-    namespace_store(
+pub fn init(ns: &mut DictStorage) {
+    dict_storage_store(ns, "index", make_builtin_function("index", op_index));
+    dict_storage_store(ns, "add", make_builtin_function("add", op_add));
+    dict_storage_store(ns, "sub", make_builtin_function("sub", op_sub));
+    dict_storage_store(ns, "mul", make_builtin_function("mul", op_mul));
+    dict_storage_store(
         ns,
         "truediv",
         make_builtin_function("truediv", |args| {
@@ -72,7 +72,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::truediv(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "floordiv",
         make_builtin_function("floordiv", |args| {
@@ -80,7 +80,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::floordiv(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "mod",
         make_builtin_function("mod", |args| {
@@ -88,7 +88,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::mod_(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "pow",
         make_builtin_function("pow", |args| {
@@ -96,7 +96,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::pow(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "neg",
         make_builtin_function("neg", |args| {
@@ -104,7 +104,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::neg(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "pos",
         make_builtin_function("pos", |args| {
@@ -112,7 +112,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::pos(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "abs",
         make_builtin_function("abs", |args| {
@@ -120,7 +120,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::builtins::builtin_abs(args)
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "invert",
         make_builtin_function("invert", |args| {
@@ -128,7 +128,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::invert(args[0])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "lshift",
         make_builtin_function("lshift", |args| {
@@ -136,7 +136,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::lshift(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "rshift",
         make_builtin_function("rshift", |args| {
@@ -144,7 +144,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::rshift(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "and_",
         make_builtin_function("and_", |args| {
@@ -152,7 +152,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::and_(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "or_",
         make_builtin_function("or_", |args| {
@@ -160,7 +160,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::or_(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "xor",
         make_builtin_function("xor", |args| {
@@ -168,7 +168,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::xor(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "not_",
         make_builtin_function("not_", |args| {
@@ -177,7 +177,7 @@ pub fn init(ns: &mut PyNamespace) {
         }),
     );
     // interp_operator.py:138
-    namespace_store(
+    dict_storage_store(
         ns,
         "truth",
         make_builtin_function("truth", |args| {
@@ -185,7 +185,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_bool_from(crate::baseobjspace::is_true(args[0])))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "is_",
         make_builtin_function("is_", |args| {
@@ -193,7 +193,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_bool_from(std::ptr::eq(args[0], args[1])))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "is_not",
         make_builtin_function("is_not", |args| {
@@ -201,7 +201,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_bool_from(!std::ptr::eq(args[0], args[1])))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "contains",
         make_builtin_function("contains", |args| {
@@ -211,7 +211,7 @@ pub fn init(ns: &mut PyNamespace) {
             )?))
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "getitem",
         make_builtin_function("getitem", |args| {
@@ -219,7 +219,7 @@ pub fn init(ns: &mut PyNamespace) {
             crate::baseobjspace::getitem(args[0], args[1])
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "setitem",
         make_builtin_function("setitem", |args| {
@@ -228,7 +228,7 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(w_none())
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "delitem",
         make_builtin_function("delitem", |args| {
@@ -238,27 +238,27 @@ pub fn init(ns: &mut PyNamespace) {
         }),
     );
     // Underscore aliases (CPython: __add__/__sub__/... via operator module).
-    namespace_store(ns, "__add__", make_builtin_function("__add__", op_add));
-    namespace_store(ns, "__sub__", make_builtin_function("__sub__", op_sub));
-    namespace_store(ns, "__mul__", make_builtin_function("__mul__", op_mul));
-    namespace_store(ns, "eq", make_builtin_function("eq", op_eq));
-    namespace_store(ns, "lt", make_builtin_function("lt", op_lt));
-    namespace_store(ns, "gt", make_builtin_function("gt", op_gt));
-    namespace_store(
+    dict_storage_store(ns, "__add__", make_builtin_function("__add__", op_add));
+    dict_storage_store(ns, "__sub__", make_builtin_function("__sub__", op_sub));
+    dict_storage_store(ns, "__mul__", make_builtin_function("__mul__", op_mul));
+    dict_storage_store(ns, "eq", make_builtin_function("eq", op_eq));
+    dict_storage_store(ns, "lt", make_builtin_function("lt", op_lt));
+    dict_storage_store(ns, "gt", make_builtin_function("gt", op_gt));
+    dict_storage_store(
         ns,
         "le",
         make_builtin_function("le", |args| {
             crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Le)
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "ge",
         make_builtin_function("ge", |args| {
             crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Ge)
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "ne",
         make_builtin_function("ne", |args| {
@@ -266,7 +266,7 @@ pub fn init(ns: &mut PyNamespace) {
         }),
     );
     // itemgetter/attrgetter stubs — return callable objects
-    namespace_store(
+    dict_storage_store(
         ns,
         "itemgetter",
         make_builtin_function("itemgetter", |args| {
@@ -274,21 +274,21 @@ pub fn init(ns: &mut PyNamespace) {
             Ok(if args.is_empty() { w_none() } else { args[0] })
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "attrgetter",
         make_builtin_function("attrgetter", |args| {
             Ok(if args.is_empty() { w_none() } else { args[0] })
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "methodcaller",
         make_builtin_function("methodcaller", |args| {
             Ok(if args.is_empty() { w_none() } else { args[0] })
         }),
     );
-    namespace_store(
+    dict_storage_store(
         ns,
         "length_hint",
         make_builtin_function("length_hint", |args| {
