@@ -8602,8 +8602,6 @@ impl<M: Clone> MetaInterp<M> {
         S: crate::pyjitpl::JitCodeSym,
         R: crate::pyjitpl::JitCodeRuntime,
     {
-        let sub_jitcodes = jitcode.exec.sub_jitcodes.clone();
-        let fn_ptrs = jitcode.exec.fn_ptrs.clone();
         // pyjitpl.py:2451: self.framestack.append(f) — push the root.
         self.framestack
             .push(crate::pyjitpl::MIFrame::new(jitcode, pc));
@@ -8615,10 +8613,14 @@ impl<M: Clone> MetaInterp<M> {
                 .tracing
                 .as_mut()
                 .expect("trace_jitcode_with_framestack requires an active trace");
+            // Sub-jitcode and fn-ptr pools now live on each JitCode's
+            // `exec.descrs` / `exec.fn_ptrs` (see RPython `blackhole.py:150-157`
+            // `j`/`d` argcode resolution), so the machine no longer
+            // needs parallel slice borrows at construction time.
             let mut machine = crate::pyjitpl::JitCodeMachine::<S, _>::with_framestack(
                 &mut self.framestack,
-                &sub_jitcodes,
-                &fn_ptrs,
+                &[],
+                &[],
             );
             machine.run_to_end(ctx, sym, runtime)
         };

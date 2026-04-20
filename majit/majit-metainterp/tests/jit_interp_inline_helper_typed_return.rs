@@ -100,7 +100,7 @@ fn jit_inline_ref_identity_works_through_jitcode_builder() {
         "caller needs at least 2 ref registers"
     );
     assert_eq!(
-        jitcode.exec.sub_jitcodes.len(),
+        jitcode.exec.descrs.len(),
         1,
         "one sub-jitcode for inline call"
     );
@@ -132,7 +132,7 @@ fn jit_inline_float_identity_works_through_jitcode_builder() {
         "caller needs at least 2 float registers"
     );
     assert_eq!(
-        jitcode.exec.sub_jitcodes.len(),
+        jitcode.exec.descrs.len(),
         1,
         "one sub-jitcode for inline call"
     );

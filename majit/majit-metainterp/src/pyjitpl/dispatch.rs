@@ -1074,8 +1074,20 @@ where
                     (sub_idx, arg_triples, return_i, return_r, return_f)
                 };
                 let pc = self.frames.current_mut().pc;
-                let sub_jitcode =
-                    self.frames.current_mut().jitcode.exec.sub_jitcodes[sub_idx].clone();
+                // RPython `blackhole.py:150-157` — `j` argcode resolves
+                // via `self.descrs[idx]` asserted to be a `JitCode`.
+                let sub_jitcode = self
+                    .frames
+                    .current_mut()
+                    .jitcode
+                    .exec
+                    .descrs
+                    .get(sub_idx)
+                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+                    .unwrap_or_else(|| {
+                        panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
+                    })
+                    .clone();
                 let mut sub_frame = MIFrame::new(sub_jitcode, pc);
                 // dispatch.rs sub-jitcode inline frame (RPython pyjitpl
                 // perform_call for non-portal jitcodes). The structured
@@ -1815,12 +1827,9 @@ where
 {
     let runtime = ClosureRuntime::new(label_at);
     let jitcode_arc = Arc::new(jitcode.clone());
-    let sub_jitcodes = jitcode_arc.exec.sub_jitcodes.clone();
-    let fn_ptrs = jitcode_arc.exec.fn_ptrs.clone();
     let mut standalone = StandaloneFrameStack::new();
     standalone.frames.push(MIFrame::new(jitcode_arc, pc));
-    let mut machine =
-        JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &sub_jitcodes, &fn_ptrs);
+    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.run_to_end(ctx, sym, &runtime)
 }
 

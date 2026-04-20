@@ -10,7 +10,9 @@ use majit_ir::OpCode;
 
 use crate::jitcode;
 
-use super::{JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode};
+use super::{
+    JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode, RuntimeBhDescr,
+};
 
 #[derive(Default)]
 pub struct JitCodeBuilder {
@@ -28,7 +30,10 @@ pub struct JitCodeBuilder {
     opcodes: Vec<OpCode>,
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
-    sub_jitcodes: Vec<std::sync::Arc<JitCode>>,
+    /// Runtime descriptor pool emitted into `JitCodeExecState.descrs`
+    /// on `finish()`. Each `BC_INLINE_CALL` operand is a 2-byte index
+    /// into this pool (RPython `j` argcode → `descrs[idx] → JitCode`).
+    descrs: Vec<RuntimeBhDescr>,
     fn_ptrs: Vec<JitCallTarget>,
     assembler_targets: Vec<JitCallAssemblerTarget>,
     has_abort: bool,
@@ -1232,18 +1237,22 @@ impl JitCodeBuilder {
         self.push_u16(src);
     }
 
+    /// Append a sub-JitCode descriptor and return its runtime
+    /// `descrs` index. Mirrors the RPython build-time flow where
+    /// `Assembler._encode_descr(jitcode)` adds the callee `JitCode` to
+    /// the shared descrs list and returns the 2-byte index that
+    /// `bhimpl_inline_call_*` later resolves via `self.descrs[idx]`
+    /// (`blackhole.py:150-157`).
     pub fn add_sub_jitcode(&mut self, jitcode: JitCode) -> u16 {
-        let idx = self.sub_jitcodes.len() as u16;
-        self.sub_jitcodes.push(std::sync::Arc::new(jitcode));
-        idx
+        self.add_sub_jitcode_arc(std::sync::Arc::new(jitcode))
     }
 
     /// Variant accepting an already-shared `Arc<JitCode>` for callers
     /// that already hold a shared handle (e.g. a re-export from
     /// `MetaInterpStaticData::indirectcalltargets`).
     pub fn add_sub_jitcode_arc(&mut self, jitcode: std::sync::Arc<JitCode>) -> u16 {
-        let idx = self.sub_jitcodes.len() as u16;
-        self.sub_jitcodes.push(jitcode);
+        let idx = self.descrs.len() as u16;
+        self.descrs.push(RuntimeBhDescr::JitCode(jitcode));
         idx
     }
 
@@ -1304,7 +1313,7 @@ impl JitCodeBuilder {
             exec: super::JitCodeExecState {
                 opcodes: self.opcodes,
                 fn_ptrs: self.fn_ptrs,
-                sub_jitcodes: self.sub_jitcodes,
+                descrs: self.descrs,
                 assembler_targets: self.assembler_targets,
             },
         }

@@ -1087,7 +1087,8 @@ impl BlackholeInterpreter {
     /// `crate::jitcode::JitCode` for `exec.*` pools. The extracted helper
     /// keeps the upstream-common part of `setposition` usable without a
     /// build→runtime conversion layer.
-    pub fn prepare_registers_for_canonical_jitcode(
+    #[cfg(test)]
+    pub(crate) fn prepare_registers_for_canonical_jitcode(
         &mut self,
         jitcode: &majit_translate::jitcode::JitCode,
         position: usize,
@@ -1112,28 +1113,6 @@ impl BlackholeInterpreter {
             body.constants_f.iter().map(|&c| c.to_bits() as i64),
         );
         self.reset_position_state(position);
-    }
-
-    /// Explicit mixed-mode helper: keep dispatch on the current runtime
-    /// adapter jitcode, but source the blackhole.py:312 register-file
-    /// sizing and constant copy from the canonical codewriter JitCode.
-    ///
-    /// Production `blackhole_from_resumedata` follows upstream again and
-    /// calls plain `setposition(jitcode, pc)`. This helper remains for
-    /// tests and for future callers that truly own both halves of the same
-    /// jitcode object graph. The caller must pass the exact matching
-    /// canonical jitcode object, not an unrelated build artifact looked up
-    /// by a coincidentally equal integer index.
-    pub fn setposition_with_canonical_jitcode(
-        &mut self,
-        runtime_jitcode: std::sync::Arc<JitCode>,
-        canonical_jitcode: &majit_translate::jitcode::JitCode,
-        position: usize,
-    ) {
-        self.prepare_registers_for_canonical_jitcode(canonical_jitcode, position);
-        // RPython: descrs / opnames stay shared on the builder; pyre still
-        // needs the runtime adapter jitcode installed for dispatch.
-        self.jitcode = runtime_jitcode;
     }
 
     pub fn new() -> Self {
@@ -2100,7 +2079,22 @@ impl BlackholeInterpreter {
                 let return_r = self.decode_return_slot();
                 let return_f = self.decode_return_slot();
 
-                let sub_jitcode = self.jitcode.exec.sub_jitcodes[sub_idx].clone();
+                // RPython `blackhole.py:150-157` — `j` argcode resolves
+                // via `self.descrs[idx]` asserted to be a `JitCode`.
+                let sub_jitcode = self
+                    .jitcode
+                    .exec
+                    .descrs
+                    .get(sub_idx)
+                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry \
+                             (runtime pool has {} items)",
+                            self.jitcode.exec.descrs.len()
+                        )
+                    })
+                    .clone();
 
                 // Create callee blackhole interpreter
                 let mut callee = BlackholeInterpreter::new();

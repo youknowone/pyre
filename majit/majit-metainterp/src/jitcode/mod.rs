@@ -222,6 +222,35 @@ impl LivenessInfo {
 /// definition lives in `majit_translate::jitcode::enumerate_vars`.
 pub use majit_translate::jitcode::enumerate_vars;
 
+/// Runtime descriptor entry — heterogeneous pool element indexed by
+/// `j` / `d` argcodes at dispatch time. Equivalent of RPython
+/// `self.descrs[idx]` where each entry is an instance of one of the
+/// `AbstractDescr` subclasses (`FieldDescr`, `ArrayDescr`, `JitCode`,
+/// ...). RPython uses `isinstance(value, JitCode)` to discriminate at
+/// runtime; pyre encodes the same discrimination in the enum tag
+/// because `majit_translate::jitcode::BhDescr` (build-time) cannot
+/// carry an `Arc<majit_metainterp::jitcode::JitCode>` without a
+/// layering inversion between the two crates.
+#[derive(Clone, Debug)]
+pub enum RuntimeBhDescr {
+    /// Target JitCode for a `j` argcode (`BC_INLINE_CALL`). RPython:
+    /// `blackhole.py:150-157` — `argtype == 'j' → descrs[idx]` asserted
+    /// `isinstance(value, JitCode)`. pyre's runtime carries the `Arc`
+    /// inline because the runtime-generated JitCodes have no global
+    /// allocation index into `metainterp_sd.all_jitcodes`.
+    JitCode(std::sync::Arc<JitCode>),
+}
+
+impl RuntimeBhDescr {
+    /// RPython parity: `isinstance(value, JitCode)` assertion at
+    /// `blackhole.py:156`. Returns the callee JitCode for `BC_INLINE_CALL`.
+    pub fn as_jitcode(&self) -> Option<&std::sync::Arc<JitCode>> {
+        match self {
+            Self::JitCode(arc) => Some(arc),
+        }
+    }
+}
+
 /// Runtime adapter state — pyre-only fields not present on canonical
 /// RPython `JitCode`. This container holds lookup pools that pyre's
 /// hardcoded `BC_*` dispatch resolves at runtime. RPython replaces the
@@ -253,11 +282,17 @@ pub struct JitCodeExecState {
     /// via a per-JitCode pool until the dispatch path migrates to
     /// insns-table + `d` argcode decode.
     pub fn_ptrs: Vec<JitCallTarget>,
-    /// Sub-JitCodes resolved by `BC_INLINE_CALL`. RPython reads the same
-    /// information via `j` argcode → `descrs[index] → JitCode`
-    /// (blackhole.py:154). pyre's runtime jitcodes hold the `Arc` inline
-    /// because they are built per-frame and have no global index.
-    pub sub_jitcodes: Vec<std::sync::Arc<JitCode>>,
+    /// Descriptor pool — indexed by the 2-byte `j`/`d` argcode operand.
+    /// Naming mirrors RPython `BlackholeInterpBuilder.descrs`
+    /// (blackhole.py:103) / `BlackholeInterpreter.descrs`
+    /// (blackhole.py:288). Build-time pyre routes the shared pool via
+    /// `BlackholeInterpBuilder.descrs`; runtime pyre keeps the
+    /// equivalent list per-JitCode because each Python-frame JitCode is
+    /// generated on demand. For `BC_INLINE_CALL` (`j` argcode) pyre
+    /// stores a `RuntimeBhDescr::JitCode(Arc<JitCode>)` — the `Arc` is
+    /// the runtime analogue of RPython's direct `JitCode` instance in
+    /// the shared pool.
+    pub descrs: Vec<RuntimeBhDescr>,
     /// CALL_ASSEMBLER target metadata keyed by loop token number. Cold
     /// field: only consulted when a portal re-enters an assembled loop
     /// via `bh_call_assembler_*`. Placed last so hotter adapter pools
@@ -582,35 +617,5 @@ mod tests {
 
         assert_eq!(bh.position, 0);
         assert!(bh.jitcode.code.is_empty());
-    }
-
-    #[test]
-    fn canonical_setposition_keeps_runtime_dispatch_jitcode_but_uses_canonical_constants() {
-        use crate::blackhole::BlackholeInterpreter;
-
-        let body = BuildJitCodeBody {
-            code: vec![BC_LIVE, 0x00, 0x00],
-            c_num_regs_i: 1,
-            c_num_regs_r: 0,
-            c_num_regs_f: 0,
-            constants_i: vec![777],
-            ..Default::default()
-        };
-        let canonical = BuildJitCode::new("slice2/canonical");
-        canonical.set_body(body);
-
-        let mut runtime = JitCodeBuilder::default().finish();
-        runtime.code = vec![BC_ABORT];
-        runtime.c_num_regs_i = 1;
-        let runtime = std::sync::Arc::new(runtime);
-
-        let mut bh = BlackholeInterpreter::new();
-        bh.setposition_with_canonical_jitcode(runtime.clone(), &canonical, 0);
-
-        assert_eq!(bh.registers_i.len(), 2);
-        assert_eq!(bh.registers_i[1], 777);
-        assert!(std::sync::Arc::ptr_eq(&bh.jitcode, &runtime));
-        assert_eq!(bh.jitcode.code, vec![BC_ABORT]);
-        assert_eq!(bh.position, 0);
     }
 }
