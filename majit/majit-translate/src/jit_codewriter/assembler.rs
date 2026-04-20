@@ -296,6 +296,10 @@ impl Assembler {
                 state.code.push(opnum);
                 state.code.push(src_reg);
                 state.code.push(dst_reg);
+                // RPython `assembler.py:210-212`: when argcodes contain
+                // `>`, record the reskind at the current pc. Mirrors
+                // `encode_op`'s handling of any op with a result slot.
+                state.resulttypes.insert(state.code.len(), src_kind);
             }
 
             // RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
@@ -313,6 +317,8 @@ impl Assembler {
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(src_reg);
+                // No `>` in argcodes → no resulttypes entry (upstream
+                // `assembler.py:210-212` guarded on `'>' in argcodes`).
             }
 
             // RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
@@ -331,6 +337,9 @@ impl Assembler {
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(dst_reg);
+                // `>` present in argcodes → record reskind per upstream
+                // `assembler.py:210-212`.
+                state.resulttypes.insert(state.code.len(), dst_kind);
             }
         }
     }
@@ -1463,7 +1472,8 @@ mod tests {
         let value_kinds =
             crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
-        let mut flat = crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types);
+        let mut flat =
+            crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types, &regallocs);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -1552,7 +1562,8 @@ mod tests {
         let value_kinds =
             crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
-        let mut flat = crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types);
+        let mut flat =
+            crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types, &regallocs);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -1631,7 +1642,7 @@ mod tests {
         value_kinds.insert(base, RegKind::Ref);
         value_kinds.insert(result, RegKind::Int);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
-        let mut flat = flatten_graph(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &regallocs);
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
 

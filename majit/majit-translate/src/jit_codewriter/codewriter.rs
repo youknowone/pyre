@@ -118,7 +118,7 @@ impl CodeWriter {
 
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
-        let mut ssarepr = flatten_with_types(&rewritten.graph, &rewritten_type_state);
+        let mut ssarepr = flatten_with_types(&rewritten.graph, &rewritten_type_state, &regallocs);
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
         // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)

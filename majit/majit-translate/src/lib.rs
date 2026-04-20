@@ -784,7 +784,11 @@ fn build_canonical_opcode_dispatch(
                 .with_type_state(&type_state);
             let rewritten = transformer.transform(&handler_graph_owned);
             let rewritten_type_state = rtype::resolve_types(&rewritten.graph, &annotations);
-            flatten::flatten_with_types(&rewritten.graph, &rewritten_type_state)
+            let value_kinds =
+                crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_type_state);
+            let regallocs =
+                crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
+            flatten::flatten_with_types(&rewritten.graph, &rewritten_type_state, &regallocs)
         });
 
         // Register the arm body in CallControl + reserve a jitcode slot.
@@ -1441,10 +1445,11 @@ mod tests {
         );
 
         // Step 3: flatten the rewritten graph
-        let flattened = flatten_with_types(
-            &result.graph,
-            &resolve_types(&result.graph, &annotate_graph(&result.graph)),
-        );
+        let types = resolve_types(&result.graph, &annotate_graph(&result.graph));
+        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&types);
+        let regallocs =
+            crate::regalloc::perform_all_register_allocations(&result.graph, &value_kinds);
+        let flattened = flatten_with_types(&result.graph, &types, &regallocs);
         eprintln!(
             "load_fast graph ops: {:?}",
             load_fast_graph.block(load_fast_graph.startblock).operations

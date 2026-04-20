@@ -7,8 +7,10 @@
 //! before register allocation and JitCode assembly.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::model::{BlockId, FunctionGraph, SpaceOperation, Terminator, ValueId};
+use crate::regalloc::RegAllocResult;
 
 /// A label in the flattened instruction stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,11 +97,16 @@ pub struct SSARepr {
 
 /// Flatten a FunctionGraph into a linear instruction sequence.
 ///
-/// RPython equivalent: `flatten_graph()` from flatten.py.
+/// RPython equivalent: `flatten_graph(graph, regallocs)` from flatten.py.
+///
+/// `regallocs` is the per-kind register-allocation result produced by
+/// the preceding `perform_all_register_allocations` pass. Upstream's
+/// `insert_renamings` reads it via `getcolor(v)` to decide cycle-break
+/// on the assigned color, not on the pre-regalloc ValueId identity.
 ///
 /// Block ordering: entry first, then BFS order. Back-edges (loops)
 /// become jumps to earlier labels.
-pub fn flatten(graph: &FunctionGraph) -> SSARepr {
+pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResult>) -> SSARepr {
     let mut ops = Vec::new();
     let mut block_labels: std::collections::HashMap<BlockId, Label> =
         std::collections::HashMap::new();
@@ -137,7 +144,7 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
             Terminator::Goto { target, args } => {
                 // RPython `flatten.py:306` `insert_renamings(link)`.
                 let target_block = graph.block(*target);
-                insert_renamings(args, &target_block.inputargs, &mut ops);
+                insert_renamings(args, &target_block.inputargs, regallocs, &mut ops);
                 ops.push(FlatOp::Jump(block_labels[target]));
             }
             Terminator::Branch {
@@ -181,14 +188,14 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
                 // RPython flatten.py:264: true path (fallthrough)
                 // insert_renamings(linktrue) + make_bytecode_block(linktrue.target)
                 let true_block = graph.block(*if_true);
-                insert_renamings(true_args, &true_block.inputargs, &mut ops);
+                insert_renamings(true_args, &true_block.inputargs, regallocs, &mut ops);
                 ops.push(FlatOp::Jump(true_label));
 
                 // RPython flatten.py:266-267: false path
                 // Label(linkfalse) then insert_renamings + make_bytecode_block
                 ops.push(FlatOp::Label(false_landing));
                 let false_block = graph.block(*if_false);
-                insert_renamings(false_args, &false_block.inputargs, &mut ops);
+                insert_renamings(false_args, &false_block.inputargs, regallocs, &mut ops);
                 ops.push(FlatOp::Jump(false_label));
             }
             Terminator::Return(_val) => {
@@ -240,8 +247,9 @@ pub fn flatten(graph: &FunctionGraph) -> SSARepr {
 pub fn flatten_with_types(
     graph: &FunctionGraph,
     types: &crate::translate_legacy::rtyper::rtyper::TypeResolutionState,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> SSARepr {
-    let mut result = flatten(graph);
+    let mut result = flatten(graph, regallocs);
     result.value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(types);
     result
 }
@@ -300,6 +308,11 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
 /// bank — a single global `reorder_renaming_list` call produces the
 /// same (src, dst) sequence as three per-kind calls would.
 ///
+/// `regallocs` supplies `getcolor(v)` per upstream — cycle detection
+/// operates on colors, not ValueIds, so it remains correct whether
+/// coalescing merged ValueIds into one color or split them across
+/// separate colors.
+///
 /// Upstream:
 /// ```py
 /// def insert_renamings(self, link):
@@ -332,40 +345,94 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
 /// `last_exception` / `last_exc_value` handling is not yet ported;
 /// majit's jtransform doesn't surface the per-link exception extras.
 /// When that lands, `generate_last_exc` will be a sibling helper.
-pub fn insert_renamings(link_args: &[ValueId], inputargs: &[ValueId], ops: &mut Vec<FlatOp>) {
+pub fn insert_renamings(
+    link_args: &[ValueId],
+    inputargs: &[ValueId],
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    ops: &mut Vec<FlatOp>,
+) {
+    // Resolve each ValueId to its regalloc-assigned color, mirroring
+    // upstream's `self.getcolor(v)` + `self.getcolor(inputargs[i])`.
+    // Cycle-break must operate on colors, not ValueIds: two distinct
+    // ValueIds can share a color after `coalesce_variables`, and two
+    // kind-separated banks use independent color spaces.
+    let get_color = |v: ValueId| -> Option<usize> {
+        for ra in regallocs.values() {
+            if let Some(&c) = ra.coloring.get(&v) {
+                return Some(c);
+            }
+        }
+        None
+    };
+
     // PRE-EXISTING-ADAPTATION: majit's synthesized graphs occasionally
     // hand over `link.args` and `link.target.inputargs` with mismatched
     // lengths (upstream RPython rejects these at graph-construction
-    // time; pyre tolerates them with a `.zip()` truncation, inherited
+    // time; majit tolerates them with a `.zip()` truncation, inherited
     // from the pre-insert_renamings flatten() implementation). Matching
     // that truncation keeps the structural port drop-in — downstream
     // passes see exactly the same Move/Push/Pop stream for the prefix
     // that upstream would have produced for a well-formed link.
-    // `for i, v in enumerate(link.args): ... (self.getcolor(v),
-    // self.getcolor(link.target.inputargs[i]))`.
-    let mut frm: Vec<ValueId> = Vec::with_capacity(link_args.len().min(inputargs.len()));
-    let mut to: Vec<ValueId> = Vec::with_capacity(link_args.len().min(inputargs.len()));
+    //
+    // Parallel color lists for `reorder_renaming_list` + representative
+    // ValueIds for emitting back into `FlatOp::Move/Push/Pop`. Each
+    // kept pair satisfies `v_color != w_color` (upstream `if v == w:
+    // continue` — after regalloc, equal colors mean equal variables).
+    let cap = link_args.len().min(inputargs.len());
+    let mut frm_colors: Vec<usize> = Vec::with_capacity(cap);
+    let mut to_colors: Vec<usize> = Vec::with_capacity(cap);
+    let mut src_vids: Vec<ValueId> = Vec::with_capacity(cap);
+    let mut dst_vids: Vec<ValueId> = Vec::with_capacity(cap);
     for (v, w) in link_args.iter().zip(inputargs.iter()) {
-        // `if v == w: continue`.
-        if v == w {
+        let Some(v_col) = get_color(*v) else { continue };
+        let Some(w_col) = get_color(*w) else { continue };
+        if v_col == w_col {
             continue;
         }
-        frm.push(*v);
-        to.push(*w);
+        frm_colors.push(v_col);
+        to_colors.push(w_col);
+        src_vids.push(*v);
+        dst_vids.push(*w);
     }
-    if frm.is_empty() {
+    if frm_colors.is_empty() {
         return;
     }
-    // `result = reorder_renaming_list(frm, to)`.
-    let result = reorder_renaming_list(&frm, &to);
+
+    // `result = reorder_renaming_list(frm, to)` — cycle-safe ordering
+    // over the color pairs.
+    let result = reorder_renaming_list(&frm_colors, &to_colors);
+
+    // Map a color back to a representative ValueId so downstream passes
+    // that still use ValueId identity (liveness backward walk, assembler
+    // `lookup_reg_with_kind`) keep working. Every Some(color) in the
+    // output corresponds to at least one entry in the `frm_colors` or
+    // `to_colors` list, respectively.
+    let find_src_vid = |c: usize| -> ValueId {
+        let idx = frm_colors
+            .iter()
+            .position(|&fc| fc == c)
+            .expect("reorder_renaming_list src color must come from frm_colors");
+        src_vids[idx]
+    };
+    let find_dst_vid = |c: usize| -> ValueId {
+        let idx = to_colors
+            .iter()
+            .position(|&tc| tc == c)
+            .expect("reorder_renaming_list dst color must come from to_colors");
+        dst_vids[idx]
+    };
+
     for (v, w) in result {
         match (v, w) {
             // `if w is None: self.emitline('%s_push' % kind, v)`.
-            (Some(src), None) => ops.push(FlatOp::Push(src)),
+            (Some(src_c), None) => ops.push(FlatOp::Push(find_src_vid(src_c))),
             // `elif v is None: self.emitline('%s_pop' % kind, "->", w)`.
-            (None, Some(dst)) => ops.push(FlatOp::Pop(dst)),
+            (None, Some(dst_c)) => ops.push(FlatOp::Pop(find_dst_vid(dst_c))),
             // `else: self.emitline('%s_copy' % kind, v, "->", w)`.
-            (Some(src), Some(dst)) => ops.push(FlatOp::Move { dst, src }),
+            (Some(src_c), Some(dst_c)) => ops.push(FlatOp::Move {
+                src: find_src_vid(src_c),
+                dst: find_dst_vid(dst_c),
+            }),
             (None, None) => unreachable!("reorder_renaming_list never yields (None, None)"),
         }
     }
@@ -475,6 +542,25 @@ mod tests {
     use super::*;
     use crate::model::{FunctionGraph, OpKind, Terminator};
 
+    /// Test helper — build a `regallocs` map that assigns each
+    /// `ValueId(n)` the color `n` in `RegKind::Int`. This turns the
+    /// color-based `insert_renamings` cycle-break into pure ValueId
+    /// identity, matching the pre-regalloc reasoning used by the
+    /// `insert_renamings_*` unit tests below.
+    fn identity_regallocs(
+        max_id: usize,
+    ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
+        let coloring: std::collections::HashMap<ValueId, usize> =
+            (0..=max_id).map(|n| (ValueId(n), n)).collect();
+        let num_regs = max_id + 1;
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            RegKind::Int,
+            crate::regalloc::RegAllocResult { coloring, num_regs },
+        );
+        m
+    }
+
     #[test]
     fn flatten_single_block() {
         let mut graph = FunctionGraph::new("simple");
@@ -482,7 +568,7 @@ mod tests {
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_terminator(entry, Terminator::Return(Some(v)));
 
-        let flat = flatten(&graph);
+        let flat = flatten(&graph, &identity_regallocs(8));
         assert_eq!(flat.name, "simple");
         // Label + ConstInt op = 2 flat ops
         assert!(flat.insns.len() >= 2);
@@ -524,7 +610,7 @@ mod tests {
         );
         graph.set_terminator(merge, Terminator::Return(None));
 
-        let flat = flatten(&graph);
+        let flat = flatten(&graph, &identity_regallocs(8));
         // Should have labels + jumps
         let has_jump = flat
             .insns
@@ -579,7 +665,7 @@ mod tests {
         );
         graph.set_terminator(exit, Terminator::Return(None));
 
-        let flat = flatten(&graph);
+        let flat = flatten(&graph, &identity_regallocs(8));
         // Body should jump back to header label
         let jumps: Vec<_> = flat
             .insns
@@ -612,7 +698,7 @@ mod tests {
         );
         graph.set_terminator(target, Terminator::Return(None));
 
-        let flat = flatten(&graph);
+        let flat = flatten(&graph, &identity_regallocs(8));
         let moves: Vec<_> = flat
             .insns
             .iter()
@@ -689,22 +775,26 @@ mod tests {
 
     // `rpython/jit/codewriter/test/test_flatten.py` exercises
     // `insert_renamings` indirectly via whole-graph tests; majit covers
-    // the standalone helper below.
+    // the standalone helper below. Identity coloring (ValueId(n) →
+    // color n) is used so the cycle-break reasoning under test matches
+    // the ValueId-level intuition these cases document.
     #[test]
     fn insert_renamings_emits_nothing_for_identity() {
         // `for i, v in enumerate(link.args): if v == w: continue`.
+        let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
         let args = vec![ValueId(0), ValueId(1), ValueId(2)];
         let inputargs = args.clone();
-        insert_renamings(&args, &inputargs, &mut ops);
+        insert_renamings(&args, &inputargs, &regallocs, &mut ops);
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
     #[test]
     fn insert_renamings_emits_move_for_acyclic_rename() {
         // Simple `%0 -> %1` phi resolution.
+        let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
-        insert_renamings(&[ValueId(0)], &[ValueId(1)], &mut ops);
+        insert_renamings(&[ValueId(0)], &[ValueId(1)], &regallocs, &mut ops);
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -718,10 +808,12 @@ mod tests {
     fn insert_renamings_breaks_swap_cycle_with_push_pop() {
         // Swap `%0 <-> %1` — reorder_renaming_list returns
         // [(0,None), (1,0), (None,1)] which maps to push/copy/pop.
+        let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
         insert_renamings(
             &[ValueId(0), ValueId(1)],
             &[ValueId(1), ValueId(0)],
+            &regallocs,
             &mut ops,
         );
         assert_eq!(
@@ -742,14 +834,90 @@ mod tests {
         // PRE-EXISTING-ADAPTATION — majit tolerates len(link.args) !=
         // len(link.target.inputargs) via `.zip()` truncation; iterating
         // over the shorter prefix only.
+        let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
-        insert_renamings(&[ValueId(0), ValueId(1)], &[ValueId(2)], &mut ops);
+        insert_renamings(
+            &[ValueId(0), ValueId(1)],
+            &[ValueId(2)],
+            &regallocs,
+            &mut ops,
+        );
         assert_eq!(
             ops,
             vec![FlatOp::Move {
                 dst: ValueId(2),
                 src: ValueId(0),
             }]
+        );
+    }
+
+    /// Two ValueIds that regalloc coalesced to the same color must NOT
+    /// emit a Move — upstream `flatten.py:314` `if v == w: continue`
+    /// tests color identity, not ValueId identity. This is the key
+    /// difference between the pre- and post-regalloc insert_renamings.
+    #[test]
+    fn insert_renamings_skips_coalesced_same_color() {
+        // ValueId(0) and ValueId(1) both colored 7 — the rename is a
+        // no-op even though the ValueIds differ.
+        let mut coloring: std::collections::HashMap<ValueId, usize> =
+            std::collections::HashMap::new();
+        coloring.insert(ValueId(0), 7);
+        coloring.insert(ValueId(1), 7);
+        let mut regallocs = std::collections::HashMap::new();
+        regallocs.insert(
+            RegKind::Int,
+            crate::regalloc::RegAllocResult {
+                coloring,
+                num_regs: 8,
+            },
+        );
+        let mut ops: Vec<FlatOp> = Vec::new();
+        insert_renamings(&[ValueId(0)], &[ValueId(1)], &regallocs, &mut ops);
+        assert_eq!(ops, Vec::<FlatOp>::new());
+    }
+
+    /// Four distinct ValueIds colored so that the color-level rename is
+    /// a 2-cycle swap. Pre-regalloc cycle-break (ValueId identity) would
+    /// not see any cycle — two unrelated moves — and emit only Moves,
+    /// corrupting the color bank. Post-regalloc cycle-break (colors)
+    /// emits Push/Move/Pop just like the pure 2-cycle test above.
+    #[test]
+    fn insert_renamings_detects_cycle_at_color_level() {
+        // Coloring:
+        //   v0 → c0, v2 → c1 (link.args)
+        //   v1 → c1, v3 → c0 (target.inputargs)
+        // Color pairs: (c0 → c1), (c1 → c0) — a swap cycle on colors.
+        let mut coloring: std::collections::HashMap<ValueId, usize> =
+            std::collections::HashMap::new();
+        coloring.insert(ValueId(0), 0);
+        coloring.insert(ValueId(1), 1);
+        coloring.insert(ValueId(2), 1);
+        coloring.insert(ValueId(3), 0);
+        let mut regallocs = std::collections::HashMap::new();
+        regallocs.insert(
+            RegKind::Int,
+            crate::regalloc::RegAllocResult {
+                coloring,
+                num_regs: 2,
+            },
+        );
+        let mut ops: Vec<FlatOp> = Vec::new();
+        insert_renamings(
+            &[ValueId(0), ValueId(2)],
+            &[ValueId(1), ValueId(3)],
+            &regallocs,
+            &mut ops,
+        );
+        // Must emit push/copy/pop — NOT two naive Moves.
+        assert!(
+            ops.iter().any(|o| matches!(o, FlatOp::Push(_))),
+            "color-level 2-cycle must emit a Push, got {:?}",
+            ops
+        );
+        assert!(
+            ops.iter().any(|o| matches!(o, FlatOp::Pop(_))),
+            "color-level 2-cycle must emit a Pop, got {:?}",
+            ops
         );
     }
 }

@@ -154,7 +154,11 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     let rewritten_types = resolve_types(&transform_result.graph, &annotations);
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
-    let flattened = flatten::flatten_with_types(&transform_result.graph, &rewritten_types);
+    let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_types);
+    let regallocs =
+        crate::regalloc::perform_all_register_allocations(&transform_result.graph, &value_kinds);
+    let flattened =
+        flatten::flatten_with_types(&transform_result.graph, &rewritten_types, &regallocs);
 
     PipelineResult {
         name: func.name.clone(),
