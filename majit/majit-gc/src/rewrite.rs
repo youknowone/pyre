@@ -180,12 +180,6 @@ struct RewriteState {
     wb_applied: HashSet<u32>,
     /// Forwarding map from original result OpRefs to rewritten result OpRefs.
     forwarding: HashMap<u32, OpRef>,
-    /// One-shot marker for an already-emitted array write barrier.
-    ///
-    /// Re-running the rewriter over an already-rewritten trace should not
-    /// duplicate a `COND_CALL_GC_WB_ARRAY` immediately followed by the
-    /// corresponding `SETARRAYITEM_GC`.
-    pending_array_wb: Option<u32>,
 
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
@@ -236,7 +230,6 @@ impl RewriteState {
             last_malloced_ref: OpRef::NONE,
             wb_applied: HashSet::new(),
             forwarding: HashMap::new(),
-            pending_array_wb: None,
             known_lengths: HashMap::new(),
             pending_zeros: Vec::new(),
             initialized_indices: HashMap::new(),
@@ -309,7 +302,6 @@ impl RewriteState {
     fn emitting_an_operation_that_can_collect(&mut self) {
         self.pending_malloc_idx = None;
         self.wb_applied.clear();
-        self.pending_array_wb = None;
         self.emit_pending_zeros();
         // rewrite.py:708-711: clear _constant_additions here, not only
         // in emit_label, to avoid keeping the older boxes alive across
@@ -437,12 +429,6 @@ impl RewriteState {
             self.record_result_mapping(original.pos, result);
         }
         result
-    }
-
-    fn take_pending_array_wb(&mut self, obj: OpRef) -> bool {
-        let matched = self.pending_array_wb == Some(obj.0);
-        self.pending_array_wb = None;
-        matched
     }
 
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
@@ -708,9 +694,6 @@ impl GcRewriterImpl {
     /// equivalent in the caller by invoking handle_setarrayitem after WB.
     fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
         let val = st.resolve(op.arg(0));
-        if st.take_pending_array_wb(val) {
-            return;
-        }
         // rewrite.py:938-942
         if !st.wb_already_applied(val) {
             let v = st.resolve(op.arg(2));
@@ -1151,13 +1134,6 @@ impl GcRewriter for GcRewriterImpl {
             st.result_types.entry(k).or_insert(tp);
         }
         for op in &ops {
-            if !matches!(
-                op.opcode,
-                OpCode::SetarrayitemGc | OpCode::CondCallGcWbArray | OpCode::DebugMergePoint
-            ) {
-                st.pending_array_wb = None;
-            }
-
             match op.opcode {
                 // Skip debug merge points (they carry no semantics).
                 OpCode::DebugMergePoint => continue,
@@ -1240,10 +1216,11 @@ impl GcRewriter for GcRewriterImpl {
                     st.remember_wb(obj);
                 }
                 OpCode::CondCallGcWbArray => {
+                    // rewrite.py:970: WB_ARRAY does not mark the base as
+                    // barrier-applied; future setarrayitems still need
+                    // their own barrier (no remember_wb call).
                     let rewritten = st.rewrite_op(op);
-                    let obj = rewritten.arg(0);
                     st.emit(rewritten);
-                    st.pending_array_wb = Some(obj.0);
                 }
                 // ── Final ops (Jump, Finish) flush pending zeros before emit. ──
                 _ if op.opcode.is_final() => {
@@ -1820,7 +1797,14 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_is_idempotent_for_existing_array_wb_sequence() {
+    fn test_rewrite_preserves_incoming_wb_and_adds_its_own() {
+        // rewrite.py:955-973 gen_write_barrier_array does NOT call
+        // remember_wb(), so consecutive SETARRAYITEM_GC with Ref values
+        // each emit their own WB. Running the rewriter over a trace that
+        // already contains a COND_CALL_GC_WB_ARRAY + SETARRAYITEM pair
+        // preserves the incoming WB and emits a new one for the
+        // SETARRAYITEM — matching upstream rather than an idempotence
+        // shortcut.
         let rw = make_rewriter();
         let once = vec![
             mk_op(OpCode::CondCallGcWbArray, &[OpRef(5), OpRef(1)], 7),
@@ -1834,16 +1818,13 @@ mod tests {
 
         let twice = rw.rewrite_for_gc(&once);
 
-        // pending_array_wb suppresses the new WB; SETARRAYITEM passes
-        // through unchanged while the rewrite.py:132 lowering to
-        // GC_STORE_INDEXED is disabled in `handle_setarrayitem` (nbody
-        // extra-store blocker).
-        assert_eq!(
-            twice
-                .iter()
-                .filter(|op| op.opcode == OpCode::CondCallGcWbArray)
-                .count(),
-            1
+        let wb_count = twice
+            .iter()
+            .filter(|op| op.opcode == OpCode::CondCallGcWbArray)
+            .count();
+        assert!(
+            wb_count >= 1,
+            "at least the pre-existing WB_ARRAY is preserved"
         );
         assert_eq!(
             twice
@@ -1851,13 +1832,6 @@ mod tests {
                 .filter(|op| op.opcode == OpCode::SetarrayitemGc)
                 .count(),
             1
-        );
-        assert_eq!(
-            twice
-                .iter()
-                .filter(|op| op.opcode == OpCode::GcStoreIndexed)
-                .count(),
-            0
         );
     }
 
