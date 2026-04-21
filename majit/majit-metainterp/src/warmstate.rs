@@ -297,8 +297,15 @@ pub struct WarmEnterState {
 pub enum HotResult {
     /// Not yet hot; keep interpreting.
     NotHot,
-    /// Threshold reached; start tracing.
-    StartTracing(Trace),
+    /// Threshold reached; start tracing. The caller (MetaInterp) builds
+    /// the Trace itself — RPython parity: `MetaInterp.create_empty_history`
+    /// / `MetaInterp.create_history` live on `MetaInterp`, not on the
+    /// warmstate (pyjitpl.py:2604-2610). Pyre's prior signal-and-factory
+    /// pattern (`HotResult::StartTracing(Trace::new())`) forced warmstate
+    /// to depend on the `recorder::Trace` type; Step 2e.2b is removing
+    /// that coupling so the `Trace` factory moves to MetaInterp where
+    /// `metainterp_sd` is available for `TraceRecordBuffer::new`.
+    StartTracing,
     /// Already tracing (caller should keep feeding ops to the active recorder).
     AlreadyTracing,
     /// Compiled code exists; run it.
@@ -334,7 +341,7 @@ impl WarmEnterState {
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
 
-        HotResult::StartTracing(Trace::new())
+        HotResult::StartTracing
     }
 
     /// Create a new WarmEnterState with the given threshold.
@@ -540,13 +547,18 @@ impl WarmEnterState {
         self.start_tracing_cell(green_key_hash)
     }
 
-    /// Start a retrace from a guard failure point.
+    /// Signal that a retrace is starting from a guard failure point.
     ///
-    /// Creates a new Trace for retracing, similar to starting a
-    /// fresh trace but from a guard's failure inputs.
-    pub fn start_retrace(&mut self, input_types: &[Type]) -> Trace {
-        Trace::with_input_types(input_types)
-    }
+    /// `input_types` is accepted for API shape parity with
+    /// `MetaInterp.create_history(max_num_inputargs)` callers who need
+    /// to size their `TraceRecordBuffer` before the retrace; warmstate
+    /// doesn't own the Trace type. Returns nothing — the caller
+    /// (`MetaInterp::start_bridge_trace` in pyjitpl/mod.rs) constructs
+    /// the `Trace` itself with its `staticdata: Arc<MetaInterpStaticData>`.
+    /// RPython parity: `warmspot.py` has no analogue of the old
+    /// `start_retrace(input_types) -> Trace` factory — RPython's
+    /// `MetaInterp.create_history(max_num_inputargs)` is the constructor.
+    pub fn start_retrace(&mut self, _input_types: &[Type]) {}
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
     /// The caller is responsible for compiling the trace and calling
@@ -1491,7 +1503,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         // Tick 3: threshold reached, start tracing
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
     }
@@ -1502,7 +1514,7 @@ mod tests {
         // First tick: eviction (always false). Second tick: threshold reached.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         // Next call sees TRACING flag
@@ -1530,7 +1542,7 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(42);
@@ -1545,7 +1557,7 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         ws.abort_tracing(42, true);
@@ -1558,7 +1570,7 @@ mod tests {
         // still retriggers separate tracing after warming up again.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing due to DONT_TRACE_HERE retrace"),
         }
     }
@@ -1568,7 +1580,7 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         // Abort without DONT_TRACE_HERE
@@ -1579,7 +1591,7 @@ mod tests {
         // so one tick to reach count=1, another to reach count=2 >= threshold=2.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing on retry"),
         }
     }
@@ -1594,7 +1606,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
         // Key 1: tick 3 -> threshold, starts tracing
         match ws.maybe_compile(1) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing for key 1"),
         }
         // Key 2 still not hot (only 2 total ticks: eviction + one more needed)
@@ -1642,10 +1654,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
 
         // Phase 2: Start tracing (third tick reaches threshold)
-        let recorder = match ws.maybe_compile(key) {
-            HotResult::StartTracing(rec) => rec,
-            _ => panic!("expected StartTracing"),
-        };
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
 
         // Phase 3: Already tracing
         assert!(matches!(ws.maybe_compile(key), HotResult::AlreadyTracing));
@@ -1658,8 +1667,6 @@ mod tests {
 
         // Phase 5: Run compiled
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
-
-        drop(recorder);
     }
 
     #[test]
@@ -1677,12 +1684,19 @@ mod tests {
 
     #[test]
     fn test_start_retrace_preserves_input_types() {
+        // RPython pyjitpl.py:2609 `MetaInterp.create_history(max_num_inputargs)`:
+        // the MetaInterp, not warmstate, owns the Trace factory. Since
+        // warmstate's `start_retrace` is now a state-only signal, this test
+        // verifies that the input_types the caller intends to use are the
+        // ones that flow into the Trace downstream (Trace::with_input_types).
         let mut ws = WarmEnterState::new(3);
-        let mut recorder = ws.start_retrace(&[Type::Ref, Type::Int, Type::Float]);
+        let input_types = [Type::Ref, Type::Int, Type::Float];
+        ws.start_retrace(&input_types);
+        let mut recorder = crate::recorder::Trace::with_input_types(&input_types);
         recorder.close_loop(&[majit_ir::OpRef(0), majit_ir::OpRef(1), majit_ir::OpRef(2)]);
         let trace = recorder.get_trace();
-        let input_types: Vec<Type> = trace.inputargs.iter().map(|arg| arg.tp).collect();
-        assert_eq!(input_types, vec![Type::Ref, Type::Int, Type::Float]);
+        let seen: Vec<Type> = trace.inputargs.iter().map(|arg| arg.tp).collect();
+        assert_eq!(seen, input_types.to_vec());
     }
 
     // ── Quasi-immutable invalidation tests ──
@@ -1775,7 +1789,7 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
 
@@ -1790,7 +1804,7 @@ mod tests {
         // RPython warmstate.py: DONT_TRACE_HERE still allows separate
         // tracing later for keys without a procedure token.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(42), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(42), HotResult::StartTracing));
     }
 
     #[test]
@@ -1814,7 +1828,7 @@ mod tests {
         // Key 42: start and abort as too long.
         assert!(matches!(ws.maybe_compile(42), HotResult::NotHot));
         match ws.maybe_compile(42) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing for key 42"),
         }
         ws.abort_tracing(42, true);
@@ -1822,7 +1836,7 @@ mod tests {
         // Key 99: should still work normally.
         assert!(matches!(ws.maybe_compile(99), HotResult::NotHot));
         match ws.maybe_compile(99) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing for key 99"),
         }
     }
@@ -1837,7 +1851,7 @@ mod tests {
         // Phase 1: reach threshold, start tracing.
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
 
@@ -1847,7 +1861,7 @@ mod tests {
         // Phase 3: retry, reach threshold again.
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_rec) => {
+            HotResult::StartTracing => {
                 // Phase 4: this time the trace succeeds.
                 ws.finish_tracing(key);
                 let token = JitCellToken::new(ws.alloc_token_number());
@@ -1871,7 +1885,7 @@ mod tests {
         // First attempt: tick once (eviction), tick twice (threshold) -> StartTracing.
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing (attempt 1)"),
         }
         ws.abort_tracing(key, false);
@@ -1879,7 +1893,7 @@ mod tests {
         // Second attempt: after abort, counter was reset, need to tick again.
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing (attempt 2)"),
         }
         ws.abort_tracing(key, false);
@@ -1887,7 +1901,7 @@ mod tests {
         // Third attempt: succeeds and gets compiled.
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {
+            HotResult::StartTracing => {
                 ws.finish_tracing(key);
                 let token = JitCellToken::new(ws.alloc_token_number());
                 ws.attach_procedure_to_interp(key, token);
@@ -1906,7 +1920,7 @@ mod tests {
 
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
 
@@ -2099,7 +2113,7 @@ mod tests {
         // Step 1: compile a loop
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(key);
@@ -2242,7 +2256,7 @@ mod tests {
             assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         }
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing at threshold 5"),
         }
 
@@ -2255,7 +2269,7 @@ mod tests {
         // Now only 2 ticks needed
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {
+            HotResult::StartTracing => {
                 ws.finish_tracing(key);
                 let token = JitCellToken::new(ws.alloc_token_number());
                 ws.attach_procedure_to_interp(key, token);
@@ -2275,7 +2289,7 @@ mod tests {
 
         // Without any ticks, force_start_tracing should start tracing
         match ws.force_start_tracing(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("force_start_tracing should start tracing immediately"),
         }
 
@@ -2304,7 +2318,7 @@ mod tests {
         // Tick to threshold → Tracing
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Tracing);
@@ -2335,7 +2349,7 @@ mod tests {
         // Compile a loop
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(key);
@@ -2400,9 +2414,9 @@ mod tests {
 
         // Start tracing two keys
         assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing));
         assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing));
 
         let stats = ws.get_stats();
         assert_eq!(stats.num_cells, 2);
@@ -2442,7 +2456,7 @@ mod tests {
 
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
-            HotResult::StartTracing(_) => {}
+            HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
 
@@ -2469,7 +2483,7 @@ mod tests {
 
         // Start tracing key 1 → generation 1
         assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing));
         assert_eq!(ws.tracing_generation(), 1);
 
         let cell = ws.get_cell(1).unwrap();
@@ -2477,7 +2491,7 @@ mod tests {
 
         // Start tracing key 2 → generation 2
         assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing));
         assert_eq!(ws.tracing_generation(), 2);
 
         let cell = ws.get_cell(2).unwrap();
@@ -2519,18 +2533,18 @@ mod tests {
         // Create some cells in various states
         // Key 1: compiled (should NOT be removed)
         assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing));
         ws.finish_tracing(1);
         let token = JitCellToken::new(ws.alloc_token_number());
         ws.attach_procedure_to_interp(1, token);
 
         // Key 2: tracing (should NOT be removed)
         assert!(matches!(ws.maybe_compile(2), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(2), HotResult::StartTracing));
 
         // Key 3: aborted without dont_trace → NotHot, removable
         assert!(matches!(ws.maybe_compile(3), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(3), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(3), HotResult::StartTracing));
         ws.abort_tracing(3, false);
 
         assert_eq!(ws.get_stats().num_cells, 3);
@@ -2550,7 +2564,7 @@ mod tests {
 
         // Compile
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
         let token = JitCellToken::new(ws.alloc_token_number());
         ws.attach_procedure_to_interp(key, token);
@@ -2605,7 +2619,7 @@ mod tests {
 
         // Compile a loop
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing(_)));
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
         let token = JitCellToken::new(ws.alloc_token_number());
         ws.attach_procedure_to_interp(key, token);

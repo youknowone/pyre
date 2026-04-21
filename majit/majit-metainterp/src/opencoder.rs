@@ -684,9 +684,10 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             let resolved = if descr_index == 0 || opcode.is_guard() {
                 None
             } else {
-                let all_descr_len = self.trace.metainterp_sd.all_descrs.len() as i64;
+                let all_descrs = self.trace.metainterp_sd.all_descrs.lock().unwrap();
+                let all_descr_len = all_descrs.len() as i64;
                 if descr_index < all_descr_len + 1 {
-                    Some(self.trace.metainterp_sd.all_descrs[(descr_index - 1) as usize].clone())
+                    Some(all_descrs[(descr_index - 1) as usize].clone())
                 } else {
                     Some(
                         self.trace._descrs[(descr_index - all_descr_len - 1) as usize]
@@ -1320,7 +1321,7 @@ impl TraceRecordBuffer {
     /// the global descriptor table length from the attached
     /// metainterp_sd.
     fn all_descrs_len(&self) -> u32 {
-        self.metainterp_sd.all_descrs.len() as u32
+        self.metainterp_sd.all_descrs.lock().unwrap().len() as u32
     }
 
     /// opencoder.py:503-508 set_inputargs(inputargs).
@@ -3613,7 +3614,10 @@ mod tests {
         let mut sd = crate::MetaInterpStaticData::new();
         // Seed all_descrs with 7 dummies so the length drives the encoding.
         for _ in 0..7 {
-            sd.all_descrs.push(Arc::new(D { idx: 0 }));
+            sd.all_descrs
+                .get_mut()
+                .unwrap()
+                .push(Arc::new(D { idx: 0 }));
         }
         let mut buf = TraceRecordBuffer::new(0, Arc::new(sd));
 

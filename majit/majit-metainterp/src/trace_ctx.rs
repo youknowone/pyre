@@ -3,7 +3,7 @@
 
 use crate::opencoder::Box as OcBox;
 use crate::recorder::{Trace, TracePosition};
-use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GreenKey, Op, OpCode, OpRef, Type, Value};
 use majit_trace::heapcache::HeapCache;
 
 use majit_backend::JitCellToken;
@@ -38,6 +38,16 @@ pub(crate) fn value_to_raw_bits(value: Value) -> i64 {
 /// - Record function calls (with auto-generated CallDescr)
 pub struct TraceCtx {
     pub(crate) recorder: Trace,
+    /// opencoder.py:472 `self.metainterp_sd = metainterp_sd` — the trace
+    /// recorder holds a shared reference to the JIT's static data so
+    /// `_encode_descr` can route global descriptors through
+    /// `metainterp_sd.all_descrs`. Pyre tracks it on TraceCtx instead
+    /// of `recorder::Trace` because the swap to `TraceRecordBuffer`
+    /// (Step 2e.2b) needs the Arc available at constructor time; wiring
+    /// it at the TraceCtx layer lets the eventual swap reuse this
+    /// plumbing without threading more parameters through
+    /// `MetaInterp::setup_tracing` etc.
+    pub(crate) metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     pub(crate) green_key: u64,
     root_green_key: u64,
     /// Structured `(code_ptr, pc)` counterpart to `green_key`. Keeps
@@ -97,9 +107,6 @@ pub struct TraceCtx {
     /// the green key for the inner loop. Used to register an alias
     /// so can_enter_jit at the inner back-edge finds the outer key's entry.
     pub cut_inner_green_key: Option<u64>,
-    /// Pending OpRef replacements from inline callee returns.
-    /// Applied when the trace is finalized (close_loop/compile).
-    replacements: Vec<(OpRef, OpRef)>,
     /// pyjitpl.py:3030 current_merge_points — loop headers visited during
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
@@ -298,19 +305,36 @@ impl TraceCtx {
     /// `cindex` = ConstInt(len(virtualref_boxes) // 2) — pair index.
     /// The optimizer can later eliminate the vref if the object stays virtual.
     pub fn virtual_ref(&mut self, obj: OpRef, cindex: OpRef) -> OpRef {
-        let result = self.recorder.record_op(OpCode::VirtualRefR, &[obj, cindex]);
+        let result = Self::do_record_op(
+            &mut self.recorder,
+            &self.constants,
+            OpCode::VirtualRefR,
+            &[obj, cindex],
+        );
         // pyjitpl.py:1807: heapcache.new(resbox)
         self.heap_cache.new_object(result);
         result
     }
 
     /// Create a standalone TraceCtx for testing or external use.
+    ///
+    /// Internally synthesizes a fresh `Arc<MetaInterpStaticData>` —
+    /// test-only parity with `RPython test_opencoder.py:24` `class
+    /// metainterp_sd: all_descrs = []` which similarly stubs a
+    /// MetaInterpStaticData fixture for unit tests. Production callers
+    /// (`MetaInterp::force_start_tracing` / `setup_tracing` /
+    /// `start_bridge_trace`) go through `TraceCtx::new` directly with
+    /// `self.staticdata.clone()`.
     pub fn for_test(num_inputs: usize) -> Self {
         let mut recorder = Trace::new();
         for _ in 0..num_inputs {
             recorder.record_input_arg(majit_ir::Type::Int);
         }
-        Self::new(recorder, 0)
+        Self::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        )
     }
 
     /// Create a TraceCtx for tests whose input args have mixed types.
@@ -321,7 +345,11 @@ impl TraceCtx {
         for &tp in types {
             recorder.record_input_arg(tp);
         }
-        Self::new(recorder, 0)
+        Self::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        )
     }
 
     /// Take the recorder out of this context (consumes self).
@@ -329,7 +357,11 @@ impl TraceCtx {
         self.recorder
     }
 
-    pub(crate) fn new(recorder: Trace, green_key: u64) -> Self {
+    pub(crate) fn new(
+        recorder: Trace,
+        green_key: u64,
+        metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
+    ) -> Self {
         let initial_position = recorder.get_position();
         let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
             .map(|i| OpRef(i as u32))
@@ -337,6 +369,7 @@ impl TraceCtx {
         let initial_types: Vec<Type> = recorder.inputarg_types().to_vec();
         TraceCtx {
             recorder,
+            metainterp_sd,
             green_key,
             root_green_key: green_key,
             green_key_raw: (0, 0),
@@ -353,7 +386,6 @@ impl TraceCtx {
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
-            replacements: Vec::new(),
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
@@ -378,6 +410,7 @@ impl TraceCtx {
         recorder: Trace,
         green_key: u64,
         green_key_values: GreenKey,
+        metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     ) -> Self {
         let initial_position = recorder.get_position();
         let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
@@ -388,6 +421,7 @@ impl TraceCtx {
         let initial_input_types = recorder.inputarg_types();
         TraceCtx {
             recorder,
+            metainterp_sd,
             green_key,
             root_green_key: green_key,
             green_key_raw: (0, 0),
@@ -404,7 +438,6 @@ impl TraceCtx {
             virtualizable_heap_ptr: None,
             header_pc: 0,
             cut_inner_green_key: None,
-            replacements: Vec::new(),
             current_merge_points: vec![MergePoint {
                 green_key,
                 position: initial_position,
@@ -491,42 +524,6 @@ impl TraceCtx {
         self.inline_frames.iter().filter(|&&k| k == target).count()
     }
 
-    /// Register a deferred OpRef replacement. When the trace is finalized,
-    /// all ops referencing `old` in their args will use `new` instead.
-    pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
-        self.replacements.push((old, new));
-    }
-
-    /// pyjitpl.py:3499 `replace_box(oldbox, newbox)` parity.
-    ///
-    /// In RPython this walks every place where the old Box might appear
-    /// (frame stacks, virtualref_boxes, virtualizable_boxes, heap caches)
-    /// and replaces it with the new Box. The pyre equivalent applies the
-    /// same logic to the side-channel `virtualizable_boxes` so that
-    /// `metainterp.virtualizable_boxes[-1]` (the standard vable identity)
-    /// stays in sync after `replace_op` calls.
-    ///
-    /// Trace ops, virtualref_boxes, and heap cache state are handled by
-    /// `apply_replacements` (deferred batch) and the optimizer's separate
-    /// `forwarded` chain. This method covers only the
-    /// `virtualizable_boxes` walk that has no other home.
-    pub fn replace_box_in_virtualizable_boxes(&mut self, old: OpRef, new: OpRef) {
-        // pyjitpl.py:3506-3511 parity:
-        //     if (jitdriver_sd.virtualizable_info is not None or
-        //         jitdriver_sd.greenfield_info is not None):
-        //         boxes = self.virtualizable_boxes
-        //         for i in range(len(boxes)):
-        //             if boxes[i] is oldbox:
-        //                 boxes[i] = newbox
-        if let Some(boxes) = self.virtualizable_boxes.as_mut() {
-            for slot in boxes.iter_mut() {
-                if *slot == old {
-                    *slot = new;
-                }
-            }
-        }
-    }
-
     /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)` —
     /// trace-context portion.
     ///
@@ -549,25 +546,14 @@ impl TraceCtx {
     ///
     /// pyre splits `MetaInterp.replace_box` across two layers:
     ///
-    ///   * `TraceCtx::replace_box` (this method) handles the eager
-    ///     virtualizable_boxes + heap_cache walks AND queues the
-    ///     deferred recorder rewrite via `replace_op`. This is what
-    ///     `is_nonstandard_virtualizable` Step 4 calls because the
-    ///     framestack walk is not reachable from inside TraceCtx.
+    ///   * `TraceCtx::replace_box` (this method) handles the
+    ///     `virtualizable_boxes` + `heap_cache` walks. This is what
+    ///     `is_nonstandard_virtualizable` Step 4 calls.
     ///
-    ///   * `MetaInterp::replace_box` (in pyjitpl.rs) is a thin
-    ///     wrapper that adds the `virtualref_boxes` walk on top of
-    ///     this TraceCtx call. It is the structural mirror of the
-    ///     full RPython entry point.
-    ///
-    /// The framestack walk
-    /// (`for frame in self.framestack: frame.replace_active_box_in_frame(...)`)
-    /// is missing because pyre's frame state lives in PyreSym
-    /// (in pyre-jit-trace) and is not reachable from MetaInterp.
-    /// The deferred recorder rewrite (queued via `replace_op` and
-    /// flushed in `apply_replacements`) substitutes for the
-    /// per-frame walk by rewriting all already-emitted op args
-    /// once at trace finalization.
+    ///   * `MetaInterp::replace_box` (in pyjitpl.rs) is the structural
+    ///     mirror of the full RPython entry point; it adds the
+    ///     `virtualref_boxes` walk and the framestack walk on top of
+    ///     this `TraceCtx::replace_box`.
     pub fn replace_box(&mut self, oldbox: OpRef, newbox: OpRef) {
         // pyjitpl.py:3506-3511 virtualizable_boxes walk.
         if let Some(boxes) = self.virtualizable_boxes.as_mut() {
@@ -579,50 +565,6 @@ impl TraceCtx {
         }
         // pyjitpl.py:3512 self.heapcache.replace_box(oldbox, newbox).
         self.heap_cache.replace_box(oldbox, newbox);
-        // Queue the deferred recorder rewrite (pyre-only — RPython's
-        // framestack walk has no equivalent in pyre's MetaInterp;
-        // the queued rewrite is applied at finalization in
-        // `apply_replacements`).
-        self.replace_op(oldbox, newbox);
-    }
-
-    /// Apply all pending replacements to the trace ops.
-    ///
-    /// Flushes the `replace_op` queue: for each `(old, new)` pair,
-    /// re-runs the eager walks (so duplicates from optimizer-level
-    /// `replace_op` calls that did NOT go through `TraceCtx::replace_box`
-    /// also see the heapcache / virtualizable_boxes update) and rewrites
-    /// the recorder's op args + fail_args.
-    pub fn apply_replacements(&mut self) {
-        if self.replacements.is_empty() {
-            return;
-        }
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] apply_replacements: {} entries",
-                self.replacements.len()
-            );
-            for (old, new) in &self.replacements {
-                eprintln!("  {:?} → {:?}", old, new);
-            }
-        }
-        // pyjitpl.py:3506-3511 virtualizable_boxes walk for queued entries.
-        for (old, new) in &self.replacements {
-            if let Some(boxes) = self.virtualizable_boxes.as_mut() {
-                for slot in boxes.iter_mut() {
-                    if *slot == *old {
-                        *slot = *new;
-                    }
-                }
-            }
-        }
-        // pyjitpl.py:3512 heapcache walk for queued entries.
-        for (old, new) in &self.replacements {
-            self.heap_cache.replace_box(*old, *new);
-        }
-        let replacements: std::collections::HashMap<OpRef, OpRef> =
-            self.replacements.drain(..).collect();
-        self.recorder.apply_replacements(&replacements);
     }
 
     /// Push an inline frame (entering a callee).
@@ -802,7 +744,7 @@ impl TraceCtx {
 
     /// Record a regular IR operation.
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
-        self.recorder.record_op(opcode, args)
+        Self::do_record_op(&mut self.recorder, &self.constants, opcode, args)
     }
 
     /// Record an operation with a descriptor (e.g., calls).
@@ -812,7 +754,7 @@ impl TraceCtx {
         args: &[OpRef],
         descr: DescrRef,
     ) -> OpRef {
-        self.recorder.record_op_with_descr(opcode, args, descr)
+        Self::do_record_op_with_descr(&mut self.recorder, &self.constants, opcode, args, descr)
     }
 
     /// Record a guard with auto-generated FailDescr.
@@ -836,7 +778,7 @@ impl TraceCtx {
 
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
         let descr = make_fail_descr(num_live);
-        self.recorder.record_guard(opcode, args, descr)
+        Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, descr)
     }
 
     /// Record a guard with explicit fail_args.
@@ -848,8 +790,14 @@ impl TraceCtx {
         fail_args: &[OpRef],
     ) -> OpRef {
         let descr = make_fail_descr(num_live);
-        self.recorder
-            .record_guard_with_fail_args(opcode, args, descr, fail_args)
+        Self::do_record_guard_with_fail_args(
+            &mut self.recorder,
+            &self.constants,
+            opcode,
+            args,
+            descr,
+            fail_args,
+        )
     }
 
     /// Record a guard with explicit typed fail_args.
@@ -861,8 +809,147 @@ impl TraceCtx {
         fail_args: &[OpRef],
     ) -> OpRef {
         let descr = make_fail_descr_typed(fail_arg_types);
-        self.recorder
-            .record_guard_with_fail_args(opcode, args, descr, fail_args)
+        Self::do_record_guard_with_fail_args(
+            &mut self.recorder,
+            &self.constants,
+            opcode,
+            args,
+            descr,
+            fail_args,
+        )
+    }
+
+    // ── Step 2e.2a: split-borrow helpers ──────────────────────────────
+    //
+    // Private `do_*` helpers take `(&mut Trace, &ConstantPool, ...)` so the
+    // caller performs an explicit two-field borrow of `self.recorder` and
+    // `self.constants`. The `_constants` parameter is currently unused —
+    // `recorder::Trace` carries raw `OpRef` values and needs no constant
+    // resolution at record time — but the signature shape matches
+    // `TraceRecordBuffer::record_op_oprefs` / `record_guard_oprefs` /
+    // `close_loop_oprefs` / `finish_oprefs` (opencoder.rs:2335-2442), all
+    // of which consume `&ConstantPool` to resolve tagged-constant `OpRef`
+    // into wire bytes. Step 2e.2b swaps the `recorder` field type from
+    // `Trace` to `TraceRecordBuffer`; at that point the helper bodies
+    // change from the Vec-of-Op forms below to the `_oprefs` byte-stream
+    // forms, while the public record methods above stay untouched.
+
+    fn do_record_op(
+        recorder: &mut Trace,
+        _constants: &ConstantPool,
+        opcode: OpCode,
+        args: &[OpRef],
+    ) -> OpRef {
+        recorder.record_op(opcode, args)
+    }
+
+    fn do_record_op_with_descr(
+        recorder: &mut Trace,
+        _constants: &ConstantPool,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+    ) -> OpRef {
+        recorder.record_op_with_descr(opcode, args, descr)
+    }
+
+    fn do_record_guard(
+        recorder: &mut Trace,
+        _constants: &ConstantPool,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+    ) -> OpRef {
+        recorder.record_guard(opcode, args, descr)
+    }
+
+    fn do_record_guard_with_fail_args(
+        recorder: &mut Trace,
+        _constants: &ConstantPool,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+        fail_args: &[OpRef],
+    ) -> OpRef {
+        recorder.record_guard_with_fail_args(opcode, args, descr, fail_args)
+    }
+
+    fn do_close_loop(recorder: &mut Trace, _constants: &ConstantPool, jump_args: &[OpRef]) {
+        recorder.close_loop(jump_args);
+    }
+
+    fn do_close_loop_with_descr(
+        recorder: &mut Trace,
+        _constants: &ConstantPool,
+        jump_args: &[OpRef],
+        descr: Option<DescrRef>,
+    ) {
+        recorder.close_loop_with_descr(jump_args, descr);
+    }
+
+    fn do_finish(
+        recorder: &mut Trace,
+        _constants: &ConstantPool,
+        finish_args: &[OpRef],
+        descr: DescrRef,
+    ) {
+        recorder.finish(finish_args, descr);
+    }
+
+    // ── Step 2e.2b.glue: public TraceCtx wrappers over self.recorder ──
+    //
+    // These methods centralize every `ctx.recorder.X()` external call
+    // pattern. Post-swap (Step 2e.2b), only these helper bodies change
+    // to call `TraceRecordBuffer::close_loop_oprefs` / `finish_oprefs` /
+    // `get_trace_equivalent` etc.; external callers stay put. This keeps
+    // the Step 2e.2b field-type swap localized to TraceCtx.
+
+    /// pyjitpl.py:3188-3190 `history.record1(rop.JUMP, ..., descr=ptoken)` —
+    /// close the loop with an implicit no-descr JUMP.
+    pub fn close_loop(&mut self, jump_args: &[OpRef]) {
+        Self::do_close_loop(&mut self.recorder, &self.constants, jump_args);
+    }
+
+    /// pyjitpl.py:3188-3190 close-loop variant with an explicit JUMP
+    /// descriptor (tentative target token recorded before compile_trace).
+    pub fn close_loop_with_descr(&mut self, jump_args: &[OpRef], descr: Option<DescrRef>) {
+        Self::do_close_loop_with_descr(&mut self.recorder, &self.constants, jump_args, descr);
+    }
+
+    /// pyjitpl.py:1637 `history.record1(rop.FINISH, ..., descr=token)` —
+    /// finalize a non-looping trace with explicit FailDescr.
+    pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
+        Self::do_finish(&mut self.recorder, &self.constants, finish_args, descr);
+    }
+
+    /// Consume the TraceCtx and return the completed `TreeLoop`.
+    ///
+    /// Pyre analog of RPython's `MetaInterp.history.trace` access — after
+    /// tracing ends, downstream callers (optimizer, bridge export) see
+    /// the loop as `TreeLoop { inputargs, ops, snapshots }`.
+    pub fn into_tree_loop(self) -> crate::history::TreeLoop {
+        self.recorder.get_trace()
+    }
+
+    /// Snapshot slice accessor — Pyre-level parity with
+    /// `MetaInterp.history.trace.snapshots()`. The storage is a
+    /// `Vec<Snapshot>` side-table today; Step 2e.2b migrates this to
+    /// the byte-stream `_snapshot_data` / `_snapshot_array_data`.
+    pub fn snapshots(&self) -> &[crate::recorder::Snapshot] {
+        self.recorder.snapshots()
+    }
+
+    /// Op slice accessor — returns the raw recorded operations. After
+    /// Step 2e.2b this materializes via `ByteTraceIter::next` walking
+    /// the byte stream.
+    pub fn ops(&self) -> &[Op] {
+        self.recorder.ops()
+    }
+
+    /// `num_inputargs()` — alias for `num_inputs()` keeping RPython
+    /// `Trace.num_inputargs` name parity in external call sites.
+    pub fn num_inputargs(&self) -> usize {
+        self.recorder.num_inputargs()
     }
 
     /// Record a void-returning function call (CallN).
@@ -886,7 +973,12 @@ impl TraceCtx {
     /// Record a FINISH op with a single result value.
     /// pyjitpl.py:1637 history.record1(rop.FINISH, ..., descr=token)
     pub fn record_finish(&mut self, result: OpRef, _tp: Type) {
-        self.recorder.record_op(OpCode::Finish, &[result]);
+        Self::do_record_op(
+            &mut self.recorder,
+            &self.constants,
+            OpCode::Finish,
+            &[result],
+        );
     }
 
     /// pyjitpl.py:2789-2791 `blackhole_if_trace_too_long` check:
@@ -1412,7 +1504,8 @@ impl TraceCtx {
         if self.forced_virtualizable == Some(vbox) {
             return false;
         }
-        let force_token = self.recorder.record_op(OpCode::ForceToken, &[]);
+        let force_token =
+            Self::do_record_op(&mut self.recorder, &self.constants, OpCode::ForceToken, &[]);
         let token_descr = info.token_field_descr();
         self.vable_setfield_descr(vbox, force_token, token_descr);
         // pyjitpl.py:3236 self.generate_guard(rop.GUARD_NOT_FORCED_2)
@@ -1534,7 +1627,9 @@ impl TraceCtx {
             .expect("emit_force_virtualizable: clear_vable_descr not set");
         //     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
         //                          calldescr, False, False)
-        self.recorder.record_op_with_descr(
+        Self::do_record_op_with_descr(
+            &mut self.recorder,
+            &self.constants,
             OpCode::CondCallN,
             &[condbox, funcbox, vable_opref],
             clear_descr,
@@ -3331,7 +3426,14 @@ mod tests {
         let r = recorder.record_input_arg(Type::Ref);
         let f = recorder.record_input_arg(Type::Float);
         let i = recorder.record_input_arg(Type::Int);
-        (TraceCtx::new(recorder, 0), [r, f, i])
+        (
+            TraceCtx::new(
+                recorder,
+                0,
+                std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+            ),
+            [r, f, i],
+        )
     }
 
     fn take_single_call_descr(ctx: TraceCtx, jump_args: &[OpRef]) -> (Vec<Type>, OpCode) {
@@ -3434,7 +3536,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         let state = TestSyncState {
             vable_ref: vable,
@@ -3472,7 +3578,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         let state = TestSyncState {
             vable_ref: vable,
@@ -3508,7 +3618,11 @@ mod tests {
         let vable = recorder.record_input_arg(Type::Ref);
         let int_val = recorder.record_input_arg(Type::Int);
         let ref_val = recorder.record_input_arg(Type::Ref);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         let state = TestSyncState {
             vable_ref: vable,
@@ -3553,7 +3667,11 @@ mod tests {
         let mut recorder = Trace::new();
         let val = recorder.record_input_arg(Type::Int);
         let vable = recorder.record_input_arg(Type::Ref);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         let state = TestSyncState {
             vable_ref: vable,
@@ -3582,7 +3700,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let float_val = recorder.record_input_arg(Type::Float);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         let state = TestSyncState {
             vable_ref: vable,
@@ -3643,7 +3765,11 @@ mod tests {
 
         let mut recorder = Trace::new();
         let val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         let state = NoVableState;
 
         let (result, sync) = ctx.call_may_force_with_jitstate_sync_int(
@@ -3717,7 +3843,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         let state = VableState {
             vable_ref: vable,
             field_val,
@@ -3784,7 +3914,11 @@ mod tests {
 
         let mut recorder = Trace::new();
         let val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         let state = ForcedState;
 
         let (_result, sync) = ctx.call_may_force_with_jitstate_sync_int(
@@ -3858,7 +3992,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Ref);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         let state = RefState {
             vable_ref: vable,
             field_val,
@@ -3934,7 +4072,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let field_val = recorder.record_input_arg(Type::Float);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         let state = FloatState {
             vable_ref: vable,
             field_val,
@@ -3999,7 +4141,11 @@ mod tests {
 
         let mut recorder = Trace::new();
         let val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         let state = ForcedVoidState;
 
         let sync = ctx.call_may_force_with_jitstate_sync_void(
@@ -4066,7 +4212,11 @@ mod tests {
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Int); // pc
         let box1 = recorder.record_input_arg(Type::Int); // sp
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(
             &info,
@@ -4102,7 +4252,11 @@ mod tests {
         let box0 = recorder.record_input_arg(Type::Int);
         let box1 = recorder.record_input_arg(Type::Int);
         let new_val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(
             &info,
@@ -4136,7 +4290,11 @@ mod tests {
         // Without init_virtualizable_boxes, falls back to GETFIELD_GC_I
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
         let _result = ctx.vable_getfield_int(vable, fd8);
@@ -4151,7 +4309,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
         ctx.vable_setfield(vable, fd8, val, ph(Type::Int));
@@ -4168,7 +4330,11 @@ mod tests {
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Int);
         let box1 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(
             &info,
@@ -4199,7 +4365,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Ref);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(&info, vable, ph(Type::Ref), &[box0], &[ph(Type::Ref)], &[]);
 
@@ -4221,7 +4391,11 @@ mod tests {
         let mut recorder = Trace::new();
         let vable = recorder.record_input_arg(Type::Ref);
         let box0 = recorder.record_input_arg(Type::Float);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(
             &info,
@@ -4250,7 +4424,11 @@ mod tests {
         let box_arr0 = recorder.record_input_arg(Type::Int);
         let box_arr1 = recorder.record_input_arg(Type::Int);
         let box_arr2 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(
             &info,
@@ -4288,7 +4466,11 @@ mod tests {
         let box_arr0 = recorder.record_input_arg(Type::Int);
         let box_arr1 = recorder.record_input_arg(Type::Int);
         let new_val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(
             &info,
@@ -4319,7 +4501,11 @@ mod tests {
         let vable = recorder.record_input_arg(Type::Ref);
         let box_pc = recorder.record_input_arg(Type::Int);
         let box_arr0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         ctx.init_virtualizable_boxes(
             &info,
@@ -4348,7 +4534,11 @@ mod tests {
         let box0 = recorder.record_input_arg(Type::Int);
         let box1 = recorder.record_input_arg(Type::Int);
         let new_val = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
 
         // Before init: None
         assert!(ctx.collect_virtualizable_boxes().is_none());
@@ -4391,7 +4581,11 @@ mod tests {
         let box_pc = recorder.record_input_arg(Type::Int);
         let box_arr0 = recorder.record_input_arg(Type::Ref);
         let box_arr1 = recorder.record_input_arg(Type::Ref);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         ctx.init_virtualizable_boxes(
             &info,
             vable,
@@ -4440,7 +4634,11 @@ mod tests {
         let other_vable = recorder.record_input_arg(Type::Ref);
         let box_pc = recorder.record_input_arg(Type::Int);
         let box_arr0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(recorder, 0);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
         ctx.init_virtualizable_boxes(
             &info,
             vable,
