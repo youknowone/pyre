@@ -1105,6 +1105,23 @@ impl OpCode {
         (0..OPCODE_COUNT as u16).map(|i| unsafe { std::mem::transmute::<u16, OpCode>(i) })
     }
 
+    /// Safe reverse of `as_u16` — bounds-checked conversion used by the
+    /// byte-stream `ByteTraceIter` (opencoder.py:362-406 `next()` reads the
+    /// opnum byte and looks it up in the `OP_*` registry; in RPython this
+    /// is the `opnum` → class-table mapping). Returns `None` when `n`
+    /// lies outside the defined `0..OPCODE_COUNT` range.
+    pub fn from_u16(n: u16) -> Option<OpCode> {
+        if (n as usize) < OPCODE_COUNT {
+            // SAFETY: `OpCode` is `#[repr(u16)]` with contiguous variants
+            // in `0..OPCODE_COUNT` — any value in that range is a
+            // well-defined enum bit pattern (the same rationale used by
+            // `OpCode::all` above).
+            Some(unsafe { std::mem::transmute::<u16, OpCode>(n) })
+        } else {
+            None
+        }
+    }
+
     // ── Category classification (mirrors rop.is_* static methods) ──
 
     pub fn is_final(self) -> bool {
@@ -2532,6 +2549,18 @@ mod tests {
                 op.as_u16()
             );
         }
+    }
+
+    /// `from_u16` is the left-inverse of `as_u16` over the defined
+    /// `0..OPCODE_COUNT` range, and returns `None` everywhere outside it.
+    #[test]
+    fn test_opcode_from_u16_roundtrip() {
+        for op in all_opcodes() {
+            let n = op.as_u16();
+            assert_eq!(OpCode::from_u16(n), Some(op));
+        }
+        assert_eq!(OpCode::from_u16(OPCODE_COUNT as u16), None);
+        assert_eq!(OpCode::from_u16(u16::MAX), None);
     }
 
     #[test]

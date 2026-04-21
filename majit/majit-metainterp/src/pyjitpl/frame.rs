@@ -242,15 +242,40 @@ impl MIFrame {
         const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
         use majit_translate::liveness::{LivenessIterator, decode_offset};
 
-        // pyjitpl.py:180-193 — result_argcode clear when this frame is
-        // not the topmost frame.  Still unsupported; see docstring.
-        assert!(
-            !in_a_call,
-            "MIFrame::get_list_of_active_boxes: in_a_call=true branch \
-             (pyjitpl.py:180-193 result_argcode clear) needs CONST_FALSE / \
-             CONST_NULL / CONST_FZERO OpRef seeding; currently only the \
-             topmost-frame (in_a_call=false) path is wired."
-        );
+        // pyjitpl.py:180-193 — in_a_call branch.  The frame that holds
+        // the in-flight CALL instruction has a "result" register slot
+        // that is not yet defined (the call has not returned).  RPython
+        // clears that slot to a zero constant (history.CONST_FALSE /
+        // CONST_NULL / history.CONST_FZERO) so the snapshot captures a
+        // well-defined placeholder instead of pre-call stale data.
+        //
+        // pyre does not yet wire frame-register mutation here (matching
+        // RPython's `self.registers_i[index] = CONST_FALSE`) because
+        // that requires an OpRef for the zero constant, which lives in
+        // the TraceCtx ConstantPool — currently outside the callback
+        // reachable from this code.  Instead we record the cleared
+        // register bank + index and substitute `Box::Const{Int,Ptr,
+        // Float}(0)` directly into the snapshot-array output.  This
+        // gives a snapshot that is byte-identical to RPython's; the
+        // only observable difference is that a subsequent
+        // `make_result_of_lastop` (pyjitpl.py:258-275) still sees the
+        // pre-clear register contents, instead of the zero constant.
+        // That mutation is tracked as a follow-up (requires TraceCtx
+        // const-pool plumbing) but does not affect snapshot content.
+        let (clear_int_idx, clear_ref_idx, clear_float_idx) = if in_a_call {
+            let argcode = self._result_argcode;
+            let index = self.jitcode.code[self.pc - 1] as usize;
+            // pyjitpl.py:193 `self._result_argcode = '?'` — mark cleared.
+            self._result_argcode = b'?';
+            match argcode {
+                b'i' => (Some(index), None, None),
+                b'r' => (None, Some(index), None),
+                b'f' => (None, None, Some(index)),
+                _ => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
 
         // pyjitpl.py:194-198 — pick the pc of the preceding LIVE op.
         let pc = if in_a_call || after_residual_call {
@@ -273,31 +298,67 @@ impl MIFrame {
         let total = (length_i + length_r + length_f) as usize;
         let storage = trace.new_array(total);
 
-        // pyjitpl.py:216-221 — push live int registers.
+        let num_regs_i = self.jitcode.c_num_regs_i as usize;
+        let num_regs_r = self.jitcode.c_num_regs_r as usize;
+        let num_regs_f = self.jitcode.c_num_regs_f as usize;
+
+        // pyjitpl.py:216-221 — push live int registers.  Liveness
+        // indices are interpreted against the `num_regs_and_consts_i`
+        // layout (RPython pyjitpl.py:82-83): the first `num_regs_i`
+        // slots are runtime registers, the remaining are jitcode
+        // constants copied in by `setup()`.  pyre keeps registers
+        // separate from the jitcode's `constants_i` Vec, so a liveness
+        // index past `num_regs_i` reads directly from
+        // `self.jitcode.constants_i[idx - num_regs_i]` and emits the
+        // corresponding `ConstInt` box — matching what RPython's
+        // `copy_constants` + `registers_i[index]` lookup would return.
         if length_i > 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             while let Some(index) = it.next() {
                 let idx = index as usize;
-                let opref = self.int_regs[idx]
-                    .expect("get_list_of_active_boxes: int register uninitialized");
-                let value = self.int_values[idx]
-                    .expect("get_list_of_active_boxes: int value uninitialized");
-                let b = register_to_box_int(opref, value);
+                let b = if Some(idx) == clear_int_idx {
+                    // pyjitpl.py:184-185 history.CONST_FALSE clearing.
+                    OpBox::ConstInt(0)
+                } else if idx < num_regs_i {
+                    let opref = self.int_regs[idx]
+                        .expect("get_list_of_active_boxes: int register uninitialized");
+                    let value = self.int_values[idx]
+                        .expect("get_list_of_active_boxes: int value uninitialized");
+                    register_to_box_int(opref, value)
+                } else {
+                    // pyjitpl.py:82-83 `copy_constants(..., constants_i, ...,
+                    // ConstInt)` — constants live in the `[num_regs_i ..
+                    // num_regs_and_consts_i)` back slots.
+                    OpBox::ConstInt(self.jitcode.constants_i[idx - num_regs_i])
+                };
                 trace._add_box_to_storage_box(b);
             }
             offset = it.offset;
         }
 
-        // pyjitpl.py:222-227 — push live ref registers.
+        // pyjitpl.py:222-227 — push live ref registers.  Constants
+        // area mirror of the int path above;
+        // `jitcode.constants_r[i]` stores raw GC addresses as i64 so
+        // we cast through `u64` for `Box::ConstPtr`.
         if length_r > 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             while let Some(index) = it.next() {
                 let idx = index as usize;
-                let opref = self.ref_regs[idx]
-                    .expect("get_list_of_active_boxes: ref register uninitialized");
-                let value = self.ref_values[idx]
-                    .expect("get_list_of_active_boxes: ref value uninitialized");
-                let b = register_to_box_ref(opref, value);
+                let b = if Some(idx) == clear_ref_idx {
+                    // pyjitpl.py:186-187 CONST_NULL clearing.
+                    OpBox::ConstPtr(0)
+                } else if idx < num_regs_r {
+                    let opref = self.ref_regs[idx]
+                        .expect("get_list_of_active_boxes: ref register uninitialized");
+                    let value = self.ref_values[idx]
+                        .expect("get_list_of_active_boxes: ref value uninitialized");
+                    register_to_box_ref(opref, value)
+                } else {
+                    // pyjitpl.py:84-85 `copy_constants(..., constants_r, ...,
+                    // ConstPtrJitCode)` — constants_r store raw GC
+                    // addresses; we cast through u64 for `Box::ConstPtr`.
+                    OpBox::ConstPtr(self.jitcode.constants_r[idx - num_regs_r] as u64)
+                };
                 trace._add_box_to_storage_box(b);
             }
             offset = it.offset;
@@ -308,11 +369,21 @@ impl MIFrame {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             while let Some(index) = it.next() {
                 let idx = index as usize;
-                let opref = self.float_regs[idx]
-                    .expect("get_list_of_active_boxes: float register uninitialized");
-                let value = self.float_values[idx]
-                    .expect("get_list_of_active_boxes: float value uninitialized");
-                let b = register_to_box_float(opref, value);
+                let b = if Some(idx) == clear_float_idx {
+                    // pyjitpl.py:188-189 history.CONST_FZERO clearing.
+                    OpBox::ConstFloat(0)
+                } else if idx < num_regs_f {
+                    let opref = self.float_regs[idx]
+                        .expect("get_list_of_active_boxes: float register uninitialized");
+                    let value = self.float_values[idx]
+                        .expect("get_list_of_active_boxes: float value uninitialized");
+                    register_to_box_float(opref, value)
+                } else {
+                    // pyjitpl.py:86-87 `copy_constants(..., constants_f,
+                    // ..., ConstFloat)` — `constants_f[i]` stores the
+                    // raw bits of the f64.
+                    OpBox::ConstFloat(self.jitcode.constants_f[idx - num_regs_f] as u64)
+                };
                 trace._add_box_to_storage_box(b);
             }
             let _ = it.offset; // offset no longer read after the last bank
@@ -511,27 +582,185 @@ mod tests {
         assert!(tag1 != 0, "ref register should encode to non-zero tag");
     }
 
+    /// pyjitpl.py:180-193 in_a_call branch — the parent frame in a
+    /// nested `capture_resumedata` walk clears the result register of
+    /// the in-flight CALL to a zero constant.  When the liveness list
+    /// INCLUDES the cleared slot, the snapshot array must record
+    /// `Box::ConstInt(0)` (RPython's `history.CONST_FALSE`) instead
+    /// of the pre-call register contents.
+    ///
+    /// Bytecode layout around `self.pc`:
+    /// `[... call_op][dst_idx]_at_pc-1 [LIVE_byte]_at_pc
+    ///  [off_lo][off_hi] ...` — the LIVE op carries the 2-byte offset
+    /// to the bank-size + index bytes inside `all_liveness`.
     #[test]
-    #[should_panic(expected = "in_a_call=true branch")]
-    fn get_list_of_active_boxes_in_a_call_is_not_yet_wired() {
+    fn get_list_of_active_boxes_in_a_call_emits_const_for_cleared_slot() {
         use crate::opencoder::TraceRecordBuffer;
         use std::sync::Arc;
 
-        let jitcode = make_jitcode_with_regs(1, 0, 0);
-        let mut frame = MIFrame::new(jitcode, 0);
-        frame.int_regs[0] = Some(OpRef(0));
-        frame.int_values[0] = Some(0);
+        const OP_LIVE: u8 = 0x42;
+        // `[0x88_call, 0x00_dst_idx, OP_LIVE, 0x00, 0x00]`
+        //            ^^ pc - 1          ^^ pc
+        let code = vec![0x88, 0x00, OP_LIVE, 0x00, 0x00];
+        let live_pc = 2; // index of OP_LIVE byte
+
+        let jitcode_arc = {
+            let mut jc = make_jitcode_with_regs(1, 0, 0);
+            let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
+            jc_mut.code = code;
+            jc
+        };
+
+        // `decode_offset(code, live_pc + 1)` reads offset bytes at
+        // indices 3 and 4 — both 0, so `offset` into `all_liveness`
+        // is 0.  Layout: `[length_i, length_r, length_f,
+        //                 int_bitset_byte]`.  `length_i=1` means "1
+        // live int bit set"; bitset byte `0b0000_0001` lights up
+        // register index 0 (the cleared slot).
+        let all_liveness: Vec<u8> = vec![1, 0, 0, 0b0000_0001];
+
+        let mut frame = MIFrame::new(jitcode_arc, live_pc);
+        frame._result_argcode = b'i';
+        // Pre-call stale contents — must NOT leak into the snapshot.
+        frame.int_regs[0] = Some(OpRef(777));
+        frame.int_values[0] = Some(666);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(1, sd);
-        // Triggers the in_a_call guard — see docstring.
-        let _ = frame.get_list_of_active_boxes(
+
+        let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ true,
             &mut trace,
-            /* op_live */ 0,
-            /* all_liveness */ &[],
+            OP_LIVE,
+            &all_liveness,
             /* after_residual_call */ false,
         );
+
+        // pyjitpl.py:193 — `_result_argcode` flips to `b'?'` after
+        // the clear.
+        assert_eq!(frame._result_argcode, b'?');
+
+        // Snapshot array content: `[length=1][ConstInt(0) tag]`.
+        let (length, consumed) =
+            crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[storage as usize..]);
+        assert_eq!(length, 1);
+        let (tag0, _) = crate::opencoder::decode_varint_signed(
+            &trace._snapshot_array_data[storage as usize + consumed..],
+        );
+        // `ConstInt(0)` encodes as `tag(TAGINT, 0) = 0`.
+        assert_eq!(tag0, 0, "cleared slot must encode as ConstInt(0)");
+    }
+
+    /// Complement: when the liveness walk lists a register OTHER than
+    /// the cleared slot, the snapshot records the register's pre-
+    /// existing box (not ConstInt(0)), while `_result_argcode` still
+    /// flips to `b'?'`.
+    #[test]
+    fn get_list_of_active_boxes_in_a_call_preserves_other_registers() {
+        use crate::opencoder::TraceRecordBuffer;
+        use std::sync::Arc;
+
+        const OP_LIVE: u8 = 0x42;
+        let code = vec![0x88, 0x00, OP_LIVE, 0x00, 0x00];
+        let live_pc = 2;
+
+        let jitcode_arc = {
+            let mut jc = make_jitcode_with_regs(2, 0, 0);
+            let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
+            jc_mut.code = code;
+            jc
+        };
+
+        // Liveness: live int idx 1 (NOT the cleared slot 0).
+        // bitset byte 0b0000_0010 lights up bit 1.
+        let all_liveness: Vec<u8> = vec![1, 0, 0, 0b0000_0010];
+
+        let mut frame = MIFrame::new(jitcode_arc, live_pc);
+        frame._result_argcode = b'i';
+        frame.int_regs[0] = Some(OpRef(10)); // cleared — not listed.
+        frame.int_values[0] = Some(999);
+        frame.int_regs[1] = Some(OpRef(11)); // live — recorded as ResOp(11).
+        frame.int_values[1] = Some(42);
+
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut trace = TraceRecordBuffer::new(2, sd);
+
+        let storage = frame.get_list_of_active_boxes(
+            /* in_a_call */ true,
+            &mut trace,
+            OP_LIVE,
+            &all_liveness,
+            false,
+        );
+        assert_eq!(frame._result_argcode, b'?');
+
+        let (length, consumed) =
+            crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[storage as usize..]);
+        assert_eq!(length, 1);
+        let (tag0, _) = crate::opencoder::decode_varint_signed(
+            &trace._snapshot_array_data[storage as usize + consumed..],
+        );
+        // OpRef(11) encodes as `tag(TAGBOX, 11) = 11 << 2 | 3 = 47`.
+        assert_eq!(tag0, TraceRecordBuffer::_encode_box_position(11));
+    }
+
+    /// pyjitpl.py:82-83 `copy_constants` — liveness indices past
+    /// `num_regs_i` read from `jitcode.constants_i`.  pyre does not
+    /// copy the constants into the `int_regs` Vec; instead the
+    /// liveness walk reads `jitcode.constants_i[idx - num_regs_i]`
+    /// directly and emits `Box::ConstInt(v)`.  This test confirms
+    /// parity-equivalent snapshot content for the constants area.
+    #[test]
+    fn get_list_of_active_boxes_reads_constants_area() {
+        use crate::opencoder::TraceRecordBuffer;
+        use std::sync::Arc;
+
+        const OP_LIVE: u8 = 0x42;
+        let code = vec![OP_LIVE, 0x00, 0x00];
+        let live_pc = 0;
+
+        let jitcode_arc = {
+            let mut jc = make_jitcode_with_regs(1, 0, 0);
+            let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
+            jc_mut.code = code;
+            // `num_regs_i == 1`; constants_i has a single entry at
+            // "register" index 1 (= num_regs_i).
+            jc_mut.constants_i = vec![1234];
+            jc
+        };
+
+        // `self.pc = live_pc + SIZE_LIVE_OP` (in_a_call=false path:
+        // `pc = self.pc - SIZE_LIVE_OP`).
+        let current_pc = live_pc + majit_translate::jit_codewriter::liveness::OFFSET_SIZE + 1;
+
+        // Liveness lists register index `1` — falls into the
+        // constants area.  bitset byte 0b0000_0010 lights up bit 1.
+        let all_liveness: Vec<u8> = vec![1, 0, 0, 0b0000_0010];
+
+        let mut frame = MIFrame::new(jitcode_arc, current_pc);
+        frame.int_regs[0] = Some(OpRef(5)); // real register — not referenced.
+        frame.int_values[0] = Some(99);
+
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut trace = TraceRecordBuffer::new(1, sd);
+
+        let storage = frame.get_list_of_active_boxes(
+            /* in_a_call */ false,
+            &mut trace,
+            OP_LIVE,
+            &all_liveness,
+            false,
+        );
+
+        let (length, consumed) =
+            crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[storage as usize..]);
+        assert_eq!(length, 1);
+        let (tag0, _) = crate::opencoder::decode_varint_signed(
+            &trace._snapshot_array_data[storage as usize + consumed..],
+        );
+        // `ConstInt(1234)` — fits in SMALL_INT range so TAGINT with
+        // shifted value.  `tag(TAGINT, 1234) = 1234 << 2 = 4936`.
+        assert_eq!(tag0, 1234 << 2);
     }
 
     #[test]

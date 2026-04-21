@@ -306,7 +306,9 @@ impl Trace {
         self.op_count = pos.op_count;
     }
 
-    /// Number of operations recorded so far (not counting input args).
+    /// history.py:725 `length`: number of non-inputarg ops recorded so far.
+    /// Compared against `warmstate.trace_limit` by
+    /// `MetaInterp.blackhole_if_trace_too_long` (pyjitpl.py:2791).
     pub fn num_ops(&self) -> usize {
         self.ops.len()
     }
@@ -319,13 +321,6 @@ impl Trace {
     /// Input argument types in loop-header order.
     pub fn inputarg_types(&self) -> Vec<Type> {
         self.inputargs.iter().map(|arg| arg.tp).collect()
-    }
-
-    /// history.py:725 `length`: number of non-inputarg ops recorded so far.
-    /// Compared against `warmstate.trace_limit` by
-    /// `MetaInterp.blackhole_if_trace_too_long` (pyjitpl.py:2791).
-    pub fn length(&self) -> usize {
-        self.ops.len()
     }
 
     /// Number of guards recorded so far.
@@ -503,15 +498,15 @@ mod tests {
     }
 
     #[test]
-    fn test_length_counts_non_inputargs() {
+    fn test_num_ops_counts_non_inputargs() {
         // history.py:725 length() = trace._count - len(inputargs).
         // In pyre that's ops.len() since inputargs aren't stored in ops.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
-        assert_eq!(rec.length(), 0);
+        assert_eq!(rec.num_ops(), 0);
 
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        assert_eq!(rec.length(), 1);
+        assert_eq!(rec.num_ops(), 1);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! No direct RPython equivalent — unified trace recording context
 //! (RPython splits this across MetaInterp.history, compile.py, and Trace).
 
+use crate::opencoder::Box as OcBox;
 use crate::recorder::{Trace, TracePosition};
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_trace::heapcache::HeapCache;
@@ -764,6 +765,41 @@ impl TraceCtx {
         Some(self.const_int(value))
     }
 
+    /// M1 bridge: translate a pyre `OpRef` into the `opencoder::Box` that
+    /// `TraceRecordBuffer::record_op(&[Box], descr)` expects.
+    ///
+    /// Pyre's OpRef uses the high bit (`>= 10_000` via `OpRef::from_const`)
+    /// to mark constants and keeps their values in a side `ConstantPool`;
+    /// RPython's opencoder takes concrete `Const{Int,Float,Ptr}` /
+    /// `AbstractResOp` boxes and encodes them inline through the
+    /// `_bigints` / `_floats` / `_refs` pools in `_encode`.
+    ///
+    /// This helper is the conversion point between the two worlds.  It
+    /// unblocks M2 (routing `TraceCtx::record_*` through TraceRecordBuffer's
+    /// Box-taking API) without touching any call site yet.
+    ///
+    /// Panics when a constant OpRef has no pool entry — that is a genuine
+    /// invariant break (every `is_constant()` OpRef must have been minted
+    /// via `ConstantPool::get_or_insert_typed` or friends).
+    pub fn opref_to_box(&self, opref: OpRef) -> OcBox {
+        if opref.is_constant() {
+            let value = self
+                .constants
+                .get_value(opref)
+                .unwrap_or_else(|| panic!("opref_to_box: constant {:?} not in pool", opref));
+            match value {
+                Value::Int(v) => OcBox::ConstInt(v),
+                Value::Float(f) => OcBox::ConstFloat(f.to_bits()),
+                Value::Ref(r) => OcBox::ConstPtr(r.as_usize() as u64),
+                Value::Void => {
+                    panic!("opref_to_box: constant {:?} has Void type", opref)
+                }
+            }
+        } else {
+            OcBox::of_op(opref)
+        }
+    }
+
     /// Record a regular IR operation.
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         self.recorder.record_op(opcode, args)
@@ -854,10 +890,11 @@ impl TraceCtx {
     }
 
     /// pyjitpl.py:2789-2791 `blackhole_if_trace_too_long` check:
-    /// `length > warmrunnerstate.trace_limit`.  `length` is the non-inputarg
-    /// op count; `trace_limit` is cached from warmstate at trace start.
+    /// `length > warmrunnerstate.trace_limit`.  `num_ops` is the non-inputarg
+    /// op count (= `history.length()`); `trace_limit` is cached from warmstate
+    /// at trace start.
     pub fn is_too_long(&self) -> bool {
-        self.recorder.length() > self.trace_limit
+        self.recorder.num_ops() > self.trace_limit
     }
 
     /// Current cached trace limit snapshot (for diagnostics + force_finish
@@ -3157,6 +3194,68 @@ mod tests {
         // mark_type → numbering_type_overrides takes priority over the
         // intrinsic Int; this is the raw-pointer-ConstInt retag path.
         assert_eq!(ctx.const_type(c), Some(Type::Ref));
+    }
+
+    // ── M1 · opref_to_box bridge tests ─────────────────────────────────
+
+    /// M1: non-constant OpRefs (inputargs + recorded op results) map
+    /// straight to Box::ResOp(opref.0).  No constant-pool lookup.
+    #[test]
+    fn test_opref_to_box_non_constant_m1() {
+        let mut ctx = TraceCtx::for_test(2);
+        let i0 = OpRef(0); // first inputarg
+        let i1 = OpRef(1); // second inputarg
+        let add = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
+        assert_eq!(ctx.opref_to_box(i0), OcBox::ResOp(0));
+        assert_eq!(ctx.opref_to_box(i1), OcBox::ResOp(1));
+        assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.0));
+    }
+
+    /// M1: constant OpRefs route through ConstantPool::get_value for
+    /// type-preserving Box::Const* construction.
+    #[test]
+    fn test_opref_to_box_constant_int_m1() {
+        let mut ctx = TraceCtx::for_test(0);
+        let c = ctx.const_int(42);
+        assert!(c.is_constant());
+        assert_eq!(ctx.opref_to_box(c), OcBox::ConstInt(42));
+    }
+
+    #[test]
+    fn test_opref_to_box_constant_float_m1() {
+        let mut ctx = TraceCtx::for_test(0);
+        let c = ctx
+            .constants
+            .get_or_insert_typed((3.14_f64).to_bits() as i64, Type::Float);
+        assert!(c.is_constant());
+        match ctx.opref_to_box(c) {
+            OcBox::ConstFloat(bits) => {
+                assert_eq!(f64::from_bits(bits), 3.14);
+            }
+            other => panic!("expected ConstFloat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_opref_to_box_constant_ref_m1() {
+        let mut ctx = TraceCtx::for_test(0);
+        // Non-zero Ref address exercises the shadow-stack rooting path.
+        let addr = 0xdead_beef_u64;
+        let c = ctx.constants.get_or_insert_typed(addr as i64, Type::Ref);
+        assert!(c.is_constant());
+        assert_eq!(ctx.opref_to_box(c), OcBox::ConstPtr(addr));
+    }
+
+    /// M1: constant OpRef that was not registered in the pool is a
+    /// genuine invariant break — the helper must panic rather than
+    /// silently substitute a Box::ResOp.
+    #[test]
+    #[should_panic(expected = "not in pool")]
+    fn test_opref_to_box_orphan_constant_panics_m1() {
+        let ctx = TraceCtx::for_test(0);
+        // Forge a constant-namespace OpRef without touching the pool.
+        let orphan = OpRef::from_const(7);
+        ctx.opref_to_box(orphan);
     }
 
     #[derive(Clone, Copy)]
