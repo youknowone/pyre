@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use crate::flowspace::model::ConstValue;
 use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
 use crate::translate_legacy::annotator::annrpython::AnnotationState;
 
@@ -88,9 +89,21 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
         for link in &block.exits {
             let target_block = graph.block(link.target);
             for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                let Some(src) = src.as_value() else { continue };
                 if state.get(*dst) == &ConcreteType::Unknown {
-                    let src_ty = state.get(src).clone();
+                    let src_ty = match src {
+                        crate::model::LinkArg::Value(src) => state.get(*src).clone(),
+                        crate::model::LinkArg::Const(_)
+                            if Some(src) == link.last_exception.as_ref() =>
+                        {
+                            ConcreteType::Signed
+                        }
+                        crate::model::LinkArg::Const(_)
+                            if Some(src) == link.last_exc_value.as_ref() =>
+                        {
+                            ConcreteType::GcRef
+                        }
+                        crate::model::LinkArg::Const(value) => const_value_to_concrete(value),
+                    };
                     if src_ty != ConcreteType::Unknown {
                         state.concrete_types.insert(*dst, src_ty);
                     }
@@ -100,6 +113,23 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     }
 
     state
+}
+
+fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
+    match value {
+        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => ConcreteType::Signed,
+        ConstValue::Float(_) => ConcreteType::Float,
+        ConstValue::Placeholder => ConcreteType::Unknown,
+        ConstValue::Atom(_)
+        | ConstValue::Dict(_)
+        | ConstValue::Str(_)
+        | ConstValue::Tuple(_)
+        | ConstValue::List(_)
+        | ConstValue::None
+        | ConstValue::Code(_)
+        | ConstValue::Function(_)
+        | ConstValue::HostObject(_) => ConcreteType::GcRef,
+    }
 }
 
 fn kind_char_to_concrete(kind: char) -> ConcreteType {

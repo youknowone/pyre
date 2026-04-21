@@ -168,14 +168,26 @@ fn compute_liveness_pass(
                 }
             }
             FlatOp::Move { dst, src } => {
-                let dst = *dst;
-                let src = *src;
-                alive.remove(&dst);
-                alive.insert(src);
+                // `src` may be a Variable or a Constant (upstream
+                // `getcolor` at flatten.py:382-384 returns the Constant
+                // as-is); Constants contribute no live range.
+                alive.remove(dst);
+                if let Some(v) = src.as_value() {
+                    alive.insert(v);
+                }
             }
             FlatOp::Push(src) => {
                 // RPython `flatten.py:329` `%s_push` — reads `v` into
                 // tmpreg. Backwards: treat as a pure use of `src`.
+                //
+                // Only Variables reach this arm: upstream
+                // `reorder_renaming_list` at `flatten.py:395-414` only
+                // triggers a push when no progress is possible, which
+                // requires every `to[i]` Register to appear in `frm`;
+                // Constants are structurally distinct from Registers
+                // (Python `==`), so a Constant `frm[i]` is always
+                // consumed in a non-cycle step and never lands in the
+                // cycle-break save slot.
                 alive.insert(*src);
             }
             FlatOp::Pop(dst) => {
@@ -192,7 +204,9 @@ fn compute_liveness_pass(
                 // leaves the frame.  Backward walk: the return value is
                 // alive at this point; after it (forward) nothing is.
                 alive.clear();
-                alive.insert(*v);
+                if let Some(value) = v.as_value() {
+                    alive.insert(value);
+                }
             }
             FlatOp::VoidReturn => {
                 // `bhimpl_void_return()` has no args.  Nothing alive
@@ -202,10 +216,9 @@ fn compute_liveness_pass(
             FlatOp::Raise(v) => {
                 // `bhimpl_raise(excvalue)` reads the evalue and raises.
                 alive.clear();
-                alive.insert(*v);
-            }
-            FlatOp::RaiseConst(_) => {
-                alive.clear();
+                if let Some(value) = v.as_value() {
+                    alive.insert(value);
+                }
             }
         }
     }

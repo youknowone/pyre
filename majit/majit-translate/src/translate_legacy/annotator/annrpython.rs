@@ -9,7 +9,8 @@
 //! each op's inputs and computing the output type. Iterates to
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
-use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
+use crate::flowspace::model::ConstValue;
+use crate::model::{FunctionGraph, LinkArg, OpKind, ValueId, ValueType};
 use std::collections::HashMap;
 
 /// Annotation state: maps ValueId → inferred ValueType.
@@ -71,8 +72,10 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
             for link in &block.exits {
                 let target_block = graph.block(link.target);
                 for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    let Some(src) = src.as_value() else { continue };
-                    let src_ty = state.get(src).clone();
+                    let src_ty = match src {
+                        LinkArg::Value(src) => state.get(*src).clone(),
+                        LinkArg::Const(value) => const_value_type(value),
+                    };
                     let current = state.get(*dst).clone();
                     let merged = union_type(&current, &src_ty);
                     if merged != current {
@@ -85,6 +88,23 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     }
 
     state
+}
+
+fn const_value_type(value: &ConstValue) -> ValueType {
+    match value {
+        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => ValueType::Int,
+        ConstValue::Float(_) => ValueType::Float,
+        ConstValue::Placeholder => ValueType::Unknown,
+        ConstValue::Atom(_)
+        | ConstValue::Dict(_)
+        | ConstValue::Str(_)
+        | ConstValue::Tuple(_)
+        | ConstValue::List(_)
+        | ConstValue::None
+        | ConstValue::Code(_)
+        | ConstValue::Function(_)
+        | ConstValue::HostObject(_) => ValueType::Ref,
+    }
 }
 
 /// Infer the output type of an operation from its inputs.

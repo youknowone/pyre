@@ -854,7 +854,7 @@ impl BhDescr {
 ///     return buf.getvalue()
 /// ```
 pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
-    use crate::flatten::{FlatOp, RegKind};
+    use crate::flatten::{FlatOp, RegKind, constvalue_kind};
     use std::fmt::Write;
 
     let kind_char = |v: crate::model::ValueId| -> char {
@@ -869,6 +869,25 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             RegKind::Int => "int",
             RegKind::Ref => "ref",
             RegKind::Float => "float",
+        }
+    };
+    let linkarg_kind_char = |arg: &crate::model::LinkArg| -> char {
+        match arg {
+            crate::model::LinkArg::Value(v) => kind_char(*v),
+            crate::model::LinkArg::Const(cv) => constvalue_kind(cv),
+        }
+    };
+    let linkarg_kind_name = |arg: &crate::model::LinkArg| -> &'static str {
+        match linkarg_kind_char(arg) {
+            'i' => "int",
+            'f' => "float",
+            _ => "ref",
+        }
+    };
+    let linkarg_repr = |arg: &crate::model::LinkArg| -> String {
+        match arg {
+            crate::model::LinkArg::Value(v) => format!("%{}{}", kind_char(*v), v.0),
+            crate::model::LinkArg::Const(cv) => format!("${cv}"),
         }
     };
 
@@ -943,10 +962,9 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
             FlatOp::Move { dst, src } => {
                 writeln!(
                     out,
-                    "  {}_copy %{}{} -> %{}{}",
-                    kind_name(*src),
-                    kind_char(*src),
-                    src.0,
+                    "  {}_copy {} -> %{}{}",
+                    linkarg_kind_name(src),
+                    linkarg_repr(src),
                     kind_char(*dst),
                     dst.0
                 )
@@ -982,22 +1000,19 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                 writeln!(out, "  reraise").ok();
             }
             FlatOp::IntReturn(v) => {
-                writeln!(out, "  int_return %i{}", v.0).ok();
+                writeln!(out, "  int_return {}", linkarg_repr(v)).ok();
             }
             FlatOp::RefReturn(v) => {
-                writeln!(out, "  ref_return %r{}", v.0).ok();
+                writeln!(out, "  ref_return {}", linkarg_repr(v)).ok();
             }
             FlatOp::FloatReturn(v) => {
-                writeln!(out, "  float_return %f{}", v.0).ok();
+                writeln!(out, "  float_return {}", linkarg_repr(v)).ok();
             }
             FlatOp::VoidReturn => {
                 writeln!(out, "  void_return").ok();
             }
             FlatOp::Raise(v) => {
-                writeln!(out, "  raise %r{}", v.0).ok();
-            }
-            FlatOp::RaiseConst(value) => {
-                writeln!(out, "  raise ${value}").ok();
+                writeln!(out, "  raise {}", linkarg_repr(v)).ok();
             }
         }
     }

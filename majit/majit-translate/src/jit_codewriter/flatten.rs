@@ -66,12 +66,18 @@ pub enum FlatOp {
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
     ///
     /// RPython `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
-    Move { dst: ValueId, src: ValueId },
+    /// Upstream `getcolor(v)` returns `v` as-is for `Constant`
+    /// (flatten.py:382-384), so `src` can be either a `Variable`-backed
+    /// `ValueId` or a `Constant` literal — carried here as
+    /// [`LinkArg::Value`] / [`LinkArg::Const`] respectively.
+    Move { dst: ValueId, src: LinkArg },
     /// Save a value into the per-kind tmpreg, to break a cycle in a
     /// link renaming. Always paired with a later `Pop`.
     ///
     /// RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
     /// Blackhole handler: `blackhole.py:661-669` `bhimpl_{int,ref,float}_push`.
+    /// Only register sources participate in cycle breaking, so `Push`
+    /// stays `ValueId`-typed even though [`Move`] can copy constants.
     Push(ValueId),
     /// Restore a value from the per-kind tmpreg into `dst`, completing
     /// a cycle break started by a prior `Push`.
@@ -102,23 +108,20 @@ pub enum FlatOp {
     ///   `{kind}_return` with a single arg when the final block returns
     ///   a non-void value.  Blackhole: `blackhole.py:841-857` sets
     ///   `_return_type = kind` and raises `LeaveFrame`.
-    IntReturn(ValueId),
+    IntReturn(LinkArg),
     /// RPython `flatten.py:137` `ref_return` — blackhole at
     /// `blackhole.py:847-851`.
-    RefReturn(ValueId),
+    RefReturn(LinkArg),
     /// RPython `flatten.py:137` `float_return` — blackhole at
     /// `blackhole.py:853-857`.
-    FloatReturn(ValueId),
+    FloatReturn(LinkArg),
     /// RPython `flatten.py:136` `void_return` — blackhole at
     /// `blackhole.py:859-863`.
     VoidReturn,
     /// RPython `flatten.py:139-143` `make_return` with a 2-inputarg
     /// final block: emit `raise` on the `evalue` (second inputarg).
     /// Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
-    Raise(ValueId),
-    /// RPython `flatten.py:166-173` direct overflow reraises use
-    /// `raise Constant(standard_OverflowError_instance)`.
-    RaiseConst(ConstValue),
+    Raise(LinkArg),
     /// Unreachable marker — marks the end of a code path.
     /// RPython: `---` operation. Resets the alive set in liveness analysis.
     Unreachable,
@@ -349,12 +352,17 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             }
             FlatOp::Move {
                 dst: ValueId(d),
-                src: ValueId(s),
+                src,
             } => {
                 max_value = max_value.max(*d + 1);
-                max_value = max_value.max(*s + 1);
+                if let Some(ValueId(s)) = src.as_value() {
+                    max_value = max_value.max(s + 1);
+                }
             }
-            FlatOp::Push(ValueId(v)) | FlatOp::Pop(ValueId(v)) => {
+            FlatOp::Push(ValueId(v)) => {
+                max_value = max_value.max(*v + 1);
+            }
+            FlatOp::Pop(ValueId(v)) => {
                 max_value = max_value.max(*v + 1);
             }
             FlatOp::GotoIfNot {
@@ -376,11 +384,13 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             | FlatOp::LastExcValue { dst: ValueId(d) } => {
                 max_value = max_value.max(*d + 1);
             }
-            FlatOp::IntReturn(ValueId(v))
-            | FlatOp::RefReturn(ValueId(v))
-            | FlatOp::FloatReturn(ValueId(v))
-            | FlatOp::Raise(ValueId(v)) => {
-                max_value = max_value.max(*v + 1);
+            FlatOp::IntReturn(v)
+            | FlatOp::RefReturn(v)
+            | FlatOp::FloatReturn(v)
+            | FlatOp::Raise(v) => {
+                if let Some(ValueId(v)) = v.as_value() {
+                    max_value = max_value.max(v + 1);
+                }
             }
             _ => {}
         }
@@ -521,29 +531,30 @@ fn generate_last_exc(link: &Link, target_inputargs: &[ValueId], ops: &mut Vec<Fl
 /// (`Unreachable`) pair from the final-block inputargs (or, when called
 /// from the `make_link` optimization, directly from the link's args).
 fn make_return(
-    _graph: &FunctionGraph,
+    graph: &FunctionGraph,
     ops: &mut Vec<FlatOp>,
     regallocs: &HashMap<RegKind, RegAllocResult>,
     args: &[LinkArg],
 ) {
-    let expect_value_arg = |arg: &LinkArg, context: &str| -> ValueId {
-        match arg {
-            LinkArg::Value(value) => *value,
-            LinkArg::Const(value) => {
-                panic!("{context}: Constant link arg {value:?} is not supported in this path")
-            }
-        }
+    let arg_kind = |arg: &LinkArg, fallback: Option<ValueId>, context: &str| match arg {
+        LinkArg::Value(value) => value_kind(*value, regallocs),
+        LinkArg::Const(_) => fallback
+            .map(|value| value_kind(value, regallocs))
+            .unwrap_or_else(|| panic!("{context}: missing target inputarg kind for Constant")),
     };
     match args.len() {
         1 => {
             // `flatten.py:131-138` return-from-function.
-            let v = expect_value_arg(&args[0], "make_return");
-            let kind = value_kind(v, regallocs);
+            let kind = arg_kind(
+                &args[0],
+                graph.block(graph.returnblock).inputargs.first().copied(),
+                "make_return",
+            );
             match kind {
                 'v' => ops.push(FlatOp::VoidReturn),
-                'i' => ops.push(FlatOp::IntReturn(v)),
-                'r' => ops.push(FlatOp::RefReturn(v)),
-                'f' => ops.push(FlatOp::FloatReturn(v)),
+                'i' => ops.push(FlatOp::IntReturn(args[0].clone())),
+                'r' => ops.push(FlatOp::RefReturn(args[0].clone())),
+                'f' => ops.push(FlatOp::FloatReturn(args[0].clone())),
                 _ => unreachable!("unexpected kind {kind} for return value"),
             }
         }
@@ -555,7 +566,12 @@ fn make_return(
             ops.push(FlatOp::Live {
                 live_values: Vec::new(),
             });
-            ops.push(FlatOp::Raise(expect_value_arg(&args[1], "make_return")));
+            let _ = arg_kind(
+                &args[1],
+                graph.block(graph.exceptblock).inputargs.get(1).copied(),
+                "make_return",
+            );
+            ops.push(FlatOp::Raise(args[1].clone()));
         }
         0 => {
             // RPython reaches `make_return` only for exits == () blocks,
@@ -585,6 +601,41 @@ fn value_kind(value: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> c
     // `lltype.Void` is not assigned a color by regalloc
     // (`flatten.py:325 if v.concretetype is not lltype.Void`).
     'v'
+}
+
+/// Kind of a [`LinkArg`] for opname selection — upstream `assembler.py:168-170`
+/// `getkind(x.concretetype)` for `Constant`, `x.kind` for `Register`.
+///
+/// Returns `'i'` / `'r'` / `'f'` / `'v'` matching RPython `KINDS`.
+#[allow(dead_code)]
+pub(crate) fn linkarg_kind(arg: &LinkArg, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
+    match arg {
+        LinkArg::Value(v) => value_kind(*v, regallocs),
+        LinkArg::Const(cv) => constvalue_kind(cv),
+    }
+}
+
+/// RPython `rpython/rtyper/lltypesystem/lltype.py` + `rpython/jit/codewriter/support.py`
+/// `getkind` — map a Constant's concretetype to a `KINDS` char.
+///
+/// Pyre's [`ConstValue`] carries the effective lltype by variant: `Int`
+/// is `lltype.Signed`, `Float` is `lltype.Float`, `HostObject`/`None`/`Str`
+/// are gcref-bearing (kind `'r'`), `SpecTag` is a Signed wrapper.
+pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
+    match cv {
+        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => 'i',
+        ConstValue::Float(_) => 'f',
+        ConstValue::None
+        | ConstValue::Str(_)
+        | ConstValue::HostObject(_)
+        | ConstValue::Tuple(_)
+        | ConstValue::List(_)
+        | ConstValue::Dict(_)
+        | ConstValue::Code(_)
+        | ConstValue::Function(_)
+        | ConstValue::Atom(_)
+        | ConstValue::Placeholder => 'r',
+    }
 }
 
 fn overflow_jump_op(op: &SpaceOperation, target: Label) -> Option<FlatOp> {
@@ -655,7 +706,7 @@ fn make_exception_link(
             ]
     {
         if handling_ovf {
-            ops.push(FlatOp::RaiseConst(overflow_error_instance()));
+            ops.push(FlatOp::Raise(LinkArg::Const(overflow_error_instance())));
         } else {
             ops.push(FlatOp::Reraise);
         }
@@ -736,6 +787,12 @@ pub fn insert_renamings(
     regallocs: &HashMap<RegKind, RegAllocResult>,
     ops: &mut Vec<FlatOp>,
 ) {
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum RenameItem {
+        Color(usize),
+        Const(ConstValue),
+    }
+
     // Resolve each ValueId to its regalloc-assigned color, mirroring
     // upstream's `self.getcolor(v)` + `self.getcolor(inputargs[i])`.
     // Cycle-break must operate on colors, not ValueIds: two distinct
@@ -764,24 +821,31 @@ pub fn insert_renamings(
     // kept pair satisfies `v_color != w_color` (upstream `if v == w:
     // continue` — after regalloc, equal colors mean equal variables).
     let cap = link.args.len().min(target_inputargs.len());
-    let mut frm_colors: Vec<usize> = Vec::with_capacity(cap);
-    let mut to_colors: Vec<usize> = Vec::with_capacity(cap);
-    let mut src_vids: Vec<ValueId> = Vec::with_capacity(cap);
+    let mut frm_colors: Vec<RenameItem> = Vec::with_capacity(cap);
+    let mut to_colors: Vec<RenameItem> = Vec::with_capacity(cap);
+    let mut src_vids: Vec<(usize, ValueId)> = Vec::with_capacity(cap);
     let mut dst_vids: Vec<ValueId> = Vec::with_capacity(cap);
     for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
         // `flatten.py:310-311` skip.
         if Some(v) == link.last_exception.as_ref() || Some(v) == link.last_exc_value.as_ref() {
             continue;
         }
-        let Some(v) = v.as_value() else { continue };
-        let Some(v_col) = get_color(v) else { continue };
         let Some(w_col) = get_color(*w) else { continue };
-        if v_col == w_col {
-            continue;
-        }
-        frm_colors.push(v_col);
-        to_colors.push(w_col);
-        src_vids.push(v);
+        let src_item = match v {
+            LinkArg::Value(value) => {
+                let Some(v_col) = get_color(*value) else {
+                    continue;
+                };
+                if v_col == w_col {
+                    continue;
+                }
+                src_vids.push((v_col, *value));
+                RenameItem::Color(v_col)
+            }
+            LinkArg::Const(value) => RenameItem::Const(value.clone()),
+        };
+        frm_colors.push(src_item);
+        to_colors.push(RenameItem::Color(w_col));
         dst_vids.push(*w);
     }
 
@@ -794,16 +858,15 @@ pub fn insert_renamings(
         // passes that still use ValueId identity (liveness backward
         // walk, assembler `lookup_reg_with_kind`) keep working.
         let find_src_vid = |c: usize| -> ValueId {
-            let idx = frm_colors
+            src_vids
                 .iter()
-                .position(|&fc| fc == c)
-                .expect("reorder_renaming_list src color must come from frm_colors");
-            src_vids[idx]
+                .find_map(|(src_c, value)| (*src_c == c).then_some(*value))
+                .unwrap_or_else(|| panic!("reorder_renaming_list missing source for color {c}"))
         };
         let find_dst_vid = |c: usize| -> ValueId {
             let idx = to_colors
                 .iter()
-                .position(|&tc| tc == c)
+                .position(|tc| matches!(tc, RenameItem::Color(tc_color) if *tc_color == c))
                 .expect("reorder_renaming_list dst color must come from to_colors");
             dst_vids[idx]
         };
@@ -811,14 +874,37 @@ pub fn insert_renamings(
         for (v, w) in result {
             match (v, w) {
                 // `if w is None: self.emitline('%s_push' % kind, v)`.
-                (Some(src_c), None) => ops.push(FlatOp::Push(find_src_vid(src_c))),
+                (Some(RenameItem::Color(src_c)), None) => {
+                    ops.push(FlatOp::Push(find_src_vid(src_c)))
+                }
                 // `elif v is None: self.emitline('%s_pop' % kind, "->", w)`.
-                (None, Some(dst_c)) => ops.push(FlatOp::Pop(find_dst_vid(dst_c))),
+                (None, Some(RenameItem::Color(dst_c))) => {
+                    ops.push(FlatOp::Pop(find_dst_vid(dst_c)))
+                }
                 // `else: self.emitline('%s_copy' % kind, v, "->", w)`.
-                (Some(src_c), Some(dst_c)) => ops.push(FlatOp::Move {
-                    src: find_src_vid(src_c),
-                    dst: find_dst_vid(dst_c),
-                }),
+                (Some(RenameItem::Color(src_c)), Some(RenameItem::Color(dst_c))) => {
+                    ops.push(FlatOp::Move {
+                        src: LinkArg::Value(find_src_vid(src_c)),
+                        dst: find_dst_vid(dst_c),
+                    })
+                }
+                (Some(RenameItem::Const(value)), Some(RenameItem::Color(dst_c))) => {
+                    ops.push(FlatOp::Move {
+                        src: LinkArg::Const(value),
+                        dst: find_dst_vid(dst_c),
+                    })
+                }
+                (Some(RenameItem::Const(_)), None) => {
+                    unreachable!("constant renaming sources cannot participate in cycles")
+                }
+                // Renaming destinations come exclusively from
+                // `link.target.inputargs` (upstream `flatten.py:309`),
+                // which are always colored Variables.
+                (None, Some(RenameItem::Const(_)))
+                | (Some(RenameItem::Color(_)), Some(RenameItem::Const(_)))
+                | (Some(RenameItem::Const(_)), Some(RenameItem::Const(_))) => {
+                    unreachable!("renaming destinations are always colored inputargs")
+                }
                 (None, None) => unreachable!("reorder_renaming_list never yields (None, None)"),
             }
         }
@@ -861,18 +947,19 @@ pub fn insert_renamings(
 /// emitted by `insert_renamings`; `(src, None)` maps to `%s_push src`
 /// and `(None, dst)` maps to `%s_pop -> dst` (flatten.py:326-335).
 ///
-/// `T: Eq + Copy + Hash` so the algorithm works for any register
+/// `T: Eq + Clone + Hash` so the algorithm works for any register
 /// representation — RPython uses `Register` objects keyed by identity,
-/// we'll typically instantiate with `Register` or `u16` color indices.
+/// we'll typically instantiate with `Register`, `u16` color indices,
+/// or a mixed color/constant enum.
 pub fn reorder_renaming_list<T>(frm: &[T], to: &[T]) -> Vec<(Option<T>, Option<T>)>
 where
-    T: Eq + Copy + std::hash::Hash,
+    T: Eq + Clone + std::hash::Hash,
 {
     // Mutable copy so the `frm[pending_indices[0]] = None` cycle-break
     // write has a home. In Rust we use `Option<T>` in the working
     // buffer; `None` is the "register already saved on the stack"
     // marker, matching RPython's `frm[...] = None`.
-    let mut frm: Vec<Option<T>> = frm.iter().copied().map(Some).collect();
+    let mut frm: Vec<Option<T>> = frm.iter().cloned().map(Some).collect();
     let to: Vec<T> = to.to_vec();
     assert_eq!(frm.len(), to.len(), "frm and to must have equal length");
 
@@ -887,14 +974,14 @@ where
         // "already saved via push", which `to[i] not in not_read` checks
         // against.
         let not_read: std::collections::HashSet<Option<T>> =
-            pending_indices.iter().map(|&i| frm[i]).collect();
+            pending_indices.iter().map(|&i| frm[i].clone()).collect();
         let mut still_pending_indices: Vec<usize> = Vec::new();
         // `for i in pending_indices:`.
         for &i in &pending_indices {
             // `if to[i] not in not_read`.
-            if !not_read.contains(&Some(to[i])) {
+            if !not_read.contains(&Some(to[i].clone())) {
                 // `result.append((frm[i], to[i]))`.
-                result.push((frm[i], Some(to[i])));
+                result.push((frm[i].clone(), Some(to[i].clone())));
             } else {
                 // `still_pending_indices.append(i)`.
                 still_pending_indices.push(i);
@@ -909,7 +996,7 @@ where
             );
             // `result.append((frm[pending_indices[0]], None))`.
             let head = pending_indices[0];
-            result.push((frm[head], None));
+            result.push((frm[head].clone(), None));
             // `frm[pending_indices[0]] = None`.
             frm[head] = None;
             continue;
@@ -1185,7 +1272,7 @@ mod tests {
         let raise_idx = flat
             .insns
             .iter()
-            .position(|op| matches!(op, FlatOp::Raise(v) if *v == last_exc_value))
+            .position(|op| matches!(op, FlatOp::Raise(LinkArg::Value(v)) if *v == last_exc_value))
             .expect("final exceptblock should flatten to raise");
         assert!(
             matches!(
@@ -1197,6 +1284,29 @@ mod tests {
         assert!(
             matches!(flat.insns.get(raise_idx + 1), Some(FlatOp::Unreachable)),
             "raise should still terminate with ---"
+        );
+    }
+
+    #[test]
+    fn flatten_final_return_accepts_constant_link_arg() {
+        let mut graph = FunctionGraph::new("final_const_return");
+        let entry = graph.startblock;
+        graph.set_control_flow_metadata(
+            entry,
+            None,
+            vec![Link::new_mixed(
+                vec![LinkArg::Const(ConstValue::Int(42))],
+                graph.returnblock,
+                None,
+            )],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(16));
+        assert!(
+            flat.insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::IntReturn(LinkArg::Const(ConstValue::Int(42))))),
+            "final return should preserve Constant link args"
         );
     }
 
@@ -1322,7 +1432,7 @@ mod tests {
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
-                FlatOp::RaiseConst(ConstValue::HostObject(obj)) if *obj == standard_overflow
+                FlatOp::Raise(LinkArg::Const(ConstValue::HostObject(obj))) if *obj == standard_overflow
             )),
             "overflow direct reraises should emit raise Constant(OverflowError-instance)"
         );
@@ -1430,7 +1540,22 @@ mod tests {
             ops,
             vec![FlatOp::Move {
                 dst: ValueId(1),
-                src: ValueId(0),
+                src: LinkArg::Value(ValueId(0)),
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_renamings_emits_move_for_constant_source() {
+        let regallocs = identity_regallocs(8);
+        let mut ops: Vec<FlatOp> = Vec::new();
+        let link = Link::new_mixed(vec![LinkArg::Const(ConstValue::Int(7))], BlockId(0), None);
+        insert_renamings(&link, &[ValueId(1)], &regallocs, &mut ops);
+        assert_eq!(
+            ops,
+            vec![FlatOp::Move {
+                dst: ValueId(1),
+                src: LinkArg::Const(ConstValue::Int(7)),
             }]
         );
     }
@@ -1449,7 +1574,7 @@ mod tests {
                 FlatOp::Push(ValueId(0)),
                 FlatOp::Move {
                     dst: ValueId(0),
-                    src: ValueId(1),
+                    src: LinkArg::Value(ValueId(1)),
                 },
                 FlatOp::Pop(ValueId(1)),
             ]

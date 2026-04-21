@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
-use crate::model::ValueId;
+use crate::model::{LinkArg, ValueId};
 use crate::regalloc::RegAllocResult;
 
 /// Assembler — converts SSARepr to JitCode.
@@ -116,8 +116,10 @@ impl Assembler {
             code: Vec::new(),
             constants_i: Vec::new(),
             constants_r: Vec::new(),
+            constants_f: Vec::new(),
             num_regs_i,
             num_regs_r,
+            num_regs_f,
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
             startpoints: std::collections::HashSet::new(),
@@ -161,12 +163,20 @@ impl Assembler {
             "too many registers (i={num_regs_i} r={num_regs_r} f={num_regs_f})"
         );
         // RPython assembler.py:49 `jitcode._ssarepr = ssarepr`
+        // RPython `longlong.FLOATSTORAGE` stores floats as 64-bit ints in
+        // `constants_f`; pyre's `JitCodeBody.constants_f` holds `f64`, so
+        // bit-cast each pool entry back at commit time.
+        let constants_f_f64: Vec<f64> = state
+            .constants_f
+            .iter()
+            .map(|&bits| f64::from_bits(bits as u64))
+            .collect();
         let body = JitCodeBody {
             calldescr: BhCallDescr::default(),
             code: state.code,
             constants_i: state.constants_i,
             constants_r: state.constants_r,
-            constants_f: Vec::new(),
+            constants_f: constants_f_f64,
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
             c_num_regs_f: num_regs_f as u8,
@@ -349,9 +359,20 @@ impl Assembler {
             // flags the result position in the key so the blackhole
             // wire `int_copy/i>i` (blackhole.rs:5670) finds the handler
             // and `Assembler.resulttypes[pc]` is populated correctly.
+            //
+            // Upstream's source operand (`v`) can be either a `Register`
+            // or a `Constant` (`getcolor` returns the Constant as-is at
+            // flatten.py:382-384); in both cases the `assembler.py:164-174`
+            // single-byte encoder shares the argcode kind letter and
+            // disambiguates register vs constant at decode time via
+            // `byte >= count_regs[kind]`.
             FlatOp::Move { dst, src } => {
-                let (src_reg, src_kind) = self.lookup_reg_with_kind(*src, regallocs);
-                let (dst_reg, _) = self.lookup_reg_with_kind(*dst, regallocs);
+                let (dst_reg, dst_kind) = self.lookup_reg_with_kind(*dst, regallocs);
+                let (src_reg, src_kind) = self.encode_link_arg_source(src, regallocs, state);
+                debug_assert_eq!(
+                    src_kind, dst_kind,
+                    "int/ref/float_copy src and dst must share kind"
+                );
                 let kind_name = match src_kind {
                     'r' => "ref",
                     'f' => "float",
@@ -371,6 +392,7 @@ impl Assembler {
             // RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
             // Argcodes: one typed register, no result marker. Blackhole
             // wires under `{kind}_push/{kind}` (see blackhole.rs:5727-5729).
+            // Only register-backed cycle breaks reach this path.
             FlatOp::Push(src) => {
                 let (src_reg, src_kind) = self.lookup_reg_with_kind(*src, regallocs);
                 let kind_name = match src_kind {
@@ -436,8 +458,11 @@ impl Assembler {
 
             // RPython `flatten.py:131-138` `make_return`.  Blackhole
             // handlers: `blackhole.py:841-863 bhimpl_{int,ref,float,void}_return`.
+            // `emit_const_*` returns a byte ≥ `num_regs_{kind}` so the
+            // single-byte argcode `i`/`r`/`f` suffices for both register
+            // and constant sources (upstream `assembler.py:164-174`).
             FlatOp::IntReturn(v) => {
-                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
                 debug_assert_eq!(kind, 'i');
                 let opnum = self.get_opnum("int_return/i");
                 state.startpoints.insert(state.code.len());
@@ -445,7 +470,7 @@ impl Assembler {
                 state.code.push(reg);
             }
             FlatOp::RefReturn(v) => {
-                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
                 debug_assert_eq!(kind, 'r');
                 let opnum = self.get_opnum("ref_return/r");
                 state.startpoints.insert(state.code.len());
@@ -453,7 +478,7 @@ impl Assembler {
                 state.code.push(reg);
             }
             FlatOp::FloatReturn(v) => {
-                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
                 debug_assert_eq!(kind, 'f');
                 let opnum = self.get_opnum("float_return/f");
                 state.startpoints.insert(state.code.len());
@@ -465,22 +490,54 @@ impl Assembler {
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
             }
-            // RPython `flatten.py:139-143` `make_return` 2-inputarg case.
-            // Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
+            // RPython `flatten.py:139-143` `make_return` 2-inputarg case
+            // plus the `flatten.py:166-173` overflow reraise.  Both paths
+            // funnel through the single `raise/r` opname — upstream's
+            // source operand can be either a Variable (the raised
+            // exception value) or a Constant (e.g. the standard
+            // OverflowError instance), and the single-byte argcode `r`
+            // covers both.  Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
             FlatOp::Raise(v) => {
-                let (reg, kind) = self.lookup_reg_with_kind(*v, regallocs);
+                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
                 debug_assert_eq!(kind, 'r');
                 let opnum = self.get_opnum("raise/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
-            FlatOp::RaiseConst(value) => {
-                let reg = self.emit_const_r(value, state);
-                let opnum = self.get_opnum("raise/r");
-                state.startpoints.insert(state.code.len());
-                state.code.push(opnum);
-                state.code.push(reg);
+        }
+    }
+
+    /// Encode a [`LinkArg`] source operand for `{kind}_copy` /
+    /// `{kind}_push` / `{kind}_return` / `raise`.
+    ///
+    /// Mirrors RPython `assembler.py:164-174`: registers and constants
+    /// share a single-byte argcode per kind, with constants landing at
+    /// byte values `>= count_regs[kind]`.  Returns `(byte, kind_char)`.
+    fn encode_link_arg_source(
+        &mut self,
+        arg: &LinkArg,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+        state: &mut AssemblyState,
+    ) -> (u8, char) {
+        match arg {
+            LinkArg::Value(v) => self.lookup_reg_with_kind(*v, regallocs),
+            LinkArg::Const(cv) => {
+                let kind = crate::flatten::constvalue_kind(cv);
+                let byte = match kind {
+                    'i' => match cv {
+                        ConstValue::Int(n) => self.emit_const_i(*n, state),
+                        ConstValue::Bool(b) => self.emit_const_i(*b as i64, state),
+                        ConstValue::SpecTag(tag) => self.emit_const_i(*tag as i64, state),
+                        other => {
+                            panic!("integer-kind constant not supported by emit_const_i: {other:?}")
+                        }
+                    },
+                    'r' => self.emit_const_r(cv, state),
+                    'f' => self.emit_const_f(cv, state),
+                    other => panic!("unknown LinkArg kind {other:?} for {cv:?}"),
+                };
+                (byte, kind)
             }
         }
     }
@@ -1189,6 +1246,22 @@ impl Assembler {
         state.constants_r.push(bits);
         (state.num_regs_r + state.constants_r.len() - 1) as u8
     }
+
+    fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+        let bits = match value {
+            ConstValue::Float(bits) => *bits as i64,
+            other => panic!("float constant pool does not support {other:?}"),
+        };
+        if let Some(index) = state
+            .constants_f
+            .iter()
+            .position(|&existing| existing == bits)
+        {
+            return (state.num_regs_f + index) as u8;
+        }
+        state.constants_f.push(bits);
+        (state.num_regs_f + state.constants_f.len() - 1) as u8
+    }
 }
 
 /// Per-assembly state (RPython: Assembler.setup() fields).
@@ -1196,8 +1269,10 @@ struct AssemblyState {
     code: Vec<u8>,
     constants_i: Vec<i64>,
     constants_r: Vec<u64>,
+    constants_f: Vec<i64>,
     num_regs_i: usize,
     num_regs_r: usize,
+    num_regs_f: usize,
     label_positions: HashMap<Label, usize>,
     tlabel_fixups: Vec<(Label, usize)>,
     startpoints: std::collections::HashSet<usize>,

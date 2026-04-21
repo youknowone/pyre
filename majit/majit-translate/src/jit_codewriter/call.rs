@@ -13,7 +13,7 @@ use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
 use crate::front::ast::SemanticFunction;
-use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation};
+use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 
@@ -40,10 +40,7 @@ pub enum CanRaise {
     Yes,
 }
 
-/// Internal lattice for RaiseAnalyzer parity.
-///
-/// Ordered as `No < MemoryErrorOnly < Yes`; joins preserve the strongest
-/// evidence seen while traversing a graph.
+/// Operation-level raise classification for `_canraise()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RaiseClass {
     No,
@@ -51,19 +48,11 @@ enum RaiseClass {
     Yes,
 }
 
-impl RaiseClass {
-    fn join(self, other: Self) -> Self {
-        self.max(other)
-    }
-}
-
-impl From<RaiseClass> for CanRaise {
-    fn from(value: RaiseClass) -> Self {
-        match value {
-            RaiseClass::No => CanRaise::No,
-            RaiseClass::MemoryErrorOnly => CanRaise::MemoryErrorOnly,
-            RaiseClass::Yes => CanRaise::Yes,
-        }
+fn raise_class_can_raise(value: RaiseClass, ignore_memoryerror: bool) -> bool {
+    match value {
+        RaiseClass::No => false,
+        RaiseClass::MemoryErrorOnly => !ignore_memoryerror,
+        RaiseClass::Yes => true,
     }
 }
 
@@ -2120,24 +2109,22 @@ impl CallControl {
     /// - `analyze_external_call`: `getattr(fnobj, 'canraise', True)`
     /// - `analyze_exceptblock_in_graph`: checks except blocks
     ///
-    /// Shared implementation for both raise analyzers.
-    ///
-    /// RPython has two separate RaiseAnalyzer instances (call.py:34-36):
-    /// - `raise_analyzer`: normal mode
-    /// - `raise_analyzer_ignore_memoryerror`: `do_ignore_memory_error()` mode
-    ///
-    /// `ignore_memoryerror` controls whether ops that can only raise
-    /// MemoryError are treated as non-raising (canraise.py:11-17).
-    fn analyze_can_raise_impl(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> RaiseClass {
+    /// Shared implementation for the two upstream RaiseAnalyzer instances:
+    /// normal mode and `do_ignore_memory_error()` mode.
+    fn analyze_can_raise_impl(
+        &self,
+        path: &CallPath,
+        seen: &mut HashSet<CallPath>,
+        ignore_memoryerror: bool,
+    ) -> bool {
         if !seen.insert(path.clone()) {
-            return RaiseClass::No; // cycle → bottom_result
+            return false; // cycle → bottom_result
         }
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // RPython: analyze_external_call → getattr(fnobj, 'canraise', True)
-            None => return RaiseClass::Yes,
+            None => return true,
         };
-        let mut result = RaiseClass::No;
         for block in &graph.blocks {
             // RPython: analyze_simple_operation(op) per operation.
             // canraise.py:14-17: LL_OPERATIONS[op.opname].canraise
@@ -2146,48 +2133,48 @@ impl CallControl {
                     OpKind::Call { target, .. } => {
                         let callee_path = match self.target_to_path(target) {
                             Some(p) => p,
-                            None => return RaiseClass::Yes, // unresolvable → conservative
+                            None => return true, // unresolvable → conservative
                         };
-                        self.analyze_can_raise_impl(&callee_path, seen)
+                        self.analyze_can_raise_impl(&callee_path, seen, ignore_memoryerror)
                     }
                     OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => RaiseClass::Yes, // graphanalyze.py:117-121 → top_result()
+                        None => true, // graphanalyze.py:117-121 → top_result()
                         Some(graphs) => {
-                            let mut family = RaiseClass::No;
                             for callee_path in graphs {
-                                family =
-                                    family.join(self.analyze_can_raise_impl(callee_path, seen));
-                                if family == RaiseClass::Yes {
-                                    break;
+                                if self.analyze_can_raise_impl(
+                                    callee_path,
+                                    seen,
+                                    ignore_memoryerror,
+                                ) {
+                                    return true;
                                 }
                             }
-                            family
+                            false
                         }
                     },
-                    other => op_can_raise(other),
+                    other => raise_class_can_raise(op_can_raise(other), ignore_memoryerror),
                 };
-                result = result.join(op_result);
-                if result == RaiseClass::Yes {
-                    return result;
+                if op_result {
+                    return true;
                 }
             }
         }
         // RPython `backendopt/canraise.py:27-41 analyze_exceptblock_in_graph`
-        // treats direct links to `graph.exceptblock` as raising unless the
-        // graph merely re-raises a previously-caught exception, in which case
-        // the original raise site already accounts for it.
+        // only applies the re-raise suppression in the ignore-MemoryError
+        // analyzer. The normal analyzer always treats exceptblock exits as
+        // raising.
         if graph
             .blocks
             .iter()
             .flat_map(|block| block.exits.iter())
             .any(|link| link.target == graph.exceptblock)
         {
-            if exceptblock_is_reraise_of_caught_exception(graph) {
-                return result;
+            if ignore_memoryerror && exceptblock_is_reraise_of_caught_exception(graph) {
+                return false;
             }
-            return result.join(RaiseClass::Yes);
+            return true;
         }
-        result
+        false
     }
 
     /// RPython: VirtualizableAnalyzer.analyze() (effectinfo.py:401-404).
@@ -2423,16 +2410,21 @@ impl CallControl {
     ///
     /// RPython call.py:337-355 — `_canraise()` returns the tri-state
     /// `{False, "mem", True}` collapsed here to [`CanRaise`].
-    ///
-    /// Pyre computes the same lattice directly inside
-    /// `analyze_can_raise_impl()` instead of running two separate
-    /// BoolGraphAnalyzer instances.
     fn cached_can_raise_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> CanRaise {
         if let Some(&result) = cache.can_raise.get(&path) {
             return result;
         }
         let mut seen = HashSet::new();
-        let result = CanRaise::from(self.analyze_can_raise_impl(path, &mut seen));
+        let result = if !self.analyze_can_raise_impl(path, &mut seen, false) {
+            CanRaise::No
+        } else {
+            let mut seen_ignore_memoryerror = HashSet::new();
+            if self.analyze_can_raise_impl(path, &mut seen_ignore_memoryerror, true) {
+                CanRaise::Yes
+            } else {
+                CanRaise::MemoryErrorOnly
+            }
+        };
         cache.can_raise.insert(path.clone(), result);
         result
     }
@@ -3149,74 +3141,71 @@ fn resolve_array_identity(
     base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
     value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
-    phi_sources: &HashMap<crate::model::ValueId, crate::model::ValueId>,
+    phi_sources: &HashMap<crate::model::ValueId, LinkArg>,
     cc: &CallControl,
 ) -> Option<String> {
+    fn producer_array_identity(
+        value: crate::model::ValueId,
+        value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
+        cc: &CallControl,
+    ) -> Option<String> {
+        let producer = value_producers.get(&value)?;
+        match producer {
+            // FieldRead: self.array → full ARRAY type from struct registry.
+            // RPython: op.args[0].concretetype is the ARRAY lltype directly.
+            OpKind::FieldRead { field, .. } => field
+                .owner_root
+                .as_deref()
+                .and_then(|owner| cc.field_type(owner, &field.name))
+                .map(ToOwned::to_owned),
+            // ArrayRead with known array_type_id: propagate.
+            OpKind::ArrayRead { array_type_id, .. } if array_type_id.is_some() => {
+                array_type_id.clone()
+            }
+            // Call result: RPython resolves via result.concretetype → full type.
+            OpKind::Call { target, .. } => cc
+                .target_to_path(target)
+                .and_then(|callee_path| cc.return_types.get(&callee_path).cloned()),
+            OpKind::Input { .. } => None,
+            _ => None,
+        }
+    }
+
+    fn const_array_identity(value: &crate::flowspace::model::ConstValue) -> Option<String> {
+        match value {
+            crate::flowspace::model::ConstValue::List(_) => Some("list".to_string()),
+            crate::flowspace::model::ConstValue::Tuple(_) => Some("tuple".to_string()),
+            crate::flowspace::model::ConstValue::Str(_) => Some("str".to_string()),
+            crate::flowspace::model::ConstValue::HostObject(obj) => {
+                Some(obj.instance_class().unwrap_or(obj).qualname().to_string())
+            }
+            _ => None,
+        }
+    }
+
     // 1. Parser-set element type (from FnArg or typed let binding).
     if op_array_type_id.is_some() {
         return op_array_type_id.clone();
     }
     // 2. Trace back to producer — RPython: op.args[0].concretetype.
-    if let Some(producer) = value_producers.get(base) {
-        match producer {
-            // FieldRead: self.array → full ARRAY type from struct registry.
-            // RPython: op.args[0].concretetype is the ARRAY lltype directly.
-            OpKind::FieldRead { field, .. } => {
-                if let Some(owner) = &field.owner_root {
-                    if let Some(field_type_str) = cc.field_type(owner, &field.name) {
-                        return Some(field_type_str.to_string());
-                    }
-                }
-            }
-            // ArrayRead with known array_type_id: propagate.
-            OpKind::ArrayRead { array_type_id, .. } => {
-                if array_type_id.is_some() {
-                    return array_type_id.clone();
-                }
-            }
-            // Call result: RPython resolves via result.concretetype → full type.
-            OpKind::Call { target, .. } => {
-                if let Some(callee_path) = cc.target_to_path(target) {
-                    if let Some(ret_type) = cc.return_types.get(&callee_path) {
-                        return Some(ret_type.clone());
-                    }
-                }
-            }
-            OpKind::Input { .. } => {}
-            _ => {}
-        }
+    if let Some(identity) = producer_array_identity(*base, value_producers, cc) {
+        return Some(identity);
     }
     // 3. Phi/link: RPython concretetype propagates through block boundaries.
-    // Follow inputarg → source value chain (limited depth to avoid cycles).
-    let mut vid = *base;
+    // Follow inputarg → source link-arg chain (limited depth to avoid cycles).
+    let mut source = LinkArg::Value(*base);
     for _ in 0..4 {
-        if let Some(&src) = phi_sources.get(&vid) {
-            // Check if the source has a producer with array identity.
-            if let Some(producer) = value_producers.get(&src) {
-                match producer {
-                    OpKind::FieldRead { field, .. } => {
-                        if let Some(owner) = &field.owner_root {
-                            if let Some(fts) = cc.field_type(owner, &field.name) {
-                                return Some(fts.to_string());
-                            }
-                        }
-                    }
-                    OpKind::ArrayRead { array_type_id, .. } if array_type_id.is_some() => {
-                        return array_type_id.clone();
-                    }
-                    OpKind::Call { target, .. } => {
-                        if let Some(cp) = cc.target_to_path(target) {
-                            if let Some(rt) = cc.return_types.get(&cp) {
-                                return Some(rt.clone());
-                            }
-                        }
-                    }
-                    _ => {}
+        match &source {
+            LinkArg::Value(vid) => {
+                if let Some(identity) = producer_array_identity(*vid, value_producers, cc) {
+                    return Some(identity);
                 }
+                let Some(next) = phi_sources.get(vid) else {
+                    break;
+                };
+                source = next.clone();
             }
-            vid = src;
-        } else {
-            break;
+            LinkArg::Const(value) => return const_array_identity(value),
         }
     }
     None
@@ -3308,14 +3297,12 @@ fn collect_readwrite_effects(
     // `flowspace/model.py:244 renamevariables` walks `for link in
     // self.exits: link.args`), so resolve_array_identity can trace through
     // control-flow merges of any exit fan-out.
-    let mut phi_sources: HashMap<crate::model::ValueId, crate::model::ValueId> = HashMap::new();
+    let mut phi_sources: HashMap<crate::model::ValueId, LinkArg> = HashMap::new();
     for block in &graph.blocks {
         for link in &block.exits {
             if let Some(target_block) = graph.blocks.get(link.target.0) {
                 for (ia, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    if let Some(src) = src.as_value() {
-                        phi_sources.insert(*ia, src);
-                    }
+                    phi_sources.insert(*ia, src.clone());
                 }
             }
         }
@@ -4765,6 +4752,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_array_identity_follows_phi_chain_to_constant_link_arg() {
+        let cc = CallControl::new();
+        let base = ValueId(1);
+        let forwarded = ValueId(2);
+        let value_producers: HashMap<ValueId, &OpKind> = HashMap::new();
+        let mut phi_sources: HashMap<ValueId, LinkArg> = HashMap::new();
+        phi_sources.insert(base, LinkArg::Value(forwarded));
+        phi_sources.insert(
+            forwarded,
+            LinkArg::Const(crate::flowspace::model::ConstValue::List(vec![])),
+        );
+
+        assert_eq!(
+            resolve_array_identity(
+                &base,
+                &Option::<String>::None,
+                &value_producers,
+                &phi_sources,
+                &cc,
+            ),
+            Some("list".to_string())
+        );
+    }
+
+    #[test]
     fn test_getcalldescr_elidable_ignores_writes() {
         // Elidable function: write_descrs should be 0 even if graph has writes.
         // RPython effectinfo.py:181-186: ignore writes for elidable.
@@ -4828,7 +4840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_canraise_reraise_only_graph_is_not_new_raise_site() {
+    fn test_canraise_reraise_only_graph_matches_upstream_tri_state() {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["reraise_only"]);
         cc.register_function_graph(path.clone(), reraise_only_graph("reraise_only"));
@@ -4836,7 +4848,17 @@ mod tests {
         let target = CallTarget::function_path(["reraise_only"]);
         let mut cache = AnalysisCache::default();
         let result = cc._canraise(&target, &mut cache);
-        assert_eq!(result, CanRaise::No);
+        assert_eq!(result, CanRaise::MemoryErrorOnly);
+    }
+
+    #[test]
+    fn test_canraise_ignore_memoryerror_suppresses_reraise_only_exceptblock() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["reraise_only"]);
+        cc.register_function_graph(path.clone(), reraise_only_graph("reraise_only"));
+
+        let mut seen = HashSet::new();
+        assert!(!cc.analyze_can_raise_impl(&path, &mut seen, true));
     }
 
     #[test]
@@ -4921,17 +4943,6 @@ mod tests {
         let result = cc._canraise(&target, &mut cache);
         assert_eq!(result, CanRaise::Yes);
     }
-
-    // RPython `rpython/jit/codewriter/call.py:337-355 _canraise` distinguishes
-    // "raises only MemoryError" (returning the sentinel `"mem"`,
-    // CanRaise::MemoryErrorOnly here) from "raises anything" by running two
-    // RaiseAnalyzer passes — the second configured with
-    // `ignore_exact_class={MemoryError}` — and comparing the results per op.
-    // Pyre does not yet carry per-operation raise-class metadata (the
-    // Abort.reason-string channel that used to approximate it was deleted
-    // with Terminator::Abort), so this classification collapses to Yes/No
-    // in practice.  Re-introduce the MemoryError-only coverage once the
-    // per-op RaiseAnalyzer port lands.
 
     #[test]
     fn struct_layout_depth3_nested_fixed_point() {

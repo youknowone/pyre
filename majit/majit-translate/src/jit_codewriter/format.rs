@@ -141,11 +141,11 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             // prints `asm[0]` verbatim. Mirror that here by deriving
             // the kind from the moved register's `value_kinds` entry.
             FlatOp::Move { dst, src } => {
-                let kind = kind_name(*src, &ssarepr.value_kinds);
+                let kind = linkarg_kind_name(src, &ssarepr.value_kinds);
                 let _ = writeln!(
                     out,
                     "{prefix}{kind}_copy {} -> {}",
-                    register_repr(*src, &ssarepr.value_kinds),
+                    linkarg_repr(src, &ssarepr.value_kinds),
                     register_repr(*dst, &ssarepr.value_kinds)
                 );
             }
@@ -195,21 +195,21 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}int_return {}",
-                    register_repr(*v, &ssarepr.value_kinds)
+                    linkarg_repr(v, &ssarepr.value_kinds)
                 );
             }
             FlatOp::RefReturn(v) => {
                 let _ = writeln!(
                     out,
                     "{prefix}ref_return {}",
-                    register_repr(*v, &ssarepr.value_kinds)
+                    linkarg_repr(v, &ssarepr.value_kinds)
                 );
             }
             FlatOp::FloatReturn(v) => {
                 let _ = writeln!(
                     out,
                     "{prefix}float_return {}",
-                    register_repr(*v, &ssarepr.value_kinds)
+                    linkarg_repr(v, &ssarepr.value_kinds)
                 );
             }
             FlatOp::VoidReturn => {
@@ -219,11 +219,8 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}raise {}",
-                    register_repr(*v, &ssarepr.value_kinds)
+                    linkarg_repr(v, &ssarepr.value_kinds)
                 );
-            }
-            FlatOp::RaiseConst(value) => {
-                let _ = writeln!(out, "{prefix}raise ${value}");
             }
             FlatOp::Unreachable => {
                 let _ = writeln!(out, "{prefix}---");
@@ -320,6 +317,33 @@ fn kind_name(v: ValueId, kinds: &HashMap<ValueId, RegKind>) -> &'static str {
         RegKind::Int => "int",
         RegKind::Ref => "ref",
         RegKind::Float => "float",
+    }
+}
+
+/// Upstream `getcolor(v)` returns either a `Register` (→ `%{i,r,f}<n>`)
+/// or a `Constant` (→ `$<value>`); reproduce both shapes for the
+/// `int_copy`/`ref_copy`/`float_copy` + `*_push` + `*_return` + `raise`
+/// source operand printing.
+fn linkarg_repr(arg: &crate::model::LinkArg, kinds: &HashMap<ValueId, RegKind>) -> String {
+    match arg {
+        crate::model::LinkArg::Value(v) => register_repr(*v, kinds),
+        crate::model::LinkArg::Const(cv) => format!("${cv}"),
+    }
+}
+
+/// Kind prefix for a [`LinkArg`] source — `value_kinds` for Variables,
+/// `ConstValue` shape (via `flatten::constvalue_kind`) for Constants.
+fn linkarg_kind_name(
+    arg: &crate::model::LinkArg,
+    kinds: &HashMap<ValueId, RegKind>,
+) -> &'static str {
+    match arg {
+        crate::model::LinkArg::Value(v) => kind_name(*v, kinds),
+        crate::model::LinkArg::Const(cv) => match crate::flatten::constvalue_kind(cv) {
+            'i' => "int",
+            'f' => "float",
+            _ => "ref",
+        },
     }
 }
 
