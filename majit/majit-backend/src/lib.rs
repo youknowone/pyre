@@ -1091,6 +1091,43 @@ pub struct DeadFrame {
     pub data: Box<dyn std::any::Any + Send>,
 }
 
+/// `compile.py:665-674` `make_and_attach_done_descrs` + `pyjitpl.py:2283`
+/// `propagate_exception_descr`: snapshot of the six descrs the metainterp
+/// attaches to the owning cpu instance at
+/// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).  RPython backend
+/// code reads these as `self.cpu.xxx` attributes at every use site
+/// (`rpython/jit/backend/x86/assembler.py:337`,
+/// `rpython/jit/backend/llgraph/runner.py:1478`); pyre captures them by
+/// value at `compile_loop` entry (from the owning backend's per-instance
+/// fields) so FINISH / CALL_ASSEMBLER emission can stamp `jf_descr` with
+/// the attached identity without holding a `&dyn Backend` receiver.
+///
+/// Field names mirror the RPython attribute names 1:1 for parity with
+/// `compile.make_and_attach_done_descrs` targets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttachedDescrPtrs {
+    pub done_with_this_frame_descr_void: usize,
+    pub done_with_this_frame_descr_int: usize,
+    pub done_with_this_frame_descr_ref: usize,
+    pub done_with_this_frame_descr_float: usize,
+    pub exit_frame_with_exception_descr_ref: usize,
+    pub propagate_exception_descr: usize,
+}
+
+impl AttachedDescrPtrs {
+    /// `compile.py:324-336` `_call_assembler` — pick the attached
+    /// `done_with_this_frame_descr_*` whose result type matches the
+    /// portal's finish kind.
+    pub fn done_with_this_frame_descr_ptr_for_type(&self, tp: Type) -> usize {
+        match tp {
+            Type::Void => self.done_with_this_frame_descr_void,
+            Type::Int => self.done_with_this_frame_descr_int,
+            Type::Ref => self.done_with_this_frame_descr_ref,
+            Type::Float => self.done_with_this_frame_descr_float,
+        }
+    }
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.

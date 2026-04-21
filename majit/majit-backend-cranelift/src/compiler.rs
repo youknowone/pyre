@@ -2338,6 +2338,7 @@ fn install_call_assembler_expectations(
 fn register_call_assembler_target(
     token: &mut JitCellToken,
     compiled: &CompiledLoop,
+    attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     invalidate_ca_thread_cache(token.number);
     let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
@@ -2418,7 +2419,12 @@ fn register_call_assembler_target(
         .iter()
         .find(|d| d.is_finish() && !d.is_exit_frame_with_exception)
     {
-        let ptr = done_with_this_frame_descr_ptr(&finish_descr.fail_arg_types);
+        let result_type = finish_descr
+            .fail_arg_types
+            .first()
+            .copied()
+            .unwrap_or(Type::Void);
+        let ptr = attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64;
         ca_dispatch_set_finish_descr_ptr(token.number, ptr);
     }
     with_call_assembler_registry(|m| m.insert(token.number, target));
@@ -5740,6 +5746,49 @@ impl CraneliftBackend {
         self.vtable_offset = offset;
     }
 
+    /// `compile.py:665-674` `make_and_attach_done_descrs` parity: expose
+    /// the six per-cpu-instance descrs as raw pointers for emission
+    /// consumers (`collect_guards` FINISH sites, `register_call_assembler_target`).
+    /// The metainterp attaches the real descrs through
+    /// `Backend::set_done_with_this_frame_descr_*` during
+    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222); until then,
+    /// the per-thread fallback slots in this module answer so
+    /// backend-only integration tests that skip `MetaInterp::new` still
+    /// get a non-zero pointer per result type.
+    pub(crate) fn attached_descr_ptrs(&self) -> majit_backend::AttachedDescrPtrs {
+        fn ptr_or(d: &Option<majit_ir::DescrRef>, fallback: i64) -> usize {
+            d.as_ref().map_or(fallback as usize, |arc| {
+                Arc::as_ptr(arc) as *const () as usize
+            })
+        }
+        majit_backend::AttachedDescrPtrs {
+            done_with_this_frame_descr_void: ptr_or(
+                &self.done_descr_void,
+                done_with_this_frame_descr_ptr(&[]),
+            ),
+            done_with_this_frame_descr_int: ptr_or(
+                &self.done_descr_int,
+                done_with_this_frame_descr_ptr(&[Type::Int]),
+            ),
+            done_with_this_frame_descr_ref: ptr_or(
+                &self.done_descr_ref,
+                done_with_this_frame_descr_ptr(&[Type::Ref]),
+            ),
+            done_with_this_frame_descr_float: ptr_or(
+                &self.done_descr_float,
+                done_with_this_frame_descr_ptr(&[Type::Float]),
+            ),
+            exit_frame_with_exception_descr_ref: ptr_or(
+                &self.exit_frame_with_exception_descr_ref,
+                exit_frame_with_exception_descr_ref_ptr(),
+            ),
+            propagate_exception_descr: self
+                .propagate_exception_descr
+                .as_ref()
+                .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize),
+        }
+    }
+
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Delegates to the installed `GcAllocator`. RPython resolves the
@@ -6157,6 +6206,7 @@ impl CraneliftBackend {
         let mut fail_descrs: Vec<Arc<CraneliftFailDescr>> = Vec::new();
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
         let mut max_output_slots: usize = 0;
+        let attached_descrs = self.attached_descr_ptrs();
         collect_guards(
             ops,
             inputargs,
@@ -6171,6 +6221,7 @@ impl CraneliftBackend {
             &self.constants,
             self.gc_runtime_id,
             self.callinfocollection.as_deref(),
+            attached_descrs,
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
@@ -10853,6 +10904,7 @@ fn collect_guards(
     constants: &HashMap<u32, i64>,
     gc_runtime_id: Option<u64>,
     callinfocollection: Option<&majit_ir::CallInfoCollection>,
+    attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
@@ -11419,9 +11471,10 @@ fn collect_guards(
             // the pointer back to a `CraneliftFailDescr` singleton for
             // downstream consumers that need `bridge_ref`/fail_arg_types.
             if descr.is_exit_frame_with_exception {
-                exit_frame_with_exception_descr_ref_ptr()
+                attached_descrs.exit_frame_with_exception_descr_ref as i64
             } else {
-                done_with_this_frame_descr_ptr(&descr.fail_arg_types)
+                let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
+                attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
             }
         } else {
             Arc::as_ptr(&descr) as i64
@@ -11544,7 +11597,7 @@ impl majit_backend::Backend for CraneliftBackend {
             code_addr: compiled.code_ptr as usize,
             code_size: compiled.code_size,
         };
-        register_call_assembler_target(token, &compiled)?;
+        register_call_assembler_target(token, &compiled, self.attached_descr_ptrs())?;
         if let Err(err) =
             install_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token.number), ops)
         {

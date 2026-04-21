@@ -11,6 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use majit_backend::ExitRecoveryLayout;
 use majit_ir::{Descr, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
 
+/// Re-export the shared struct so existing `crate::guard::AttachedDescrPtrs`
+/// imports in `x86/assembler.rs` / `aarch64/assembler.rs` / `runner.rs`
+/// keep resolving while the canonical definition lives in `majit-backend`
+/// (shared with cranelift via `majit_backend::AttachedDescrPtrs`).
+pub use majit_backend::AttachedDescrPtrs;
+
 /// assembler.py: ResumeGuardDescr concrete type for dynasm backend.
 pub struct DynasmFailDescr {
     pub fail_index: u32,
@@ -254,41 +260,6 @@ static FALLBACK_DONE_FLOAT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     std::sync::LazyLock::new(|| {
         Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![Type::Float], true))
     });
-
-/// `compile.py:665-674` `make_and_attach_done_descrs` + `pyjitpl.py:2283`
-/// `propagate_exception_descr`: snapshot of the six descr pointers the
-/// metainterp attaches to the owning cpu instance.  RPython backend code
-/// reads these as `self.cpu.xxx` attributes at every use site; pyre
-/// captures them by value at `compile_loop` entry (from the owning
-/// `DynasmBackend`'s per-instance fields) so FINISH / CALL_ASSEMBLER
-/// emission can stamp `jf_descr` with the attached identity without
-/// holding a `&Backend` receiver.
-///
-/// Field names mirror the RPython attribute names for 1:1 parity with
-/// `compile.make_and_attach_done_descrs` targets.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AttachedDescrPtrs {
-    pub done_with_this_frame_descr_void: usize,
-    pub done_with_this_frame_descr_int: usize,
-    pub done_with_this_frame_descr_ref: usize,
-    pub done_with_this_frame_descr_float: usize,
-    pub exit_frame_with_exception_descr_ref: usize,
-    pub propagate_exception_descr: usize,
-}
-
-impl AttachedDescrPtrs {
-    /// `compile.py:324-336` `_call_assembler` — pick the attached
-    /// `done_with_this_frame_descr_*` whose result type matches the
-    /// portal's finish kind.
-    pub fn done_with_this_frame_descr_ptr_for_type(&self, tp: Type) -> usize {
-        match tp {
-            Type::Void => self.done_with_this_frame_descr_void,
-            Type::Int => self.done_with_this_frame_descr_int,
-            Type::Ref => self.done_with_this_frame_descr_ref,
-            Type::Float => self.done_with_this_frame_descr_float,
-        }
-    }
-}
 
 pub(crate) fn set_done_with_this_frame_descr_void(descr: majit_ir::DescrRef) {
     DONE_WITH_THIS_FRAME_DESCR_VOID.with(|c| *c.borrow_mut() = Some(descr));
