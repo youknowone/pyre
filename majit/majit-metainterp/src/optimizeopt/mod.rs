@@ -546,21 +546,38 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: vi.known_class,
+                // info.py:243-247 `_visitor_walk_recursive` registers the
+                // full `_fields` list in descriptor order, leaving unfilled
+                // slots as `None`. Preserve that shape so `fieldnums` aligns
+                // 1:1 with `descr.get_all_fielddescrs()` for `_cached_vinfo`
+                // reuse at resume.py:307-315.
                 field_oprefs: vi
-                    .fields
+                    .field_descrs
                     .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
-                    .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
+                    .enumerate()
+                    .map(|(fi, _)| {
+                        vi.fields
+                            .iter()
+                            .find(|(field_idx, _)| *field_idx == fi as u32)
+                            .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
+                            .unwrap_or(OpRef::NONE)
+                    })
                     .collect(),
             }),
             PtrInfo::VirtualStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: None,
                 field_oprefs: vi
-                    .fields
+                    .field_descrs
                     .iter()
-                    .filter(|(fi, _)| !is_typeptr_field(*fi, &vi.field_descrs, &vi.descr))
-                    .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
+                    .enumerate()
+                    .map(|(fi, _)| {
+                        vi.fields
+                            .iter()
+                            .find(|(field_idx, _)| *field_idx == fi as u32)
+                            .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
+                            .unwrap_or(OpRef::NONE)
+                    })
                     .collect(),
             }),
             PtrInfo::VirtualArray(vi) => Some(majit_ir::VirtualFieldsInfo {
@@ -579,8 +596,12 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .element_fields
                     .iter()
                     .flat_map(|ef| {
-                        ef.iter()
-                            .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
+                        vi.fielddescrs.iter().enumerate().map(|(fi, _)| {
+                            ef.iter()
+                                .find(|(field_idx, _)| *field_idx == fi as u32)
+                                .map(|(_, vref)| self.ctx.get_box_replacement(*vref))
+                                .unwrap_or(OpRef::NONE)
+                        })
                     })
                     .collect(),
             }),
@@ -744,18 +765,16 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     fn visit_virtual(
         &mut self,
         descr: &majit_ir::DescrRef,
-        fielddescr_indices: &[u32],
+        _fielddescr_indices: &[u32],
         fielddescrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
-        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescr_indices
+        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescrs
             .iter()
-            .filter(|fi| !is_typeptr_field(**fi, fielddescrs, descr))
-            .map(|fi| {
-                let fd = fielddescrs
-                    .get(*fi as usize)
-                    .and_then(|d| d.as_field_descr());
+            .enumerate()
+            .map(|(fi, descr)| {
+                let fd = descr.as_field_descr();
                 majit_ir::FieldDescrInfo {
-                    index: *fi,
+                    index: fi as u32,
                     offset: fd.map(|f| f.offset()).unwrap_or(0),
                     field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
                     field_size: fd.map(|f| f.field_size()).unwrap_or(8),
@@ -781,18 +800,16 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     fn visit_vstruct(
         &mut self,
         typedescr: &majit_ir::DescrRef,
-        fielddescr_indices: &[u32],
+        _fielddescr_indices: &[u32],
         fielddescrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
-        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescr_indices
+        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescrs
             .iter()
-            .filter(|fi| !is_typeptr_field(**fi, fielddescrs, typedescr))
-            .map(|fi| {
-                let fd = fielddescrs
-                    .get(*fi as usize)
-                    .and_then(|d| d.as_field_descr());
+            .enumerate()
+            .map(|(fi, descr)| {
+                let fd = descr.as_field_descr();
                 majit_ir::FieldDescrInfo {
-                    index: *fi,
+                    index: fi as u32,
                     offset: fd.map(|f| f.offset()).unwrap_or(0),
                     field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
                     field_size: fd.map(|f| f.field_size()).unwrap_or(8),
@@ -844,7 +861,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         &mut self,
         arraydescr: &majit_ir::DescrRef,
         length: usize,
-        fielddescr_indices: &[u32],
+        _fielddescr_indices: &[u32],
         fielddescrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
         // info.py:701-704: visitor_dispatch_virtual_type always hands
@@ -875,15 +892,16 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
             }
         }
         if ft.is_empty() {
-            ft = vec![0u8; fielddescr_indices.len()];
+            ft = vec![0u8; canonical_fielddescrs.len()];
         }
         let ad = arraydescr.as_array_descr();
+        let fielddescr_count = canonical_fielddescrs.len();
         Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr: Some(arraydescr.clone()),
             descr_index: arraydescr.index(),
             size: length,
             fielddescrs: canonical_fielddescrs,
-            fielddescr_indices: fielddescr_indices.to_vec(),
+            fielddescr_indices: (0..fielddescr_count).map(|i| i as u32).collect(),
             field_types: ft,
             base_size: ad.map(|a| a.base_size()).unwrap_or(0),
             item_size: ad.map(|a| a.item_size()).unwrap_or(0),

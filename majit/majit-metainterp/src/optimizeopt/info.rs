@@ -1254,12 +1254,10 @@ impl PtrInfo {
         visitor: &mut V,
     ) -> Option<V::VInfo> {
         match self {
-            // info.py:331-334 InstancePtrInfo.visitor_dispatch_virtual_type
-            //
-            // **Pyre adaptation**: Majit's `fields` stores filled-only
-            // entries (`(field_index, OpRef)` pairs, no typeptr), so we
-            // forward the filled slot indices alongside the full descr
-            // list — see `walkvirtual::VirtualVisitor::visit_virtual` doc.
+            // info.py:331-334 InstancePtrInfo.visitor_dispatch_virtual_type.
+            // `fields` still stores sparse `(field_index, OpRef)` entries, but
+            // the visitor now rebuilds the full descriptor-order slot list so
+            // resume.py can pair `fielddescrs` and `fieldnums` 1:1 again.
             PtrInfo::Virtual(info) => {
                 let indices: Vec<u32> = info.fields.iter().map(|(fi, _)| *fi).collect();
                 Some(visitor.visit_virtual(&info.descr, &indices, &info.field_descrs))
@@ -1271,16 +1269,11 @@ impl PtrInfo {
             }
             // info.py:598-599 ArrayPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualArray(info) => Some(visitor.visit_varray(&info.descr, info.clear)),
-            // info.py:701-704 ArrayStructInfo.visitor_dispatch_virtual_type
-            //
-            // **Pyre adaptation**: indices come from `element_fields[0]` —
-            // the per-element slot layout that each array item follows.
+            // info.py:701-704 ArrayStructInfo.visitor_dispatch_virtual_type.
+            // The visitor consumes the canonical `fielddescrs` ordering; the
+            // compatibility indices are the same descriptor-order slot numbers.
             PtrInfo::VirtualArrayStruct(info) => {
-                let indices: Vec<u32> = info
-                    .element_fields
-                    .first()
-                    .map(|ef| ef.iter().map(|(fi, _)| *fi).collect())
-                    .unwrap_or_default();
+                let indices: Vec<u32> = (0..info.fielddescrs.len()).map(|i| i as u32).collect();
                 Some(visitor.visit_varraystruct(
                     &info.descr,
                     info.element_fields.len(),

@@ -29,13 +29,11 @@ pub trait VirtualVisitor {
 
     /// walkvirtual.py:8; info.py:331-334.
     ///
-    /// **Pyre adaptation**: `fielddescr_indices` is a pyre-specific extra
-    /// argument. RPython's visit_virtual receives only (descr, fielddescrs)
-    /// because RPython's `AbstractVirtualStructInfo.fielddescrs` includes
-    /// *all* slots and its paired `fieldnums` list uses UNINITIALIZED tags
-    /// for unassigned ones. Majit's `RdVirtualInfo.fielddescrs` stores
-    /// filled-only entries (matching `fieldnums` length), so the visitor
-    /// needs the original slot indices to populate `FieldDescrInfo.index`.
+    /// `fielddescr_indices` is a remaining Rust-side compatibility shim for
+    /// call sites that still thread slot numbers explicitly. The canonical
+    /// shape now matches RPython again: `fielddescrs` contains the full
+    /// descriptor-order slot list and the paired `fieldnums` list uses
+    /// UNINITIALIZED tags for holes.
     fn visit_virtual(
         &mut self,
         descr: &DescrRef,
@@ -44,7 +42,7 @@ pub trait VirtualVisitor {
     ) -> Self::VInfo;
 
     /// walkvirtual.py:11; info.py:368-372. See `visit_virtual` for the
-    /// `fielddescr_indices` adaptation rationale.
+    /// compatibility note on `fielddescr_indices`.
     fn visit_vstruct(
         &mut self,
         typedescr: &DescrRef,
@@ -56,8 +54,7 @@ pub trait VirtualVisitor {
     fn visit_varray(&mut self, arraydescr: &DescrRef, clear: bool) -> Self::VInfo;
 
     /// walkvirtual.py:17; info.py:700-704. See `visit_virtual` for the
-    /// `fielddescr_indices` adaptation rationale (here the indices come
-    /// from each array element's `element_fields[0]` slot layout).
+    /// compatibility note on `fielddescr_indices`.
     fn visit_varraystruct(
         &mut self,
         arraydescr: &DescrRef,
