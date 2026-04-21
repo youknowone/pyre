@@ -33,14 +33,10 @@ pub(crate) fn value_to_raw_bits(value: Value) -> i64 {
 /// concrete ptrs carried by two Refs (virtualizable identity).  Non-Ref
 /// values are never compared as virtualizable boxes, so falling into the
 /// catch-all `false` branch preserves the Step 4 "not standard" path in
-/// `is_nonstandard_virtualizable`.
-///
-/// Unused in the current emission of `is_nonstandard_virtualizable` Step 4
-/// (which retains pyre's hardcoded `isstandard = 0` placeholder until the
-/// dispatch.rs follow-up threads a per-box concrete through — see Codex
-/// follow-up #65). Left as a named helper because the RPython parity
-/// restoration commit will light it up without further churn.
-#[allow(dead_code)]
+/// `is_nonstandard_virtualizable` — this is how an `opref` backed by a
+/// non-Ref constant (e.g. `ConstInt(0xCAFE)` in a test) still resolves to
+/// `isstandard = 0` and proceeds to Step 5 / `emit_force_virtualizable`,
+/// matching upstream's runtime behavior for the same bogus input.
 fn concrete_ptrs_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Ref(ra), Value::Ref(rb)) => ra == rb,
@@ -1416,6 +1412,45 @@ impl TraceCtx {
             .and_then(|values| values.last().copied())
     }
 
+    /// Best-effort concrete (runtime) value associated with an OpRef, from
+    /// TraceCtx-local state.  Parallels upstream `box.getref_base()` /
+    /// `box.getint()` / `box.getfloatstorage()` — in RPython each Box
+    /// carries its own runtime concrete via the Box subclass; pyre's
+    /// `OpRef` is opaque, so concrete must be reconstructed.
+    ///
+    /// Resolution order, mirroring the subclass dispatch upstream performs
+    /// implicitly:
+    ///   1. Constant OpRefs — read from the `ConstantPool` (value + type).
+    ///   2. `standard_virtualizable_box()` — use the runtime shadow held in
+    ///      `virtualizable_values[-1]`.
+    ///   3. Fallback — a sentinel `Value::Ref(GcRef(usize::MAX))` that
+    ///      never matches a real heap pointer, so PTR_EQ comparisons with
+    ///      the standard vable resolve to "different" at trace time.  The
+    ///      fallback is the conservative answer for OpRefs whose concrete
+    ///      lives only on the interpreter stack and must be threaded in
+    ///      by the external caller (Task #68): alias canonicalization for
+    ///      those paths remains off until dispatch.rs supplies the real
+    ///      concrete.
+    pub fn concrete_of_opref(&self, opref: OpRef) -> Value {
+        if opref.is_constant() {
+            if let Some(raw) = self.constants.as_ref().get(&opref.0).copied() {
+                let tp = self.constants.constant_type(opref).unwrap_or(Type::Int);
+                return match tp {
+                    Type::Int => Value::Int(raw),
+                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
+                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
+                    Type::Void => Value::Void,
+                };
+            }
+        }
+        if Some(opref) == self.standard_virtualizable_box() {
+            if let Some(v) = self.standard_virtualizable_concrete() {
+                return v;
+            }
+        }
+        Value::Ref(majit_ir::GcRef(usize::MAX))
+    }
+
     /// Whether standard virtualizable boxes are active.
     pub fn has_virtualizable_boxes(&self) -> bool {
         self.virtualizable_boxes.is_some()
@@ -1781,28 +1816,36 @@ impl TraceCtx {
         //
         // pyre's `jitdriver_sd.virtualizable_info is fielddescr.get_vinfo()`
         // check is structurally the "active virtualizable matches the
-        // descriptor's owning type" guard.  `fielddescr` and `concrete`
-        // are threaded in for RPython signature parity; today the internal
-        // callers route every `vable_opref` through `standard_vable_field_descr`,
-        // so Step 3 short-circuits before Step 4 in the live path.
-        //
-        // Step 4 is structurally unreachable in the current architecture —
-        // Step 3's `standard_box == vable_opref` test always holds for the
-        // caller shim that derives `concrete` from `standard_virtualizable_concrete`.
-        // The PTR_EQ + GuardValue(eqbox, 0) shape is preserved line-by-line
-        // so a future caller that threads a distinct `concrete` ptr (via
-        // the dispatch.rs thread of orgpc + box concrete, see Codex follow-up #65)
-        // can flip the guard payload to the runtime-evaluated
-        // `concrete_ptrs_eq(concrete, standard_concrete)` without changing
-        // the emission shape.
+        // descriptor's owning type" guard.  `fielddescr` is threaded in so
+        // a future `FieldDescr::get_vinfo()` backref can dispatch per
+        // descriptor (Task #68 B); today every caller routes through
+        // `standard_vable_field_descr` which already filters by the active
+        // vinfo, so the check reduces to `virtualizable_info().is_some()`.
         let _ = fielddescr;
-        let _ = concrete;
+        let standard_concrete = self
+            .standard_virtualizable_concrete()
+            .unwrap_or(Value::Ref(majit_ir::GcRef(usize::MAX)));
+        // pyjitpl.py:1135-1138 `eqbox = self.metainterp.execute_and_record(
+        //     rop.PTR_EQ, None, box, standard_box);
+        //     eqbox = self.implement_guard_value(eqbox, pc);
+        //     isstandard = eqbox.getint()`.
+        //
+        // pyre resolves `isstandard` by comparing the traced concrete ptrs
+        // directly (see `concrete_of_opref` for how `concrete` is
+        // reconstructed from tracer-local state).  The subsequent
+        // `promote_int` records the GUARD_VALUE that commits the runtime
+        // outcome to the trace.  `pc` threads through for RPython signature
+        // parity; pyre's `record_guard` seeds the guard descr via
+        // `num_live` (live-var count), not pc, so the parameter is
+        // documented here but not consumed at this layer.
         let _ = pc;
         let eqbox = self.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
-        let isstandard: i64 = 0;
-        let const_isstandard = self.const_int(isstandard);
-        self.record_guard(OpCode::GuardValue, &[eqbox, const_isstandard], 0);
-        #[allow(unreachable_code)]
+        let isstandard: i64 = if concrete_ptrs_eq(&concrete, &standard_concrete) {
+            1
+        } else {
+            0
+        };
+        self.promote_int(eqbox, isstandard, 0);
         if isstandard != 0 {
             // pyjitpl.py:1140-1142 `if box.type == 'r':
             //     self.metainterp.replace_box(box, standard_box)`.
@@ -1811,9 +1854,9 @@ impl TraceCtx {
             // `MetaInterp.replace_box` includes a framestack walk (see
             // `MetaInterp::replace_box` in pyjitpl/mod.rs).  Reaching that
             // walk from TraceCtx requires a MetaInterp backref which does
-            // not exist today; when Codex follow-up #65 threads the real
-            // per-box concrete through the dispatch layer, the call should
-            // be routed via a metainterp helper so the framestack walk is
+            // not exist today; when Task #68 threads the real per-box
+            // concrete through the dispatch layer, the call should be
+            // routed via a metainterp helper so the framestack walk is
             // not silently skipped.
             self.replace_box(vable_opref, standard_box);
             return false;
@@ -1859,9 +1902,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
-        let concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_i(box, fielddescr)
             let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
@@ -1907,9 +1948,7 @@ impl TraceCtx {
         value: OpRef,
         concrete: Value,
     ) {
-        let vable_concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, vable_concrete) {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
             self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], fielddescr);
@@ -1953,9 +1992,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
-        let concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, concrete) {
             let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
             return (op, Value::Void);
@@ -1993,9 +2030,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
-        let concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, concrete) {
             let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
             return (op, Value::Void);
@@ -2092,9 +2127,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: DescrRef,
     ) -> (OpRef, Value) {
-        let concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
@@ -2146,9 +2179,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: DescrRef,
     ) -> (OpRef, Value) {
-        let concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
@@ -2195,9 +2226,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: DescrRef,
     ) -> (OpRef, Value) {
-        let concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
@@ -2256,9 +2285,7 @@ impl TraceCtx {
         value: OpRef,
         concrete: Value,
     ) {
-        let vable_concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, vable_concrete) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
@@ -2298,9 +2325,7 @@ impl TraceCtx {
     ///      return ConstInt(result)
     /// ```
     pub fn vable_arraylen_vable(&mut self, vable_opref: OpRef, fdescr: DescrRef) -> OpRef {
-        let concrete = self
-            .standard_virtualizable_concrete()
-            .unwrap_or(Value::Ref(majit_ir::GcRef(0)));
+        let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_arraylen_gc(arraybox, adescr)
