@@ -687,16 +687,14 @@ fn make_exception_link(
     debug_assert!(link.last_exception.is_some());
     debug_assert!(link.last_exc_value.is_some());
     let target = graph.block(link.target);
-    // Bare-reraise special case: upstream `flatten.py:160-168` collapses
-    // `Link([last_exception, last_exc_value], graph.exceptblock)` into a
-    // single `reraise` + `---` pair so the common propagate-unhandled
-    // shape doesn't need a renaming.  Require the target to be the
-    // graph's canonical `exceptblock` in addition to the args pattern,
-    // otherwise a typed-exception link whose args happen to match
-    // (e.g. a catch handler that receives both exception variables) is
-    // mis-classified as a reraise.
-    if link.target == graph.exceptblock
-        && target.operations.is_empty()
+    // `flatten.py:160-168` bare-reraise special case: a link whose
+    // target has no operations and whose args are exactly
+    // `[link.last_exception, link.last_exc_value]` collapses to a
+    // single `reraise` + `---` pair.  Upstream's graph construction
+    // guarantees that only the canonical `exceptblock` ever has
+    // `operations == ()`; typed catch-handler blocks always carry at
+    // least one operation, so they do not match this shape.
+    if target.operations.is_empty()
         && link.args
             == vec![
                 link.last_exception.clone().unwrap(),
@@ -1248,6 +1246,13 @@ mod tests {
         let handler_exc_value = graph.alloc_value();
         graph.block_mut(handler).inputargs.push(handler_exc_type);
         graph.block_mut(handler).inputargs.push(handler_exc_value);
+        // Upstream invariant: a typed catch-handler block is never empty
+        // — it carries at least the handler body's first op (type check,
+        // re-binding, etc.).  The empty-operations shape is reserved for
+        // the canonical `exceptblock`, which is the sole target of the
+        // `flatten.py:160-168` bare-reraise collapse.  Emit a `-live-`
+        // placeholder so this test matches the upstream shape.
+        graph.push_op(handler, OpKind::Live, false);
         graph.set_goto(handler, graph.returnblock, vec![handler_exc_value]);
 
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
