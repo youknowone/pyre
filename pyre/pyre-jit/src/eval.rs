@@ -4574,6 +4574,13 @@ r = acc",
     /// in the recursive return path.
     #[test]
     fn test_recursive_fib_returns_correct_result_through_jit() {
+        // Serialize with other tests that touch the process-global
+        // `JIT_PENDING_EXCEPTION` slot — a concurrent slowpath probe
+        // writing to the slot would be picked up by this test's JIT
+        // runtime at its next backend boundary, aborting eval_with_jit
+        // before `result = fib(12)` stores into `w_globals`.
+        let _jit_guard = pyre_interpreter::stack_check::lock_jit_state_tests();
+
         let source = "\
 def fib(n):
     if n < 2:

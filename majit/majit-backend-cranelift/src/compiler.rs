@@ -727,8 +727,17 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
 }
 
 /// Global exception state for JIT-compiled code.
-/// pyre is no-GIL single-threaded, so global statics are safe and allow
-/// GUARD_NO_EXCEPTION to emit a direct memory load instead of a TLS call.
+///
+/// PRE-EXISTING-ADAPTATION: pyre is no-GIL, but the JIT codegen embeds the
+/// static addresses of these atomics directly into generated machine code
+/// (see `jit_exc_value_addr()` consumers at `iconst(..., jit_exc_value_addr()
+/// as i64)`), so they cannot be moved to `thread_local!` without rewriting
+/// codegen to go through a per-thread libcall.
+///
+/// This is a known race under no-GIL multi-thread JIT execution: concurrent
+/// threads will see each other's exception state via these globals.  Fixing
+/// it properly requires a per-thread slot (mirroring CPython's
+/// `tstate->curexc_*` approach), which is a larger refactor.
 static JIT_EXC_VALUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static JIT_EXC_TYPE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
