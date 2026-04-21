@@ -1632,29 +1632,35 @@ impl TraceRecordBuffer {
         self._pos
     }
 
-    /// opencoder.py:567-568 cut_point — snapshot `(pos, count, index,
-    /// snapshot_data_len, snapshot_array_data_len)`. Returned as a tuple
-    /// so `cut_at` can restore all five fields atomically.
-    pub fn cut_point(&self) -> (usize, u32, u32, usize, usize) {
-        (
-            self._pos,
-            self._count,
-            self._index,
-            self._snapshot_data.len(),
-            self._snapshot_array_data.len(),
-        )
+    /// opencoder.py:567-568 `cut_point` — 5-tuple `(_pos, _count, _index,
+    /// len(_snapshot_data), len(_snapshot_array_data))` returned as a
+    /// `TracePosition` struct so `cut_at` can restore all five fields
+    /// atomically (RPython uses a bare tuple; the Rust struct carries the
+    /// same shape plus field names).
+    pub fn cut_point(&self) -> crate::recorder::TracePosition {
+        crate::recorder::TracePosition {
+            _pos: self._pos,
+            _count: self._count,
+            _index: self._index,
+            snapshot_data_len: self._snapshot_data.len(),
+            snapshot_array_data_len: self._snapshot_array_data.len(),
+        }
     }
 
-    /// opencoder.py:570-575 cut_at(end) — restore the first three fields
-    /// of the cut_point tuple. The snapshot lengths are intentionally
-    /// NOT truncated in RPython (they grow monotonically for a single
-    /// trace; bridge compilation handles snapshot reuse separately).
-    pub fn cut_at(&mut self, end: (usize, u32, u32, usize, usize)) {
-        self._pos = end.0;
-        self._count = end.1;
-        self._index = end.2;
-        // `end.3`, `end.4` are the snapshot data lengths; RPython ignores
-        // them in `cut_at` — keep parity.
+    /// opencoder.py:570-575 `cut_at(end)` — restore the first three
+    /// fields of the cut_point tuple. The snapshot lengths are
+    /// intentionally NOT truncated in RPython (they grow monotonically
+    /// for a single trace; bridge compilation handles snapshot reuse
+    /// separately).
+    pub fn cut_at(&mut self, end: crate::recorder::TracePosition) {
+        self._pos = end._pos;
+        self._count = end._count;
+        // opencoder.py:574 `assert index >= 0` — guarded here by the
+        // `u32` type of `_index`.
+        self._index = end._index;
+        // `end.snapshot_data_len` / `end.snapshot_array_data_len` are
+        // ignored by `cut_at` in RPython — snapshot chains grow
+        // monotonically for a single trace. Parity preserved.
     }
 
     /// opencoder.py:577-578 `cut_trace_from((start, count, index, _, _),
@@ -1668,14 +1674,14 @@ impl TraceRecordBuffer {
     /// acting as fresh inputargs for the resumed trace.
     pub fn cut_trace_from(
         &self,
-        cut: (usize, u32, u32, usize, usize),
+        cut: crate::recorder::TracePosition,
         inputargs: Vec<Box>,
     ) -> CutTrace<'_> {
         CutTrace {
             trace: self,
-            start: cut.0,
-            count: cut.1,
-            index: cut.2,
+            start: cut._pos,
+            count: cut._count,
+            index: cut._index,
             inputargs,
         }
     }
@@ -3598,11 +3604,14 @@ mod tests {
     fn test_cut_point_five_tuple_b9() {
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
         let before = buf.cut_point();
-        assert_eq!(before.0, buf._pos);
-        assert_eq!(before.1, buf._count);
-        assert_eq!(before.2, buf._index);
-        assert_eq!(before.3, buf._snapshot_data.len());
-        assert_eq!(before.4, buf._snapshot_array_data.len());
+        assert_eq!(before._pos, buf._pos);
+        assert_eq!(before._count, buf._count);
+        assert_eq!(before._index, buf._index);
+        assert_eq!(before.snapshot_data_len, buf._snapshot_data.len());
+        assert_eq!(
+            before.snapshot_array_data_len,
+            buf._snapshot_array_data.len()
+        );
 
         // Advance all five independently.
         buf.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
@@ -3610,17 +3619,20 @@ mod tests {
         buf._add_box_to_storage(TraceRecordBuffer::_encode_smallint(7));
         let _ = buf.create_top_snapshot(1, 10, array, &[], &[], true);
         let after = buf.cut_point();
-        assert_ne!(after.0, before.0);
-        assert_ne!(after.1, before.1); // _count bumped by guard.
-        assert_eq!(after.2, before.2); // _index did NOT bump (guard is void).
-        assert_ne!(after.3, before.3); // _snapshot_data grew.
-        assert_ne!(after.4, before.4); // _snapshot_array_data grew.
+        assert_ne!(after._pos, before._pos);
+        assert_ne!(after._count, before._count); // _count bumped by guard.
+        assert_eq!(after._index, before._index); // _index did NOT bump (guard is void).
+        assert_ne!(after.snapshot_data_len, before.snapshot_data_len);
+        assert_ne!(
+            after.snapshot_array_data_len,
+            before.snapshot_array_data_len
+        );
 
         // cut_at restores only the first three fields.
         buf.cut_at(before);
-        assert_eq!(buf._pos, before.0);
-        assert_eq!(buf._count, before.1);
-        assert_eq!(buf._index, before.2);
+        assert_eq!(buf._pos, before._pos);
+        assert_eq!(buf._count, before._count);
+        assert_eq!(buf._index, before._index);
     }
 
     /// Phase B7 smoke test: record a guard, then call
@@ -4155,9 +4167,9 @@ mod tests {
         let p1 = buf.cut_point();
         assert_ne!(p0, p1);
         buf.cut_at(p0);
-        assert_eq!(buf._pos, p0.0);
-        assert_eq!(buf._count, p0.1);
-        assert_eq!(buf._index, p0.2);
+        assert_eq!(buf._pos, p0._pos);
+        assert_eq!(buf._count, p0._count);
+        assert_eq!(buf._index, p0._index);
         // RPython's cut_at intentionally does NOT rewind the snapshot chains
         // (they grow monotonically). Only _pos/_count/_index come back.
     }

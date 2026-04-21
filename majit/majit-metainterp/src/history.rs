@@ -226,7 +226,7 @@ impl TreeLoop {
         use std::collections::{HashMap, HashSet, VecDeque};
 
         let num_original_inputargs = self.inputargs.len() as u32;
-        let cut_ops = &self.ops[start.ops_len..];
+        let cut_ops = &self.ops[start._pos..];
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
         let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
@@ -1069,8 +1069,11 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = crate::recorder::TracePosition {
-            op_count: 3,
-            ops_len: 1, // cut after op0
+            _pos: 1, // cut after op0
+            _count: 3,
+            _index: 3,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
         };
         let original_boxes = vec![OpRef(0), OpRef(1)];
         let original_box_types = vec![Type::Int, Type::Int];
@@ -1105,8 +1108,11 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = crate::recorder::TracePosition {
-            op_count: 3,
-            ops_len: 1, // cut after op0
+            _pos: 1, // cut after op0
+            _count: 3,
+            _index: 3,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
         };
         // original_boxes only has v0 — v2 is escaped
         let original_boxes = vec![OpRef(0)];
@@ -1140,8 +1146,11 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = crate::recorder::TracePosition {
-            op_count: 2,
-            ops_len: 1,
+            _pos: 1,
+            _count: 2,
+            _index: 2,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
         };
         let original_boxes = vec![OpRef(0)];
         let original_box_types = vec![Type::Int];
@@ -1175,8 +1184,11 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = crate::recorder::TracePosition {
-            op_count: 3,
-            ops_len: 2, // cut after op0 and op1
+            _pos: 2, // cut after op0 and op1
+            _count: 3,
+            _index: 3,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
         };
         let original_boxes = vec![OpRef(0)];
         let original_box_types = vec![Type::Int];

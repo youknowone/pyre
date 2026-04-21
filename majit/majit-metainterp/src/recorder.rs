@@ -9,17 +9,32 @@ use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 
 use crate::history::TreeLoop;
 
-/// opencoder.py: cut_point() — snapshot of trace recorder position.
+/// opencoder.py:567-568 `cut_point()` — RPython 5-tuple
+/// `(_pos, _count, _index, len(_snapshot_data), len(_snapshot_array_data))`.
 ///
-/// In RPython this is a 5-tuple `(_pos, _count, _index, snapshot_len, array_len)`.
-/// majit's structured IR ops make byte-level tracking and snapshot buffers
-/// unnecessary, so position reduces to op_count + ops.len().
+/// The byte-stream recorder (`TraceRecordBuffer`) fills in every field
+/// from its byte cursor / counter state.  The legacy `Vec<Op>` recorder
+/// (`recorder::Trace`, being migrated away in Step 2e.2b) maps `_pos` to
+/// the ops-Vec cursor (number of ops currently stored) and stores the
+/// running op count in `_count == _index` (recorder::Trace does not
+/// distinguish void-yielding ops from box-yielding ops).  Snapshot lens
+/// are 0 because `recorder::Trace` keeps snapshots as a separate
+/// `Vec<Snapshot>` side-table; the byte-stream migration retires that
+/// side-table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TracePosition {
-    /// Next OpRef index at this position (Trace.op_count).
-    pub op_count: u32,
-    /// Number of ops in the ops vec at this position.
-    pub ops_len: usize,
+    /// opencoder.py:475 `self._pos` — byte cursor for TRB, ops-Vec cursor
+    /// for `recorder::Trace`.
+    pub _pos: usize,
+    /// opencoder.py:497 `self._count` — total op count (including voids).
+    pub _count: u32,
+    /// opencoder.py:498 `self._index` — count of box-yielding (non-void)
+    /// ops; equals `_count` in `recorder::Trace`.
+    pub _index: u32,
+    /// opencoder.py:567 `len(self._snapshot_data)`.
+    pub snapshot_data_len: usize,
+    /// opencoder.py:567 `len(self._snapshot_array_data)`.
+    pub snapshot_array_data_len: usize,
 }
 
 /// The trace recorder: accumulates operations during tracing.
@@ -271,19 +286,23 @@ impl Trace {
 
     pub fn get_position(&self) -> TracePosition {
         TracePosition {
-            op_count: self.op_count,
-            ops_len: self.ops.len(),
+            _pos: self.ops.len(),
+            _count: self.op_count,
+            _index: self.op_count,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
         }
     }
 
-    /// opencoder.py: cut_at() — restore the recorder to a previously saved position.
+    /// opencoder.py:570-575 `cut_at(end)` — restore the recorder to a
+    /// previously saved position.
     ///
     /// Discards all operations recorded after `pos`. Used to undo a
     /// tentative JUMP after compile_trace succeeds or fails
     /// (pyjitpl.py:3195 finally: `self.history.cut(cut_at)`).
     pub fn cut(&mut self, pos: TracePosition) {
-        self.ops.truncate(pos.ops_len);
-        self.op_count = pos.op_count;
+        self.ops.truncate(pos._pos);
+        self.op_count = pos._count;
     }
 
     /// history.py:725 `length`: number of non-inputarg ops recorded so far.
@@ -1160,13 +1179,13 @@ mod tests {
     fn test_get_position_and_cut() {
         let mut rec = Trace::with_num_inputs(2);
         let pos0 = rec.get_position();
-        assert_eq!(pos0.ops_len, 0);
-        assert_eq!(pos0.op_count, 2); // 2 inputargs
+        assert_eq!(pos0._pos, 0);
+        assert_eq!(pos0._count, 2); // 2 inputargs
 
         let _a = rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         let pos1 = rec.get_position();
-        assert_eq!(pos1.ops_len, 1);
-        assert_eq!(pos1.op_count, 3);
+        assert_eq!(pos1._pos, 1);
+        assert_eq!(pos1._count, 3);
 
         let _b = rec.record_op(OpCode::IntSub, &[OpRef(0), OpRef(1)]);
         let _c = rec.record_op(OpCode::IntMul, &[OpRef(0), OpRef(1)]);
@@ -1179,7 +1198,7 @@ mod tests {
 
         // Can record more ops after cut
         let d = rec.record_op(OpCode::IntNeg, &[OpRef(0)]);
-        assert_eq!(d, OpRef(3)); // continues from pos1.op_count
+        assert_eq!(d, OpRef(3)); // continues from pos1._count
         assert_eq!(rec.num_ops(), 2);
 
         // Cut back to pos0 — should discard everything

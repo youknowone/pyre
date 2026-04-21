@@ -1417,7 +1417,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:269: cross-loop cut uses the inner loop's merge point.
         // Lookup by inner_key (not ctx.green_key which is the outer loop).
         ctx.get_merge_point_at(inner_key, ctx.header_pc)
-            .filter(|mp| mp.position.ops_len > 0)
+            .filter(|mp| mp.position._pos > 0)
             .map(|mp| (mp.header_pc, mp.original_box_types.clone()))
     }
 
@@ -2736,7 +2736,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut ctx = self.tracing.take().unwrap();
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
-                .filter(|mp| mp.position.ops_len > 0)
+                .filter(|mp| mp.position._pos > 0)
                 .map(|mp| {
                     (
                         mp.original_boxes.clone(),
@@ -2796,8 +2796,8 @@ impl<M: Clone> MetaInterp<M> {
         {
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] cut_trace_from: start.ops_len={} original_boxes={} trace_ops={} header_pc={}",
-                    start.ops_len,
+                    "[jit] cut_trace_from: start._pos={} original_boxes={} trace_ops={} header_pc={}",
+                    start._pos,
                     original_boxes.len(),
                     trace.ops.len(),
                     ctx.header_pc,
