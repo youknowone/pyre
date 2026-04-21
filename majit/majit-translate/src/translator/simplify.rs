@@ -621,10 +621,20 @@ pub fn transform_dead_op_vars_in_blocks(
         let annotated = annotator.annotated.borrow();
         let mut start_blocks = HashSet::new();
         for block in blocks {
-            let graph = annotated
+            // Upstream's `complete_helpers()` threads `added_blocks`
+            // into `simplify(block_subset=...)`, and `processblock()`
+            // keeps those entries in `added_blocks` even when the
+            // annotator resets `annotated[block]` to `None` (blocked
+            // or still-to-retry). Skip unannotated / blocked entries
+            // the same way the rest of `simplify()` ignores them —
+            // the annotator will revisit them on the next fixpoint
+            // iteration.
+            let Some(graph) = annotated
                 .get(&BlockKey::of(block))
                 .and_then(|graph| graph.as_ref())
-                .expect("transform_dead_op_vars_in_blocks: block missing from translator.annotator.annotated");
+            else {
+                continue;
+            };
             start_blocks.insert(BlockKey::of(&graph.borrow().startblock));
         }
         start_blocks
