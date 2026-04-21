@@ -417,13 +417,6 @@ pub enum Operand {
     Descr(Rc<DescrOperand>),
     /// `IndirectCallTargets` — list of jitcodes for `indirect_call`.
     IndirectCallTargets(IndirectCallTargets),
-    /// majit IR `OpCode` passed verbatim to `record_binop_*` /
-    /// `record_unary_*` dispatch arms. RPython's equivalent is a
-    /// `Constant(Address)` holding the low-level helper pointer; pyre's
-    /// in-process path carries the typed `majit_ir::OpCode` so the
-    /// assembler can forward it to `JitCodeBuilder::record_*` without a
-    /// lossy int-tag round-trip.
-    OpCode(majit_ir::OpCode),
 }
 
 impl Operand {

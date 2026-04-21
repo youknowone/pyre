@@ -35,7 +35,6 @@ use majit_translate::jitcode::BhCallDescr;
 use pyre_interpreter::CodeObject;
 use pyre_jit_trace::PyJitCode;
 
-use super::codewriter::CodeWriter;
 use super::cpu::Cpu;
 
 /// RPython: `rpython/jit/codewriter/effectinfo.py` `class CallInfoCollection`.
@@ -91,6 +90,23 @@ pub struct JitDriverStaticData {
     pub merge_point_pc: Option<usize>,
 }
 
+impl JitDriverStaticData {
+    /// Normalize `portal_graph` to the runtime raw-code identity when a
+    /// wrapper object is available. This keeps the stored field closer
+    /// to RPython's `jd.portal_graph is graph` contract: after
+    /// registration, every portal lookup/grab path sees the same raw
+    /// `CodeObject*` that execution paths derive from `w_code`.
+    pub(crate) fn canonicalized(mut self) -> Self {
+        if !self.w_code.is_null() {
+            self.portal_graph = unsafe {
+                pyre_interpreter::w_code_get_ptr(self.w_code as pyre_object::PyObjectRef)
+                    as *const CodeObject
+            };
+        }
+        self
+    }
+}
+
 /// RPython: `rpython/jit/codewriter/call.py:21` `class CallControl(object)`.
 pub struct CallControl {
     /// call.py:22 `virtualref_info = None` — class-level default,
@@ -128,12 +144,10 @@ pub struct CallControl {
 
     /// call.py:29 `self.jitcodes = {}` — map `{graph: jitcode}`.
     ///
-    /// pyre keys on the wrapping `w_code` object when available,
-    /// falling back to the raw `CodeObject*` only for tests or local
-    /// callers that have no wrapper pointer. That keeps the cache
-    /// closer to RPython's "graph object identity" and aligns it with
-    /// the trace-side `MetaInterpStaticData.by_code` table, which is
-    /// already keyed by `w_code`.
+    /// pyre keys on the canonical raw `CodeObject*` graph identity.
+    /// Callers normalize wrapper-backed runtime inputs before they
+    /// reach `CallControl`, so the cache itself can stay a plain
+    /// `{graph: jitcode}` map like RPython's.
     ///
     /// Values are `Arc<PyJitCode>` so the same allocation can sit in
     /// `MetaInterpStaticData.jitcodes` too. RPython's two stores hold
@@ -152,18 +166,11 @@ pub struct CallControl {
     /// new graph and drained by `enum_pending_graphs()` inside
     /// `make_jitcodes()` (codewriter.py:79).
     ///
-    /// pyre stores `(code_ptr, w_code, merge_point_pc)` triples instead
-    /// of bare graphs because the drain loop — pyre's analog of
-    /// `transform_graph_to_jitcode(graph, jitcode, ...)` at
-    /// codewriter.py:80 — needs `w_code` so the resulting `Arc<PyJitCode>`
-    /// is keyed correctly in `MetaInterpStaticData.jitcodes`, and
-    /// `merge_point_pc` because pyre's `transform_graph_to_jitcode`
-    /// consumes it as the trace-entry hint (RPython has no analog
-    /// because portal PCs are statically known). RPython's Assembler
-    /// reads the `w_code`-equivalent identity off each `JitCode`
-    /// directly; pyre's `state::JitCode` is keyed on `w_code` so we
-    /// carry it through.
-    pub unfinished_graphs: Vec<(*const CodeObject, *const (), Option<usize>)>,
+    /// pyre now mirrors the upstream queue shape and stores bare graph
+    /// pointers again. The pyre-only `w_code` and `merge_point_pc`
+    /// refinements live on the cached `PyJitCode` skeleton instead and
+    /// are recovered from there by the drain loop.
+    pub unfinished_graphs: Vec<*const CodeObject>,
 
     /// call.py:31 `self.callinfocollection = CallInfoCollection()`.
     ///
@@ -226,10 +233,8 @@ impl CallControl {
     /// directly after `make_jitcodes()` has populated the dict; no
     /// compilation side effect. Returns `None` if `code` has not been
     /// compiled yet.
-    pub fn find_jitcode(&self, code: *const CodeObject, w_code: *const ()) -> Option<&PyJitCode> {
-        self.jitcodes
-            .get(&Self::jitcode_key(code, w_code))
-            .map(|arc| arc.as_ref())
+    pub fn find_jitcode(&self, code: *const CodeObject) -> Option<&PyJitCode> {
+        self.jitcodes.get(&(code as usize)).map(|arc| arc.as_ref())
     }
 
     /// `Arc`-cloning variant used by the trace-side `state::jitcode_for`
@@ -238,13 +243,9 @@ impl CallControl {
     /// `MetaInterpStaticData.jitcodes` and `CallControl.jitcodes`
     /// hold the same Python `JitCode` objects via refcount semantics;
     /// this helper is the Rust analog.
-    pub fn find_jitcode_arc(
-        &self,
-        code: *const CodeObject,
-        w_code: *const (),
-    ) -> Option<std::sync::Arc<PyJitCode>> {
+    pub fn find_jitcode_arc(&self, code: *const CodeObject) -> Option<std::sync::Arc<PyJitCode>> {
         self.jitcodes
-            .get(&Self::jitcode_key(code, w_code))
+            .get(&(code as usize))
             .map(std::sync::Arc::clone)
     }
 
@@ -265,13 +266,23 @@ impl CallControl {
     pub fn find_compiled_jitcode_arc(
         &self,
         code: *const CodeObject,
-        w_code: *const (),
     ) -> Option<std::sync::Arc<PyJitCode>> {
-        let arc = self.jitcodes.get(&Self::jitcode_key(code, w_code))?;
+        let arc = self.jitcodes.get(&(code as usize))?;
         if !arc.is_populated() {
             return None;
         }
         Some(std::sync::Arc::clone(arc))
+    }
+
+    /// Recover the pyre-only inputs the drain needs for a queued graph.
+    /// The queue itself keeps RPython's bare `graph` shape; the extra
+    /// runtime identity/refinement data lives on the cached skeleton.
+    pub fn queued_graph_inputs(
+        &self,
+        code: *const CodeObject,
+    ) -> Option<(*const (), Option<usize>)> {
+        let arc = self.jitcodes.get(&(code as usize))?;
+        Some((arc.w_code, arc.merge_point_pc))
     }
 
     /// Reverse lookup: find the `PyJitCode` whose inner `JitCode` matches
@@ -300,10 +311,10 @@ impl CallControl {
     ///     yield graph, self.jitcodes[graph]
     /// ```
     ///
-    /// pyre returns the queue tuple per call (no `&PyJitCode` since the
-    /// drain replaces the entry by re-running
-    /// `transform_graph_to_jitcode`); callers loop until `None`.
-    pub fn enum_pending_graphs(&mut self) -> Option<(*const CodeObject, *const (), Option<usize>)> {
+    /// pyre now mirrors the upstream return shape and yields the bare
+    /// graph pointer. The drain recovers pyre-only runtime inputs from
+    /// the cached skeleton stored in `self.jitcodes[graph]`.
+    pub fn enum_pending_graphs(&mut self) -> Option<*const CodeObject> {
         self.unfinished_graphs.pop()
     }
 
@@ -393,7 +404,13 @@ impl CallControl {
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) -> &'static PyJitCode {
-        let key = Self::jitcode_key(code as *const CodeObject, w_code);
+        // RPython's `get_jitcode(graph)` receives the exact graph object
+        // the dict is keyed by. Match that by requiring callers to pass
+        // the canonical raw graph here; portal setup canonicalizes
+        // `jd.portal_graph` once, and the lazy trace-side callback
+        // unwraps `w_code` before calling into `CallControl`.
+        let code_ptr = code as *const CodeObject;
+        let key = code_ptr as usize;
         let needs_rebuild = if let Some(existing) = self.jitcodes.get(&key) {
             merge_point_pc.is_some() && existing.merge_point_pc != merge_point_pc
         } else {
@@ -406,13 +423,12 @@ impl CallControl {
             // `CodeWriter::make_jitcodes`'s drain loop at
             // codewriter.py:80 `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
-            self.reset_jitcode_skeleton(key, merge_point_pc);
+            self.reset_jitcode_skeleton(key, w_code, merge_point_pc);
             // call.py:171 `self.unfinished_graphs.append(graph)`. pyre
             // also re-pushes on a merge_point_pc refinement so the
             // drain picks the refined entry up again for the recompile
             // — see `make_jitcodes` at codewriter.rs.
-            self.unfinished_graphs
-                .push((code as *const CodeObject, w_code, merge_point_pc));
+            self.unfinished_graphs.push(code_ptr);
         }
         let entry = self.jitcodes.get(&key).unwrap();
         // SAFETY: the per-thread `CodeWriter` singleton lives for the
@@ -441,16 +457,21 @@ impl CallControl {
     /// (codewriter.py:67) on it. Mutates the cached object in place
     /// via `Arc::get_mut` when the slot is still unique; falls back to
     /// `Arc` replacement only when another store has already cloned it.
-    pub fn reset_jitcode_skeleton(&mut self, key: usize, merge_point_pc: Option<usize>) {
+    pub fn reset_jitcode_skeleton(
+        &mut self,
+        key: usize,
+        w_code: *const (),
+        merge_point_pc: Option<usize>,
+    ) {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
             if let Some(existing) = std::sync::Arc::get_mut(slot) {
-                *existing = PyJitCode::skeleton(merge_point_pc);
+                *existing = PyJitCode::skeleton(w_code, merge_point_pc);
                 return;
             }
         }
         self.jitcodes.insert(
             key,
-            std::sync::Arc::new(PyJitCode::skeleton(merge_point_pc)),
+            std::sync::Arc::new(PyJitCode::skeleton(w_code, merge_point_pc)),
         );
     }
 
@@ -483,12 +504,8 @@ impl CallControl {
         raw_ptr
     }
 
-    pub(crate) fn jitcode_key(code: *const CodeObject, w_code: *const ()) -> usize {
-        if !w_code.is_null() {
-            w_code as usize
-        } else {
-            code as usize
-        }
+    pub(crate) fn jitcode_key(code: *const CodeObject) -> usize {
+        code as usize
     }
 }
 

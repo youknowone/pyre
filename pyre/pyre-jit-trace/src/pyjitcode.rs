@@ -11,7 +11,8 @@
 //!     codewriter `majit_translate::jitcode::JitCode`.
 //!   * `PyJitCode` (this struct) wraps that JitCode together with
 //!     pyre-only translation metadata — `pc_map` (Python PC → byte
-//!     offset), `merge_point_pc`, register layout — that RPython
+//!     offset), `merge_point_pc`, the runtime `w_code` wrapper, and
+//!     register layout — that RPython
 //!     does not need because RPython's bytecode PCs are already
 //!     JitCode PCs.
 //!
@@ -59,6 +60,11 @@ pub struct PyJitCodeMetadata {
 pub struct PyJitCode {
     pub jitcode: std::sync::Arc<RuntimeJitCode>,
     pub metadata: PyJitCodeMetadata,
+    /// pyre-only: the `W_CodeObject` wrapper this jitcode was compiled
+    /// for. Stored on the shared payload so `CallControl` can recover
+    /// the runtime code identity during its `unfinished_graphs` drain
+    /// without carrying a parallel `(graph, w_code, ...)` queue.
+    pub w_code: *const (),
     /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
     /// Precomputed at compile time to avoid repeated bytecode scanning.
     pub has_abort: bool,
@@ -94,10 +100,9 @@ impl PyJitCode {
     /// `get_jitcode` calls (or pyre's `merge_point_pc` refinement
     /// shortcut) can find an existing key without recompiling.
     ///
-    /// Until the drain replaces the slot, the only field with meaningful
-    /// content is `merge_point_pc` (the refinement hint passed in by
-    /// `get_jitcode`).
-    pub fn skeleton(merge_point_pc: Option<usize>) -> Self {
+    /// Until the drain replaces the slot, the only fields with
+    /// meaningful content are `w_code` and `merge_point_pc`.
+    pub fn skeleton(w_code: *const (), merge_point_pc: Option<usize>) -> Self {
         Self {
             jitcode: std::sync::Arc::new(RuntimeJitCode::default()),
             metadata: PyJitCodeMetadata {
@@ -107,6 +112,7 @@ impl PyJitCode {
                 portal_ec_reg: 0,
                 stack_base: 0,
             },
+            w_code,
             has_abort: false,
             merge_point_pc,
         }

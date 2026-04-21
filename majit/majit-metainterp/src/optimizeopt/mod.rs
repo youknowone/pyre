@@ -3544,8 +3544,21 @@ impl OptContext {
     pub fn clear_newoperations(&mut self) {
         self.new_operations.clear();
         // Reset next_pos to the iteration's first fresh OpRef position
-        // (right after the inputarg slice in the OpRef namespace).
-        self.next_pos = self.inputarg_base + self.num_inputs;
+        // (right after the inputarg slice in the OpRef namespace), but
+        // never below an already-registered value_types position. The
+        // context survives across iterations (e.g. Phase 2 final_ctx
+        // reused as `jump_ctx` for short-preamble inlining), so every
+        // previously emitted op still sits in `value_types`. `reserve_pos`
+        // only skips constants; without accounting for the typed slots
+        // here, a subsequent `alloc_op_position` would hand out a pos
+        // already typed in the prior iteration and trip the Box.type
+        // retype invariant at `register_value_type`.
+        let base = self.inputarg_base + self.num_inputs;
+        self.next_pos = if let Some(&max_typed_pos) = self.value_types.keys().max() {
+            base.max(max_typed_pos.saturating_add(1))
+        } else {
+            base
+        };
         self.const_infos.clear();
     }
 

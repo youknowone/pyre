@@ -697,23 +697,12 @@ fn dispatch_op(
                 .vable_arraylen(dst, expect_small_u16(&args[0]));
         }
         "hint_force_virtualizable" => state.builder.vable_force(),
-        "record_binop_i" => {
-            let dst = expect_result_reg(result, Kind::Int, "record_binop_i needs result");
-            state.builder.record_binop_i(
-                dst,
-                expect_opcode(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-                expect_reg(&args[2], Kind::Int),
-            );
-        }
         // `rpython/jit/metainterp/resoperation.py` / `jtransform.py`
         // emit per-OpCode opnames for integer comparisons and
-        // arithmetic. pyre routes these through the same
-        // `record_binop_i` builder (no IR-level difference because
-        // pyre's tracer emits the specific `OpCode` at trace time),
-        // but the SSARepr carries the RPython-parity opname so the
-        // Phase 3c switchover can reproduce the byte-level dispatch
-        // without a pyre-only `record_binop_i` entry.
+        // arithmetic. pyre currently only emits `int_eq` at the
+        // SSARepr layer (via the `PopJumpIfTrue` branch-folding chain
+        // in `codewriter.rs`); additional per-opname entries land here
+        // when their emitter appears.
         "int_eq" => {
             let dst = expect_result_reg(result, Kind::Int, "int_eq needs result");
             state.builder.record_binop_i(
@@ -721,31 +710,6 @@ fn dispatch_op(
                 majit_ir::OpCode::IntEq,
                 expect_reg(&args[0], Kind::Int),
                 expect_reg(&args[1], Kind::Int),
-            );
-        }
-        "record_binop_f" => {
-            let dst = expect_result_reg(result, Kind::Float, "record_binop_f needs result");
-            state.builder.record_binop_f(
-                dst,
-                expect_opcode(&args[0]),
-                expect_reg(&args[1], Kind::Float),
-                expect_reg(&args[2], Kind::Float),
-            );
-        }
-        "record_unary_i" => {
-            let dst = expect_result_reg(result, Kind::Int, "record_unary_i needs result");
-            state.builder.record_unary_i(
-                dst,
-                expect_opcode(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-            );
-        }
-        "record_unary_f" => {
-            let dst = expect_result_reg(result, Kind::Float, "record_unary_f needs result");
-            state.builder.record_unary_f(
-                dst,
-                expect_opcode(&args[0]),
-                expect_reg(&args[1], Kind::Float),
             );
         }
         "call_void" | "residual_call_void" => {
@@ -1124,21 +1088,6 @@ fn expect_small_u16(op: &Operand) -> u16 {
     match op {
         Operand::ConstInt(value) => u16::try_from(*value).expect("expected u16-sized ConstInt"),
         _ => panic!("expected ConstInt(u16), got {:?}", op),
-    }
-}
-
-/// `record_binop_*` / `record_unary_*` arg decoder.
-///
-/// The recorded op is passed as `Operand::OpCode(majit_ir::OpCode)`
-/// matching `JitCodeBuilder::record_*`'s signature. RPython's
-/// `codewriter/assembler.py` does not narrow this to a fixed enum; the
-/// opcode is an `AbstractDescr` equivalent and the record path in the
-/// metainterp consumes whatever is passed, so any valid `OpCode` must
-/// round-trip through here without a hand-maintained allowlist.
-fn expect_opcode(op: &Operand) -> majit_ir::OpCode {
-    match op {
-        Operand::OpCode(code) => *code,
-        _ => panic!("expected OpCode operand, got {:?}", op),
     }
 }
 

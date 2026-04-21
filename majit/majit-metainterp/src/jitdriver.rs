@@ -941,7 +941,15 @@ impl<S: JitState> JitDriver<S> {
                 };
                 if S::validate_close(sym, &trace_meta) {
                     let jump_args = S::collect_jump_args(sym);
-                    let provisional_meta = self.meta.take_trace_meta().unwrap();
+                    // pyjitpl.py:2993-3036 parity: compile_loop borrows the
+                    // frontend meta the same way `self.history` is a shared
+                    // mutable object on the RPython MetaInterp — the caller
+                    // does not drain it. Read via `trace_meta().cloned()` so
+                    // the `active_trace_session` envelope stays live for the
+                    // duration of the compile. `compile_loop` itself owns
+                    // the post-exit invariant that session lifetime tracks
+                    // `self.tracing` (see `compile_loop` wrapper).
+                    let provisional_meta = self.meta.trace_meta().cloned().unwrap();
                     // When cross-loop cut redirects to a different header_pc,
                     // rebuild meta from merge point to get the inner header's
                     // frame layout (vsd, slot_types).
@@ -953,18 +961,22 @@ impl<S: JitState> JitDriver<S> {
                         }
                     };
                     // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
-                    let meta_backup = meta.clone();
                     let outcome = self.meta.compile_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
-                            // pyjitpl.py:3095 raise_if_successful → done
+                            // pyjitpl.py:3095 raise_if_successful → done.
+                            // compile_loop already drained tracing+session.
                         }
                         crate::CompileOutcome::Cancelled => {
-                            // pyjitpl.py:3018-3019 cancel_count incremented inside
-                            // compile_loop. Tracing continues — next loop header
-                            // will retry compile_loop with accumulated cancel_count.
-                            self.meta.begin_trace_session(meta_backup);
-                            return;
+                            // pyjitpl.py:3018-3032 parity: cancel_count is
+                            // incremented inside compile_loop and tracing
+                            // continues unless `cancelled_too_many_times`
+                            // escalates to Aborted. The wrapper restored
+                            // session↔tracing alignment so no extra cleanup
+                            // is required here — either the early-Cancelled
+                            // path kept both live (tracing continues) or a
+                            // late-Cancelled path drained both (next bound
+                            // reaches begins a fresh session).
                         }
                         crate::CompileOutcome::Aborted => {
                             // pyjitpl.py:3028 SwitchToBlackhole(ABORT_BAD_LOOP)
@@ -1050,7 +1062,11 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 };
                 if S::validate_close_with_jump_args(sym, &trace_meta, &jump_args) {
-                    let provisional_meta = self.meta.take_trace_meta().unwrap();
+                    // pyjitpl.py:2993-3036 parity: keep `active_trace_session`
+                    // alive across compile_loop — the session envelope mirrors
+                    // RPython's `self.history` which compile_loop borrows
+                    // without consuming.
+                    let provisional_meta = self.meta.trace_meta().cloned().unwrap();
                     let meta = {
                         if let Some((cut_pc, ref cut_types)) = self.meta.cross_loop_cut_info() {
                             S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_types)
@@ -1059,16 +1075,16 @@ impl<S: JitState> JitDriver<S> {
                         }
                     };
                     // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
-                    let meta_backup = meta.clone();
                     let outcome = self.meta.compile_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
-                            // pyjitpl.py:3095 raise_if_successful → done
+                            // pyjitpl.py:3095 raise_if_successful → done.
                         }
                         crate::CompileOutcome::Cancelled => {
-                            // pyjitpl.py:3018-3019 tracing continues.
-                            self.meta.begin_trace_session(meta_backup);
-                            return;
+                            // pyjitpl.py:3018-3032 parity: no explicit abort,
+                            // tracing continues (or is already drained inside
+                            // compile_loop for late-cancel cases). The wrapper
+                            // maintains the session↔tracing invariant.
                         }
                         crate::CompileOutcome::Aborted => {
                             // pyjitpl.py:3028 SwitchToBlackhole

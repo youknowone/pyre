@@ -1243,6 +1243,7 @@ impl CodeWriter {
     /// jd's `merge_point_pc` so the refinement hint propagates into
     /// the next `grab_initial_jitcodes` pass.
     pub fn setup_jitdriver(&self, jitdriver_sd: super::call::JitDriverStaticData) {
+        let jitdriver_sd = jitdriver_sd.canonicalized();
         let cc = self.callcontrol();
         if let Some(existing) = cc
             .jitdrivers_sd
@@ -3192,6 +3193,7 @@ impl CodeWriter {
         self.finalize_jitcode(
             assembler,
             ssarepr,
+            w_code,
             code,
             pc_map,
             depth_at_pc,
@@ -3227,6 +3229,7 @@ impl CodeWriter {
         &self,
         assembler: SSAReprEmitter,
         ssarepr: SSARepr,
+        w_code: *const (),
         code: &CodeObject,
         pc_map: Vec<usize>,
         depth_at_pc: Vec<u16>,
@@ -3287,6 +3290,7 @@ impl CodeWriter {
         PyJitCode {
             jitcode: std::sync::Arc::new(jitcode),
             metadata,
+            w_code,
             has_abort,
             merge_point_pc,
         }
@@ -3357,9 +3361,13 @@ impl CodeWriter {
         // codewriter.py:79 `for graph, jitcode in enum_pending_graphs():`.
         loop {
             let popped = self.callcontrol().enum_pending_graphs();
-            let Some((code_ptr, w_code, merge_point_pc)) = popped else {
+            let Some(code_ptr) = popped else {
                 break;
             };
+            let (w_code, merge_point_pc) = self
+                .callcontrol()
+                .queued_graph_inputs(code_ptr)
+                .expect("queued graph must still have a cached skeleton");
             // codewriter.py:80 `self.transform_graph_to_jitcode(graph,
             //                     jitcode, verbose, len(all_jitcodes))`.
             //
@@ -3372,7 +3380,7 @@ impl CodeWriter {
             // `Arc`.
             let pyjitcode =
                 self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
-            let key = super::call::CallControl::jitcode_key(code_ptr, w_code);
+            let key = code_ptr as usize;
             let raw_ptr = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
             all_jitcodes.push(raw_ptr);
@@ -3415,12 +3423,7 @@ impl CodeWriter {
             .jitdrivers_sd
             .iter()
             .enumerate()
-            .map(|(idx, jd)| {
-                (
-                    super::call::CallControl::jitcode_key(jd.portal_graph, jd.w_code),
-                    idx,
-                )
-            })
+            .map(|(idx, jd)| (super::call::CallControl::jitcode_key(jd.portal_graph), idx))
             .collect();
         for (key, idx) in assignments {
             if let Some(arc) = cc.jitcodes.get_mut(&key) {
@@ -3578,7 +3581,7 @@ fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitC
     let code = unsafe { &*raw_code };
     if let Some(existing) = CodeWriter::instance()
         .callcontrol()
-        .find_compiled_jitcode_arc(code as *const _, w_code)
+        .find_compiled_jitcode_arc(code as *const _)
     {
         return Some(existing);
     }
@@ -3587,7 +3590,7 @@ fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitC
     // SD entry stores the same allocation as `CallControl.jitcodes`.
     CodeWriter::instance()
         .callcontrol()
-        .find_compiled_jitcode_arc(code as *const _, w_code)
+        .find_compiled_jitcode_arc(code as *const _)
 }
 
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where
@@ -3712,15 +3715,47 @@ mod tests {
     }
 
     #[test]
+    fn get_jitcode_queues_canonical_raw_graph_only() {
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code_ref = unsafe { &*raw_code };
+
+        let _ = writer
+            .callcontrol()
+            .get_jitcode(code_ref, w_code as *const (), Some(11));
+
+        let queued = writer
+            .callcontrol()
+            .enum_pending_graphs()
+            .expect("fresh jitcode must queue one graph");
+        let (queued_w_code, queued_merge_point_pc) = writer
+            .callcontrol()
+            .queued_graph_inputs(raw_code)
+            .expect("queued graph must still have a cached skeleton");
+
+        assert_eq!(queued, raw_code);
+        assert_eq!(queued_w_code, w_code as *const ());
+        assert_eq!(queued_merge_point_pc, Some(11));
+    }
+
+    #[test]
     fn drain_unfinished_graphs_preserves_unique_pyjitcode_identity() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let w_code = pyre_interpreter::box_code_constant(&code);
-        let key = w_code as *const () as usize;
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code_ref = unsafe { &*raw_code };
+        let key = raw_code as usize;
 
         let _ = writer
             .callcontrol()
-            .get_jitcode(&code, w_code as *const (), None);
+            .get_jitcode(code_ref, w_code as *const (), None);
         let skeleton_ptr = {
             let slot = writer
                 .callcontrol()
@@ -3745,14 +3780,12 @@ mod tests {
             populated_ptr, skeleton_ptr,
             "unique skeleton Arc should be filled in place"
         );
-        let pyjit = writer
-            .callcontrol()
-            .find_jitcode(&code as *const _, w_code as *const ())
-            .unwrap();
+        let pyjit = writer.callcontrol().find_jitcode(raw_code).unwrap();
         assert!(
             !pyjit.metadata.pc_map.is_empty(),
             "drain must populate bytecode metadata on the existing entry"
         );
+        assert_eq!(pyjit.w_code, w_code as *const ());
     }
 
     #[test]
@@ -3926,21 +3959,19 @@ mod tests {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let w_code = pyre_interpreter::box_code_constant(&code);
-        let code_ptr = &code as *const pyre_interpreter::CodeObject;
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code_ref = unsafe { &*raw_code };
 
         let _ = writer
             .callcontrol()
-            .get_jitcode(&code, w_code as *const (), None);
+            .get_jitcode(code_ref, w_code as *const (), None);
+        assert!(writer.callcontrol().find_jitcode_arc(raw_code).is_some());
         assert!(
             writer
                 .callcontrol()
-                .find_jitcode_arc(code_ptr, w_code as *const ())
-                .is_some()
-        );
-        assert!(
-            writer
-                .callcontrol()
-                .find_compiled_jitcode_arc(code_ptr, w_code as *const ())
+                .find_compiled_jitcode_arc(raw_code)
                 .is_none(),
             "fresh shells must not be treated as populated jitcodes"
         );
@@ -3949,7 +3980,7 @@ mod tests {
         assert!(
             writer
                 .callcontrol()
-                .find_compiled_jitcode_arc(code_ptr, w_code as *const ())
+                .find_compiled_jitcode_arc(raw_code)
                 .is_some(),
             "drained jitcodes must become visible through the compiled-only lookup"
         );
@@ -3968,7 +3999,7 @@ mod tests {
         compile_jitcode_for_callee(code_ref, w_code as *const ());
         let cached = writer
             .callcontrol()
-            .find_compiled_jitcode_arc(code_ptr, w_code as *const ())
+            .find_compiled_jitcode_arc(code_ptr)
             .expect("callee compile must cache a populated jitcode");
 
         let returned = compile_jitcode_via_w_code(w_code as *const ())
@@ -4115,5 +4146,32 @@ mod tests {
         assert_eq!(existing_borrow.exits.len(), 1);
         let forwarded = existing_borrow.exits[0].borrow();
         assert_eq!(forwarded.target, Some(merged.block()));
+    }
+
+    #[test]
+    fn setup_jitdriver_dedups_by_runtime_code_identity() {
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: &code as *const _,
+            w_code: w_code as *const (),
+            merge_point_pc: None,
+        });
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: raw_code,
+            w_code: w_code as *const (),
+            merge_point_pc: Some(7),
+        });
+
+        let cc = writer.callcontrol();
+        assert_eq!(cc.jitdrivers_sd.len(), 1);
+        assert_eq!(cc.jitdrivers_sd[0].portal_graph, raw_code);
+        assert_eq!(cc.jitdrivers_sd[0].merge_point_pc, Some(7));
+        assert_eq!(cc.jitdriver_sd_from_portal_graph(raw_code), Some(0));
     }
 }

@@ -769,8 +769,7 @@ pub fn resume_in_blackhole(
         // call.py:148: jitcode via jitcodes dict lookup (jitdriver_sd
         // set on portal). virtualizable.py:126-137: code from resume
         // data, not heap. Lookup-only: trace setup already compiled.
-        let w_code = section.code;
-        let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _, w_code) {
+        let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
             Some(pjc) => pjc,
             None => {
                 release_chain_bh(prev_bh);
@@ -1596,21 +1595,12 @@ pub fn blackhole_resume_via_rd_numb(
         if pc < 0 {
             return None;
         }
-        let code_ptr = pyre_jit_trace::state::code_for_jitcode_index(jitcode_index)?;
-        if code_ptr.is_null() {
-            return None;
-        }
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
+        let raw_code = pyre_jit_trace::state::raw_code_for_jitcode_index(jitcode_index)?;
         if raw_code.is_null() {
             return None;
         }
         let code = unsafe { &*raw_code };
-        let pyjitcode = writer
-            .callcontrol()
-            .find_jitcode(code as *const _, code_ptr)?;
+        let pyjitcode = writer.callcontrol().find_jitcode(code as *const _)?;
         if pyjitcode.has_abort_opcode() {
             return None;
         }

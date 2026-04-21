@@ -799,63 +799,37 @@ where
                 );
             }
 
-            jitcode::BC_RECORD_BINOP_I => {
-                let (dst, lhs_idx, rhs_idx, opcode) = {
-                    let frame = self.frames.current_mut();
-                    let dst = frame.next_u16() as usize;
-                    let opcode_idx = frame.next_u16() as usize;
-                    let lhs_idx = frame.next_u16() as usize;
-                    let rhs_idx = frame.next_u16() as usize;
-                    let opcode = *frame
-                        .jitcode
-                        .exec
-                        .opcodes
-                        .get(opcode_idx)
-                        .expect("jitcode opcode index out of bounds");
-                    (dst, lhs_idx, rhs_idx, opcode)
-                };
-                let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
-                let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
-                if opcode.is_ovf() {
-                    // Overflow-checked op: abort trace if overflow occurs.
-                    match eval_binop_ovf(opcode, lhs_value, rhs_value) {
-                        Some(value) => {
-                            let result = ctx.record_op(opcode, &[lhs, rhs]);
-                            let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                            Self::record_state_guard(
-                                ctx,
-                                sym,
-                                OpCode::GuardNoOverflow,
-                                &[],
-                                &[resume_pc],
-                            );
-                            self.set_int_reg(dst, Some(result), Some(value));
-                        }
-                        None => return TraceAction::Abort,
-                    }
-                } else {
-                    let value = eval_binop_i(opcode, lhs_value, rhs_value);
-                    self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
-                }
-            }
-            jitcode::BC_RECORD_UNARY_I => {
-                let (dst, src_idx, opcode) = {
-                    let frame = self.frames.current_mut();
-                    let dst = frame.next_u16() as usize;
-                    let opcode_idx = frame.next_u16() as usize;
-                    let src_idx = frame.next_u16() as usize;
-                    let opcode = *frame
-                        .jitcode
-                        .exec
-                        .opcodes
-                        .get(opcode_idx)
-                        .expect("jitcode opcode index out of bounds");
-                    (dst, src_idx, opcode)
-                };
-                let (src, src_value) = self.read_int_reg(src_idx);
-                let value = eval_unary_i(opcode, src_value);
-                self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
-            }
+            // Per-opname integer arithmetic tracer handlers. RPython
+            // `pyjitpl.py` emits one `opimpl_int_<op>` per primitive
+            // (`pyjitpl.py:1460-1513`); pyre's hardcoded tracer match
+            // collapses the shape through `trace_binop_i`, which records
+            // the constant `OpCode` and updates the shadow register.
+            jitcode::BC_INT_ADD => self.trace_binop_i(ctx, OpCode::IntAdd),
+            jitcode::BC_INT_SUB => self.trace_binop_i(ctx, OpCode::IntSub),
+            jitcode::BC_INT_MUL => self.trace_binop_i(ctx, OpCode::IntMul),
+            jitcode::BC_INT_FLOORDIV => self.trace_binop_i(ctx, OpCode::IntFloorDiv),
+            jitcode::BC_INT_MOD => self.trace_binop_i(ctx, OpCode::IntMod),
+            jitcode::BC_INT_AND => self.trace_binop_i(ctx, OpCode::IntAnd),
+            jitcode::BC_INT_OR => self.trace_binop_i(ctx, OpCode::IntOr),
+            jitcode::BC_INT_XOR => self.trace_binop_i(ctx, OpCode::IntXor),
+            jitcode::BC_INT_LSHIFT => self.trace_binop_i(ctx, OpCode::IntLshift),
+            jitcode::BC_INT_RSHIFT => self.trace_binop_i(ctx, OpCode::IntRshift),
+            jitcode::BC_INT_EQ => self.trace_binop_i(ctx, OpCode::IntEq),
+            jitcode::BC_INT_NE => self.trace_binop_i(ctx, OpCode::IntNe),
+            jitcode::BC_INT_LT => self.trace_binop_i(ctx, OpCode::IntLt),
+            jitcode::BC_INT_LE => self.trace_binop_i(ctx, OpCode::IntLe),
+            jitcode::BC_INT_GT => self.trace_binop_i(ctx, OpCode::IntGt),
+            jitcode::BC_INT_GE => self.trace_binop_i(ctx, OpCode::IntGe),
+            jitcode::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
+            jitcode::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
+            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`
+            // + `pyjitpl.py:281-283` opimpl rolls.
+            jitcode::BC_UINT_RSHIFT => self.trace_binop_i(ctx, OpCode::UintRshift),
+            jitcode::BC_UINT_MUL_HIGH => self.trace_binop_i(ctx, OpCode::UintMulHigh),
+            jitcode::BC_UINT_LT => self.trace_binop_i(ctx, OpCode::UintLt),
+            jitcode::BC_UINT_LE => self.trace_binop_i(ctx, OpCode::UintLe),
+            jitcode::BC_UINT_GT => self.trace_binop_i(ctx, OpCode::UintGt),
+            jitcode::BC_UINT_GE => self.trace_binop_i(ctx, OpCode::UintGe),
             jitcode::BC_BRANCH_REG_ZERO => {
                 let (cond_idx, target) = {
                     let frame = self.frames.current_mut();
@@ -1664,44 +1638,14 @@ where
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 }
             }
-            jitcode::BC_RECORD_BINOP_F => {
-                let (dst, lhs_idx, rhs_idx, opcode) = {
-                    let frame = self.frames.current_mut();
-                    let dst = frame.next_u16() as usize;
-                    let opcode_idx = frame.next_u16() as usize;
-                    let lhs_idx = frame.next_u16() as usize;
-                    let rhs_idx = frame.next_u16() as usize;
-                    let opcode = *frame
-                        .jitcode
-                        .exec
-                        .opcodes
-                        .get(opcode_idx)
-                        .expect("jitcode opcode index out of bounds");
-                    (dst, lhs_idx, rhs_idx, opcode)
-                };
-                let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
-                let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
-                let value = eval_binop_f(opcode, lhs_value, rhs_value);
-                self.set_float_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
-            }
-            jitcode::BC_RECORD_UNARY_F => {
-                let (dst, src_idx, opcode) = {
-                    let frame = self.frames.current_mut();
-                    let dst = frame.next_u16() as usize;
-                    let opcode_idx = frame.next_u16() as usize;
-                    let src_idx = frame.next_u16() as usize;
-                    let opcode = *frame
-                        .jitcode
-                        .exec
-                        .opcodes
-                        .get(opcode_idx)
-                        .expect("jitcode opcode index out of bounds");
-                    (dst, src_idx, opcode)
-                };
-                let (src, src_value) = self.read_float_reg(src_idx);
-                let value = eval_unary_f(opcode, src_value);
-                self.set_float_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
-            }
+            // Per-opname float tracer arms — RPython
+            // `pyjitpl.py:1561-1573` `opimpl_float_{add,sub,mul,...}`.
+            jitcode::BC_FLOAT_ADD => self.trace_binop_f(ctx, OpCode::FloatAdd),
+            jitcode::BC_FLOAT_SUB => self.trace_binop_f(ctx, OpCode::FloatSub),
+            jitcode::BC_FLOAT_MUL => self.trace_binop_f(ctx, OpCode::FloatMul),
+            jitcode::BC_FLOAT_TRUEDIV => self.trace_binop_f(ctx, OpCode::FloatTrueDiv),
+            jitcode::BC_FLOAT_NEG => self.trace_unary_f(ctx, OpCode::FloatNeg),
+            jitcode::BC_FLOAT_ABS => self.trace_unary_f(ctx, OpCode::FloatAbs),
             // pyjitpl.py opimpl_int_guard_value → implement_guard_value
             // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
             jitcode::BC_INT_GUARD_VALUE => {
@@ -1808,6 +1752,75 @@ where
             }
         }
     }
+
+    /// Per-opname integer binop tracer helper. Decodes `dst, lhs, rhs`
+    /// from the current frame's bytecode stream, records the op with
+    /// the constant `opcode`, and updates the shadow register. Mirrors
+    /// the `opimpl_int_<op>` shape (`pyjitpl.py:1460-1513`).
+    fn trace_binop_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
+        let (dst, lhs_idx, rhs_idx) = {
+            let frame = self.frames.current_mut();
+            let dst = frame.next_u16() as usize;
+            let lhs_idx = frame.next_u16() as usize;
+            let rhs_idx = frame.next_u16() as usize;
+            (dst, lhs_idx, rhs_idx)
+        };
+        let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
+        let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
+        // `b1 is b2` crude fastpath for comparisons — `pyjitpl.py:326-336`
+        // `FASTPATHS_SAME_BOXES`. Same OpRef means the reads came from
+        // the same shadow register slot without re-assignment, matching
+        // RPython's Python-level `is` check on IntFrontendOp boxes.
+        if lhs == rhs {
+            if let Some(fast) = fastpath_same_boxes(opcode) {
+                self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
+                return;
+            }
+        }
+        let value = eval_binop_i(opcode, lhs_value, rhs_value);
+        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+    }
+
+    /// Per-opname integer unary tracer helper.
+    fn trace_unary_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
+        let (dst, src_idx) = {
+            let frame = self.frames.current_mut();
+            let dst = frame.next_u16() as usize;
+            let src_idx = frame.next_u16() as usize;
+            (dst, src_idx)
+        };
+        let (src, src_value) = self.read_int_reg(src_idx);
+        let value = eval_unary_i(opcode, src_value);
+        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
+    }
+
+    /// Per-opname float binop tracer helper.
+    fn trace_binop_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
+        let (dst, lhs_idx, rhs_idx) = {
+            let frame = self.frames.current_mut();
+            let dst = frame.next_u16() as usize;
+            let lhs_idx = frame.next_u16() as usize;
+            let rhs_idx = frame.next_u16() as usize;
+            (dst, lhs_idx, rhs_idx)
+        };
+        let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
+        let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
+        let value = eval_binop_f(opcode, lhs_value, rhs_value);
+        self.set_float_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+    }
+
+    /// Per-opname float unary tracer helper.
+    fn trace_unary_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
+        let (dst, src_idx) = {
+            let frame = self.frames.current_mut();
+            let dst = frame.next_u16() as usize;
+            let src_idx = frame.next_u16() as usize;
+            (dst, src_idx)
+        };
+        let (src, src_value) = self.read_float_reg(src_idx);
+        let value = eval_unary_f(opcode, src_value);
+        self.set_float_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
+    }
 }
 
 /// Legacy entry point used by tests and integrations that still hold
@@ -1832,6 +1845,18 @@ where
     standalone.frames.push(MIFrame::new(jitcode_arc, pc));
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.run_to_end(ctx, sym, &runtime)
+}
+
+/// `b1 is b2` crude fastpath result for comparison opcodes —
+/// `pyjitpl.py:56-63` `FASTPATHS_SAME_BOXES`. Returns the constant
+/// result (1 for TRUE, 0 for FALSE) when both operands are the same
+/// box, or `None` for opcodes without a same-box fastpath.
+pub(crate) fn fastpath_same_boxes(opcode: OpCode) -> Option<i64> {
+    match opcode {
+        OpCode::IntEq | OpCode::IntLe | OpCode::IntGe => Some(1),
+        OpCode::IntNe | OpCode::IntLt | OpCode::IntGt => Some(0),
+        _ => None,
+    }
 }
 
 pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
@@ -1864,23 +1889,25 @@ pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
         OpCode::IntLe => i64::from(lhs <= rhs),
         OpCode::IntGt => i64::from(lhs > rhs),
         OpCode::IntGe => i64::from(lhs >= rhs),
+        // `bhimpl_uint_rshift` (`blackhole.py:521`) — unsigned shift-right.
+        OpCode::UintRshift => (lhs as u64).wrapping_shr(rhs as u32) as i64,
+        // `bhimpl_uint_mul_high` (`blackhole.py:471`) — high 64 bits of
+        // `r_uint(a) * r_uint(b)` via widening u128 multiplication.
+        OpCode::UintMulHigh => (((lhs as u64) as u128 * (rhs as u64) as u128) >> 64) as i64,
+        // `bhimpl_uint_{lt,le,gt,ge}` (`blackhole.py:571-582`).
+        OpCode::UintLt => i64::from((lhs as u64) < (rhs as u64)),
+        OpCode::UintLe => i64::from((lhs as u64) <= (rhs as u64)),
+        OpCode::UintGt => i64::from((lhs as u64) > (rhs as u64)),
+        OpCode::UintGe => i64::from((lhs as u64) >= (rhs as u64)),
         other => panic!("unsupported jitcode integer binop {other:?}"),
-    }
-}
-
-/// Evaluate an overflow-checked binop. Returns `None` on overflow.
-pub(crate) fn eval_binop_ovf(opcode: OpCode, lhs: i64, rhs: i64) -> Option<i64> {
-    match opcode {
-        OpCode::IntAddOvf => lhs.checked_add(rhs),
-        OpCode::IntSubOvf => lhs.checked_sub(rhs),
-        OpCode::IntMulOvf => lhs.checked_mul(rhs),
-        other => panic!("unsupported jitcode overflow binop {other:?}"),
     }
 }
 
 pub(crate) fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
     match opcode {
         OpCode::IntNeg => value.wrapping_neg(),
+        // `bhimpl_int_invert` (`blackhole.py:531`) — bitwise NOT.
+        OpCode::IntInvert => !value,
         other => panic!("unsupported jitcode integer unary op {other:?}"),
     }
 }

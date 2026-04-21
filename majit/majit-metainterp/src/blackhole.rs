@@ -796,9 +796,7 @@ fn blackhole_with_recovery_layout(
 
 use crate::jitcode::{self, JitArgKind, JitCode};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
-use crate::pyjitpl::{
-    call_int_function, eval_binop_f, eval_binop_i, eval_binop_ovf, eval_unary_f, eval_unary_i,
-};
+use crate::pyjitpl::{call_int_function, eval_binop_f, eval_binop_i, eval_unary_f, eval_unary_i};
 
 // ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────
 //
@@ -1471,6 +1469,32 @@ impl BlackholeInterpreter {
         jitcode::read_u16(&self.jitcode.code, &mut self.position)
     }
 
+    /// Per-opname integer binop helper. Decodes `dst, lhs, rhs` from the
+    /// bytecode stream and applies `opcode` through `eval_binop_i`; the
+    /// `OpCode` argument is a constant at each call site so the inner
+    /// match folds to a single primitive call. RPython's equivalent is
+    /// one `bhimpl_int_<op>` per primitive (`blackhole.py:459-521`).
+    fn bh_binop_i(&mut self, opcode: OpCode) {
+        let dst = self.next_u16() as usize;
+        let lhs_idx = self.next_u16() as usize;
+        let rhs_idx = self.next_u16() as usize;
+        let lhs = self.registers_i[lhs_idx];
+        let rhs = self.registers_i[rhs_idx];
+        self.registers_i[dst] = eval_binop_i(opcode, lhs, rhs);
+    }
+
+    /// Per-opname float binop helper. See `bh_binop_i` for the pattern.
+    /// RPython equivalents: `bhimpl_float_{add,sub,mul,truediv}`
+    /// (`blackhole.py:663-687`).
+    fn bh_binop_f(&mut self, opcode: OpCode) {
+        let dst = self.next_u16() as usize;
+        let lhs_idx = self.next_u16() as usize;
+        let rhs_idx = self.next_u16() as usize;
+        let lhs = self.registers_f[lhs_idx];
+        let rhs = self.registers_f[rhs_idx];
+        self.registers_f[dst] = eval_binop_f(opcode, lhs, rhs);
+    }
+
     /// blackhole.py:1732-1748 _get_list_of_values parity.
     ///
     /// Decodes a bytecode-encoded register list: [length:u8][indices:u8...].
@@ -1718,59 +1742,66 @@ impl BlackholeInterpreter {
                 let src = self.next_u16() as usize;
                 self.registers_f[dst] = self.registers_f[src];
             }
-            jitcode::BC_RECORD_BINOP_I => {
+            // Per-opname integer arithmetic handlers — RPython
+            // `blackhole.py:459-521` `bhimpl_int_{add,sub,mul,...}`. Each
+            // primitive has its own insn_id in
+            // `BlackholeInterpBuilder.insns` (`blackhole.py:52-81
+            // setup_insns`); pyre's hardcoded dispatch uses one `BC_*`
+            // byte per opname instead. The `eval_binop_i` branch folds
+            // to a direct primitive call at compile time because the
+            // `OpCode` argument is a constant at each match arm.
+            jitcode::BC_INT_ADD => self.bh_binop_i(OpCode::IntAdd),
+            jitcode::BC_INT_SUB => self.bh_binop_i(OpCode::IntSub),
+            jitcode::BC_INT_MUL => self.bh_binop_i(OpCode::IntMul),
+            jitcode::BC_INT_FLOORDIV => self.bh_binop_i(OpCode::IntFloorDiv),
+            jitcode::BC_INT_MOD => self.bh_binop_i(OpCode::IntMod),
+            jitcode::BC_INT_AND => self.bh_binop_i(OpCode::IntAnd),
+            jitcode::BC_INT_OR => self.bh_binop_i(OpCode::IntOr),
+            jitcode::BC_INT_XOR => self.bh_binop_i(OpCode::IntXor),
+            jitcode::BC_INT_LSHIFT => self.bh_binop_i(OpCode::IntLshift),
+            jitcode::BC_INT_RSHIFT => self.bh_binop_i(OpCode::IntRshift),
+            jitcode::BC_INT_EQ => self.bh_binop_i(OpCode::IntEq),
+            jitcode::BC_INT_NE => self.bh_binop_i(OpCode::IntNe),
+            jitcode::BC_INT_LT => self.bh_binop_i(OpCode::IntLt),
+            jitcode::BC_INT_LE => self.bh_binop_i(OpCode::IntLe),
+            jitcode::BC_INT_GT => self.bh_binop_i(OpCode::IntGt),
+            jitcode::BC_INT_GE => self.bh_binop_i(OpCode::IntGe),
+            jitcode::BC_INT_NEG => {
                 let dst = self.next_u16() as usize;
-                let opcode_idx = self.next_u16() as usize;
-                let lhs_idx = self.next_u16() as usize;
-                let rhs_idx = self.next_u16() as usize;
-                let opcode = self.jitcode.exec.opcodes[opcode_idx];
-                let lhs = self.registers_i[lhs_idx];
-                let rhs = self.registers_i[rhs_idx];
-                if opcode.is_ovf() {
-                    // Overflow: use wrapping in blackhole
-                    let value = eval_binop_ovf(opcode, lhs, rhs).unwrap_or_else(|| {
-                        // Overflow occurred: use wrapping result
-                        eval_binop_i(
-                            match opcode {
-                                OpCode::IntAddOvf => OpCode::IntAdd,
-                                OpCode::IntSubOvf => OpCode::IntSub,
-                                OpCode::IntMulOvf => OpCode::IntMul,
-                                _ => opcode,
-                            },
-                            lhs,
-                            rhs,
-                        )
-                    });
-                    self.registers_i[dst] = value;
-                } else {
-                    self.registers_i[dst] = eval_binop_i(opcode, lhs, rhs);
-                }
-            }
-            jitcode::BC_RECORD_UNARY_I => {
-                let dst = self.next_u16() as usize;
-                let opcode_idx = self.next_u16() as usize;
                 let src_idx = self.next_u16() as usize;
-                let opcode = self.jitcode.exec.opcodes[opcode_idx];
                 let value = self.registers_i[src_idx];
-                self.registers_i[dst] = eval_unary_i(opcode, value);
+                self.registers_i[dst] = eval_unary_i(OpCode::IntNeg, value);
             }
-            jitcode::BC_RECORD_BINOP_F => {
+            jitcode::BC_INT_INVERT => {
                 let dst = self.next_u16() as usize;
-                let opcode_idx = self.next_u16() as usize;
-                let lhs_idx = self.next_u16() as usize;
-                let rhs_idx = self.next_u16() as usize;
-                let opcode = self.jitcode.exec.opcodes[opcode_idx];
-                let lhs = self.registers_f[lhs_idx];
-                let rhs = self.registers_f[rhs_idx];
-                self.registers_f[dst] = eval_binop_f(opcode, lhs, rhs);
-            }
-            jitcode::BC_RECORD_UNARY_F => {
-                let dst = self.next_u16() as usize;
-                let opcode_idx = self.next_u16() as usize;
                 let src_idx = self.next_u16() as usize;
-                let opcode = self.jitcode.exec.opcodes[opcode_idx];
+                let value = self.registers_i[src_idx];
+                self.registers_i[dst] = eval_unary_i(OpCode::IntInvert, value);
+            }
+            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`.
+            jitcode::BC_UINT_RSHIFT => self.bh_binop_i(OpCode::UintRshift),
+            jitcode::BC_UINT_MUL_HIGH => self.bh_binop_i(OpCode::UintMulHigh),
+            jitcode::BC_UINT_LT => self.bh_binop_i(OpCode::UintLt),
+            jitcode::BC_UINT_LE => self.bh_binop_i(OpCode::UintLe),
+            jitcode::BC_UINT_GT => self.bh_binop_i(OpCode::UintGt),
+            jitcode::BC_UINT_GE => self.bh_binop_i(OpCode::UintGe),
+            // Per-opname float primitives — RPython `blackhole.py:696-723`
+            // `bhimpl_float_{add,sub,mul,truediv,neg,abs}`.
+            jitcode::BC_FLOAT_ADD => self.bh_binop_f(OpCode::FloatAdd),
+            jitcode::BC_FLOAT_SUB => self.bh_binop_f(OpCode::FloatSub),
+            jitcode::BC_FLOAT_MUL => self.bh_binop_f(OpCode::FloatMul),
+            jitcode::BC_FLOAT_TRUEDIV => self.bh_binop_f(OpCode::FloatTrueDiv),
+            jitcode::BC_FLOAT_NEG => {
+                let dst = self.next_u16() as usize;
+                let src_idx = self.next_u16() as usize;
                 let value = self.registers_f[src_idx];
-                self.registers_f[dst] = eval_unary_f(opcode, value);
+                self.registers_f[dst] = eval_unary_f(OpCode::FloatNeg, value);
+            }
+            jitcode::BC_FLOAT_ABS => {
+                let dst = self.next_u16() as usize;
+                let src_idx = self.next_u16() as usize;
+                let value = self.registers_f[src_idx];
+                self.registers_f[dst] = eval_unary_f(OpCode::FloatAbs, value);
             }
             jitcode::BC_BRANCH_REG_ZERO => {
                 let cond_idx = self.next_u16() as usize;

@@ -85,7 +85,11 @@ impl JitCode {
 /// model has no RPython equivalent for them; they are a minimal pyre
 /// adaptation layer on top of the canonical staticdata.
 struct MetaInterpStaticData {
-    /// codewriter.py:80: CodeObject* → index into jitcodes vec.
+    /// codewriter.py:80: graph identity → index into jitcodes vec.
+    ///
+    /// pyre canonicalizes the trace-side key to the raw `CodeObject*`
+    /// carried by the wrapper `w_code`, matching the producer-side
+    /// `CallControl.jitcodes` key space.
     by_code: std::collections::HashMap<usize, usize>,
     /// warmspot.py:282: self.metainterp_sd.jitcodes = jitcodes.
     /// Box<JitCode> for address stability across vec growth.
@@ -217,6 +221,14 @@ pub(crate) fn publish_liveness_info(bytes: Vec<u8>) {
 
 #[allow(dead_code)]
 impl MetaInterpStaticData {
+    #[inline]
+    fn canonical_code_key(code: *const ()) -> usize {
+        if code.is_null() {
+            return 0;
+        }
+        unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as usize }
+    }
+
     /// codewriter.py:68: get or create JitCode for a CodeObject.
     /// Returns a stable pointer (Box ensures no reallocation moves).
     ///
@@ -235,7 +247,7 @@ impl MetaInterpStaticData {
         code: *const (),
         supplied: Option<std::sync::Arc<crate::PyJitCode>>,
     ) -> *const JitCode {
-        let key = code as usize;
+        let key = Self::canonical_code_key(code);
         if let Some(&idx) = self.by_code.get(&key) {
             if let Some(arc) = supplied {
                 // codewriter.py:67-68 parity — the SD-local position is
@@ -253,7 +265,7 @@ impl MetaInterpStaticData {
             return &*self.jitcodes[idx] as *const JitCode;
         }
         let payload =
-            supplied.unwrap_or_else(|| std::sync::Arc::new(crate::PyJitCode::skeleton(None)));
+            supplied.unwrap_or_else(|| std::sync::Arc::new(crate::PyJitCode::skeleton(code, None)));
         let index = self.jitcodes.len() as i32;
         if std::env::var_os("MAJIT_LOG").is_some() && index > 30 {
             eprintln!("[jitcode-for] new idx={} code={:#x}", index, key);
@@ -307,7 +319,7 @@ impl MetaInterpStaticData {
     /// `assembler.assemble(ssarepr, jitcode, num_regs)`
     /// (codewriter.py:67) has run.
     fn compiled_jitcode_lookup(&self, code: *const ()) -> Option<*const JitCode> {
-        let idx = *self.by_code.get(&(code as usize))?;
+        let idx = *self.by_code.get(&Self::canonical_code_key(code))?;
         let jitcode = &self.jitcodes[idx];
         if !jitcode.payload.is_populated() {
             return None;
@@ -517,15 +529,14 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
 /// registered — callers decide whether to fall back to the LiveVars
 /// path.
 ///
-/// Uses the same key as `MetaInterpStaticData::jitcode_for`
-/// (`code as usize` — the tracer-side `jitcode_for(w_code)` call
-/// sites at trace_opcode.rs:3501 / :3580 / state.rs:1908 all pass
-/// the w_code wrapper pointer).
+/// Uses the same canonical raw-code key as
+/// `MetaInterpStaticData::jitcode_for`; callers still pass the
+/// wrapper `w_code`, and the lookup normalizes it internally.
 pub(crate) fn jitcode_lookup(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
-        let key = code as usize;
+        let key = MetaInterpStaticData::canonical_code_key(code);
         match sd.by_code.get(&key) {
             Some(&idx) => &*sd.jitcodes[idx] as *const JitCode,
             None => std::ptr::null(),
@@ -542,6 +553,21 @@ pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
         sd.jitcodes.get(idx).map(|jc| jc.code)
+    })
+}
+
+/// warmspot.py:282 `metainterp_sd.jitcodes[jitcode_index]` helper:
+/// resolve the indexed runtime entry to its canonical raw `CodeObject*`.
+///
+/// Unlike [`code_for_jitcode_index`], this strips the wrapper round-trip
+/// up front for callers that only need the graph identity to re-enter
+/// `CallControl.jitcodes`.
+pub fn raw_code_for_jitcode_index(jitcode_index: i32) -> Option<*const CodeObject> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let idx = jitcode_index as usize;
+        sd.jitcodes.get(idx).map(|jc| unsafe { jc.raw_code() })
     })
 }
 
@@ -758,7 +784,7 @@ fn null_jitcode() -> &'static JitCode {
         let r = cell.get_or_init(|| JitCode {
             code: std::ptr::null(),
             index: -1,
-            payload: std::sync::Arc::new(crate::PyJitCode::skeleton(None)),
+            payload: std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null(), None)),
         });
         // SAFETY: per-thread `OnceCell` initialises once; the
         // resulting reference lives for the thread's lifetime.
@@ -6108,8 +6134,9 @@ mod indirectcalltargets_tests {
     //! `MetaInterpStaticData` methods directly — independent of the
     //! thread-local `METAINTERP_SD` singleton so concurrent callers
     //! (and unrelated tests that use the thread-local) do not alias.
-    use super::MetaInterpStaticData;
+    use super::{METAINTERP_SD, MetaInterpStaticData, raw_code_for_jitcode_index};
     use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
+    use pyre_interpreter::bytecode::CodeObject;
     use std::sync::Arc;
 
     fn make_jitcode_with_fnaddr(fnaddr: usize) -> Arc<JitCode> {
@@ -6165,8 +6192,10 @@ mod indirectcalltargets_tests {
     #[test]
     fn compiled_jitcode_lookup_ignores_skeleton_payload() {
         let mut sd = MetaInterpStaticData::new();
-        let code = 0x1234usize as *const ();
-        let skeleton = Arc::new(crate::PyJitCode::skeleton(None));
+        let raw_code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
+            as *const ();
+        let skeleton = Arc::new(crate::PyJitCode::skeleton(code, None));
         let inserted = sd.jitcode_for(code, Some(skeleton));
         assert!(std::ptr::eq(inserted, sd.jitcodes[0].as_ref()));
         assert!(sd.compiled_jitcode_lookup(code).is_none());
@@ -6175,8 +6204,10 @@ mod indirectcalltargets_tests {
     #[test]
     fn compiled_jitcode_lookup_returns_populated_entry() {
         let mut sd = MetaInterpStaticData::new();
-        let code = 0x5678usize as *const ();
-        let mut pyjit = crate::PyJitCode::skeleton(None);
+        let raw_code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
+            as *const ();
+        let mut pyjit = crate::PyJitCode::skeleton(code, None);
         pyjit.metadata.pc_map.push(0);
         let inserted = sd.jitcode_for(code, Some(Arc::new(pyjit)));
         let hit = sd
@@ -6201,10 +6232,21 @@ mod indirectcalltargets_tests {
         // lands at wrapper.index == 1.  This makes the regression test
         // sensitive to whether the hit-path re-stamp uses the actual
         // SD slot (1) rather than the inner JitCode's default (0).
-        let code_a = 0xA000usize as *const ();
-        let code_b = 0xB000usize as *const ();
-        let _ = sd.jitcode_for(code_a, Some(Arc::new(crate::PyJitCode::skeleton(None))));
-        let first = Arc::new(crate::PyJitCode::skeleton(None));
+        //
+        // `canonical_code_key` dereferences the W_CodeObject wrapper via
+        // `w_code_get_ptr`, so the test must use real wrappers rather
+        // than synthetic pointer values.
+        let raw_a = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let code_a =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_a)) as *const ()) as *const ();
+        let raw_b = pyre_interpreter::compile_exec("x = 2\n").expect("source must compile");
+        let code_b =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_b)) as *const ()) as *const ();
+        let _ = sd.jitcode_for(
+            code_a,
+            Some(Arc::new(crate::PyJitCode::skeleton(code_a, None))),
+        );
+        let first = Arc::new(crate::PyJitCode::skeleton(code_b, None));
         let _ = sd.jitcode_for(code_b, Some(first.clone()));
         assert_eq!(first.jitcode.index.load(Ordering::Relaxed), 1);
 
@@ -6212,7 +6254,7 @@ mod indirectcalltargets_tests {
         // The replacement's inner JitCode starts with index=0 (the
         // default from JitCodeBuilder::finish); after jitcode_for, it
         // must carry index=1 — matching the SD slot it fills.
-        let second = Arc::new(crate::PyJitCode::skeleton(None));
+        let second = Arc::new(crate::PyJitCode::skeleton(code_b, None));
         assert_eq!(
             second.jitcode.index.load(Ordering::Relaxed),
             0,
@@ -6227,5 +6269,39 @@ mod indirectcalltargets_tests {
         // The first PyJitCode is no longer the payload but still carries
         // its own index=1 — the stamp is idempotent, not a swap.
         assert_eq!(first.jitcode.index.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn jitcode_for_indexes_entries_by_raw_code_identity() {
+        let mut sd = MetaInterpStaticData::new();
+        let raw_code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
+            as *const ();
+        let raw_key =
+            unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as usize };
+
+        let _ = sd.jitcode_for(code, Some(Arc::new(crate::PyJitCode::skeleton(code, None))));
+
+        assert!(sd.by_code.contains_key(&raw_key));
+        assert!(!sd.by_code.contains_key(&(code as usize)));
+    }
+
+    #[test]
+    fn raw_code_for_jitcode_index_returns_canonical_graph_pointer() {
+        let mut sd = MetaInterpStaticData::new();
+        let raw_code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
+            as *const ();
+        let expected_raw = unsafe {
+            pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject
+        };
+
+        let _ = sd.jitcode_for(code, Some(Arc::new(crate::PyJitCode::skeleton(code, None))));
+        METAINTERP_SD.with(|slot| {
+            *slot.borrow_mut() = sd;
+        });
+
+        let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
+        assert_eq!(hit, expected_raw);
     }
 }

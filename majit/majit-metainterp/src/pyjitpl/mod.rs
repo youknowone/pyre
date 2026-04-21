@@ -5,8 +5,7 @@ pub use dispatch::{
     ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack, trace_jitcode,
 };
 pub(crate) use dispatch::{
-    call_int_function, call_void_function, eval_binop_f, eval_binop_i, eval_binop_ovf,
-    eval_unary_f, eval_unary_i,
+    call_int_function, call_void_function, eval_binop_f, eval_binop_i, eval_unary_f, eval_unary_i,
 };
 pub use frame::{MIFrame, MIFrameStack};
 
@@ -2572,7 +2571,33 @@ impl<M: Clone> MetaInterp<M> {
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
     /// in the same order as the InputArgs registered during `on_back_edge`.
     /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
+    /// pyjitpl.py:2979-3036 `reached_loop_header` → `compile_loop` dispatch.
+    ///
+    /// This public entry wraps [`Self::compile_loop_body`] so every exit
+    /// path restores the RPython invariant that
+    /// `active_trace_session.is_some()` iff `self.tracing.is_some()`.
+    /// Upstream uses `self.history` as a shared mutable object — cancel
+    /// paths fall through to `current_merge_points.append(...)` with the
+    /// history still live, and the only time the session ends is when
+    /// `abort_tracing` or successful compilation drops the tracer. pyre
+    /// mirrors that by checking, after the body returns, whether the
+    /// inner path consumed `self.tracing`. If so, the session envelope
+    /// is dropped alongside it; if not (early-Cancelled paths), both
+    /// halves stay live for continued tracing.
     pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+        let outcome = self.compile_loop_body(jump_args, meta);
+        // pyjitpl.py:3015-3032 parity: once the body has taken the trace
+        // ctx (tracing=None), drop the matching frontend session so the
+        // next `begin_trace_session` sees a clean slate. Cancelled paths
+        // that kept `self.tracing` alive (e.g. `prior_retraced_count ==
+        // MAX` above) fall through harmlessly and keep tracing running.
+        if self.tracing.is_none() && self.active_trace_session.is_some() {
+            self.clear_trace_session();
+        }
+        outcome
+    }
+
+    fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -2659,13 +2684,52 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .and_then(|ctx| ctx.driver_descriptor())
             .cloned();
+        // pyjitpl.py:3015-3032 parity: compile_loop uses `self.history`
+        // without consuming it, so cancel paths can fall through to
+        // `current_merge_points.append(...)` and keep tracing. Before
+        // committing to a compile we mirror that by reading green_key
+        // from the live trace ctx; only the "committed" exits below
+        // take ownership of the ctx and drop the trace session.
+        let (green_key, cut_inner_green_key) = {
+            let ctx = self
+                .tracing
+                .as_ref()
+                .expect("compile_loop: no active trace ctx");
+            let outer = ctx.green_key;
+            let cut_inner = ctx.cut_inner_green_key;
+            // compile.py:269-270: cross-loop cut → store under inner loop's
+            // jitcell_token. RPython: jitcell_token = cross_loop.jitcell_token.
+            (cut_inner.unwrap_or(outer), cut_inner)
+        };
+
+        // pyjitpl.py:3015-3032 parity: pyre caches the retrace limit per
+        // green_key so guard-heavy recompilations do not loop forever.
+        // The limit check happens BEFORE we consume the trace ctx so
+        // Cancelled here keeps `self.tracing` + `active_trace_session`
+        // alive — the caller (reached_loop_header analogue) then falls
+        // through to `current_merge_points.append(...)` and records more
+        // ops. `warm_state.abort_tracing(..., permanent=true)` disables
+        // future entries at this key without disturbing the live trace.
+        let prior_front_target_tokens_early = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| compiled.front_target_tokens.clone())
+            .unwrap_or_default();
+        let prior_retraced_count_early = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| compiled.retraced_count)
+            .unwrap_or(0);
+        if prior_retraced_count_early == u32::MAX && !prior_front_target_tokens_early.is_empty() {
+            if crate::majit_log_enabled() {
+                eprintln!("[jit] skipping recompile: retraced_count=MAX for key={green_key}");
+            }
+            self.warm_state.abort_tracing(green_key, true);
+            return CompileOutcome::Cancelled;
+        }
+
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
-        let outer_green_key = ctx.green_key;
-        let cut_inner_green_key = ctx.cut_inner_green_key;
-        // compile.py:269-270: cross-loop cut → store under inner loop's
-        // jitcell_token. RPython: jitcell_token = cross_loop.jitcell_token.
-        let green_key = cut_inner_green_key.unwrap_or(outer_green_key);
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
                 .filter(|mp| mp.position.ops_len > 0)
@@ -2765,6 +2829,11 @@ impl<M: Clone> MetaInterp<M> {
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
+        // NOTE: the `prior_retraced_count == u32::MAX` early Cancelled
+        // path fires above (before ctx take) so we only reach this point
+        // when a recompile is actually attempted. `pending_preamble_tokens`
+        // must be consumed here because the tokens from a previous
+        // InvalidLoop attempt are now being resupplied to the unroller.
         let prior_front_target_tokens = self
             .compiled_loops
             .get(&green_key)
@@ -2774,25 +2843,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
-        // history.py: carry retraced_count across recompilations
-        let prior_retraced_count = self
-            .compiled_loops
-            .get(&green_key)
-            .map(|compiled| compiled.retraced_count)
-            .unwrap_or(0);
-        // RPython parity: if retracing was already disabled for this key
-        // (too many guards from a previous compilation), skip recompilation.
-        // The existing compiled code handles this loop. Recompiling with
-        // different context (e.g., cut_trace_from) would produce equally
-        // heavy traces that hang in jump_to_existing_trace.
-        if prior_retraced_count == u32::MAX && !prior_front_target_tokens.is_empty() {
-            if crate::majit_log_enabled() {
-                eprintln!("[jit] skipping recompile: retraced_count=MAX for key={green_key}");
-            }
-            self.warm_state.abort_tracing(green_key, true);
-            return CompileOutcome::Cancelled;
-        }
-        unroll_opt.retraced_count = prior_retraced_count;
+        unroll_opt.retraced_count = prior_retraced_count_early;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
@@ -4001,6 +4052,18 @@ impl<M: Clone> MetaInterp<M> {
             // payload even though the ctx has been taken.
             self.pending_abort_green_key = Some(green_key);
             self.pending_abort_permanent = permanent;
+            // RPython invariant: `tracing` (the tracer context) and
+            // `active_trace_session` (the frontend meta envelope) share
+            // a lifetime — upstream's `MetaInterp.staticdata` carries
+            // both through `begin_tracing` / abort paths as one unit.
+            // If we take the tracer, the session must go with it, or a
+            // subsequent `bound_reached` → `begin_trace_session` will
+            // find a stale `Some(..)` and fire the "already active"
+            // assertion. Clearing unconditionally here is idempotent for
+            // sites that already consumed the session via
+            // `take_trace_meta` (e.g. the compile_loop dispatch) — a
+            // None→None set is a no-op.
+            self.clear_trace_session();
         }
     }
 

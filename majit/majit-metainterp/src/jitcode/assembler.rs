@@ -27,7 +27,6 @@ pub struct JitCodeBuilder {
     constants_i: Vec<i64>,
     constants_r: Vec<i64>,
     constants_f: Vec<i64>,
-    opcodes: Vec<OpCode>,
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
     /// Runtime descriptor pool emitted into `JitCodeExecState.descrs`
@@ -326,25 +325,60 @@ impl JitCodeBuilder {
         self.push_u16(src);
     }
 
+    /// RPython `blackhole.py:459-521` `bhimpl_int_*` per-opname handlers:
+    /// each primitive has its own insn_id in `BlackholeInterpBuilder.insns`
+    /// (`blackhole.py:52-81 setup_insns`). pyre's runtime dispatch uses a
+    /// hardcoded byte match so each primitive is assigned its own `BC_*`
+    /// byte; this function picks the byte from the IR `OpCode` the tracer
+    /// synthesised and emits the canonical `dst, lhs, rhs` operand triple.
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
-        let opcode_idx = self.intern_opcode(opcode);
+        let bc = match opcode {
+            OpCode::IntAdd => jitcode::BC_INT_ADD,
+            OpCode::IntSub => jitcode::BC_INT_SUB,
+            OpCode::IntMul => jitcode::BC_INT_MUL,
+            OpCode::IntFloorDiv => jitcode::BC_INT_FLOORDIV,
+            OpCode::IntMod => jitcode::BC_INT_MOD,
+            OpCode::IntAnd => jitcode::BC_INT_AND,
+            OpCode::IntOr => jitcode::BC_INT_OR,
+            OpCode::IntXor => jitcode::BC_INT_XOR,
+            OpCode::IntLshift => jitcode::BC_INT_LSHIFT,
+            OpCode::IntRshift => jitcode::BC_INT_RSHIFT,
+            OpCode::IntEq => jitcode::BC_INT_EQ,
+            OpCode::IntNe => jitcode::BC_INT_NE,
+            OpCode::IntLt => jitcode::BC_INT_LT,
+            OpCode::IntLe => jitcode::BC_INT_LE,
+            OpCode::IntGt => jitcode::BC_INT_GT,
+            OpCode::IntGe => jitcode::BC_INT_GE,
+            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`.
+            OpCode::UintRshift => jitcode::BC_UINT_RSHIFT,
+            OpCode::UintMulHigh => jitcode::BC_UINT_MUL_HIGH,
+            OpCode::UintLt => jitcode::BC_UINT_LT,
+            OpCode::UintLe => jitcode::BC_UINT_LE,
+            OpCode::UintGt => jitcode::BC_UINT_GT,
+            OpCode::UintGe => jitcode::BC_UINT_GE,
+            other => panic!("record_binop_i: unsupported opcode {other:?}"),
+        };
         self.touch_reg(dst);
         self.touch_reg(lhs);
         self.touch_reg(rhs);
-        self.push_u8(jitcode::BC_RECORD_BINOP_I);
+        self.push_u8(bc);
         self.push_u16(dst);
-        self.push_u16(opcode_idx);
         self.push_u16(lhs);
         self.push_u16(rhs);
     }
 
+    /// RPython `blackhole.py:527-533` `bhimpl_int_{neg,invert}` per-opname
+    /// handlers. See `record_binop_i` for the `BC_*` mapping rationale.
     pub fn record_unary_i(&mut self, dst: u16, opcode: OpCode, src: u16) {
-        let opcode_idx = self.intern_opcode(opcode);
+        let bc = match opcode {
+            OpCode::IntNeg => jitcode::BC_INT_NEG,
+            OpCode::IntInvert => jitcode::BC_INT_INVERT,
+            other => panic!("record_unary_i: unsupported opcode {other:?}"),
+        };
         self.touch_reg(dst);
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_RECORD_UNARY_I);
+        self.push_u8(bc);
         self.push_u16(dst);
-        self.push_u16(opcode_idx);
         self.push_u16(src);
     }
 
@@ -1262,25 +1296,38 @@ impl JitCodeBuilder {
         self.call_assembler_float_like(jitcode::BC_CALL_ASSEMBLER_FLOAT, target_idx, arg_regs, dst);
     }
 
+    /// RPython `blackhole.py:696-719` `bhimpl_float_{add,sub,mul,truediv}`
+    /// per-opname handlers. `float_floordiv` / `float_mod` have no direct
+    /// RPython `bhimpl_*` — those lower to a residual call at the
+    /// codewriter layer, never reaching a jitcode bytecode.
     pub fn record_binop_f(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
-        let opcode_idx = self.intern_opcode(opcode);
+        let bc = match opcode {
+            OpCode::FloatAdd => jitcode::BC_FLOAT_ADD,
+            OpCode::FloatSub => jitcode::BC_FLOAT_SUB,
+            OpCode::FloatMul => jitcode::BC_FLOAT_MUL,
+            OpCode::FloatTrueDiv => jitcode::BC_FLOAT_TRUEDIV,
+            other => panic!("record_binop_f: unsupported opcode {other:?}"),
+        };
         self.touch_float_reg(dst);
         self.touch_float_reg(lhs);
         self.touch_float_reg(rhs);
-        self.push_u8(jitcode::BC_RECORD_BINOP_F);
+        self.push_u8(bc);
         self.push_u16(dst);
-        self.push_u16(opcode_idx);
         self.push_u16(lhs);
         self.push_u16(rhs);
     }
 
+    /// RPython `blackhole.py:689-695` `bhimpl_float_{neg,abs}` per-opname handlers.
     pub fn record_unary_f(&mut self, dst: u16, opcode: OpCode, src: u16) {
-        let opcode_idx = self.intern_opcode(opcode);
+        let bc = match opcode {
+            OpCode::FloatNeg => jitcode::BC_FLOAT_NEG,
+            OpCode::FloatAbs => jitcode::BC_FLOAT_ABS,
+            other => panic!("record_unary_f: unsupported opcode {other:?}"),
+        };
         self.touch_float_reg(dst);
         self.touch_float_reg(src);
-        self.push_u8(jitcode::BC_RECORD_UNARY_F);
+        self.push_u8(bc);
         self.push_u16(dst);
-        self.push_u16(opcode_idx);
         self.push_u16(src);
     }
 
@@ -1373,7 +1420,6 @@ impl JitCodeBuilder {
             // store at registration time.
             index: std::sync::atomic::AtomicI64::new(0),
             exec: super::JitCodeExecState {
-                opcodes: self.opcodes,
                 descrs: self.descrs,
             },
         }
@@ -1554,14 +1600,5 @@ impl JitCodeBuilder {
             self.code[patch_offset] = bytes[0];
             self.code[patch_offset + 1] = bytes[1];
         }
-    }
-
-    fn intern_opcode(&mut self, opcode: OpCode) -> u16 {
-        if let Some(index) = self.opcodes.iter().position(|&existing| existing == opcode) {
-            return index as u16;
-        }
-        let index = self.opcodes.len() as u16;
-        self.opcodes.push(opcode);
-        index
     }
 }

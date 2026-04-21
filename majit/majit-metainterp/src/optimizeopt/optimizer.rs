@@ -1678,10 +1678,19 @@ impl Optimizer {
         // RPython Box type parity: in RPython each Box carries its type
         // intrinsically (InputArgInt, InputArgRef, etc.). In majit, OpRef
         // is an untyped u32. Seed value_types from ALL sources, lowest
-        // priority first (later entries override earlier):
+        // priority first (later entries override earlier).
+        //
+        // Skip Void entries: value_types tracks producing-op result types
+        // (register_value_type asserts against Void). original_trace_op_types
+        // and prev_phase_value_types still keep Void slots for snapshot
+        // resolution, but they must not reach the value_types map — a
+        // reserve_pos that later hands out a Void slot for a new typed op
+        // would otherwise fire the Box.type retype invariant.
         // 1. Original trace ops (pre-transformation positions for snapshots)
         for (&k, &v) in &self.original_trace_op_types {
-            ctx.value_types.insert(k, v);
+            if v != majit_ir::Type::Void {
+                ctx.value_types.insert(k, v);
+            }
         }
         // 2. Previous phase's emitted op types (Phase 1 → Phase 2 carry)
         //
@@ -1690,7 +1699,9 @@ impl Optimizer {
         // ops must win, matching PyPy's intrinsic Box.type on the current
         // ResOperation objects.
         for (&k, &v) in &self.prev_phase_value_types {
-            ctx.value_types.insert(k, v);
+            if v != majit_ir::Type::Void {
+                ctx.value_types.insert(k, v);
+            }
         }
         // 3. Inputarg types (from recorder — RPython InputArgInt/Ref/Float).
         //    Seeded BEFORE the current trace ops so an op at a position
@@ -1712,6 +1723,21 @@ impl Optimizer {
             if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
                 ctx.value_types.insert(op.pos.0, op.result_type());
             }
+        }
+
+        // Bump reserve_pos cursor past every seeded value_types position.
+        //
+        // `reserve_pos` only skips over `constants`; it does not consult
+        // `value_types`. Phase 2 / retrace contexts inherit Phase 1's
+        // positions through `original_trace_op_types` and
+        // `prev_phase_value_types`, and Phase 1's emit-side high water
+        // can sit above the caller-provided `start_next_pos` whenever
+        // the transformed `ops` slice ends below that mark. Without this
+        // bump, a later `get_or_make_const` / `emit` would hand out an
+        // already-seeded position and fire the Box.type retype invariant.
+        if let Some(&max_typed_pos) = ctx.value_types.keys().max() {
+            let next_after = max_typed_pos.saturating_add(1);
+            ctx.next_pos = ctx.next_pos.max(next_after);
         }
 
         // optimizer.py:293 patchguardop parity: propagate to Phase 2
@@ -2054,6 +2080,14 @@ impl Optimizer {
                     .clone()
                     .filter(|op| op.opcode == OpCode::Jump)
             });
+        // RPython compile.py:327 `loop.operations = ([start_label] + preamble_ops
+        // + loop_info.extra_same_as + loop_info.extra_before_label + [label_op]
+        // + loop_ops)`: alias SameAs ops allocated during the preamble
+        // export dedup belong to `loop_info.extra_same_as`, NOT to the
+        // preamble body. Keep them in a side vector so they land at the
+        // spliced parity position below instead of appearing in
+        // `ctx.new_operations` past the terminator.
+        let mut extra_same_as_aliases: Vec<Op> = Vec::new();
         self.exported_loop_state = jump.map(|jump| {
             // RPython unroll.py:454-457 order:
             //   end_args = [force_box_for_end_of_preamble(a) for a ...]
@@ -2132,7 +2166,13 @@ impl Optimizer {
                     let fresh = ctx.alloc_op_position();
                     let mut op = Op::new(same_as, &[orig]);
                     op.pos = fresh;
-                    ctx.emit(op);
+                    // unroll.py:146 + compile.py:327 parity: accumulate the
+                    // alias op in `extra_same_as` and splice it between the
+                    // preamble body and the label at final assembly. Emitting
+                    // directly into `ctx.new_operations` would push the op
+                    // past the already-sent terminal JUMP and force the
+                    // loop-tail relocation workaround below.
+                    extra_same_as_aliases.push(op);
                     ctx.register_value_type(fresh, arg_type);
                     if let Some(val) = ctx.get_constant(orig).cloned() {
                         ctx.make_constant(fresh, val);
@@ -2577,7 +2617,30 @@ impl Optimizer {
         sanitize_backend_constants_for_ops(&ctx.new_operations, constants);
 
         // Preserve final context for jump_to_existing_trace.
-        let ops = std::mem::take(&mut ctx.new_operations);
+        let mut ops = std::mem::take(&mut ctx.new_operations);
+
+        // RPython compile.py:327 final loop assembly:
+        //   loop.operations = ([start_label] + preamble_ops
+        //       + loop_info.extra_same_as + loop_info.extra_before_label
+        //       + [label_op] + loop_ops)
+        //
+        // pyre does not split the preamble / body boundary at this layer —
+        // both simple-loop and Phase-1-of-unroll consumers receive a single
+        // `ops` vector that already carries the terminal JUMP. Matching the
+        // RPython ordering means splicing the alias `extra_same_as` ops
+        // just ahead of that terminator so they execute at end of preamble
+        // and never appear past the Jump. With the dedup loop now
+        // accumulating into `extra_same_as_aliases` (see the closure
+        // above), no `ctx.emit`-after-terminator cleanup is needed.
+        if !extra_same_as_aliases.is_empty() {
+            let term_idx = ops
+                .iter()
+                .position(|op| op.opcode == OpCode::Jump || op.opcode == OpCode::Finish)
+                .unwrap_or(ops.len());
+            for (offset, op) in extra_same_as_aliases.into_iter().enumerate() {
+                ops.insert(term_idx + offset, op);
+            }
+        }
         // resume.py:411-417 parity: store_final_boxes_in_guard
         // (mod.rs:2261) already replaces TAGCONST/TAGVIRTUAL fail_args
         // entries with OpRef::NONE via the snapshot-driven numbering pass
