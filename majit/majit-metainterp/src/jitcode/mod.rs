@@ -338,7 +338,16 @@ pub struct JitCodeExecState {
 /// registers per kind (see pyre/pyre-jit/src/jit/codewriter.rs
 /// `liveness_regs_to_u8_sorted` for the companion fallback). The name
 /// matches RPython even though the representation is wider.
-#[derive(Clone, Debug, Default)]
+///
+/// PRE-EXISTING-ADAPTATION: `index` uses `AtomicI64` interior mutability
+/// because pyre's runtime registration path (`state::jitcode_for`) needs
+/// to back-stamp the canonical `metainterp_sd.jitcodes` position onto
+/// the inner `JitCode` after the surrounding `Arc<PyJitCode>` is already
+/// shared (refcount > 1).  RPython mutates the `JitCode` Python object
+/// in place via `jitcode.index = index` (codewriter.py:68); the atomic
+/// field gives Rust the same in-place semantics under shared ownership
+/// without forcing a deep clone or restructuring the `Arc` plumbing.
+#[derive(Debug, Default)]
 pub struct JitCode {
     // rpython/jit/codewriter/jitcode.py:14-43 canonical fields.
     /// RPython `jitcode.py:15` `self.name = name` — symbolic name for
@@ -379,7 +388,10 @@ pub struct JitCode {
     /// `0` until the owning codewriter/setup path assigns it; the -1
     /// sentinel for "empty snapshot" is handled on the snapshot side
     /// (see `create_empty_top_snapshot`).
-    pub index: i64,
+    ///
+    /// `AtomicI64` so `state::jitcode_for` can back-stamp the wrapper's
+    /// allocated position onto an already-`Arc`-shared inner JitCode.
+    pub index: std::sync::atomic::AtomicI64,
 
     // majit bytecode adapter extension.
     // These fields have no RPython JitCode counterpart. RPython's
@@ -393,6 +405,27 @@ pub struct JitCode {
     /// `assembler_targets` ordered by access frequency (hottest first)
     /// so the tight-loop benchmarks keep their cache locality.
     pub exec: JitCodeExecState,
+}
+
+impl Clone for JitCode {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering;
+        Self {
+            name: self.name.clone(),
+            code: self.code.clone(),
+            c_num_regs_i: self.c_num_regs_i,
+            c_num_regs_r: self.c_num_regs_r,
+            c_num_regs_f: self.c_num_regs_f,
+            constants_i: self.constants_i.clone(),
+            constants_r: self.constants_r.clone(),
+            constants_f: self.constants_f.clone(),
+            jitdriver_sd: self.jitdriver_sd,
+            fnaddr: self.fnaddr,
+            calldescr: self.calldescr.clone(),
+            index: std::sync::atomic::AtomicI64::new(self.index.load(Ordering::Relaxed)),
+            exec: self.exec.clone(),
+        }
+    }
 }
 
 // -- RPython jitcode.py parity methods --

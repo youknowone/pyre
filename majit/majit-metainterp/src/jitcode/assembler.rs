@@ -1320,10 +1320,10 @@ impl JitCodeBuilder {
             fnaddr: 0,
             calldescr: majit_translate::jitcode::BhCallDescr::default(),
             // codewriter.py:68 `jitcode.index = index` — defaults to 0
-            // here; the owning codewriter/setup path assigns the real
-            // `metainterp_sd.jitcodes[]` position (a later commit on
-            // this branch back-stamps via `state::jitcode_for`).
-            index: 0,
+            // here; `state::jitcode_for` back-stamps the canonical
+            // `metainterp_sd.jitcodes` position via the AtomicI64
+            // store at registration time.
+            index: std::sync::atomic::AtomicI64::new(0),
             exec: super::JitCodeExecState {
                 opcodes: self.opcodes,
                 descrs: self.descrs,

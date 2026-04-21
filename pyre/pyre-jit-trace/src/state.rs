@@ -248,6 +248,19 @@ impl MetaInterpStaticData {
         if std::env::var_os("MAJIT_LOG").is_some() && index > 30 {
             eprintln!("[jitcode-for] new idx={} code={:#x}", index, key);
         }
+        // codewriter.py:68 `jitcode.index = index` — back-stamp the
+        // canonical `metainterp_sd.jitcodes` position onto the inner
+        // `Arc<majit_metainterp::jitcode::JitCode>` so a snapshot whose
+        // `frame.jitcode` points to this allocation encodes the
+        // correct `metainterp_sd.jitcodes[index]` lookup target on the
+        // resume side.  The atomic store works regardless of the outer
+        // Arc<PyJitCode> refcount; without interior mutability the
+        // back-stamp would require Arc::get_mut which fails as soon as
+        // CallControl.jitcodes also holds the same allocation.
+        payload
+            .jitcode
+            .index
+            .store(index as i64, std::sync::atomic::Ordering::Relaxed);
         let jitcode = Box::new(JitCode {
             code,
             index,

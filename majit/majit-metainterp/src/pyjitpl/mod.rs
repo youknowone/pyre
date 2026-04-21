@@ -1883,26 +1883,26 @@ impl<M: Clone> MetaInterp<M> {
     /// tracing — frame registers, virtualref pairs, the standard
     /// virtualizable box array, and the heap cache — and does so
     /// eagerly so subsequent tracing-time queries see the new identity.
-    ///
-    /// pyre's frame registers (PyreSym) live inside the jitcode machine
-    /// driver and are not reachable from MetaInterp during tracing; the
-    /// in-flight trace ops are rewritten as a deferred batch via
-    /// `TraceCtx::replace_op` queued by this method, and the
-    /// virtualref/virtualizable/heap-cache walks are run eagerly here so
-    /// the next call into Step 1 of `nonstandard_virtualizable` (or any
-    /// other heapcache query) observes the new OpRef.
     pub fn replace_box(&mut self, oldbox: OpRef, newbox: OpRef) {
         // pyjitpl.py:3500-3501: for frame in self.framestack:
         //                          frame.replace_active_box_in_frame(...)
         //
-        // pyre defers the per-frame symbolic register rewrite into the
-        // recorder via `TraceCtx::replace_op` (queued by
-        // `TraceCtx::replace_box` below). The jitcode machine's PyreSym
-        // frames are not reachable from MetaInterp; the deferred
-        // recorder pass at trace finalization rewrites all already-emitted
-        // op args + fail_args, which substitutes for the eager per-frame
-        // walk RPython performs here.
-        //
+        // pyre's MIFrame::replace_active_box_in_frame needs `oldbox.type`
+        // to pick the bank to scan; OpRef does not carry a type tag, so
+        // resolve the type once via the trace context's type oracle and
+        // reuse it for every frame.  When the trace context is absent
+        // (post-tracing or never-traced paths) the framestack walk is a
+        // no-op, matching the RPython semantic that `replace_box` is
+        // exclusively a tracing-time operation.
+        if let Some(oldbox_type) = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.get_opref_type(oldbox))
+        {
+            for frame in self.framestack.frames.iter_mut() {
+                frame.replace_active_box_in_frame(oldbox, newbox, oldbox_type);
+            }
+        }
         // pyjitpl.py:3502-3505: virtualref_boxes walk
         for slot in self.virtualref_boxes.iter_mut() {
             if slot.0 == oldbox {
@@ -1918,9 +1918,9 @@ impl<M: Clone> MetaInterp<M> {
             //     self.heapcache.replace_box(oldbox, newbox)
             //
             // The trace-context portion (virtualizable_boxes walk +
-            // heap_cache walk + deferred recorder rewrite) lives on
-            // `TraceCtx::replace_box` so the trace_ctx-only call site in
-            // `_nonstandard_virtualizable` Step 4 shares the same helper.
+            // heap_cache walk) lives on `TraceCtx::replace_box` so the
+            // trace_ctx-only call site in `_nonstandard_virtualizable`
+            // Step 4 shares the same helper.
             ctx.replace_box(oldbox, newbox);
         }
     }

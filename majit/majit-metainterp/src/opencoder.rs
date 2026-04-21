@@ -1904,8 +1904,16 @@ impl TraceRecordBuffer {
     ) -> i64 {
         self._total_snapshots += 1;
         // opencoder.py:769 frame.get_list_of_active_boxes(False, ...).
-        let array =
-            frame.get_list_of_active_boxes(false, self, op_live, all_liveness, after_residual_call);
+        // The topmost frame always uses `in_a_call=false`, so the
+        // ConstantPool is unused — pass None.
+        let array = frame.get_list_of_active_boxes(
+            /* in_a_call */ false,
+            self,
+            /* pool */ None,
+            op_live,
+            all_liveness,
+            after_residual_call,
+        );
         // opencoder.py:771-780 — write vable / vref arrays, then the
         // snapshot record. `s` captures the snapshot_data offset
         // before any writes so `patch_last_guard_descr_slot` can
@@ -1915,7 +1923,10 @@ impl TraceRecordBuffer {
         let vref_array = self._list_of_boxes_from_boxes(vref_boxes);
         self.append_snapshot_data_int(vable_array);
         self.append_snapshot_data_int(vref_array);
-        let jitcode_index = frame.jitcode.index as i64;
+        let jitcode_index = frame
+            .jitcode
+            .index
+            .load(std::sync::atomic::Ordering::Relaxed);
         let pc = frame.pc as i64;
         self._encode_snapshot(jitcode_index, pc, array, is_last);
         self.patch_last_guard_descr_slot(s);
@@ -1928,25 +1939,37 @@ impl TraceRecordBuffer {
     /// `snapshot_add_prev`), then emits this snapshot with
     /// `SNAPSHOT_PREV_NEEDS_PATCHING`.
     ///
-    /// `in_a_call=true` is forced on parent frames (pyjitpl.py:808)
-    /// so the paired `get_list_of_active_boxes` clears the
-    /// in-flight CALL's result register.  pyre replaces RPython's
-    /// `self.registers_i[index] = CONST_FALSE` mutation with a
-    /// direct `Box::Const*(0)` write into the snapshot array —
-    /// yielding byte-identical snapshot content without the
-    /// registers mutation (the latter is tracked as a follow-up
-    /// that needs TraceCtx const-pool plumbing).
+    /// `in_a_call=true` is forced on parent frames (pyjitpl.py:808):
+    /// the paired `get_list_of_active_boxes` clears the in-flight
+    /// CALL's result register to a zero constant via the supplied
+    /// ConstantPool, mirroring RPython's `self.registers_i[index] =
+    /// history.CONST_FALSE` mutation line-by-line.  When `pool` is
+    /// `None` (test fixtures that do not wire a ConstantPool) the
+    /// fallback substitutes `Box::Const*(0)` directly into the
+    /// snapshot bytes — identical encoded output but the register
+    /// slot keeps its pre-call contents.
     pub fn create_snapshot_from_frame(
         &mut self,
         frame: &mut crate::pyjitpl::MIFrame,
+        pool: Option<&mut ConstantPool>,
         op_live: u8,
         all_liveness: &[u8],
         is_last: bool,
     ) -> i64 {
         self._total_snapshots += 1;
-        let array = frame.get_list_of_active_boxes(true, self, op_live, all_liveness, false);
+        let array = frame.get_list_of_active_boxes(
+            /* in_a_call */ true,
+            self,
+            pool,
+            op_live,
+            all_liveness,
+            /* after_residual_call */ false,
+        );
         self.snapshot_add_prev(SNAPSHOT_PREV_COMES_NEXT);
-        let jitcode_index = frame.jitcode.index as i64;
+        let jitcode_index = frame
+            .jitcode
+            .index
+            .load(std::sync::atomic::Ordering::Relaxed);
         let pc = frame.pc as i64;
         self._encode_snapshot(jitcode_index, pc, array, is_last)
     }
@@ -1963,6 +1986,7 @@ impl TraceRecordBuffer {
         framestack: &mut [crate::pyjitpl::MIFrame],
         virtualizable_boxes: &[Box],
         virtualref_boxes: &[Box],
+        pool: Option<&mut ConstantPool>,
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
@@ -1988,11 +2012,14 @@ impl TraceRecordBuffer {
                 )
             };
             // opencoder.py:828 self._ensure_parent_resumedata(framestack, n).
-            self._ensure_parent_resumedata(framestack, n, op_live, all_liveness);
+            // The parent walk uses `in_a_call=true`, so the pool is
+            // threaded through to the per-frame register-clear path.
+            self._ensure_parent_resumedata(framestack, n, pool, op_live, all_liveness);
             result
         } else {
             // opencoder.py:829-831 — empty framestack → empty top
             // snapshot.
+            let _ = pool;
             self.create_empty_top_snapshot_from_boxes(virtualizable_boxes, virtualref_boxes)
         }
     }
@@ -2011,6 +2038,7 @@ impl TraceRecordBuffer {
         &mut self,
         framestack: &mut [crate::pyjitpl::MIFrame],
         n: usize,
+        mut pool: Option<&mut ConstantPool>,
         op_live: u8,
         all_liveness: &[u8],
     ) {
@@ -2026,7 +2054,15 @@ impl TraceRecordBuffer {
             let is_last = n == 1;
             let s = {
                 let back = &mut framestack[n - 1];
-                self.create_snapshot_from_frame(back, op_live, all_liveness, is_last)
+                // Re-borrow `pool` per iteration so the &mut threads
+                // through the loop without being consumed.
+                self.create_snapshot_from_frame(
+                    back,
+                    pool.as_deref_mut(),
+                    op_live,
+                    all_liveness,
+                    is_last,
+                )
             };
             // opencoder.py:842 `target.parent_snapshot = s`.
             framestack[n].parent_snapshot = s;
@@ -4046,7 +4082,7 @@ mod tests {
         jc.c_num_regs_f = 0;
         const LIVE_OP: u8 = 0x42;
         jc.code = vec![LIVE_OP, 0x00, 0x00];
-        jc.index = 11;
+        jc.index.store(11, std::sync::atomic::Ordering::Relaxed);
         let jc = Arc::new(jc);
 
         // all_liveness: len_i=1 len_r=0 len_f=0, bitmask = 0b1.
@@ -4062,6 +4098,7 @@ mod tests {
             &mut stack,
             &[],
             &[],
+            /* pool */ None,
             LIVE_OP,
             &all_liveness,
             /* after_residual_call */ true,
@@ -4089,7 +4126,7 @@ mod tests {
         let _ = buf.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
 
         let mut stack: Vec<crate::pyjitpl::MIFrame> = Vec::new();
-        let snap = buf.capture_resumedata(&mut stack, &[], &[], 0, &[], false);
+        let snap = buf.capture_resumedata(&mut stack, &[], &[], None, 0, &[], false);
         let it = buf.get_snapshot_iter(snap as usize);
         assert!(
             it.framestack.is_empty(),

@@ -5,8 +5,9 @@
 /// the call stack of nested inline calls.
 use std::sync::Arc;
 
-use majit_ir::OpRef;
+use majit_ir::{OpRef, Type};
 
+use crate::constant_pool::ConstantPool;
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
 
@@ -225,16 +226,19 @@ impl MIFrame {
     /// `.liveness_info`) — pyre passes them explicitly so this method
     /// does not depend on `MetaInterpStaticData` structurally.
     ///
-    /// `in_a_call=true` branch is not yet wired: it requires
-    /// `CONST_FALSE` / `CONST_NULL` / `CONST_FZERO` OpRef seeding
-    /// (pyjitpl.py:188-192) which is tracked in the ConstantPool
-    /// follow-up. `create_top_snapshot` (the current capture_resumedata
-    /// caller for the topmost frame) passes `in_a_call=false`, so this
-    /// restriction does not block it.
+    /// `pool` carries the trace's `ConstantPool` so the in_a_call
+    /// branch can mint `history.CONST_FALSE` / `CONST_NULL` /
+    /// `history.CONST_FZERO` OpRefs and write them into the cleared
+    /// register slot exactly as pyjitpl.py:188-192 does.  Tests that
+    /// only care about the snapshot output may pass `None` — the
+    /// fallback path then substitutes `Box::Const*(0)` directly into
+    /// the snapshot array (byte-identical to the structural path) but
+    /// leaves the register slot untouched.
     pub fn get_list_of_active_boxes(
         &mut self,
         in_a_call: bool,
         trace: &mut TraceRecordBuffer,
+        pool: Option<&mut ConstantPool>,
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
@@ -249,29 +253,57 @@ impl MIFrame {
         // CONST_NULL / history.CONST_FZERO) so the snapshot captures a
         // well-defined placeholder instead of pre-call stale data.
         //
-        // pyre does not yet wire frame-register mutation here (matching
-        // RPython's `self.registers_i[index] = CONST_FALSE`) because
-        // that requires an OpRef for the zero constant, which lives in
-        // the TraceCtx ConstantPool — currently outside the callback
-        // reachable from this code.  Instead we record the cleared
-        // register bank + index and substitute `Box::Const{Int,Ptr,
-        // Float}(0)` directly into the snapshot-array output.  This
-        // gives a snapshot that is byte-identical to RPython's; the
-        // only observable difference is that a subsequent
-        // `make_result_of_lastop` (pyjitpl.py:258-275) still sees the
-        // pre-clear register contents, instead of the zero constant.
-        // That mutation is tracked as a follow-up (requires TraceCtx
-        // const-pool plumbing) but does not affect snapshot content.
+        // When `pool` is provided we mirror RPython exactly: mint the
+        // zero constant, write it into the register slot (and the
+        // parallel `*_values` mirror), and let the bank loop below
+        // emit it through the normal register → OpBox path.  This makes
+        // a subsequent `get_list_of_active_boxes` (e.g. a re-snapshot
+        // of the same in-flight call before `make_result_of_lastop`)
+        // see the cleared slot rather than the pre-call stale contents.
+        //
+        // When `pool` is `None` (test fixtures that do not wire a
+        // ConstantPool) we fall back to substituting the cleared box
+        // directly into the snapshot array via `clear_*_idx`.  The
+        // snapshot bytes are identical, but the register slot retains
+        // its pre-call contents — acceptable for tests that only check
+        // snapshot bytes.
         let (clear_int_idx, clear_ref_idx, clear_float_idx) = if in_a_call {
             let argcode = self._result_argcode;
             let index = self.jitcode.code[self.pc - 1] as usize;
             // pyjitpl.py:193 `self._result_argcode = '?'` — mark cleared.
             self._result_argcode = b'?';
-            match argcode {
-                b'i' => (Some(index), None, None),
-                b'r' => (None, Some(index), None),
-                b'f' => (None, None, Some(index)),
-                _ => (None, None, None),
+            if let Some(pool) = pool {
+                // pyjitpl.py:184-192 register clearing via ConstantPool.
+                match argcode {
+                    b'i' => {
+                        let opref = pool.get_or_insert(0);
+                        self.int_regs[index] = Some(opref);
+                        self.int_values[index] = Some(0);
+                        (None, None, None)
+                    }
+                    b'r' => {
+                        let opref = pool.get_or_insert_typed(0, Type::Ref);
+                        self.ref_regs[index] = Some(opref);
+                        self.ref_values[index] = Some(0);
+                        (None, None, None)
+                    }
+                    b'f' => {
+                        let opref = pool.get_or_insert_typed(0, Type::Float);
+                        self.float_regs[index] = Some(opref);
+                        self.float_values[index] = Some(0);
+                        (None, None, None)
+                    }
+                    _ => (None, None, None),
+                }
+            } else {
+                // Test-fallback: substitute zero in the snapshot output
+                // without mutating the register slot.
+                match argcode {
+                    b'i' => (Some(index), None, None),
+                    b'r' => (None, Some(index), None),
+                    b'f' => (None, None, Some(index)),
+                    _ => (None, None, None),
+                }
             }
         } else {
             (None, None, None)
@@ -390,6 +422,50 @@ impl MIFrame {
         }
 
         storage
+    }
+
+    /// pyjitpl.py:236-255 `MIFrame.replace_active_box_in_frame(oldbox, newbox)`.
+    ///
+    /// ```python
+    /// def replace_active_box_in_frame(self, oldbox, newbox):
+    ///     if oldbox.type == 'i':
+    ///         count = self.jitcode.num_regs_i()
+    ///         registers = self.registers_i
+    ///     elif oldbox.type == 'r':
+    ///         count = self.jitcode.num_regs_r()
+    ///         registers = self.registers_r
+    ///     elif oldbox.type == 'f':
+    ///         count = self.jitcode.num_regs_f()
+    ///         registers = self.registers_f
+    ///     else:
+    ///         assert 0, oldbox
+    ///     if not count:
+    ///         return
+    ///     for i in range(count):
+    ///         if registers[i] is oldbox:
+    ///             registers[i] = newbox
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython reads `oldbox.type` directly off
+    /// the Box.  pyre's OpRef does not carry a type tag, so the bank is
+    /// selected by an explicit `oldbox_type` parameter that the caller
+    /// (`MetaInterp::replace_box`) resolves once via
+    /// `TraceCtx::get_opref_type`.
+    pub fn replace_active_box_in_frame(&mut self, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
+        let registers = match oldbox_type {
+            Type::Int => &mut self.int_regs,
+            Type::Ref => &mut self.ref_regs,
+            Type::Float => &mut self.float_regs,
+            Type::Void => return,
+        };
+        if registers.is_empty() {
+            return;
+        }
+        for slot in registers.iter_mut() {
+            if *slot == Some(oldbox) {
+                *slot = Some(newbox);
+            }
+        }
     }
 
     pub fn setup_call(&mut self, argboxes: &[(JitArgKind, OpRef, i64)]) {
@@ -551,6 +627,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ false,
             &mut trace,
+            /* pool */ None,
             LIVE_OP,
             &all_liveness,
             /* after_residual_call */ true,
@@ -631,6 +708,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ true,
             &mut trace,
+            /* pool */ None,
             OP_LIVE,
             &all_liveness,
             /* after_residual_call */ false,
@@ -649,6 +727,60 @@ mod tests {
         );
         // `ConstInt(0)` encodes as `tag(TAGINT, 0) = 0`.
         assert_eq!(tag0, 0, "cleared slot must encode as ConstInt(0)");
+    }
+
+    /// pyjitpl.py:184-192 — when a `ConstantPool` is provided, the
+    /// in_a_call branch mutates the register slot itself to the
+    /// pool's zero constant.  A second snapshot of the same in-flight
+    /// call (after `_result_argcode` flips to `b'?'`) therefore also
+    /// sees the cleared register, instead of the pre-call stale box.
+    #[test]
+    fn get_list_of_active_boxes_in_a_call_with_pool_mutates_register() {
+        use crate::constant_pool::ConstantPool;
+        use crate::opencoder::TraceRecordBuffer;
+        use std::sync::Arc;
+
+        const OP_LIVE: u8 = 0x42;
+        let code = vec![0x88, 0x00, OP_LIVE, 0x00, 0x00];
+        let live_pc = 2;
+
+        let jitcode_arc = {
+            let mut jc = make_jitcode_with_regs(1, 0, 0);
+            let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
+            jc_mut.code = code;
+            jc
+        };
+
+        let all_liveness: Vec<u8> = vec![1, 0, 0, 0b0000_0001];
+
+        let mut frame = MIFrame::new(jitcode_arc, live_pc);
+        frame._result_argcode = b'i';
+        frame.int_regs[0] = Some(OpRef(777));
+        frame.int_values[0] = Some(666);
+
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut trace = TraceRecordBuffer::new(1, sd);
+        let mut pool = ConstantPool::new();
+
+        let _ = frame.get_list_of_active_boxes(
+            /* in_a_call */ true,
+            &mut trace,
+            Some(&mut pool),
+            OP_LIVE,
+            &all_liveness,
+            /* after_residual_call */ false,
+        );
+
+        // Register slot now holds the pool's zero ConstInt OpRef
+        // (constants live in the namespace whose OpRef has the high
+        // const bit set), and the parallel value mirror is 0.
+        let cleared = frame.int_regs[0].expect("register cleared, not unset");
+        assert!(
+            cleared.is_constant(),
+            "cleared register must be a constant OpRef"
+        );
+        assert_eq!(frame.int_values[0], Some(0));
+        assert_eq!(frame._result_argcode, b'?');
     }
 
     /// Complement: when the liveness walk lists a register OTHER than
@@ -688,6 +820,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ true,
             &mut trace,
+            /* pool */ None,
             OP_LIVE,
             &all_liveness,
             false,
@@ -747,6 +880,7 @@ mod tests {
         let storage = frame.get_list_of_active_boxes(
             /* in_a_call */ false,
             &mut trace,
+            /* pool */ None,
             OP_LIVE,
             &all_liveness,
             false,
@@ -787,6 +921,55 @@ mod tests {
         assert!(frame.ref_values.iter().all(|v| v.is_none()));
         // pyjitpl.py:127: pushed_box is reset to None.
         assert_eq!(frame.pushed_box, None);
+    }
+
+    /// pyjitpl.py:236-255 `MIFrame.replace_active_box_in_frame`.
+    ///
+    /// Bank dispatch: `oldbox.type` selects which register array to scan;
+    /// the other banks must NOT be touched.  Walk replaces every slot
+    /// whose `Some(opref)` matches `oldbox` with `Some(newbox)`; non-
+    /// matching slots stay untouched.
+    #[test]
+    fn replace_active_box_in_frame_replaces_only_matching_oprefs() {
+        let jitcode = make_jitcode_with_regs(3, 2, 1);
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[0] = Some(OpRef(7));
+        frame.int_regs[1] = Some(OpRef(8));
+        frame.int_regs[2] = Some(OpRef(7)); // duplicate — must also flip.
+        frame.ref_regs[0] = Some(OpRef(7)); // same OpRef but different bank.
+        frame.float_regs[0] = Some(OpRef(7));
+
+        frame.replace_active_box_in_frame(OpRef(7), OpRef(42), Type::Int);
+
+        assert_eq!(frame.int_regs[0], Some(OpRef(42)));
+        assert_eq!(frame.int_regs[1], Some(OpRef(8)));
+        assert_eq!(frame.int_regs[2], Some(OpRef(42)));
+        // Ref / float banks untouched — bank dispatch is by oldbox.type.
+        assert_eq!(frame.ref_regs[0], Some(OpRef(7)));
+        assert_eq!(frame.float_regs[0], Some(OpRef(7)));
+    }
+
+    /// Empty bank short-circuit: pyjitpl.py:248 `if not count: return`.
+    #[test]
+    fn replace_active_box_in_frame_returns_early_when_bank_empty() {
+        let jitcode = make_jitcode_with_regs(0, 1, 0);
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.ref_regs[0] = Some(OpRef(7));
+        frame.replace_active_box_in_frame(OpRef(7), OpRef(42), Type::Int);
+        // Int bank empty — ref bank stays untouched.
+        assert_eq!(frame.ref_regs[0], Some(OpRef(7)));
+    }
+
+    /// Type::Void is not a valid box type (pyjitpl.py:246 `assert 0,
+    /// oldbox`).  The Rust port returns silently rather than panic so a
+    /// stale void OpRef does not bring down tracing in release.
+    #[test]
+    fn replace_active_box_in_frame_void_type_is_noop() {
+        let jitcode = make_jitcode_with_regs(1, 1, 1);
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[0] = Some(OpRef(7));
+        frame.replace_active_box_in_frame(OpRef(7), OpRef(42), Type::Void);
+        assert_eq!(frame.int_regs[0], Some(OpRef(7)));
     }
 
     #[test]
