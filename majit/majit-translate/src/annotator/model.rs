@@ -2057,9 +2057,26 @@ impl SomeValue {
             }
             SomeValue::None_(_) => Ok(s_impossible_value()),
             SomeValue::BuiltinMethod(method) => method.call(args),
-            SomeValue::Builtin(_) => Err(AnnotatorError::new(
-                "SomeBuiltin.call() still requires builtin.py analyser wiring",
-            )),
+            SomeValue::Builtin(sb) => {
+                // upstream `SomeBuiltin.call(args)` (unaryop.py:940-946):
+                //
+                //     args_s, kwds = args.unpack()
+                //     kwds_s = {}
+                //     for key, s_value in kwds.items():
+                //         kwds_s['s_'+key] = s_value
+                //     return self.analyser(*args_s, **kwds_s)
+                let bk = super::bookkeeper::getbookkeeper().ok_or_else(|| {
+                    AnnotatorError::new("SomeBuiltin.call() called without an active bookkeeper")
+                })?;
+                let (args_s, kwds) = args
+                    .unpack()
+                    .map_err(|err| AnnotatorError::new(err.getmsg()))?;
+                let kwds_s: std::collections::HashMap<String, SomeValue> = kwds
+                    .into_iter()
+                    .map(|(k, v)| (format!("s_{k}"), v))
+                    .collect();
+                super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s, &kwds_s)
+            }
             _ => Err(AnnotatorError::new(
                 "Cannot prove that the object is callable",
             )),

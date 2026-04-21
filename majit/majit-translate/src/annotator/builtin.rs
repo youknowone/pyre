@@ -1344,6 +1344,56 @@ mod tests {
     }
 
     #[test]
+    fn somebuiltin_call_dispatches_through_registry() {
+        // End-to-end wiring check: SomeBuiltin("range") carried inside
+        // `SomeValue::call` reaches `call_builtin("range", ...)` and the
+        // registered analyser runs. Mirrors upstream's
+        // `SomeBuiltin.call(args)` path at unaryop.py:940-946.
+        use crate::annotator::argument::{ArgumentsForTranslation, simple_args};
+        use crate::annotator::model::{SomeBuiltin, SomeValue};
+
+        let bk = bk();
+        bk.enter(None);
+
+        let s_stop = bk.immutablevalue(&ConstValue::Int(4)).unwrap();
+        let args: ArgumentsForTranslation = simple_args(vec![s_stop]);
+        let s_callee = SomeValue::Builtin(SomeBuiltin::new("range", None, Some("range".into())));
+        let s_result = s_callee
+            .call(&args)
+            .expect("SomeBuiltin.call should dispatch");
+        assert!(matches!(s_result, SomeValue::List(_)));
+
+        bk.leave();
+    }
+
+    #[test]
+    fn somebuiltin_call_returns_error_for_unregistered_qualname() {
+        use crate::annotator::argument::{ArgumentsForTranslation, simple_args};
+        use crate::annotator::model::{SomeBuiltin, SomeValue};
+
+        let bk = bk();
+        bk.enter(None);
+
+        let args: ArgumentsForTranslation = simple_args(vec![]);
+        let s_callee = SomeValue::Builtin(SomeBuiltin::new(
+            "completely.made.up.name",
+            None,
+            Some("completely.made.up.name".into()),
+        ));
+        let err = s_callee
+            .call(&args)
+            .expect_err("unregistered analyser should error");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("no analyser registered")
+        );
+
+        bk.leave();
+    }
+
+    #[test]
     fn constpropagate_invokes_evaluator_on_all_constants() {
         let bk = bk();
         let s_a = bk.immutablevalue(&ConstValue::Int(7)).unwrap();

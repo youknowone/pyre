@@ -13,9 +13,16 @@
 //! * `immutablevalue(HostObject)` — the `extregistry.is_registered(x)`
 //!   branch (bookkeeper.py:312-314) returns `AnnotatorError` until the
 //!   extregistry bridge lands.
-//! * `BUILTIN_ANALYZERS` registry — blocked on `builtin.py`; the
-//!   registry stays empty and `SomeBuiltin` is seeded from the host
-//!   qualname so `specialcase.rs` can dispatch once analysers register.
+//! * `BUILTIN_ANALYZERS` registry — ported in [`super::builtin`].
+//!   `SomeBuiltin.analyser_name` is seeded from the host qualname;
+//!   `SomeValue::call()` for `Builtin(_)` dispatches through
+//!   [`super::builtin::call_builtin`]. Upstream only routes registered
+//!   callables through `SomeBuiltin` (bookkeeper.py:309-311) and falls
+//!   every other builtin through to the `callable(x)` branch; the Rust
+//!   port preserves the "everything becomes `SomeBuiltin`" shape to
+//!   keep `policy.rs` sandboxing dispatch intact, so non-registered
+//!   qualnames surface at call time as
+//!   `AnnotatorError::new("no analyser registered for …")`.
 //! * `classpbc_attr_families` / `all_specializations` — not yet
 //!   mirrored on the Rust bookkeeper; reachable only from rtyper-phase
 //!   consumers.
@@ -1674,10 +1681,11 @@ impl Bookkeeper {
         }
         // upstream bookkeeper.py:309-311 — `elif ishashable(x) and x
         // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`. The Rust
-        // port keeps the analyser registry empty (builtin.py is still
-        // deferred), so `analyser_name` is filled from the host
-        // qualname and callers resolving through specialcase.rs
-        // dispatch on that string when an analyser registers.
+        // port routes every `is_builtin_callable` through `SomeBuiltin`
+        // (not only registered ones) because `policy.rs` sandboxing
+        // dispatch inspects `SomeValue::Builtin` directly; see the
+        // registry note in the module header above. Analyser lookup
+        // happens at call time in [`super::builtin::call_builtin`].
         if obj.is_builtin_callable() {
             let mut sb = SomeBuiltin::new(
                 obj.qualname().to_string(),

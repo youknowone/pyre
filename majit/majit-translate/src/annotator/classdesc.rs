@@ -992,16 +992,29 @@ impl ClassDesc {
         // classdesc.py:624-626 — MemberDescriptor skip. HostObject does
         // not emit MemberDescriptors so nothing to guard against.
 
-        // classdesc.py:627-633 — __init__ on builtin exception class
-        // routes through BUILTIN_ANALYZERS (builtin.py). Until builtin.py
-        // lands, mirror upstream's "skip store" effect conservatively —
-        // the BUILTIN_ANALYZERS registry would normally decide whether
-        // to keep the assignment; an empty registry means no whitelist,
-        // so upstream drops it.
+        // classdesc.py:627-633 — __init__ on a builtin exception class
+        // is dropped unless the method itself is registered in
+        // `BUILTIN_ANALYZERS`. Upstream:
+        //
+        //     if name == '__init__' and self.is_builtin_exception_class():
+        //         from rpython.annotator.builtin import BUILTIN_ANALYZERS
+        //         value = getattr(value, 'im_func', value)
+        //         if value not in BUILTIN_ANALYZERS:
+        //             return
+        //
+        // Rust keys the analyser registry on HostObject qualname (see
+        // `super::builtin` module header), so the membership test
+        // becomes `super::builtin::is_registered(host.qualname())`.
         if name == "__init__" {
             let is_builtin_exc = this.borrow().is_builtin_exception_class();
             if is_builtin_exc {
-                return Ok(());
+                let registered = match &value {
+                    ConstValue::HostObject(host) => super::builtin::is_registered(host.qualname()),
+                    _ => false,
+                };
+                if !registered {
+                    return Ok(());
+                }
             }
         }
 
@@ -3321,6 +3334,10 @@ mod tests {
 
     #[test]
     fn classdesc_add_source_attribute_skips_builtin_exc_init() {
+        // upstream classdesc.py:627-633 — `if __init__ and
+        // is_builtin_exception_class() and value not in BUILTIN_ANALYZERS:
+        // return`. A non-HostObject ConstValue (here an Int sentinel) is
+        // trivially unregistered, so the assignment drops.
         let bk = make_bk();
         let base_exc = HOST_ENV.lookup_builtin("BaseException").unwrap();
         let desc_rc = Rc::new(RefCell::new(ClassDesc::new_shell(
@@ -3328,10 +3345,32 @@ mod tests {
             base_exc,
             "BaseException".into(),
         )));
-        // __init__ on a builtin exception class is skipped (upstream
-        // BUILTIN_ANALYZERS dep — defer to builtin.py port).
         ClassDesc::add_source_attribute(&desc_rc, "__init__", ConstValue::Int(0), false).unwrap();
         assert!(!desc_rc.borrow().classdict.contains_key("__init__"));
+    }
+
+    #[test]
+    fn classdesc_add_source_attribute_keeps_registered_builtin_exc_init() {
+        // upstream classdesc.py:627-633 positive side — when the value
+        // IS in BUILTIN_ANALYZERS (e.g. `object.__init__` registered by
+        // `builtin.py:198`), the assignment survives even on a builtin
+        // exception class.
+        let bk = make_bk();
+        let base_exc = HOST_ENV.lookup_builtin("BaseException").unwrap();
+        let desc_rc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            base_exc,
+            "BaseException".into(),
+        )));
+        let init_host = HostObject::new_builtin_callable("object.__init__");
+        ClassDesc::add_source_attribute(
+            &desc_rc,
+            "__init__",
+            ConstValue::HostObject(init_host),
+            false,
+        )
+        .unwrap();
+        assert!(desc_rc.borrow().classdict.contains_key("__init__"));
     }
 
     #[test]
