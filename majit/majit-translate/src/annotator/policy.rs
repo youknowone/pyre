@@ -304,7 +304,8 @@ impl AnnotatorPolicy {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            let _ = bk.emulate_pbc_call(key, &pbc_value, &payload.args_s, &[]);
+                            let _ =
+                                bk.emulate_pbc_call(key, &pbc_value, &payload.args_s, &[], None);
                             trampoline
                         }
                     }

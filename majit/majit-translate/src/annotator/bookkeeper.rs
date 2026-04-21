@@ -12,16 +12,11 @@
 //!
 //! ## Phase 5 P5.2+ dependency-blocked helpers
 //!
-//! * `getdesc(x)` / `immutablevalue` for function / class / bound-
-//!   method / weakref / frozen PBC inputs — blocked on
-//!   `description.py`.
-//! * `getuniqueclassdef(cls)` — blocked on `classdesc.py`.
-//! * `emulate_pbc_call(key, pbc, args_s)` — blocked on
-//!   `binaryop.py` call-family machinery.
+//! * `immutablevalue(HostObject)` — bound-method / weakref / extregistry
+//!   branches still return `AnnotatorError` until the corresponding
+//!   upstream helpers land (bookkeeper.py:299-333).
 //! * `register_builtins()` / `BUILTIN_ANALYZERS` registry — blocked
 //!   on `builtin.py`.
-//! * `annotator` backlink (`reflowfromposition` callback) — blocked
-//!   on `annrpython.py` driver.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -281,6 +276,23 @@ pub enum EmulatedPbcCallKey {
     },
 }
 
+/// RPython `Bookkeeper.pbc_call`'s `emulated` parameter
+/// (bookkeeper.py:512-531). Encodes the Python-side three-state
+/// polymorphism (`None` / `True` / `<position_key>`) as a Rust enum:
+///
+/// * `None` — real call: use `self.position_key`; pull
+///   `s_previous_result` from the current op's annotation.
+/// * `True` — fully emulated: `whence=None`, `op=None`,
+///   `s_previous_result=s_ImpossibleValue`.
+/// * `Callback(position)` — callback-style: `whence=position`, same
+///   `op=None` / `s_previous_result=s_ImpossibleValue` as `True`.
+#[derive(Clone, Debug)]
+pub enum PbcCallEmulated {
+    None,
+    True,
+    Callback(PositionKey),
+}
+
 impl EmulatedPbcCallKey {
     /// Build the sandbox-trampoline key used by
     /// `AnnotatorPolicy::no_more_blocks_to_annotate` (policy.py:87).
@@ -490,10 +502,10 @@ impl Bookkeeper {
     pub fn compute_at_fixpoint(self: &Rc<Self>) {
         let _guard = self.at_position(None);
         let ann = self.annotator();
-        for call_op in ann.call_sites() {
+        for (call_op, op_key) in ann.call_sites_with_positions() {
             // Errors surface via annotator.errors in upstream (Priority
             // #3). For now propagate-by-ignore matches the stub contract.
-            let _ = self.consider_call_site(&call_op);
+            let _ = self.consider_call_site(&call_op, Some(op_key));
         }
         // Snapshot values so we can mutate emulated_pbc_calls inside the
         // loop (upstream does `for pbc, args_s in
@@ -539,6 +551,7 @@ impl Bookkeeper {
     pub fn consider_call_site(
         self: &Rc<Self>,
         call_op: &crate::flowspace::model::SpaceOperation,
+        op_key: Option<PositionKey>,
     ) -> Result<(), AnnotatorError> {
         let ann = self.annotator();
         let Some(s_callable) = ann.annotation(&call_op.args[0]) else {
@@ -560,15 +573,6 @@ impl Bookkeeper {
             // (list(args_s))`, `call_args` → `fromshape(args_s[0].const,
             // args_s[1:])`.
             let args = build_args_for_op(&call_op.opname, &args_s)?;
-            // upstream: `s_callable.consider_call_site(args, s_result, call_op)`.
-            // `call_op` 은 upstream 에서 FunctionDesc.get_graph / specializer
-            // 에게 재전달된다. Rust 쪽은 op → PositionKey 로 축약하는데,
-            // 현재 `call_sites()` 는 `SpaceOperation` 만 반환하고 속한
-            // block/graph 식별자를 함께 돌려주지 않는다. 따라서 여기서는
-            // bookkeeper 의 current position (at_position(None) 가드에 의해
-            // 현재 None) 을 사용한다. `call_sites()` 반환 타입을 `(op,
-            // PositionKey)` 로 확장하는 것은 후속 커밋.
-            let op_key = self.current_position_key();
             pbc.consider_call_site(&args, &s_result, op_key)?;
         }
         Ok(())
@@ -809,14 +813,9 @@ impl Bookkeeper {
     ///   * `Class` → `ClassDesc` (c1 shell — c2c replaces this with the
     ///     full `ClassDesc::__init__` body; the shell still satisfies
     ///     identity-caching so basedesc lookups land in a shared Rc)
+    ///   * `BoundMethod` → `MethodDesc` / `MethodOfFrozenDesc`
     ///   * `Instance` / `BuiltinCallable` / `Module` / `Opaque` →
     ///     [`Self::getfrozen`] (upstream's `_freeze_` fallback)
-    ///
-    /// The upstream bound-method branch (MethodType) has no direct
-    /// HostObject counterpart yet; when HostObject gains a `Method`
-    /// variant (c3), this function routes it through
-    /// `getmethoddesc(self.getdesc(im_func), …)` matching
-    /// bookkeeper.py:374-396.
     pub fn getdesc(self: &Rc<Self>, pyobj: &HostObject) -> Result<DescEntry, AnnotatorError> {
         if let Some(existing) = self.descs.borrow().get(pyobj) {
             return Ok(existing.clone());
@@ -835,6 +834,61 @@ impl Bookkeeper {
             let name = pyobj.qualname().to_string();
             let desc_rc = ClassDesc::new(self, pyobj.clone(), Some(name), None, None)?;
             DescEntry::Class(desc_rc)
+        } else if pyobj.is_bound_method() {
+            let self_obj = pyobj.bound_method_self().ok_or_else(|| {
+                AnnotatorError::new("Bookkeeper.getdesc(bound method): missing __self__")
+            })?;
+            let func = pyobj.bound_method_func().ok_or_else(|| {
+                AnnotatorError::new("Bookkeeper.getdesc(bound method): missing __func__")
+            })?;
+            let funcdesc = self.getdesc(func)?.as_function().ok_or_else(|| {
+                AnnotatorError::new("Bookkeeper.getdesc(bound method): __func__ is not a function")
+            })?;
+
+            if self_obj.is_instance()
+                && self_obj
+                    .instance_class()
+                    .is_some_and(|cls| cls.class_get("_freeze_").is_some())
+            {
+                let frozendesc = self.getdesc(self_obj)?.as_frozen().ok_or_else(|| {
+                    AnnotatorError::new(
+                        "Bookkeeper.getdesc(bound method): frozen self did not produce FrozenDesc",
+                    )
+                })?;
+                DescEntry::MethodOfFrozen(Rc::new(RefCell::new(
+                    super::description::MethodOfFrozenDesc::new(self.clone(), funcdesc, frozendesc),
+                )))
+            } else {
+                let origin_class = pyobj.bound_method_origin_class().ok_or_else(|| {
+                    AnnotatorError::new(
+                        "Bookkeeper.getdesc(bound method): missing origin class from descriptor lookup",
+                    )
+                })?;
+                let self_class = if self_obj.is_class() {
+                    self_obj.clone()
+                } else {
+                    self_obj.instance_class().cloned().ok_or_else(|| {
+                        AnnotatorError::new(
+                            "Bookkeeper.getdesc(bound method): regular method self has no class",
+                        )
+                    })?
+                };
+                let classdef = self.getuniqueclassdef(&self_class)?;
+                if self_obj.is_instance() {
+                    super::classdesc::ClassDef::see_instance(&classdef, self_obj)?;
+                }
+                let name = pyobj.bound_method_name().ok_or_else(|| {
+                    AnnotatorError::new("Bookkeeper.getdesc(bound method): missing method name")
+                })?;
+                let _ = super::classdesc::ClassDef::find_attribute(&classdef, name)?;
+                DescEntry::Method(self.getmethoddesc(
+                    &funcdesc,
+                    ClassDefKey::from_classdef(&self.getuniqueclassdef(origin_class)?),
+                    Some(ClassDefKey::from_classdef(&classdef)),
+                    name,
+                    std::collections::BTreeMap::new(),
+                ))
+            }
         } else if pyobj.is_builtin_callable()
             || pyobj.is_instance()
             || pyobj.is_module()
@@ -1017,112 +1071,6 @@ impl Bookkeeper {
         Ok(super::model::SomeException::new(clsdefs))
     }
 
-    fn pbc_call_result_from_entry(
-        self: &Rc<Self>,
-        entry: &DescEntry,
-        args_s: &[SomeValue],
-    ) -> Result<SomeValue, AnnotatorError> {
-        let args = simple_args(args_s.to_vec());
-        // `op_key = None` — threading the flow-space op through the
-        // bookkeeper.pbc_call shim requires the annrpython.py driver.
-        // CallLocation specialisation over-merges until that lands.
-        match entry {
-            DescEntry::Function(fd) => {
-                let graph = fd.borrow().get_graph(&args, None)?;
-                self.infer_graph_result(&graph.graph.borrow(), args_s)
-            }
-            DescEntry::Method(md) => {
-                let graph = md.borrow().get_graph(&args, None)?;
-                self.infer_graph_result(&graph.graph.borrow(), args_s)
-            }
-            DescEntry::MethodOfFrozen(mfd) => {
-                let graph = mfd.borrow().get_graph(&args, None)?;
-                self.infer_graph_result(&graph.graph.borrow(), args_s)
-            }
-            DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(
-                "Bookkeeper.pbc_call: non-callable PBC entry",
-            )),
-        }
-    }
-
-    fn infer_graph_result(
-        self: &Rc<Self>,
-        graph: &crate::flowspace::model::FunctionGraph,
-        inputcells: &[SomeValue],
-    ) -> Result<SomeValue, AnnotatorError> {
-        use crate::flowspace::model::{BlockKey, Hlvalue};
-
-        let mut defined: HashMap<(BlockKey, crate::flowspace::model::Variable), SomeValue> =
-            HashMap::new();
-        for (index, arg) in graph.getargs().into_iter().enumerate() {
-            if let (Hlvalue::Variable(v), Some(s_value)) = (arg, inputcells.get(index)) {
-                defined.insert((BlockKey::of(&graph.startblock), v), s_value.clone());
-            }
-        }
-
-        for block in graph.iterblocks() {
-            let block_key = BlockKey::of(&block);
-            for op in &block.borrow().operations {
-                let inferred = match op.opname.as_str() {
-                    "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "is_" | "contains" | "bool" => {
-                        SomeValue::Bool(SomeBool::new())
-                    }
-                    "hash" | "len" | "ord" | "int" | "add" | "sub" | "mul" | "floordiv" | "mod"
-                    | "lshift" | "rshift" | "and_" | "or_" | "xor" => {
-                        SomeValue::Integer(SomeInteger::default())
-                    }
-                    "type" => SomeValue::Impossible,
-                    _ => continue,
-                };
-                let crate::flowspace::model::Hlvalue::Variable(v) = &op.result else {
-                    continue;
-                };
-                defined.insert((block_key.clone(), v.clone()), inferred);
-            }
-        }
-
-        let mut results = Vec::new();
-        for link_ref in graph.iterlinks() {
-            let link = link_ref.borrow();
-            let Some(target) = &link.target else {
-                continue;
-            };
-            if BlockKey::of(target) != BlockKey::of(&graph.returnblock) {
-                continue;
-            }
-            let Some(arg) = link.args.first().and_then(|arg| arg.clone()) else {
-                continue;
-            };
-            match arg {
-                crate::flowspace::model::Hlvalue::Constant(c) => {
-                    results.push(self.immutablevalue(&c.value)?);
-                }
-                crate::flowspace::model::Hlvalue::Variable(v) => {
-                    let prevblock = link
-                        .prevblock
-                        .as_ref()
-                        .and_then(|prev| prev.upgrade())
-                        .ok_or_else(|| AnnotatorError::new("return link missing prevblock"))?;
-                    let prev_key = BlockKey::of(&prevblock);
-                    if let Some(s_value) = defined.get(&(prev_key, v.clone())) {
-                        results.push(s_value.clone());
-                    } else {
-                        return Ok(SomeValue::Impossible);
-                    }
-                }
-            }
-        }
-
-        let mut iter = results.into_iter();
-        let Some(mut acc) = iter.next() else {
-            return Ok(SomeValue::Impossible);
-        };
-        for s_value in iter {
-            acc = super::model::union(&acc, &s_value).map_err(|e| AnnotatorError::new(e.msg))?;
-        }
-        Ok(acc)
-    }
-
     /// RPython `Bookkeeper.pbc_call(self, pbc, args, emulated=None)`
     /// (bookkeeper.py:512-537).
     ///
@@ -1148,47 +1096,71 @@ impl Bookkeeper {
     ///     s_result = unionof(*results)
     ///     return s_result
     /// ```
-    pub fn pbc_call_args(
+    ///
+    /// Python's three-state `emulated` parameter (`None` / `True` /
+    /// `<position_key>`) maps onto [`PbcCallEmulated`] in Rust.
+    pub fn pbc_call(
         self: &Rc<Self>,
         pbc: &SomePBC,
         args: &super::argument::ArgumentsForTranslation,
+        emulated: PbcCallEmulated,
     ) -> Result<SomeValue, AnnotatorError> {
         use super::model::s_impossible_value;
-        // upstream: `whence = self.position_key; s_previous_result = ...`.
-        let pk = self.current_position_key();
-        let whence: Option<(
-            crate::flowspace::model::GraphRef,
-            crate::flowspace::model::BlockRef,
-            usize,
-        )> = pk.as_ref().and_then(|p| {
-            // PositionKey carries Weak refs; upgrade to Rc for whence.
-            // If either ref has been dropped, fall back to whence=None
-            // (still correct — matches emulated=True path).
-            match (p.graph(), p.block()) {
-                (Some(g), Some(b)) => Some((g, b, p.op_index)),
-                _ => None,
-            }
-        });
-        // upstream: `op = block.operations[i]; s_previous_result = annotation(op.result)`.
-        let s_previous_result = if let Some(pk) = pk.as_ref() {
-            if let (Some(block), Some(ann)) = (pk.block(), self.annotator.borrow().upgrade()) {
-                let i = pk.op_index;
-                let block_borrow = block.borrow();
-                if i < block_borrow.operations.len() {
-                    let result_var = block_borrow.operations[i].result.clone();
-                    ann.annotation(&result_var)
-                        .unwrap_or_else(s_impossible_value)
+        // upstream bookkeeper.py:516-531 — 3-way branch on `emulated`.
+        let (whence, op_key, s_previous_result) = match &emulated {
+            PbcCallEmulated::None => {
+                // upstream: `whence = self.position_key;
+                //            op = block.operations[i];
+                //            s_previous_result = annotation(op.result)
+                //                                 or s_ImpossibleValue`.
+                let pk = self.current_position_key();
+                let whence: Option<(
+                    crate::flowspace::model::GraphRef,
+                    crate::flowspace::model::BlockRef,
+                    usize,
+                )> = pk.as_ref().and_then(|p| match (p.graph(), p.block()) {
+                    (Some(g), Some(b)) => Some((g, b, p.op_index)),
+                    _ => None,
+                });
+                let s_prev = if let Some(pk_ref) = pk.as_ref() {
+                    if let (Some(block), Some(ann)) =
+                        (pk_ref.block(), self.annotator.borrow().upgrade())
+                    {
+                        let i = pk_ref.op_index;
+                        let block_borrow = block.borrow();
+                        if i < block_borrow.operations.len() {
+                            let result_var = block_borrow.operations[i].result.clone();
+                            ann.annotation(&result_var)
+                                .unwrap_or_else(s_impossible_value)
+                        } else {
+                            s_impossible_value()
+                        }
+                    } else {
+                        s_impossible_value()
+                    }
                 } else {
                     s_impossible_value()
-                }
-            } else {
-                s_impossible_value()
+                };
+                (whence, pk, s_prev)
             }
-        } else {
-            s_impossible_value()
+            PbcCallEmulated::True => {
+                // upstream: `whence = None; op = None;
+                //            s_previous_result = s_ImpossibleValue`.
+                (None, None, s_impossible_value())
+            }
+            PbcCallEmulated::Callback(callback) => {
+                // upstream: `whence = emulated; op = None;
+                //            s_previous_result = s_ImpossibleValue`.
+                let whence = match (callback.graph(), callback.block()) {
+                    (Some(g), Some(b)) => Some((g, b, callback.op_index)),
+                    _ => None,
+                };
+                (whence, None, s_impossible_value())
+            }
         };
-        // upstream: `for desc in pbc.descriptions: results.append(desc.pycall(...))`.
-        let op_key = pk.clone();
+
+        // upstream: `for desc in pbc.descriptions:
+        //             results.append(desc.pycall(whence, args, s_previous_result, op))`.
         let mut results: Vec<SomeValue> = Vec::with_capacity(pbc.descriptions.len());
         for entry in pbc.descriptions.values() {
             let r = match entry {
@@ -1222,50 +1194,65 @@ impl Bookkeeper {
             .map_err(|e| AnnotatorError::new(format!("pbc_call unionof: {}", e)))
     }
 
-    /// Legacy entry used by the in-progress infer_graph_result path —
-    /// takes positional args only and routes through the Rust-only
-    /// shim that collapses args to a synthetic ArgumentsForTranslation.
-    /// Prefer [`Self::pbc_call_args`] for upstream parity.
-    pub fn pbc_call(
-        self: &Rc<Self>,
-        pbc: &SomePBC,
-        args_s: &[SomeValue],
-    ) -> Result<SomeValue, AnnotatorError> {
-        let mut results = Vec::new();
-        for entry in pbc.descriptions.values() {
-            results.push(self.pbc_call_result_from_entry(entry, args_s)?);
-        }
-        let mut iter = results.into_iter();
-        let Some(mut acc) = iter.next() else {
-            return Ok(SomeValue::Impossible);
-        };
-        for s_value in iter {
-            acc = super::model::union(&acc, &s_value).map_err(|e| AnnotatorError::new(e.msg))?;
-        }
-        Ok(acc)
-    }
-
+    /// RPython `Bookkeeper.emulate_pbc_call(self, unique_key, pbc,
+    /// args_s, replace=[], callback=None)` (bookkeeper.py:539-572).
+    ///
+    /// ```python
+    /// def emulate_pbc_call(self, unique_key, pbc, args_s,
+    ///                      replace=[], callback=None):
+    ///     with self.at_position(None):
+    ///         emulated_pbc_calls = self.emulated_pbc_calls
+    ///         prev = [unique_key]
+    ///         prev.extend(replace)
+    ///         for other_key in prev:
+    ///             if other_key in emulated_pbc_calls:
+    ///                 del emulated_pbc_calls[other_key]
+    ///         emulated_pbc_calls[unique_key] = pbc, args_s
+    ///
+    ///         args = simple_args(args_s)
+    ///         if callback is None:
+    ///             emulated = True
+    ///         else:
+    ///             emulated = callback
+    ///         return self.pbc_call(pbc, args, emulated=emulated)
+    /// ```
     pub fn emulate_pbc_call(
         self: &Rc<Self>,
         unique_key: EmulatedPbcCallKey,
         pbc: &SomeValue,
         args_s: &[SomeValue],
         replace: &[EmulatedPbcCallKey],
+        callback: Option<PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
         let SomeValue::PBC(pbc) = pbc else {
             return Err(AnnotatorError::new(format!(
                 "Bookkeeper.emulate_pbc_call expects SomePBC, got {pbc:?}"
             )));
         };
+        // upstream: `with self.at_position(None):`
+        let _guard = self.at_position(None);
         {
-            let mut emulated = self.emulated_pbc_calls.borrow_mut();
-            emulated.remove(&unique_key);
+            let mut emulated_map = self.emulated_pbc_calls.borrow_mut();
+            // upstream: `prev = [unique_key]; prev.extend(replace);
+            //            for other_key in prev:
+            //                if other_key in emulated_pbc_calls:
+            //                    del emulated_pbc_calls[other_key]`.
+            emulated_map.remove(&unique_key);
             for key in replace {
-                emulated.remove(key);
+                emulated_map.remove(key);
             }
-            emulated.insert(unique_key, (pbc.clone(), args_s.to_vec()));
+            // upstream: `emulated_pbc_calls[unique_key] = pbc, args_s`.
+            emulated_map.insert(unique_key, (pbc.clone(), args_s.to_vec()));
         }
-        self.pbc_call(pbc, args_s)
+        // upstream: `args = simple_args(args_s)`.
+        let args = simple_args(args_s.to_vec());
+        // upstream: `emulated = True if callback is None else callback`.
+        let emulated = match callback {
+            None => PbcCallEmulated::True,
+            Some(cb) => PbcCallEmulated::Callback(cb),
+        };
+        // upstream: `return self.pbc_call(pbc, args, emulated=emulated)`.
+        self.pbc_call(pbc, &args, emulated)
     }
 
     /// RPython `Bookkeeper.immutablevalue(x)` (bookkeeper.py:214-325).
@@ -1407,10 +1394,22 @@ impl Bookkeeper {
         obj: &HostObject,
         raw: &ConstValue,
     ) -> Result<SomeValue, AnnotatorError> {
-        // upstream bookkeeper.py:317 `callable(x)` → SomePBC path. In
-        // the Rust port we treat user-functions explicitly because
-        // bound-method / find_method dispatch (bookkeeper.py:318-329)
-        // requires a full descriptor registry that isn't ported yet.
+        if obj.is_bound_method() {
+            let self_obj = obj.bound_method_self().ok_or_else(|| {
+                AnnotatorError::new("Bookkeeper.immutablevalue(bound method): missing __self__")
+            })?;
+            let s_self = self.immutablevalue(&ConstValue::HostObject(self_obj.clone()))?;
+            if let Some(name) = obj.bound_method_name()
+                && let Some(result) = s_self.find_method(name)
+            {
+                return Ok(result);
+            }
+            let entry = self.getdesc(obj)?;
+            let mut pbc = SomePBC::new(vec![entry], false);
+            pbc.base.const_box = Some(Constant::new(raw.clone()));
+            return Ok(SomeValue::PBC(pbc));
+        }
+        // upstream bookkeeper.py:317 `callable(x)` → SomePBC path.
         if obj.is_user_function() {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
@@ -1449,10 +1448,43 @@ impl Bookkeeper {
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
+        // upstream bookkeeper.py:332-345 — `hasattr(x, '_freeze_')` →
+        // `SomePBC([getdesc(x)])`; `hasattr(x, '__class__') and
+        // x.__class__.__module__ != '__builtin__'` →
+        // `getuniqueclassdef(x.__class__) + see_instance + SomeInstance`.
+        if obj.is_instance() {
+            if let Some(class_obj) = obj.instance_class() {
+                // upstream: `hasattr(x, '_freeze_')` — in the Rust port we
+                // take "class defines `_freeze_` in its __dict__" as the
+                // structural equivalent, matching the upstream assertion
+                // `assert x._freeze_() is True` (only True-returning
+                // `_freeze_` methods are expected).
+                if class_obj.class_get("_freeze_").is_some() {
+                    let entry = self.getdesc(obj)?;
+                    let mut pbc = SomePBC::new(vec![entry], false);
+                    pbc.base.const_box = Some(Constant::new(raw.clone()));
+                    return Ok(SomeValue::PBC(pbc));
+                }
+                // upstream: `classdef = self.getuniqueclassdef(x.__class__);
+                //            classdef.see_instance(x);
+                //            result = SomeInstance(classdef)`.
+                // `hasattr(x, '_cleanup_'): x._cleanup_()` (line 341-342)
+                // is omitted — we can't invoke Python-side `_cleanup_`.
+                let classdef = self.getuniqueclassdef(class_obj)?;
+                super::classdesc::ClassDef::see_instance(&classdef, obj)?;
+                let mut inst = super::model::SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
+                );
+                inst.base.const_box = Some(Constant::new(raw.clone()));
+                return Ok(SomeValue::Instance(inst));
+            }
+        }
         Err(AnnotatorError::new(format!(
             "Bookkeeper.immutablevalue({raw:?}): host object kind not yet routed \
-             (Phase 5 P5.2+ dep — needs classdesc.py / builtin.py / extregistry / \
-             weakref / bound-method lookup; see bookkeeper.py:299-333)"
+             (weakref / extregistry branches pending; see \
+             bookkeeper.py:299-333)"
         )))
     }
 }
@@ -1934,10 +1966,12 @@ mod tests {
     }
 
     #[test]
-    fn immutablevalue_instance_host_object_defers() {
-        // Non-function/non-class/non-builtin HostObject kinds (Module,
-        // Instance, Opaque) stay deferred until the descriptor
-        // registry lands — fail-fast rather than silently routing.
+    fn immutablevalue_module_host_object_defers() {
+        // Module HostObjects aren't mapped to SomeInstance yet —
+        // upstream bookkeeper.py:339-345 would route them via
+        // `hasattr(x, '__class__') and __class__.__module__ !=
+        // '__builtin__'`, but Module has no __class__ in the Rust
+        // port's HostObject model. Stays deferred.
         use crate::flowspace::model::HostObject;
         let bk = bk();
         let mod_obj = HostObject::new_module("m");
@@ -1945,6 +1979,63 @@ mod tests {
             .immutablevalue(&ConstValue::HostObject(mod_obj))
             .expect_err("module HostObject stays deferred");
         assert!(err.msg.unwrap_or_default().contains("not yet routed"));
+    }
+
+    #[test]
+    fn immutablevalue_user_class_instance_routes_to_some_instance() {
+        // upstream bookkeeper.py:339-345 — user-class instance
+        // (non-`_freeze_`, non-builtin class) routes to
+        // `SomeInstance(getuniqueclassdef(x.__class__))` with the
+        // instance recorded via `classdef.see_instance(x)`.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.Holder", vec![]);
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        inst.instance_set("x", ConstValue::Int(42));
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(inst.clone()))
+            .expect("user-class instance must route to SomeInstance");
+        match s {
+            SomeValue::Instance(si) => {
+                assert!(si.classdef.is_some(), "classdef must be attached");
+                // `see_instance` records the instance in classdef.instances_seen.
+                let classdef = si.classdef.unwrap();
+                assert!(
+                    classdef
+                        .borrow()
+                        .instances_seen
+                        .contains(&inst.identity_id())
+                );
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immutablevalue_freeze_instance_routes_to_some_pbc() {
+        // upstream bookkeeper.py:332-338 — `hasattr(x, '_freeze_')`
+        // routes to `SomePBC([getdesc(x)])`. The Rust port detects
+        // `_freeze_` via `class_obj.class_get("_freeze_")`.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.Frozen", vec![]);
+        // Mark `_freeze_` as defined on the class; the presence alone
+        // is structurally equivalent to upstream's `hasattr + returns True`.
+        cls.class_set("_freeze_", ConstValue::Bool(true));
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(inst))
+            .expect("_freeze_ instance must route to SomePBC");
+        match s {
+            SomeValue::PBC(pbc) => {
+                assert_eq!(pbc.descriptions.len(), 1);
+            }
+            other => panic!("expected SomePBC, got {other:?}"),
+        }
     }
 
     #[test]

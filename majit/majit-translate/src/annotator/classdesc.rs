@@ -14,7 +14,7 @@
 //! | `is_primitive_type` (classdesc.py:474) | [`is_primitive_type`] |
 //! | `BuiltinTypeDesc` (classdesc.py:479-485) | [`BuiltinTypeDesc`] |
 //! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) | [`force_attributes_into_classes`] |
-//! | `ClassDesc` stub shell (classdesc.py:488-600) | [`ClassDesc`] |
+//! | `ClassDesc` (classdesc.py:488-600) | [`ClassDesc`] |
 //!
 //! ## PRE-EXISTING-ADAPTATION: cyclic ClassDef ↔ ClassDesc
 //!
@@ -54,12 +54,11 @@
 //!
 //! ## PRE-EXISTING-ADAPTATION: HostObject class-dict reflection
 //!
-//! Upstream reflection such as `cls.__dict__.get('_mixin_')` is not
-//! available on [`HostObject`] yet; [`is_mixin`] / [`is_primitive_type`]
-//! / [`ClassDesc::new`] carry stub behaviour that defaults to "not a
-//! mixin" / "not primitive" with a comment citing the upstream line.
-//! Full reflection lands alongside c2 where `ClassDesc.__init__` body
-//! is ported.
+//! [`HostObject::Class`] exposes `class_get(name)` /
+//! `class_contains(name)` as the reflection surface upstream reads via
+//! `cls.__dict__.get(…)`. `ClassDesc::__init__` uses these to detect
+//! `_mixin_`, `_immutable_fields_`, `__slots__`, `_attrs_`,
+//! `__NOT_RPYTHON__`, and `_annspecialcase_`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -67,7 +66,9 @@ use std::rc::{Rc, Weak};
 
 use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::model::{AnnotatorError, DescKind, SomeInteger, SomeString, SomeValue, union};
-use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
+use crate::flowspace::model::{
+    ConstValue, Constant, HOST_ENV, HostGetAttrError, HostObject, host_getattr,
+};
 
 // ---------------------------------------------------------------------------
 // ClassDictEntry (classdesc.py:506 `{attr: Constant-or-Desc}`).
@@ -278,9 +279,7 @@ impl AttrSource {
 /// Wraps a prebuilt Python instance seen by the annotator. The Rust
 /// port stores the `Bookkeeper` as `Weak` to match upstream's Python
 /// reference and captures the live object via its [`HostObject`]
-/// carrier. The `s_get_value` / `all_instance_attributes` bodies call
-/// into Python reflection that isn't available here; both surface as
-/// [`AnnotatorError`] with a Phase 5 P5.2+ citation.
+/// carrier.
 #[derive(Clone, Debug)]
 pub struct InstanceSource {
     pub bookkeeper: Weak<Bookkeeper>,
@@ -301,29 +300,86 @@ impl InstanceSource {
     /// RPython `InstanceSource.s_get_value(classdef, name)`
     /// (classdesc.py:442-451).
     ///
-    /// Defers to live instance reflection; returns [`AnnotatorError`]
-    /// citing the dep until c2/c3 wires instance-attribute reads.
     pub fn s_get_value(
         &self,
-        _classdef: Option<&Rc<RefCell<ClassDef>>>,
-        _name: &str,
+        classdef: Option<&Rc<RefCell<ClassDef>>>,
+        name: &str,
     ) -> Result<SomeValue, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "InstanceSource.s_get_value requires live instance attribute \
-             reflection (Phase 5 P5.2+ dep — see classdesc.py:442-451)",
-        ))
+        let value = match host_getattr(&self.obj, name) {
+            Ok(value) => value,
+            Err(HostGetAttrError::Missing) => {
+                if let Some(classdef) = classdef {
+                    let classdef = classdef.borrow();
+                    let all_enforced_attrs = &classdef.classdesc.borrow().all_enforced_attrs;
+                    if all_enforced_attrs
+                        .as_ref()
+                        .is_some_and(|attrs| attrs.contains(name))
+                    {
+                        return Ok(SomeValue::Impossible);
+                    }
+                }
+                return Err(AnnotatorError::new(format!(
+                    "AttributeError: {:?} object has no attribute {:?}",
+                    self.obj.qualname(),
+                    name
+                )));
+            }
+            Err(HostGetAttrError::Unsupported) => {
+                return Err(AnnotatorError::new(format!(
+                    "InstanceSource.s_get_value({:?}): host getattr is unsupported",
+                    self.obj.qualname()
+                )));
+            }
+        };
+        let bk = self
+            .bookkeeper
+            .upgrade()
+            .ok_or_else(|| AnnotatorError::new("InstanceSource.s_get_value: Bookkeeper dropped"))?;
+        bk.immutablevalue(&value)
     }
 
     /// RPython `InstanceSource.all_instance_attributes(self)`
     /// (classdesc.py:453-464).
-    ///
-    /// Walks `obj.__dict__` + `tp.__mro__` `__slots__`. Deferred as
-    /// above.
     pub fn all_instance_attributes(&self) -> Result<Vec<String>, AnnotatorError> {
-        Err(AnnotatorError::new(
-            "InstanceSource.all_instance_attributes requires live __dict__ / \
-             __slots__ reflection (Phase 5 P5.2+ dep — see classdesc.py:453-464)",
-        ))
+        let mut result = self.obj.instance_dict_keys();
+        let Some(tp) = self.obj.instance_class() else {
+            return Ok(result);
+        };
+        if !tp.is_class() {
+            return Ok(result);
+        }
+        let Some(mro) = tp.mro() else {
+            return Ok(result);
+        };
+        for basetype in mro {
+            let Some(slots) = basetype.class_get("__slots__") else {
+                continue;
+            };
+            if matches!(slots.truthy(), Some(false)) {
+                continue;
+            }
+            match slots {
+                ConstValue::Str(slot) => result.push(slot),
+                ConstValue::Tuple(items) | ConstValue::List(items) => {
+                    for item in items {
+                        match item {
+                            ConstValue::Str(slot) => result.push(slot),
+                            _ => {
+                                return Err(AnnotatorError::new(
+                                    "__slots__ must be a sequence of strings",
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return Err(AnnotatorError::new(
+                        "__slots__ must be a string or a sequence of strings",
+                    ));
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -457,10 +513,10 @@ impl Attribute {
 
     /// RPython `Attribute.modified(self, classdef='?')` (classdesc.py:122-134).
     ///
-    /// The `attr_allowed=False` path needs `bookkeeper.getattr_locations`,
-    /// which is a Phase 5 P5.2+ bookkeeper-commit-2 dependency; when
-    /// that branch fires we surface an [`AnnotatorError`] citing the
-    /// missing dep rather than silently continuing.
+    /// The `attr_allowed=False` path invokes `bookkeeper.getattr_locations`
+    /// to render the list of read locations in the `NoSuchAttrError`
+    /// message; when the backlink is missing the error is returned with
+    /// an empty location list.
     pub fn modified(
         &mut self,
         classdef: Option<&Rc<RefCell<ClassDef>>>,
@@ -506,7 +562,7 @@ impl Attribute {
 }
 
 // ---------------------------------------------------------------------------
-// ClassDesc stub (classdesc.py:488-600 — data shell only; c2 fills body).
+// ClassDesc (classdesc.py:488-600).
 // ---------------------------------------------------------------------------
 
 /// RPython `class ClassDesc(Desc)` (classdesc.py:488-600).
@@ -521,9 +577,9 @@ impl Attribute {
 /// `getallbases` / `getcommonbase` / `MethodDesc` initdesc recursion),
 /// `getattrfamily`, `mergeattrfamilies`, and exception-class predicates.
 ///
-/// Remaining deferred: `find_source_for`, `maybe_return_immutable_list`,
-/// `pythontype` helpers — rtyper-phase dependencies not reachable
-/// from the annotator fixpoint.
+/// Remaining deferred: `maybe_return_immutable_list`, `pythontype`
+/// helpers — rtyper-phase dependencies not reachable from the
+/// annotator fixpoint.
 #[derive(Debug)]
 pub struct ClassDesc {
     /// RPython `self.pyobj` — the live Python class object.
@@ -556,10 +612,10 @@ pub struct ClassDesc {
 }
 
 impl ClassDesc {
-    /// RPython `ClassDesc.__init__` stub (classdesc.py:494-588).
-    ///
-    /// c1 skips the mixin / slots / exception detection so the
-    /// structural port compiles. c2 replaces this with the full body.
+    /// Data-only shell used by unit tests that need a bare `ClassDesc`
+    /// without running the full `__init__` (classdesc.py:494-588)
+    /// mixin / slots / exception-pre-population body. Production
+    /// callers use [`Self::new`].
     pub fn new_shell(bookkeeper: &Rc<Bookkeeper>, pyobj: HostObject, name: String) -> Self {
         ClassDesc {
             pyobj,
@@ -1087,6 +1143,7 @@ impl ClassDesc {
                 &s_func,
                 &args_s,
                 &[],
+                None,
             )?;
             assert!(super::model::s_none().contains(&s));
         }
@@ -1143,7 +1200,7 @@ impl ClassDesc {
         _s_previous_result: &SomeValue,
         _op_key: Option<super::bookkeeper::PositionKey>,
     ) -> Result<SomeValue, AnnotatorError> {
-        use super::model::{SomeInstance, SomeValue, s_impossible_value};
+        use super::model::{SomeInstance, SomeValue};
         // upstream: `classdef = self.getuniqueclassdef()`.
         let classdef = Self::getuniqueclassdef(this)?;
         // upstream: `s_instance = SomeInstance(classdef)`.
@@ -1155,7 +1212,6 @@ impl ClassDesc {
         // upstream: `s_init = self.s_read_attribute('__init__')`.
         let s_init = Self::s_read_attribute(this, "__init__")?;
         let is_impossible = matches!(s_init, SomeValue::Impossible);
-        let _ = s_impossible_value; // suppress unused warning if paths shift
         if is_impossible {
             // upstream: `if not self.is_exception_class(): args.fixedunpack(0)`.
             let is_exc = this.borrow().is_exception_class();
@@ -1174,22 +1230,11 @@ impl ClassDesc {
         } else {
             // upstream: `args = args.prepend(s_instance); s_init.call(args)`.
             let bound_args = args.prepend(s_instance.clone());
-            match &s_init {
-                SomeValue::PBC(pbc) => {
-                    let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
-                        AnnotatorError::new("ClassDesc.pycall: Bookkeeper backlink dropped")
-                    })?;
-                    bk.pbc_call_args(pbc, &bound_args)?;
-                }
-                SomeValue::None_(_) => {
-                    let _ = s_impossible_value;
-                }
-                _ => {
-                    return Err(AnnotatorError::new(
-                        "Cannot prove that the object is callable",
-                    ));
-                }
-            }
+            let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+                AnnotatorError::new("ClassDesc.pycall: Bookkeeper backlink dropped")
+            })?;
+            let _guard = bk.at_position(None);
+            s_init.call(&bound_args)?;
         }
         Ok(s_instance)
     }
@@ -1410,6 +1455,42 @@ impl ClassDesc {
         _key: (),
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
         Self::getuniqueclassdef(this)
+    }
+
+    /// RPython `ClassDesc.find_source_for(self, name)` (classdesc.py:808-817).
+    ///
+    /// ```python
+    /// def find_source_for(self, name):
+    ///     if name in self.classdict:
+    ///         return self
+    ///     cls = self.pyobj
+    ///     if name in cls.__dict__:
+    ///         self.add_source_attribute(name, cls.__dict__[name])
+    ///         if name in self.classdict:
+    ///             return self
+    ///     return None
+    /// ```
+    ///
+    /// Returns an [`AttrSource::Class`] pointing at `this` when the
+    /// attribute lives in (or was just imported into) `classdict`.
+    pub fn find_source_for(
+        this: &Rc<RefCell<Self>>,
+        name: &str,
+    ) -> Result<Option<AttrSource>, AnnotatorError> {
+        // upstream: `if name in self.classdict: return self`
+        if this.borrow().classdict.contains_key(name) {
+            return Ok(Some(AttrSource::Class(Rc::downgrade(this))));
+        }
+        // upstream: `cls = self.pyobj; if name in cls.__dict__: ...`
+        let pyobj = this.borrow().pyobj.clone();
+        if let Some(value) = pyobj.class_get(name) {
+            // upstream: `self.add_source_attribute(name, cls.__dict__[name])`.
+            Self::add_source_attribute(this, name, value, false)?;
+            if this.borrow().classdict.contains_key(name) {
+                return Ok(Some(AttrSource::Class(Rc::downgrade(this))));
+            }
+        }
+        Ok(None)
     }
 
     /// RPython `ClassDesc.consider_call_site(descs, args, s_result, op)`
@@ -2036,6 +2117,274 @@ impl ClassDef {
         Ok(attr_value)
     }
 
+    /// RPython `ClassDef.lookup_filter(self, pbc, name=None, flags={})`
+    /// (classdesc.py:336-374).
+    ///
+    /// "Selects the methods in the pbc that could possibly be seen by
+    /// a lookup performed on an instance of 'self', removing the ones
+    /// that cannot appear."
+    pub fn lookup_filter(
+        this: &Rc<RefCell<ClassDef>>,
+        pbc: &super::model::SomePBC,
+        _name: Option<&str>,
+        flags: &std::collections::BTreeMap<String, bool>,
+    ) -> Result<SomeValue, AnnotatorError> {
+        let mut d: Vec<super::description::DescEntry> = Vec::new();
+        let mut uplookup: Option<Rc<RefCell<ClassDef>>> = None;
+        let mut updesc: Option<Rc<RefCell<super::description::MethodDesc>>> = None;
+
+        let bookkeeper = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+            AnnotatorError::new("ClassDef.lookup_filter: bookkeeper backlink dropped")
+        })?;
+
+        for entry in pbc.descriptions.values() {
+            // upstream: `if isinstance(desc, MethodDesc) and desc.selfclassdef is None:`
+            let method = match entry {
+                super::description::DescEntry::Method(md) => {
+                    if md.borrow().selfclassdef.is_none() {
+                        Some(md.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            let Some(desc) = method else {
+                // upstream: `d.append(desc)` for non-method or
+                // already-bound methods.
+                d.push(entry.clone());
+                continue;
+            };
+
+            // upstream: `methclassdef = desc.originclassdef`.
+            let methclassdef_key = desc.borrow().originclassdef;
+            let Some(methclassdef) = bookkeeper.lookup_classdef(methclassdef_key) else {
+                // Missing classdef — skip this desc (upstream never hits
+                // this because the UnionFind keeps classdefs alive).
+                continue;
+            };
+
+            let is_same = Rc::ptr_eq(&methclassdef, this);
+            let is_subclass_of_self = !is_same && methclassdef.borrow().issubclass(this);
+            let self_subclass_of_meth = this.borrow().issubclass(&methclassdef);
+
+            if is_subclass_of_self {
+                // upstream: `pass  # subclasses methods are always candidates`.
+            } else if self_subclass_of_meth {
+                // upstream: `if uplookup is None or methclassdef.issubclass(uplookup):`
+                let replace = match &uplookup {
+                    None => true,
+                    Some(up) => methclassdef.borrow().issubclass(up),
+                };
+                if replace {
+                    uplookup = Some(methclassdef.clone());
+                    updesc = Some(desc.clone());
+                }
+                continue;
+            } else {
+                // upstream: `continue  # not matching`.
+                continue;
+            }
+
+            // upstream: `desc = desc.bind_self(methclassdef, flags)`.
+            let bound = desc.borrow().bind_self(methclassdef_key, flags.clone())?;
+            d.push(super::description::DescEntry::Method(bound));
+        }
+
+        // upstream: `if uplookup is not None: d.append(updesc.bind_self(self, flags))`.
+        if let (Some(up), Some(ud)) = (uplookup.as_ref(), updesc.as_ref()) {
+            let up_key = super::description::ClassDefKey::from_classdef(up);
+            // NB. upstream uses `self` — bind_self to the caller's own
+            // classdef, not `up`. Matches classdesc.py:367.
+            let self_key = super::description::ClassDefKey::from_classdef(this);
+            let _ = up_key;
+            let bound = ud.borrow().bind_self(self_key, flags.clone())?;
+            d.push(super::description::DescEntry::Method(bound));
+        }
+
+        // upstream: `if d: return SomePBC(d, can_be_None=pbc.can_be_None)`.
+        if !d.is_empty() {
+            let new_pbc = super::model::SomePBC::with_subset(d, pbc.can_be_none, None);
+            return Ok(SomeValue::PBC(new_pbc));
+        }
+        // upstream: `elif pbc.can_be_None: return s_None`.
+        if pbc.can_be_none {
+            return Ok(super::model::s_none());
+        }
+        // upstream: `else: return s_ImpossibleValue`.
+        Ok(super::model::s_impossible_value())
+    }
+
+    /// RPython `ClassDef.s_getattr(self, attrname, flags)` (classdesc.py:168-187).
+    ///
+    /// ```python
+    /// def s_getattr(self, attrname, flags):
+    ///     attrdef = self.find_attribute(attrname)
+    ///     s_result = attrdef.s_value
+    ///     if isinstance(s_result, SomePBC):
+    ///         s_result = self.lookup_filter(s_result, attrname, flags)
+    ///     elif isinstance(s_result, SomeImpossibleValue):
+    ///         self.check_missing_attribute_update(attrname)
+    ///         for basedef in self.getmro():
+    ///             if basedef.classdesc.all_enforced_attrs is not None:
+    ///                 if attrname in basedef.classdesc.all_enforced_attrs:
+    ///                     raise HarmlesslyBlocked("get enforced attr")
+    ///     elif isinstance(s_result, SomeList):
+    ///         s_result = self.classdesc.maybe_return_immutable_list(
+    ///             attrname, s_result)
+    ///     return s_result
+    /// ```
+    pub fn s_getattr(
+        this: &Rc<RefCell<ClassDef>>,
+        attrname: &str,
+        flags: &std::collections::BTreeMap<String, bool>,
+    ) -> Result<SomeValue, AnnotatorError> {
+        // upstream: `attrdef = self.find_attribute(attrname);
+        //            s_result = attrdef.s_value`.
+        let s_result = Self::find_attribute(this, attrname)?;
+        match &s_result {
+            SomeValue::PBC(pbc) => Self::lookup_filter(this, pbc, Some(attrname), flags),
+            SomeValue::Impossible => {
+                // upstream: `self.check_missing_attribute_update(attrname)`.
+                Self::check_missing_attribute_update(this, attrname)?;
+                // upstream: `for basedef in self.getmro(): if
+                //            basedef.classdesc.all_enforced_attrs is not None
+                //            and attrname in all_enforced_attrs:
+                //            raise HarmlesslyBlocked(...)`.
+                for basedef in Self::getmro(this) {
+                    let cdesc = basedef.borrow().classdesc.clone();
+                    let all_enforced = cdesc.borrow().all_enforced_attrs.clone();
+                    if let Some(attrs) = all_enforced {
+                        if attrs.contains(attrname) {
+                            return Err(AnnotatorError::new(format!(
+                                "HarmlesslyBlocked: get enforced attr {attrname}"
+                            )));
+                        }
+                    }
+                }
+                Ok(s_result)
+            }
+            SomeValue::List(_) => {
+                // upstream: `s_result = self.classdesc.maybe_return_immutable_list(
+                //                          attrname, s_result)`.
+                // maybe_return_immutable_list is rtyper-phase; pass through.
+                Ok(s_result)
+            }
+            _ => Ok(s_result),
+        }
+    }
+
+    /// RPython `ClassDef.check_attr_here(self, name)` (classdesc.py:389-400).
+    ///
+    /// ```python
+    /// def check_attr_here(self, name):
+    ///     source = self.classdesc.find_source_for(name)
+    ///     if source is not None:
+    ///         self.add_source_for_attribute(name, source)
+    ///         for subdef in self.getallsubdefs():
+    ///             if subdef is not self:
+    ///                 subdef.check_attr_here(name)
+    ///         return True
+    ///     else:
+    ///         return False
+    /// ```
+    pub fn check_attr_here(
+        this: &Rc<RefCell<ClassDef>>,
+        name: &str,
+    ) -> Result<bool, AnnotatorError> {
+        let classdesc = this.borrow().classdesc.clone();
+        let source = ClassDesc::find_source_for(&classdesc, name)?;
+        let Some(source) = source else {
+            return Ok(false);
+        };
+        Self::add_source_for_attribute(this, name, source)?;
+        for subdef in Self::getallsubdefs(this) {
+            if !Rc::ptr_eq(&subdef, this) {
+                Self::check_attr_here(&subdef, name)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// RPython `ClassDef.check_missing_attribute_update(self, name)`
+    /// (classdesc.py:376-387).
+    ///
+    /// ```python
+    /// def check_missing_attribute_update(self, name):
+    ///     found = False
+    ///     parents = list(self.getmro())
+    ///     parents.reverse()
+    ///     for base in parents:
+    ///         if base.check_attr_here(name):
+    ///             found = True
+    ///     return found
+    /// ```
+    pub fn check_missing_attribute_update(
+        this: &Rc<RefCell<ClassDef>>,
+        name: &str,
+    ) -> Result<bool, AnnotatorError> {
+        let mut found = false;
+        let mut parents = Self::getmro(this);
+        parents.reverse();
+        for base in parents {
+            if Self::check_attr_here(&base, name)? {
+                found = true;
+            }
+        }
+        Ok(found)
+    }
+
+    /// RPython `ClassDef.see_instance(self, x)` (classdesc.py:404-416).
+    ///
+    /// ```python
+    /// def see_instance(self, x):
+    ///     assert isinstance(x, self.classdesc.pyobj)
+    ///     key = Hashable(x)
+    ///     if key in self.instances_seen:
+    ///         return
+    ///     self.instances_seen.add(key)
+    ///     self.bookkeeper.event('mutable', x)
+    ///     source = InstanceSource(self.bookkeeper, x)
+    ///     def delayed():
+    ///         for attr in source.all_instance_attributes():
+    ///             self.add_source_for_attribute(attr, source)
+    ///     self._see_instance_flattenrec(delayed)
+    /// ```
+    ///
+    /// `_see_instance_flattenrec` (a `FlattenRecursion`) queues
+    /// recursive `see_instance` calls so deeply-nested instance graphs
+    /// don't blow the Python recursion limit. The Rust port executes
+    /// the attribute-source scan in-line; the recursion flattener is
+    /// only observable for pathologically deep instance chains which
+    /// the current test corpus never constructs. `bookkeeper.event`
+    /// is the default empty hook (bookkeeper.py:78-79) so the Rust
+    /// port omits the dispatch.
+    pub fn see_instance(
+        this: &Rc<RefCell<ClassDef>>,
+        x: &HostObject,
+    ) -> Result<(), AnnotatorError> {
+        // upstream: `key = Hashable(x); if key in self.instances_seen: return`.
+        let key = x.identity_id();
+        {
+            let mut borrowed = this.borrow_mut();
+            if !borrowed.instances_seen.insert(key) {
+                return Ok(());
+            }
+        }
+        // upstream: `source = InstanceSource(self.bookkeeper, x)`.
+        let bookkeeper = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+            AnnotatorError::new("ClassDef.see_instance: bookkeeper backlink dropped")
+        })?;
+        let inst_source = InstanceSource::new(&bookkeeper, x.clone());
+        // upstream: `for attr in source.all_instance_attributes(): self.add_source_for_attribute(attr, source)`.
+        let attrs = inst_source.all_instance_attributes()?;
+        for attr in attrs {
+            Self::add_source_for_attribute(this, &attr, AttrSource::Instance(inst_source.clone()))?;
+        }
+        Ok(())
+    }
+
     /// RPython `ClassDef.generalize_attr(self, attr, s_value=None)`
     /// (classdesc.py:315-322).
     pub fn generalize_attr(
@@ -2348,21 +2697,46 @@ mod tests {
     }
 
     #[test]
-    fn instance_source_defers_with_phase5_citation() {
+    fn instance_source_all_instance_attributes_collects_instance_dict_and_slots() {
         let bk = make_bk();
-        let obj = HostObject::new_instance(HostObject::new_class("pkg.X", vec![]), vec![]);
+        let base = HostObject::new_class("pkg.Base", vec![]);
+        base.class_set("__slots__", ConstValue::Str("base_slot".into()));
+        let cls = HostObject::new_class("pkg.X", vec![base]);
+        cls.class_set(
+            "__slots__",
+            ConstValue::Tuple(vec![ConstValue::Str("slot_a".into())]),
+        );
+        let obj = HostObject::new_instance(cls, vec![]);
+        obj.instance_set("dyn", ConstValue::Int(1));
         let src = InstanceSource::new(&bk, obj);
-        let err = src.all_instance_attributes().unwrap_err();
-        assert!(err.msg.as_deref().unwrap().contains("Phase 5 P5.2+"));
+        let attrs = src.all_instance_attributes().unwrap();
+        assert!(attrs.iter().any(|attr| attr == "dyn"));
+        assert!(attrs.iter().any(|attr| attr == "slot_a"));
+        assert!(attrs.iter().any(|attr| attr == "base_slot"));
     }
 
     #[test]
-    fn attr_source_s_get_value_defers() {
+    fn attr_source_s_get_value_reads_instance_and_enforced_missing() {
         let bk = make_bk();
-        let obj = HostObject::new_instance(HostObject::new_class("pkg.X", vec![]), vec![]);
+        let cls = HostObject::new_class("pkg.X", vec![]);
+        cls.class_set("klass", ConstValue::Int(9));
+        let obj = HostObject::new_instance(cls.clone(), vec![]);
+        obj.instance_set("x", ConstValue::Int(4));
         let src = AttrSource::Instance(InstanceSource::new(&bk, obj));
-        let err = src.s_get_value(None, "x").unwrap_err();
-        assert!(err.msg.as_deref().unwrap().contains("live instance"));
+
+        let s_x = src.s_get_value(None, "x").unwrap();
+        assert!(matches!(s_x, SomeValue::Integer(_)));
+
+        let s_klass = src.s_get_value(None, "klass").unwrap();
+        assert!(matches!(s_klass, SomeValue::Integer(_)));
+
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(&bk, cls, "pkg.X".into())));
+        desc.borrow_mut()
+            .all_enforced_attrs
+            .replace(HashSet::from([String::from("must_exist")]));
+        let classdef = ClassDef::new(&bk, &desc);
+        let s_missing = src.s_get_value(Some(&classdef), "must_exist").unwrap();
+        assert!(matches!(s_missing, SomeValue::Impossible));
     }
 
     #[test]
@@ -2759,7 +3133,15 @@ mod tests {
 
     #[test]
     fn classdesc_init_classdef_emulates_del_call() {
-        let bk = make_bk();
+        // upstream classdesc.py:691-696 — `_init_classdef` dispatches
+        // `__del__` through `bookkeeper.emulate_pbc_call`. The new
+        // emulate_pbc_call path delegates to real `FunctionDesc.pycall`
+        // (bookkeeper.py:570-572 `self.pbc_call(...)`), which requires a
+        // live annotator backlink — so the test wires up the full
+        // `RPythonAnnotator` rather than a bare Bookkeeper.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
         let cls = HostObject::new_class("pkg.HasDel", vec![]);
         cls.class_set(
             "__del__",

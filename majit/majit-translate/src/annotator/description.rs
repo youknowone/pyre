@@ -423,18 +423,21 @@ impl Desc {
         None
     }
 
-    /// RPython `Desc.simplify_desc_set(descs)` (description.py:180-182).
-    ///
-    /// Base `@staticmethod` no-op; subclasses override to collapse
-    /// shadowed MethodDescs.
-    pub fn simplify_desc_set(_descs: &mut Vec<Rc<RefCell<Desc>>>) {}
-
     /// Pointer-identity key for [`CallFamily`] / `FrozenAttrFamily` /
     /// `ClassAttrFamily` storage. Upstream uses `desc` itself as the
     /// key (dict-by-identity).
     pub fn desc_key(self_rc: &Rc<RefCell<Desc>>) -> DescKey {
         DescKey::from_rc(self_rc)
     }
+}
+
+/// RPython `Desc.simplify_desc_set(descs)` — `@staticmethod` base
+/// (description.py:180-182). No-op; only [`MethodDesc::simplify_desc_set`]
+/// overrides it. Dispatched polymorphically from
+/// [`super::model::SomePBC::simplify`].
+pub(crate) fn simplify_desc_set_default(
+    _descs: &mut std::collections::BTreeMap<DescKey, DescEntry>,
+) {
 }
 
 /// PRE-EXISTING-ADAPTATION: single-inheritance Desc hierarchy in Rust.
@@ -603,9 +606,8 @@ impl Eq for DescEntry {}
 /// RPython `class FunctionDesc(Desc)` (description.py:190-393).
 ///
 /// "The 'FunctionDesc' wraps a Python function or method." Fields
-/// match upstream line-by-line; the graph-building / specialization
-/// / pycall methods are stubbed pending the annrpython.py driver
-/// (see doc on [`Self::pycall`] for the dep list).
+/// match upstream line-by-line. Graph-building / specialization /
+/// pycall paths are wired to `RPythonAnnotator.recursivecall`.
 #[derive(Debug)]
 pub struct FunctionDesc {
     /// Embedded base-class state (description.py:195 `super().__init__`).
@@ -825,15 +827,12 @@ impl FunctionDesc {
                 self.name
             )));
         }
-        if enforceargs.is_some() {
+        if let Some(sig) = enforceargs {
             // upstream: `enforceargs(self, inputs_s)` — Sig.__call__
-            // is Phase 5 P5.2 blocked (signature.py:113-147). Return
-            // loud error rather than silently skip.
-            return Err(AnnotatorError::new(format!(
-                "{}: Sig.__call__ path requires description.py commit 3+ bookkeeper \
-                 integration (Phase 5 P5.2 dep — see signature.py:113-147)",
-                self.name
-            )));
+            // (signature.py:113-147).
+            sig.call(&self.name, &self.base.bookkeeper, inputs_s)
+                .map_err(|e| -> AnnotatorError { e.into() })?;
+            return Ok(());
         }
         if let Some(sig) = signature {
             super::signature::enforce_signature_args(
@@ -1096,8 +1095,8 @@ impl FunctionDesc {
     /// [`Specializer::CallLocation`] can cache graphs per call site
     /// (upstream `specialize_call_location(funcdesc, args_s, op)` keys
     /// on `(op,)` — specialize.py:368-370). When `None`, CallLocation
-    /// falls back to a shared key — acceptable because the annrpython
-    /// driver isn't wired yet (Phase 5 P5.2+ dep).
+    /// falls back to a shared key — used by emulated / callback
+    /// `pbc_call` paths that do not have a live flow-space op.
     pub fn specialize(
         &self,
         inputcells: &mut [SomeValue],
@@ -1770,9 +1769,6 @@ impl MethodDesc {
 
     /// RPython `MethodDesc.bind_self(newselfclassdef, flags={})`
     /// (description.py:451-456).
-    ///
-    /// **Not ported.** Requires `bookkeeper.getmethoddesc` — Phase
-    /// 5 P5.2 dep on description.py commit 4 / classdesc.py.
     pub fn bind_self(
         &self,
         newselfclassdef: ClassDefKey,
@@ -1941,16 +1937,13 @@ impl MethodDesc {
 
 /// RPython helper `new_or_old_class(c)` (description.py:522-526).
 ///
-/// Upstream returns `c.__class__` when the instance carries one, and
-/// `type(c)` otherwise. The Rust port only has enough HostObject
-/// plumbing to cover the instance-with-class path via
-/// [`HostObject::instance_class`]; `type(c)` for modules / opaque /
-/// builtins resolves to a generic `ModuleType` / `type` that our
-/// HostObject model does not yet carry, so those cases still return
-/// `None`. When classdesc.py / full HostObject getattr land, the
-/// fallback becomes a real `type(pyobj)` lookup.
+/// Upstream returns `c.__class__` when available, and `type(c)`
+/// otherwise. The HostObject carrier exposes the same query via
+/// [`HostObject::class_of`], with `Opaque` remaining the only
+/// unresolved case because its runtime type is intentionally hidden
+/// from the Rust port.
 pub fn new_or_old_class(pyobj: &HostObject) -> Option<HostObject> {
-    pyobj.instance_class().cloned()
+    pyobj.class_of()
 }
 
 /// RPython `read_attribute` callback type for [`FrozenDesc`]
@@ -2948,6 +2941,40 @@ mod tests {
         let pyobj = HostObject::new_module("os");
         let fd = FrozenDesc::new(bk, pyobj).unwrap();
         assert!(fd.attrcache.borrow().is_empty());
+        assert_eq!(
+            fd.knowntype.as_ref().map(HostObject::qualname),
+            Some("module")
+        );
+    }
+
+    #[test]
+    fn new_or_old_class_maps_host_kinds_to_host_types() {
+        let cls = HostObject::new_class("C", vec![]);
+        assert_eq!(
+            new_or_old_class(&cls).as_ref().map(HostObject::qualname),
+            Some("type")
+        );
+
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        assert_eq!(
+            new_or_old_class(&inst).as_ref().map(HostObject::qualname),
+            Some("C")
+        );
+
+        let func = HostObject::new_user_function(crate::flowspace::model::GraphFunc::new(
+            "f",
+            Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        assert_eq!(
+            new_or_old_class(&func).as_ref().map(HostObject::qualname),
+            Some("function")
+        );
+
+        let prop = HostObject::new_property("p", None, None, None);
+        assert_eq!(
+            new_or_old_class(&prop).as_ref().map(HostObject::qualname),
+            Some("property")
+        );
     }
 
     #[test]

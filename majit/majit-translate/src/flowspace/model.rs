@@ -137,6 +137,16 @@ enum HostObjectKind {
     /// recognizes this wrapper and raises the upstream
     /// "classmethods are not supported" error.
     ClassMethod { func: HostObject },
+    /// Python bound method object. This is the host-level result of
+    /// `function.__get__(obj, cls)` / `classmethod.__get__(obj, cls)`
+    /// in places where flowspace or FrozenDesc must mirror real
+    /// `getattr()`.
+    BoundMethod {
+        self_obj: HostObject,
+        func: HostObject,
+        name: String,
+        origin_class: HostObject,
+    },
 }
 
 impl PartialEq for HostObject {
@@ -332,6 +342,17 @@ impl HostObject {
         }
     }
 
+    /// Instance `__dict__.keys()` snapshot. Non-instance returns an
+    /// empty Vec, mirroring `getattr(obj, '__dict__', {}).keys()`.
+    pub fn instance_dict_keys(&self) -> Vec<String> {
+        match &self.inner.kind {
+            HostObjectKind::Instance { instance_dict, .. } => {
+                instance_dict.lock().unwrap().keys().cloned().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Instance setter — installs an entry into the per-instance
     /// `__dict__`. Used by prebuilt-instance fixtures in tests and
     /// by the `@setattr_to_class_annotation` style decorators
@@ -354,6 +375,27 @@ impl HostObject {
     pub fn module_set(&self, name: impl Into<String>, value: HostObject) {
         if let HostObjectKind::Module { members } = &self.inner.kind {
             members.lock().unwrap().insert(name.into(), value);
+        }
+    }
+
+    /// Host-level `obj.__class__` / `type(obj)` view used by
+    /// `description.new_or_old_class()`. Only returns `None` for
+    /// `Opaque`, whose real runtime type the Rust carrier does not
+    /// know.
+    pub fn class_of(&self) -> Option<HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::Class { .. } => HOST_ENV.lookup_builtin("type"),
+            HostObjectKind::Module { .. } => HOST_ENV.lookup_builtin("module"),
+            HostObjectKind::BuiltinCallable => {
+                HOST_ENV.lookup_builtin("builtin_function_or_method")
+            }
+            HostObjectKind::UserFunction { .. } => HOST_ENV.lookup_builtin("function"),
+            HostObjectKind::Instance { class_obj, .. } => Some(class_obj.clone()),
+            HostObjectKind::Opaque => None,
+            HostObjectKind::Property { .. } => HOST_ENV.lookup_builtin("property"),
+            HostObjectKind::StaticMethod { .. } => HOST_ENV.lookup_builtin("staticmethod"),
+            HostObjectKind::ClassMethod { .. } => HOST_ENV.lookup_builtin("classmethod"),
+            HostObjectKind::BoundMethod { .. } => HOST_ENV.lookup_builtin("method"),
         }
     }
 
@@ -551,6 +593,61 @@ impl HostObject {
             _ => None,
         }
     }
+
+    /// Host-level bound method constructor. Mirrors the runtime object
+    /// returned by descriptor `__get__` for plain functions and
+    /// classmethods.
+    pub fn new_bound_method(
+        qualname: impl Into<String>,
+        self_obj: HostObject,
+        func: HostObject,
+        name: impl Into<String>,
+        origin_class: HostObject,
+    ) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::BoundMethod {
+                    self_obj,
+                    func,
+                    name: name.into(),
+                    origin_class,
+                },
+            }),
+        }
+    }
+
+    pub fn is_bound_method(&self) -> bool {
+        matches!(self.inner.kind, HostObjectKind::BoundMethod { .. })
+    }
+
+    pub fn bound_method_self(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::BoundMethod { self_obj, .. } => Some(self_obj),
+            _ => None,
+        }
+    }
+
+    pub fn bound_method_func(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::BoundMethod { func, .. } => Some(func),
+            _ => None,
+        }
+    }
+
+    pub fn bound_method_name(&self) -> Option<&str> {
+        match &self.inner.kind {
+            HostObjectKind::BoundMethod { name, .. } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn bound_method_origin_class(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::BoundMethod { origin_class, .. } => Some(origin_class),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,27 +656,66 @@ pub enum HostGetAttrError {
     Unsupported,
 }
 
-fn host_class_mro_get(cls: &HostObject, name: &str) -> Option<ConstValue> {
+fn host_class_mro_lookup(cls: &HostObject, name: &str) -> Option<(ConstValue, HostObject)> {
     if let Some(value) = cls.class_get(name) {
-        return Some(value);
+        return Some((value, cls.clone()));
     }
     let mro = cls.mro()?;
     for base in mro.iter().skip(1) {
         if let Some(value) = base.class_get(name) {
-            return Some(value);
+            return Some((value, base.clone()));
         }
     }
     None
 }
 
-fn host_unwrap_staticmethod(value: ConstValue) -> ConstValue {
+fn host_descriptor_get(
+    value: ConstValue,
+    name: &str,
+    self_obj: Option<&HostObject>,
+    owner: &HostObject,
+    origin_class: &HostObject,
+) -> Result<ConstValue, HostGetAttrError> {
     match value {
         ConstValue::HostObject(host) if host.is_staticmethod() => host
             .staticmethod_func()
             .cloned()
             .map(ConstValue::HostObject)
-            .unwrap_or(ConstValue::HostObject(host)),
-        other => other,
+            .ok_or(HostGetAttrError::Unsupported),
+        ConstValue::HostObject(host) if host.is_classmethod() => {
+            let func = host
+                .classmethod_func()
+                .cloned()
+                .ok_or(HostGetAttrError::Unsupported)?;
+            Ok(ConstValue::HostObject(HostObject::new_bound_method(
+                format!("{}.{}", owner.qualname(), name),
+                owner.clone(),
+                func,
+                name,
+                origin_class.clone(),
+            )))
+        }
+        ConstValue::HostObject(host) if host.is_property() => {
+            if self_obj.is_some() {
+                Err(HostGetAttrError::Unsupported)
+            } else {
+                Ok(ConstValue::HostObject(host))
+            }
+        }
+        ConstValue::HostObject(host) if host.is_user_function() => {
+            if let Some(self_obj) = self_obj {
+                Ok(ConstValue::HostObject(HostObject::new_bound_method(
+                    format!("{}.{}", self_obj.qualname(), name),
+                    self_obj.clone(),
+                    host,
+                    name,
+                    origin_class.clone(),
+                )))
+            } else {
+                Ok(ConstValue::HostObject(host))
+            }
+        }
+        other => Ok(other),
     }
 }
 
@@ -589,13 +725,13 @@ fn host_unwrap_staticmethod(value: ConstValue) -> ConstValue {
 /// This mirrors the parts of Python descriptor lookup the HostObject
 /// carrier can represent directly today:
 /// * modules read from the module dict;
-/// * class lookup walks the class MRO and unwraps `staticmethod`;
+/// * class lookup walks the class MRO, applies `staticmethod.__get__`,
+///   and materialises bound methods for `classmethod`;
 /// * instance lookup consults `__dict__` first, then the class MRO, and
-///   unwraps `staticmethod`.
+///   materialises bound methods for plain functions / classmethods.
 ///
-/// Descriptors that would require executing Python code or materialising
-/// a bound method object are still outside the current host model and
-/// therefore remain unresolved here.
+/// Descriptors that would require executing Python code, notably
+/// instance `property` getters, still remain unresolved here.
 pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGetAttrError> {
     if pyobj.is_module() {
         return pyobj
@@ -604,9 +740,10 @@ pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGe
             .ok_or(HostGetAttrError::Missing);
     }
     if pyobj.is_class() {
-        return host_class_mro_get(pyobj, name)
-            .map(host_unwrap_staticmethod)
-            .ok_or(HostGetAttrError::Missing);
+        let Some((value, origin_class)) = host_class_mro_lookup(pyobj, name) else {
+            return Err(HostGetAttrError::Missing);
+        };
+        return host_descriptor_get(value, name, None, pyobj, &origin_class);
     }
     if pyobj.is_instance() {
         if let Some(value) = pyobj.instance_get(name) {
@@ -615,9 +752,10 @@ pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGe
         let cls = pyobj
             .instance_class()
             .ok_or(HostGetAttrError::Unsupported)?;
-        return host_class_mro_get(cls, name)
-            .map(host_unwrap_staticmethod)
-            .ok_or(HostGetAttrError::Missing);
+        let Some((value, origin_class)) = host_class_mro_lookup(cls, name) else {
+            return Err(HostGetAttrError::Missing);
+        };
+        return host_descriptor_get(value, name, Some(pyobj), cls, &origin_class);
     }
     Err(HostGetAttrError::Unsupported)
 }
@@ -759,6 +897,10 @@ impl HostEnv {
         for name in [
             "type",
             "object",
+            "module",
+            "function",
+            "method",
+            "builtin_function_or_method",
             "str",
             "int",
             "float",

@@ -1141,37 +1141,12 @@ impl SomeObjectTrait for SomeException {
 /// constant" — a set of descriptions representing a closed family of
 /// callables / classes / frozen instances.
 ///
-/// **Phase 4 A4.5 stub — documented per CLAUDE.md parity rule #1.**
-///
-/// Upstream `SomePBC.__init__` (model.py:519-553) performs substantial
-/// bookkeeping that the Rust port does not yet replicate:
-///
-///   * `descriptions` is stored as a Python `set`. The Rust port
-///     mirrors that shape with a `BTreeSet<Desc>` so union and
-///     noneify semantics stay set-based and deterministic.
-///   * `simplify()` — calls `kind.simplify_desc_set(descriptions)` to
-///     collapse `MethodDesc`s that shadow each other. **Not ported**.
-///   * `knowntype = reduce(commonbase, [x.knowntype for x in descriptions])`
-///     — folds the common-base class of every `Desc.knowntype`. **Not
-///     ported** (requires `commonbase` + live Python classes). Current
-///     `knowntype()` returns `KnownType::Other`.
-///   * The `len(descriptions) == 1 and not can_be_None` shortcut that
-///     sets `self.const = desc.pyobj` is surfaced via
-///     `is_constant()` here — but the upstream check additionally
-///     requires `desc.pyobj is not None`. Without a `pyobj` field on
-///     [`Desc`] we approximate by collapsing that condition away;
-///     callers that depend on the pyobj-present guarantee must wait
-///     for Phase 5's description.py port.
-///   * `len(descriptions) > 1` branch that enforces specialization
-///     invariants on `ClassDesc` / `MethodOfFrozenDesc` sets (and
-///     raises `AnnotatorError` on mixed funcdescs) is **not ported**
-///     — `new()` only rejects the empty set.
-///
-/// Port rewrite landed with the SomePBC structural fix: `descriptions`
-/// now carries real [`super::description::DescEntry`] values (one per
-/// upstream Desc subclass, each wrapping an `Rc<RefCell<…>>` of the
-/// concrete description instance). The constructor runs [`simplify`]
-/// and the model.py:527-553 kind/knowntype/const branches.
+/// `descriptions` carries real [`super::description::DescEntry`]
+/// values (one per upstream Desc subclass, each wrapping an
+/// `Rc<RefCell<…>>` of the concrete description instance). The
+/// constructor runs [`simplify`] and the model.py:527-553
+/// `knowntype` / `self.const = desc.pyobj` / multi-desc kind
+/// enforcement branches (ClassDesc / MethodOfFrozenDesc).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomePBC {
     pub base: SomeObjectBase,
@@ -1320,10 +1295,22 @@ impl SomePBC {
     /// ```
     ///
     pub fn simplify(&mut self) -> Result<(), AnnotatorError> {
+        // upstream: `kind.simplify_desc_set(self.descriptions)` —
+        // polymorphic dispatch on `type(desc)`. Desc.simplify_desc_set
+        // (description.py:180-182) is the staticmethod no-op base;
+        // MethodDesc overrides it (description.py:473-519).
         let kind = self.get_kind()?;
         if self.descriptions.len() > 1 {
-            if matches!(kind, DescKind::Method) {
-                super::description::MethodDesc::simplify_desc_set(&mut self.descriptions);
+            match kind {
+                DescKind::Method => {
+                    super::description::MethodDesc::simplify_desc_set(&mut self.descriptions);
+                }
+                DescKind::Function
+                | DescKind::Class
+                | DescKind::Frozen
+                | DescKind::MethodOfFrozen => {
+                    super::description::simplify_desc_set_default(&mut self.descriptions);
+                }
             }
         }
         Ok(())
@@ -1427,18 +1414,9 @@ impl SomeObjectTrait for SomePBC {
     fn is_constant(&self) -> bool {
         // upstream: `SomePBC.__init__` sets `self.const` when
         // `len(descriptions) == 1 and not can_be_None and desc.pyobj
-        // is not None` (model.py:534-537). The `pyobj is not None`
-        // guard matters: descriptions that lack a backing Python value
-        // (e.g. forward-referenced classes, specializations without
-        // pyobj) must not be treated as constants.
-        //
-        // `annotator::model::Desc` is the Phase 4 A4.5 stub flavour
-        // (kind + name only) — no `pyobj` field yet. Until
-        // `description::Desc` is unified with `model::Desc` (handoff
-        // gotcha #1), we cannot inspect the per-desc pyobj cheaply, so
-        // we fall back to the explicit `const_box` signal only. A
-        // single-desc PBC that was *never* witnessed with a concrete
-        // pyobj stays non-constant, matching upstream's pyobj gate.
+        // is not None` (model.py:534-537). The constructor already
+        // pins `const_box` via [`DescEntry::pyobj`], so this check
+        // reduces to inspecting `const_box`.
         self.base.const_box.is_some()
     }
     fn can_be_none(&self) -> bool {
@@ -1620,6 +1598,19 @@ impl SomeBuiltinMethod {
             s_self: Box::new(s_self),
             methodname: methodname.into(),
         }
+    }
+
+    /// RPython `SomeBuiltinMethod.call(self, args, implicit_init=False)`
+    /// (unaryop.py:961-967).
+    pub fn call(
+        &self,
+        args: &super::argument::ArgumentsForTranslation,
+    ) -> Result<SomeValue, AnnotatorError> {
+        let bk = super::bookkeeper::getbookkeeper().ok_or_else(|| {
+            AnnotatorError::new("SomeBuiltinMethod.call() called without an active bookkeeper")
+        })?;
+        let ann = bk.annotator();
+        super::unaryop::call_builtin_method(&ann, self, args)
     }
 }
 
@@ -2026,6 +2017,36 @@ impl SomeValue {
             SomeValue::TypeOf(s) => s.base.const_box.as_ref(),
         };
         cb.map(|c| &c.value)
+    }
+
+    /// RPython `SomeObject.find_method(self, name)` (unaryop.py:206-213).
+    pub fn find_method(&self, name: &str) -> Option<SomeValue> {
+        super::unaryop::find_method(self, name).map(SomeValue::BuiltinMethod)
+    }
+
+    /// RPython `SomeObject.call(self, args, implicit_init=False)` and the
+    /// `SomeBuiltinMethod` / `SomePBC` / `SomeNone` overrides
+    /// (unaryop.py:237-238, 961-967, 985-987, 1011-1012).
+    pub fn call(
+        &self,
+        args: &super::argument::ArgumentsForTranslation,
+    ) -> Result<SomeValue, AnnotatorError> {
+        match self {
+            SomeValue::PBC(pbc) => {
+                let bk = super::bookkeeper::getbookkeeper().ok_or_else(|| {
+                    AnnotatorError::new("SomePBC.call() called without an active bookkeeper")
+                })?;
+                bk.pbc_call(pbc, args, super::bookkeeper::PbcCallEmulated::None)
+            }
+            SomeValue::None_(_) => Ok(s_impossible_value()),
+            SomeValue::BuiltinMethod(method) => method.call(args),
+            SomeValue::Builtin(_) => Err(AnnotatorError::new(
+                "SomeBuiltin.call() still requires builtin.py analyser wiring",
+            )),
+            _ => Err(AnnotatorError::new(
+                "Cannot prove that the object is callable",
+            )),
+        }
     }
 }
 
@@ -3408,6 +3429,50 @@ mod tests {
         assert!(s.immutable());
         assert!(!s.can_be_none());
         assert_eq!(s.knowntype(), KnownType::BuiltinFunctionOrMethod);
+    }
+
+    #[test]
+    fn find_method_wraps_list_append_as_somebuiltinmethod() {
+        let s_list = SomeValue::List(SomeList::new(ld(
+            SomeValue::Integer(SomeInteger::default()),
+        )));
+        let method = s_list
+            .find_method("append")
+            .expect("list.append must be recognized by find_method");
+        let SomeValue::BuiltinMethod(method) = method else {
+            panic!("expected SomeBuiltinMethod");
+        };
+        assert_eq!(method.analyser_name, "list_method_append");
+        assert_eq!(method.methodname, "append");
+    }
+
+    #[test]
+    fn somevalue_call_routes_through_builtinmethod_append() {
+        let ann = super::super::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let _guard = ann.bookkeeper.at_position(None);
+        let list = SomeList::new(ListDef::new(
+            Some(ann.bookkeeper.clone()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        ));
+        let s_list = SomeValue::List(list.clone());
+        let method = s_list
+            .find_method("append")
+            .expect("list.append must be recognized by find_method");
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::new(false, false))],
+            None,
+            None,
+        );
+
+        let result = method.call(&args).expect("append call must succeed");
+
+        assert!(matches!(result, SomeValue::Impossible));
+        let SomeValue::Integer(item) = list.listdef.s_value() else {
+            panic!("expected SomeInteger list item");
+        };
+        assert!(!item.nonneg, "append should widen the list item annotation");
     }
 
     #[test]

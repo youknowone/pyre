@@ -616,31 +616,58 @@ impl RPythonAnnotator {
         self.bookkeeper.check_no_flags_on_instances();
     }
 
-    /// RPython `call_sites(self)` (annrpython.py:342-353).
-    ///
-    /// Yields every `simple_call` / `call_args` operation over the
-    /// driver's tracked blocks — `added_blocks` if set, else
-    /// everything in `annotated`. Stops early on a block once an
-    /// operation with an unannotated result surfaces (matches the
-    /// upstream `break` on a partially-annotated block).
-    pub fn call_sites(&self) -> Vec<super::super::flowspace::model::SpaceOperation> {
+    /// Internal helper behind [`Self::call_sites`] that also preserves
+    /// the upstream `(graph, block, opindex)` identity as a
+    /// [`PositionKey`].
+    pub fn call_sites_with_positions(
+        &self,
+    ) -> Vec<(
+        super::super::flowspace::model::SpaceOperation,
+        super::bookkeeper::PositionKey,
+    )> {
         let mut out = Vec::new();
         let added = self.added_blocks.borrow();
-        let blocks: Vec<BlockRef> = match added.as_ref() {
+        let blocks: Vec<(GraphRef, BlockRef)> = match added.as_ref() {
             // upstream: `newblocks = self.added_blocks` (dict/set of Blocks).
-            Some(set) => set.values().cloned().collect(),
+            Some(set) => {
+                let annotated = self.annotated.borrow();
+                set.values()
+                    .filter_map(|block| {
+                        let graph = annotated
+                            .get(&BlockKey::of(block))
+                            .and_then(|g| g.clone())?;
+                        Some((graph, block.clone()))
+                    })
+                    .collect()
+            }
             // upstream: `newblocks = self.annotated  # all of them`.
             // Iterating a Python dict yields keys (Block objects). The
-            // Rust port keeps an `all_blocks: BlockKey -> BlockRef`
-            // parallel index so every seen block is reachable here.
-            None => self.all_blocks.borrow().values().cloned().collect(),
+            // Rust port rebuilds those keys through `all_blocks` and
+            // keeps the associated graph alongside them so
+            // `PositionKey::from_refs` can reconstruct the real call
+            // site identity.
+            None => {
+                let annotated = self.annotated.borrow();
+                let all_blocks = self.all_blocks.borrow();
+                annotated
+                    .iter()
+                    .filter_map(|(block_key, graph)| {
+                        let graph = graph.clone()?;
+                        let block = all_blocks.get(block_key)?.clone();
+                        Some((graph, block))
+                    })
+                    .collect()
+            }
         };
         drop(added);
-        for block in blocks {
+        for (graph, block) in blocks {
             let blk = block.borrow();
-            for op in &blk.operations {
+            for (i, op) in blk.operations.iter().enumerate() {
                 if op.opname == "simple_call" || op.opname == "call_args" {
-                    out.push(op.clone());
+                    out.push((
+                        op.clone(),
+                        super::bookkeeper::PositionKey::from_refs(&graph, &block, i),
+                    ));
                 }
                 // upstream: `if op.result.annotation is None: break`.
                 if let super::super::flowspace::model::Hlvalue::Variable(v) = &op.result {
@@ -651,6 +678,20 @@ impl RPythonAnnotator {
             }
         }
         out
+    }
+
+    /// RPython `call_sites(self)` (annrpython.py:342-353).
+    ///
+    /// Yields every `simple_call` / `call_args` operation over the
+    /// driver's tracked blocks — `added_blocks` if set, else
+    /// everything in `annotated`. Stops early on a block once an
+    /// operation with an unannotated result surfaces (matches the
+    /// upstream `break` on a partially-annotated block).
+    pub fn call_sites(&self) -> Vec<super::super::flowspace::model::SpaceOperation> {
+        self.call_sites_with_positions()
+            .into_iter()
+            .map(|(op, _)| op)
+            .collect()
     }
 
     /// RPython `simplify(self, block_subset=None, extra_passes=None)`
@@ -677,7 +718,7 @@ impl RPythonAnnotator {
     /// ```
     ///
     /// The Rust port routes the fixpoint call through the bookkeeper's
-    /// `compute_at_fixpoint` stub. `transform_graph`,
+    /// `compute_at_fixpoint`. `transform_graph`,
     /// `eliminate_empty_blocks`, and `perform_normalizations` live in
     /// `rpython/translator/` and `rpython/rtyper/` — those stay as
     /// no-op placeholders until the translator/rtyper ports land.

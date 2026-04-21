@@ -250,11 +250,12 @@ pub fn annotationoftype(
 /// RPython `class Sig` (signature.py:108-147).
 ///
 /// Carries the list of argument types declared via `@signature(...)`.
-/// The `__call__` method — which walks `inputcells` against the
-/// declared types, honours `NOT_CONSTANT` / `lltype.Void`, and raises
-/// `SignatureError` on mismatch — is Phase 5 P5.2 blocked on
-/// `funcdesc.bookkeeper` (description.py) and is therefore not yet
-/// implemented.
+/// [`Self::call`] walks `inputcells` against `argtypes`, builds
+/// `args_s` via [`annotation`], then union + `.contains(...)` check.
+/// `FunctionType` / `MethodType` argtypes (upstream line 119-120) are
+/// not representable in our [`AnnotationSpec`] enum; `lltype.Void` /
+/// `NOT_CONSTANT` branches (upstream 121-132) depend on rtyper hooks
+/// that aren't ported and surface as [`SignatureError`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sig {
     pub argtypes: Vec<AnnotationSpec>,
@@ -264,6 +265,90 @@ impl Sig {
     /// RPython `Sig.__init__(*argtypes)` (signature.py:110-111).
     pub fn new(argtypes: Vec<AnnotationSpec>) -> Self {
         Sig { argtypes }
+    }
+
+    /// RPython `Sig.__call__(self, funcdesc, inputcells)`
+    /// (signature.py:113-147).
+    ///
+    /// ```python
+    /// def __call__(self, funcdesc, inputcells):
+    ///     args_s = []
+    ///     for i, argtype in enumerate(self.argtypes):
+    ///         if isinstance(argtype, (types.FunctionType, types.MethodType)):
+    ///             argtype = argtype(*inputcells)
+    ///         if argtype is lltype.Void: ...
+    ///         elif argtype is None:
+    ///             args_s.append(inputcells[i])
+    ///         elif argtype is NOT_CONSTANT:
+    ///             args_s.append(not_const(inputcells[i]))
+    ///         else:
+    ///             args_s.append(annotation(argtype, bookkeeper=funcdesc.bookkeeper))
+    ///     if len(inputcells) != len(args_s):
+    ///         raise SignatureError(...)
+    ///     for i, (s_arg, s_input) in enumerate(zip(args_s, inputcells)):
+    ///         s_input = unionof(s_input, s_arg)
+    ///         if not s_arg.contains(s_input):
+    ///             raise SignatureError(...)
+    ///     inputcells[:] = args_s
+    /// ```
+    pub fn call(
+        &self,
+        funcname: &str,
+        bookkeeper: &Rc<Bookkeeper>,
+        inputcells: &mut [SomeValue],
+    ) -> Result<(), SignatureError> {
+        // upstream: `args_s = []; for i, argtype in enumerate(self.argtypes):`.
+        let mut args_s: Vec<SomeValue> = Vec::with_capacity(self.argtypes.len());
+        for (i, argtype) in self.argtypes.iter().enumerate() {
+            match argtype {
+                // upstream: `elif argtype is None: args_s.append(inputcells[i])`.
+                // Our [`AnnotationSpec`] cannot represent Python `None`
+                // directly; callers should use [`AnnotationSpec::NoneType`]
+                // for the explicit NoneType annotation and the closest
+                // analogue to upstream `argtype is None` (= "no type
+                // constraint") is `AnnotationSpec::Already(Impossible)`.
+                // Pass-through matches either interpretation because
+                // subsequent union/contains rejects type-mismatched
+                // inputs regardless.
+                AnnotationSpec::Already(s_arg) if matches!(s_arg, SomeValue::Impossible) => {
+                    args_s.push(inputcells.get(i).cloned().unwrap_or(SomeValue::Impossible));
+                }
+                // upstream: `args_s.append(annotation(argtype, bookkeeper=funcdesc.bookkeeper))`.
+                spec => {
+                    args_s.push(annotation(spec, Some(bookkeeper))?);
+                }
+            }
+        }
+        // upstream: `if len(inputcells) != len(args_s): raise SignatureError`.
+        if inputcells.len() != args_s.len() {
+            return Err(SignatureError::new(format!(
+                "{}: expected {} args, got {}",
+                funcname,
+                args_s.len(),
+                inputcells.len()
+            )));
+        }
+        // upstream: `for i, (s_arg, s_input) in enumerate(zip(args_s, inputcells)):
+        //             s_input = unionof(s_input, s_arg);
+        //             if not s_arg.contains(s_input): raise SignatureError`.
+        for (i, (s_arg, s_input)) in args_s.iter().zip(inputcells.iter()).enumerate() {
+            let s_merged =
+                super::model::union(s_input, s_arg).map_err(|e| SignatureError::new(e.msg))?;
+            if !s_arg.contains(&s_merged) {
+                return Err(SignatureError::new(format!(
+                    "{} argument {}:\nexpected {:?},\n     got {:?}",
+                    funcname,
+                    i + 1,
+                    s_arg,
+                    s_merged
+                )));
+            }
+        }
+        // upstream: `inputcells[:] = args_s`.
+        for (slot, new_s) in inputcells.iter_mut().zip(args_s.into_iter()) {
+            *slot = new_s;
+        }
+        Ok(())
     }
 }
 
@@ -625,5 +710,51 @@ mod tests {
         let inferred = SomeValue::String(super::super::model::SomeString::default());
         let out = enforce_signature_return("f", &bk, &sigtype, &inferred).unwrap();
         assert_eq!(out, None);
+    }
+
+    #[test]
+    fn sig_call_rewrites_inputcells_to_declared_types() {
+        // upstream signature.py:113-147 — Sig.__call__ rebuilds inputcells
+        // from annotation(argtype, ...) when the arg contains the input.
+        let bk = bk();
+        let sig = Sig::new(vec![AnnotationSpec::Int, AnnotationSpec::Bool]);
+        let mut inputs = vec![
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            SomeValue::Bool(super::super::model::SomeBool::new()),
+        ];
+        sig.call("f", &bk, &mut inputs)
+            .expect("sig.call must succeed");
+        // args_s is built from annotation; inputcells are overwritten.
+        assert!(matches!(inputs[0], SomeValue::Integer(_)));
+        assert!(matches!(inputs[1], SomeValue::Bool(_)));
+    }
+
+    #[test]
+    fn sig_call_rejects_wrong_length() {
+        let bk = bk();
+        let sig = Sig::new(vec![AnnotationSpec::Int, AnnotationSpec::Int]);
+        let mut inputs = vec![SomeValue::Integer(SomeInteger::new(true, false))];
+        let err = sig.call("f", &bk, &mut inputs).unwrap_err();
+        assert!(err.0.contains("expected 2 args"));
+    }
+
+    #[test]
+    fn sig_call_rejects_type_mismatch() {
+        // upstream: `if not s_arg.contains(s_input): raise SignatureError`.
+        // If unionof(s_input, s_arg) fails structurally, the union error
+        // is surfaced via SignatureError (instead of the downstream
+        // `.contains()` check) — matches upstream because Python's
+        // `unionof(Int, Str)` raises UnionError which propagates up.
+        let bk = bk();
+        let sig = Sig::new(vec![AnnotationSpec::Int]);
+        let mut inputs = vec![SomeValue::String(super::super::model::SomeString::default())];
+        let err = sig.call("f", &bk, &mut inputs).unwrap_err();
+        // Either the upstream 'argument' message or the union error
+        // surfaces — both signal rejection.
+        assert!(
+            err.0.contains("argument 1") || err.0.contains("pair"),
+            "unexpected error message: {}",
+            err.0
+        );
     }
 }

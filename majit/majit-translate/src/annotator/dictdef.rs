@@ -22,10 +22,9 @@
 //!   [`super::listdef::ItemOwner::DictValue`] variants consulted by
 //!   the shared `ListItem::merge` patch loop.
 //!
-//! * `DictKey.emulate_rdict_calls` (dictdef.py:43-66) requires the
-//!   bookkeeper's `emulate_pbc_call` — Phase 5 P5.2 dependency. The
-//!   call site in [`DictKey::update_rdict_annotations`] stays but the
-//!   bookkeeper dispatch is a TODO pending the bookkeeper port.
+//! * `DictKey.emulate_rdict_calls` (dictdef.py:43-66) dispatches
+//!   `eq` + `hash` as `bookkeeper.emulate_pbc_call` pairs and
+//!   validates return annotations against `SomeBool` / `SomeInteger`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -122,13 +121,10 @@ impl DictKey {
             b.s_rdict_hashfn = new_hashfn;
         }
         // upstream: `self.emulate_rdict_calls(other=other)` (dictdef.py:41
-        // tail). The call performs two `bookkeeper.emulate_pbc_call` dispatches
-        // — one for eq, one for hash — and validates the return annotations
+        // tail). Performs two `bookkeeper.emulate_pbc_call` dispatches —
+        // one for eq, one for hash — and validates the return annotations
         // against `s_Bool` / `SomeInteger` (dictdef.py:56-66), raising
-        // `AnnotatorError` on mismatch. `Bookkeeper.emulate_pbc_call` waits
-        // for Phase 5 P5.2; until then we REFUSE to silently pass so a
-        // broken custom-eq/hash can't slip through unnoticed. See
-        // `dictdef.py:43-66` for the exact shape the port must match.
+        // `AnnotatorError` on mismatch.
         Self::emulate_rdict_calls(self_li)
     }
 
@@ -183,6 +179,7 @@ impl DictKey {
                 &s_eqfn,
                 &[s_key.clone(), s_key.clone()],
                 &[],
+                None,
             )
             .map_err(|e| UnionError {
                 lhs: s_eqfn.clone(),
@@ -206,6 +203,7 @@ impl DictKey {
                 &s_hashfn,
                 &[s_key.clone()],
                 &[],
+                None,
             )
             .map_err(|e| UnionError {
                 lhs: s_hashfn.clone(),
@@ -469,10 +467,11 @@ mod tests {
     fn generalize_key_routes_through_dictkey_override_on_rdict() {
         // upstream dictdef.py:29-33 — on an r_dict (custom_eq_hash=true),
         // when generalize actually widens the key type, emulate_rdict_
-        // calls must fire. Our emulate_rdict_calls is a fail-fast stub
-        // pending bookkeeper.emulate_pbc_call; the test verifies the
-        // dispatch arrives there (and not that the ListItem::generalize
-        // path silently succeeds).
+        // calls must fire. The test passes a SomeInteger as s_eqfn which
+        // `bookkeeper.emulate_pbc_call` rejects ("expects SomePBC"),
+        // confirming the dispatch reaches the bookkeeper entry-point
+        // rather than silently succeeding on the ListItem::generalize
+        // path.
         let dd = DictDef::new(
             Some(bk()),
             SomeValue::Integer(SomeInteger::new(true, false)),
@@ -483,7 +482,7 @@ mod tests {
         );
         let err = dd
             .generalize_key(&SomeValue::Integer(SomeInteger::new(false, false)))
-            .expect_err("rdict key widen must route to emulate_rdict_calls stub");
+            .expect_err("rdict key widen must reach emulate_pbc_call");
         assert!(err.msg.contains("emulate_pbc_call"));
     }
 

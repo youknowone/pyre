@@ -30,8 +30,9 @@ use super::super::flowspace::operation::{
 };
 use super::annrpython::RPythonAnnotator;
 use super::model::{
-    SomeBool, SomeFloat, SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple,
-    SomeTypeOf, SomeUnicodeString, SomeValue, SomeValueTag, s_impossible_value,
+    AnnotatorError, SomeBool, SomeBuiltinMethod, SomeFloat, SomeInteger, SomeIterator,
+    SomeObjectTrait, SomeString, SomeTuple, SomeTypeOf, SomeUnicodeString, SomeValue, SomeValueTag,
+    s_impossible_value, s_none,
 };
 
 /// RPython `UNARY_OPERATIONS` (unaryop.py:26-28).
@@ -338,6 +339,41 @@ fn init_someobject_defaults(
         Specialization {
             apply: Box::new(|_ann, _hl| SomeValue::Float(SomeFloat::new())),
             can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // unaryop.py:215-229 — getattr(self, s_attr).
+    register(
+        reg,
+        OpKind::GetAttr,
+        SomeValueTag::Object,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_self = ann.annotation(&hl.args[0]).expect("getattr: self unbound");
+                let s_attr = ann.annotation(&hl.args[1]).expect("getattr: attr unbound");
+                let Some(ConstValue::Str(attr)) = s_attr.const_().cloned() else {
+                    panic!(
+                        "AnnotatorError: getattr({:?}, {:?}) has non-constant argument",
+                        s_self, s_attr
+                    );
+                };
+                if let Some(s_method) = s_self.find_method(&attr) {
+                    return s_method;
+                }
+                if s_self.is_immutable_constant() {
+                    if let Some(ConstValue::HostObject(pyobj)) = s_self.const_() {
+                        if let Ok(value) = crate::flowspace::model::host_getattr(pyobj, &attr) {
+                            return ann.bookkeeper.immutablevalue(&value).unwrap_or_else(|err| {
+                                panic!("getattr immutablevalue failed: {}", err)
+                            });
+                        }
+                    }
+                }
+                panic!(
+                    "AnnotatorError: Cannot find attribute {:?} on {:?}",
+                    attr, s_self
+                )
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
     // unaryop.py:200-204 — delattr: warning-only. Returns no value
@@ -953,9 +989,9 @@ fn check_negative_slice(s_start: &SomeValue, s_stop: &SomeValue, error: &str) {
 // Upstream these are class methods on `class __extend__(SomeList)`. They
 // are NOT directly `@op.X.register` targets; instead `SomeObject.getattr`
 // looks up `method_<name>` via `find_method` and wraps them in a
-// `SomeBuiltinMethod` for downstream `simple_call`. Commit 6d wires up
-// the `find_method` → `SomeBuiltinMethod.call` dispatch; for now these
-// stay as independent free functions that Commit 6d will dispatch to.
+// `SomeBuiltinMethod` for downstream `simple_call`. The Rust port keeps
+// the analyzer bodies as free functions and the `find_method` /
+// `SomeBuiltinMethod.call` bridge below dispatches to them.
 
 #[allow(dead_code)]
 pub fn list_method_append(
@@ -1754,6 +1790,366 @@ pub fn char_method_isupper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> Some
     SomeValue::Bool(SomeBool::new())
 }
 
+/// RPython `SomeObject.find_method(self, name)` (unaryop.py:206-213).
+pub fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> {
+    let analyser_name = match s_self {
+        SomeValue::List(_) => match name {
+            "append" => "list_method_append",
+            "extend" => "list_method_extend",
+            "reverse" => "list_method_reverse",
+            "insert" => "list_method_insert",
+            "remove" => "list_method_remove",
+            "pop" => "list_method_pop",
+            "index" => "list_method_index",
+            _ => return None,
+        },
+        SomeValue::Dict(_) => match name {
+            "get" | "setdefault" => "dict_method_get",
+            "copy" => "dict_method_copy",
+            "update" => "dict_method_update",
+            "keys" => "dict_method_keys",
+            "values" => "dict_method_values",
+            "iterkeys" => "dict_method_iterkeys",
+            "itervalues" => "dict_method_itervalues",
+            "iteritems" => "dict_method_iteritems",
+            "clear" => "dict_method_clear",
+            "pop" => "dict_method_pop",
+            _ => return None,
+        },
+        SomeValue::String(_) | SomeValue::UnicodeString(_) => match name {
+            "startswith" => "str_method_startswith",
+            "endswith" => "str_method_endswith",
+            "find" => "str_method_find",
+            "rfind" => "str_method_rfind",
+            "count" => "str_method_count",
+            "strip" => "str_method_strip",
+            "upper" => "str_method_upper",
+            "lower" => "str_method_lower",
+            "isdigit" => "str_method_isdigit",
+            "isalpha" => "str_method_isalpha",
+            "isalnum" => "str_method_isalnum",
+            "replace" => "str_method_replace",
+            "format" => "str_method_format",
+            _ => return None,
+        },
+        SomeValue::Char(_) => match name {
+            "upper" => "str_method_upper",
+            "lower" => "str_method_lower",
+            "isdigit" => "str_method_isdigit",
+            "isalpha" => "str_method_isalpha",
+            "isalnum" => "str_method_isalnum",
+            "isspace" => "char_method_isspace",
+            "islower" => "char_method_islower",
+            "isupper" => "char_method_isupper",
+            _ => return None,
+        },
+        SomeValue::UnicodeCodePoint(_) => match name {
+            "upper" => "str_method_upper",
+            "lower" => "str_method_lower",
+            "isdigit" => "str_method_isdigit",
+            "isalpha" => "str_method_isalpha",
+            "isalnum" => "str_method_isalnum",
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(SomeBuiltinMethod::new(analyser_name, s_self.clone(), name))
+}
+
+fn builtin_method_receiver_error(method: &SomeBuiltinMethod) -> AnnotatorError {
+    AnnotatorError::new(format!(
+        "SomeBuiltinMethod.call(): receiver/type mismatch for {}",
+        method.methodname
+    ))
+}
+
+fn builtin_method_arg_error(method: &SomeBuiltinMethod) -> AnnotatorError {
+    AnnotatorError::new(format!(
+        "SomeBuiltinMethod.call(): wrong argument shape for {}",
+        method.methodname
+    ))
+}
+
+/// RPython `SomeBuiltinMethod.call(self, args, implicit_init=False)`
+/// dispatch helper (unaryop.py:961-967).
+pub fn call_builtin_method(
+    ann: &RPythonAnnotator,
+    method: &SomeBuiltinMethod,
+    args: &super::argument::ArgumentsForTranslation,
+) -> Result<SomeValue, AnnotatorError> {
+    let (args_s, kwds) = args
+        .unpack()
+        .map_err(|err| AnnotatorError::new(err.getmsg()))?;
+    if !kwds.is_empty() {
+        return Err(AnnotatorError::new(format!(
+            "SomeBuiltinMethod.call(): keyword arguments are not supported for {}",
+            method.methodname
+        )));
+    }
+
+    let result = match method.analyser_name.as_str() {
+        "list_method_append" => {
+            let SomeValue::List(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [s_value] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            list_method_append(ann, s_self, s_value)
+        }
+        "list_method_extend" => {
+            let SomeValue::List(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [s_iterable] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            list_method_extend(ann, s_self, s_iterable)
+        }
+        "list_method_reverse" => {
+            let SomeValue::List(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            list_method_reverse(ann, s_self)
+        }
+        "list_method_insert" => {
+            let SomeValue::List(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [s_index, s_value] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            list_method_insert(ann, s_self, s_index, s_value)
+        }
+        "list_method_remove" => {
+            let SomeValue::List(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [s_value] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            list_method_remove(ann, s_self, s_value)
+        }
+        "list_method_pop" => {
+            let SomeValue::List(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            match args_s.as_slice() {
+                [] => list_method_pop(ann, s_self, None),
+                [s_index] => list_method_pop(ann, s_self, Some(s_index)),
+                _ => return Err(builtin_method_arg_error(method)),
+            }
+        }
+        "list_method_index" => {
+            let SomeValue::List(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [s_value] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            list_method_index(ann, s_self, s_value)
+        }
+        "dict_method_get" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            match args_s.as_slice() {
+                [s_key] => dict_method_get(ann, s_self, s_key, &s_none()),
+                [s_key, s_dfl] => dict_method_get(ann, s_self, s_key, s_dfl),
+                _ => return Err(builtin_method_arg_error(method)),
+            }
+        }
+        "dict_method_copy" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_copy(ann, s_self)
+        }
+        "dict_method_update" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [s_other] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_update(ann, s_self, s_other)
+        }
+        "dict_method_keys" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_keys(ann, s_self)
+        }
+        "dict_method_values" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_values(ann, s_self)
+        }
+        "dict_method_iterkeys" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_iterkeys(ann, s_self)
+        }
+        "dict_method_itervalues" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_itervalues(ann, s_self)
+        }
+        "dict_method_iteritems" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_iteritems(ann, s_self)
+        }
+        "dict_method_clear" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            dict_method_clear(ann, s_self)
+        }
+        "dict_method_pop" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            match args_s.as_slice() {
+                [s_key] => dict_method_pop(ann, s_self, s_key, None),
+                [s_key, s_dfl] => dict_method_pop(ann, s_self, s_key, Some(s_dfl)),
+                _ => return Err(builtin_method_arg_error(method)),
+            }
+        }
+        "str_method_startswith" => {
+            let [s_frag] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_startswith(ann, &method.s_self, s_frag)
+        }
+        "str_method_endswith" => {
+            let [s_frag] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_endswith(ann, &method.s_self, s_frag)
+        }
+        "str_method_find" => match args_s.as_slice() {
+            [s_frag] => str_method_find(ann, &method.s_self, s_frag, None, None),
+            [s_frag, s_start] => str_method_find(ann, &method.s_self, s_frag, Some(s_start), None),
+            [s_frag, s_start, s_end] => {
+                str_method_find(ann, &method.s_self, s_frag, Some(s_start), Some(s_end))
+            }
+            _ => return Err(builtin_method_arg_error(method)),
+        },
+        "str_method_rfind" => match args_s.as_slice() {
+            [s_frag] => str_method_rfind(ann, &method.s_self, s_frag, None, None),
+            [s_frag, s_start] => str_method_rfind(ann, &method.s_self, s_frag, Some(s_start), None),
+            [s_frag, s_start, s_end] => {
+                str_method_rfind(ann, &method.s_self, s_frag, Some(s_start), Some(s_end))
+            }
+            _ => return Err(builtin_method_arg_error(method)),
+        },
+        "str_method_count" => match args_s.as_slice() {
+            [s_frag] => str_method_count(ann, &method.s_self, s_frag, None, None),
+            [s_frag, s_start] => str_method_count(ann, &method.s_self, s_frag, Some(s_start), None),
+            [s_frag, s_start, s_end] => {
+                str_method_count(ann, &method.s_self, s_frag, Some(s_start), Some(s_end))
+            }
+            _ => return Err(builtin_method_arg_error(method)),
+        },
+        "str_method_strip" => match args_s.as_slice() {
+            [] => str_method_strip(ann, &method.s_self, None),
+            [s_chr] => str_method_strip(ann, &method.s_self, Some(s_chr)),
+            _ => return Err(builtin_method_arg_error(method)),
+        },
+        "str_method_upper" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_upper(ann, &method.s_self)
+        }
+        "str_method_lower" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_lower(ann, &method.s_self)
+        }
+        "str_method_isdigit" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_isdigit(ann, &method.s_self)
+        }
+        "str_method_isalpha" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_isalpha(ann, &method.s_self)
+        }
+        "str_method_isalnum" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_isalnum(ann, &method.s_self)
+        }
+        "str_method_replace" => {
+            let [s1, s2] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            str_method_replace(ann, &method.s_self, s1, s2)
+        }
+        "str_method_format" => str_method_format(ann, &method.s_self, &args_s),
+        "char_method_isspace" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            char_method_isspace(ann, &method.s_self)
+        }
+        "char_method_islower" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            char_method_islower(ann, &method.s_self)
+        }
+        "char_method_isupper" => {
+            let [] = args_s.as_slice() else {
+                return Err(builtin_method_arg_error(method));
+            };
+            char_method_isupper(ann, &method.s_self)
+        }
+        _ => {
+            return Err(AnnotatorError::new(format!(
+                "SomeBuiltinMethod.call(): unknown analyser {}",
+                method.analyser_name
+            )));
+        }
+    };
+    Ok(result)
+}
+
 // =====================================================================
 // unaryop.py:806-830 — class __extend__(SomeIterator)
 // =====================================================================
@@ -2517,7 +2913,7 @@ fn init_instance_attr_transform(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::flowspace::model::{Hlvalue, Variable};
+    use super::super::super::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
     use super::*;
 
     fn mk_ann() -> Rc<RPythonAnnotator> {
@@ -2537,6 +2933,38 @@ mod tests {
         assert!(!UNARY_OPERATIONS.contains(&OpKind::Contains));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Len));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Bool));
+    }
+
+    #[test]
+    fn consider_getattr_prefers_find_method_on_lists() {
+        let ann = mk_ann();
+        let mut v = Variable::named("lst");
+        ann.setbinding(
+            &mut v,
+            SomeValue::List(super::super::model::SomeList::new(
+                super::super::listdef::ListDef::new(
+                    Some(ann.bookkeeper.clone()),
+                    SomeValue::Integer(SomeInteger::default()),
+                    false,
+                    false,
+                ),
+            )),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::Str("append".into()))),
+            ],
+        );
+
+        let result = hl.consider(&ann).expect("getattr must succeed");
+
+        let SomeValue::BuiltinMethod(method) = result else {
+            panic!("expected SomeBuiltinMethod");
+        };
+        assert_eq!(method.analyser_name, "list_method_append");
+        assert_eq!(method.methodname, "append");
     }
 
     #[test]
