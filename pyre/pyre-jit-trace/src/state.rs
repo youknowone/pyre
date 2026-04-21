@@ -4332,7 +4332,7 @@ mod tests {
         });
 
         let recorder = ctx.into_recorder();
-        let op = recorder.last_op().expect("guard op should be present");
+        let op = recorder.ops().last().expect("guard op should be present");
         assert_eq!(op.opcode, OpCode::GuardNonnullClass);
         assert_eq!(op.args[0], obj);
     }
@@ -4707,7 +4707,7 @@ mod tests {
             assert_eq!(loaded.opref, local);
 
             let recorder = ctx.into_recorder();
-            assert_eq!(recorder.last_op().map(|op| op.opcode), expected_guard);
+            assert_eq!(recorder.ops().last().map(|op| op.opcode), expected_guard);
         };
 
         run_case(Type::Int, "j", None);
@@ -4817,7 +4817,7 @@ mod tests {
         .expect("generic helper call should box raw operands first");
 
         let recorder = ctx.into_recorder();
-        let call = recorder.last_op().expect("call op should be present");
+        let call = recorder.ops().last().expect("call op should be present");
         assert!(matches!(
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
@@ -4851,7 +4851,7 @@ mod tests {
             .expect("known builtin helper boundary should box raw int args");
 
         let recorder = ctx.into_recorder();
-        let call = recorder.last_op().expect("call op should be present");
+        let call = recorder.ops().last().expect("call op should be present");
         assert!(matches!(
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
@@ -5135,7 +5135,10 @@ mod tests {
         });
 
         let recorder = ctx.into_recorder();
-        let guard = recorder.last_op().expect("branch guard should be recorded");
+        let guard = recorder
+            .ops()
+            .last()
+            .expect("branch guard should be recorded");
         let fail_args = guard
             .fail_args
             .as_ref()
@@ -5181,7 +5184,10 @@ mod tests {
         });
 
         let recorder = ctx.into_recorder();
-        let guard = recorder.last_op().expect("branch guard should be recorded");
+        let guard = recorder
+            .ops()
+            .last()
+            .expect("branch guard should be recorded");
         let fail_args = guard
             .fail_args
             .as_ref()
@@ -5437,7 +5443,7 @@ mod tests {
 
         let recorder = ctx.into_recorder();
         assert_ne!(
-            recorder.last_op().map(|op| op.opcode),
+            recorder.ops().last().map(|op| op.opcode),
             Some(OpCode::CallI),
             "len(list) should not fall back to the builtin helper call path"
         );
