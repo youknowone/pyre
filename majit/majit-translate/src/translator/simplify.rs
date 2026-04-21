@@ -349,6 +349,568 @@ pub fn remove_identical_vars(graph: &FunctionGraph) {
     }
 }
 
+/// RPython `simplify_exceptions(graph)` (simplify.py:110-170).
+///
+/// Collapses the `except Exception:` chain-of-is_/issubtype tests
+/// produced by the flowspace into a single list of `exitcase=cls`
+/// links on the raising block.
+///
+/// ```python
+/// def simplify_exceptions(graph):
+///     renaming = {}
+///     for block in graph.iterblocks():
+///         if not (block.canraise
+///                 and block.exits[-1].exitcase is Exception):
+///             continue
+///         covered = [link.exitcase for link in block.exits[1:-1]]
+///         seen = []
+///         preserve = list(block.exits[:-1])
+///         exc = block.exits[-1]
+///         last_exception = exc.last_exception
+///         last_exc_value = exc.last_exc_value
+///         query = exc.target
+///         switches = []
+///         while len(query.exits) == 2:
+///             newrenaming = {}
+///             for lprev, ltarg in zip(exc.args, query.inputargs):
+///                 newrenaming[ltarg] = lprev.replace(renaming)
+///             op = query.operations[0]
+///             if not (op.opname in ("is_", "issubtype") and
+///                     op.args[0].replace(newrenaming) == last_exception):
+///                 break
+///             renaming.update(newrenaming)
+///             case = query.operations[0].args[-1].value
+///             assert issubclass(case, py.builtin.BaseException)
+///             lno, lyes = query.exits
+///             assert lno.exitcase == False and lyes.exitcase == True
+///             if case not in seen:
+///                 is_covered = False
+///                 for cov in covered:
+///                     if issubclass(case, cov):
+///                         is_covered = True
+///                         break
+///                 if not is_covered:
+///                     switches.append( (case, lyes) )
+///                 seen.append(case)
+///             exc = lno
+///             query = exc.target
+///         if Exception not in seen:
+///             switches.append( (Exception, exc) )
+///         exits = []
+///         for case, oldlink in switches:
+///             link = oldlink.replace(renaming)
+///             link.last_exception = last_exception
+///             link.last_exc_value = last_exc_value
+///             renaming2 = {}
+///             for v in link.getextravars():
+///                 renaming2[v] = Variable(v)
+///             link = link.replace(renaming2)
+///             link.exitcase = case
+///             exits.append(link)
+///         block.recloseblock(*(preserve + exits))
+/// ```
+pub fn simplify_exceptions(graph: &FunctionGraph) {
+    let exception_class = HOST_ENV
+        .lookup_builtin("Exception")
+        .expect("HOST_ENV missing Exception");
+    let mut renaming: HashMap<Variable, Hlvalue> = HashMap::new();
+
+    for block in graph.iterblocks() {
+        // upstream: `if not (block.canraise and block.exits[-1].exitcase is Exception): continue`.
+        let (canraise, last_is_exception, exits_snapshot) = {
+            let b = block.borrow();
+            let canraise = b.canraise();
+            let last_is_exception = b
+                .exits
+                .last()
+                .and_then(|l| l.borrow().exitcase.clone())
+                .map(|c| match c {
+                    Hlvalue::Constant(Constant {
+                        value: ConstValue::HostObject(h),
+                        ..
+                    }) => h == exception_class,
+                    _ => false,
+                })
+                .unwrap_or(false);
+            let exits_snapshot: Vec<LinkRef> = b.exits.iter().cloned().collect();
+            (canraise, last_is_exception, exits_snapshot)
+        };
+        if !(canraise && last_is_exception) {
+            continue;
+        }
+
+        // upstream: `covered = [link.exitcase for link in block.exits[1:-1]]`.
+        let covered: Vec<Option<Hlvalue>> = exits_snapshot
+            .iter()
+            .skip(1)
+            .take(exits_snapshot.len().saturating_sub(2))
+            .map(|l| l.borrow().exitcase.clone())
+            .collect();
+        // upstream: `preserve = list(block.exits[:-1])`.
+        let preserve: Vec<LinkRef> = exits_snapshot[..exits_snapshot.len().saturating_sub(1)]
+            .iter()
+            .cloned()
+            .collect();
+        let mut seen: Vec<Hlvalue> = Vec::new();
+        let mut switches: Vec<(Hlvalue, LinkRef)> = Vec::new();
+
+        // upstream: `exc = block.exits[-1]; ... query = exc.target`.
+        let mut exc: LinkRef = exits_snapshot
+            .last()
+            .cloned()
+            .expect("canraise block has ≥2 exits");
+        let last_exception = exc.borrow().last_exception.clone();
+        let last_exc_value = exc.borrow().last_exc_value.clone();
+        let mut query: Option<BlockRef> = exc.borrow().target.clone();
+
+        // upstream: `while len(query.exits) == 2:`.
+        while let Some(q) = query.clone() {
+            if q.borrow().exits.len() != 2 {
+                break;
+            }
+            // upstream: `newrenaming[ltarg] = lprev.replace(renaming)`.
+            let mut newrenaming: HashMap<Variable, Hlvalue> = HashMap::new();
+            let exc_args: Vec<Option<Hlvalue>> = exc.borrow().args.clone();
+            let q_inputargs = q.borrow().inputargs.clone();
+            for (lprev_opt, ltarg) in exc_args.iter().zip(q_inputargs.iter()) {
+                let Some(lprev) = lprev_opt else { continue };
+                let Hlvalue::Variable(tgt_v) = ltarg else {
+                    continue;
+                };
+                let replaced = rename_hl(lprev, &renaming);
+                newrenaming.insert(tgt_v.clone(), replaced);
+            }
+            // upstream: `op = query.operations[0]`.
+            let q_ops = q.borrow().operations.clone();
+            let Some(op) = q_ops.first() else { break };
+            // upstream: `if not (op.opname in ("is_", "issubtype") and
+            //              op.args[0].replace(newrenaming) == last_exception): break`.
+            if !(op.opname == "is_" || op.opname == "issubtype") {
+                break;
+            }
+            let Some(last_exc_hl) = last_exception.as_ref() else {
+                break;
+            };
+            let Some(op_arg0) = op.args.first() else {
+                break;
+            };
+            if rename_hl(op_arg0, &newrenaming) != *last_exc_hl {
+                break;
+            }
+            // upstream: `renaming.update(newrenaming)`.
+            for (k, v) in newrenaming.into_iter() {
+                renaming.insert(k, v);
+            }
+            // upstream: `case = query.operations[0].args[-1].value`.
+            let Some(case_arg) = op.args.last() else {
+                break;
+            };
+            let case_hl = case_arg.clone();
+            // upstream: `assert issubclass(case, BaseException)` — debug.
+            debug_assert!(match &case_hl {
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(h),
+                    ..
+                }) => h.is_class(),
+                _ => false,
+            });
+            // upstream: `lno, lyes = query.exits; assert lno.exitcase == False and
+            // lyes.exitcase == True`. Our boolean switch invariant
+            // (checkgraph) maps exits[0] → False, exits[1] → True.
+            let q_exits = q.borrow().exits.clone();
+            let Some(lno) = q_exits.first().cloned() else {
+                break;
+            };
+            let Some(lyes) = q_exits.get(1).cloned() else {
+                break;
+            };
+            // upstream: `if case not in seen: ... switches.append((case, lyes))`.
+            if !seen.iter().any(|s| *s == case_hl) {
+                let is_covered = covered.iter().any(|cov_opt| match cov_opt {
+                    Some(cov) => is_exitcase_subclass(&case_hl, cov),
+                    None => false,
+                });
+                if !is_covered {
+                    switches.push((case_hl.clone(), lyes));
+                }
+                seen.push(case_hl);
+            }
+            // upstream: `exc = lno; query = exc.target`.
+            exc = lno;
+            query = exc.borrow().target.clone();
+        }
+        // upstream: `if Exception not in seen: switches.append((Exception, exc))`.
+        let exception_hlvalue = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+            exception_class.clone(),
+        )));
+        if !seen.iter().any(|s| *s == exception_hlvalue) {
+            switches.push((exception_hlvalue.clone(), exc));
+        }
+
+        // upstream: `exits = []; for case, oldlink in switches:
+        //   link = oldlink.replace(renaming); ... link.exitcase = case; exits.append(link)`.
+        let mut new_exits: Vec<LinkRef> = Vec::new();
+        for (case_hl, oldlink) in switches {
+            let link = rename_link_args(&oldlink, &renaming);
+            {
+                let mut lb = link.borrow_mut();
+                lb.last_exception = last_exception.clone();
+                lb.last_exc_value = last_exc_value.clone();
+            }
+            // upstream: `renaming2[v] = Variable(v)` for each extra
+            // var — fresh identity, upstream Variable(v) copies prefix
+            // via rename; our Variable::copy does the same.
+            let mut renaming2: HashMap<Variable, Hlvalue> = HashMap::new();
+            {
+                let lb = link.borrow();
+                if let Some(Hlvalue::Variable(v)) = &lb.last_exception {
+                    renaming2.insert(v.clone(), Hlvalue::Variable(v.copy()));
+                }
+                if let Some(Hlvalue::Variable(v)) = &lb.last_exc_value {
+                    renaming2.insert(v.clone(), Hlvalue::Variable(v.copy()));
+                }
+            }
+            // Apply renaming2 in place on the fresh link's args, etc.
+            let link2 = rename_link_args(&link, &renaming2);
+            link2.borrow_mut().exitcase = Some(case_hl);
+            new_exits.push(link2);
+        }
+        let mut combined: Vec<LinkRef> = preserve;
+        combined.extend(new_exits);
+        block.recloseblock(combined);
+    }
+}
+
+/// RPython `coalesce_bool(graph)` (simplify.py:656-699).
+///
+/// Collapses the two-step pattern
+/// ```text
+/// block: bool(v); exitswitch=result_v
+///   ├─False→ block2: bool(result_v_again); exitswitch=...
+///   └─True→  block2_same
+/// ```
+/// into a direct jump from `block` to `block2`'s true/false targets.
+/// Upstream walks candidate bool-ended blocks, rewrites each
+/// `bool`-exitcase-keyed exit to point at `block2`'s outgoing arm, and
+/// repeats until a fixed point.
+pub fn coalesce_bool(graph: &FunctionGraph) {
+    // upstream: list of (block, [(case, target_block)]) candidate tuples.
+    let mut candidates: Vec<(BlockRef, Vec<(bool, BlockRef)>)> = Vec::new();
+    for block in graph.iterblocks() {
+        let is_bool = {
+            let b = block.borrow();
+            b.operations
+                .last()
+                .map(|op| op.opname == "bool")
+                .unwrap_or(false)
+        };
+        if !is_bool {
+            continue;
+        }
+        let tgts = has_bool_exitpath(&block);
+        if !tgts.is_empty() {
+            candidates.push((block, tgts));
+        }
+    }
+
+    while let Some((cand, tgts)) = candidates.pop() {
+        let cand_exits_snapshot: Vec<LinkRef> = cand.borrow().exits.iter().cloned().collect();
+        let mut new_exits: Vec<LinkRef> = cand_exits_snapshot.clone();
+
+        for (case_bool, tgt) in tgts {
+            // upstream: `exit = cand.exits[case]` where `case` is bool
+            // (Python bool subclasses int → cand.exits[0/1]).
+            let idx = if case_bool { 1 } else { 0 };
+            let Some(exit_link) = cand_exits_snapshot.get(idx).cloned() else {
+                continue;
+            };
+            // upstream: `rrenaming = dict(zip(tgt.inputargs, exit.args));
+            //  rrenaming[tgt.operations[0].result] = cand.operations[-1].result`.
+            let mut rrenaming: HashMap<Variable, Hlvalue> = HashMap::new();
+            let tgt_inputargs = tgt.borrow().inputargs.clone();
+            let exit_args: Vec<Option<Hlvalue>> = exit_link.borrow().args.clone();
+            for (ltarg, lprev_opt) in tgt_inputargs.iter().zip(exit_args.iter()) {
+                let Hlvalue::Variable(tgt_v) = ltarg else {
+                    continue;
+                };
+                let Some(lprev) = lprev_opt else { continue };
+                rrenaming.insert(tgt_v.clone(), lprev.clone());
+            }
+            let tgt_first_result = {
+                let b = tgt.borrow();
+                b.operations
+                    .first()
+                    .map(|op| op.result.clone())
+                    .and_then(|r| match r {
+                        Hlvalue::Variable(v) => Some(v),
+                        _ => None,
+                    })
+            };
+            let cand_last_result = {
+                let b = cand.borrow();
+                b.operations.last().map(|op| op.result.clone())
+            };
+            if let (Some(tgt_first), Some(cand_last)) = (tgt_first_result, cand_last_result) {
+                rrenaming.insert(tgt_first, cand_last);
+            }
+            // upstream: `newlink = tgt.exits[case].copy(rename)`.
+            let tgt_exits = tgt.borrow().exits.clone();
+            let Some(tgt_exit) = tgt_exits.get(idx).cloned() else {
+                continue;
+            };
+            let newlink = rename_link_args(&tgt_exit, &rrenaming);
+            new_exits[idx] = newlink;
+        }
+        cand.recloseblock(new_exits);
+        // upstream: retry against the same cand in case another bool-
+        // chain opened up.
+        let again = has_bool_exitpath(&cand);
+        if !again.is_empty() {
+            candidates.push((cand, again));
+        }
+    }
+}
+
+/// Helper for `coalesce_bool` — mirrors upstream's nested
+/// `has_bool_exitpath(block)` closure (simplify.py:663-677).
+fn has_bool_exitpath(block: &BlockRef) -> Vec<(bool, BlockRef)> {
+    let mut tgts: Vec<(bool, BlockRef)> = Vec::new();
+    let b = block.borrow();
+    let Some(start_op) = b.operations.last() else {
+        return tgts;
+    };
+    let Some(cond_v) = start_op.args.first().cloned() else {
+        return tgts;
+    };
+    if b.exitswitch.as_ref() != Some(&start_op.result) {
+        return tgts;
+    }
+    for exit in &b.exits {
+        let exit_b = exit.borrow();
+        let Some(tgt) = exit_b.target.clone() else {
+            continue;
+        };
+        // upstream: `if tgt == block: continue`.
+        if std::rc::Rc::ptr_eq(&tgt, block) {
+            continue;
+        }
+        let tgt_b = tgt.borrow();
+        if tgt_b.operations.len() != 1 || tgt_b.operations[0].opname != "bool" {
+            continue;
+        }
+        let tgt_op = &tgt_b.operations[0];
+        if tgt_b.exitswitch.as_ref() != Some(&tgt_op.result) {
+            continue;
+        }
+        // upstream: `rrenaming.get(tgt_op.args[0]) == cond_v`.
+        let Some(tgt_op_arg0) = tgt_op.args.first() else {
+            continue;
+        };
+        let Hlvalue::Variable(arg_var) = tgt_op_arg0 else {
+            continue;
+        };
+        // Build rrenaming just enough to check `arg_var → cond_v`.
+        let position = tgt_b
+            .inputargs
+            .iter()
+            .position(|ia| matches!(ia, Hlvalue::Variable(v) if v == arg_var));
+        let Some(pos) = position else { continue };
+        let Some(link_arg) = exit_b.args.get(pos).cloned().flatten() else {
+            continue;
+        };
+        if link_arg != cond_v {
+            continue;
+        }
+        let case_bool = match &exit_b.exitcase {
+            Some(Hlvalue::Constant(Constant {
+                value: ConstValue::Bool(b),
+                ..
+            })) => *b,
+            _ => continue,
+        };
+        drop(tgt_b);
+        tgts.push((case_bool, tgt));
+    }
+    tgts
+}
+
+/// RPython `transform_xxxitem(graph)` (simplify.py:172-186).
+///
+/// ```python
+/// def transform_xxxitem(graph):
+///     # xxx setitem too
+///     for block in graph.iterblocks():
+///         if block.canraise:
+///             last_op = block.raising_op
+///             if last_op.opname == 'getitem':
+///                 postfx = []
+///                 for exit in block.exits:
+///                     if exit.exitcase is IndexError:
+///                         postfx.append('idx')
+///                 if postfx:
+///                     Op = getattr(op, '_'.join(['getitem'] + postfx))
+///                     newop = Op(*last_op.args)
+///                     newop.result = last_op.result
+///                     block.operations[-1] = newop
+/// ```
+///
+/// `op.getitem_idx` is the sole descendant: when `IndexError` appears
+/// in a `getitem` block's exit cases, we rewrite the raising op to
+/// `getitem_idx`. Upstream's open-ended postfx list (`['idx', 'key']`
+/// etc.) does not materialise — `op.getitem_idx_key` does exist but
+/// the pass only builds an `'idx'` postfx.
+pub fn transform_xxxitem(graph: &FunctionGraph) {
+    let index_error = HOST_ENV
+        .lookup_builtin("IndexError")
+        .expect("HOST_ENV missing IndexError");
+    for block in graph.iterblocks() {
+        let (canraise, is_getitem) = {
+            let b = block.borrow();
+            let canraise = b.canraise();
+            let is_getitem = canraise
+                && b.raising_op()
+                    .map(|op| op.opname == "getitem")
+                    .unwrap_or(false);
+            (canraise, is_getitem)
+        };
+        if !canraise || !is_getitem {
+            continue;
+        }
+        // upstream: `for exit in block.exits: if exit.exitcase is IndexError: postfx.append('idx')`.
+        let has_idx = {
+            let b = block.borrow();
+            b.exits.iter().any(|link| match &link.borrow().exitcase {
+                Some(Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(h),
+                    ..
+                })) => h == &index_error,
+                _ => false,
+            })
+        };
+        if !has_idx {
+            continue;
+        }
+        // upstream: `newop = Op(*last_op.args); newop.result = last_op.result;
+        // block.operations[-1] = newop`. The Rust port rewrites opname
+        // in place since SpaceOperation is already the concrete carrier.
+        let mut b = block.borrow_mut();
+        if let Some(op) = b.operations.last_mut() {
+            op.opname = "getitem_idx".to_string();
+        }
+    }
+}
+
+/// RPython `remove_dead_exceptions(graph)` (simplify.py:189-216).
+///
+/// ```python
+/// def remove_dead_exceptions(graph):
+///     """Exceptions can be removed if they are unreachable"""
+///     def issubclassofmember(cls, seq):
+///         for member in seq:
+///             if member and issubclass(cls, member):
+///                 return True
+///         return False
+///     for block in list(graph.iterblocks()):
+///         if not block.canraise:
+///             continue
+///         exits = []
+///         seen = []
+///         for link in block.exits:
+///             case = link.exitcase
+///             if issubclassofmember(case, seen):
+///                 continue
+///             while len(exits) > 1:
+///                 prev = exits[-1]
+///                 if not (issubclass(prev.exitcase, link.exitcase) and
+///                     prev.target is link.target and prev.args == link.args):
+///                     break
+///                 exits.pop()
+///             exits.append(link)
+///             seen.append(case)
+///         block.recloseblock(*exits)
+/// ```
+pub fn remove_dead_exceptions(graph: &FunctionGraph) {
+    // upstream: `for block in list(graph.iterblocks())` — snapshot.
+    for block in graph.iterblocks() {
+        if !block.borrow().canraise() {
+            continue;
+        }
+        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+        let mut new_exits: Vec<LinkRef> = Vec::new();
+        let mut seen: Vec<Option<Hlvalue>> = Vec::new();
+
+        for link in exits_snapshot {
+            let case = link.borrow().exitcase.clone();
+
+            // upstream: `if issubclassofmember(case, seen): continue`.
+            if issubclassofmember(case.as_ref(), &seen) {
+                continue;
+            }
+
+            // upstream: merge the previous case if it's a subclass of
+            // the current one and the link shape matches.
+            while new_exits.len() > 1 {
+                let prev = new_exits.last().expect("len > 1 ⇒ non-empty");
+                let (subclass_ok, target_same, args_same) = {
+                    let prev_b = prev.borrow();
+                    let link_b = link.borrow();
+                    let subclass_ok = match (&prev_b.exitcase, &link_b.exitcase) {
+                        (Some(a), Some(b)) => is_exitcase_subclass(a, b),
+                        _ => false,
+                    };
+                    let target_same = match (prev_b.target.as_ref(), link_b.target.as_ref()) {
+                        (Some(a), Some(b)) => std::rc::Rc::ptr_eq(a, b),
+                        _ => false,
+                    };
+                    let args_same = prev_b.args == link_b.args;
+                    (subclass_ok, target_same, args_same)
+                };
+                if !(subclass_ok && target_same && args_same) {
+                    break;
+                }
+                new_exits.pop();
+            }
+            new_exits.push(link);
+            seen.push(case);
+        }
+        block.recloseblock(new_exits);
+    }
+}
+
+fn issubclassofmember(cls: Option<&Hlvalue>, seq: &[Option<Hlvalue>]) -> bool {
+    let Some(cls) = cls else {
+        return false;
+    };
+    for member in seq {
+        // upstream: `if member and issubclass(cls, member): return True`.
+        let Some(member) = member else { continue };
+        if is_exitcase_subclass(cls, member) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `issubclass(exitcase_cls, other_cls)` over Hlvalue-wrapped Constant
+/// HostObjects. Returns `false` for any non-class payload (upstream's
+/// Python `issubclass` raises TypeError on non-classes, but upstream
+/// only ever calls this with exception classes).
+fn is_exitcase_subclass(cls: &Hlvalue, other: &Hlvalue) -> bool {
+    match (cls, other) {
+        (
+            Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(a),
+                ..
+            }),
+            Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(b),
+                ..
+            }),
+        ) => a.is_subclass_of(b),
+        _ => false,
+    }
+}
+
 /// RPython `remove_assertion_errors(graph)` (simplify.py:321-346).
 ///
 /// ```python
@@ -1150,6 +1712,98 @@ mod tests {
         // match.
         assert_eq!(body.borrow().inputargs.len(), 1);
         assert_eq!(start.borrow().exits[0].borrow().args.len(), 1);
+    }
+
+    #[test]
+    fn transform_xxxitem_rewrites_getitem_to_idx() {
+        // Block raising `getitem` with an IndexError exit → opname
+        // swaps to `getitem_idx`.
+        use crate::flowspace::model::{
+            ConstValue as CV, Constant as C, HOST_ENV as HE, LAST_EXCEPTION, SpaceOperation as SO,
+        };
+        let index_err = HE.lookup_builtin("IndexError").unwrap();
+        let v_in = Variable::new();
+        let block = Block::shared(vec![Hlvalue::Variable(v_in.clone())]);
+        block.borrow_mut().operations.push(SO::new(
+            "getitem",
+            vec![
+                Hlvalue::Variable(v_in.clone()),
+                Hlvalue::Constant(C::new(CV::Int(0))),
+            ],
+            Hlvalue::Variable(Variable::new()),
+        ));
+        block.borrow_mut().exitswitch =
+            Some(Hlvalue::Constant(C::new(CV::Atom(LAST_EXCEPTION.clone()))));
+        let graph = FunctionGraph::new("f", block.clone());
+        let ok_link = Link::new(
+            vec![block.borrow().operations[0].result.clone()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        let err_link = Link::new(
+            vec![
+                Hlvalue::Constant(C::new(CV::HostObject(index_err.clone()))),
+                Hlvalue::Constant(C::new(CV::HostObject(index_err.clone()))),
+            ],
+            Some(graph.exceptblock.clone()),
+            Some(Hlvalue::Constant(C::new(CV::HostObject(index_err.clone())))),
+        )
+        .into_ref();
+        block.closeblock(vec![ok_link, err_link]);
+
+        transform_xxxitem(&graph);
+
+        assert_eq!(block.borrow().operations[0].opname, "getitem_idx");
+    }
+
+    #[test]
+    fn remove_dead_exceptions_noop_on_non_raising_block() {
+        // No canraise block → function is effectively a no-op and
+        // doesn't panic.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let link = Link::new(
+            vec![Hlvalue::Constant(C::new(CV::Int(0)))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link]);
+        remove_dead_exceptions(&graph);
+    }
+
+    #[test]
+    fn simplify_exceptions_noop_on_simple_graph() {
+        // No Exception-terminated canraise block → pass is a no-op.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let link = Link::new(
+            vec![Hlvalue::Constant(C::new(CV::Int(0)))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link]);
+        simplify_exceptions(&graph);
+    }
+
+    #[test]
+    fn coalesce_bool_noop_on_simple_graph() {
+        // No bool op at block tail → pass is a no-op.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let link = Link::new(
+            vec![Hlvalue::Constant(C::new(CV::Int(0)))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link]);
+        coalesce_bool(&graph);
     }
 
     #[test]
