@@ -502,11 +502,9 @@ impl PyreMetaInterp {
             return;
         }
 
-        let Some((opcode_pc, instruction, op_arg)) =
+        let (opcode_pc, instruction, op_arg) =
             pyre_interpreter::decode_instruction_for_dispatch(code, ni)
-        else {
-            return;
-        };
+                .expect("concrete_execute_step: bytecode corruption");
         cf.set_last_instr_from_next_instr(opcode_pc + 1);
         let next = cf.next_instr();
 
@@ -534,11 +532,9 @@ impl PyreMetaInterp {
             return pyre_object::PY_NULL;
         }
 
-        let Some((opcode_pc, instruction, op_arg)) =
+        let (opcode_pc, instruction, op_arg) =
             pyre_interpreter::decode_instruction_for_dispatch(code, ni)
-        else {
-            return pyre_object::PY_NULL;
-        };
+                .expect("concrete_execute_return: bytecode corruption");
         cf.set_last_instr_from_next_instr(opcode_pc + 1);
         let next = cf.next_instr();
 

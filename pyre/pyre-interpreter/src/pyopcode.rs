@@ -148,16 +148,21 @@ pub fn decode_instruction_at(code: &CodeObject, pc: usize) -> Option<(Instructio
 pub fn decode_instruction_for_dispatch(
     code: &CodeObject,
     pc: usize,
-) -> Option<(usize, Instruction, OpArg)> {
+) -> Result<(usize, Instruction, OpArg), crate::pycode::BytecodeCorruption> {
     let mut opcode_pc = pc;
-    let (mut instruction, mut op_arg) = decode_instruction_at(code, opcode_pc)?;
+    let (mut instruction, mut op_arg) =
+        decode_instruction_at(code, opcode_pc).ok_or(crate::pycode::BytecodeCorruption)?;
     while matches!(instruction, Instruction::ExtendedArg) {
         opcode_pc += 1;
-        let decoded = decode_instruction_at(code, opcode_pc)?;
+        let decoded =
+            decode_instruction_at(code, opcode_pc).ok_or(crate::pycode::BytecodeCorruption)?;
         instruction = decoded.0;
         op_arg = decoded.1;
+        if !matches!(instruction, Instruction::ExtendedArg) && u8::from(instruction) < 44 {
+            return Err(crate::pycode::BytecodeCorruption);
+        }
     }
-    Some((opcode_pc, instruction, op_arg))
+    Ok((opcode_pc, instruction, op_arg))
 }
 
 pub trait LocalOpcodeHandler: SharedOpcodeHandler {
@@ -2064,5 +2069,19 @@ mod tests {
             std::mem::discriminant(&target_instr)
         );
         assert_eq!(u32::from(decoded_arg), u32::from(target_arg));
+    }
+
+    #[test]
+    fn decode_instruction_for_dispatch_rejects_malformed_extended_arg_chain() {
+        let code = compile_exec("x = 1").expect("compile failed");
+        assert!(
+            code.instructions.len() >= 2,
+            "expected at least two instructions"
+        );
+        unsafe {
+            code.instructions.replace_op(0, Instruction::ExtendedArg);
+            code.instructions.replace_op(1, Instruction::GetIter);
+        }
+        assert!(decode_instruction_for_dispatch(&code, 0).is_err());
     }
 }

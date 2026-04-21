@@ -238,10 +238,7 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
 
         let pc = next_instr;
         frame.last_instr = pc as isize;
-        let Some((opcode_pc, instruction, op_arg)) = decode_instruction_for_dispatch(code, pc)
-        else {
-            return Ok(w_none());
-        };
+        let (opcode_pc, instruction, op_arg) = decode_instruction_for_dispatch(code, pc)?;
         let fallthrough = opcode_pc + 1;
         match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
             Ok(StepResult::Continue)
@@ -2299,6 +2296,19 @@ r = acc",
             let r = *(*frame.w_globals).get("r").unwrap();
             assert_eq!(w_int_get_value(r), 6);
         }
+    }
+
+    #[test]
+    fn test_eval_loop_raises_on_malformed_extended_arg_chain() {
+        let code = compile_exec("x = 1").expect("compile failed");
+        unsafe {
+            code.instructions.replace_op(0, Instruction::ExtendedArg);
+            code.instructions.replace_op(1, Instruction::GetIter);
+        }
+        let mut frame = PyFrame::new(code);
+        let err = eval_frame_plain(&mut frame).expect_err("expected bytecode corruption");
+        assert_eq!(err.kind, PyErrorKind::RuntimeError);
+        assert_eq!(err.message, "bytecode corruption");
     }
 
     #[test]

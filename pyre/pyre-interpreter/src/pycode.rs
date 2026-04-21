@@ -13,6 +13,12 @@ pub type PyCode = W_CodeObject;
 #[derive(Debug, Clone)]
 pub struct BytecodeCorruption;
 
+impl From<BytecodeCorruption> for crate::PyError {
+    fn from(_: BytecodeCorruption) -> Self {
+        crate::PyError::runtime_error("bytecode corruption")
+    }
+}
+
 /// Compatibility container for code-hook caching state.
 #[derive(Debug, Default)]
 pub struct CodeHookCache {

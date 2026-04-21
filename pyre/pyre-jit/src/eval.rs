@@ -1212,9 +1212,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         }
 
         let pc = frame.next_instr();
-        let Some((opcode_pc, instruction, op_arg)) = decode_instruction_for_dispatch(code, pc)
-        else {
-            return LoopResult::Done(Ok(w_none()));
+        let (opcode_pc, instruction, op_arg) = match decode_instruction_for_dispatch(code, pc) {
+            Ok(decoded) => decoded,
+            Err(err) => return LoopResult::Done(Err(err.into())),
         };
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
@@ -1319,9 +1319,9 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
         }
 
         let pc = frame.next_instr();
-        let Some((opcode_pc, instruction, op_arg)) = decode_instruction_for_dispatch(code, pc)
-        else {
-            return LoopResult::Done(Ok(w_none()));
+        let (opcode_pc, instruction, op_arg) = match decode_instruction_for_dispatch(code, pc) {
+            Ok(decoded) => decoded,
+            Err(err) => return LoopResult::Done(Err(err.into())),
         };
 
         // pyjitpl.py:1892-1914 run_one_step: trace + execute.
