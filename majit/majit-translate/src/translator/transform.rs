@@ -751,6 +751,23 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                         .const_()
                         .cloned()
                         .expect("transform_list_contains: immutable constant missing const");
+                    // Python keeps distinct `nan` keys (`nan != nan`)
+                    // in a dict by design — `{nan1: 1, nan2: 2}` has
+                    // two entries and `x in dict` resolves via hash +
+                    // (identity-or-equality), letting same-object lookups
+                    // succeed. Rust `HashMap<ConstValue, _>` collapses
+                    // bit-equal NaN floats under derived `Eq`, so the
+                    // rewritten dict would drop entries. Skip the
+                    // optimisation when any constant key is NaN so the
+                    // original list-iteration path (which Python's
+                    // `list.__contains__` runs with identity-or-equality)
+                    // stays intact.
+                    if let ConstValue::Float(bits) = key
+                        && f64::from_bits(bits).is_nan()
+                    {
+                        all_constant = false;
+                        break;
+                    }
                     // upstream `items[s.const] = None` relies on Python
                     // dict key semantics where `1 == 1.0 == True` all
                     // hash to the same bucket. `ConstValue`'s derived
@@ -1197,5 +1214,53 @@ mod tests {
 
         let ops = &block.borrow().operations;
         assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
+    }
+
+    #[test]
+    fn transform_list_contains_skips_when_any_key_is_nan() {
+        // Codex P2 (round 6): Python keeps distinct nan keys in a dict
+        // because `nan != nan`; Rust `HashMap<ConstValue, _>` collapses
+        // them. Verify the rewrite is skipped so runtime `list.__contains__`
+        // semantics (identity-or-equality per item) stay intact.
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        let nan_bits = f64::NAN.to_bits();
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![
+                Hlvalue::Constant(C::new(CV::Float(nan_bits))),
+                Hlvalue::Constant(C::new(CV::Int(3))),
+            ],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        // Must stay as Variable(list_v) — the rewrite must have been
+        // skipped because of the NaN entry.
+        assert!(
+            matches!(ops[1].args[0], Hlvalue::Variable(_)),
+            "NaN-containing list must not be rewritten to Constant(dict)"
+        );
     }
 }
