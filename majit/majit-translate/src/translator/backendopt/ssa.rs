@@ -520,9 +520,15 @@ pub fn ssi_to_ssa(graph: &FunctionGraph) {
 ///                 pending.append((link.prevblock, v))
 /// ```
 ///
-/// The `annotator` parameter on upstream is unused (ignored for API
-/// parity with older callers); the Rust port omits it.
-pub fn ssa_to_ssi(graph: &FunctionGraph) {
+/// The `annotator` parameter on upstream is unused in the function
+/// body (ignored for API parity with older callers). The Rust port
+/// preserves that shape: `_annotator: Option<&RPythonAnnotator>`
+/// matches upstream's `annotator=None` default so callers don't have
+/// to pick between two signatures.
+pub fn ssa_to_ssi(
+    graph: &FunctionGraph,
+    _annotator: Option<&crate::annotator::annrpython::RPythonAnnotator>,
+) {
     let mut entrymap = mkentrymap(graph);
     entrymap.remove(&BlockKey::of(&graph.startblock));
 

@@ -258,17 +258,37 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
 
 /// RPython `CanRemove = {...}` (simplify.py:405-417).
 ///
-/// Upstream also fills `CanRemove` with everything from
-/// `lloperation.enum_ops_without_sideeffects()`; that rtyper-phase
-/// table is not yet ported, so the Rust port includes only the
-/// explicit high-level opname list. Annotator-phase callers
-/// (`transform_dead_op_vars` via `translator/transform.py`) see the
-/// exact same subset they'd see upstream during the annotator pass.
+/// ```python
+/// CanRemove = {}
+/// for _op in '''
+///         newtuple newlist newdict bool
+///         is_ id type issubtype isinstance repr str len hash getattr getitem
+///         pos neg abs hex oct ord invert add sub mul
+///         truediv floordiv div mod divmod pow lshift rshift and_ or_
+///         xor int float long lt le eq ne gt ge cmp coerce contains
+///         iter get'''.split():
+///     CanRemove[_op] = True
+/// from rpython.rtyper.lltypesystem.lloperation import enum_ops_without_sideeffects
+/// for _op in enum_ops_without_sideeffects():
+///     CanRemove[_op] = True
+/// ```
+///
+/// The Rust port populates the high-level opname list verbatim. The
+/// second upstream step — merging
+/// `lloperation.enum_ops_without_sideeffects()` — depends on the
+/// rtyper-phase `LL_OPERATIONS` table which has not been ported yet;
+/// once `rpython/rtyper/lltypesystem/lloperation.py` lands as
+/// `translator/lloperation.rs`, extend the OnceLock initializer with
+/// the same `for _op in enum_ops_without_sideeffects()` loop. Until
+/// then annotator-phase opnames (the high-level list) are the only
+/// names visible in flowgraphs reaching this pass, so observable
+/// pruning is identical to upstream in annotator phase.
 fn can_remove_opnames() -> &'static HashSet<&'static str> {
     use std::sync::OnceLock;
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| {
-        [
+        // upstream: high-level opname list (simplify.py:406-413).
+        let mut set: HashSet<&'static str> = [
             "newtuple",
             "newlist",
             "newdict",
@@ -321,8 +341,25 @@ fn can_remove_opnames() -> &'static HashSet<&'static str> {
             "get",
         ]
         .into_iter()
-        .collect()
+        .collect();
+        // upstream: `for _op in enum_ops_without_sideeffects(): CanRemove[_op] = True`
+        // (simplify.py:414-416). The `enum_ops_without_sideeffects`
+        // function ships in `rpython/rtyper/lltypesystem/lloperation.py`
+        // and is pending the rtyper-port phase. Merge its output here
+        // when that table lands; no-op until then so annotator-phase
+        // pruning exactly matches upstream.
+        set.extend(enum_ops_without_sideeffects());
+        set
     })
+}
+
+/// RPython `lloperation.enum_ops_without_sideeffects()` — pending
+/// port of `rpython/rtyper/lltypesystem/lloperation.py` (the full
+/// `LL_OPERATIONS` table plus its `sideeffects` column). Returns an
+/// empty iterator until the rtyper-phase port merges the ll-op
+/// opname table into the majit-translate crate.
+fn enum_ops_without_sideeffects() -> impl Iterator<Item = &'static str> {
+    std::iter::empty()
 }
 
 /// RPython `CanRemoveBuiltins = {hasattr: True}` (simplify.py:418-420).
@@ -338,37 +375,238 @@ fn can_remove_builtins() -> Vec<HostObject> {
 
 /// RPython `get_graph(arg, translator)` (simplify.py:20-33).
 ///
-/// Returns the `FunctionGraph` associated with a `direct_call`'s
-/// constant callee, or `None` when the callee is a Variable or a
-/// non-function constant. The Rust port matches on the user-function
-/// shape exposed via `HostObject::user_function()` and walks the
-/// translator's `graphs` list for a graph whose name matches the
-/// function's `name` attribute — a lightweight stand-in for upstream's
-/// `lltype._ptr._obj.graph` traversal.
-fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
-    let Hlvalue::Constant(c) = arg else {
+/// ```python
+/// def get_graph(arg, translator):
+///     if isinstance(arg, Variable):
+///         return None
+///     f = arg.value
+///     if not isinstance(f, lltype._ptr):
+///         return None
+///     try:
+///         funcobj = f._obj
+///     except lltype.DelayedPointer:
+///         return None
+///     try:
+///         return funcobj.graph
+///     except AttributeError:
+///         return None
+/// ```
+///
+/// Upstream explicitly filters out non-`lltype._ptr` callees: in the
+/// annotator phase callees are plain Python functions, not lltype
+/// pointers, so `get_graph` returns `None` for every annotator-phase
+/// direct_call and `has_no_side_effects` pruning never fires. The
+/// lltype pointer → `funcobj.graph` edge only materialises once the
+/// rtyper has run.
+///
+/// The Rust port reproduces that semantics exactly: ConstValue has no
+/// `lltype._ptr` variant yet (that lands with the rtyper port), so
+/// `get_graph_for_call` returns `None` for every reachable callee.
+/// Name-based graph lookup (which Codex flagged — two graphs sharing a
+/// name would false-match) is explicitly NOT used; upstream doesn't
+/// resolve callees by name at any phase.
+fn get_graph_for_call(arg: &Hlvalue, _translator: &TranslationContext) -> Option<GraphRef> {
+    // upstream: `if isinstance(arg, Variable): return None`.
+    let Hlvalue::Constant(_c) = arg else {
         return None;
     };
-    let ConstValue::HostObject(h) = &c.value else {
-        return None;
-    };
-    let gf = h.user_function()?;
-    let fn_name = &gf.name;
-    for g in translator.graphs.borrow().iter() {
-        if g.borrow().name == *fn_name {
-            return Some(g.clone());
-        }
-    }
+    // upstream: `if not isinstance(f, lltype._ptr): return None`.
+    // ConstValue lacks an lltype-pointer variant during annotator
+    // phase, so this branch unconditionally returns None. When the
+    // rtyper port lands, add a `ConstValue::LLPtr(funcptr)` arm whose
+    // `funcptr._obj.graph` wires the callee → graph edge.
     None
 }
 
+/// RPython `op_has_side_effects(op)` (simplify.py:352-353).
+///
+/// ```python
+/// def op_has_side_effects(op):
+///     return lloperation.LL_OPERATIONS[op.opname].sideeffects
+/// ```
+///
+/// **Deferred pending rtyper-phase port.** Needs the full
+/// `rpython/rtyper/lltypesystem/lloperation.py` table (mainly
+/// `LL_OPERATIONS[opname].sideeffects`). Conservatively returns
+/// `true` so dead-op elimination treats every ll-op as a
+/// side-effect barrier — matching upstream's annotator-phase
+/// behaviour where this function isn't reached (the
+/// `translator.rtyper is None` short-circuit in
+/// [`has_no_side_effects`] fires first).
+fn op_has_side_effects(_op: &SpaceOperation) -> bool {
+    true
+}
+
+/// RPython `rec_op_has_side_effects(translator, op, seen=None)`
+/// (simplify.py:377-392).
+///
+/// ```python
+/// def rec_op_has_side_effects(translator, op, seen=None):
+///     if op.opname == "direct_call":
+///         g = get_graph(op.args[0], translator)
+///         if g is None:
+///             return True
+///         if not has_no_side_effects(translator, g, seen):
+///             return True
+///     elif op.opname == "indirect_call":
+///         graphs = op.args[-1].value
+///         if graphs is None:
+///             return True
+///         for g in graphs:
+///             if not has_no_side_effects(translator, g, seen):
+///                 return True
+///     else:
+///         return op_has_side_effects(op)
+/// ```
+///
+/// The indirect_call path reads `op.args[-1].value` which is an
+/// rtyper-synthesised list-of-graphs attached to the last call arg;
+/// that shape lands with the rtyper port. Until then the function
+/// only models the direct_call branch faithfully (mirroring upstream's
+/// conservative "has side effects" answer whenever the target graph
+/// can't be resolved) and treats other opnames via `op_has_side_effects`.
+fn rec_op_has_side_effects(
+    translator: &TranslationContext,
+    op: &SpaceOperation,
+    seen: Option<&HashSet<GraphKeyForSeen>>,
+) -> bool {
+    if op.opname == "direct_call" {
+        let Some(callee_arg) = op.args.first() else {
+            return true;
+        };
+        let g = get_graph_for_call(callee_arg, translator);
+        let Some(g) = g else {
+            return true;
+        };
+        if !has_no_side_effects(translator, &g, seen) {
+            return true;
+        }
+        false
+    } else if op.opname == "indirect_call" {
+        // upstream: `graphs = op.args[-1].value`. ConstValue lacks the
+        // graph-list variant (rtyper-phase output), so conservatively
+        // report side effects.
+        true
+    } else {
+        op_has_side_effects(op)
+    }
+}
+
+/// Marker for `has_no_side_effects`'s `seen` set. Upstream stores graph
+/// identities as dict keys; Rust uses [`GraphKey`] plus a thin wrapper
+/// so the set's type is local to this module.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GraphKeyForSeen(usize);
+
+impl GraphKeyForSeen {
+    fn of(g: &GraphRef) -> Self {
+        GraphKeyForSeen(std::rc::Rc::as_ptr(g) as usize)
+    }
+}
+
 /// RPython `has_no_side_effects(translator, graph, seen=None)`
-/// (simplify.py:355+). The full upstream logic recurses through
-/// `lloperation.LL_OPERATIONS[...].sideeffects` and the callgraph;
-/// neither piece is ported yet. Conservatively return `false` — the
-/// direct_call pruning branch then leaves the op alone, matching the
-/// upstream call shape when `translator is None`.
-fn has_no_side_effects(_translator: &TranslationContext, _graph: &GraphRef) -> bool {
+/// (simplify.py:355-375).
+///
+/// ```python
+/// def has_no_side_effects(translator, graph, seen=None):
+///     if translator.rtyper is None:
+///         return False
+///     else:
+///         if graph.startblock not in translator.rtyper.already_seen:
+///             return False
+///     if seen is None:
+///         seen = {}
+///     elif graph in seen:
+///         return True
+///     newseen = seen.copy()
+///     newseen[graph] = True
+///     for block in graph.iterblocks():
+///         if block is graph.exceptblock:
+///             return False
+///         for op in block.operations:
+///             if rec_op_has_side_effects(translator, op, newseen):
+///                 return False
+///     return True
+/// ```
+///
+/// Upstream short-circuits to `False` whenever `translator.rtyper is
+/// None`. The Rust port's `TranslationContext` has no `rtyper` field
+/// yet (that lands with the rtyper-phase port); expressing that
+/// absence explicitly here keeps the structural line-by-line mapping
+/// so the remaining branches can be filled in once the rtyper arrives.
+///
+/// **Deferred completeness.** Currently [`translator_has_rtyper`]
+/// always returns `false`, so the function always exits at the
+/// `translator.rtyper is None` branch with `return False`. That
+/// matches upstream's annotator-phase behaviour byte-for-byte: during
+/// annotation, `translator.rtyper is None` because the rtyper hasn't
+/// been instantiated, so upstream's `has_no_side_effects` also
+/// returns `False`. The structural walk (seen-cycle guard, block
+/// iteration, [`rec_op_has_side_effects`] dispatch) stays in place
+/// so the rtyper-phase port only needs to flip
+/// [`translator_has_rtyper`] / [`rtyper_already_seen`] — and supply
+/// the [`LL_OPERATIONS`-like side-effect table](op_has_side_effects)
+/// — for the full post-rtyper pruning to activate without further
+/// restructuring.
+fn has_no_side_effects(
+    translator: &TranslationContext,
+    graph: &GraphRef,
+    seen: Option<&HashSet<GraphKeyForSeen>>,
+) -> bool {
+    // upstream: `if translator.rtyper is None: return False`. The
+    // Rust `TranslationContext` has no `rtyper` field yet — until the
+    // rtyper port lands, every call lands in this branch and matches
+    // upstream's annotator-phase behaviour exactly.
+    if !translator_has_rtyper(translator) {
+        return false;
+    }
+    // upstream: `if graph.startblock not in translator.rtyper.already_seen: return False`.
+    // Same deferral as above; cannot evaluate `already_seen` without the rtyper.
+    if !rtyper_already_seen(translator, graph) {
+        return false;
+    }
+    // upstream: seen-cycle guard.
+    let key = GraphKeyForSeen::of(graph);
+    let mut newseen: HashSet<GraphKeyForSeen> = match seen {
+        None => HashSet::new(),
+        Some(s) => {
+            if s.contains(&key) {
+                return true;
+            }
+            s.clone()
+        }
+    };
+    newseen.insert(key);
+    // upstream: walk blocks; bail on the except block or any op with
+    // side effects.
+    let exceptblock_key = BlockKey::of(&graph.borrow().exceptblock);
+    for block in graph.borrow().iterblocks() {
+        if BlockKey::of(&block) == exceptblock_key {
+            return false;
+        }
+        let b = block.borrow();
+        for op in &b.operations {
+            if rec_op_has_side_effects(translator, op, Some(&newseen)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// RPython `translator.rtyper is None` guard. Pending the rtyper-phase
+/// port of `TranslationContext.rtyper`; returns `false` today so
+/// `has_no_side_effects` exits at the `translator.rtyper is None`
+/// branch exactly like upstream during annotator phase.
+fn translator_has_rtyper(_translator: &TranslationContext) -> bool {
+    false
+}
+
+/// RPython `graph.startblock in translator.rtyper.already_seen`.
+/// Unreachable until `translator_has_rtyper` starts returning true;
+/// the default conservative answer mirrors upstream's "not seen →
+/// return False" branch.
+fn rtyper_already_seen(_translator: &TranslationContext, _graph: &GraphRef) -> bool {
     false
 }
 
@@ -409,16 +647,24 @@ pub fn transform_dead_op_vars_in_blocks(
     // `dependencies`: map from Var → [dependency Vars].
     let mut dependencies: HashMap<Variable, HashSet<Variable>> = HashMap::new();
 
-    let canremove_op = |op: &SpaceOperation, block: &BlockRef| -> bool {
+    let canremove_op = |op: &SpaceOperation, block: &BlockRef, idx: usize| -> bool {
         if !can_remove_ops.contains(op.opname.as_str()) {
             return false;
         }
         // upstream: `op is not block.raising_op`.
-        let raising = block.borrow().raising_op().cloned();
-        match raising {
-            Some(r) => *op != r,
-            None => true,
+        //
+        // `block.raising_op` is `block.operations[-1]` when
+        // `block.canraise()` (model.rs:2426-2433), so positional
+        // identity (`idx == operations.len()-1`) reproduces upstream's
+        // Python object-identity check. Value equality would
+        // mis-classify a structurally-identical op earlier in the
+        // block as the raising op — e.g. the same opname+args may
+        // appear twice in `remove_assertion_errors` input.
+        let b = block.borrow();
+        if !b.canraise() {
+            return true;
         }
+        idx + 1 != b.operations.len()
     };
     let add_read_var = |read_vars: &mut HashSet<Variable>, v: &Hlvalue| {
         if let Hlvalue::Variable(var) = v {
@@ -435,8 +681,8 @@ pub fn transform_dead_op_vars_in_blocks(
     // upstream: `for block in blocks: compute read_vars + dependencies`.
     for block in blocks {
         let b = block.borrow();
-        for op in &b.operations {
-            if !canremove_op(op, block) {
+        for (idx, op) in b.operations.iter().enumerate() {
+            if !canremove_op(op, block, idx) {
                 // upstream: `read_vars.update(op.args)`.
                 for a in &op.args {
                     add_read_var(&mut read_vars, a);
@@ -528,7 +774,7 @@ pub fn transform_dead_op_vars_in_blocks(
             if result_used {
                 continue;
             }
-            if canremove_op(&op, block) {
+            if canremove_op(&op, block, i) {
                 block.borrow_mut().operations.remove(i);
             } else if opname == "simple_call" {
                 if let Some(h) = first_arg_builtin {
@@ -542,13 +788,15 @@ pub fn transform_dead_op_vars_in_blocks(
                         continue;
                     };
                     if let Some(graph) = get_graph_for_call(callee_arg, trans) {
-                        let is_raising = block
-                            .borrow()
-                            .raising_op()
-                            .cloned()
-                            .map(|r| r == op)
-                            .unwrap_or(false);
-                        if has_no_side_effects(trans, &graph) && !is_raising {
+                        // upstream: `op is not block.raising_op` —
+                        // positional identity matches upstream object
+                        // identity because `raising_op` is
+                        // `operations[-1]` (model.rs:2426-2433).
+                        let is_raising = {
+                            let b = block.borrow();
+                            b.canraise() && i + 1 == b.operations.len()
+                        };
+                        if has_no_side_effects(trans, &graph, None) && !is_raising {
                             block.borrow_mut().operations.remove(i);
                         }
                     }
@@ -1727,7 +1975,7 @@ pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
         remove_identical_vars_ssa,
         constfold_exitswitch,
         remove_trivial_links,
-        crate::translator::backendopt::ssa::ssa_to_ssi,
+        ssa_to_ssi_shim,
         coalesce_bool,
         transform_ovfcheck,
         simplify_exceptions,
@@ -1738,6 +1986,10 @@ pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
 
 fn dead_op_vars_shim(graph: &FunctionGraph) {
     transform_dead_op_vars(graph, None);
+}
+
+fn ssa_to_ssi_shim(graph: &FunctionGraph) {
+    crate::translator::backendopt::ssa::ssa_to_ssi(graph, None);
 }
 
 /// RPython `simplify_graph(graph, passes=True)` (simplify.py:1075-1081).

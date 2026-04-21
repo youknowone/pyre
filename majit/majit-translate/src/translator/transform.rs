@@ -12,27 +12,18 @@
 //! completed.
 //! ```
 //!
-//! Port coverage so far:
+//! Port coverage:
 //!   - `checkgraphs` (transform.py:13-19)
 //!   - `fully_annotated_blocks` (transform.py:21-25)
-//!   - `transform_graph` (transform.py:253-272)
-//!
-//! The pattern-matching extra passes (`transform_allocate`,
-//! `transform_extend_with_str_slice`, `transform_extend_with_char_count`,
-//! `transform_list_contains`) depend on annotation-typed queries
-//! (`self.gettype(v) is str`, `SomeChar`/`SomeInteger` discrimination)
-//! and stay deferred until those annotation accessors land on the
-//! port's `RPythonAnnotator`.
-//!
-//! `transform_dead_code` + `cutoff_alwaysraising_block` (transform.py:
-//! 145-198) rewrite block exits and need the bookkeeper's
-//! `getuniqueclassdef(AssertionError)` wired to the host-env side; they
-//! land in a follow-up commit.
-//!
-//! `transform_dead_op_vars` (transform.py:137-143) just forwards to
-//! `simplify.transform_dead_op_vars_in_blocks` (simplify.py:422+)
-//! which is ~100 LOC on its own; it will land together with the
-//! remaining `simplify.py` backlog.
+//!   - `transform_allocate` (transform.py:36-50)
+//!   - `transform_extend_with_str_slice` (transform.py:59-75)
+//!   - `transform_extend_with_char_count` (transform.py:84-106)
+//!   - `transform_list_contains` (transform.py:115-134)
+//!   - `transform_dead_op_vars` (transform.py:137-143) — forwards to
+//!      [`crate::translator::simplify::transform_dead_op_vars_in_blocks`].
+//!   - `transform_dead_code` + `cutoff_alwaysraising_block`
+//!      (transform.py:145-198).
+//!   - `default_extra_passes` + `transform_graph` (transform.py:246-272).
 //!
 //! `insert_ll_stackcheck` (transform.py:200-243) is rtyper-phase and
 //! therefore out of scope for the annotator-phase port.
@@ -41,10 +32,13 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
-use crate::annotator::model::{SomeInstance, SomeValue, s_impossible_value, typeof_vars};
+use crate::annotator::model::{
+    KnownType, SomeInstance, SomeObjectTrait, SomeValue, SomeValueTag, s_impossible_value,
+    typeof_vars,
+};
 use crate::flowspace::model::{
     BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, GraphKey, GraphRef, HOST_ENV, Hlvalue,
-    HostObject, Link, LinkKey, LinkRef, Variable, checkgraph,
+    HostObject, Link, LinkKey, LinkRef, SpaceOperation, Variable, checkgraph,
 };
 
 /// RPython `transform.py:13-19` — `checkgraphs(self, blocks)`.
@@ -121,12 +115,30 @@ pub type TransformPass = fn(&RPythonAnnotator, &[BlockRef]);
 
 /// RPython `transform.py:246-251` — `default_extra_passes = [...]`.
 ///
-/// Empty for now: the four pattern-matching passes listed upstream
-/// (`transform_allocate` / `transform_extend_with_str_slice` /
-/// `transform_extend_with_char_count` / `transform_list_contains`)
-/// all depend on annotation-typed queries and land once those
-/// accessors reach the `RPythonAnnotator` surface.
-pub const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[];
+/// ```python
+/// default_extra_passes = [
+///     transform_allocate,
+///     transform_extend_with_str_slice,
+///     transform_extend_with_char_count,
+///     transform_list_contains,
+/// ]
+/// ```
+///
+/// The four pattern-rewriting passes are defined in this module and
+/// stay available as freestanding functions, but three of them
+/// (`transform_allocate`, `transform_extend_with_str_slice`,
+/// `transform_extend_with_char_count`) are temporarily held back
+/// from this list until their synthetic opnames
+/// (`alloc_and_set`, `extend_with_str_slice`, `extend_with_char_count`)
+/// are registered in [`crate::flowspace::operation::OpKind`]. Upstream
+/// never reflows blocks after `transform_graph` fires, so the
+/// annotator never has to look up these opnames in `OpKind`; the Rust
+/// port can't rely on that invariant yet because
+/// [`RPythonAnnotator::reflowpendingblock`] may be reached from later
+/// helper-graph specialisation paths and `flowin_op_loop` panics on
+/// unknown raising opnames. `transform_list_contains` is currently a
+/// no-op (see its own doc comment) so it's safe to keep wired.
+pub const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[transform_list_contains];
 
 /// RPython `transform.py:253-272` — `transform_graph(ann, extra_passes,
 /// block_subset)`.
@@ -488,6 +500,267 @@ pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef])
     }
 }
 
+/// RPython `transform.py:36-50` — `transform_allocate(self, block_subset)`.
+///
+/// ```python
+/// def transform_allocate(self, block_subset):
+///     """Transforms [a] * b to alloc_and_set(b, a) where b is int."""
+///     for block in block_subset:
+///         length1_lists = {}   # maps 'c' to 'a', in the above notation
+///         for i in range(len(block.operations)):
+///             op = block.operations[i]
+///             if (op.opname == 'newlist' and
+///                 len(op.args) == 1):
+///                 length1_lists[op.result] = op.args[0]
+///             elif (op.opname == 'mul' and
+///                   op.args[0] in length1_lists):
+///                 new_op = SpaceOperation('alloc_and_set',
+///                                         (op.args[1], length1_lists[op.args[0]]),
+///                                         op.result)
+///                 block.operations[i] = new_op
+/// ```
+pub fn transform_allocate(_ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
+    for block in block_subset {
+        // upstream: maps `c` (newlist result) → `a` (newlist's only arg).
+        let mut length1_lists: HashMap<Variable, Hlvalue> = HashMap::new();
+        let ops_len = block.borrow().operations.len();
+        for i in 0..ops_len {
+            // upstream: `op = block.operations[i]`.
+            let op = block.borrow().operations[i].clone();
+            if op.opname == "newlist" && op.args.len() == 1 {
+                if let Hlvalue::Variable(result_v) = &op.result {
+                    length1_lists.insert(result_v.clone(), op.args[0].clone());
+                }
+            } else if op.opname == "mul" {
+                // upstream: `op.args[0] in length1_lists`.
+                let Some(Hlvalue::Variable(first_var)) = op.args.first() else {
+                    continue;
+                };
+                let Some(a_value) = length1_lists.get(first_var) else {
+                    continue;
+                };
+                let Some(b_value) = op.args.get(1) else {
+                    continue;
+                };
+                // upstream: `SpaceOperation('alloc_and_set', (op.args[1], length1_lists[op.args[0]]), op.result)`.
+                let new_op = SpaceOperation::with_offset(
+                    "alloc_and_set",
+                    vec![b_value.clone(), a_value.clone()],
+                    op.result.clone(),
+                    op.offset,
+                );
+                block.borrow_mut().operations[i] = new_op;
+            }
+        }
+    }
+}
+
+/// RPython `transform.py:59-75` — `transform_extend_with_str_slice(self, block_subset)`.
+///
+/// ```python
+/// def transform_extend_with_str_slice(self, block_subset):
+///     """Transforms lst += string[x:y] to extend_with_str_slice"""
+///     for block in block_subset:
+///         slice_sources = {}
+///         for i in range(len(block.operations)):
+///             op = block.operations[i]
+///             if (op.opname == 'getslice' and
+///                 self.gettype(op.args[0]) is str):
+///                 slice_sources[op.result] = op.args
+///             elif (op.opname == 'inplace_add' and
+///                   op.args[1] in slice_sources and
+///                   self.gettype(op.args[0]) is list):
+///                 v_string, v_x, v_y = slice_sources[op.args[1]]
+///                 new_op = SpaceOperation('extend_with_str_slice',
+///                                         [op.args[0], v_x, v_y, v_string],
+///                                         op.result)
+///                 block.operations[i] = new_op
+/// ```
+///
+/// `self.gettype(v) is str` routes through `ann.gettype(v) ==
+/// KnownType::Str`, which — like upstream — matches both `SomeString`
+/// and `SomeChar` because both set `knowntype = str`. The equivalent
+/// `is list` check goes through `SomeValue::List(_)` since the Rust
+/// port's [`KnownType`] enum collapses SomeList to [`KnownType::Other`]
+/// (list variant pending).
+pub fn transform_extend_with_str_slice(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
+    for block in block_subset {
+        // upstream: maps `b` (getslice result Variable) → [string, x, y].
+        let mut slice_sources: HashMap<Variable, Vec<Hlvalue>> = HashMap::new();
+        let ops_len = block.borrow().operations.len();
+        for i in 0..ops_len {
+            let op = block.borrow().operations[i].clone();
+            if op.opname == "getslice" && op.args.len() >= 3 {
+                // upstream: `self.gettype(op.args[0]) is str` — true
+                // for both SomeString and SomeChar (both set
+                // knowntype = str).
+                if ann.gettype(&op.args[0]) == KnownType::Str {
+                    if let Hlvalue::Variable(result_v) = &op.result {
+                        slice_sources.insert(result_v.clone(), op.args.clone());
+                    }
+                }
+            } else if op.opname == "inplace_add" && op.args.len() == 2 {
+                // upstream: `op.args[1] in slice_sources`.
+                let Hlvalue::Variable(arg1_v) = &op.args[1] else {
+                    continue;
+                };
+                let Some(source_args) = slice_sources.get(arg1_v) else {
+                    continue;
+                };
+                // upstream: `self.gettype(op.args[0]) is list`.
+                if !matches!(ann.annotation(&op.args[0]), Some(SomeValue::List(_))) {
+                    continue;
+                }
+                // upstream: `v_string, v_x, v_y = slice_sources[op.args[1]]`.
+                let v_string = source_args[0].clone();
+                let v_x = source_args[1].clone();
+                let v_y = source_args[2].clone();
+                let new_op = SpaceOperation::with_offset(
+                    "extend_with_str_slice",
+                    vec![op.args[0].clone(), v_x, v_y, v_string],
+                    op.result.clone(),
+                    op.offset,
+                );
+                block.borrow_mut().operations[i] = new_op;
+            }
+        }
+    }
+}
+
+/// RPython `transform.py:84-106` — `transform_extend_with_char_count(self, block_subset)`.
+///
+/// ```python
+/// def transform_extend_with_char_count(self, block_subset):
+///     """Transforms lst += char*count to extend_with_char_count"""
+///     for block in block_subset:
+///         mul_sources = {}
+///         for i in range(len(block.operations)):
+///             op = block.operations[i]
+///             if op.opname == 'mul':
+///                 s0 = self.annotation(op.args[0])
+///                 s1 = self.annotation(op.args[1])
+///                 if (isinstance(s0, annmodel.SomeChar) and
+///                     isinstance(s1, annmodel.SomeInteger)):
+///                     mul_sources[op.result] = op.args[0], op.args[1]
+///                 elif (isinstance(s1, annmodel.SomeChar) and
+///                       isinstance(s0, annmodel.SomeInteger)):
+///                     mul_sources[op.result] = op.args[1], op.args[0]
+///             elif (op.opname == 'inplace_add' and
+///                   op.args[1] in mul_sources and
+///                   self.gettype(op.args[0]) is list):
+///                 v_char, v_count = mul_sources[op.args[1]]
+///                 new_op = SpaceOperation('extend_with_char_count',
+///                                         [op.args[0], v_char, v_count],
+///                                         op.result)
+///                 block.operations[i] = new_op
+/// ```
+pub fn transform_extend_with_char_count(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
+    // upstream: `isinstance(s, annmodel.SomeInteger)` — Python's
+    // `isinstance` walks the MRO, so `SomeBool` (which subclasses
+    // `SomeInteger`) matches too. Reproduce that via
+    // [`SomeValueTag::mro`] so `SomeBool` / `SomeInteger` both
+    // qualify as integer counts.
+    fn is_integer_subclass(s: &Option<SomeValue>) -> bool {
+        s.as_ref()
+            .is_some_and(|sv| sv.tag().mro().iter().any(|t| *t == SomeValueTag::Integer))
+    }
+
+    for block in block_subset {
+        // upstream: maps `b` (mul result Variable) → (char, count).
+        let mut mul_sources: HashMap<Variable, (Hlvalue, Hlvalue)> = HashMap::new();
+        let ops_len = block.borrow().operations.len();
+        for i in 0..ops_len {
+            let op = block.borrow().operations[i].clone();
+            if op.opname == "mul" && op.args.len() == 2 {
+                // upstream: `s0 = self.annotation(op.args[0])`.
+                let s0 = ann.annotation(&op.args[0]);
+                let s1 = ann.annotation(&op.args[1]);
+                let Hlvalue::Variable(result_v) = &op.result else {
+                    continue;
+                };
+                // upstream: SomeChar * SomeInteger.
+                if matches!(s0, Some(SomeValue::Char(_))) && is_integer_subclass(&s1) {
+                    mul_sources.insert(result_v.clone(), (op.args[0].clone(), op.args[1].clone()));
+                } else if matches!(s1, Some(SomeValue::Char(_))) && is_integer_subclass(&s0) {
+                    // upstream: swap so char is first.
+                    mul_sources.insert(result_v.clone(), (op.args[1].clone(), op.args[0].clone()));
+                }
+            } else if op.opname == "inplace_add" && op.args.len() == 2 {
+                let Hlvalue::Variable(arg1_v) = &op.args[1] else {
+                    continue;
+                };
+                let Some((v_char, v_count)) = mul_sources.get(arg1_v).cloned() else {
+                    continue;
+                };
+                if !matches!(ann.annotation(&op.args[0]), Some(SomeValue::List(_))) {
+                    continue;
+                }
+                let new_op = SpaceOperation::with_offset(
+                    "extend_with_char_count",
+                    vec![op.args[0].clone(), v_char, v_count],
+                    op.result.clone(),
+                    op.offset,
+                );
+                block.borrow_mut().operations[i] = new_op;
+            }
+        }
+    }
+}
+
+/// RPython `transform.py:115-134` — `transform_list_contains(self, block_subset)`.
+///
+/// ```python
+/// def transform_list_contains(self, block_subset):
+///     """Transforms x in [2, 3]"""
+///     for block in block_subset:
+///         newlist_sources = {}
+///         for i in range(len(block.operations)):
+///             op = block.operations[i]
+///             if op.opname == 'newlist':
+///                 newlist_sources[op.result] = op.args
+///             elif op.opname == 'contains' and op.args[0] in newlist_sources:
+///                 items = {}
+///                 for v in newlist_sources[op.args[0]]:
+///                     s = self.annotation(v)
+///                     if not s.is_immutable_constant():
+///                         break
+///                     items[s.const] = None
+///                 else:
+///                     # all arguments of the newlist are annotation constants
+///                     op.args[0] = Constant(items)
+///                     s_dict = self.annotation(op.args[0])
+///                     s_dict.dictdef.generalize_key(self.binding(op.args[1]))
+/// ```
+///
+/// The port runs as an intentional no-op pending the rtyper-phase
+/// port. Two Rust-side prerequisites block the rewrite:
+///
+/// 1. **ConstValue key typing.** Upstream stores `s.const` (any
+///    immutable Python value — int, str, float …) as the dict key,
+///    but the Rust [`ConstValue::Dict`] variant is
+///    `HashMap<String, ConstValue>` and only supports string keys. A
+///    faithful rewrite of `[2, 3]` into a `Dict{ ... }` cannot
+///    preserve the original keys, and any string-substitute scheme
+///    (e.g. `format!("{:?}", key)`) changes the runtime dict to be
+///    keyed by debug-formatted strings — `contains(2, dict)` would
+///    then return False and the program would silently miscompile.
+/// 2. **Downstream lowering.** The rewrite's sole benefit is runtime
+///    O(1) dict lookup in place of linear list scan, which only
+///    materialises once the rtyper lowers the Constant(dict) into a
+///    real hash-map literal. The Rust port is currently
+///    annotator-only; no rtyper exists to consume the rewritten
+///    `contains(x, dict)`. Rewriting without a consumer has no
+///    observable effect (since the rewritten Constant never
+///    executes) while risking the miscompilation path above.
+///
+/// The pass therefore stays in [`DEFAULT_EXTRA_PASSES`] for
+/// line-by-line parity with upstream's pass list, but with an empty
+/// body until the rtyper port lands and [`ConstValue::Dict`] (or a
+/// new companion variant) supports arbitrary-typed keys.
+pub fn transform_list_contains(_ann: &RPythonAnnotator, _block_subset: &[BlockRef]) {
+    // Intentional no-op — see the doc comment above.
+}
+
 // References to unused imports during deferred-port phase would trip
 // the -Dwarnings profile; keep them live via the helper below.
 #[allow(dead_code)]
@@ -666,5 +939,127 @@ mod tests {
             s.exits[0].borrow().target.as_ref().unwrap(),
             &body
         ));
+    }
+
+    #[test]
+    fn transform_allocate_rewrites_newlist_plus_mul_to_alloc_and_set() {
+        // Port of upstream's shape:
+        //   c = newlist(a)
+        //   d = mul(c, b)
+        //   -->
+        //   d = alloc_and_set(b, a)
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+        let a = Variable::new();
+        let b = Variable::new();
+        let c = Variable::new();
+        let d = Variable::new();
+        // newlist(a) → c
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Variable(a.clone())],
+            Hlvalue::Variable(c.clone()),
+        ));
+        // mul(c, b) → d
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "mul",
+            vec![Hlvalue::Variable(c.clone()), Hlvalue::Variable(b.clone())],
+            Hlvalue::Variable(d.clone()),
+        ));
+        // Unrelated op to prove the pass doesn't touch foreign muls.
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "mul",
+            vec![
+                Hlvalue::Variable(Variable::new()),
+                Hlvalue::Constant(C::new(CV::Int(2))),
+            ],
+            Hlvalue::Variable(Variable::new()),
+        ));
+
+        transform_allocate(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        assert_eq!(ops[0].opname, "newlist");
+        assert_eq!(ops[1].opname, "alloc_and_set");
+        // upstream: args become (b, a).
+        let Hlvalue::Variable(arg0) = &ops[1].args[0] else {
+            panic!("alloc_and_set arg0 should be Variable");
+        };
+        assert_eq!(arg0, &b);
+        let Hlvalue::Variable(arg1) = &ops[1].args[1] else {
+            panic!("alloc_and_set arg1 should be Variable");
+        };
+        assert_eq!(arg1, &a);
+        // Unrelated mul is left alone.
+        assert_eq!(ops[2].opname, "mul");
+    }
+
+    #[test]
+    fn transform_extend_with_str_slice_rewrites_when_types_match() {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeList, SomeString, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let mut s = Variable::new(); // string source
+        let x = Variable::new();
+        let y = Variable::new();
+        let mut lst = Variable::new(); // list target
+        let sliced = Variable::new(); // getslice result
+        let result = Variable::new();
+
+        // Pre-bind annotations so the pass's type checks succeed.
+        s.annotation = Some(std::rc::Rc::new(SomeValue::String(SomeString::new(
+            false, false,
+        ))));
+        lst.annotation = Some(std::rc::Rc::new(SomeValue::List(SomeList::new(
+            ListDef::new(None, SomeValue::Impossible, false, false),
+        ))));
+
+        // getslice(s, x, y) → sliced
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "getslice",
+            vec![
+                Hlvalue::Variable(s.clone()),
+                Hlvalue::Variable(x.clone()),
+                Hlvalue::Variable(y.clone()),
+            ],
+            Hlvalue::Variable(sliced.clone()),
+        ));
+        // inplace_add(lst, sliced) → result
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "inplace_add",
+            vec![
+                Hlvalue::Variable(lst.clone()),
+                Hlvalue::Variable(sliced.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+
+        transform_extend_with_str_slice(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        assert_eq!(ops[0].opname, "getslice");
+        assert_eq!(ops[1].opname, "extend_with_str_slice");
+        // upstream: args become [lst, x, y, string].
+        let Hlvalue::Variable(arg0) = &ops[1].args[0] else {
+            panic!();
+        };
+        assert_eq!(arg0, &lst);
+        let Hlvalue::Variable(arg1) = &ops[1].args[1] else {
+            panic!();
+        };
+        assert_eq!(arg1, &x);
+        let Hlvalue::Variable(arg2) = &ops[1].args[2] else {
+            panic!();
+        };
+        assert_eq!(arg2, &y);
+        let Hlvalue::Variable(arg3) = &ops[1].args[3] else {
+            panic!();
+        };
+        assert_eq!(arg3, &s);
     }
 }
