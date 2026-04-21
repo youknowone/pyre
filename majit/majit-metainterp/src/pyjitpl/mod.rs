@@ -13359,7 +13359,7 @@ mod tests {
         assert_eq!(result, OpRef(1));
 
         let ctx = meta.trace_ctx().unwrap();
-        assert_eq!(ctx.recorder.num_ops(), 0);
+        assert_eq!(ctx.num_ops(), 0);
     }
 
     #[test]
@@ -13389,7 +13389,7 @@ mod tests {
         // virtualizable struct via `vinfo.write_boxes` WITHOUT recording
         // any trace ops (RPython pyjitpl.py:3446-3450). The trace stays
         // empty until a non-virtualizable op is recorded.
-        assert_eq!(ctx.recorder.num_ops(), 0);
+        assert_eq!(ctx.num_ops(), 0);
     }
 
     #[test]
@@ -13412,7 +13412,7 @@ mod tests {
         assert_eq!(result, OpRef(2));
 
         let ctx = meta.trace_ctx().unwrap();
-        assert_eq!(ctx.recorder.num_ops(), 0);
+        assert_eq!(ctx.num_ops(), 0);
     }
 
     #[test]
@@ -13430,7 +13430,7 @@ mod tests {
         let len_ref = meta.opimpl_arraylen_vable(OpRef(0), fd24);
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.const_value(len_ref), Some(2));
-        assert_eq!(ctx.recorder.num_ops(), 0);
+        assert_eq!(ctx.num_ops(), 0);
     }
 
     #[test]

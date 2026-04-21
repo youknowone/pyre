@@ -658,7 +658,7 @@ impl<S: JitState> JitDriver<S> {
     /// Returns the number of ops in the active trace, or -1 if not tracing.
     pub fn current_trace_length(&mut self) -> i64 {
         match self.meta.trace_ctx() {
-            Some(ctx) => ctx.recorder.num_ops() as i64,
+            Some(ctx) => ctx.num_ops() as i64,
             None => -1,
         }
     }
