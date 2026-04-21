@@ -242,16 +242,11 @@ fn snapshot_map_from_trace_snapshots(
     std::collections::HashMap<i32, Vec<usize>>,
     std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    std::collections::HashMap<u32, majit_ir::Type>, // snapshot_box_types
 ) {
     let mut box_map = std::collections::HashMap::new();
     let mut size_map = std::collections::HashMap::new();
     let mut vable_map = std::collections::HashMap::new();
     let mut pc_map = std::collections::HashMap::new();
-    // RPython box.type parity: each Box carries its type from tracing.
-    // Collected here so _number_boxes can detect virtual vs int correctly.
-    let mut snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type> =
-        std::collections::HashMap::new();
     let mut next_const_idx = constants
         .keys()
         .filter(|k| majit_ir::OpRef(**k).is_constant())
@@ -262,10 +257,7 @@ fn snapshot_map_from_trace_snapshots(
     // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
     let mut tagged_to_opref = |t: &crate::recorder::SnapshotTagged| -> majit_ir::OpRef {
         match t {
-            crate::recorder::SnapshotTagged::Box(n, tp) => {
-                snapshot_box_types.insert(*n, *tp);
-                majit_ir::OpRef(*n)
-            }
+            crate::recorder::SnapshotTagged::Box(n, _tp) => majit_ir::OpRef(*n),
             crate::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
             crate::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
@@ -315,7 +307,7 @@ fn snapshot_map_from_trace_snapshots(
         vable_map.insert(id, vable_boxes);
         pc_map.insert(id, frame_pcs);
     }
-    (box_map, size_map, vable_map, pc_map, snapshot_box_types)
+    (box_map, size_map, vable_map, pc_map)
 }
 
 fn normalize_root_loop_entry_contract(
@@ -2762,18 +2754,16 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map, sbt) =
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
             snapshot_map_from_trace_snapshots(
                 &trace_snapshots,
                 &mut constants,
                 &mut constant_types,
             );
-        let retry_sbt = sbt.clone();
         unroll_opt.snapshot_boxes = snapshot_map.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
-        unroll_opt.snapshot_box_types = sbt;
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
@@ -2837,7 +2827,6 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
-                        simple_opt.snapshot_box_types = retry_sbt.clone();
                         simple_opt.call_pure_results = call_pure_results.clone();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3390,17 +3379,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.snapshots().to_vec();
-        let (
-            snapshot_boxes,
-            snapshot_frame_sizes,
-            snapshot_vable_boxes,
-            snapshot_frame_pcs,
-            snapshot_box_types,
-        ) = snapshot_map_from_trace_snapshots(
-            &trace_snapshots,
-            &mut constants,
-            &mut constant_types,
-        );
+        let (snapshot_boxes, snapshot_frame_sizes, snapshot_vable_boxes, snapshot_frame_pcs) =
+            snapshot_map_from_trace_snapshots(
+                &trace_snapshots,
+                &mut constants,
+                &mut constant_types,
+            );
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.cut_trace(cut_at);
@@ -3468,7 +3452,6 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
                     snapshot_frame_pcs,
-                    snapshot_box_types.clone(),
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -3498,7 +3481,6 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
                     snapshot_frame_pcs,
-                    snapshot_box_types,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -3628,7 +3610,6 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_frame_sizes,
             retrace_snapshot_vable_boxes,
             retrace_snapshot_frame_pcs,
-            retrace_sbt,
         ) = snapshot_map_from_trace_snapshots(
             &trace.snapshots,
             &mut constants,
@@ -3638,7 +3619,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;
-        unroll_opt.snapshot_box_types = retrace_sbt;
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
@@ -4026,7 +4006,7 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map, sbt) =
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
             snapshot_map_from_trace_snapshots(
                 &trace_snapshots,
                 &mut constants,
@@ -4044,7 +4024,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
-        optimizer.snapshot_box_types = sbt;
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
@@ -4381,7 +4360,7 @@ impl<M: Clone> MetaInterp<M> {
             optimizer.constant_types.insert(ia.index, ia.tp);
         }
 
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map, _sbt) =
+        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
             snapshot_map_from_trace_snapshots(
                 &trace_snapshots,
                 &mut constants,
@@ -6058,7 +6037,6 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
         snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
         snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
-        snapshot_box_types: HashMap<u32, Type>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -6075,7 +6053,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
-        optimizer.snapshot_box_types = snapshot_box_types;
         optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
@@ -6331,7 +6308,6 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
         snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
         snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
-        snapshot_box_types: HashMap<u32, Type>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -6352,10 +6328,6 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
-        // RPython Box.type parity: snapshot_box_types maps OpRef→Type for
-        // boxes captured in trace snapshots. Without this, bridge optimizer
-        // cannot resolve types for OpRefs in store_final_boxes_in_guard.
-        optimizer.snapshot_box_types = snapshot_box_types;
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
         let compiled = self.compiled_loops.get_mut(&green_key).unwrap();

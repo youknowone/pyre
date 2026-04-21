@@ -1023,7 +1023,7 @@ impl TraceCtx {
     /// so a stale lookup of a void op's pos would otherwise return
     /// `Type::Void`. Filter that case out and return `None` so callers
     /// fall back to a safe default rather than letting Void leak into
-    /// `snapshot_box_types` / `livebox_types` / `fail_arg_types`.
+    /// `livebox_types` / `fail_arg_types`.
     pub fn get_opref_type(&self, opref: OpRef) -> Option<Type> {
         if (opref.0 as usize) < self.recorder.num_inputargs() {
             return Some(self.recorder.inputarg_types()[opref.0 as usize]);

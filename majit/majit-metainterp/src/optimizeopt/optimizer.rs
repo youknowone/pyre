@@ -149,8 +149,6 @@ pub struct Optimizer {
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    /// RPython box.type parity: snapshot Box types.
-    pub snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython Box type parity: in RPython each Box carries its type
     /// intrinsically. In majit, OpRef is an untyped u32, so we track
     /// types in value_types. Phase 1 value_types are preserved here
@@ -1006,7 +1004,6 @@ impl Optimizer {
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
-            snapshot_box_types: std::collections::HashMap::new(),
             prev_phase_value_types: std::collections::HashMap::new(),
             original_trace_op_types: std::collections::HashMap::new(),
         }
@@ -1734,7 +1731,6 @@ impl Optimizer {
         ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        ctx.snapshot_box_types = self.snapshot_box_types.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
         // RPython parity: merge numbering_type_overrides (ob_type Ref types)
         // into constant_types_for_numbering. These override Int → Ref for

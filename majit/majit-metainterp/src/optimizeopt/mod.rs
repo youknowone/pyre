@@ -359,10 +359,6 @@ pub struct OptContext {
     pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
-    /// RPython box.type parity: each snapshot Box carries its type.
-    /// Used by InlineBoxEnv.get_type() to avoid fallback to Int for
-    /// unresolved OpRefs (resume.py:210 box.type == 'r' vs 'i').
-    pub snapshot_box_types: HashMap<u32, majit_ir::Type>,
     /// compile.rs value_types parity: OpRef → Type for all defined values
     /// (inputargs + operation results). Used by store_final_boxes_in_guard
     /// to infer fail_arg types correctly for OpRefs from earlier phases.
@@ -482,10 +478,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // to every op (including void ops like SetfieldGc and guards),
         // so a stale lookup of a void op's pos would otherwise leak
         // `Type::Void` here. Filter it out and fall through so it never
-        // reaches snapshot_box_types / livebox_types / fail_arg_types,
-        // where it would propagate into bridge `exit_types` and produce
-        // `Value::Void` slots in `decode_exit_layout_values` that zero
-        // out the bridge fail-arg bank.
+        // reaches livebox_types / fail_arg_types, where it would propagate
+        // into bridge `exit_types` and produce `Value::Void` slots in
+        // `decode_exit_layout_values` that zero out the bridge fail-arg bank.
         if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
             if tp != majit_ir::Type::Void {
                 return tp;
@@ -495,15 +490,8 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // `value_types` aggregates the four upstream sources (original trace
         // ops, prev-phase carry, inputarg types, transformed trace result
         // types) seeded in `Optimizer::make_ctx`, plus every non-Void op
-        // emitted so far via `register_value_type`. It is a strict superset
-        // of the tracing-time `snapshot_box_types` cache (which only covers
-        // `SnapshotTagged::Box` positions).
+        // emitted so far via `register_value_type`.
         if let Some(&tp) = self.ctx.value_types.get(&opref.0) {
-            if tp != majit_ir::Type::Void {
-                return tp;
-            }
-        }
-        if let Some(&tp) = self.ctx.snapshot_box_types.get(&opref.0) {
             if tp != majit_ir::Type::Void {
                 return tp;
             }
@@ -1110,7 +1098,6 @@ impl OptContext {
             snapshot_frame_pcs: HashMap::new(),
 
             constant_types_for_numbering: HashMap::new(),
-            snapshot_box_types: HashMap::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
@@ -1189,7 +1176,6 @@ impl OptContext {
             snapshot_frame_pcs: HashMap::new(),
 
             constant_types_for_numbering: HashMap::new(),
-            snapshot_box_types: HashMap::new(),
             value_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,

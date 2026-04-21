@@ -81,9 +81,6 @@ pub struct UnrollOptimizer {
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    /// RPython box.type parity: each snapshot Box carries its type from tracing.
-    /// Used by InlineBoxEnv.get_type() for correct _number_boxes virtual detection.
-    pub snapshot_box_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
@@ -142,7 +139,6 @@ impl UnrollOptimizer {
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
-            snapshot_box_types: std::collections::HashMap::new(),
             all_descrs: Vec::new(),
             trace_inputarg_types: Vec::new(),
             original_trace_op_types: std::collections::HashMap::new(),
@@ -311,7 +307,6 @@ impl UnrollOptimizer {
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-            opt_p1.snapshot_box_types = self.snapshot_box_types.clone();
             opt_p1.call_pure_results = self.call_pure_results.clone();
             // RPython optimize_preamble (unroll.py:101-103): flush=False.
             // JUMP/FINISH is NOT sent through the pass pipeline; it's
@@ -519,7 +514,6 @@ impl UnrollOptimizer {
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
-        opt_p2.snapshot_box_types = self.snapshot_box_types.clone();
         opt_p2.call_pure_results = self.call_pure_results.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
         // Phase 1 processes GUARD_FUTURE_CONDITION (from close_loop_args_at)
@@ -647,12 +641,6 @@ impl UnrollOptimizer {
             }
         }
         // KEY translation: rebuild HashMap with translated keys.
-        let translated_box_types: HashMap<u32, Type> = opt_p2
-            .snapshot_box_types
-            .iter()
-            .map(|(&k, &v)| (translate_opref(OpRef(k)).0, v))
-            .collect();
-        opt_p2.snapshot_box_types = translated_box_types;
         let translated_op_types: HashMap<u32, Type> = opt_p2
             .original_trace_op_types
             .iter()
