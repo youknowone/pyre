@@ -1949,6 +1949,11 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
         // `compile.py:658` inherits `final_descr = True` from `_DoneWithThisFrameDescr`.
         true
     }
+    fn is_exit_frame_with_exception(&self) -> bool {
+        // `compile.py:658` subclass identity: ExitFrameWithExceptionDescrRef
+        // dispatches to `jitexc.ExitFrameWithExceptionRef` via `handle_fail`.
+        true
+    }
 }
 
 /// `compile.py:1092-1099` `class PropagateExceptionDescr(AbstractFailDescr)`.
