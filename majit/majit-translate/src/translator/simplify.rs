@@ -1592,6 +1592,168 @@ pub fn remove_assertion_errors(graph: &FunctionGraph) {
     }
 }
 
+/// RPython `transform_ovfcheck(graph)` (simplify.py:71-108).
+///
+/// Rewrites `simple_call(ovfcheck, result_of_prev_op)` into the
+/// `_ovf` variant of the previous operation. When `ovfcheck` sits at
+/// the start of its block, upstream collapses the predecessor link
+/// first via `join_blocks` and re-enters; the Rust port mirrors that
+/// fixpoint loop.
+pub fn transform_ovfcheck(graph: &FunctionGraph) {
+    let ovfcheck_sentinel: HostObject = HOST_ENV
+        .lookup_builtin("ovfcheck")
+        .expect("HOST_ENV missing ovfcheck sentinel");
+
+    loop {
+        let mut any_block_needs_merge = false;
+
+        for block in graph.iterblocks() {
+            // upstream: `for i in range(len(block.operations)-1, -1, -1)`.
+            let ops_len = block.borrow().operations.len();
+            let mut i = ops_len;
+            while i > 0 {
+                i -= 1;
+                let (is_ovfcheck_call, result_of_call) = {
+                    let b = block.borrow();
+                    let op = &b.operations[i];
+                    let matches_ovfcheck = op.opname == "simple_call"
+                        && matches!(
+                            op.args.first(),
+                            Some(Hlvalue::Constant(Constant {
+                                value: ConstValue::HostObject(h),
+                                ..
+                            })) if h == &ovfcheck_sentinel
+                        );
+                    (matches_ovfcheck, op.result.clone())
+                };
+                if !is_ovfcheck_call {
+                    continue;
+                }
+
+                // upstream: hard case — `ovfcheck` at block start.
+                if i == 0 {
+                    let entrymap = mkentrymap(graph);
+                    let Some(links) = entrymap.get(&BlockKey::of(&block)) else {
+                        break;
+                    };
+                    assert_eq!(
+                        links.len(),
+                        1,
+                        "ovfcheck at block start requires single entry"
+                    );
+                    let Some(prevblock) = links[0]
+                        .borrow()
+                        .prevblock
+                        .as_ref()
+                        .and_then(|w| w.upgrade())
+                    else {
+                        break;
+                    };
+                    {
+                        let first_exit = prevblock.borrow().exits.first().cloned();
+                        if let Some(fe) = first_exit {
+                            assert!(matches!(
+                                fe.borrow().target.as_ref(),
+                                Some(t) if std::rc::Rc::ptr_eq(t, &block)
+                            ));
+                        }
+                    }
+                    prevblock.borrow_mut().exitswitch = None;
+                    prevblock.recloseblock(vec![links[0].clone()]);
+                    any_block_needs_merge = true;
+                    break;
+                }
+
+                // upstream: `op1 = block.operations[i - 1]`. Must be
+                // overflow-capable.
+                let (op1_opname, op1_result) = {
+                    let b = block.borrow();
+                    let op1 = &b.operations[i - 1];
+                    (op1.opname.clone(), op1.result.clone())
+                };
+                let kind = crate::flowspace::operation::OpKind::from_opname(&op1_opname)
+                    .unwrap_or_else(|| {
+                        panic!("ovfcheck on unknown opname {op1_opname} in {}", graph.name)
+                    });
+                let ovf_kind = kind.ovf_variant().unwrap_or_else(|| {
+                    panic!(
+                        "ovfcheck in {}: Operation {op1_opname} has no overflow variant",
+                        graph.name
+                    )
+                });
+                // upstream: `op1_ovf = op1.ovfchecked()`; we just flip
+                // opname in place — args/result/offset already match.
+                {
+                    let mut b = block.borrow_mut();
+                    b.operations[i - 1].opname = ovf_kind.opname().to_string();
+                    b.operations.remove(i);
+                }
+                let Hlvalue::Variable(result_v) = result_of_call else {
+                    continue;
+                };
+                let mut renaming: HashMap<Variable, Hlvalue> = HashMap::new();
+                renaming.insert(result_v, op1_result);
+                renamevariables_hl(&block, &renaming);
+            }
+        }
+
+        if !any_block_needs_merge {
+            break;
+        }
+        // upstream: after merging, re-run join_blocks + retry.
+        join_blocks(graph);
+    }
+}
+
+/// RPython `all_passes = [...]` (simplify.py:1060-1073) + `simplify_graph`
+/// (simplify.py:1075-1081).
+///
+/// `all_passes` upstream is a list of callables; the Rust port uses a
+/// `fn(&FunctionGraph)` slice so every entry has the same call shape.
+/// `transform_dead_op_vars(graph, translator=None)` and
+/// `SSA_to_SSI(graph, annotator=None)` are wrapped to match — both
+/// accept `translator=None` / `annotator=None` by default and the
+/// Rust wrappers pass `None`.
+pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
+    &[
+        dead_op_vars_shim,
+        eliminate_empty_blocks,
+        remove_assertion_errors,
+        remove_identical_vars_ssa,
+        constfold_exitswitch,
+        remove_trivial_links,
+        crate::translator::backendopt::ssa::ssa_to_ssi,
+        coalesce_bool,
+        transform_ovfcheck,
+        simplify_exceptions,
+        transform_xxxitem,
+        remove_dead_exceptions,
+    ]
+}
+
+fn dead_op_vars_shim(graph: &FunctionGraph) {
+    transform_dead_op_vars(graph, None);
+}
+
+/// RPython `simplify_graph(graph, passes=True)` (simplify.py:1075-1081).
+///
+/// ```python
+/// def simplify_graph(graph, passes=True):
+///     if passes is True:
+///         passes = all_passes
+///     for pass_ in passes:
+///         pass_(graph)
+///     checkgraph(graph)
+/// ```
+pub fn simplify_graph(graph: &FunctionGraph, passes: Option<&[fn(&FunctionGraph)]>) {
+    let default_passes = all_passes();
+    let passes = passes.unwrap_or(default_passes);
+    for pass_ in passes {
+        pass_(graph);
+    }
+    checkgraph(graph);
+}
+
 /// RPython `cleanup_graph(graph)` (simplify.py:1083-1088).
 ///
 /// ```python
@@ -2532,6 +2694,73 @@ mod tests {
             body.borrow().exits[0].borrow().target.as_ref().unwrap(),
             &returnblock
         ));
+    }
+
+    #[test]
+    fn transform_ovfcheck_rewrites_add_to_add_ovf() {
+        // Block operations: `t = add v1 v2`; `r = simple_call(ovfcheck, t)`.
+        // After transform_ovfcheck, the block should contain only
+        // `r = add_ovf v1 v2` (t absorbed into r via renaming).
+        use crate::flowspace::model::{
+            ConstValue as CV, Constant as C, HOST_ENV as HE, SpaceOperation as SO,
+        };
+        let ovf_sentinel = HE.lookup_builtin("ovfcheck").unwrap();
+        let v1 = Variable::new();
+        let v2 = Variable::new();
+        let t = Variable::new();
+        let r = Variable::new();
+        let start = Block::shared(vec![
+            Hlvalue::Variable(v1.clone()),
+            Hlvalue::Variable(v2.clone()),
+        ]);
+        start.borrow_mut().operations.push(SO::new(
+            "add",
+            vec![Hlvalue::Variable(v1.clone()), Hlvalue::Variable(v2.clone())],
+            Hlvalue::Variable(t.clone()),
+        ));
+        start.borrow_mut().operations.push(SO::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(C::new(CV::HostObject(ovf_sentinel.clone()))),
+                Hlvalue::Variable(t.clone()),
+            ],
+            Hlvalue::Variable(r.clone()),
+        ));
+
+        let graph = FunctionGraph::new("f", start.clone());
+        let link = Link::new(
+            vec![Hlvalue::Variable(r.clone())],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link.clone()]);
+
+        transform_ovfcheck(&graph);
+
+        let b = start.borrow();
+        assert_eq!(b.operations.len(), 1);
+        assert_eq!(b.operations[0].opname, "add_ovf");
+        // The `return` link's arg was renamed from r → t.
+        let link_arg = link.borrow().args[0].clone();
+        assert!(matches!(link_arg, Some(Hlvalue::Variable(v)) if v == t));
+    }
+
+    #[test]
+    fn simplify_graph_runs_all_passes_on_valid_graph() {
+        // Smoke-test the driver end-to-end: minimum valid graph, all
+        // 12 passes applied, checkgraph bookend. Must not panic.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("g", start.clone());
+        let link = Link::new(
+            vec![Hlvalue::Constant(C::new(CV::Int(7)))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link]);
+        simplify_graph(&graph, None);
     }
 
     #[test]

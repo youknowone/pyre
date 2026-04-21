@@ -1284,6 +1284,12 @@ impl HostEnv {
         ] {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
+        // RPython-only overflow-check sentinel — upstream
+        // `rpython/rlib/rarithmetic.py` exports `ovfcheck` as a plain
+        // function. `translator/simplify.py:78` compares against
+        // `Constant(rarithmetic.ovfcheck)`, so the sentinel needs a
+        // stable `HostObject` identity in `HOST_ENV`.
+        self.insert_builtin("ovfcheck", HostObject::new_builtin_callable("ovfcheck"));
     }
 
     fn bootstrap_std_modules(&mut self) {

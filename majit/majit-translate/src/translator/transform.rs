@@ -435,11 +435,49 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
 
 /// RPython `transform.py:137-143` — `transform_dead_op_vars(ann, blocks)`.
 ///
-/// Upstream just forwards to `simplify.transform_dead_op_vars_in_blocks`.
-/// Both that callee and its dependency on the translator's full graph
-/// set are deferred; see module docs.
-pub fn transform_dead_op_vars(_ann: &RPythonAnnotator, _block_subset: &[BlockRef]) {
-    // intentionally no-op — see module-level note.
+/// ```python
+/// def transform_dead_op_vars(ann, block_subset):
+///     from rpython.translator.simplify import transform_dead_op_vars_in_blocks
+///     transform_dead_op_vars_in_blocks(block_subset, ann.translator.graphs,
+///             ann.translator)
+/// ```
+///
+/// Delegates to `simplify::transform_dead_op_vars_in_blocks` with the
+/// annotator's translator hooked up. Upstream's multi-graph
+/// `start_blocks` set (`translator.annotator.annotated[block].startblock`)
+/// is computed here and threaded through as a graph-resolver closure
+/// (Rust doesn't have Python's `for block in blocks: ...annotated[block]
+/// .startblock` concise expression).
+pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
+    use crate::translator::simplify;
+    // upstream: `set_of_blocks = set(blocks)`; start_blocks computed
+    // by `ann.translator.annotated[block].startblock`. The Rust port
+    // splits this: `simplify::transform_dead_op_vars_in_blocks` takes
+    // a single-graph reference + translator; iterate the distinct
+    // graphs covered by block_subset and run the pass per-graph. The
+    // Rust model's `annotated` map is keyed by block identity, so the
+    // same dispatch produces the same set of graphs upstream would
+    // build via `{translator.annotator.annotated[block].startblock
+    // for block in blocks}`.
+    let mut seen: HashSet<GraphKey> = HashSet::new();
+    let annotated = ann.annotated.borrow();
+    for block in block_subset {
+        let Some(Some(graph)) = annotated.get(&BlockKey::of(block)) else {
+            continue;
+        };
+        let gkey = GraphKey::of(graph);
+        if !seen.insert(gkey) {
+            continue;
+        }
+        let graph_blocks = graph.borrow().iterblocks();
+        let _ = graph_blocks.len();
+        simplify::transform_dead_op_vars_in_blocks(
+            &graph_blocks,
+            &[graph.as_ptr() as *const _],
+            Some(&ann.translator.borrow()),
+            &graph.borrow(),
+        );
+    }
 }
 
 // References to unused imports during deferred-port phase would trip
