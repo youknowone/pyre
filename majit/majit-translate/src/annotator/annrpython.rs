@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::super::flowspace::model::{
-    BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable,
+    BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable, checkgraph,
 };
 use super::bookkeeper::Bookkeeper;
 use super::model::{SomeValue, TLS, UnionError, unionof};
@@ -457,17 +457,13 @@ impl RPythonAnnotator {
     ///         self.complete()
     ///     return self.annotation(flowgraph.getreturnvar())
     /// ```
-    ///
-    /// `checkgraph` (flowspace/model.py:checkgraph) is a structural
-    /// sanity check not yet ported — the Rust stub omits it; every
-    /// graph fed through `build_graph_types` today comes straight from
-    /// the flowspace builder which already obeys the invariants.
     pub fn build_graph_types(
         &self,
         graph: &GraphRef,
         inputcells: &[SomeValue],
         complete_now: bool,
     ) -> Option<SomeValue> {
+        checkgraph(&graph.borrow());
         let nbarg = graph.borrow().getargs().len();
         assert_eq!(
             nbarg,
@@ -2265,15 +2261,27 @@ mod tests {
 
     #[test]
     fn build_graph_types_zero_arg_calls_complete() {
-        // A graph with no input args and an untouched return var:
-        // complete() will force s_ImpossibleValue on the returnvar.
+        // Minimum valid graph (mirrors upstream test_mingraph): no
+        // inputs, startblock closes directly to returnblock with
+        // `Constant(1)`. `complete()` binds `returnvar` to
+        // `SomeValue::Integer` — this test just verifies the
+        // build_graph_types → checkgraph → complete wiring.
+        use super::super::super::flowspace::model::{BlockRefExt, ConstValue, Constant, Link};
         let translator = super::super::super::translator::translator::TranslationContext::new();
         let graph = mk_graph("f0", 0);
+        {
+            let g = graph.borrow();
+            let link = Rc::new(RefCell::new(Link::new(
+                vec![Hlvalue::Constant(Constant::new(ConstValue::Int(1)))],
+                Some(g.returnblock.clone()),
+                None,
+            )));
+            g.startblock.closeblock(vec![link]);
+        }
         translator.graphs.borrow_mut().push(Rc::clone(&graph));
         let ann = RPythonAnnotator::new(Some(translator), None, None, false);
         let r = ann.build_graph_types(&graph, &[], true);
-        // No body, no operations — return var is forced to Impossible.
-        assert!(matches!(r, Some(SomeValue::Impossible)), "got {:?}", r);
+        assert!(matches!(r, Some(SomeValue::Integer(_))), "got {:?}", r);
     }
 
     #[test]
