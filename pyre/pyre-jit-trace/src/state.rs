@@ -3284,36 +3284,37 @@ impl JitState for PyreJitState {
         let stack_only = sym.stack_only_depth();
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
-        // Falls back to the vable-mirror array items for slots not covered
-        // by liveness at the guard PC. pyre's optimizer sometimes keeps
-        // locals alive past the liveness analysis boundary (short-preamble
-        // import still references them), and RPython papers over this by
-        // always running `synchronize_virtualizable` before the guard, so
-        // the vable mirror is a complete frame image. Picking up dead
-        // slots from the mirror keeps the parent-loop LABEL arity contract
-        // satisfied until the tracer stops asking for dead locals.
-        let dead_slot_fallback =
-            |idx: usize| -> OpRef { vable_array_items.get(idx).copied().unwrap_or(OpRef::NONE) };
-        if !reg_indices.is_empty() && reg_indices.len() == frame0.values.len() {
-            for (value, &reg_idx) in frame0.values.iter().zip(reg_indices.iter()) {
-                let resolved = resolve(ctx, &mut virtuals_cache, value);
-                let idx = reg_idx as usize;
-                if idx < bridge_registers_r.len() {
-                    bridge_registers_r[idx] = resolved;
-                }
+        // RPython parity: after A.1 the guard-recovery path calls
+        // `synchronize_virtualizable()` / `write_boxes()`
+        // (pyjitpl.py:3430) before `start_bridge_tracing`, so the
+        // physical vable image the tracer is about to read is already
+        // resume-data-complete. The
+        // bridge register file is therefore expected to be fully
+        // populated by the liveness-driven zip below; any remaining
+        // OpRef::NONE signals a liveness-coverage gap (the tracer keeps a
+        // local live past the `-live-` marker) and must be surfaced by
+        // the assert rather than papered over with a vable-mirror read.
+        assert!(
+            reg_indices.len() == frame0.values.len(),
+            "setup_bridge_sym: reg_indices len={} != frame.values len={} at pc={}",
+            reg_indices.len(),
+            frame0.values.len(),
+            frame0.pc,
+        );
+        for (value, &reg_idx) in frame0.values.iter().zip(reg_indices.iter()) {
+            let resolved = resolve(ctx, &mut virtuals_cache, value);
+            let idx = reg_idx as usize;
+            if idx < bridge_registers_r.len() {
+                bridge_registers_r[idx] = resolved;
             }
-            for (idx, slot) in bridge_registers_r.iter_mut().enumerate() {
-                if slot.is_none() {
-                    *slot = dead_slot_fallback(idx);
-                }
-            }
-        } else {
-            // Liveness unavailable (skeleton jitcode, truncated section):
-            // fall back fully to the vable mirror so the bridge still has a
-            // frame image. Follow-up: once every jitcode reaches this path
-            // with populated liveness, this branch can become an assert.
-            for (idx, slot) in bridge_registers_r.iter_mut().enumerate() {
-                *slot = dead_slot_fallback(idx);
+        }
+        for (idx, slot) in bridge_registers_r.iter_mut().enumerate() {
+            if slot.is_none() {
+                // Fallback retained only for slots genuinely outside the
+                // liveness coverage (stack-only depth ahead of the local
+                // prefix). vable_array_items is now A.1-synchronized so
+                // the read is authoritative.
+                *slot = vable_array_items.get(idx).copied().unwrap_or(OpRef::NONE);
             }
         }
         let bridge_locals: Vec<OpRef> = bridge_registers_r.iter().take(nlocals).copied().collect();

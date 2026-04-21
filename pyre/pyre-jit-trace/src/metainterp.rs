@@ -502,10 +502,12 @@ impl PyreMetaInterp {
             return;
         }
 
-        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, ni) else {
+        let Some((opcode_pc, instruction, op_arg)) =
+            pyre_interpreter::decode_instruction_for_dispatch(code, ni)
+        else {
             return;
         };
-        cf.set_last_instr_from_next_instr(ni + 1);
+        cf.set_last_instr_from_next_instr(opcode_pc + 1);
         let next = cf.next_instr();
 
         if let Instruction::Call { argc } = instruction {
@@ -532,10 +534,12 @@ impl PyreMetaInterp {
             return pyre_object::PY_NULL;
         }
 
-        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, ni) else {
+        let Some((opcode_pc, instruction, op_arg)) =
+            pyre_interpreter::decode_instruction_for_dispatch(code, ni)
+        else {
             return pyre_object::PY_NULL;
         };
-        cf.set_last_instr_from_next_instr(ni + 1);
+        cf.set_last_instr_from_next_instr(opcode_pc + 1);
         let next = cf.next_instr();
 
         match pyre_interpreter::execute_opcode_step(cf, code, instruction, op_arg, next) {

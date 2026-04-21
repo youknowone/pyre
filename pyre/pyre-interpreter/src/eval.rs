@@ -10,10 +10,10 @@ use crate::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
-    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_at,
-    dict_storage_load, dict_storage_store, ensure_range_iter, execute_opcode_step,
-    make_function_from_code_obj, range_iter_continues, range_iter_next_or_null,
-    stack_underflow_error, unpack_sequence_exact, w_code_new,
+    build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
+    decode_instruction_for_dispatch, dict_storage_load, dict_storage_store, ensure_range_iter,
+    execute_opcode_step, make_function_from_code_obj, range_iter_continues,
+    range_iter_next_or_null, stack_underflow_error, unpack_sequence_exact, w_code_new,
 };
 use pyre_object::*;
 
@@ -238,28 +238,10 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
 
         let pc = next_instr;
         frame.last_instr = pc as isize;
-        let Some((mut instruction, mut op_arg)) = decode_instruction_at(code, pc) else {
+        let Some((opcode_pc, instruction, op_arg)) = decode_instruction_for_dispatch(code, pc)
+        else {
             return Ok(w_none());
         };
-        // pypy/interpreter/pyopcode.py:187-193 dispatch_bytecode: fold
-        // EXTENDED_ARG prefixes into the same dispatch step so the real
-        // opcode is executed once with the fully accumulated oparg.
-        // decode_instruction_at already walks back to collect prefixes, so
-        // advancing opcode_pc until a non-prefix opcode is reached re-decodes
-        // with the running accumulation.
-        let mut opcode_pc = pc;
-        while matches!(instruction, Instruction::ExtendedArg) {
-            opcode_pc += 1;
-            if opcode_pc >= code.instructions.len() {
-                return Ok(w_none());
-            }
-            let Some((next_insn, next_arg)) = decode_instruction_at(code, opcode_pc) else {
-                return Ok(w_none());
-            };
-            instruction = next_insn;
-            op_arg = next_arg;
-        }
-        frame.last_instr = opcode_pc as isize;
         let fallthrough = opcode_pc + 1;
         match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
             Ok(StepResult::Continue)

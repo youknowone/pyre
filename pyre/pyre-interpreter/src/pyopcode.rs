@@ -139,6 +139,27 @@ pub fn decode_instruction_at(code: &CodeObject, pc: usize) -> Option<(Instructio
     Some(arg_state.get(code_unit))
 }
 
+/// pypy/interpreter/pyopcode.py:187-193 dispatch_bytecode parity.
+///
+/// Returns the semantic opcode to execute for a dispatch step starting at
+/// `pc`. If `pc` points at one or more `EXTENDED_ARG` prefixes, this walks
+/// forward to the real opcode and returns its fully accumulated oparg along
+/// with the real opcode PC.
+pub fn decode_instruction_for_dispatch(
+    code: &CodeObject,
+    pc: usize,
+) -> Option<(usize, Instruction, OpArg)> {
+    let mut opcode_pc = pc;
+    let (mut instruction, mut op_arg) = decode_instruction_at(code, opcode_pc)?;
+    while matches!(instruction, Instruction::ExtendedArg) {
+        opcode_pc += 1;
+        let decoded = decode_instruction_at(code, opcode_pc)?;
+        instruction = decoded.0;
+        op_arg = decoded.1;
+    }
+    Some((opcode_pc, instruction, op_arg))
+}
+
 pub trait LocalOpcodeHandler: SharedOpcodeHandler {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError>;
     fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
@@ -1960,7 +1981,7 @@ pub fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_instruction_at;
+    use super::{decode_instruction_at, decode_instruction_for_dispatch};
     use crate::bytecode::Instruction;
     use crate::{OpArgState, compile_exec};
 
@@ -2005,5 +2026,43 @@ mod tests {
             expected
                 .map(|(instruction, arg)| (std::mem::discriminant(&instruction), u32::from(arg)))
         );
+    }
+
+    #[test]
+    fn decode_instruction_for_dispatch_absorbs_extended_arg_prefix() {
+        let source = (0..400)
+            .map(|i| format!("v{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = compile_exec(&source).expect("compile failed");
+
+        let target_pc = code
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, unit)| {
+                if pc > 0
+                    && matches!(code.instructions[pc - 1].op, Instruction::ExtendedArg)
+                    && !matches!(unit.op, Instruction::ExtendedArg)
+                {
+                    Some(pc)
+                } else {
+                    None
+                }
+            })
+            .expect("expected an instruction with an ExtendedArg prefix");
+        let prefix_pc = target_pc - 1;
+
+        let (decoded_pc, decoded_instr, decoded_arg) =
+            decode_instruction_for_dispatch(&code, prefix_pc).expect("dispatch decode failed");
+        let (target_instr, target_arg) =
+            decode_instruction_at(&code, target_pc).expect("target decode failed");
+
+        assert_eq!(decoded_pc, target_pc);
+        assert_eq!(
+            std::mem::discriminant(&decoded_instr),
+            std::mem::discriminant(&target_instr)
+        );
+        assert_eq!(u32::from(decoded_arg), u32::from(target_arg));
     }
 }
