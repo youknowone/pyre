@@ -625,6 +625,45 @@ impl ListDef {
         li_mut.generalize(s_value)
     }
 
+    /// RPython `ListDef.never_resize(self)` (listdef.py:189-192).
+    ///
+    /// ```python
+    /// def never_resize(self):
+    ///     if self.listitem.resized:
+    ///         raise ListChangeUnallowed("list already resized")
+    ///     self.listitem.must_not_resize = True
+    /// ```
+    pub fn never_resize(&self) -> Result<(), ListChangeUnallowed> {
+        let li = self.inner.listitem.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        if li_mut.resized {
+            return Err(ListChangeUnallowed("list already resized".to_string()));
+        }
+        li_mut.must_not_resize = true;
+        Ok(())
+    }
+
+    /// RPython `ListDef.mark_as_immutable(self)` (listdef.py:194-204).
+    ///
+    /// ```python
+    /// def mark_as_immutable(self):
+    ///     self.never_resize()
+    ///     if not self.listitem.mutated:
+    ///         self.listitem.immutable = True
+    /// ```
+    pub fn mark_as_immutable(&self) -> Result<(), ListChangeUnallowed> {
+        self.never_resize()?;
+        let li = self.inner.listitem.borrow().clone();
+        let mut li_mut = li.borrow_mut();
+        if !li_mut.mutated {
+            li_mut.immutable = true;
+        }
+        // else: the list was already mutated; leave immutable=false. The
+        // upstream comment at listdef.py:203-204 notes this is expected
+        // and matches test_can_merge_immutable_list_with_regular_list.
+        Ok(())
+    }
+
     /// RPython `ListDef.offspring(bookkeeper, *others)` (listdef.py:154-165).
     ///
     /// ```python

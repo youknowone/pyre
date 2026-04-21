@@ -24,6 +24,7 @@ use std::rc::Rc;
 use super::super::flowspace::model::ConstValue;
 use super::super::flowspace::model::Constant;
 use super::super::flowspace::model::Hlvalue;
+use super::super::flowspace::model::Variable;
 use super::super::flowspace::operation::{
     BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation,
     register_single,
@@ -1022,14 +1023,20 @@ pub fn list_method_extend(
         // upstream:
         //     s_iter = s_iterable.iter()
         //     self.method_append(s_iter.next())
-        // Dispatching back through the registry requires the `iter` op
-        // on the iterable's tag and then `next` — land this in Commit 6d
-        // alongside the general `find_method`/SomeBuiltinMethod.call
-        // wiring.
-        panic!(
-            "list.method_extend: non-list iterable path requires iter/next dispatch \
-             (lands with SomeBuiltinMethod wiring, Commit 6d)"
-        );
+        let mut v_iterable = Variable::named("list_extend_iterable");
+        ann.setbinding(&mut v_iterable, s_iterable.clone());
+        let hl_iter = HLOperation::new(OpKind::Iter, vec![Hlvalue::Variable(v_iterable)]);
+        let s_iter = hl_iter
+            .consider(ann)
+            .expect("list.method_extend: iter() dispatch failed");
+
+        let mut v_iter = Variable::named("list_extend_iter");
+        ann.setbinding(&mut v_iter, s_iter);
+        let hl_next = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v_iter)]);
+        let s_item = hl_next
+            .consider(ann)
+            .expect("list.method_extend: next() dispatch failed");
+        list_method_append(ann, s_self, &s_item);
     }
     SomeValue::Impossible
 }
@@ -1282,6 +1289,18 @@ pub fn dict_method_values(ann: &RPythonAnnotator, s_self: &super::model::SomeDic
 }
 
 #[allow(dead_code)]
+pub fn dict_method_items(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+    // unaryop.py:529-531 — bk.newlist(self.getanyitem(..., variant='items')).
+    let position = ann.bookkeeper.current_position_key();
+    let s_item = container_getanyitem(&SomeValue::Dict(s_self.clone()), Some("items"), position);
+    let s_list = ann
+        .bookkeeper
+        .newlist(&[s_item], None)
+        .expect("bookkeeper.newlist failed");
+    SomeValue::List(s_list)
+}
+
+#[allow(dead_code)]
 pub fn dict_method_iterkeys(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:533-534 — SomeIterator(self, 'keys').
     SomeValue::Iterator(SomeIterator::new(
@@ -1313,9 +1332,38 @@ pub fn dict_method_iteritems(
 }
 
 #[allow(dead_code)]
+pub fn dict_method_iterkeys_with_hash(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+) -> SomeValue {
+    SomeValue::Iterator(SomeIterator::new(
+        SomeValue::Dict(s_self.clone()),
+        vec!["keys_with_hash".into()],
+    ))
+}
+
+#[allow(dead_code)]
+pub fn dict_method_iteritems_with_hash(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+) -> SomeValue {
+    SomeValue::Iterator(SomeIterator::new(
+        SomeValue::Dict(s_self.clone()),
+        vec!["items_with_hash".into()],
+    ))
+}
+
+#[allow(dead_code)]
 pub fn dict_method_clear(_ann: &RPythonAnnotator, _s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:548-549 — pass.
     SomeValue::Impossible
+}
+
+#[allow(dead_code)]
+pub fn dict_method_popitem(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+    // unaryop.py:551-553 — return self.getanyitem(position, variant='items').
+    let position = ann.bookkeeper.current_position_key();
+    container_getanyitem(&SomeValue::Dict(s_self.clone()), Some("items"), position)
 }
 
 #[allow(dead_code)]
@@ -1644,6 +1692,29 @@ fn const_str_of(sv: &SomeValue) -> Option<String> {
     })
 }
 
+fn const_int_of(sv: &SomeValue) -> Option<i64> {
+    match sv.const_() {
+        Some(ConstValue::Int(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+fn stringish_no_nul(sv: &SomeValue) -> bool {
+    match sv {
+        SomeValue::String(s) => s.inner.no_nul,
+        SomeValue::UnicodeString(s) => s.inner.no_nul,
+        SomeValue::Char(s) => s.inner.no_nul,
+        SomeValue::UnicodeCodePoint(s) => s.inner.no_nul,
+        _ => false,
+    }
+}
+
+fn s_const_int(value: i64) -> SomeValue {
+    let mut s = SomeInteger::new(value >= 0, false);
+    s.base.const_box = Some(Constant::new(ConstValue::Int(value)));
+    SomeValue::Integer(s)
+}
+
 #[allow(dead_code)]
 pub fn str_method_find(
     _ann: &RPythonAnnotator,
@@ -1687,27 +1758,118 @@ pub fn str_method_count(
     SomeValue::Integer(SomeInteger::new(true, false))
 }
 
+fn str_method_strip_like(s_self: &SomeValue, s_chr: Option<&SomeValue>, opname: &str) -> SomeValue {
+    // unaryop.py:633-644 — strip/lstrip/rstrip share the same shape.
+    if s_chr.is_none() && matches!(s_self, SomeValue::UnicodeString(_)) {
+        panic!("AnnotatorError: unicode.{opname}() with no arg is not RPython");
+    }
+    basestring_of(s_self, stringish_no_nul(s_self))
+}
+
 #[allow(dead_code)]
 pub fn str_method_strip(
     _ann: &RPythonAnnotator,
     s_self: &SomeValue,
-    _s_chr: Option<&SomeValue>,
+    s_chr: Option<&SomeValue>,
 ) -> SomeValue {
-    // unaryop.py:633-636
-    //   if chr is None and isinstance(self, SomeUnicodeString):
-    //       raise AnnotatorError("unicode.strip() with no arg is not RPython")
-    //   return self.basestringclass(no_nul=self.no_nul)
-    if _s_chr.is_none() && matches!(s_self, SomeValue::UnicodeString(_)) {
-        panic!("AnnotatorError: unicode.strip() with no arg is not RPython");
+    str_method_strip_like(s_self, s_chr, "strip")
+}
+
+#[allow(dead_code)]
+pub fn str_method_lstrip(
+    _ann: &RPythonAnnotator,
+    s_self: &SomeValue,
+    s_chr: Option<&SomeValue>,
+) -> SomeValue {
+    str_method_strip_like(s_self, s_chr, "lstrip")
+}
+
+#[allow(dead_code)]
+pub fn str_method_rstrip(
+    _ann: &RPythonAnnotator,
+    s_self: &SomeValue,
+    s_chr: Option<&SomeValue>,
+) -> SomeValue {
+    str_method_strip_like(s_self, s_chr, "rstrip")
+}
+
+#[allow(dead_code)]
+pub fn str_method_join(
+    ann: &RPythonAnnotator,
+    s_self: &SomeValue,
+    s_list: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:646-655.
+    if s_none().contains(s_list) {
+        return SomeValue::Impossible;
     }
-    let no_nul = match s_self {
-        SomeValue::String(s) => s.inner.no_nul,
-        SomeValue::UnicodeString(s) => s.inner.no_nul,
-        SomeValue::Char(s) => s.inner.no_nul,
-        SomeValue::UnicodeCodePoint(s) => s.inner.no_nul,
-        _ => false,
+    let SomeValue::List(s_list) = s_list else {
+        panic!("AnnotatorError: string.join() argument must be a list");
     };
+    let position = ann.bookkeeper.current_position_key();
+    let s_item = s_list.listdef.read_item(position);
+    if s_none().contains(&s_item) {
+        let empty = match s_self {
+            SomeValue::UnicodeString(_) => String::new(),
+            _ => String::new(),
+        };
+        let mut s = match s_self {
+            SomeValue::UnicodeString(_) => {
+                return {
+                    let mut u = SomeUnicodeString::new(false, false);
+                    u.inner.base.const_box = Some(Constant::new(ConstValue::Str(empty)));
+                    SomeValue::UnicodeString(u)
+                };
+            }
+            _ => SomeString::new(false, false),
+        };
+        s.inner.base.const_box = Some(Constant::new(ConstValue::Str(empty)));
+        return SomeValue::String(s);
+    }
+    let no_nul = stringish_no_nul(s_self) && stringish_no_nul(&s_item);
     basestring_of(s_self, no_nul)
+}
+
+#[allow(dead_code)]
+pub fn str_method_split(
+    ann: &RPythonAnnotator,
+    s_self: &SomeValue,
+    s_patt: &SomeValue,
+    s_max: Option<&SomeValue>,
+) -> SomeValue {
+    // unaryop.py:667-675.
+    let max_value = s_max.and_then(const_int_of).unwrap_or(-1);
+    let no_nul = if max_value == -1
+        && const_str_of(s_patt)
+            .map(|p| p.chars().count() == 1 && p.chars().next() == Some('\0'))
+            .unwrap_or(false)
+    {
+        true
+    } else {
+        stringish_no_nul(s_self)
+    };
+    let s_item = basestring_of(s_self, no_nul);
+    let s_list = ann
+        .bookkeeper
+        .newlist(&[s_item], None)
+        .expect("bookkeeper.newlist failed");
+    SomeValue::List(s_list)
+}
+
+#[allow(dead_code)]
+pub fn str_method_rsplit(
+    ann: &RPythonAnnotator,
+    s_self: &SomeValue,
+    _s_patt: &SomeValue,
+    _s_max: Option<&SomeValue>,
+) -> SomeValue {
+    // unaryop.py:677-679.
+    let s_item = basestring_of(s_self, stringish_no_nul(s_self));
+    let s_list = ann
+        .bookkeeper
+        .newlist(&[s_item], None)
+        .expect("bookkeeper.newlist failed");
+    SomeValue::List(s_list)
 }
 
 #[allow(dead_code)]
@@ -1766,6 +1928,18 @@ pub fn str_method_replace(
 }
 
 #[allow(dead_code)]
+pub fn str_method_splitlines(ann: &RPythonAnnotator, s_self: &SomeValue) -> SomeValue {
+    // unaryop.py:744-748.
+    let s_item = basestring_of(s_self, false);
+    let s_list = ann
+        .bookkeeper
+        .newlist(&[s_item], None)
+        .expect("bookkeeper.newlist failed");
+    s_list.listdef.resize().expect("listdef.resize failed");
+    SomeValue::List(s_list)
+}
+
+#[allow(dead_code)]
 pub fn str_method_format(
     _ann: &RPythonAnnotator,
     _s_self: &SomeValue,
@@ -1809,20 +1983,51 @@ pub fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> 
             "update" => "dict_method_update",
             "keys" => "dict_method_keys",
             "values" => "dict_method_values",
+            "items" => "dict_method_items",
             "iterkeys" => "dict_method_iterkeys",
             "itervalues" => "dict_method_itervalues",
             "iteritems" => "dict_method_iteritems",
+            "iterkeys_with_hash" => "dict_method_iterkeys_with_hash",
+            "iteritems_with_hash" => "dict_method_iteritems_with_hash",
             "clear" => "dict_method_clear",
+            "popitem" => "dict_method_popitem",
             "pop" => "dict_method_pop",
             _ => return None,
         },
-        SomeValue::String(_) | SomeValue::UnicodeString(_) => match name {
+        SomeValue::String(_) => match name {
             "startswith" => "str_method_startswith",
             "endswith" => "str_method_endswith",
             "find" => "str_method_find",
             "rfind" => "str_method_rfind",
             "count" => "str_method_count",
             "strip" => "str_method_strip",
+            "lstrip" => "str_method_lstrip",
+            "rstrip" => "str_method_rstrip",
+            "join" => "str_method_join",
+            "split" => "str_method_split",
+            "rsplit" => "str_method_rsplit",
+            "upper" => "str_method_upper",
+            "lower" => "str_method_lower",
+            "isdigit" => "str_method_isdigit",
+            "isalpha" => "str_method_isalpha",
+            "isalnum" => "str_method_isalnum",
+            "replace" => "str_method_replace",
+            "splitlines" => "str_method_splitlines",
+            "format" => "str_method_format",
+            _ => return None,
+        },
+        SomeValue::UnicodeString(_) => match name {
+            "startswith" => "str_method_startswith",
+            "endswith" => "str_method_endswith",
+            "find" => "str_method_find",
+            "rfind" => "str_method_rfind",
+            "count" => "str_method_count",
+            "strip" => "str_method_strip",
+            "lstrip" => "str_method_lstrip",
+            "rstrip" => "str_method_rstrip",
+            "join" => "str_method_join",
+            "split" => "str_method_split",
+            "rsplit" => "str_method_rsplit",
             "upper" => "str_method_upper",
             "lower" => "str_method_lower",
             "isdigit" => "str_method_isdigit",
@@ -1870,6 +2075,28 @@ fn builtin_method_arg_error(method: &SomeBuiltinMethod) -> AnnotatorError {
     ))
 }
 
+fn bind_builtin_method_args(
+    args_s: Vec<SomeValue>,
+    kwds: std::collections::HashMap<String, SomeValue>,
+    argnames: &[&str],
+    defaults: Option<Vec<SomeValue>>,
+) -> Result<Vec<SomeValue>, AnnotatorError> {
+    let signature = crate::flowspace::argument::Signature::new(
+        argnames.iter().map(|name| (*name).to_string()).collect(),
+        None,
+        None,
+    );
+    let prefixed_kwds = kwds
+        .into_iter()
+        .map(|(key, value)| (format!("s_{key}"), value))
+        .collect();
+    let call_args =
+        super::argument::ArgumentsForTranslation::new(args_s, Some(prefixed_kwds), None);
+    call_args
+        .match_signature(&signature, defaults.as_deref())
+        .map_err(|err| AnnotatorError::new(format!("SomeBuiltinMethod.call(): {}", err.getmsg())))
+}
+
 /// RPython `SomeBuiltinMethod.call(self, args, implicit_init=False)`
 /// dispatch helper (unaryop.py:961-967).
 pub fn call_builtin_method(
@@ -1880,20 +2107,15 @@ pub fn call_builtin_method(
     let (args_s, kwds) = args
         .unpack()
         .map_err(|err| AnnotatorError::new(err.getmsg()))?;
-    if !kwds.is_empty() {
-        return Err(AnnotatorError::new(format!(
-            "SomeBuiltinMethod.call(): keyword arguments are not supported for {}",
-            method.methodname
-        )));
-    }
 
     let result = match method.analyser_name.as_str() {
         "list_method_append" => {
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [s_value] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_value"], None)?;
+            let [s_value] = scope.as_slice() else {
+                unreachable!();
             };
             list_method_append(ann, s_self, s_value)
         }
@@ -1901,8 +2123,9 @@ pub fn call_builtin_method(
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [s_iterable] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_iterable"], None)?;
+            let [s_iterable] = scope.as_slice() else {
+                unreachable!();
             };
             list_method_extend(ann, s_self, s_iterable)
         }
@@ -1910,8 +2133,9 @@ pub fn call_builtin_method(
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             list_method_reverse(ann, s_self)
         }
@@ -1919,8 +2143,9 @@ pub fn call_builtin_method(
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [s_index, s_value] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_index", "s_value"], None)?;
+            let [s_index, s_value] = scope.as_slice() else {
+                unreachable!();
             };
             list_method_insert(ann, s_self, s_index, s_value)
         }
@@ -1928,8 +2153,9 @@ pub fn call_builtin_method(
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [s_value] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_value"], None)?;
+            let [s_value] = scope.as_slice() else {
+                unreachable!();
             };
             list_method_remove(ann, s_self, s_value)
         }
@@ -1937,18 +2163,23 @@ pub fn call_builtin_method(
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            match args_s.as_slice() {
-                [] => list_method_pop(ann, s_self, None),
-                [s_index] => list_method_pop(ann, s_self, Some(s_index)),
-                _ => return Err(builtin_method_arg_error(method)),
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_index"], Some(vec![s_none()]))?;
+            let [s_index] = scope.as_slice() else {
+                unreachable!();
+            };
+            if matches!(s_index, SomeValue::None_(_)) {
+                list_method_pop(ann, s_self, None)
+            } else {
+                list_method_pop(ann, s_self, Some(s_index))
             }
         }
         "list_method_index" => {
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [s_value] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_value"], None)?;
+            let [s_value] = scope.as_slice() else {
+                unreachable!();
             };
             list_method_index(ann, s_self, s_value)
         }
@@ -1956,18 +2187,20 @@ pub fn call_builtin_method(
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            match args_s.as_slice() {
-                [s_key] => dict_method_get(ann, s_self, s_key, &s_none()),
-                [s_key, s_dfl] => dict_method_get(ann, s_self, s_key, s_dfl),
-                _ => return Err(builtin_method_arg_error(method)),
-            }
+            let scope =
+                bind_builtin_method_args(args_s, kwds, &["s_key", "s_dfl"], Some(vec![s_none()]))?;
+            let [s_key, s_dfl] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_get(ann, s_self, s_key, s_dfl)
         }
         "dict_method_copy" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_copy(ann, s_self)
         }
@@ -1975,8 +2208,9 @@ pub fn call_builtin_method(
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [s_other] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_other"], None)?;
+            let [s_other] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_update(ann, s_self, s_other)
         }
@@ -1984,8 +2218,9 @@ pub fn call_builtin_method(
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_keys(ann, s_self)
         }
@@ -1993,17 +2228,29 @@ pub fn call_builtin_method(
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_values(ann, s_self)
+        }
+        "dict_method_items" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_items(ann, s_self)
         }
         "dict_method_iterkeys" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_iterkeys(ann, s_self)
         }
@@ -2011,8 +2258,9 @@ pub fn call_builtin_method(
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_itervalues(ann, s_self)
         }
@@ -2020,123 +2268,309 @@ pub fn call_builtin_method(
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_iteritems(ann, s_self)
+        }
+        "dict_method_iterkeys_with_hash" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_iterkeys_with_hash(ann, s_self)
+        }
+        "dict_method_iteritems_with_hash" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_iteritems_with_hash(ann, s_self)
         }
         "dict_method_clear" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             dict_method_clear(ann, s_self)
+        }
+        "dict_method_popitem" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_popitem(ann, s_self)
         }
         "dict_method_pop" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
-            match args_s.as_slice() {
-                [s_key] => dict_method_pop(ann, s_self, s_key, None),
-                [s_key, s_dfl] => dict_method_pop(ann, s_self, s_key, Some(s_dfl)),
-                _ => return Err(builtin_method_arg_error(method)),
+            let scope =
+                bind_builtin_method_args(args_s, kwds, &["s_key", "s_dfl"], Some(vec![s_none()]))?;
+            let [s_key, s_dfl] = scope.as_slice() else {
+                unreachable!();
+            };
+            if matches!(s_dfl, SomeValue::None_(_)) {
+                dict_method_pop(ann, s_self, s_key, None)
+            } else {
+                dict_method_pop(ann, s_self, s_key, Some(s_dfl))
             }
         }
         "str_method_startswith" => {
-            let [s_frag] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_frag"], None)?;
+            let [s_frag] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_startswith(ann, &method.s_self, s_frag)
         }
         "str_method_endswith" => {
-            let [s_frag] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_frag"], None)?;
+            let [s_frag] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_endswith(ann, &method.s_self, s_frag)
         }
-        "str_method_find" => match args_s.as_slice() {
-            [s_frag] => str_method_find(ann, &method.s_self, s_frag, None, None),
-            [s_frag, s_start] => str_method_find(ann, &method.s_self, s_frag, Some(s_start), None),
-            [s_frag, s_start, s_end] => {
-                str_method_find(ann, &method.s_self, s_frag, Some(s_start), Some(s_end))
-            }
-            _ => return Err(builtin_method_arg_error(method)),
-        },
-        "str_method_rfind" => match args_s.as_slice() {
-            [s_frag] => str_method_rfind(ann, &method.s_self, s_frag, None, None),
-            [s_frag, s_start] => str_method_rfind(ann, &method.s_self, s_frag, Some(s_start), None),
-            [s_frag, s_start, s_end] => {
-                str_method_rfind(ann, &method.s_self, s_frag, Some(s_start), Some(s_end))
-            }
-            _ => return Err(builtin_method_arg_error(method)),
-        },
-        "str_method_count" => match args_s.as_slice() {
-            [s_frag] => str_method_count(ann, &method.s_self, s_frag, None, None),
-            [s_frag, s_start] => str_method_count(ann, &method.s_self, s_frag, Some(s_start), None),
-            [s_frag, s_start, s_end] => {
-                str_method_count(ann, &method.s_self, s_frag, Some(s_start), Some(s_end))
-            }
-            _ => return Err(builtin_method_arg_error(method)),
-        },
-        "str_method_strip" => match args_s.as_slice() {
-            [] => str_method_strip(ann, &method.s_self, None),
-            [s_chr] => str_method_strip(ann, &method.s_self, Some(s_chr)),
-            _ => return Err(builtin_method_arg_error(method)),
-        },
+        "str_method_find" => {
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_frag", "s_start", "s_end"],
+                Some(vec![s_none(), s_none()]),
+            )?;
+            let [s_frag, s_start, s_end] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_find(
+                ann,
+                &method.s_self,
+                s_frag,
+                if matches!(s_start, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_start)
+                },
+                if matches!(s_end, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_end)
+                },
+            )
+        }
+        "str_method_rfind" => {
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_frag", "s_start", "s_end"],
+                Some(vec![s_none(), s_none()]),
+            )?;
+            let [s_frag, s_start, s_end] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_rfind(
+                ann,
+                &method.s_self,
+                s_frag,
+                if matches!(s_start, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_start)
+                },
+                if matches!(s_end, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_end)
+                },
+            )
+        }
+        "str_method_count" => {
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_frag", "s_start", "s_end"],
+                Some(vec![s_none(), s_none()]),
+            )?;
+            let [s_frag, s_start, s_end] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_count(
+                ann,
+                &method.s_self,
+                s_frag,
+                if matches!(s_start, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_start)
+                },
+                if matches!(s_end, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_end)
+                },
+            )
+        }
+        "str_method_strip" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_chr"], Some(vec![s_none()]))?;
+            let [s_chr] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_strip(
+                ann,
+                &method.s_self,
+                if matches!(s_chr, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_chr)
+                },
+            )
+        }
+        "str_method_lstrip" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_chr"], Some(vec![s_none()]))?;
+            let [s_chr] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_lstrip(
+                ann,
+                &method.s_self,
+                if matches!(s_chr, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_chr)
+                },
+            )
+        }
+        "str_method_rstrip" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_chr"], Some(vec![s_none()]))?;
+            let [s_chr] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_rstrip(
+                ann,
+                &method.s_self,
+                if matches!(s_chr, SomeValue::None_(_)) {
+                    None
+                } else {
+                    Some(s_chr)
+                },
+            )
+        }
+        "str_method_join" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_list"], None)?;
+            let [s_list] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_join(ann, &method.s_self, s_list)
+        }
+        "str_method_split" => {
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_patt", "s_max"],
+                Some(vec![s_const_int(-1)]),
+            )?;
+            let [s_patt, s_max] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_split(ann, &method.s_self, s_patt, Some(s_max))
+        }
+        "str_method_rsplit" => {
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_patt", "s_max"],
+                Some(vec![s_const_int(-1)]),
+            )?;
+            let [s_patt, s_max] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_rsplit(ann, &method.s_self, s_patt, Some(s_max))
+        }
         "str_method_upper" => {
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_upper(ann, &method.s_self)
         }
         "str_method_lower" => {
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_lower(ann, &method.s_self)
         }
         "str_method_isdigit" => {
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_isdigit(ann, &method.s_self)
         }
         "str_method_isalpha" => {
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_isalpha(ann, &method.s_self)
         }
         "str_method_isalnum" => {
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_isalnum(ann, &method.s_self)
         }
         "str_method_replace" => {
-            let [s1, s2] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &["s1", "s2"], None)?;
+            let [s1, s2] = scope.as_slice() else {
+                unreachable!();
             };
             str_method_replace(ann, &method.s_self, s1, s2)
         }
-        "str_method_format" => str_method_format(ann, &method.s_self, &args_s),
-        "char_method_isspace" => {
-            let [] = args_s.as_slice() else {
+        "str_method_splitlines" => {
+            let scope =
+                bind_builtin_method_args(args_s, kwds, &["s_keep_newlines"], Some(vec![s_none()]))?;
+            let [_s_keep_newlines] = scope.as_slice() else {
+                unreachable!();
+            };
+            str_method_splitlines(ann, &method.s_self)
+        }
+        "str_method_format" => {
+            if !kwds.is_empty() {
                 return Err(builtin_method_arg_error(method));
+            }
+            str_method_format(ann, &method.s_self, &args_s)
+        }
+        "char_method_isspace" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             char_method_isspace(ann, &method.s_self)
         }
         "char_method_islower" => {
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             char_method_islower(ann, &method.s_self)
         }
         "char_method_isupper" => {
-            let [] = args_s.as_slice() else {
-                return Err(builtin_method_arg_error(method));
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
             };
             char_method_isupper(ann, &method.s_self)
         }
@@ -3566,5 +4000,86 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn list_method_extend_uses_iter_next_for_non_list_iterable() {
+        let ann = mk_ann();
+        let s_list = mk_list_of(SomeValue::Integer(SomeInteger::default()));
+        let s_iterable = SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
+            SomeInteger::default(),
+        )]));
+        let result = list_method_extend(&ann, &s_list, &s_iterable);
+        assert!(matches!(result, SomeValue::Impossible));
+        assert!(matches!(
+            s_list.listdef.read_item(None),
+            SomeValue::Integer(_)
+        ));
+    }
+
+    #[test]
+    fn builtin_method_call_binds_keywords_like_python_call() {
+        let ann = mk_ann();
+        let method = SomeBuiltinMethod::new(
+            "str_method_find",
+            SomeValue::String(SomeString::new(false, false)),
+            "find",
+        );
+        let mut kwds = std::collections::HashMap::new();
+        kwds.insert("start".to_string(), s_const_int(1));
+        kwds.insert("end".to_string(), s_const_int(3));
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![SomeValue::String(SomeString::new(false, false))],
+            Some(kwds),
+            None,
+        );
+        let result = call_builtin_method(&ann, &method, &args).expect("builtin call must bind");
+        assert!(matches!(result, SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn find_method_exposes_dict_items_and_string_split_surface() {
+        let ann = mk_ann();
+        let dictdef = super::super::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let s_dict = SomeValue::Dict(super::super::model::SomeDict::new(dictdef));
+        let s_string = SomeValue::String(SomeString::new(false, false));
+
+        let SomeValue::BuiltinMethod(dict_items) = s_dict.find_method("items").unwrap() else {
+            panic!("dict.items must be recognized");
+        };
+        assert_eq!(dict_items.analyser_name, "dict_method_items");
+
+        let SomeValue::BuiltinMethod(str_split) = s_string.find_method("split").unwrap() else {
+            panic!("str.split must be recognized");
+        };
+        assert_eq!(str_split.analyser_name, "str_method_split");
+    }
+
+    #[test]
+    fn dict_method_items_returns_list_of_pairs() {
+        let ann = mk_ann();
+        let pk = super::super::bookkeeper::PositionKey::new(7, 0, 0);
+        ann.bookkeeper.set_position_key(Some(pk));
+        let dictdef = super::super::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let s_dict = super::super::model::SomeDict::new(dictdef);
+        let result = dict_method_items(&ann, &s_dict);
+        let SomeValue::List(list) = result else {
+            panic!("expected SomeList");
+        };
+        assert!(matches!(list.listdef.read_item(None), SomeValue::Tuple(_)));
     }
 }

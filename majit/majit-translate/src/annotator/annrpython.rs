@@ -718,17 +718,24 @@ impl RPythonAnnotator {
     /// ```
     ///
     /// The Rust port routes the fixpoint call through the bookkeeper's
-    /// `compute_at_fixpoint`. `transform_graph`,
-    /// `eliminate_empty_blocks`, and `perform_normalizations` live in
-    /// `rpython/translator/` and `rpython/rtyper/` — those stay as
-    /// no-op placeholders until the translator/rtyper ports land.
+    /// `compute_at_fixpoint` and invokes `eliminate_empty_blocks` over
+    /// the translator's graph set. `transform_graph` and
+    /// `perform_normalizations` remain as no-op placeholders until
+    /// `rpython/translator/transform.py` and `rpython/rtyper/
+    /// normalizecalls.py` land.
     pub fn simplify(&self) {
-        // translator.simplify.eliminate_empty_blocks + translator
-        // .transform.transform_graph + rtyper.normalizecalls
-        // .perform_normalizations are all translator/rtyper-side and
-        // live outside this commit. The fixpoint call is the only part
-        // the bookkeeper already exposes.
+        // upstream: `transform.transform_graph(self, ...)` — deferred
+        // until translator/transform.py port lands.
+        // upstream: `for graph in graphs: simplify.eliminate_empty_blocks(graph)`.
+        let graphs: Vec<_> = self.translator.borrow().graphs.borrow().clone();
+        for graph_ref in graphs {
+            let fg = graph_ref.borrow();
+            super::super::translator::simplify::eliminate_empty_blocks(&fg);
+        }
+        // upstream: `self.bookkeeper.compute_at_fixpoint()`.
         self.bookkeeper.compute_at_fixpoint();
+        // upstream: `if block_subset is None: perform_normalizations(self)`
+        // — perform_normalizations is rtyper-phase; deferred.
     }
 
     /// RPython `apply_renaming(self, s_out, renaming)`

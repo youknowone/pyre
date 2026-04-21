@@ -24,11 +24,6 @@
 //! * `lltype.LowLevelType` branch (`_compute_annotation`
 //!   signature.py:59-60) — deferred until `rtyper/lltypesystem/lltype.py`
 //!   is ported.
-//! * `bookkeeper.getuniqueclassdef(t)` call inside
-//!   `annotationoftype` (signature.py:103-104) — deferred until
-//!   `bookkeeper.py` / `classdesc.py` land a full classdef registry.
-//! * `Sig.__call__` (signature.py:113-147) — deferred: needs
-//!   `funcdesc.bookkeeper` (description.py).
 //! * `_annotation_cache` memoization (signature.py:13, 30-38) —
 //!   skipped; callers re-compute on every call. Performance-only;
 //!   correctness matches upstream.

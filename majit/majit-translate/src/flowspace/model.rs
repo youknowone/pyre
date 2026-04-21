@@ -147,6 +147,12 @@ enum HostObjectKind {
         name: String,
         origin_class: HostObject,
     },
+    /// Python `weakref.ref(obj)`. Upstream `bookkeeper.immutablevalue`
+    /// dereferences the weakref via `x()` and routes the referent
+    /// (or `None` for dead weakrefs) through the SomeWeakRef path
+    /// (bookkeeper.py:299-306). `referent=None` models a dead
+    /// weakref whose target has been garbage-collected.
+    Weakref { referent: Option<HostObject> },
 }
 
 impl PartialEq for HostObject {
@@ -396,6 +402,7 @@ impl HostObject {
             HostObjectKind::StaticMethod { .. } => HOST_ENV.lookup_builtin("staticmethod"),
             HostObjectKind::ClassMethod { .. } => HOST_ENV.lookup_builtin("classmethod"),
             HostObjectKind::BoundMethod { .. } => HOST_ENV.lookup_builtin("method"),
+            HostObjectKind::Weakref { .. } => HOST_ENV.lookup_builtin("weakref"),
         }
     }
 
@@ -645,6 +652,31 @@ impl HostObject {
     pub fn bound_method_origin_class(&self) -> Option<&HostObject> {
         match &self.inner.kind {
             HostObjectKind::BoundMethod { origin_class, .. } => Some(origin_class),
+            _ => None,
+        }
+    }
+
+    /// Host-level `weakref.ref(obj)` constructor. `referent=None`
+    /// models a dead weakref whose target has been garbage-collected.
+    pub fn new_weakref(qualname: impl Into<String>, referent: Option<HostObject>) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::Weakref { referent },
+            }),
+        }
+    }
+
+    pub fn is_weakref(&self) -> bool {
+        matches!(self.inner.kind, HostObjectKind::Weakref { .. })
+    }
+
+    /// Dereference the weakref — upstream `x()`. `Some(Some(h))` when
+    /// the weakref is alive; `Some(None)` when it has been collected;
+    /// `None` when `self` isn't a weakref at all.
+    pub fn weakref_referent(&self) -> Option<Option<&HostObject>> {
+        match &self.inner.kind {
+            HostObjectKind::Weakref { referent } => Some(referent.as_ref()),
             _ => None,
         }
     }

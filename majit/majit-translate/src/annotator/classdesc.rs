@@ -69,6 +69,17 @@ use super::model::{AnnotatorError, DescKind, SomeInteger, SomeString, SomeValue,
 use crate::flowspace::model::{
     ConstValue, Constant, HOST_ENV, HostGetAttrError, HostObject, host_getattr,
 };
+use crate::tool::flattenrec::FlattenRecursion;
+
+thread_local! {
+    /// RPython `ClassDef._see_instance_flattenrec = FlattenRecursion()`
+    /// (classdesc.py:402). Upstream's `FlattenRecursion` inherits
+    /// `TlsClass` (tool/flattenrec.py:7-10) so the class-attribute is
+    /// effectively one-per-thread; the Rust port mirrors the scope
+    /// with `thread_local!`.
+    static SEE_INSTANCE_FLATTENREC: FlattenRecursion<AnnotatorError> =
+        FlattenRecursion::new();
+}
 
 // ---------------------------------------------------------------------------
 // ClassDictEntry (classdesc.py:506 `{attr: Constant-or-Desc}`).
@@ -607,6 +618,11 @@ pub struct ClassDesc {
     /// RPython class attribute `instance_level = False`
     /// (classdesc.py:490).
     pub instance_level: bool,
+    /// RPython `self._detect_invalid_attrs` (classdesc.py:826) — lazily
+    /// populated attribute-name set used by
+    /// [`Self::maybe_return_immutable_list`] to detect subclass-declared
+    /// `_immutable_fields_` entries that were migrated to a superclass.
+    pub detect_invalid_attrs: Option<HashSet<String>>,
     /// Back-reference to the bookkeeper. Weak to avoid cycles.
     pub bookkeeper: Weak<Bookkeeper>,
 }
@@ -626,6 +642,7 @@ impl ClassDesc {
             classdict: HashMap::new(),
             immutable_fields: HashSet::new(),
             instance_level: false,
+            detect_invalid_attrs: None,
             bookkeeper: Rc::downgrade(bookkeeper),
         }
     }
@@ -796,6 +813,7 @@ impl ClassDesc {
             classdict: classdict.unwrap_or_default(),
             immutable_fields,
             instance_level: false,
+            detect_invalid_attrs: None,
             bookkeeper: Rc::downgrade(bookkeeper),
         }));
 
@@ -1494,6 +1512,113 @@ impl ClassDesc {
     }
 
     /// RPython `ClassDesc.consider_call_site(descs, args, s_result, op)`
+    /// RPython `ClassDesc.maybe_return_immutable_list(self, attr, s_result)`
+    /// (classdesc.py:819-850).
+    ///
+    /// ```python
+    /// def maybe_return_immutable_list(self, attr, s_result):
+    ///     if self._detect_invalid_attrs and attr in self._detect_invalid_attrs:
+    ///         raise AnnotatorError("field %r was migrated to %r from a subclass...")
+    ///     search1 = '%s[*]' % (attr,)
+    ///     search2 = '%s?[*]' % (attr,)
+    ///     cdesc = self
+    ///     while cdesc is not None:
+    ///         immutable_fields = cdesc.immutable_fields
+    ///         if immutable_fields:
+    ///             if (search1 in immutable_fields or search2 in immutable_fields):
+    ///                 s_result.listdef.never_resize()
+    ///                 s_copy = s_result.listdef.offspring(self.bookkeeper)
+    ///                 s_copy.listdef.mark_as_immutable()
+    ///                 cdesc = cdesc.basedesc
+    ///                 while cdesc is not None:
+    ///                     if cdesc._detect_invalid_attrs is None:
+    ///                         cdesc._detect_invalid_attrs = set()
+    ///                     cdesc._detect_invalid_attrs.add(attr)
+    ///                     cdesc = cdesc.basedesc
+    ///                 return s_copy
+    ///         cdesc = cdesc.basedesc
+    ///     return s_result
+    /// ```
+    ///
+    /// "hack: `x.lst` where `lst` is listed in `_immutable_fields_` as
+    /// either `lst[*]` or `lst?[*]` should really return an immutable
+    /// list as a result."
+    pub fn maybe_return_immutable_list(
+        this: &Rc<RefCell<Self>>,
+        attr: &str,
+        s_result: &SomeValue,
+    ) -> Result<SomeValue, AnnotatorError> {
+        // upstream: `if self._detect_invalid_attrs and attr in ...: raise`.
+        {
+            let borrowed = this.borrow();
+            if let Some(detect) = &borrowed.detect_invalid_attrs {
+                if detect.contains(attr) {
+                    return Err(AnnotatorError::new(format!(
+                        "field {:?} was migrated to {:?} from a subclass in \
+                         which it was declared as _immutable_fields_",
+                        attr, borrowed.pyobj
+                    )));
+                }
+            }
+        }
+
+        // upstream: `search1 = '%s[*]' % (attr,); search2 = '%s?[*]' % (attr,)`.
+        let search1 = format!("{attr}[*]");
+        let search2 = format!("{attr}?[*]");
+
+        // upstream: `cdesc = self; while cdesc is not None: ...`.
+        let SomeValue::List(s_list) = s_result else {
+            // maybe_return_immutable_list is only called by
+            // ClassDef::s_getattr on a SomeList. If we somehow land
+            // here with a non-list, keep upstream's pass-through.
+            return Ok(s_result.clone());
+        };
+
+        let mut cdesc: Option<Rc<RefCell<Self>>> = Some(this.clone());
+        while let Some(cd) = cdesc {
+            let is_match = {
+                let b = cd.borrow();
+                !b.immutable_fields.is_empty()
+                    && (b.immutable_fields.contains(&search1)
+                        || b.immutable_fields.contains(&search2))
+            };
+            if is_match {
+                // upstream: `s_result.listdef.never_resize();
+                //            s_copy = s_result.listdef.offspring(self.bookkeeper);
+                //            s_copy.listdef.mark_as_immutable()`.
+                s_list.listdef.never_resize().map_err(|e| {
+                    AnnotatorError::new(format!("maybe_return_immutable_list({attr}): {}", e.0))
+                })?;
+                let bookkeeper = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+                    AnnotatorError::new(
+                        "ClassDesc.maybe_return_immutable_list: bookkeeper backlink dropped",
+                    )
+                })?;
+                let s_copy = s_list.listdef.offspring(&bookkeeper, &[])?;
+                s_copy.listdef.mark_as_immutable().map_err(|e| {
+                    AnnotatorError::new(format!("maybe_return_immutable_list({attr}): {}", e.0))
+                })?;
+
+                // upstream inner loop: walk basedesc chain marking
+                // `_detect_invalid_attrs`.
+                let mut inner = cd.borrow().basedesc.clone();
+                while let Some(base_cd) = inner {
+                    {
+                        let mut b = base_cd.borrow_mut();
+                        b.detect_invalid_attrs
+                            .get_or_insert_with(HashSet::new)
+                            .insert(attr.to_string());
+                    }
+                    inner = base_cd.borrow().basedesc.clone();
+                }
+                return Ok(SomeValue::List(s_copy));
+            }
+            cdesc = cd.borrow().basedesc.clone();
+        }
+        // upstream: `return s_result`.
+        Ok(s_result.clone())
+    }
+
     /// (classdesc.py:853-902).
     ///
     /// Phase 1: `descs[0].getcallfamily(); descs[0].mergecallfamilies(*descs[1:])`
@@ -2268,8 +2393,8 @@ impl ClassDef {
             SomeValue::List(_) => {
                 // upstream: `s_result = self.classdesc.maybe_return_immutable_list(
                 //                          attrname, s_result)`.
-                // maybe_return_immutable_list is rtyper-phase; pass through.
-                Ok(s_result)
+                let classdesc = this.borrow().classdesc.clone();
+                ClassDesc::maybe_return_immutable_list(&classdesc, attrname, &s_result)
             }
             _ => Ok(s_result),
         }
@@ -2335,9 +2460,11 @@ impl ClassDef {
         Ok(found)
     }
 
-    /// RPython `ClassDef.see_instance(self, x)` (classdesc.py:404-416).
+    /// RPython `ClassDef.see_instance(self, x)` (classdesc.py:402-416).
     ///
     /// ```python
+    /// _see_instance_flattenrec = FlattenRecursion()
+    ///
     /// def see_instance(self, x):
     ///     assert isinstance(x, self.classdesc.pyobj)
     ///     key = Hashable(x)
@@ -2349,17 +2476,15 @@ impl ClassDef {
     ///     def delayed():
     ///         for attr in source.all_instance_attributes():
     ///             self.add_source_for_attribute(attr, source)
+    ///             # ^^^ can trigger reflowing
     ///     self._see_instance_flattenrec(delayed)
     /// ```
     ///
-    /// `_see_instance_flattenrec` (a `FlattenRecursion`) queues
-    /// recursive `see_instance` calls so deeply-nested instance graphs
-    /// don't blow the Python recursion limit. The Rust port executes
-    /// the attribute-source scan in-line; the recursion flattener is
-    /// only observable for pathologically deep instance chains which
-    /// the current test corpus never constructs. `bookkeeper.event`
-    /// is the default empty hook (bookkeeper.py:78-79) so the Rust
-    /// port omits the dispatch.
+    /// `_see_instance_flattenrec` is a class-attribute
+    /// [`FlattenRecursion`] — upstream inherits `TlsClass`, so one
+    /// per thread. Rust port stores the flattener in a `thread_local!`
+    /// to match the TLS scope. `bookkeeper.event` is the default
+    /// empty hook (bookkeeper.py:78-79) so the dispatch is omitted.
     pub fn see_instance(
         this: &Rc<RefCell<ClassDef>>,
         x: &HostObject,
@@ -2377,12 +2502,22 @@ impl ClassDef {
             AnnotatorError::new("ClassDef.see_instance: bookkeeper backlink dropped")
         })?;
         let inst_source = InstanceSource::new(&bookkeeper, x.clone());
-        // upstream: `for attr in source.all_instance_attributes(): self.add_source_for_attribute(attr, source)`.
-        let attrs = inst_source.all_instance_attributes()?;
-        for attr in attrs {
-            Self::add_source_for_attribute(this, &attr, AttrSource::Instance(inst_source.clone()))?;
-        }
-        Ok(())
+        // upstream: `def delayed(): for attr in source.all_instance_attributes():
+        //                             self.add_source_for_attribute(attr, source)`.
+        let this_cloned = this.clone();
+        let delayed = Box::new(move || -> Result<(), AnnotatorError> {
+            let attrs = inst_source.all_instance_attributes()?;
+            for attr in attrs {
+                Self::add_source_for_attribute(
+                    &this_cloned,
+                    &attr,
+                    AttrSource::Instance(inst_source.clone()),
+                )?;
+            }
+            Ok(())
+        });
+        // upstream: `self._see_instance_flattenrec(delayed)`.
+        SEE_INSTANCE_FLATTENREC.with(|flat| flat.call(delayed))
     }
 
     /// RPython `ClassDef.generalize_attr(self, attr, s_value=None)`
@@ -3114,6 +3249,56 @@ mod tests {
         // BUILTIN_ANALYZERS dep — defer to builtin.py port).
         ClassDesc::add_source_attribute(&desc_rc, "__init__", ConstValue::Int(0), false).unwrap();
         assert!(!desc_rc.borrow().classdict.contains_key("__init__"));
+    }
+
+    #[test]
+    fn maybe_return_immutable_list_marks_copy_when_attr_matches() {
+        // upstream classdesc.py:836-839 — `x.lst` with lst[*] in
+        // `_immutable_fields_` must return a marked-immutable list copy.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeInteger, SomeList};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.C", vec![]);
+        cls.class_set(
+            "_immutable_fields_",
+            ConstValue::Tuple(vec![ConstValue::Str("lst[*]".to_string())]),
+        );
+        let desc = ClassDesc::new(&bk, cls, None, None, None).unwrap();
+        let s_list = SomeValue::List(SomeList::new(ListDef::new(
+            Some(bk.clone()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        )));
+        let out = ClassDesc::maybe_return_immutable_list(&desc, "lst", &s_list)
+            .expect("attr matches lst[*] so must return a marked copy");
+        let SomeValue::List(marked) = out else {
+            panic!("expected SomeList copy");
+        };
+        assert!(marked.listdef.listitem_rc().borrow().immutable);
+    }
+
+    #[test]
+    fn maybe_return_immutable_list_passes_through_when_no_match() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeInteger, SomeList};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.C", vec![]);
+        // _immutable_fields_ omitted — attr doesn't match.
+        let desc = ClassDesc::new(&bk, cls, None, None, None).unwrap();
+        let s_list = SomeValue::List(SomeList::new(ListDef::new(
+            Some(bk.clone()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        )));
+        let out = ClassDesc::maybe_return_immutable_list(&desc, "other", &s_list).unwrap();
+        // upstream: returns s_result unchanged ("common case").
+        assert_eq!(out, s_list);
     }
 
     #[test]

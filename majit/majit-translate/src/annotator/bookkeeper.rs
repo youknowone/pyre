@@ -1394,6 +1394,75 @@ impl Bookkeeper {
         obj: &HostObject,
         raw: &ConstValue,
     ) -> Result<SomeValue, AnnotatorError> {
+        // upstream bookkeeper.py:299-306 — `tp is weakref.ReferenceType`:
+        //   x1 = x()
+        //   if x1 is None:
+        //       result = SomeWeakRef(None)    # dead weakref
+        //   else:
+        //       s1 = self.immutablevalue(x1)
+        //       assert isinstance(s1, SomeInstance)
+        //       result = SomeWeakRef(s1.classdef)
+        //
+        // Upstream checks this FIRST (right after the dict cache
+        // path), before property/callable/class — weakref objects
+        // are themselves callable, so the order matters on upstream.
+        // `HostObjectKind` variants are disjoint in the Rust port,
+        // so the branches below are observationally order-
+        // independent; the sequence here mirrors upstream anyway.
+        if obj.is_weakref() {
+            let mut wr = match obj.weakref_referent().flatten() {
+                // dead weakref.
+                None => super::model::SomeWeakRef::new(None),
+                Some(referent) => {
+                    let s1 = self.immutablevalue(&ConstValue::HostObject(referent.clone()))?;
+                    let SomeValue::Instance(inst) = s1 else {
+                        return Err(AnnotatorError::new(format!(
+                            "Bookkeeper.immutablevalue(weakref): target {referent:?} does not \
+                             annotate as SomeInstance (upstream asserts isinstance(s1, SomeInstance))"
+                        )));
+                    };
+                    super::model::SomeWeakRef::new(inst.classdef.clone())
+                }
+            };
+            wr.base.const_box = Some(Constant::new(raw.clone()));
+            return Ok(SomeValue::WeakRef(wr));
+        }
+        // upstream bookkeeper.py:307-308 — `elif tp is property: return SomeProperty(x)`.
+        if obj.is_property() {
+            return Ok(SomeValue::Property(super::model::SomeProperty::new(obj)));
+        }
+        // upstream bookkeeper.py:309-311 — `elif ishashable(x) and x
+        // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`. The Rust
+        // port keeps the analyser registry empty (builtin.py is still
+        // deferred), so `analyser_name` is filled from the host
+        // qualname and callers resolving through specialcase.rs
+        // dispatch on that string when an analyser registers.
+        if obj.is_builtin_callable() {
+            let mut sb = SomeBuiltin::new(
+                obj.qualname().to_string(),
+                None,
+                Some(obj.qualname().to_string()),
+            );
+            sb.base.const_box = Some(Constant::new(raw.clone()));
+            return Ok(SomeValue::Builtin(sb));
+        }
+        // upstream bookkeeper.py:312-314 — `elif extregistry.is_registered(x)` —
+        // deferred until the Rust port grows an extregistry bridge.
+        // upstream bookkeeper.py:315-316 — `elif tp is type: result =
+        // SomeConstantType(x, self)`. Implemented as a constant
+        // SomePBC over the real [`ClassDesc`] returned by [`Self::getdesc`].
+        if obj.is_class() {
+            let entry = self.getdesc(obj)?;
+            let mut pbc = SomePBC::new(vec![entry], false);
+            pbc.base.const_box = Some(Constant::new(raw.clone()));
+            return Ok(SomeValue::PBC(pbc));
+        }
+        // upstream bookkeeper.py:317-331 — `elif callable(x):` splits
+        // into im_self/__self__ bound-method routing (→ find_method on
+        // s_self) and the plain-callable fallback (→
+        // SomePBC([getdesc(x)])). The Rust port encodes these as two
+        // disjoint `HostObjectKind` variants that appear in the same
+        // position as upstream's single `callable(x)` branch.
         if obj.is_bound_method() {
             let self_obj = obj.bound_method_self().ok_or_else(|| {
                 AnnotatorError::new("Bookkeeper.immutablevalue(bound method): missing __self__")
@@ -1409,7 +1478,6 @@ impl Bookkeeper {
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
-        // upstream bookkeeper.py:317 `callable(x)` → SomePBC path.
         if obj.is_user_function() {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
@@ -1421,70 +1489,41 @@ impl Bookkeeper {
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
-        if obj.is_property() {
-            return Ok(SomeValue::Property(super::model::SomeProperty::new(obj)));
-        }
-        // upstream bookkeeper.py:309-311 — BUILTIN_ANALYZERS lookup
-        // produces SomeBuiltin. The Rust port keeps the analyser
-        // registry empty (builtin.py is still deferred), so
-        // `analyser_name` is set from the host qualname and callers
-        // resolving through specialcase.rs dispatch on that string
-        // when an analyser registers.
-        if obj.is_builtin_callable() {
-            let mut sb = SomeBuiltin::new(
-                obj.qualname().to_string(),
-                None,
-                Some(obj.qualname().to_string()),
-            );
-            sb.base.const_box = Some(Constant::new(raw.clone()));
-            return Ok(SomeValue::Builtin(sb));
-        }
-        // upstream bookkeeper.py:315-316 — `tp is type` → SomeConstant
-        // Type(x, self). Implemented as a constant SomePBC over the
-        // real [`ClassDesc`] returned by [`Self::getdesc`].
-        if obj.is_class() {
+        // upstream bookkeeper.py:332-338 — `elif hasattr(x, '_freeze_'):
+        // assert x._freeze_() is True; result = SomePBC([getdesc(x)])`.
+        // Check BEFORE the instance branch so any HostObject carrying
+        // a `_freeze_` member routes to the frozen-PBC path regardless
+        // of its kind (Instance / Module / Opaque all surface their
+        // attribute dict the same way).
+        if has_freeze_method(obj) {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
-        // upstream bookkeeper.py:332-345 — `hasattr(x, '_freeze_')` →
-        // `SomePBC([getdesc(x)])`; `hasattr(x, '__class__') and
+        // upstream bookkeeper.py:339-345 — `hasattr(x, '__class__') and
         // x.__class__.__module__ != '__builtin__'` →
         // `getuniqueclassdef(x.__class__) + see_instance + SomeInstance`.
-        if obj.is_instance() {
-            if let Some(class_obj) = obj.instance_class() {
-                // upstream: `hasattr(x, '_freeze_')` — in the Rust port we
-                // take "class defines `_freeze_` in its __dict__" as the
-                // structural equivalent, matching the upstream assertion
-                // `assert x._freeze_() is True` (only True-returning
-                // `_freeze_` methods are expected).
-                if class_obj.class_get("_freeze_").is_some() {
-                    let entry = self.getdesc(obj)?;
-                    let mut pbc = SomePBC::new(vec![entry], false);
-                    pbc.base.const_box = Some(Constant::new(raw.clone()));
-                    return Ok(SomeValue::PBC(pbc));
-                }
-                // upstream: `classdef = self.getuniqueclassdef(x.__class__);
-                //            classdef.see_instance(x);
-                //            result = SomeInstance(classdef)`.
-                // `hasattr(x, '_cleanup_'): x._cleanup_()` (line 341-342)
-                // is omitted — we can't invoke Python-side `_cleanup_`.
-                let classdef = self.getuniqueclassdef(class_obj)?;
-                super::classdesc::ClassDef::see_instance(&classdef, obj)?;
-                let mut inst = super::model::SomeInstance::new(
-                    Some(classdef),
-                    false,
-                    std::collections::BTreeMap::new(),
-                );
-                inst.base.const_box = Some(Constant::new(raw.clone()));
-                return Ok(SomeValue::Instance(inst));
-            }
+        if let Some(class_obj) = obj.instance_class() {
+            // `hasattr(x, '_cleanup_'): x._cleanup_()` (upstream line
+            // 341-342) is omitted — we can't invoke Python-side
+            // `_cleanup_`.
+            let classdef = self.getuniqueclassdef(class_obj)?;
+            super::classdesc::ClassDef::see_instance(&classdef, obj)?;
+            let mut inst = super::model::SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            );
+            inst.base.const_box = Some(Constant::new(raw.clone()));
+            return Ok(SomeValue::Instance(inst));
         }
+        // upstream bookkeeper.py:349 — final `raise AnnotatorError("Don't
+        // know how to represent %r" % (x,))`. Module / Opaque / weakref
+        // / extregistry HostObject kinds without `_freeze_` land here
+        // because upstream also raises for them.
         Err(AnnotatorError::new(format!(
-            "Bookkeeper.immutablevalue({raw:?}): host object kind not yet routed \
-             (weakref / extregistry branches pending; see \
-             bookkeeper.py:299-333)"
+            "Don't know how to represent {raw:?}"
         )))
     }
 }
@@ -1493,6 +1532,27 @@ impl Default for Bookkeeper {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// RPython `hasattr(x, '_freeze_')` (bookkeeper.py:332). In the Rust
+/// port we take "class defines `_freeze_` in its __dict__" (for
+/// Instance hosts) / "module dict has `_freeze_`" (for Module hosts)
+/// as the structural equivalent. Matches upstream's assertion
+/// `assert x._freeze_() is True` — only True-returning `_freeze_`
+/// methods are expected.
+fn has_freeze_method(obj: &HostObject) -> bool {
+    if let Some(class_obj) = obj.instance_class() {
+        if class_obj.class_get("_freeze_").is_some() {
+            return true;
+        }
+    }
+    if obj.is_class() && obj.class_get("_freeze_").is_some() {
+        return true;
+    }
+    if obj.is_module() && obj.module_get("_freeze_").is_some() {
+        return true;
+    }
+    false
 }
 
 /// RPython `CallOp.build_args(args_s)` dispatch by opname
@@ -1966,19 +2026,96 @@ mod tests {
     }
 
     #[test]
-    fn immutablevalue_module_host_object_defers() {
-        // Module HostObjects aren't mapped to SomeInstance yet —
-        // upstream bookkeeper.py:339-345 would route them via
-        // `hasattr(x, '__class__') and __class__.__module__ !=
-        // '__builtin__'`, but Module has no __class__ in the Rust
-        // port's HostObject model. Stays deferred.
+    fn immutablevalue_bound_method_returns_method_pbc() {
+        use crate::annotator::model::{DescKind, SomeValue};
+        use crate::flowspace::model::{Constant, GraphFunc, HostObject};
+
+        let bk = bk();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func = HostObject::new_user_function(GraphFunc::new("m", globals));
+        let cls = HostObject::new_class("pkg.C", vec![]);
+        cls.class_set("m", ConstValue::HostObject(func.clone()));
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let meth = HostObject::new_bound_method("pkg.C.m", inst, func, "m", cls);
+
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(meth))
+            .expect("bound method HostObject must produce SomePBC");
+
+        match s {
+            SomeValue::PBC(pbc) => assert_eq!(pbc.get_kind().unwrap(), DescKind::Method),
+            other => panic!("expected method SomePBC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immutablevalue_dead_weakref_returns_none_classdef() {
+        // upstream bookkeeper.py:300-302 — `x1 = x(); if x1 is None:
+        // result = SomeWeakRef(None)`.
+        use crate::flowspace::model::HostObject;
+        let bk = bk();
+        let dead = HostObject::new_weakref("weakref.ref", None);
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(dead))
+            .expect("dead weakref must route to SomeWeakRef");
+        match s {
+            SomeValue::WeakRef(wr) => assert!(wr.classdef.is_none()),
+            other => panic!("expected SomeWeakRef(None), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immutablevalue_live_weakref_pulls_instance_classdef() {
+        // upstream bookkeeper.py:303-306 — `s1 = immutablevalue(x1);
+        // assert isinstance(s1, SomeInstance); result = SomeWeakRef(s1.classdef)`.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.Target", vec![]);
+        let inst = HostObject::new_instance(cls, vec![]);
+        let wref = HostObject::new_weakref("weakref.ref", Some(inst));
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(wref))
+            .expect("live weakref must route to SomeWeakRef");
+        match s {
+            SomeValue::WeakRef(wr) => assert!(wr.classdef.is_some()),
+            other => panic!("expected SomeWeakRef(Some(classdef)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immutablevalue_module_without_freeze_raises() {
+        // upstream bookkeeper.py:349 — a raw Module hits the final
+        // `raise AnnotatorError("Don't know how to represent %r")`
+        // fallthrough because `module.__class__.__module__ ==
+        // '__builtin__'` and it lacks `_freeze_`.
         use crate::flowspace::model::HostObject;
         let bk = bk();
         let mod_obj = HostObject::new_module("m");
         let err = bk
             .immutablevalue(&ConstValue::HostObject(mod_obj))
-            .expect_err("module HostObject stays deferred");
-        assert!(err.msg.unwrap_or_default().contains("not yet routed"));
+            .expect_err("raw module must raise AnnotatorError");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("Don't know how to represent")
+        );
+    }
+
+    #[test]
+    fn immutablevalue_module_with_freeze_routes_to_some_pbc() {
+        // upstream bookkeeper.py:332-338 — any host with `_freeze_`
+        // routes through SomePBC([getdesc(x)]). The Rust port detects
+        // module `_freeze_` via `module_get("_freeze_")`.
+        use crate::flowspace::model::HostObject;
+        let bk = bk();
+        let mod_obj = HostObject::new_module("m");
+        mod_obj.module_set("_freeze_", HostObject::new_builtin_callable("m._freeze_"));
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(mod_obj))
+            .expect("module with _freeze_ must route to SomePBC");
+        assert!(matches!(s, SomeValue::PBC(_)));
     }
 
     #[test]

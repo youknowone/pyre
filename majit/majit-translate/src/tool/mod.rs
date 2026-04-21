@@ -9,8 +9,10 @@
 //! |-----------------------|-------------------------------|
 //! | `algo::unionfind`     | `algo/unionfind.py`           |
 //! | `error`               | `error.py`                    |
+//! | `flattenrec`          | `flattenrec.py`               |
 //! | `pairtype`            | `pairtype.py`                 |
 
 pub mod algo;
 pub mod error;
+pub mod flattenrec;
 pub mod pairtype;

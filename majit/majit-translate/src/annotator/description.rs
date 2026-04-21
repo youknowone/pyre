@@ -3184,6 +3184,68 @@ mod tests {
     }
 
     #[test]
+    fn frozen_desc_default_reader_binds_instance_function_method() {
+        let bk = bk();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func =
+            HostObject::new_user_function(crate::flowspace::model::GraphFunc::new("f", globals));
+        let cls = HostObject::new_class("Cls", vec![]);
+        cls.class_set("f", ConstValue::HostObject(func));
+        let instance = HostObject::new_instance(cls.clone(), vec![]);
+
+        let fd = FrozenDesc::new(bk, instance.clone()).unwrap();
+        let v = fd.read_attribute("f").unwrap();
+        let ConstValue::HostObject(bound) = v else {
+            panic!("expected bound-method HostObject");
+        };
+        assert!(bound.is_bound_method());
+        assert_eq!(bound.bound_method_self(), Some(&instance));
+        assert_eq!(bound.bound_method_name(), Some("f"));
+        assert_eq!(bound.bound_method_origin_class(), Some(&cls));
+
+        let s = fd.s_read_attribute("f").unwrap();
+        match s {
+            SomeValue::PBC(pbc) => {
+                assert_eq!(
+                    pbc.get_kind().unwrap(),
+                    crate::annotator::model::DescKind::Method
+                )
+            }
+            other => panic!("expected method SomePBC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frozen_desc_default_reader_binds_classmethod() {
+        let bk = bk();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func =
+            HostObject::new_user_function(crate::flowspace::model::GraphFunc::new("cm", globals));
+        let cls = HostObject::new_class("Cls", vec![]);
+        cls.class_set(
+            "cm",
+            ConstValue::HostObject(HostObject::new_classmethod("Cls.cm", func)),
+        );
+
+        let fd = FrozenDesc::new(bk, cls.clone()).unwrap();
+        let v = fd.read_attribute("cm").unwrap();
+        let ConstValue::HostObject(bound) = v else {
+            panic!("expected bound-method HostObject");
+        };
+        assert!(bound.is_bound_method());
+        assert_eq!(bound.bound_method_self(), Some(&cls));
+        assert_eq!(bound.bound_method_name(), Some("cm"));
+        assert_eq!(bound.bound_method_origin_class(), Some(&cls));
+
+        let err = fd.s_read_attribute("cm").unwrap_err();
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("classmethods are not supported")
+        );
+    }
+
+    #[test]
     fn frozen_desc_family_methods_use_unionfind() {
         let bk = bk();
         let pyobj = HostObject::new_module("mod");
