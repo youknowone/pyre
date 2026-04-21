@@ -3066,11 +3066,14 @@ impl CodeWriter {
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, site.landing_label);
-            // RPython pyframe.py:379-417 pushvalue parity: each push updates
-            // the virtualizable-backed stack array slot AND valuestackdepth.
+            // pyframe.py:378-387 `pushvalue` semantics — each push writes
+            // `locals_cells_stack_w[depth]` AND bumps `valuestackdepth`.
+            // jtransform.py:1898 `do_fixed_list_setitem` lowers the array
+            // write to `setarrayitem_vable_r`; jtransform.py:920-928
+            // lowers the `valuestackdepth` write to `setfield_vable_i`.
             // Without this mirror, the handler's first opcode (and any
             // compiled-trace re-entry via ContinueRunningNormally) reads
-            // stale vable state because only the SSA register slot was
+            // stale vable state because only the SSA stack slot was
             // populated.
             let mut exc_slot = stack_base + site.stack_depth;
             let mut depth: u16 = site.stack_depth;
