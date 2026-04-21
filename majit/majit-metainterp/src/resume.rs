@@ -161,6 +161,12 @@ pub struct NumberingState {
     pub liveboxes: LiveboxMap,
     pub num_boxes: i32,
     pub num_virtuals: i32,
+    /// PyPy/RPython virtualizable parity: virtualizable.py:86 wraps each
+    /// field/item into a fresh Box, so identical runtime values do not share
+    /// a TAGBOX with frame slots. pyre snapshots do not carry that fresh Box
+    /// identity, so we replay these numbering-only TAGBOX assignments into the
+    /// final liveboxes array during finish().
+    pub fresh_tagbox_entries: Vec<(i32, majit_ir::OpRef)>,
     /// RPython Box.type parity: type of each TAGBOX livebox, captured at
     /// numbering time when env.get_type() is called. Eliminates the need
     /// for post-hoc type inference cascades in store_final_boxes_in_guard.
@@ -174,6 +180,7 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
+            fresh_tagbox_entries: Vec::new(),
             livebox_types: std::collections::HashMap::new(),
         }
     }
@@ -3545,6 +3552,64 @@ impl ResumeDataLoopMemo {
         Ok(())
     }
 
+    /// virtualizable.py:86-99 read_boxes() parity.
+    ///
+    /// PyPy numbers virtualizable field/item boxes through the same
+    /// `_number_boxes` path, but each slot is first wrapped into a fresh Box.
+    /// pyre snapshots store only the underlying OpRef, so this helper mimics
+    /// the fresh-identity effect for non-virtual TAGBOX entries while keeping
+    /// TAGVIRTUAL handling on the normal liveboxes path.
+    pub fn _number_boxes_fresh(
+        &mut self,
+        boxes: &[majit_ir::OpRef],
+        numb_state: &mut NumberingState,
+        env: &dyn BoxEnv,
+    ) -> Result<(), TagOverflow> {
+        for &raw_opref in boxes {
+            if raw_opref.is_none() {
+                numb_state.append_short(NULLREF);
+                continue;
+            }
+            let opref = env.get_box_replacement(raw_opref);
+            if opref.is_none() {
+                numb_state.append_short(NULLREF);
+                continue;
+            }
+            if env.is_const(opref) {
+                let (val, tp) = env.get_const(opref);
+                let tagged = self.getconst(val, tp);
+                numb_state.append_short(tagged);
+                continue;
+            }
+
+            let box_type = env.get_type(opref);
+            let is_virtual = match box_type {
+                majit_ir::Type::Ref => env.is_virtual_ref(opref),
+                majit_ir::Type::Int => env.is_virtual_raw(opref),
+                _ => false,
+            };
+            if is_virtual {
+                if let Some(tagged) = numb_state.liveboxes.get(opref.0) {
+                    numb_state.append_short(tagged);
+                    continue;
+                }
+                let tagged = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
+                numb_state.num_virtuals += 1;
+                numb_state.liveboxes.insert(opref.0, tagged);
+                numb_state.append_short(tagged);
+                continue;
+            }
+
+            numb_state.livebox_types.insert(opref.0, box_type);
+            let tagged = tag(numb_state.num_boxes, TAGBOX)?;
+            let index = numb_state.num_boxes;
+            numb_state.num_boxes += 1;
+            numb_state.fresh_tagbox_entries.push((index, opref));
+            numb_state.append_short(tagged);
+        }
+        Ok(())
+    }
+
     /// resume.py:228-256 number() — serialize a guard's full snapshot.
     ///
     /// Output format (in NumberingState):
@@ -3604,19 +3669,17 @@ impl ResumeDataLoopMemo {
             );
         }
 
-        // resume.py:240-241 virtualizable array. In RPython the vable
-        // section is numbered by the same `_number_boxes` as any other
-        // section; cached_boxes dedup on Box identity makes vable slots
-        // distinct from frame slots because `read_boxes()` (virtualizable.py:86)
-        // wraps each slot into a fresh `RefFrontendOp`/`IntFrontendOp`.
-        // pyre does not allocate fresh OpRef identities for vable slots
-        // — when a vable slot and a frame slot happen to share the same
-        // OpRef, they dedup into the same TAGBOX and recovery takes the
-        // shared slot through frame-section liveness (trace_opcode.rs
-        // build_virtualizable_boxes). Keeping this on the same code path
-        // as the frame section avoids a pyre-only side channel.
+        // resume.py:240-241 virtualizable array. In RPython, the first entry
+        // is the virtualizable object itself and the remaining entries come
+        // from virtualizable.py:86 read_boxes(), which wraps each field/item
+        // into a fresh Box identity. pyre snapshots flatten those back into
+        // plain OpRefs, so we preserve parity by numbering the payload portion
+        // through `_number_boxes_fresh`.
         numb_state.append_int(snapshot.vable_array.len() as i32);
-        self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
+        if let Some((virtualizable, vable_values)) = snapshot.vable_array.split_first() {
+            self._number_boxes(std::slice::from_ref(virtualizable), &mut numb_state, env)?;
+            self._number_boxes_fresh(vable_values, &mut numb_state, env)?;
+        }
 
         // resume.py:243-247: virtualref array
         let vref_len = snapshot.vref_array.len();
@@ -3703,6 +3766,12 @@ impl ResumeDataLoopMemo {
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 virtual_worklist.push(opref_id);
+            }
+        }
+
+        for &(index, opref) in &numb_state.fresh_tagbox_entries {
+            if (index as usize) < liveboxes.len() {
+                liveboxes[index as usize] = Some(opref);
             }
         }
 
@@ -4544,6 +4613,74 @@ mod tests {
             rebuilt_frames[0].values[3],
             RebuiltValue::Box(1, majit_ir::Type::Int)
         );
+    }
+
+    #[test]
+    fn test_number_virtualizable_payload_uses_fresh_tagboxes() {
+        use majit_ir::OpRef;
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = SimpleBoxEnv::new();
+        env.types.insert(7, majit_ir::Type::Ref);
+        env.types.insert(1, majit_ir::Type::Int);
+
+        let snapshot = Snapshot {
+            vable_array: vec![OpRef(7), OpRef(1)],
+            vref_array: vec![],
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 8,
+                boxes: vec![OpRef(1)],
+            }],
+        };
+
+        let numb_state = memo.number(&snapshot, &env, 0).unwrap();
+        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+
+        assert_eq!(items[2], 2);
+        let (val, tagbits) = untag(items[3] as i16);
+        assert_eq!(tagbits, TAGBOX);
+        assert_eq!(val, 0);
+
+        let (val, tagbits) = untag(items[4] as i16);
+        assert_eq!(tagbits, TAGBOX);
+        assert_eq!(val, 1);
+
+        assert_eq!(items[5], 0);
+        assert_eq!(items[6], 0);
+        assert_eq!(items[7], 8);
+
+        let (val, tagbits) = untag(items[8] as i16);
+        assert_eq!(tagbits, TAGBOX);
+        assert_eq!(val, 2);
+    }
+
+    #[test]
+    fn test_finish_replays_fresh_virtualizable_liveboxes() {
+        use majit_ir::OpRef;
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = SimpleBoxEnv::new();
+        env.types.insert(7, majit_ir::Type::Ref);
+        env.types.insert(1, majit_ir::Type::Int);
+
+        let snapshot = Snapshot {
+            vable_array: vec![OpRef(7), OpRef(1)],
+            vref_array: vec![],
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 8,
+                boxes: vec![OpRef(1)],
+            }],
+        };
+
+        let numb_state = memo.number(&snapshot, &env, 0).unwrap();
+        let (_rd_numb, _rd_consts, _rd_virtuals, liveboxes, livebox_types) =
+            memo.finish(numb_state, &env, &mut [], None);
+
+        assert_eq!(liveboxes, vec![OpRef(7), OpRef(1), OpRef(1)]);
+        assert_eq!(livebox_types.get(&7), Some(&majit_ir::Type::Ref));
+        assert_eq!(livebox_types.get(&1), Some(&majit_ir::Type::Int));
     }
 
     #[test]
