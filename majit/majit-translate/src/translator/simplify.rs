@@ -10,8 +10,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::{
     BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, LinkRef,
-    SpaceOperation, Variable, mkentrymap,
+    SpaceOperation, Variable, checkgraph, mkentrymap,
 };
+use crate::translator::backendopt::ssa::DataFlowFamilyBuilder;
 
 /// RPython `eliminate_empty_blocks(graph)` (simplify.py:52-69).
 ///
@@ -252,6 +253,118 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     block.borrow_mut().exitswitch = None;
     block.recloseblock(newexits.clone());
     newexits
+}
+
+/// RPython `remove_identical_vars(graph)` (simplify.py:597-653).
+///
+/// ```python
+/// def remove_identical_vars(graph):
+///     """When the same variable is passed multiple times into the next
+///     block, pass it only once."""
+///     builder = DataFlowFamilyBuilder(graph)
+///     variable_families = builder.get_variable_families()  # vertical removal
+///     while True:
+///         if not builder.merge_identical_phi_nodes():    # horizontal removal
+///             break
+///         if not builder.complete():                     # vertical removal
+///             break
+///     for block, links in mkentrymap(graph).items():
+///         if block is graph.startblock:
+///             continue
+///         renaming = {}
+///         family2blockvar = {}
+///         kills = []
+///         for i, v in enumerate(block.inputargs):
+///             v1 = variable_families.find_rep(v)
+///             if v1 in family2blockvar:
+///                 renaming[v] = family2blockvar[v1]
+///                 kills.append(i)
+///             else:
+///                 family2blockvar[v1] = v
+///         if renaming:
+///             block.renamevariables(renaming)
+///             kills.reverse()
+///             for i in kills:
+///                 del block.inputargs[i]
+///                 for link in links:
+///                     del link.args[i]
+/// ```
+pub fn remove_identical_vars(graph: &FunctionGraph) {
+    let mut builder = DataFlowFamilyBuilder::new(graph);
+    // upstream: `builder.get_variable_families()` triggers initial
+    // vertical removal (calls `complete()`); we discard the returned
+    // handle and drive the subsequent steps on the same builder.
+    let _ = builder.get_variable_families();
+    loop {
+        // upstream: horizontal removal first, then vertical.
+        if !builder.merge_identical_phi_nodes() {
+            break;
+        }
+        if !builder.complete() {
+            break;
+        }
+    }
+    let variable_families = &mut builder.variable_families;
+
+    let entrymap = mkentrymap(graph);
+    for (block_key, links) in entrymap.iter() {
+        // upstream: `if block is graph.startblock: continue`.
+        if *block_key == BlockKey::of(&graph.startblock) {
+            continue;
+        }
+        let block = links
+            .first()
+            .and_then(|l| l.borrow().target.clone())
+            .expect("link.target missing");
+
+        let mut renaming: HashMap<Variable, Variable> = HashMap::new();
+        let mut family2blockvar: HashMap<Hlvalue, Variable> = HashMap::new();
+        let mut kills: Vec<usize> = Vec::new();
+
+        let inputargs_snapshot: Vec<Hlvalue> = block.borrow().inputargs.clone();
+        for (i, input) in inputargs_snapshot.iter().enumerate() {
+            let Hlvalue::Variable(v) = input else {
+                continue;
+            };
+            let v1 = variable_families.find_rep(Hlvalue::Variable(v.clone()));
+            if let Some(existing) = family2blockvar.get(&v1) {
+                renaming.insert(v.clone(), existing.clone());
+                kills.push(i);
+            } else {
+                family2blockvar.insert(v1, v.clone());
+            }
+        }
+        if !renaming.is_empty() {
+            block.borrow_mut().renamevariables(&renaming);
+            // upstream: `kills.reverse()` + `del block.inputargs[i]`
+            // + `del link.args[i]` for each incoming link.
+            kills.reverse();
+            for i in &kills {
+                block.borrow_mut().inputargs.remove(*i);
+                for link in links {
+                    link.borrow_mut().args.remove(*i);
+                }
+            }
+        }
+    }
+}
+
+/// RPython `cleanup_graph(graph)` (simplify.py:1083-1088).
+///
+/// ```python
+/// def cleanup_graph(graph):
+///     checkgraph(graph)
+///     eliminate_empty_blocks(graph)
+///     join_blocks(graph)
+///     remove_identical_vars(graph)
+///     checkgraph(graph)
+/// ```
+pub fn cleanup_graph(graph: &FunctionGraph) {
+    checkgraph(graph);
+    eliminate_empty_blocks(graph);
+    join_blocks(graph);
+    remove_identical_vars(graph);
+    checkgraph(graph);
 }
 
 /// RPython `constfold_exitswitch(graph)` (simplify.py:218-239).
@@ -885,6 +998,70 @@ mod tests {
             s.exits[0].borrow().target.as_ref().unwrap(),
             &returnblock
         ));
+    }
+
+    #[test]
+    fn remove_identical_vars_dedupes_duplicate_phi_inputs() {
+        // A block receives two input args whose phi nodes pull from
+        // the same Constant on every incoming link. `remove_identical_vars`
+        // should collapse them to a single inputarg.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let v_a = Variable::new();
+        let v_b = Variable::new();
+        let body = Block::shared(vec![
+            Hlvalue::Variable(v_a.clone()),
+            Hlvalue::Variable(v_b.clone()),
+        ]);
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let returnblock = graph.returnblock.clone();
+
+        // start -> body with [Const(1), Const(1)] — both phis see the
+        // same value so merge_identical_phi_nodes unifies v_a / v_b.
+        let link_sb = Link::new(
+            vec![
+                Hlvalue::Constant(C::new(CV::Int(1))),
+                Hlvalue::Constant(C::new(CV::Int(1))),
+            ],
+            Some(body.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link_sb]);
+        let link_br = Link::new(
+            vec![body.borrow().inputargs[0].clone()],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        body.closeblock(vec![link_br.clone()]);
+
+        remove_identical_vars(&graph);
+
+        // body should now have exactly one inputarg — the duplicate
+        // was pruned, and the entrymap link's args list shrank to
+        // match.
+        assert_eq!(body.borrow().inputargs.len(), 1);
+        assert_eq!(start.borrow().exits[0].borrow().args.len(), 1);
+    }
+
+    #[test]
+    fn cleanup_graph_composes_passes_on_valid_graph() {
+        // Smoke test — cleanup_graph on a minimum valid graph must
+        // not panic (checkgraph bookends + the three inner passes are
+        // all idempotent on a well-formed shape).
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("g", start.clone());
+        let link = Link::new(
+            vec![Hlvalue::Constant(C::new(CV::Int(7)))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link]);
+
+        cleanup_graph(&graph);
     }
 
     #[test]

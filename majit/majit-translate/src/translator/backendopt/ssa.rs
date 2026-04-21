@@ -270,7 +270,22 @@ impl DataFlowFamilyBuilder {
     ///     self.complete()
     ///     return self.variable_families
     /// ```
-    pub fn get_variable_families(mut self) -> UnionFind<Hlvalue, ()> {
+    ///
+    /// Upstream returns the same attribute the builder retains (Python
+    /// reference semantics), letting callers continue to call
+    /// `merge_identical_phi_nodes` / `complete` on the builder while
+    /// holding the family handle. The Rust port mirrors that shape by
+    /// taking `&mut self` and returning `&mut UnionFind` — callers
+    /// that just want the UF and can drop the builder should route
+    /// through `into_variable_families` below.
+    pub fn get_variable_families(&mut self) -> &mut UnionFind<Hlvalue, ()> {
+        self.complete();
+        &mut self.variable_families
+    }
+
+    /// Consume-variant of `get_variable_families` — useful when the
+    /// caller only needs the final UF.
+    pub fn into_variable_families(mut self) -> UnionFind<Hlvalue, ()> {
         self.complete();
         self.variable_families
     }
@@ -373,7 +388,7 @@ pub fn variables_created_in(block: &BlockRef) -> HashSet<Hlvalue> {
 /// they catch upstream bugs at port-time too — if they fire, the
 /// graph shape diverged from what `DataFlowFamilyBuilder` expected.
 pub fn ssi_to_ssa(graph: &FunctionGraph) {
-    let mut variable_families = DataFlowFamilyBuilder::new(graph).get_variable_families();
+    let mut variable_families = DataFlowFamilyBuilder::new(graph).into_variable_families();
     // upstream: `for v in variable_families.keys(): ... v.set_name_from(v1)`.
     // Upstream mutates the Variable in place and Python identity
     // propagates the rename through every storage slot that holds the
@@ -511,7 +526,7 @@ pub fn ssa_to_ssi(graph: &FunctionGraph) {
     let mut entrymap = mkentrymap(graph);
     entrymap.remove(&BlockKey::of(&graph.startblock));
 
-    let mut variable_families = DataFlowFamilyBuilder::new(graph).get_variable_families();
+    let mut variable_families = DataFlowFamilyBuilder::new(graph).into_variable_families();
 
     // upstream: build initial pending list by walking each block and
     // recording used-but-undefined Variables.
