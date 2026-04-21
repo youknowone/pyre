@@ -700,6 +700,14 @@ pub(crate) fn build_guard_metadata(
             // No rd_numb: identity recovery layout.
             // Every guard has at minimum an identity mapping from
             // fail_args → frame slots, with exit_types as slot_types.
+            // `jitcode_index: 0` is a placeholder for the no-rd_numb
+            // path — `patch_backend_guard_recovery_layouts_for_trace`
+            // (compile.rs:1596) overwrites this with the resume_layout
+            // derived from `Snapshot::single_frame(jitcode_index, pc, ...)`.
+            // The outermost-frame rule at eval.rs:3938-3951 means a
+            // stale `jitcode_index: 0` is never consulted for code lookup
+            // on the sole frame of a single-frame identity layout — code
+            // comes from the vable instead.
             let slots: Vec<majit_backend::ExitValueSourceLayout> = (0..exit_types.len())
                 .map(majit_backend::ExitValueSourceLayout::ExitValue)
                 .collect();

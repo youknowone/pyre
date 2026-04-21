@@ -657,6 +657,12 @@ fn caller_prefix_recovery_layout(
             header_pc: Some(header_pc),
             source_guard,
             pc: header_pc,
+            // Placeholder: this caller-prefix identity layout is replaced by
+            // the resume_layout-derived layout via
+            // `compile::patch_backend_guard_recovery_layouts_for_trace`
+            // (compile.rs:1596) before any guard can fire. The
+            // resume_layout carries the authoritative jitcode_index
+            // threaded from `Snapshot::single_frame`.
             jitcode_index: 0,
             slots: slot_types
                 .iter()
@@ -5346,6 +5352,14 @@ fn identity_recovery_layout(
         header_pc: Some(header_pc),
         source_guard,
         pc: guard_resume_pc.unwrap_or(header_pc),
+        // Placeholder: this backend-side identity layout is produced at
+        // compile time, then replaced by the resume_layout-derived layout
+        // via `compile::patch_backend_guard_recovery_layouts_for_trace`
+        // (compile.rs:1596). The guard-exit rd_numb path at compiler.rs
+        // ~11035 additionally overwrites `frame.jitcode_index` with the
+        // topmost rd_numb frame, covering guards whose resume_layout is
+        // absent. `Snapshot::single_frame(jitcode_index, pc, ...)` is the
+        // upstream source of truth.
         jitcode_index: 0,
         slots: (0..slot_types.len())
             .map(ExitValueSourceLayout::ExitValue)

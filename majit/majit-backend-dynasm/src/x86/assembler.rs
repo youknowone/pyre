@@ -2539,6 +2539,10 @@ impl Assembler386 {
             })
             .collect();
         // Build identity recovery_layout (Cranelift identity_recovery_layout parity).
+        // `jitcode_index: 0` is a placeholder: every guard is later patched
+        // via `compile::patch_backend_guard_recovery_layouts_for_trace`
+        // (compile.rs:1596) with a resume_layout-derived layout whose
+        // jitcode_index originates from `Snapshot::single_frame`.
         let recovery_layout = {
             let slot_types = &descr.fail_arg_types;
             ExitRecoveryLayout {
