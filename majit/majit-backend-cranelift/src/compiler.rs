@@ -158,52 +158,47 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFa
 // `compile.py:665` `setattr(cpu, name, descr)` binds the descr to a
 // specific cpu instance; each `(metainterp_sd, cpu)` pair gets its
 // own attachment, and re-running `make_and_attach_done_descrs`
-// overwrites.  Pyre keeps the attachment in process-global `RwLock`
-// slots because cranelift-emitted machine code and extern-C
-// callbacks resolve the identity without a backend receiver in
-// scope, and because compiled code emitted by the metainterp on one
-// thread may be invoked from another — per-thread slots would miss
-// on cross-thread execution and fall back to the raw-cast path with
-// a misread layout.  Last-attach-wins on re-assignment matches
-// upstream `setattr` semantics.
+// overwrites.  Pyre stores the descrs in per-thread slots instead of
+// per-`Backend` instance fields: Cranelift-emitted machine code and
+// extern-C callbacks resolve the identity without a backend receiver
+// in scope, and production deploys one backend per thread — so the
+// thread-local captures the same "one attachment per backend"
+// lifetime the RPython instance attribute does.  Tests that spin up
+// multiple backend instances on the same thread observe
+// last-attach-wins, also matching `setattr` semantics.
 
-static METAINTERP_DONE_VOID: std::sync::RwLock<Option<majit_ir::DescrRef>> =
-    std::sync::RwLock::new(None);
-static METAINTERP_DONE_INT: std::sync::RwLock<Option<majit_ir::DescrRef>> =
-    std::sync::RwLock::new(None);
-static METAINTERP_DONE_REF: std::sync::RwLock<Option<majit_ir::DescrRef>> =
-    std::sync::RwLock::new(None);
-static METAINTERP_DONE_FLOAT: std::sync::RwLock<Option<majit_ir::DescrRef>> =
-    std::sync::RwLock::new(None);
-static METAINTERP_EXIT_EXC_REF: std::sync::RwLock<Option<majit_ir::DescrRef>> =
-    std::sync::RwLock::new(None);
-static METAINTERP_PROPAGATE_EXC: std::sync::RwLock<Option<majit_ir::DescrRef>> =
-    std::sync::RwLock::new(None);
+thread_local! {
+    static METAINTERP_DONE_VOID: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_DONE_INT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_DONE_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_DONE_FLOAT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_EXIT_EXC_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_PROPAGATE_EXC: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 pub(crate) fn set_done_with_this_frame_descr_void(descr: majit_ir::DescrRef) {
-    *METAINTERP_DONE_VOID.write().unwrap() = Some(descr);
+    METAINTERP_DONE_VOID.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_int(descr: majit_ir::DescrRef) {
-    *METAINTERP_DONE_INT.write().unwrap() = Some(descr);
+    METAINTERP_DONE_INT.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_ref(descr: majit_ir::DescrRef) {
-    *METAINTERP_DONE_REF.write().unwrap() = Some(descr);
+    METAINTERP_DONE_REF.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_float(descr: majit_ir::DescrRef) {
-    *METAINTERP_DONE_FLOAT.write().unwrap() = Some(descr);
+    METAINTERP_DONE_FLOAT.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_exit_frame_with_exception_descr_ref(descr: majit_ir::DescrRef) {
-    *METAINTERP_EXIT_EXC_REF.write().unwrap() = Some(descr);
+    METAINTERP_EXIT_EXC_REF.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
-    *METAINTERP_PROPAGATE_EXC.write().unwrap() = Some(descr);
-}
-
-fn attached_descr_ptr(slot: &std::sync::RwLock<Option<majit_ir::DescrRef>>) -> Option<i64> {
-    slot.read()
-        .unwrap()
-        .as_ref()
-        .map(|arc| Arc::as_ptr(arc) as *const () as i64)
+    METAINTERP_PROPAGATE_EXC.with(|c| *c.borrow_mut() = Some(descr));
 }
 
 /// `pyjitpl.py:2222` parity: pointer of the metainterp-attached
@@ -213,11 +208,20 @@ fn attached_descr_ptr(slot: &std::sync::RwLock<Option<majit_ir::DescrRef>>) -> O
 /// classifier path keeps working in either case because both
 /// pointers route through the same FINISH fast path.
 fn done_with_this_frame_descr_ptr(result_types: &[Type]) -> i64 {
+    fn attached_ptr(
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
+    ) -> Option<i64> {
+        slot.with(|c| {
+            c.borrow()
+                .as_ref()
+                .map(|arc| Arc::as_ptr(arc) as *const () as i64)
+        })
+    }
     let attached = match result_types {
-        [Type::Float] => attached_descr_ptr(&METAINTERP_DONE_FLOAT),
-        [Type::Ref] => attached_descr_ptr(&METAINTERP_DONE_REF),
-        [] => attached_descr_ptr(&METAINTERP_DONE_VOID),
-        _ => attached_descr_ptr(&METAINTERP_DONE_INT),
+        [Type::Float] => attached_ptr(&METAINTERP_DONE_FLOAT),
+        [Type::Ref] => attached_ptr(&METAINTERP_DONE_REF),
+        [] => attached_ptr(&METAINTERP_DONE_VOID),
+        _ => attached_ptr(&METAINTERP_DONE_INT),
     };
     attached.unwrap_or_else(|| Arc::as_ptr(done_with_this_frame_descr(result_types)) as i64)
 }
@@ -226,8 +230,12 @@ fn done_with_this_frame_descr_ptr(result_types: &[Type]) -> i64 {
 /// `Arc<ExitFrameWithExceptionDescrRef>`.  Falls back to the
 /// cranelift-side singleton when the metainterp has not attached yet.
 fn exit_frame_with_exception_descr_ref_ptr() -> i64 {
-    attached_descr_ptr(&METAINTERP_EXIT_EXC_REF)
-        .unwrap_or_else(|| Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as i64)
+    let attached = METAINTERP_EXIT_EXC_REF.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|arc| Arc::as_ptr(arc) as *const () as i64)
+    });
+    attached.unwrap_or_else(|| Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as i64)
 }
 
 /// Match `jf_descr_raw` against the metainterp-attached
@@ -241,19 +249,25 @@ fn match_metainterp_finish_descr(
 ) -> Option<(majit_ir::DescrRef, Arc<CraneliftFailDescr>)> {
     let ptr = jf_descr_raw as usize;
     fn check(
-        slot: &std::sync::RwLock<Option<majit_ir::DescrRef>>,
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
         expected: usize,
     ) -> Option<majit_ir::DescrRef> {
-        slot.read().unwrap().as_ref().and_then(|arc| {
-            if Arc::as_ptr(arc) as *const () as usize == expected {
-                Some(arc.clone())
-            } else {
-                None
-            }
+        slot.with(|c| {
+            c.borrow().as_ref().and_then(|arc| {
+                if Arc::as_ptr(arc) as *const () as usize == expected {
+                    Some(arc.clone())
+                } else {
+                    None
+                }
+            })
         })
     }
     for (slot, cl_singleton) in [
-        (&METAINTERP_DONE_INT, &*DONE_WITH_THIS_FRAME_DESCR_INT),
+        (
+            &METAINTERP_DONE_INT
+                as &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
+            &*DONE_WITH_THIS_FRAME_DESCR_INT,
+        ),
         (&METAINTERP_DONE_FLOAT, &*DONE_WITH_THIS_FRAME_DESCR_FLOAT),
         (&METAINTERP_DONE_REF, &*DONE_WITH_THIS_FRAME_DESCR_REF),
         (&METAINTERP_DONE_VOID, &*DONE_WITH_THIS_FRAME_DESCR_VOID),
