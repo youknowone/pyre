@@ -327,14 +327,22 @@ impl MIFrame {
         // reach final code emission.
         let jc = unsafe { &*jitcode_ptr };
         if jc.payload.metadata.pc_map.is_empty() {
-            // Skeleton payload (no `pc_map` yet). Production runs go
-            // through `CallControl.get_jitcode` drain which fills the
-            // payload before any guard capture (audit 2026-04-20: 0
-            // hits across pyre/check.sh), but unit-test entry points
-            // (`PyreSym::new_uninit`) legitimately land here. Fall
-            // back to pyre-jit-trace's LiveVars analysis: it matches
-            // `frame_value_count_at`'s skeleton fallback so the
-            // encoder box count stays in sync with the decoder.
+            // `CallControl.get_jitcode` drain fills pc_map before any
+            // guard capture (pyjitpl.py:199 parity). Phase X-0 (commit
+            // 0b30f5a85e) also eliminated the out-of-range-pc source
+            // that previously reached this branch. Release builds panic
+            // here — every remaining reach would be a bug. Debug builds
+            // retain the LiveVars fallback so the existing
+            // `PyreSym::new_uninit`-based unit test harness can still
+            // call this function without setting up a full jitcode.
+            if !cfg!(debug_assertions) {
+                panic!(
+                    "get_list_of_active_boxes: skeleton jitcode (pc_map empty) \
+                     at live_pc={} — Phase X-0 removed the known production \
+                     trigger; further hits are bugs.",
+                    live_pc
+                );
+            }
             let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
             let live = if !raw_code_ptr.is_null() {
                 Some(liveness_for(raw_code_ptr))

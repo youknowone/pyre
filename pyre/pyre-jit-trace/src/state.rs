@@ -580,15 +580,26 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
                 return length_i + length_r + length_f;
             }
         }
-        // Skeleton / uninit-jitcode fallback. Production runs go
-        // through the `jitcode_for` drain which fills pc_map +
-        // liveness before any guard capture (audit 2026-04-20: 0 hits
-        // across pyre/check.sh), but unit-test entry points
-        // (`PyreSym::new_uninit`) legitimately land here. Mirror
-        // trace_opcode.rs:get_list_of_active_boxes: iterate locals +
-        // stack filtering by is_local_live / is_stack_live so the
-        // decoded value count agrees with the encoder's BC_LIVE box
-        // count.
+        // `CallControl.get_jitcode` drain fills pc_map + liveness
+        // before any guard capture (pyjitpl.py:199 parity). Phase X-0
+        // (commit 0b30f5a85e) also eliminated the out-of-range-pc source
+        // that previously reached this branch by threading
+        // jitcode_index through `Snapshot::single_frame`. Release
+        // builds panic here — every remaining reach would be a bug.
+        // Debug builds retain the LiveVars fallback so the existing
+        // `PyreSym::new_uninit`-based unit test harness can still
+        // exercise this function without setting up a full jitcode.
+        if !cfg!(debug_assertions) {
+            panic!(
+                "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
+                 (pc_map.len={}, all_liveness.len={}). Phase X-0 removed the \
+                 known production trigger — further hits are bugs.",
+                jitcode_index,
+                pc,
+                payload.metadata.pc_map.len(),
+                sd.liveness_info.len(),
+            );
+        }
         if !jc.code.is_null() {
             let raw = unsafe { jc.raw_code() };
             let live = crate::liveness::liveness_for(raw);
@@ -3983,9 +3994,21 @@ impl JitState for PyreJitState {
             true
         })();
         if !decoded_via_jitcode {
-            // Fallback: LiveVars-based decode (skeleton jitcode / no
-            // pc_map entry / unregistered code). Retained for RPython
-            // parity with `get_list_of_active_boxes` skeleton path.
+            // Phase X-0 (commit 0b30f5a85e) eliminated the out-of-range-pc
+            // source that previously reached this branch. Release builds
+            // panic here — every remaining reach would be a bug. Debug
+            // builds retain the LiveVars fallback so unit-test harness
+            // paths that construct `PyreSym::new_uninit` without a full
+            // jitcode can still call this function.
+            if !cfg!(debug_assertions) {
+                panic!(
+                    "bridge resume decode: jitcode path failed — \
+                     w_code_ptr={:p} raw_code_ptr={:p} live_pc={} \
+                     nlocals={} stack_only={}. Phase X-0 removed the known \
+                     production trigger; further hits are bugs.",
+                    w_code_ptr, raw_code_ptr, live_pc, nlocals, stack_only
+                );
+            }
             let live = if !raw_code_ptr.is_null() {
                 Some(liveness_for(raw_code_ptr))
             } else {
@@ -4507,6 +4530,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_guard_class_uses_guard_nonnull_class() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef(0);
@@ -4536,6 +4563,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_trace_guarded_int_payload_uses_guard_nonnull_class_and_pure_payload() {
         let mut ctx = TraceCtx::for_test(1);
         let int_obj = OpRef(0);
@@ -4813,6 +4844,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
         use majit_ir::GcRef;
         use pyre_interpreter::pyframe::PyFrame;
@@ -4880,6 +4915,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_load_local_checked_value_respects_symbolic_local_type() {
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test(1);
@@ -4959,6 +4998,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_trace_dynamic_list_index_typed_int_skips_object_unbox() {
         let mut ctx = TraceCtx::for_test(2);
         let key = OpRef(0);
@@ -5298,6 +5341,10 @@ mod tests {
     // COMPARE_OP + POP_JUMP_IF* pair directly (pyjitpl.py:541-556 parity).
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_branch_guard_preserves_pre_pop_stack_shape() {
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -5398,6 +5445,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_branch_truth_uses_concrete_parameter() {
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -5441,6 +5492,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_current_fail_args_flushes_virtualizable_header_before_capture() {
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = OpRef(0);
@@ -5486,6 +5541,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_current_fail_args_materializes_symbolic_holes_from_concrete_frame() {
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -5541,6 +5600,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_close_loop_args_at_target_pc_preserves_virtualizable_stack() {
         // PyPy reached_loop_header carries self.virtualizable_boxes[:-1]
         // into the JUMP unchanged. virtualizable.py:86-98 read_boxes
@@ -5598,6 +5661,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_direct_len_value_returns_typed_raw_len_for_integer_list() {
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -5672,6 +5739,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_trace_direct_float_list_getitem_uses_gc_field_loads_for_list_object() {
         let mut ctx = TraceCtx::for_test(2);
         let list = OpRef(0);
@@ -5720,6 +5791,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_list_append_value_uses_raw_storage_fast_paths() {
         use pyre_interpreter::pyframe::PyFrame;
 
@@ -5843,6 +5918,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
+    )]
     fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int() {
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_object::w_range_iter_new;
