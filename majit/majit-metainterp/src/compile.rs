@@ -86,7 +86,7 @@ pub struct CompiledExitLayout {
     /// resume.py:451 — shared constant pool.
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object blueprints.
-    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
     /// resume.py:858 rd_pendingfields — deferred heap writes.
     pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
@@ -166,6 +166,7 @@ pub(crate) fn build_guard_metadata(
     ops: &[majit_ir::Op],
     pc: u64,
     constant_types: &std::collections::HashMap<u32, Type>,
+    callinfocollection: Option<&majit_ir::CallInfoCollection>,
 ) -> (
     HashMap<u32, StoredResumeData>,
     HashMap<u32, usize>,
@@ -418,7 +419,8 @@ pub(crate) fn build_guard_metadata(
                     entries
                         .iter()
                         .enumerate()
-                        .map(|(vidx, entry)| {
+                        .map(|(vidx, entry_rc)| {
+                            let entry: &majit_ir::RdVirtualInfo = entry_rc.as_ref();
                             let target_slot = frame_slots.iter().position(
                                 |s| matches!(s, ExitValueSourceLayout::Virtual(v) if *v == vidx),
                             );
@@ -550,21 +552,94 @@ pub(crate) fn build_guard_metadata(
                                         base,
                                     }
                                 }
-                                // resume.py:763-870 VStr/VUni*Info — virtual
-                                // string materialization is not yet wired in
-                                // pyre. Compile path must fail loudly until
-                                // vstring.py's producer side is ported.
-                                majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
-                                | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
-                                | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
-                                | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
-                                | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-                                | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
-                                    panic!(
-                                        "[jit] rd_virtuals[{vidx}] is VStr/VUni \
-                                         but vstring.py materialization is not \
-                                         ported yet (resume.py:763-870)"
+                                // resume.py:763 VStrPlainInfo /
+                                // resume.py:817 VUniPlainInfo —
+                                // length = len(fieldnums).
+                                majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
+                                    let chars = fieldnums
+                                        .iter()
+                                        .map(|&fnum| resolve_tagged_source(fnum))
+                                        .collect();
+                                    majit_backend::ExitVirtualLayout::StrPlain {
+                                        is_unicode: false,
+                                        chars,
+                                    }
+                                }
+                                majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
+                                    let chars = fieldnums
+                                        .iter()
+                                        .map(|&fnum| resolve_tagged_source(fnum))
+                                        .collect();
+                                    majit_backend::ExitVirtualLayout::StrPlain {
+                                        is_unicode: true,
+                                        chars,
+                                    }
+                                }
+                                // resume.py:781 VStrConcatInfo /
+                                // resume.py:836 VUniConcatInfo —
+                                // decoder.concat_strings(left, right).
+                                majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
+                                | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+                                    let is_unicode = matches!(
+                                        entry,
+                                        majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
                                     );
+                                    let oopspec = if is_unicode {
+                                        majit_ir::effectinfo::OopSpecIndex::UniConcat
+                                    } else {
+                                        majit_ir::effectinfo::OopSpecIndex::StrConcat
+                                    };
+                                    let cic = callinfocollection.expect(
+                                        "build_guard_metadata: callinfocollection \
+                                         required for VStr/VUni Concat recovery",
+                                    );
+                                    let (calldescr, func) =
+                                        cic.callinfo_for_oopspec(oopspec).expect(
+                                            "callinfo_for_oopspec missing OS_STR_CONCAT/OS_UNI_CONCAT",
+                                        );
+                                    let left = resolve_tagged_source(fieldnums[0]);
+                                    let right = resolve_tagged_source(fieldnums[1]);
+                                    majit_backend::ExitVirtualLayout::StrConcat {
+                                        is_unicode,
+                                        func: *func as i64,
+                                        calldescr: calldescr.clone(),
+                                        left,
+                                        right,
+                                    }
+                                }
+                                // resume.py:801 VStrSliceInfo /
+                                // resume.py:856 VUniSliceInfo —
+                                // decoder.slice_string(largerstr, start, length).
+                                majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
+                                | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+                                    let is_unicode = matches!(
+                                        entry,
+                                        majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
+                                    );
+                                    let oopspec = if is_unicode {
+                                        majit_ir::effectinfo::OopSpecIndex::UniSlice
+                                    } else {
+                                        majit_ir::effectinfo::OopSpecIndex::StrSlice
+                                    };
+                                    let cic = callinfocollection.expect(
+                                        "build_guard_metadata: callinfocollection \
+                                         required for VStr/VUni Slice recovery",
+                                    );
+                                    let (calldescr, func) =
+                                        cic.callinfo_for_oopspec(oopspec).expect(
+                                            "callinfo_for_oopspec missing OS_STR_SLICE/OS_UNI_SLICE",
+                                        );
+                                    let str_src = resolve_tagged_source(fieldnums[0]);
+                                    let start = resolve_tagged_source(fieldnums[1]);
+                                    let length = resolve_tagged_source(fieldnums[2]);
+                                    majit_backend::ExitVirtualLayout::StrSlice {
+                                        is_unicode,
+                                        func: *func as i64,
+                                        calldescr: calldescr.clone(),
+                                        str_src,
+                                        start,
+                                        length,
+                                    }
                                 }
                                 majit_ir::RdVirtualInfo::Empty => {
                                     panic!("[jit] rd_virtuals[{vidx}] is Empty");
@@ -1719,7 +1794,7 @@ mod tests {
         guard.rd_consts = Some(rd_consts);
 
         let (_resume_data, _guard_indices, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new());
+            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new(), None);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");

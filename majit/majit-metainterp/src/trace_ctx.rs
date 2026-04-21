@@ -116,6 +116,13 @@ pub struct TraceCtx {
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
     /// matches RPython's get_procedure_token(greenboxes) + has_compiled_targets.
     pub has_compiled_targets_fn: Option<Box<dyn Fn(u64) -> bool>>,
+    /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
+    /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
+    /// / `slice_unicode` (resume.py:1143-1188) which look up the
+    /// `OS_STR_CONCAT` / `OS_STR_SLICE` / `OS_UNI_CONCAT` / `OS_UNI_SLICE`
+    /// calldescr + func pointers while rematerializing virtual strings
+    /// during bridge-virtual reconstruction.
+    pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// pyjitpl.py:2398: tracing-time heap cache.
     /// Tracks field/array values, allocations, escape status, and class/nullity
     /// knowledge during tracing to avoid recording redundant operations.
@@ -400,6 +407,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            callinfocollection: None,
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
         }
@@ -452,6 +460,7 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            callinfocollection: None,
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
         }

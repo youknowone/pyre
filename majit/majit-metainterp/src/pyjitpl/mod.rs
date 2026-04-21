@@ -56,7 +56,7 @@ pub struct BridgeRetraceResult {
     pub fail_types: Vec<Type>,
     pub rd_numb: Option<Vec<u8>>,
     pub rd_consts: Option<Vec<(i64, Type)>>,
-    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// Result of checking a back-edge.
@@ -181,7 +181,7 @@ pub(crate) struct StoredExitLayout {
     pub(crate) resume_layout: Option<ResumeLayoutSummary>,
     pub(crate) rd_numb: Option<Vec<u8>>,
     pub(crate) rd_consts: Option<Vec<(i64, Type)>>,
-    pub(crate) rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub(crate) rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
     pub(crate) rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
@@ -1405,6 +1405,17 @@ impl<M: Clone> MetaInterp<M> {
         &mut self.warm_state
     }
 
+    /// pyjitpl.py:2268 `metainterp.staticdata.callinfocollection` accessor.
+    ///
+    /// Returns the cached `Arc<CallInfoCollection>` used by the frontend
+    /// runtime (pyre-jit eval.rs) to resolve OS_STR_CONCAT /
+    /// OS_UNI_CONCAT / OS_STR_SLICE / OS_UNI_SLICE func pointers and
+    /// calldescrs when materializing VStr/VUni Concat/Slice virtuals
+    /// during guard-exit recovery (resume.py:1143-1188).
+    pub fn callinfocollection(&self) -> Option<&std::sync::Arc<majit_ir::CallInfoCollection>> {
+        self.callinfocollection.as_ref()
+    }
+
     /// Decay all counters to avoid stale hotness data.
     pub fn decay_counters(&mut self) {
         self.warm_state.decay_counters();
@@ -1670,6 +1681,7 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.set_root_green_key_raw(green_key_raw);
                 // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
                 ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
+                ctx.callinfocollection = self.callinfocollection.clone();
                 ctx.initial_inputarg_consts = live_values
                     .iter()
                     .map(|v| {
@@ -1817,6 +1829,7 @@ impl<M: Clone> MetaInterp<M> {
         // per-trace context so `is_too_long` can consult it without needing
         // a warmstate borrow at every check site.
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
+        ctx.callinfocollection = self.callinfocollection.clone();
         ctx.initial_inputarg_consts = live_values
             .iter()
             .map(|v| {
@@ -3021,6 +3034,13 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
         self.backend.set_constant_types(constant_types.clone());
+        // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
+        // materialization needs the staticdata.callinfocollection to
+        // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
+        // OS_UNI_SLICE func pointers + calldescr. Backends that don't
+        // handle VStr/VUni at the backend layer (dynasm) get a no-op.
+        self.backend
+            .set_callinfocollection(self.callinfocollection.clone());
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.backend
                 .compile_loop(&inputargs, &compiled_ops, &mut token)
@@ -3078,6 +3098,7 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_ops,
                         green_key,
                         &compiled_constant_types,
+                        self.callinfocollection.as_deref(),
                     );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
@@ -3738,6 +3759,13 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
         self.backend.set_constant_types(constant_types.clone());
+        // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
+        // materialization needs the staticdata.callinfocollection to
+        // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
+        // OS_UNI_SLICE func pointers + calldescr. Backends that don't
+        // handle VStr/VUni at the backend layer (dynasm) get a no-op.
+        self.backend
+            .set_callinfocollection(self.callinfocollection.clone());
 
         let token_num = self.warm_state.alloc_token_number();
         let mut token = JitCellToken::new(token_num);
@@ -3776,6 +3804,7 @@ impl<M: Clone> MetaInterp<M> {
                         &combined_ops,
                         green_key,
                         &compiled_constant_types,
+                        self.callinfocollection.as_deref(),
                     );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
@@ -4168,6 +4197,13 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
         self.backend.set_constant_types(constant_types.clone());
+        // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
+        // materialization needs the staticdata.callinfocollection to
+        // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
+        // OS_UNI_SLICE func pointers + calldescr. Backends that don't
+        // handle VStr/VUni at the backend layer (dynasm) get a no-op.
+        self.backend
+            .set_callinfocollection(self.callinfocollection.clone());
         token.green_key = green_key;
         // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
         // so the backend can find the first local in force_fn paths.
@@ -4185,6 +4221,7 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                         green_key,
                         &compiled_constant_types,
+                        self.callinfocollection.as_deref(),
                     );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
@@ -4471,6 +4508,13 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
         self.backend.set_constant_types(constant_types.clone());
+        // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
+        // materialization needs the staticdata.callinfocollection to
+        // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
+        // OS_UNI_SLICE func pointers + calldescr. Backends that don't
+        // handle VStr/VUni at the backend layer (dynasm) get a no-op.
+        self.backend
+            .set_callinfocollection(self.callinfocollection.clone());
         token.green_key = green_key;
 
         match self
@@ -4485,6 +4529,7 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_ops,
                         green_key,
                         &compiled_constant_types,
+                        self.callinfocollection.as_deref(),
                     );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
@@ -5997,7 +6042,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-    ) -> Option<Vec<majit_ir::RdVirtualInfo>> {
+    ) -> Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
         let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
@@ -6153,6 +6198,13 @@ impl<M: Clone> MetaInterp<M> {
 
         self.backend.set_constants(constants);
         self.backend.set_constant_types(constant_types.clone());
+        // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
+        // materialization needs the staticdata.callinfocollection to
+        // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
+        // OS_UNI_SLICE func pointers + calldescr. Backends that don't
+        // handle VStr/VUni at the backend layer (dynasm) get a no-op.
+        self.backend
+            .set_callinfocollection(self.callinfocollection.clone());
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(original_green_key);
 
@@ -6178,6 +6230,7 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                         original_green_key,
                         &compiled_constant_types,
+                        self.callinfocollection.as_deref(),
                     );
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
@@ -6516,6 +6569,13 @@ impl<M: Clone> MetaInterp<M> {
 
         self.backend.set_constants(constants);
         self.backend.set_constant_types(constant_types.clone());
+        // resume.py:1143-1188 parity — VStr/VUni Concat/Slice guard-exit
+        // materialization needs the staticdata.callinfocollection to
+        // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
+        // OS_UNI_SLICE func pointers + calldescr. Backends that don't
+        // handle VStr/VUni at the backend layer (dynasm) get a no-op.
+        self.backend
+            .set_callinfocollection(self.callinfocollection.clone());
         self.backend.set_next_trace_id(bridge_trace_id);
         self.backend.set_next_header_pc(green_key);
 
@@ -6599,6 +6659,7 @@ impl<M: Clone> MetaInterp<M> {
                             &optimized_ops,
                             green_key,
                             &compiled_constant_types,
+                            self.callinfocollection.as_deref(),
                         );
                     let mut terminal_exit_layouts =
                         compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
@@ -6744,6 +6805,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key, self.staticdata.clone());
         // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot for bridge traces.
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
+        ctx.callinfocollection = self.callinfocollection.clone();
         self.tracing = Some(ctx);
 
         // RPython uses global ConstInt/ConstPtr boxes, so a bridge that
@@ -13117,8 +13179,13 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops, &mut token)
             .expect("loop should compile");
-        let (mut resume_data, guard_op_indices, mut exit_layouts) =
-            compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
+        let (mut resume_data, guard_op_indices, mut exit_layouts) = compile::build_guard_metadata(
+            inputargs,
+            &ops,
+            green_key,
+            &HashMap::new(),
+            meta.callinfocollection.as_deref(),
+        );
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);

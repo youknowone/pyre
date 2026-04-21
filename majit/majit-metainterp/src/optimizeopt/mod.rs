@@ -696,7 +696,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         &self,
         opref: OpRef,
         fieldnums: Vec<i16>,
-    ) -> Option<majit_ir::RdVirtualInfo> {
+    ) -> Option<std::rc::Rc<majit_ir::RdVirtualInfo>> {
         let resolved = self.ctx.get_box_replacement(opref);
         let info = self.ctx.get_ptr_info(resolved)?;
         // resume.py:307-315 `ResumeDataVirtualAdder.make_virtual_info`:
@@ -708,10 +708,17 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         //     vinfo.set_content(fieldnums)
         //     info._cached_vinfo = vinfo
         //     return vinfo
+        //
+        // The cache stores an `Rc<RdVirtualInfo>` so that cache hits return
+        // the same shared handle (matching RPython's Python object identity
+        // on cache hit, info.py:124-128). Downstream storage in
+        // `storage.rd_virtuals` keeps the shared handle so two guards that
+        // reference the same virtual with the same fieldnums end up pointing
+        // at the same `RdVirtualInfo` object.
         if let Some(cache) = info.cached_vinfo() {
             if let Some(vinfo) = cache.borrow().as_ref() {
                 if vinfo.equals(&fieldnums) {
-                    return Some(vinfo.clone());
+                    return Some(std::rc::Rc::clone(vinfo));
                 }
             }
         }
@@ -719,11 +726,13 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         let mut vinfo = info.visitor_dispatch_virtual_type(&mut builder)??;
         // resume.py:313: vinfo.set_content(fieldnums)
         vinfo.set_content(fieldnums);
-        // resume.py:314: info._cached_vinfo = vinfo
+        let shared = std::rc::Rc::new(vinfo);
+        // resume.py:314: info._cached_vinfo = vinfo — store the shared handle
+        // so a later equals-hit returns the SAME object.
         if let Some(cache) = info.cached_vinfo() {
-            *cache.borrow_mut() = Some(vinfo.clone());
+            *cache.borrow_mut() = Some(std::rc::Rc::clone(&shared));
         }
-        Some(vinfo)
+        Some(shared)
     }
 
     fn virtual_info_would_be_reused(&self, opref: OpRef, fieldnums: &[i16]) -> bool {

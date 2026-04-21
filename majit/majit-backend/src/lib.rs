@@ -149,6 +149,44 @@ pub enum ExitVirtualLayout {
         /// resume.py:693: fieldnums (decoded)
         values: Vec<ExitValueSourceLayout>,
     },
+    /// resume.py:763 VStrPlainInfo — virtual byte-string
+    /// (bh_newstr(len) + bh_strsetitem per character).
+    ///
+    /// `is_unicode = false` → bh_newstr/bh_strsetitem.
+    /// `is_unicode = true`  → bh_newunicode/bh_unicodesetitem (unified
+    /// variant for resume.py:817 VUniPlainInfo).
+    StrPlain {
+        is_unicode: bool,
+        /// Per-character values, length = string length. UNINITIALIZED
+        /// fieldnums (resume.py:774) remain as `Uninitialized`.
+        chars: Vec<ExitValueSourceLayout>,
+    },
+    /// resume.py:781 VStrConcatInfo + resume.py:836 VUniConcatInfo.
+    /// decoder.concat_strings(left, right) = cic.funcptr_for_oopspec(
+    /// OS_STR_CONCAT)(left, right).
+    StrConcat {
+        is_unicode: bool,
+        /// OS_STR_CONCAT or OS_UNI_CONCAT func pointer (resume.py:1468).
+        func: i64,
+        /// calldescr for OS_STR_CONCAT/OS_UNI_CONCAT. Carried so pyre's
+        /// bh_call_r can dispatch to the right calling convention.
+        calldescr: majit_ir::DescrRef,
+        left: ExitValueSourceLayout,
+        right: ExitValueSourceLayout,
+    },
+    /// resume.py:801 VStrSliceInfo + resume.py:856 VUniSliceInfo.
+    /// decoder.slice_string(str, start, length) =
+    /// cic.funcptr_for_oopspec(OS_STR_SLICE)(str, start, start + length).
+    StrSlice {
+        is_unicode: bool,
+        /// OS_STR_SLICE or OS_UNI_SLICE func pointer (resume.py:1478).
+        func: i64,
+        /// calldescr for OS_STR_SLICE/OS_UNI_SLICE.
+        calldescr: majit_ir::DescrRef,
+        str_src: ExitValueSourceLayout,
+        start: ExitValueSourceLayout,
+        length: ExitValueSourceLayout,
+    },
 }
 
 impl ExitVirtualLayout {
@@ -252,6 +290,41 @@ impl ExitVirtualLayout {
                     .iter()
                     .map(|source| source.shifted_virtuals(virtual_offset))
                     .collect(),
+            },
+            Self::StrPlain { is_unicode, chars } => Self::StrPlain {
+                is_unicode: *is_unicode,
+                chars: chars
+                    .iter()
+                    .map(|source| source.shifted_virtuals(virtual_offset))
+                    .collect(),
+            },
+            Self::StrConcat {
+                is_unicode,
+                func,
+                calldescr,
+                left,
+                right,
+            } => Self::StrConcat {
+                is_unicode: *is_unicode,
+                func: *func,
+                calldescr: calldescr.clone(),
+                left: left.shifted_virtuals(virtual_offset),
+                right: right.shifted_virtuals(virtual_offset),
+            },
+            Self::StrSlice {
+                is_unicode,
+                func,
+                calldescr,
+                str_src,
+                start,
+                length,
+            } => Self::StrSlice {
+                is_unicode: *is_unicode,
+                func: *func,
+                calldescr: calldescr.clone(),
+                str_src: str_src.shifted_virtuals(virtual_offset),
+                start: start.shifted_virtuals(virtual_offset),
+                length: length.shifted_virtuals(virtual_offset),
             },
         }
     }
@@ -365,6 +438,50 @@ impl PartialEq for ExitVirtualLayout {
                     ..
                 },
             ) => a1 == b1 && a2 == b2 && a3 == b3,
+            (
+                Self::StrPlain {
+                    is_unicode: a1,
+                    chars: a2,
+                },
+                Self::StrPlain {
+                    is_unicode: b1,
+                    chars: b2,
+                },
+            ) => a1 == b1 && a2 == b2,
+            (
+                Self::StrConcat {
+                    is_unicode: a1,
+                    func: a2,
+                    left: a3,
+                    right: a4,
+                    ..
+                },
+                Self::StrConcat {
+                    is_unicode: b1,
+                    func: b2,
+                    left: b3,
+                    right: b4,
+                    ..
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            (
+                Self::StrSlice {
+                    is_unicode: a1,
+                    func: a2,
+                    str_src: a3,
+                    start: a4,
+                    length: a5,
+                    ..
+                },
+                Self::StrSlice {
+                    is_unicode: b1,
+                    func: b2,
+                    str_src: b3,
+                    start: b4,
+                    length: b5,
+                    ..
+                },
+            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
             _ => false,
         }
     }
@@ -535,7 +652,7 @@ pub struct FailDescrLayout {
     /// resume.py:451 — shared constant pool referenced by `rd_numb`.
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object field info referenced by `rd_numb`.
-    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
     /// Deferred heap writes associated with this guard exit.
     pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
@@ -571,7 +688,7 @@ pub struct TerminalExitLayout {
     /// resume.py:451 — shared constant pool referenced by `rd_numb`.
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object field info referenced by `rd_numb`.
-    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
     /// Deferred heap writes associated with this terminal exit.
     pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
@@ -1078,6 +1195,22 @@ pub trait Backend: Send {
     /// jitcounter.fetch_next_hash(). Skips guards that already have
     /// status set by make_a_counter_per_value (GUARD_VALUE).
     fn store_guard_hashes(&self, _token: &JitCellToken, _hashes: &[u64]) {}
+
+    /// compile.py / resume.py:1143 plumbing: publish the shared
+    /// `CallInfoCollection` so the backend can resolve OS_STR_CONCAT
+    /// etc. function pointers when materializing VStr/VUni
+    /// Concat/Slice virtuals from guard-exit recovery data.
+    ///
+    /// Default is a no-op: backends that handle string virtual
+    /// materialization entirely through the frontend `bh_*` runtime
+    /// (dynasm) or that never expose VStr/VUni recovery_layouts need
+    /// not participate. Cranelift overrides this to cache the
+    /// collection for `collect_guards` consumption.
+    fn set_callinfocollection(
+        &mut self,
+        _cic: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
+    ) {
+    }
 
     /// store_hash for bridge guards — same as store_guard_hashes but for
     /// the most recently compiled bridge on the given guard.

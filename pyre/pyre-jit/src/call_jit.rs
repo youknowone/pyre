@@ -1302,6 +1302,70 @@ fn unbox_int_for_force(raw: i64) -> i64 {
     }
 }
 
+/// resume.py:763-779 VStrPlainInfo.allocate / resume.py:817-829
+/// VUniPlainInfo.allocate parity — materialize a Plain string/unicode
+/// virtual via the frontend backend's bh_newstr / bh_strsetitem (and
+/// unicode variants). Registered into Cranelift's guard-exit recovery
+/// path so `rebuild_state_after_failure` hands bridge-input refs a real
+/// string pointer instead of NULL (compiler.rs:1323).
+fn materialize_str_plain_for_cranelift(is_unicode: bool, chars: &[i64]) -> i64 {
+    use majit_backend::Backend;
+    let (driver, _) = crate::eval::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let length = chars.len() as i64;
+    let string = if is_unicode {
+        backend.bh_newunicode(length)
+    } else {
+        backend.bh_newstr(length)
+    };
+    for (i, c) in chars.iter().enumerate() {
+        if is_unicode {
+            backend.bh_unicodesetitem(string, i as i64, *c);
+        } else {
+            backend.bh_strsetitem(string, i as i64, *c);
+        }
+    }
+    string
+}
+
+/// resume.py:1143-1188 string_concat / slice_string and the unicode
+/// counterparts — materialize Concat / Slice string virtuals via
+/// cpu.bh_call_r(funcptr, args_i, args_r, args_f, calldescr).
+fn materialize_str_call_for_cranelift(
+    _is_unicode: bool,
+    func: i64,
+    calldescr: &majit_ir::DescrRef,
+    args_i: &[i64],
+    args_r: &[i64],
+) -> i64 {
+    use majit_backend::Backend;
+    let (driver, _) = crate::eval::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let cd = calldescr
+        .as_call_descr()
+        .expect("materialize_str_call: calldescr must downcast to CallDescr");
+    let bh_calldescr = majit_translate::jitcode::BhCallDescr {
+        arg_classes: cd.arg_classes(),
+        result_type: cd.result_class(),
+    };
+    let result = backend.bh_call_r(
+        func,
+        if args_i.is_empty() {
+            None
+        } else {
+            Some(args_i)
+        },
+        if args_r.is_empty() {
+            None
+        } else {
+            Some(args_r)
+        },
+        None,
+        &bh_calldescr,
+    );
+    result.0 as i64
+}
+
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -1340,6 +1404,17 @@ pub fn install_jit_call_bridge() {
             );
             majit_backend_cranelift::register_jitframe_layout(arena_global_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
+            // resume.py:763-870 VStr/VUni.allocate parity — Cranelift
+            // backend's materialize_virtual_recursive invokes these
+            // callbacks so that bridge-input refs (compiler.rs:2477/2837)
+            // and call_assembler blackhole inputs (compiler.rs:3007)
+            // receive materialized string pointers, not NULL.
+            majit_backend_cranelift::register_materialize_str_plain(
+                materialize_str_plain_for_cranelift,
+            );
+            majit_backend_cranelift::register_materialize_str_call(
+                materialize_str_call_for_cranelift,
+            );
             // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
             // parity. Cranelift's prologue calls pyre_stack_check_for_jit_prologue
             // directly (combined fast path + slowpath in one function call, since
@@ -1495,7 +1570,7 @@ pub fn blackhole_resume_via_rd_numb(
     rd_consts: &[i64],
     deadframe: &[i64],
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
-    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
 ) -> BlackholeResult {
     use majit_metainterp::resume;

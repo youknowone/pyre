@@ -2358,7 +2358,7 @@ fn materialize_virtual_from_rd(
     dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[(i64, majit_ir::Type)],
-    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
     // resume.py:951: v = self.virtuals_cache.get_ptr(index)
@@ -2377,7 +2377,7 @@ fn materialize_virtual_from_rd(
         dead_frame: &[Value],
         num_failargs: i32,
         rd_consts: &[(i64, majit_ir::Type)],
-        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut HashMap<usize, Value>,
     ) -> Option<Value> {
         if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -2431,7 +2431,7 @@ fn materialize_virtual_from_rd(
         dead_frame: &[Value],
         num_failargs: i32,
         rd_consts: &[(i64, majit_ir::Type)],
-        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut HashMap<usize, Value>,
     ) -> i64 {
         match decode_tagged_fieldnum(
@@ -2456,7 +2456,7 @@ fn materialize_virtual_from_rd(
         dead_frame: &[Value],
         num_failargs: i32,
         rd_consts: &[(i64, majit_ir::Type)],
-        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut HashMap<usize, Value>,
     ) -> f64 {
         match decode_tagged_fieldnum(
@@ -2482,14 +2482,17 @@ fn materialize_virtual_from_rd(
         }
     }
     // resume.py:643-760: dispatch by virtual kind.
-    match entry {
+    match entry.as_ref() {
         majit_ir::RdVirtualInfo::VArrayInfoClear {
             kind, fieldnums, ..
         }
         | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
             kind, fieldnums, ..
         } => {
-            let clear = matches!(entry, majit_ir::RdVirtualInfo::VArrayInfoClear { .. });
+            let clear = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
+            );
             // resume.py:650-670: allocate_array(len, arraydescr, clear)
             let arr_kind = match kind {
                 2 => pyre_object::ArrayKind::Float,
@@ -2677,6 +2680,202 @@ fn materialize_virtual_from_rd(
         majit_ir::RdVirtualInfo::Empty => {
             panic!("[jit] materialize_virtual: rd_virtuals[{vidx}] is Empty");
         }
+        // resume.py:763-775 VStrPlainInfo.allocate /
+        // resume.py:817-829 VUniPlainInfo.allocate —
+        //     string = decoder.allocate_string(length)
+        //     decoder.virtuals_cache.set_ptr(index, string)
+        //     for i, fieldnum in enumerate(self.fieldnums):
+        //         if not tagged_eq(fieldnum, UNINITIALIZED):
+        //             decoder.string_setitem(string, i, fieldnum)
+        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
+            let is_unicode = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
+            );
+            let length = fieldnums.len() as i64;
+            let (driver, _) = driver_pair();
+            let backend = driver.meta_interp().backend();
+            // resume.py:1449 allocate_string / resume.py:1482 allocate_unicode.
+            let string = if is_unicode {
+                backend.bh_newunicode(length)
+            } else {
+                backend.bh_newstr(length)
+            };
+            // resume.py:766/820 virtuals_cache.set_ptr BEFORE filling.
+            let result = Value::Ref(majit_ir::GcRef(string as usize));
+            virtuals_cache.insert(vidx, result.clone());
+            // resume.py:771-774/824-827 per-char string_setitem loop.
+            for (i, &fnum) in fieldnums.iter().enumerate() {
+                if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                let char_val = decode_tagged_fieldnum_int(
+                    fnum,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals,
+                    virtuals_cache,
+                );
+                if is_unicode {
+                    driver
+                        .meta_interp()
+                        .backend()
+                        .bh_unicodesetitem(string, i as i64, char_val);
+                } else {
+                    driver
+                        .meta_interp()
+                        .backend()
+                        .bh_strsetitem(string, i as i64, char_val);
+                }
+            }
+            return result;
+        }
+        // resume.py:781-793 VStrConcatInfo.allocate /
+        // resume.py:836-848 VUniConcatInfo.allocate —
+        //     left  = decoder.decode_ref(self.fieldnums[0])
+        //     right = decoder.decode_ref(self.fieldnums[1])
+        //     string = decoder.concat_strings(left, right)
+        //     decoder.virtuals_cache.set_ptr(index, string)
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+            let is_unicode = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
+            );
+            let oopspec = if is_unicode {
+                majit_ir::effectinfo::OopSpecIndex::UniConcat
+            } else {
+                majit_ir::effectinfo::OopSpecIndex::StrConcat
+            };
+            let left_val = decode_tagged_fieldnum_int(
+                fieldnums[0],
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            );
+            let right_val = decode_tagged_fieldnum_int(
+                fieldnums[1],
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            );
+            let (driver, _) = driver_pair();
+            let cic = driver
+                .meta_interp()
+                .callinfocollection()
+                .expect(
+                    "materialize_virtual_from_rd: MetaInterp.callinfocollection \
+                     required for VStr/VUni Concat recovery (resume.py:1143)",
+                )
+                .clone();
+            let (calldescr, func) = cic
+                .callinfo_for_oopspec(oopspec)
+                .expect("callinfo_for_oopspec missing OS_STR_CONCAT / OS_UNI_CONCAT");
+            let cd = calldescr
+                .as_call_descr()
+                .expect("VStr/VUni Concat calldescr must downcast to CallDescr");
+            let bh_calldescr = majit_translate::jitcode::BhCallDescr {
+                arg_classes: cd.arg_classes(),
+                result_type: cd.result_class(),
+            };
+            // resume.py:1462-1470 concat_strings / resume.py:1489-1497
+            // concat_unicodes — cpu.bh_call_r(func, [left, right], descr).
+            let backend = driver.meta_interp().backend();
+            let result = backend.bh_call_r(
+                *func as i64,
+                None,
+                Some(&[left_val, right_val]),
+                None,
+                &bh_calldescr,
+            );
+            let value = Value::Ref(majit_ir::GcRef(result.0));
+            virtuals_cache.insert(vidx, value.clone());
+            return value;
+        }
+        // resume.py:799-813 VStrSliceInfo.allocate /
+        // resume.py:854-868 VUniSliceInfo.allocate —
+        //     largerstr = decoder.decode_ref(self.fieldnums[0])
+        //     start     = decoder.decode_int(self.fieldnums[1])
+        //     length    = decoder.decode_int(self.fieldnums[2])
+        //     string = decoder.slice_string(largerstr, start, length)
+        //     decoder.virtuals_cache.set_ptr(index, string)
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+            let is_unicode = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
+            );
+            let oopspec = if is_unicode {
+                majit_ir::effectinfo::OopSpecIndex::UniSlice
+            } else {
+                majit_ir::effectinfo::OopSpecIndex::StrSlice
+            };
+            let str_val = decode_tagged_fieldnum_int(
+                fieldnums[0],
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            );
+            let start_val = decode_tagged_fieldnum_int(
+                fieldnums[1],
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            );
+            let length_val = decode_tagged_fieldnum_int(
+                fieldnums[2],
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            );
+            // resume.py:1474 / 1501 — slice_string(str, start, start + length)
+            // passes the stop index, not the length.
+            let stop_val = start_val + length_val;
+            let (driver, _) = driver_pair();
+            let cic = driver
+                .meta_interp()
+                .callinfocollection()
+                .expect(
+                    "materialize_virtual_from_rd: MetaInterp.callinfocollection \
+                     required for VStr/VUni Slice recovery (resume.py:1143)",
+                )
+                .clone();
+            let (calldescr, func) = cic
+                .callinfo_for_oopspec(oopspec)
+                .expect("callinfo_for_oopspec missing OS_STR_SLICE / OS_UNI_SLICE");
+            let cd = calldescr
+                .as_call_descr()
+                .expect("VStr/VUni Slice calldescr must downcast to CallDescr");
+            let bh_calldescr = majit_translate::jitcode::BhCallDescr {
+                arg_classes: cd.arg_classes(),
+                result_type: cd.result_class(),
+            };
+            // resume.py:1472-1480 slice_string / resume.py:1499-1507
+            // slice_unicode — cpu.bh_call_r(func, [str, start, stop], descr).
+            let backend = driver.meta_interp().backend();
+            let result = backend.bh_call_r(
+                *func as i64,
+                Some(&[start_val, stop_val]),
+                Some(&[str_val]),
+                None,
+                &bh_calldescr,
+            );
+            let value = Value::Ref(majit_ir::GcRef(result.0));
+            virtuals_cache.insert(vidx, value.clone());
+            return value;
+        }
         _ => {} // Instance/Struct: fall through
     }
     // Instance/Struct: extract fields for ob_type-based materialization.
@@ -2692,7 +2891,7 @@ fn materialize_virtual_from_rd(
             typedescr: &'a Option<majit_ir::DescrRef>,
         },
     }
-    let (kind, fielddescrs, fieldnums, descr_size) = match entry {
+    let (kind, fielddescrs, fieldnums, descr_size) = match entry.as_ref() {
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
             known_class,
@@ -2941,7 +3140,7 @@ fn decode_tagged_value(
     dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[(i64, majit_ir::Type)],
-    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
     let (val, tagbits) = majit_metainterp::resume::untag(tagged);

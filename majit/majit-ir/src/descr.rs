@@ -761,9 +761,29 @@ pub trait FailDescr: Descr {
 
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
     /// to a guard descriptor. Non-guard fail descriptors ignore this.
+    ///
+    /// Upstream shape (history.py:143-147):
+    /// ```python
+    /// def attach_vector_info(self, info):
+    ///     info.prev = self.rd_vector_info
+    ///     self.rd_vector_info = info
+    /// ```
+    /// Implementations store the head in their internal
+    /// `Option<Box<AccumInfo>>` chain; `AccumInfo.prev` carries the tail.
     fn attach_vector_info(&self, _info: AccumInfo) {}
 
     /// Read back any attached vector resume info.
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream `descr.rd_vector_info` is a
+    /// head-linked singly-linked `Option<AccumInfo>` chain (walk via
+    /// `.prev`). Pyre stores the head-linked chain internally
+    /// (`AccumInfo.prev` field matches upstream), but this trait
+    /// method materializes the walk as a `Vec<AccumInfo>` for
+    /// callers that prefer index access. Head is at index 0 (most
+    /// recently attached); earlier entries follow via
+    /// `entries[i].prev`. Consumers that want strict parity can
+    /// walk the chain manually by taking `vector_info().into_iter()
+    /// .next()` (the head) and following `prev`.
     fn vector_info(&self) -> Vec<AccumInfo> {
         Vec::new()
     }
@@ -789,9 +809,8 @@ pub trait FailDescr: Descr {
 #[derive(Debug, Clone)]
 pub struct AccumInfo {
     /// resume.py:31/32 prev — next entry in the VectorInfo linked list.
-    /// RPython walks the chain via `next()` / `clone()`; pyre stores a
-    /// linked list per guard via `attach_vector_info` pushing onto a Vec,
-    /// with `prev` set at construction time. `None` marks list tail.
+    /// RPython stores a head-linked chain on `descr.rd_vector_info` and
+    /// traverses it via `next()` / `clone()`. `None` marks list tail.
     pub prev: Option<Box<AccumInfo>>,
     /// resume.py:27 failargs_pos — index in the guard's fail arguments.
     pub failargs_pos: usize,
@@ -830,6 +849,21 @@ pub struct UnpackAtExitInfo {
     pub variable: OpRef,
     /// resume.py:28 location — register/SSA location of the value.
     pub location: OpRef,
+}
+
+fn push_vector_info(head: &mut Option<Box<AccumInfo>>, mut info: AccumInfo) {
+    info.prev = head.take();
+    *head = Some(Box::new(info));
+}
+
+fn flatten_vector_info(head: Option<&AccumInfo>) -> Vec<AccumInfo> {
+    let mut result = Vec::new();
+    let mut current = head;
+    while let Some(info) = current {
+        result.push(info.clone());
+        current = info.prev.as_deref();
+    }
+    result
 }
 
 /// Descriptor for a fixed-size struct/object allocation.
@@ -2072,7 +2106,7 @@ pub struct SimpleFailDescr {
     is_finish: bool,
     trace_id: u64,
     /// schedule.py:654: vector accumulation info attached during vectorization.
-    vector_info: std::cell::UnsafeCell<Vec<AccumInfo>>,
+    vector_info: std::cell::UnsafeCell<Option<Box<AccumInfo>>>,
 }
 
 impl Clone for SimpleFailDescr {
@@ -2101,7 +2135,7 @@ impl SimpleFailDescr {
             fail_arg_types,
             is_finish: false,
             trace_id: 0,
-            vector_info: std::cell::UnsafeCell::new(Vec::new()),
+            vector_info: std::cell::UnsafeCell::new(None),
         }
     }
 
@@ -2112,7 +2146,7 @@ impl SimpleFailDescr {
             fail_arg_types,
             is_finish: true,
             trace_id: 0,
-            vector_info: std::cell::UnsafeCell::new(Vec::new()),
+            vector_info: std::cell::UnsafeCell::new(None),
         }
     }
 
@@ -2145,10 +2179,10 @@ impl FailDescr for SimpleFailDescr {
         self.trace_id
     }
     fn attach_vector_info(&self, info: AccumInfo) {
-        unsafe { &mut *self.vector_info.get() }.push(info);
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
-        unsafe { &mut *self.vector_info.get() }.clone()
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
     }
 }
 
@@ -2190,6 +2224,49 @@ mod tests {
         fn get_extra_info(&self) -> &EffectInfo {
             &self.effect
         }
+    }
+
+    #[test]
+    fn test_simple_fail_descr_vector_info_is_head_linked() {
+        let descr = SimpleFailDescr::new(1, 2, vec![Type::Int, Type::Int]);
+        descr.attach_vector_info(AccumInfo {
+            prev: None,
+            failargs_pos: 0,
+            variable: OpRef(10),
+            location: OpRef(20),
+            accum_operation: '+',
+            scalar: OpRef::NONE,
+        });
+        descr.attach_vector_info(AccumInfo {
+            prev: None,
+            failargs_pos: 1,
+            variable: OpRef(11),
+            location: OpRef(21),
+            accum_operation: '*',
+            scalar: OpRef::NONE,
+        });
+
+        let vector_info = descr.vector_info();
+        assert_eq!(vector_info.len(), 2);
+        assert_eq!(vector_info[0].failargs_pos, 1);
+        assert_eq!(vector_info[1].failargs_pos, 0);
+        assert_eq!(
+            vector_info[0].prev.as_ref().map(|info| info.failargs_pos),
+            Some(0)
+        );
+        assert!(vector_info[1].prev.is_none());
+
+        let cloned = descr.clone();
+        let cloned_vector_info = cloned.vector_info();
+        assert_eq!(cloned_vector_info.len(), 2);
+        assert_eq!(cloned_vector_info[0].failargs_pos, 1);
+        assert_eq!(
+            cloned_vector_info[0]
+                .prev
+                .as_ref()
+                .map(|info| info.failargs_pos),
+            Some(0)
+        );
     }
 
     #[test]

@@ -3238,7 +3238,7 @@ impl ResumeDataLoopMemo {
         num_env_virtuals: usize,
         numb_state: &NumberingState,
         env: &dyn majit_ir::BoxEnv,
-    ) -> (Vec<majit_ir::RdVirtualInfo>, usize) {
+    ) -> (Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>, usize) {
         // resume.py:460: new_liveboxes = [None] * memo.num_cached_boxes()
         let mut new_boxes_list: Vec<Option<u32>> = vec![None; self.num_cached_boxes()];
         let mut count = 0;
@@ -3276,11 +3276,21 @@ impl ResumeDataLoopMemo {
 
         // resume.py:488-506: create rd_virtuals
         // resume.py:500-501: make_virtual_info(info, fieldnums) via BoxEnv dispatch
-        let mut rd_virtuals: Vec<majit_ir::RdVirtualInfo> = Vec::new();
+        let mut rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>> = Vec::new();
         if !virtual_fields.is_empty() {
             // resume.py:491: length = num_env_virtuals + memo.num_cached_virtuals()
             let length = num_env_virtuals + self.num_cached_virtuals();
-            rd_virtuals.resize(length, majit_ir::RdVirtualInfo::Empty);
+            // PRE-EXISTING-ADAPTATION: resume.py:492 uses `[None] * length` —
+            // holes are represented as Python `None` in the list. Pyre's
+            // `Op::rd_virtuals: Option<Vec<Rc<RdVirtualInfo>>>` wraps the
+            // whole Vec in Option but the INNER element type is not itself
+            // optional. We use the `RdVirtualInfo::Empty` sentinel variant
+            // to mark hole slots; downstream consumers
+            // (compile.rs:644, compiler.rs:10952, state.rs:3180,
+            // eval.rs:2680, resume.rs:1766) match `Empty` and treat it as
+            // `None` equivalent. Functional parity is preserved; the
+            // structural divergence stays isolated to this one type.
+            rd_virtuals.resize(length, std::rc::Rc::new(majit_ir::RdVirtualInfo::Empty));
             // resume.py:493-494: memo.nvirtuals += length; memo.nvholes += length - len(vfieldboxes)
             self.nvirtuals += length;
             self.nvholes += length - virtual_fields.len();
@@ -3660,7 +3670,7 @@ impl ResumeDataLoopMemo {
     ) -> (
         Vec<u8>,
         Vec<(i64, majit_ir::Type)>,
-        Vec<majit_ir::RdVirtualInfo>,
+        Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
         Vec<majit_ir::OpRef>,
         std::collections::HashMap<u32, majit_ir::Type>,
     ) {

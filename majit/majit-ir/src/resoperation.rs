@@ -489,7 +489,11 @@ pub trait BoxEnv {
     /// Dispatches on the virtual type (Virtual, VStruct, VArray, etc.)
     /// to produce the correct variant — matching RPython's
     /// `info.visitor_dispatch_virtual_type(self)` + `vinfo.set_content(fieldnums)`.
-    fn make_virtual_info(&self, _opref: OpRef, _fieldnums: Vec<i16>) -> Option<RdVirtualInfo> {
+    fn make_virtual_info(
+        &self,
+        _opref: OpRef,
+        _fieldnums: Vec<i16>,
+    ) -> Option<std::rc::Rc<RdVirtualInfo>> {
         None
     }
     /// resume.py:504-505 `if vinfo.fieldnums is not fieldnums: memo.nvreused += 1`.
@@ -532,7 +536,10 @@ pub struct Op {
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object field info.
     /// Each entry describes a virtual's type, field descriptors, and fieldnums.
-    pub rd_virtuals: Option<Vec<RdVirtualInfo>>,
+    /// Entries are `Rc<RdVirtualInfo>` so two guards that reference the same
+    /// virtual with the same fieldnums store the SAME object (matching
+    /// RPython's `info._cached_vinfo` identity dedup at resume.py:307-315).
+    pub rd_virtuals: Option<Vec<std::rc::Rc<RdVirtualInfo>>>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
     pub vecinfo: Option<Box<VectorizationInfo>>,

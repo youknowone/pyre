@@ -1320,6 +1320,90 @@ fn materialize_virtual_recursive(
                 unsafe { std::alloc::alloc_zeroed(layout) as i64 }
             }
         }
+        // resume.py:763-779 VStrPlainInfo.allocate /
+        // resume.py:817-829 VUniPlainInfo.allocate — bh_newstr/bh_newunicode
+        // + per-char bh_strsetitem/bh_unicodesetitem. Frontend-provided
+        // callback because the primitives live on pyre-jit's Backend impl.
+        majit_backend::ExitVirtualLayout::StrPlain { is_unicode, chars } => {
+            let resolved_chars: Vec<i64> = chars
+                .iter()
+                .map(|src| {
+                    resolve_virtual_field_value_with_materialized(src, outputs, materialized)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let Some(f) = MATERIALIZE_STR_PLAIN_FN.with(|c| c.get()) else {
+                return 0;
+            };
+            f(*is_unicode, &resolved_chars)
+        }
+        // resume.py:781-796 VStrConcatInfo.allocate /
+        // resume.py:830-848 VUniConcatInfo.allocate —
+        //     left = decoder.decode_ref(fieldnums[0])
+        //     right = decoder.decode_ref(fieldnums[1])
+        //     return string_concat(metainterp_sd, left, right)
+        // string_concat: bh_call_r(func, [], [left, right], [], calldescr).
+        majit_backend::ExitVirtualLayout::StrConcat {
+            is_unicode,
+            func,
+            calldescr,
+            left,
+            right,
+        } => {
+            let left_val =
+                resolve_virtual_field_value_with_materialized(left, outputs, materialized)
+                    .unwrap_or(0);
+            let right_val =
+                resolve_virtual_field_value_with_materialized(right, outputs, materialized)
+                    .unwrap_or(0);
+            let Some(f) = MATERIALIZE_STR_CALL_FN.with(|c| c.get()) else {
+                return 0;
+            };
+            f(*is_unicode, *func, calldescr, &[], &[left_val, right_val])
+        }
+        // resume.py:799-813 VStrSliceInfo.allocate /
+        // resume.py:854-868 VUniSliceInfo.allocate —
+        //     largerstr = decoder.decode_ref(fieldnums[0])
+        //     start = decoder.decode_int(fieldnums[1])
+        //     length = decoder.decode_int(fieldnums[2])
+        //     return slice_string(metainterp_sd, largerstr, start, start + length)
+        // slice_string: bh_call_r(func, [start, stop], [str], [], calldescr).
+        majit_backend::ExitVirtualLayout::StrSlice {
+            is_unicode,
+            func,
+            calldescr,
+            str_src,
+            start,
+            length,
+        } => {
+            let str_val =
+                resolve_virtual_field_value_with_materialized(str_src, outputs, materialized)
+                    .unwrap_or(0);
+            let start_val =
+                resolve_virtual_field_value_with_materialized(start, outputs, materialized)
+                    .unwrap_or(0);
+            let length_val =
+                resolve_virtual_field_value_with_materialized(length, outputs, materialized)
+                    .unwrap_or(0);
+            // resume.py:1474 / 1501 — slice_string(str, start, start + length)
+            // passes the stop index, not the length.
+            let stop_val = start_val + length_val;
+            let Some(f) = MATERIALIZE_STR_CALL_FN.with(|c| c.get()) else {
+                return 0;
+            };
+            f(
+                *is_unicode,
+                *func,
+                calldescr,
+                &[start_val, stop_val],
+                &[str_val],
+            )
+        }
+        // Remaining variants — Array, ArrayStruct, RawBuffer, RawSlice
+        // — are still frontend-ceded because the host allocator
+        // (allocate_array / new_raw_buffer) is not yet exposed through
+        // a backend callback. The frontend's rebuild pass overwrites
+        // the null pointer produced here with the real allocation.
         _ => return 0,
     };
 
@@ -1505,6 +1589,45 @@ thread_local! {
 /// Register the virtual materialization callback. Called from pyre-jit init.
 pub fn register_rebuild_state_after_failure(f: RebuildStateAfterFailureFn) {
     REBUILD_STATE_AFTER_FAILURE.with(|c| c.set(Some(f)));
+}
+
+/// resume.py:763-779 VStrPlainInfo.allocate / resume.py:817-829
+/// VUniPlainInfo.allocate parity — materialize a Plain string/unicode
+/// virtual from per-character fieldnums. Frontend implements via
+/// `backend.bh_newstr` + `backend.bh_strsetitem` (or the unicode
+/// variants). Returns the materialized string pointer as i64.
+pub type MaterializeStrPlainFn = fn(is_unicode: bool, chars: &[i64]) -> i64;
+
+/// resume.py:1143-1188 parity — materialize a Concat / Slice string
+/// virtual by invoking `cpu.bh_call_r(func, args_i, args_r, descr)`.
+/// Concat: args_i=[], args_r=[left, right] (resume.py:1462-1470 /
+/// resume.py:1489-1497). Slice: args_i=[start, stop], args_r=[str]
+/// (resume.py:1472-1480 / resume.py:1499-1507, stop = start + length).
+pub type MaterializeStrCallFn = fn(
+    is_unicode: bool,
+    func: i64,
+    calldescr: &majit_ir::DescrRef,
+    args_i: &[i64],
+    args_r: &[i64],
+) -> i64;
+
+thread_local! {
+    static MATERIALIZE_STR_PLAIN_FN: std::cell::Cell<Option<MaterializeStrPlainFn>> =
+        const { std::cell::Cell::new(None) };
+    static MATERIALIZE_STR_CALL_FN: std::cell::Cell<Option<MaterializeStrCallFn>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Register the VStrPlain/VUniPlain materialization callback.
+/// Called from pyre-jit init.
+pub fn register_materialize_str_plain(f: MaterializeStrPlainFn) {
+    MATERIALIZE_STR_PLAIN_FN.with(|c| c.set(Some(f)));
+}
+
+/// Register the VStrConcat/VStrSlice/VUniConcat/VUniSlice materialization
+/// callback. Called from pyre-jit init.
+pub fn register_materialize_str_call(f: MaterializeStrCallFn) {
+    MATERIALIZE_STR_CALL_FN.with(|c| c.set(Some(f)));
 }
 
 /// Frame state to restore from guard failure fail_args.
@@ -5191,6 +5314,10 @@ pub struct CraneliftBackend {
     /// Set by `set_constant_types` before each compile call; used by
     /// the GC rewriter to check `v.type == 'r'` on constant values.
     constant_types: HashMap<u32, majit_ir::Type>,
+    /// compile.py: self.metainterp_sd.callinfocollection — used by
+    /// recovery_layout building for VStr/VUni Concat/Slice func ptr
+    /// lookups (resume.py:1143-1188).
+    callinfocollection: Option<Arc<majit_ir::CallInfoCollection>>,
     func_counter: u32,
     gc_runtime_id: Option<u64>,
     trace_counter: u64,
@@ -5340,6 +5467,7 @@ impl CraneliftBackend {
             func_ctx,
             constants: HashMap::new(),
             constant_types: HashMap::new(),
+            callinfocollection: None,
             func_counter: 0,
             gc_runtime_id: None,
             trace_counter: 1,
@@ -5353,6 +5481,14 @@ impl CraneliftBackend {
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
         }
+    }
+
+    /// compile.py plumbing: register the shared `CallInfoCollection` so
+    /// that recovery_layout building can resolve OS_STR_CONCAT etc.
+    /// function pointers for VStr/VUni Concat/Slice guard-exit
+    /// materialization (resume.py:1143-1188).
+    pub fn set_callinfocollection(&mut self, cic: Option<Arc<majit_ir::CallInfoCollection>>) {
+        self.callinfocollection = cic;
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
@@ -5809,6 +5945,7 @@ impl CraneliftBackend {
             caller_layout,
             &self.constants,
             self.gc_runtime_id,
+            self.callinfocollection.as_deref(),
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
@@ -10490,6 +10627,7 @@ fn collect_guards(
     caller_layout: Option<&ExitRecoveryLayout>,
     constants: &HashMap<u32, i64>,
     gc_runtime_id: Option<u64>,
+    callinfocollection: Option<&majit_ir::CallInfoCollection>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
@@ -10721,7 +10859,8 @@ fn collect_guards(
             // Build virtual_layouts from rd_virtuals or rd_virtuals.
             recovery_layout.virtual_layouts.clear();
             if let Some(rd_vi_slice) = rd_vi {
-                for (vidx, entry) in rd_vi_slice.iter().enumerate() {
+                for (vidx, entry_rc) in rd_vi_slice.iter().enumerate() {
+                    let entry: &majit_ir::RdVirtualInfo = entry_rc.as_ref();
                     let target_slot = vidx_to_slot.get(&vidx).copied();
                     let layout = match entry {
                         majit_ir::RdVirtualInfo::VirtualInfo {
@@ -10844,24 +10983,85 @@ fn collect_guards(
                                     .unwrap_or(ExitValueSourceLayout::Constant(0)),
                             }
                         }
-                        // resume.py:763-870 VStr/VUni*Info — virtual string
-                        // materialization requires `decoder.allocate_string`,
-                        // `string_setitem`, `concat_strings`, `slice_string`
-                        // from the host runtime. Until vstring.py's producer
-                        // side (info.py:142 VStringPlainInfo force_box etc.)
-                        // is ported, these variants must not reach recovery.
-                        // Fail loudly if a producer does emit one.
-                        majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
-                        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
-                        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
-                        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
-                        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-                        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
-                            panic!(
-                                "cranelift recovery: VStr/VUni RdVirtualInfo \
-                                 reached without vstring.py materialization \
-                                 support (see resume.py:763-870)"
-                            )
+                        // resume.py:763 VStrPlainInfo / resume.py:817
+                        // VUniPlainInfo — length = len(fieldnums).
+                        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
+                            let chars = fieldnums
+                                .iter()
+                                .map(|&fnum| resolve_fieldnum(fnum))
+                                .collect();
+                            ExitVirtualLayout::StrPlain {
+                                is_unicode: false,
+                                chars,
+                            }
+                        }
+                        majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
+                            let chars = fieldnums
+                                .iter()
+                                .map(|&fnum| resolve_fieldnum(fnum))
+                                .collect();
+                            ExitVirtualLayout::StrPlain {
+                                is_unicode: true,
+                                chars,
+                            }
+                        }
+                        // resume.py:781 VStrConcatInfo / resume.py:836
+                        // VUniConcatInfo — decoder.concat_strings(left, right).
+                        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
+                        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+                            let is_unicode =
+                                matches!(entry, majit_ir::RdVirtualInfo::VUniConcatInfo { .. });
+                            let oopspec = if is_unicode {
+                                majit_ir::effectinfo::OopSpecIndex::UniConcat
+                            } else {
+                                majit_ir::effectinfo::OopSpecIndex::StrConcat
+                            };
+                            let cic = callinfocollection.expect(
+                                "collect_guards: callinfocollection required for \
+                                 VStr/VUni Concat guard-exit recovery",
+                            );
+                            let (calldescr, func) = cic
+                                .callinfo_for_oopspec(oopspec)
+                                .expect("callinfo_for_oopspec missing OS_STR_CONCAT/OS_UNI_CONCAT");
+                            let left = resolve_fieldnum(fieldnums[0]);
+                            let right = resolve_fieldnum(fieldnums[1]);
+                            ExitVirtualLayout::StrConcat {
+                                is_unicode,
+                                func: *func as i64,
+                                calldescr: calldescr.clone(),
+                                left,
+                                right,
+                            }
+                        }
+                        // resume.py:801 VStrSliceInfo / resume.py:856
+                        // VUniSliceInfo — decoder.slice_string(str, start, length).
+                        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
+                        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+                            let is_unicode =
+                                matches!(entry, majit_ir::RdVirtualInfo::VUniSliceInfo { .. });
+                            let oopspec = if is_unicode {
+                                majit_ir::effectinfo::OopSpecIndex::UniSlice
+                            } else {
+                                majit_ir::effectinfo::OopSpecIndex::StrSlice
+                            };
+                            let cic = callinfocollection.expect(
+                                "collect_guards: callinfocollection required for \
+                                 VStr/VUni Slice guard-exit recovery",
+                            );
+                            let (calldescr, func) = cic
+                                .callinfo_for_oopspec(oopspec)
+                                .expect("callinfo_for_oopspec missing OS_STR_SLICE/OS_UNI_SLICE");
+                            let str_src = resolve_fieldnum(fieldnums[0]);
+                            let start = resolve_fieldnum(fieldnums[1]);
+                            let length = resolve_fieldnum(fieldnums[2]);
+                            ExitVirtualLayout::StrSlice {
+                                is_unicode,
+                                func: *func as i64,
+                                calldescr: calldescr.clone(),
+                                str_src,
+                                start,
+                                length,
+                            }
                         }
                         majit_ir::RdVirtualInfo::Empty => continue,
                     };
@@ -11307,6 +11507,16 @@ impl majit_backend::Backend for CraneliftBackend {
             }
         }
         (0, 0)
+    }
+
+    /// resume.py:1143-1188 parity — publish `metainterp.staticdata.
+    /// callinfocollection` so the guard-exit recovery builder at
+    /// `collect_guards` can resolve OS_STR_CONCAT / OS_UNI_CONCAT /
+    /// OS_STR_SLICE / OS_UNI_SLICE func pointers for VStr/VUni
+    /// Concat/Slice materialization. Forwards to the inherent
+    /// [`CraneliftBackend::set_callinfocollection`].
+    fn set_callinfocollection(&mut self, cic: Option<Arc<majit_ir::CallInfoCollection>>) {
+        CraneliftBackend::set_callinfocollection(self, cic);
     }
 
     fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {

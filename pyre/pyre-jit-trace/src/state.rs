@@ -2615,11 +2615,41 @@ impl PyreJitState {
 /// the existing vable scalar override path. The helper is added now so
 /// future setup_bridge_sym work can drop the OpRef::NONE fallback for
 /// RebuiltValue::Virtual without re-deriving the materialization logic.
+/// resume.py:1143-1188 shared oopspec-call emitter for the four
+/// concat/slice materializers. Looks up the call info via
+/// `ctx.callinfocollection` and emits a `CALL_R(func, args...)` with the
+/// matching calldescr. Panics if `callinfocollection` is not attached to
+/// the TraceCtx (should never happen once pyjitpl wiring is complete).
+#[allow(dead_code)]
+fn emit_stroruni_oopspec_call(
+    ctx: &mut majit_metainterp::TraceCtx,
+    oopspec: majit_ir::effectinfo::OopSpecIndex,
+    args: &[OpRef],
+) -> OpRef {
+    let cic = ctx
+        .callinfocollection
+        .as_ref()
+        .expect(
+            "TraceCtx.callinfocollection missing — bridge-virtual VStr/VUni \
+             Concat/Slice materialization requires pyjitpl to populate it \
+             (resume.py:1143-1188)",
+        )
+        .clone();
+    let (calldescr, func) = cic
+        .callinfo_for_oopspec(oopspec)
+        .expect("callinfo_for_oopspec missing entry for VStr/VUni oopspec");
+    let func_const = ctx.const_int(*func as i64);
+    let mut call_args = Vec::with_capacity(1 + args.len());
+    call_args.push(func_const);
+    call_args.extend_from_slice(args);
+    ctx.record_op_with_descr(majit_ir::OpCode::CallR, &call_args, calldescr.clone())
+}
+
 #[allow(dead_code)]
 fn materialize_bridge_virtual(
     ctx: &mut majit_metainterp::TraceCtx,
     vidx: usize,
-    rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &majit_metainterp::ResumeDataResult,
     cache: &mut std::collections::HashMap<usize, OpRef>,
 ) -> OpRef {
@@ -2648,7 +2678,7 @@ fn materialize_bridge_virtual(
     fn decode_fieldnum(
         ctx: &mut majit_metainterp::TraceCtx,
         tagged: i16,
-        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         resume_data: &majit_metainterp::ResumeDataResult,
         cache: &mut std::collections::HashMap<usize, OpRef>,
     ) -> OpRef {
@@ -2718,7 +2748,7 @@ fn materialize_bridge_virtual(
         fielddescrs: &[majit_ir::FieldDescrInfo],
         fieldnums: &[i16],
         parent_descr: majit_ir::DescrRef,
-        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         resume_data: &majit_metainterp::ResumeDataResult,
         cache: &mut std::collections::HashMap<usize, OpRef>,
     ) {
@@ -2750,7 +2780,7 @@ fn materialize_bridge_virtual(
         }
     }
 
-    match entry {
+    match entry.as_ref() {
         // resume.py:612-621 VirtualInfo.allocate
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
@@ -2832,7 +2862,10 @@ fn materialize_bridge_virtual(
             descr_index,
             ..
         } => {
-            let clear = matches!(entry, majit_ir::RdVirtualInfo::VArrayInfoClear { .. });
+            let clear = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
+            );
             let kind = *kind;
             let descr_index = *descr_index;
             let length = fieldnums.len();
@@ -3015,23 +3048,156 @@ fn materialize_bridge_virtual(
             }
             buffer
         }
-        // resume.py:763-870 VStr/VUni*Info — bridge-virtual materialization
-        // for virtual strings requires vstring.py force_box port (info.py:142
-        // VStringPlainInfo etc.) + host runtime hooks for allocate_string /
-        // string_setitem / concat_strings / slice_string. Until those land,
-        // the bridge tracer must fail loudly on these variants rather than
-        // return NONE and corrupt downstream OpRef references.
-        majit_ir::RdVirtualInfo::VStrPlainInfo { .. }
-        | majit_ir::RdVirtualInfo::VStrConcatInfo { .. }
-        | majit_ir::RdVirtualInfo::VStrSliceInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-        | majit_ir::RdVirtualInfo::VUniSliceInfo { .. } => {
-            panic!(
-                "pyre-jit-trace bridge-virtual: VStr/VUni RdVirtualInfo \
-                 reached without vstring.py materialization support \
-                 (see resume.py:763-870)"
-            )
+        // resume.py:766-775 VStrPlainInfo.allocate / resume.py:820-829
+        // VUniPlainInfo.allocate — `ResumeDataBoxReader.allocate_string /
+        // allocate_unicode` followed by `string_setitem` / `unicode_setitem`
+        // per character.
+        //
+        //     length = len(self.fieldnums)
+        //     string = decoder.allocate_string(length)        # NEWSTR
+        //     decoder.virtuals_cache.set_ptr(index, string)
+        //     for i in range(length):
+        //         charnum = self.fieldnums[i]
+        //         if not tagged_eq(charnum, UNINITIALIZED):
+        //             decoder.string_setitem(string, i, charnum)  # STRSETITEM
+        //     return string
+        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
+            let is_unicode = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VUniPlainInfo { .. }
+            );
+            let length = fieldnums.len();
+            let length_ref = ctx.const_int(length as i64);
+            let (alloc_opcode, set_opcode) = if is_unicode {
+                (OpCode::Newunicode, OpCode::Unicodesetitem)
+            } else {
+                (OpCode::Newstr, OpCode::Strsetitem)
+            };
+            // resume.py:769: string = decoder.allocate_string(length)
+            let string = ctx.record_op(alloc_opcode, &[length_ref]);
+            // resume.py:770: decoder.virtuals_cache.set_ptr(index, string)
+            cache.insert(vidx, string);
+            // resume.py:771-774: string_setitem for each filled char.
+            for (i, &charnum) in fieldnums.iter().enumerate() {
+                if charnum == majit_ir::resumedata::UNINITIALIZED_TAG {
+                    continue;
+                }
+                // resume.py:1138-1141 ResumeDataBoxReader.string_setitem:
+                //   charbox = self.decode_box(charnum, INT)
+                //   execute_and_record(rop.STRSETITEM, string, ConstInt(index), charbox)
+                let charbox = decode_fieldnum(ctx, charnum, rd_virtuals, resume_data, cache);
+                if charbox.is_none() {
+                    continue;
+                }
+                let idx_ref = ctx.const_int(i as i64);
+                ctx.record_op(set_opcode, &[string, idx_ref, charbox]);
+            }
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} V{}PlainInfo(length={}) → OpRef({})",
+                    vidx,
+                    if is_unicode { "Uni" } else { "Str" },
+                    length,
+                    string.0,
+                );
+            }
+            string
+        }
+        // resume.py:785-793 VStrConcatInfo.allocate / resume.py:840-848
+        // VUniConcatInfo.allocate:
+        //
+        //     left, right = self.fieldnums
+        //     string = decoder.concat_strings(left, right)   # CALL_R(OS_STR_CONCAT)
+        //     decoder.virtuals_cache.set_ptr(index, string)
+        //
+        // `ResumeDataBoxReader.concat_strings` at resume.py:1143-1149:
+        //
+        //     cic = self.metainterp.staticdata.callinfocollection
+        //     calldescr, func = cic.callinfo_for_oopspec(OS_STR_CONCAT)
+        //     str1box = self.decode_box(str1num, REF)
+        //     str2box = self.decode_box(str2num, REF)
+        //     execute_and_record_varargs(CALL_R, [ConstInt(func), str1box, str2box], calldescr)
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+            let is_unicode = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
+            );
+            debug_assert_eq!(
+                fieldnums.len(),
+                2,
+                "VStr/VUniConcatInfo must have exactly 2 fieldnums (left, right)"
+            );
+            let left = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
+            let right = decode_fieldnum(ctx, fieldnums[1], rd_virtuals, resume_data, cache);
+            let oopspec = if is_unicode {
+                majit_ir::effectinfo::OopSpecIndex::UniConcat
+            } else {
+                majit_ir::effectinfo::OopSpecIndex::StrConcat
+            };
+            let string = emit_stroruni_oopspec_call(ctx, oopspec, &[left, right]);
+            cache.insert(vidx, string);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} V{}ConcatInfo → OpRef({})",
+                    vidx,
+                    if is_unicode { "Uni" } else { "Str" },
+                    string.0,
+                );
+            }
+            string
+        }
+        // resume.py:805-809 VStrSliceInfo.allocate / resume.py:860-864
+        // VUniSliceInfo.allocate:
+        //
+        //     largerstr, start, length = self.fieldnums
+        //     string = decoder.slice_string(largerstr, start, length)
+        //     decoder.virtuals_cache.set_ptr(index, string)
+        //
+        // `ResumeDataBoxReader.slice_string` at resume.py:1151-1160 /
+        // `slice_unicode` at resume.py:1179-1188:
+        //
+        //     cic = self.metainterp.staticdata.callinfocollection
+        //     calldescr, func = cic.callinfo_for_oopspec(OS_STR_SLICE)
+        //     strbox = self.decode_box(strnum, REF)
+        //     startbox = self.decode_box(startnum, INT)
+        //     lengthbox = self.decode_box(lengthnum, INT)
+        //     stopbox = execute_and_record(INT_ADD, startbox, lengthbox)
+        //     execute_and_record_varargs(CALL_R,
+        //         [ConstInt(func), strbox, startbox, stopbox], calldescr)
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+            let is_unicode = matches!(
+                entry.as_ref(),
+                majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
+            );
+            debug_assert_eq!(
+                fieldnums.len(),
+                3,
+                "VStr/VUniSliceInfo must have exactly 3 fieldnums (largerstr, start, length)"
+            );
+            let largerstr = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
+            let start = decode_fieldnum(ctx, fieldnums[1], rd_virtuals, resume_data, cache);
+            let length = decode_fieldnum(ctx, fieldnums[2], rd_virtuals, resume_data, cache);
+            // resume.py:1157-1158 / :1185-1186: stopbox = INT_ADD(startbox, lengthbox)
+            let stop = ctx.record_op(OpCode::IntAdd, &[start, length]);
+            let oopspec = if is_unicode {
+                majit_ir::effectinfo::OopSpecIndex::UniSlice
+            } else {
+                majit_ir::effectinfo::OopSpecIndex::StrSlice
+            };
+            let string = emit_stroruni_oopspec_call(ctx, oopspec, &[largerstr, start, stop]);
+            cache.insert(vidx, string);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-virtual] vidx={} V{}SliceInfo → OpRef({})",
+                    vidx,
+                    if is_unicode { "Uni" } else { "Str" },
+                    string.0,
+                );
+            }
+            string
         }
         majit_ir::RdVirtualInfo::Empty => OpRef::NONE,
     }
@@ -3145,7 +3311,7 @@ impl JitState for PyreJitState {
         sym: &mut Self::Sym,
         ctx: &mut majit_metainterp::TraceCtx,
         resume_data: &majit_metainterp::ResumeDataResult,
-        rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         fail_values: &[i64],
         fail_types: &[Type],
     ) {

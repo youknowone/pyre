@@ -283,7 +283,7 @@ pub struct StrPtrInfo {
     /// Same semantics as the sibling Virtual/VirtualArray/... variants:
     /// `make_virtual_info` dedups across finish() calls by comparing
     /// fieldnums (resume.py:309-314).
-    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
@@ -1219,7 +1219,9 @@ impl PtrInfo {
     /// non-virtual variants. `make_virtual_info` (resume.py:307-315) uses
     /// this to dedup RdVirtualInfo allocations across multiple finish()
     /// calls that reference the same virtual.
-    pub fn cached_vinfo(&self) -> Option<&std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>> {
+    pub fn cached_vinfo(
+        &self,
+    ) -> Option<&std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>> {
         match self {
             PtrInfo::Virtual(v) => Some(&v.cached_vinfo),
             PtrInfo::VirtualStruct(v) => Some(&v.cached_vinfo),
@@ -2491,7 +2493,7 @@ pub struct VirtualInfo {
     /// dedup (resume.py:309-314). RefCell for interior mutability so
     /// the immutable-receiver `make_virtual_info` trait method can
     /// populate the cache on first miss.
-    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// A virtual array.
@@ -2506,7 +2508,7 @@ pub struct VirtualArrayInfo {
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// A non-virtual object with cached field info.
@@ -2571,7 +2573,7 @@ pub struct VirtualStructInfo {
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// A virtual array of structs (interior field access pattern).
@@ -2591,7 +2593,7 @@ pub struct VirtualArrayStructInfo {
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// info.py:RawSlicePtrInfo — alias view into a parent virtual raw buffer.
@@ -2611,7 +2613,7 @@ pub struct VirtualRawSliceInfo {
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// A virtual raw memory buffer.
@@ -2638,7 +2640,7 @@ pub struct VirtualRawBufferInfo {
     /// Saved from the original CALL_I op during virtualization.
     pub calldescr: Option<DescrRef>,
     /// info.py `_cached_vinfo` — see VirtualInfo.cached_vinfo.
-    pub cached_vinfo: std::cell::RefCell<Option<majit_ir::RdVirtualInfo>>,
+    pub cached_vinfo: std::cell::RefCell<Option<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
 }
 
 /// Error returned when a raw buffer operation violates invariants.

@@ -31,8 +31,10 @@ pub struct DynasmFailDescr {
     pub rd_numb: Option<Vec<u8>>,
     /// resume.py:451 — shared constant pool referenced by rd_numb.
     pub rd_consts: Option<Vec<(i64, Type)>>,
-    /// resume.py:488 — virtual object field info.
-    pub rd_virtuals: Option<Vec<RdVirtualInfo>>,
+    /// resume.py:488 — virtual object field info. Entries are
+    /// `Rc<RdVirtualInfo>` so cache-hit dedup at resume.py:307-315 preserves
+    /// object identity across guard boundaries.
+    pub rd_virtuals: Option<Vec<std::rc::Rc<RdVirtualInfo>>>,
     /// Deferred heap writes (SETFIELD_GC/SETARRAYITEM_GC with virtual values).
     pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,
     /// Backend-origin recovery layout, built at compile time from fail_arg_types.

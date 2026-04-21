@@ -6,6 +6,21 @@ use majit_ir::{AccumInfo, DescrRef, FailDescr, Type};
 
 use crate::resume::ResumeData;
 
+fn push_vector_info(head: &mut Option<Box<AccumInfo>>, mut info: AccumInfo) {
+    info.prev = head.take();
+    *head = Some(Box::new(info));
+}
+
+fn flatten_vector_info(head: Option<&AccumInfo>) -> Vec<AccumInfo> {
+    let mut result = Vec::new();
+    let mut current = head;
+    while let Some(info) = current {
+        result.push(info.clone());
+        current = info.prev.as_deref();
+    }
+    result
+}
+
 /// Global counter for unique fail_index allocation.
 ///
 /// Mirrors RPython's ResumeGuardDescr numbering — each guard in every
@@ -35,7 +50,7 @@ struct MetaFailDescr {
     types: Vec<Type>,
     /// schedule.py:654: vector accumulation info attached during vectorization.
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
-    vector_info: UnsafeCell<Vec<AccumInfo>>,
+    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
 }
 
 // Safety: JIT is single-threaded. UnsafeCell replaces Mutex for rd_vector_info.
@@ -55,7 +70,7 @@ impl majit_ir::Descr for MetaFailDescr {
         Some(Arc::new(MetaFailDescr {
             fail_index: alloc_fail_index(),
             types: self.types.clone(),
-            vector_info: UnsafeCell::new(self.vector_info().clone()),
+            vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
         }))
     }
 }
@@ -68,10 +83,10 @@ impl FailDescr for MetaFailDescr {
         &self.types
     }
     fn attach_vector_info(&self, info: AccumInfo) {
-        unsafe { &mut *self.vector_info.get() }.push(info);
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
-        unsafe { &mut *self.vector_info.get() }.clone()
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
     }
 }
 
@@ -87,7 +102,7 @@ struct ResumeGuardDescr {
     types: Vec<Type>,
     resume_data: ResumeData,
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
-    vector_info: UnsafeCell<Vec<AccumInfo>>,
+    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
 }
 
 unsafe impl Send for ResumeGuardDescr {}
@@ -106,7 +121,7 @@ impl majit_ir::Descr for ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: self.types.clone(),
             resume_data: self.resume_data.clone(),
-            vector_info: UnsafeCell::new(self.vector_info().clone()),
+            vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
         }))
     }
 }
@@ -119,10 +134,10 @@ impl FailDescr for ResumeGuardDescr {
         &self.types
     }
     fn attach_vector_info(&self, info: AccumInfo) {
-        unsafe { &mut *self.vector_info.get() }.push(info);
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
-        unsafe { &mut *self.vector_info.get() }.clone()
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
     }
 }
 
@@ -143,7 +158,7 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index: alloc_fail_index(),
         types: vec![Type::Int; num_live],
-        vector_info: UnsafeCell::new(Vec::new()),
+        vector_info: UnsafeCell::new(None),
     })
 }
 
@@ -156,7 +171,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
     Arc::new(MetaFailDescr {
         fail_index,
         types: vec![Type::Int; num_live],
-        vector_info: UnsafeCell::new(Vec::new()),
+        vector_info: UnsafeCell::new(None),
     })
 }
 
@@ -165,7 +180,7 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index: alloc_fail_index(),
         types,
-        vector_info: UnsafeCell::new(Vec::new()),
+        vector_info: UnsafeCell::new(None),
     })
 }
 
@@ -216,10 +231,10 @@ impl FailDescr for ResumeAtPositionDescr {
         &self.inner.types
     }
     fn attach_vector_info(&self, info: AccumInfo) {
-        unsafe { &mut *self.inner.vector_info.get() }.push(info);
+        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
-        unsafe { &mut *self.inner.vector_info.get() }.clone()
+        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
     }
 }
 
@@ -237,7 +252,7 @@ pub fn make_resume_at_position_descr() -> DescrRef {
                 virtuals: Vec::new(),
                 pending_fields: Vec::new(),
             },
-            vector_info: UnsafeCell::new(Vec::new()),
+            vector_info: UnsafeCell::new(None),
         },
     })
 }
@@ -253,7 +268,7 @@ pub fn make_resume_at_position_descr_with_data(
             fail_index: alloc_fail_index(),
             types,
             resume_data,
-            vector_info: UnsafeCell::new(Vec::new()),
+            vector_info: UnsafeCell::new(None),
         },
     })
 }
@@ -268,7 +283,7 @@ pub struct CompileLoopVersionDescr {
     fail_index: u32,
     types: Vec<Type>,
     resume_data: ResumeData,
-    vector_info: UnsafeCell<Vec<AccumInfo>>,
+    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
 }
 
 unsafe impl Send for CompileLoopVersionDescr {}
@@ -287,7 +302,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
             fail_index: alloc_fail_index(),
             types: self.types.clone(),
             resume_data: self.resume_data.clone(),
-            vector_info: UnsafeCell::new(self.vector_info().clone()),
+            vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
         }))
     }
 }
@@ -308,10 +323,10 @@ impl FailDescr for CompileLoopVersionDescr {
         true
     }
     fn attach_vector_info(&self, info: AccumInfo) {
-        unsafe { &mut *self.vector_info.get() }.push(info);
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
-        unsafe { &mut *self.vector_info.get() }.clone()
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
     }
 }
 
@@ -322,7 +337,7 @@ pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData)
         fail_index: alloc_fail_index(),
         types: vec![Type::Int; num_live],
         resume_data,
-        vector_info: UnsafeCell::new(Vec::new()),
+        vector_info: UnsafeCell::new(None),
     })
 }
 
@@ -361,7 +376,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
             pending_fields: Vec::new(),
         },
         // guard.py:91: descr.rd_vector_info = None
-        vector_info: UnsafeCell::new(Vec::new()),
+        vector_info: UnsafeCell::new(None),
     })
 }
 
@@ -379,6 +394,50 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_attach_vector_info_builds_prev_chain() {
+        let descr = make_fail_descr(2);
+        let fail_descr = descr.as_fail_descr().unwrap();
+        fail_descr.attach_vector_info(AccumInfo {
+            prev: None,
+            failargs_pos: 0,
+            variable: majit_ir::OpRef(10),
+            location: majit_ir::OpRef(20),
+            accum_operation: '+',
+            scalar: majit_ir::OpRef::NONE,
+        });
+        fail_descr.attach_vector_info(AccumInfo {
+            prev: None,
+            failargs_pos: 1,
+            variable: majit_ir::OpRef(11),
+            location: majit_ir::OpRef(21),
+            accum_operation: '*',
+            scalar: majit_ir::OpRef::NONE,
+        });
+
+        let vector_info = fail_descr.vector_info();
+        assert_eq!(vector_info.len(), 2);
+        assert_eq!(vector_info[0].failargs_pos, 1);
+        assert_eq!(vector_info[1].failargs_pos, 0);
+        assert_eq!(
+            vector_info[0].prev.as_ref().map(|info| info.failargs_pos),
+            Some(0)
+        );
+        assert!(vector_info[1].prev.is_none());
+
+        let cloned = descr.clone_descr().unwrap();
+        let cloned_vector_info = cloned.as_fail_descr().unwrap().vector_info();
+        assert_eq!(cloned_vector_info.len(), 2);
+        assert_eq!(cloned_vector_info[0].failargs_pos, 1);
+        assert_eq!(
+            cloned_vector_info[0]
+                .prev
+                .as_ref()
+                .map(|info| info.failargs_pos),
+            Some(0)
+        );
+    }
 
     #[test]
     fn test_fail_descr_unique_indices() {

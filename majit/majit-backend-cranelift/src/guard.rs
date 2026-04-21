@@ -162,7 +162,7 @@ pub struct CraneliftFailDescr {
     /// resume.py:451 — shared constant pool referenced by `rd_numb`.
     pub rd_consts: Option<Vec<(i64, Type)>>,
     /// resume.py:488 — virtual object field info referenced by `rd_numb`.
-    pub rd_virtuals: Option<Vec<majit_ir::RdVirtualInfo>>,
+    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
     /// Deferred heap writes associated with this guard exit.
     pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }

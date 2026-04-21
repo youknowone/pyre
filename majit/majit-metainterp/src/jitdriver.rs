@@ -545,7 +545,7 @@ impl<S: JitState> JitDriver<S> {
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-    ) -> Option<Vec<majit_ir::RdVirtualInfo>> {
+    ) -> Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>> {
         self.meta.get_rd_virtuals(green_key, trace_id, fail_index)
     }
 

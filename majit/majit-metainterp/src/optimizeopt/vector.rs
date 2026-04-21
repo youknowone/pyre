@@ -234,12 +234,8 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                 if let Some(ref descr) = op.descr {
                     if let Some(fail_descr) = descr.as_fail_descr() {
                         fail_descr.attach_vector_info(majit_ir::AccumInfo {
-                            // resume.py:31 prev — built at construction time;
-                            // attach_vector_info pushes onto a Vec whose end-of-list
-                            // equivalent is `None`. If multiple AccumInfos are
-                            // attached during scheduling, the visit order is the
-                            // Vec iteration order (no producer currently chains
-                            // them explicitly).
+                            // resume.py:31 prev — attach_vector_info links this
+                            // node onto descr.rd_vector_info and fills prev.
                             prev: None,
                             failargs_pos: fi,
                             variable: *arg,

@@ -221,7 +221,7 @@ pub trait JitState: Sized {
         _sym: &mut Self::Sym,
         _ctx: &mut crate::trace_ctx::TraceCtx,
         _resume_data: &ResumeDataResult,
-        _rd_virtuals: Option<&[majit_ir::RdVirtualInfo]>,
+        _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         _fail_values: &[i64],
         _fail_types: &[Type],
     ) {
