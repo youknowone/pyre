@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::{
-    BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, LinkRef,
-    SpaceOperation, Variable, checkgraph, mkentrymap,
+    BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue,
+    HostObject, LinkRef, SpaceOperation, Variable, checkgraph, mkentrymap,
 };
 use crate::translator::backendopt::ssa::DataFlowFamilyBuilder;
 
@@ -345,6 +345,113 @@ pub fn remove_identical_vars(graph: &FunctionGraph) {
                     link.borrow_mut().args.remove(*i);
                 }
             }
+        }
+    }
+}
+
+/// RPython `remove_assertion_errors(graph)` (simplify.py:321-346).
+///
+/// ```python
+/// def remove_assertion_errors(graph):
+///     """Remove branches that go directly to raising an AssertionError,
+///     assuming that AssertionError shouldn't occur at run-time.  Note that
+///     this is how implicit exceptions are removed (see _implicit_ in
+///     flowcontext.py).
+///     """
+///     for block in list(graph.iterblocks()):
+///         for i in range(len(block.exits)-1, -1, -1):
+///             exit = block.exits[i]
+///             if not (exit.target is graph.exceptblock and
+///                     exit.args[0] == Constant(AssertionError)):
+///                 continue
+///             if len(block.exits) < 2:
+///                 break
+///             if block.canraise:
+///                 if exit.exitcase is None:
+///                     break
+///                 if len(block.exits) == 2:
+///                     block.exitswitch = None
+///                     exit.exitcase = None
+///             lst = list(block.exits)
+///             del lst[i]
+///             block.recloseblock(*lst)
+/// ```
+pub fn remove_assertion_errors(graph: &FunctionGraph) {
+    // upstream: `for block in list(graph.iterblocks())` — snapshot
+    // blocks so recloseblock mid-iteration is safe.
+    let assert_err_class: HostObject = HOST_ENV
+        .lookup_builtin("AssertionError")
+        .expect("HOST_ENV missing AssertionError");
+    let exceptblock_key = BlockKey::of(&graph.exceptblock);
+
+    for block in graph.iterblocks() {
+        let mut i = block.borrow().exits.len();
+        while i > 0 {
+            i -= 1;
+            let (targets_except, args_is_assert_err, canraise, exitcase_none, exits_len) = {
+                let b = block.borrow();
+                let Some(exit) = b.exits.get(i) else {
+                    break;
+                };
+                let exit_b = exit.borrow();
+                let targets_except = exit_b
+                    .target
+                    .as_ref()
+                    .map(|t| BlockKey::of(t) == exceptblock_key)
+                    .unwrap_or(false);
+                let args_first = exit_b.args.first().cloned().flatten();
+                let args_is_assert_err = matches!(
+                    args_first,
+                    Some(Hlvalue::Constant(Constant {
+                        value: ConstValue::HostObject(ref h),
+                        ..
+                    })) if h == &assert_err_class
+                );
+                (
+                    targets_except,
+                    args_is_assert_err,
+                    b.canraise(),
+                    exit_b.exitcase.is_none(),
+                    b.exits.len(),
+                )
+            };
+
+            // upstream: `if not (exit.target is graph.exceptblock and
+            // exit.args[0] == Constant(AssertionError)): continue`.
+            if !(targets_except && args_is_assert_err) {
+                continue;
+            }
+            // upstream: `if len(block.exits) < 2: break`.
+            if exits_len < 2 {
+                break;
+            }
+            if canraise {
+                // upstream: `if exit.exitcase is None: break`.
+                if exitcase_none {
+                    break;
+                }
+                // upstream: `if len(block.exits) == 2: block.exitswitch
+                // = None; exit.exitcase = None` — the surviving exit
+                // (the non-i one) gets promoted to an unconditional
+                // link below once we delete exit i.
+                if exits_len == 2 {
+                    // upstream mutates the `exit` being removed to
+                    // have `exitcase = None`, but since we drop it in
+                    // the same block this is effectively no-op for
+                    // the outcome. Still mirror the mutation for
+                    // parity — a reader reconstructing upstream
+                    // semantics shouldn't be surprised.
+                    block.borrow_mut().exitswitch = None;
+                    if let Some(e) = block.borrow().exits.get(i) {
+                        e.borrow_mut().exitcase = None;
+                    }
+                }
+            }
+            // upstream: `lst = list(block.exits); del lst[i];
+            // block.recloseblock(*lst)`.
+            let mut lst: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+            lst.remove(i);
+            block.recloseblock(lst);
         }
     }
 }
@@ -1043,6 +1150,77 @@ mod tests {
         // match.
         assert_eq!(body.borrow().inputargs.len(), 1);
         assert_eq!(start.borrow().exits[0].borrow().args.len(), 1);
+    }
+
+    #[test]
+    fn remove_assertion_errors_drops_assertion_branch() {
+        // A canraise block with two exits:
+        //   exit[0] (exitcase=None)        → returnblock (non-ex path)
+        //   exit[1] (exitcase=AssertionError cls) → exceptblock
+        //     with args=[Constant(AssertionError), Constant(instance)]
+        // remove_assertion_errors should drop exit[1] and promote the
+        // surviving exit — but because exit[0].exitcase was already
+        // None and exits_len goes from 2→1, the exitswitch is cleared.
+        use crate::flowspace::model::{
+            ConstValue as CV, Constant as C, HOST_ENV as HE, SpaceOperation as SO,
+        };
+        let assert_err = HE.lookup_builtin("AssertionError").unwrap();
+        let v_in = Variable::new();
+        let body = Block::shared(vec![Hlvalue::Variable(v_in.clone())]);
+        // A trivial op so canraise's raising_op check passes.
+        body.borrow_mut().operations.push(SO::new(
+            "simple_call",
+            vec![Hlvalue::Variable(v_in.clone())],
+            Hlvalue::Variable(Variable::new()),
+        ));
+        body.borrow_mut().exitswitch = Some(Hlvalue::Constant(C::new(CV::Atom(
+            crate::flowspace::model::LAST_EXCEPTION.clone(),
+        ))));
+
+        let start_in = Variable::new();
+        let start = Block::shared(vec![Hlvalue::Variable(start_in.clone())]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let returnblock = graph.returnblock.clone();
+        let exceptblock = graph.exceptblock.clone();
+
+        let start_link = Link::new(
+            vec![Hlvalue::Variable(start_in.clone())],
+            Some(body.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![start_link]);
+
+        // Non-exceptional exit (exitcase=None) body → return.
+        let ok_link = Link::new(
+            vec![body.borrow().operations[0].result.clone()],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        // Exceptional exit (exitcase=AssertionError) body → exceptblock.
+        let err_link = Link::new(
+            vec![
+                Hlvalue::Constant(C::new(CV::HostObject(assert_err.clone()))),
+                Hlvalue::Constant(C::new(CV::HostObject(assert_err.clone()))),
+            ],
+            Some(exceptblock.clone()),
+            Some(Hlvalue::Constant(C::new(CV::HostObject(
+                assert_err.clone(),
+            )))),
+        )
+        .into_ref();
+        body.closeblock(vec![ok_link.clone(), err_link.clone()]);
+
+        remove_assertion_errors(&graph);
+
+        // body should have exactly one exit (the non-exceptional one).
+        assert_eq!(body.borrow().exits.len(), 1);
+        assert!(body.borrow().exitswitch.is_none());
+        assert!(Rc::ptr_eq(
+            body.borrow().exits[0].borrow().target.as_ref().unwrap(),
+            &returnblock
+        ));
     }
 
     #[test]
