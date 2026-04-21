@@ -1736,6 +1736,22 @@ impl Variable {
         self._nr.set(nr);
     }
 
+    /// Identity key — see `NEXT_VAR_ID`. No direct upstream equivalent
+    /// (Python uses `id(obj)` for object identity); the Rust port
+    /// exposes the internal counter so callers that cannot rely on
+    /// `clone()`-shared mutable state (e.g. SSI_to_SSA's second-pass
+    /// graph rewrite) can key on it.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Snapshot of the lazy `_nr` counter. Useful when a caller wants
+    /// to propagate the same `(prefix, nr)` pair onto another Variable
+    /// via `set_name`.
+    pub fn nr(&self) -> i64 {
+        self._nr.get()
+    }
+
     /// RPython `Variable.foldable()` — always False for Variable.
     pub fn foldable(&self) -> bool {
         false

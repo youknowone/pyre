@@ -10,6 +10,7 @@
 //! names, control flow) — anything that would be a NEW-DEVIATION
 //! belongs in `translator_legacy/` instead.
 
+pub mod backendopt;
 pub mod rtyper;
 pub mod simplify;
 pub mod transform;
