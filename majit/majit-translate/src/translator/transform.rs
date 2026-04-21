@@ -878,15 +878,26 @@ fn canonical_dict_key(cv: ConstValue) -> ConstValue {
     }
 }
 
-/// `true` iff `cv` is a carrier that `Bookkeeper::immutablevalue`
-/// can fold into a SomeValue suitable for use as a dict key.
+/// `true` iff `cv` is safe to use as a dict key after
+/// `transform_list_contains` rewrites the source list into a
+/// `ConstValue::Dict`.
 ///
-/// Internal flowspace carriers (`Function`, `Code`, `LLPtr`, `Atom`,
-/// `SpecTag`, `Placeholder`) still panic inside `immutablevalue` — see
-/// `bookkeeper.rs:1609-1621`. `transform_list_contains` must not feed
-/// those into `ann.annotation(v)` or the pass would crash on programs
-/// like `return x in [inner]` (`inner` being a nested function
-/// constant). Composite values recurse into their elements.
+/// Two filters must pass:
+///
+/// 1. **Python-hashable content.** `ConstValue::List` and `Dict` are
+///    unhashable in Python (`list.__hash__ = None`), so any nested
+///    list/dict — including inside a tuple — means the rewritten dict
+///    would not faithfully reproduce the original list-membership
+///    semantics: `HashMap<ConstValue, _>` happily stores them under
+///    Rust's derived `Eq`, but Python's `dict[key] = ...` would raise
+///    TypeError. Bail on transitive list/dict presence.
+///
+/// 2. **`Bookkeeper::immutablevalue` coverage.** Internal flowspace
+///    carriers (`Function`, `Code`, `LLPtr`, `Atom`, `SpecTag`,
+///    `Placeholder`) panic inside `immutablevalue` (see
+///    `bookkeeper.rs:1609-1621`). Feeding those into
+///    `ann.annotation(v)` would crash the pass on valid programs like
+///    `return x in [inner_fn]`, so filter them out.
 fn is_supported_contains_key(cv: &ConstValue) -> bool {
     match cv {
         ConstValue::Bool(_)
@@ -894,15 +905,16 @@ fn is_supported_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::Float(_)
         | ConstValue::Str(_)
         | ConstValue::None => true,
-        ConstValue::Tuple(items) | ConstValue::List(items) => {
-            items.iter().all(is_supported_contains_key)
-        }
-        ConstValue::Dict(m) => m
-            .iter()
-            .all(|(k, v)| is_supported_contains_key(k) && is_supported_contains_key(v)),
-        // Carriers that `immutablevalue` may or may not handle — route
-        // through the normal path so `HostObject(class)` / property /
-        // weakref still get their SomeBuiltin / SomePBC treatment.
+        // Tuples are hashable IFF every element is hashable.
+        ConstValue::Tuple(items) => items.iter().all(is_supported_contains_key),
+        // Lists and dicts are unhashable in Python. `x in [[1,2]]` or
+        // `x in [([True],)]` must stay as list iteration; the rewrite
+        // to a `HashMap<ConstValue, _>`-backed dict would diverge from
+        // Python's membership rules.
+        ConstValue::List(_) | ConstValue::Dict(_) => false,
+        // HostObject carriers still flow through `immutablevalue` —
+        // `HostObject(class)` / property / weakref produce the correct
+        // SomeBuiltin / SomePBC annotation for dict-key purposes.
         ConstValue::HostObject(_) => true,
         // Internal carriers that `immutablevalue` rejects.
         ConstValue::Function(_)
@@ -1342,6 +1354,49 @@ mod tests {
 
         let ops = &block.borrow().operations;
         assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
+    }
+
+    #[test]
+    fn transform_list_contains_skips_when_nested_list_in_tuple() {
+        // Codex P2 (round 10): `[([True],)]` carries an unhashable
+        // list inside a tuple. Python would `TypeError` on
+        // `items[tuple] = None`, so the rewrite must bail out and
+        // leave the list-iteration semantics intact.
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        let nested = CV::Tuple(vec![CV::List(vec![CV::Bool(true)])]);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Constant(C::new(nested))],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        assert!(
+            matches!(ops[1].args[0], Hlvalue::Variable(_)),
+            "tuple-containing-list must not be rewritten to Constant(dict)"
+        );
     }
 
     #[test]
