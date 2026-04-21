@@ -751,9 +751,27 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     std::collections::HashSet::new();
                 let mut all_constant = true;
                 for v in newlist_args {
-                    let s = ann
-                        .annotation(v)
-                        .expect("transform_list_contains: missing annotation");
+                    // Bail out for constant carriers that
+                    // `Bookkeeper::immutablevalue` still panics on
+                    // (`ConstValue::Function`, `Code`, `LLPtr`,
+                    // `Atom`, `HostObject` outside the already-bound
+                    // cases, …). A real graph like `return x in
+                    // [inner]` where `inner` is a nested function
+                    // would crash in `ann.annotation(v)` before the
+                    // rewrite could fall back to the original
+                    // `contains`. Filtering up front keeps the pass
+                    // a pure optimisation — unsupported constants
+                    // simply defeat the rewrite.
+                    if let Hlvalue::Constant(c) = v
+                        && !is_supported_contains_key(&c.value)
+                    {
+                        all_constant = false;
+                        break;
+                    }
+                    let Some(s) = ann.annotation(v) else {
+                        all_constant = false;
+                        break;
+                    };
                     if !s.is_immutable_constant() {
                         all_constant = false;
                         break;
@@ -857,6 +875,42 @@ fn canonical_dict_key(cv: ConstValue) -> ConstValue {
             ConstValue::Tuple(items.into_iter().map(canonical_dict_key).collect())
         }
         other => other,
+    }
+}
+
+/// `true` iff `cv` is a carrier that `Bookkeeper::immutablevalue`
+/// can fold into a SomeValue suitable for use as a dict key.
+///
+/// Internal flowspace carriers (`Function`, `Code`, `LLPtr`, `Atom`,
+/// `SpecTag`, `Placeholder`) still panic inside `immutablevalue` — see
+/// `bookkeeper.rs:1609-1621`. `transform_list_contains` must not feed
+/// those into `ann.annotation(v)` or the pass would crash on programs
+/// like `return x in [inner]` (`inner` being a nested function
+/// constant). Composite values recurse into their elements.
+fn is_supported_contains_key(cv: &ConstValue) -> bool {
+    match cv {
+        ConstValue::Bool(_)
+        | ConstValue::Int(_)
+        | ConstValue::Float(_)
+        | ConstValue::Str(_)
+        | ConstValue::None => true,
+        ConstValue::Tuple(items) | ConstValue::List(items) => {
+            items.iter().all(is_supported_contains_key)
+        }
+        ConstValue::Dict(m) => m
+            .iter()
+            .all(|(k, v)| is_supported_contains_key(k) && is_supported_contains_key(v)),
+        // Carriers that `immutablevalue` may or may not handle — route
+        // through the normal path so `HostObject(class)` / property /
+        // weakref still get their SomeBuiltin / SomePBC treatment.
+        ConstValue::HostObject(_) => true,
+        // Internal carriers that `immutablevalue` rejects.
+        ConstValue::Function(_)
+        | ConstValue::Code(_)
+        | ConstValue::LLPtr(_)
+        | ConstValue::Atom(_)
+        | ConstValue::SpecTag(_)
+        | ConstValue::Placeholder => false,
     }
 }
 
@@ -1286,6 +1340,54 @@ mod tests {
 
         transform_list_contains(&ann, &[block.clone()]);
 
+        let ops = &block.borrow().operations;
+        assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
+    }
+
+    #[test]
+    fn transform_list_contains_tolerates_unannotated_constant() {
+        // Codex P2 (round 9): `ann.annotation(v)` can legitimately
+        // return None for constant carriers the bookkeeper rejects
+        // (Function / Code / LLPtr / Atom). The rewrite must bail out
+        // gracefully instead of panicking.
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, GraphFunc, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        // `Function(...)` is not reached by the bookkeeper's
+        // `immutablevalue`, so `ann.annotation(Constant(Function))`
+        // returns None. Before the fix the rewrite would
+        // `.expect(...)` on it and crash.
+        let globals = C::new(CV::Dict(Default::default()));
+        let gf = GraphFunc::new("inner", globals);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Constant(C::new(CV::Function(Box::new(gf))))],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        // Must not panic.
+        transform_list_contains(&ann, &[block.clone()]);
+
+        // The contains lhs must stay as a Variable since the rewrite
+        // bailed out.
         let ops = &block.borrow().operations;
         assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
     }

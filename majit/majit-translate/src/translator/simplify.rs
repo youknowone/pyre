@@ -406,11 +406,25 @@ fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<
 ///     return lloperation.LL_OPERATIONS[op.opname].sideeffects
 /// ```
 ///
+/// Upstream calls this only on ll-lowered graphs where every opname
+/// is present in `LL_OPERATIONS`. The Rust port is reachable from
+/// `has_no_side_effects` via the newly-ported `buildrtyper()` /
+/// `rtyper_already_seen()` chain before the rtyper actually lowers
+/// anything (`RPythonTyper` is a skeleton carrying only the
+/// `already_seen` set right now). Missing opnames — high-level
+/// `newlist` / `contains` / `simple_call`, for instance — therefore
+/// still flow through here and must be treated **conservatively
+/// as having side effects** instead of panicking.
 fn op_has_side_effects(op: &SpaceOperation) -> bool {
     lloperation::ll_operations()
         .get(op.opname.as_str())
-        .expect("op_has_side_effects: opname missing from LL_OPERATIONS")
-        .sideeffects
+        .map(|entry| entry.sideeffects)
+        // Conservative fallback: unknown opname → assume it has side
+        // effects so dead-op elimination keeps it live. Mirrors the
+        // upstream contract (LL_OPERATIONS is complete after ll
+        // lowering) without introducing a panic before lowering
+        // lands.
+        .unwrap_or(true)
 }
 
 /// RPython `rec_op_has_side_effects(translator, op, seen=None)`
