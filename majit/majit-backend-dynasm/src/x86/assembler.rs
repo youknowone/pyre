@@ -291,6 +291,13 @@ pub struct Assembler386 {
     /// jf_force_descr before the call. Consumed by the subsequent
     /// GUARD_NOT_FORCED guard emission.
     pending_force_descr: Option<Arc<DynasmFailDescr>>,
+    /// `compile.py:665-674` + `pyjitpl.py:2283`: snapshot of the six
+    /// descr pointers attached to the owning cpu instance.  Matches
+    /// RPython backend code that reads `self.cpu.done_with_this_frame_descr_*`
+    /// / `self.cpu.exit_frame_with_exception_descr_ref` /
+    /// `self.cpu.propagate_exception_descr` at every FINISH /
+    /// CALL_ASSEMBLER emission site.
+    attached_descrs: crate::guard::AttachedDescrPtrs,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -344,6 +351,7 @@ impl Assembler386 {
         constants: HashMap<u32, i64>,
         vtable_offset: Option<usize>,
         classptr_to_typeid: HashMap<i64, u32>,
+        attached_descrs: crate::guard::AttachedDescrPtrs,
     ) -> Self {
         Assembler386 {
             mc: Assembler::new().unwrap(),
@@ -374,7 +382,21 @@ impl Assembler386 {
                 gcmap
             },
             pending_force_descr: None,
+            attached_descrs,
         }
+    }
+
+    /// `compile.py:665-674` parity: attach the six metainterp descrs on
+    /// the emission side.  Mirrors `self.cpu.done_with_this_frame_descr_*`
+    /// reads in `rpython/jit/backend/x86/assembler.py`.
+    fn done_with_this_frame_descr_ptr_for_type(&self, tp: Type) -> i64 {
+        self.attached_descrs
+            .done_with_this_frame_descr_ptr_for_type(tp) as i64
+    }
+
+    /// `compile.py:658` parity: `self.cpu.exit_frame_with_exception_descr_ref`.
+    fn exit_frame_with_exception_descr_ref_ptr(&self) -> i64 {
+        self.attached_descrs.exit_frame_with_exception_descr_ref as i64
     }
 
     // ----------------------------------------------------------------
@@ -2044,9 +2066,9 @@ impl Assembler386 {
                     .map(|fd| fd.is_exit_frame_with_exception())
                     .unwrap_or(false);
                 let global_descr_ptr = if is_exit_exc {
-                    crate::guard::exit_frame_with_exception_descr_ref_ptr() as i64
+                    self.exit_frame_with_exception_descr_ref_ptr()
                 } else {
-                    crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64
+                    self.done_with_this_frame_descr_ptr_for_type(result_type)
                 };
                 let descr = Arc::new(DynasmFailDescr::new(
                     fail_index,
@@ -3628,8 +3650,7 @@ impl Assembler386 {
         } else {
             fail_arg_types[0]
         };
-        let global_descr_ptr =
-            crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64;
+        let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
@@ -4463,8 +4484,7 @@ impl Assembler386 {
 
         // assembler.py:324-336 call_assembler: select done_descr by op.type.
         let result_type = op.opcode.result_type();
-        let done_descr_ptr =
-            crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64;
+        let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
         let helper_addr = crate::call_assembler_helper_addr() as i64;
         let green_key = self.header_pc as i64;
 

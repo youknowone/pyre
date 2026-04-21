@@ -263,6 +263,48 @@ impl DynasmBackend {
         self.vtable_offset
     }
 
+    /// `compile.py:665-674` `make_and_attach_done_descrs` parity: expose
+    /// the six per-cpu-instance descrs as raw pointers for emission
+    /// consumers (Assembler386 / AssemblerARM64 FINISH + CALL_ASSEMBLER
+    /// sites).  The metainterp attaches the real descrs through
+    /// `Backend::set_done_with_this_frame_descr_*` during
+    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222); until then,
+    /// the per-thread fallback singletons in `crate::guard` answer so
+    /// backend-only integration tests that skip `MetaInterp::new` still
+    /// get a non-zero pointer per result type.
+    pub(crate) fn attached_descr_ptrs(&self) -> crate::guard::AttachedDescrPtrs {
+        fn ptr_or(d: &Option<majit_ir::DescrRef>, fallback: usize) -> usize {
+            d.as_ref()
+                .map_or(fallback, |arc| Arc::as_ptr(arc) as *const () as usize)
+        }
+        crate::guard::AttachedDescrPtrs {
+            done_with_this_frame_descr_void: ptr_or(
+                &self.done_descr_void,
+                crate::guard::done_with_this_frame_descr_void_ptr(),
+            ),
+            done_with_this_frame_descr_int: ptr_or(
+                &self.done_descr_int,
+                crate::guard::done_with_this_frame_descr_int_ptr(),
+            ),
+            done_with_this_frame_descr_ref: ptr_or(
+                &self.done_descr_ref,
+                crate::guard::done_with_this_frame_descr_ref_ptr(),
+            ),
+            done_with_this_frame_descr_float: ptr_or(
+                &self.done_descr_float,
+                crate::guard::done_with_this_frame_descr_float_ptr(),
+            ),
+            exit_frame_with_exception_descr_ref: ptr_or(
+                &self.exit_frame_with_exception_descr_ref,
+                crate::guard::exit_frame_with_exception_descr_ref_ptr(),
+            ),
+            propagate_exception_descr: ptr_or(
+                &self.propagate_exception_descr,
+                crate::guard::propagate_exception_descr_ptr(),
+            ),
+        }
+    }
+
     // `set_constants`, `set_constant_types`, `set_next_trace_id`,
     // `set_next_header_pc` are provided via the `Backend` trait impl
     // below so `compile_tmp_callback` and other backend-agnostic
@@ -606,12 +648,14 @@ impl Backend for DynasmBackend {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
+        let attached_descrs = self.attached_descr_ptrs();
         let mut asm = Asm::new(
             trace_id,
             header_pc,
             constants,
             self.vtable_offset,
             typeid_table,
+            attached_descrs,
         );
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
         let compiled = asm.assemble_loop(inputargs, &prepared_ops)?;
@@ -716,7 +760,15 @@ impl Backend for DynasmBackend {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
-        let mut asm = Asm::new(trace_id, 0, constants, self.vtable_offset, typeid_table);
+        let attached_descrs = self.attached_descr_ptrs();
+        let mut asm = Asm::new(
+            trace_id,
+            0,
+            constants,
+            self.vtable_offset,
+            typeid_table,
+            attached_descrs,
+        );
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let _orig_compiled = Self::get_compiled(original_token);
