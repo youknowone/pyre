@@ -40,56 +40,70 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
     }
 }
 
-/// llmodel.py:437-444 — get_int_value.
+/// llmodel.py:440-444 — `get_int_value_direct(deadframe, pos)`.
 ///
-/// Read the `index`-th `Signed` slot from `jf_frame`. `index` is a
-/// slot index, not a byte offset.
+/// Read the `Signed` slot at pre-decoded position `slot` from
+/// `jf_frame`.  `slot` is a post-`rd_locs[i]` slot index (i.e.
+/// `pos / WORD` in upstream terms), NOT a raw byte offset and NOT
+/// the logical fail-arg index.  Upstream's `get_int_value_direct`
+/// takes a byte `pos`; majit's `JitFrame::slot_ptr_const` already
+/// scales slot * WORD internally, so the pre-WORD-scaled slot is
+/// what this accessor expects.
+///
+/// The logical `get_int_value(deadframe, index)` entry point —
+/// which first calls `_decode_pos(deadframe, index)` to translate
+/// `index` through `rd_locs[]` — belongs at the dynasm/cranelift
+/// layer that owns the `FailDescr` type hierarchy (majit-backend
+/// is descr-agnostic, so it cannot fetch `get_latest_descr` into
+/// a concrete subclass here).
 ///
 /// # Safety
-/// `ptr` must point to a valid JitFrame with at least `index + 1`
+/// `ptr` must point to a valid JitFrame with at least `slot + 1`
 /// trailing array slots.
-pub unsafe fn get_int_value(ptr: *const JitFrame, index: usize) -> isize {
-    unsafe { *JitFrame::slot_ptr_const(ptr, index) }
+pub unsafe fn get_int_value_direct(ptr: *const JitFrame, slot: usize) -> isize {
+    unsafe { *JitFrame::slot_ptr_const(ptr, slot) }
 }
 
-/// Symmetric setter for `get_int_value`.
+/// Symmetric setter for `get_int_value_direct`.
 ///
 /// llsupport/llmodel.py does not expose this: compiled code writes
 /// `jf_frame[i]` directly. It is retained here for host-side test /
 /// arena runners only.
 ///
 /// # Safety
-/// `ptr` must point to a valid JitFrame with at least `index + 1`
+/// `ptr` must point to a valid JitFrame with at least `slot + 1`
 /// trailing array slots.
-pub unsafe fn set_int_value(ptr: *mut JitFrame, index: usize, value: isize) {
+pub unsafe fn set_int_value(ptr: *mut JitFrame, slot: usize, value: isize) {
     unsafe {
-        *JitFrame::slot_ptr(ptr, index) = value;
+        *JitFrame::slot_ptr(ptr, slot) = value;
     }
 }
 
-/// llmodel.py:446-453 — get_ref_value.
+/// llmodel.py:449-453 — `get_ref_value_direct(deadframe, pos)`.
 ///
-/// Read the `index`-th slot as a reference (pointer-sized).
+/// Read the slot at pre-decoded position `slot` as a reference
+/// (pointer-sized).  See `get_int_value_direct` for the slot/index
+/// distinction.
 ///
 /// # Safety
-/// `ptr` must point to a valid JitFrame with at least `index + 1`
+/// `ptr` must point to a valid JitFrame with at least `slot + 1`
 /// trailing array slots.
-pub unsafe fn get_ref_value(ptr: *const JitFrame, index: usize) -> usize {
+pub unsafe fn get_ref_value_direct(ptr: *const JitFrame, slot: usize) -> usize {
     unsafe {
         let base = (ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const usize;
-        *base.add(index)
+        *base.add(slot)
     }
 }
 
-/// llmodel.py:455-462 — get_float_value.
+/// llmodel.py:458-462 — `get_float_value_direct(deadframe, pos)`.
 ///
 /// # Safety
-/// `ptr` must point to a valid JitFrame with at least `index + 1`
+/// `ptr` must point to a valid JitFrame with at least `slot + 1`
 /// trailing array slots.
-pub unsafe fn get_float_value(ptr: *const JitFrame, index: usize) -> u64 {
+pub unsafe fn get_float_value_direct(ptr: *const JitFrame, slot: usize) -> u64 {
     unsafe {
         let base = (ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const u64;
-        *base.add(index)
+        *base.add(slot)
     }
 }
 

@@ -241,7 +241,7 @@ fn handle_fail_dispatch(
     if guard::is_done_with_this_frame_descr(descr_raw) {
         // compile.py:626-656 `_DoneWithThisFrameDescr` subclasses
         // (Void/Int/Ref/Float) — the four finish singletons.
-        return handle_fail_done_with_this_frame(frame_ptr);
+        return handle_fail_done_with_this_frame(descr_raw, frame_ptr);
     }
     // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`
     // has no pyre singleton yet: the CALL_ASSEMBLER slow path does
@@ -258,14 +258,41 @@ fn handle_fail_dispatch(
 ///
 /// Upstream raises `jitexc.DoneWithThisFrame*(slot-0)` and
 /// `handle_jitexception` shape-casts the payload to the portal's
-/// return type. pyre hands the raw int back; the JIT-emitted caller
-/// stub (assembler_helper_wrapper) reinterprets it as the correct
-/// kind. Void returns are harmless because the caller discards.
-fn handle_fail_done_with_this_frame(frame_ptr: *mut jitframe::JitFrame) -> i64 {
-    // compile.py:633/642/651 `cpu.get_*_value(deadframe, 0)`.
-    // All four subclasses read slot 0 of the deadframe; Void returns
-    // 0 because the caller never reads the result.
-    unsafe { llmodel::get_int_value(frame_ptr, 0) as i64 }
+/// return type.  pyre returns the raw i64 back; the JIT-emitted caller
+/// stub (`assembler_helper_wrapper`) reinterprets it as the correct
+/// kind.  Each subclass picks a different accessor so the returned
+/// bits carry the right sign-extension / pointer-tagging / float
+/// bit-layout for the portal return type:
+///
+/// * `DoneWithThisFrameDescrVoid.handle_fail` — no payload, return 0
+///   (compile.py:628-632).
+/// * `DoneWithThisFrameDescrInt.handle_fail` — `get_int_value(df, 0)`
+///   (compile.py:635-640).
+/// * `DoneWithThisFrameDescrRef.handle_fail` — `get_ref_value(df, 0)`
+///   (compile.py:644-649).
+/// * `DoneWithThisFrameDescrFloat.handle_fail` — `get_float_value(df, 0)`
+///   (compile.py:653-657).
+///
+/// The descr identity selects the accessor — matched through the four
+/// `guard::done_with_this_frame_descr_*_ptr()` singletons rather than
+/// a `fail_arg_types[0]` probe, because the Void descr carries no type
+/// entry at all.
+fn handle_fail_done_with_this_frame(descr_raw: usize, frame_ptr: *mut jitframe::JitFrame) -> i64 {
+    if descr_raw == guard::done_with_this_frame_descr_void_ptr() {
+        return 0;
+    }
+    if descr_raw == guard::done_with_this_frame_descr_int_ptr() {
+        return unsafe { llmodel::get_int_value_direct(frame_ptr, 0) as i64 };
+    }
+    if descr_raw == guard::done_with_this_frame_descr_ref_ptr() {
+        return unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 };
+    }
+    if descr_raw == guard::done_with_this_frame_descr_float_ptr() {
+        return unsafe { llmodel::get_float_value_direct(frame_ptr, 0) as i64 };
+    }
+    // Unreachable: `is_done_with_this_frame_descr` gate above already
+    // narrowed `descr_raw` to one of the four singletons.
+    0
 }
 
 /// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
@@ -299,7 +326,7 @@ fn handle_fail_resume_guard(
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
     for i in 0..n_fail_args {
         let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
-        raw_values.push(unsafe { llmodel::get_int_value(frame_ptr, slot) as i64 });
+        raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 
     // compile.py:704-709 `_trace_and_compile_from_bridge`.

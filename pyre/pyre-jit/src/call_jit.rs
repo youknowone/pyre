@@ -426,7 +426,7 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     // This is the "blackhole" path — RPython resume.py parity.
     //
     // Step 1: read the raw int arg from jf_frame[0]
-    let raw_arg = unsafe { majit_backend::llmodel::get_int_value(jf, 0) };
+    let raw_arg = unsafe { majit_backend::llmodel::get_int_value_direct(jf, 0) };
 
     // Step 2: get caller frame from the force context
     #[cfg(feature = "cranelift")]
