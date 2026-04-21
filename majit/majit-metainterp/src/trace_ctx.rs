@@ -140,7 +140,17 @@ pub struct TraceCtx {
     /// to their concrete result values, recorded during tracing.
     /// Passed to the optimizer for cross-iteration CALL_PURE folding.
     call_pure_results: std::collections::HashMap<Vec<Value>, Value>,
+    /// Cached `warmstate.trace_limit` snapshot for this tracing session.
+    /// pyjitpl.py:2789 reads `self.jitdriver_sd.warmstate.trace_limit` each
+    /// call; pyre snapshots it at `setup_tracing` time (warmstate owns the
+    /// live value). Default mirrors rlib/jit.py:592 (trace_limit = 6000).
+    trace_limit: usize,
 }
+
+/// rlib/jit.py:592 default `trace_limit` — mirrored here so standalone
+/// TraceCtx construction (unit tests, `setup_tracing` before a warmstate
+/// override) matches the RPython baseline.
+pub const DEFAULT_TRACE_LIMIT: usize = 6000;
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
 ///
@@ -358,6 +368,7 @@ impl TraceCtx {
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             call_pure_results: std::collections::HashMap::new(),
+            trace_limit: DEFAULT_TRACE_LIMIT,
         }
     }
 
@@ -408,6 +419,7 @@ impl TraceCtx {
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             call_pure_results: std::collections::HashMap::new(),
+            trace_limit: DEFAULT_TRACE_LIMIT,
         }
     }
 
@@ -841,14 +853,23 @@ impl TraceCtx {
         self.recorder.record_op(OpCode::Finish, &[result]);
     }
 
-    /// Whether the trace has exceeded the maximum allowed length.
+    /// pyjitpl.py:2789-2791 `blackhole_if_trace_too_long` check:
+    /// `length > warmrunnerstate.trace_limit`.  `length` is the non-inputarg
+    /// op count; `trace_limit` is cached from warmstate at trace start.
     pub fn is_too_long(&self) -> bool {
-        self.recorder.is_too_long()
+        self.recorder.length() > self.trace_limit
     }
 
-    /// Current trace limit (for diagnostics).
+    /// Current cached trace limit snapshot (for diagnostics + force_finish
+    /// segmenting heuristic).
     pub fn trace_limit(&self) -> usize {
-        self.recorder.trace_limit()
+        self.trace_limit
+    }
+
+    /// Called by `setup_tracing` to snapshot `warmstate.trace_limit` onto
+    /// this per-trace context.
+    pub fn set_trace_limit(&mut self, limit: usize) {
+        self.trace_limit = limit;
     }
 
     /// pyjitpl.py:1618 force_finish_trace flag.

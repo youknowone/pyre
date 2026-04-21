@@ -199,7 +199,7 @@ const DEFAULT_MAX_UNROLL_RECURSION: u32 = 7;
 const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 
 /// rlib/jit.py:592 trace_limit = 6000
-const DEFAULT_TRACE_LIMIT: u32 = crate::recorder::DEFAULT_TRACE_LIMIT as u32;
+const DEFAULT_TRACE_LIMIT: u32 = crate::trace_ctx::DEFAULT_TRACE_LIMIT as u32;
 
 /// warmspot.py:93 retrace_limit=5
 const DEFAULT_RETRACE_LIMIT: u32 = 5;
@@ -334,7 +334,7 @@ impl WarmEnterState {
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
 
-        HotResult::StartTracing(Trace::with_limit(self.trace_limit as usize))
+        HotResult::StartTracing(Trace::new())
     }
 
     /// Create a new WarmEnterState with the given threshold.
@@ -545,7 +545,7 @@ impl WarmEnterState {
     /// Creates a new Trace for retracing, similar to starting a
     /// fresh trace but from a guard's failure inputs.
     pub fn start_retrace(&mut self, input_types: &[Type]) -> Trace {
-        Trace::with_input_types_and_limit(input_types, self.trace_limit as usize)
+        Trace::with_input_types(input_types)
     }
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.

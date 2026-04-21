@@ -1641,6 +1641,8 @@ impl<M: Clone> MetaInterp<M> {
 
                 let mut ctx = TraceCtx::new(recorder, green_key);
                 ctx.set_root_green_key_raw(green_key_raw);
+                // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
+                ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
                 ctx.initial_inputarg_consts = live_values
                     .iter()
                     .map(|v| {
@@ -1784,6 +1786,10 @@ impl<M: Clone> MetaInterp<M> {
             TraceCtx::new(recorder, green_key)
         };
         ctx.set_root_green_key_raw(green_key_raw);
+        // pyjitpl.py:2789 warmrunnerstate.trace_limit — snapshot onto the
+        // per-trace context so `is_too_long` can consult it without needing
+        // a warmstate borrow at every check site.
+        ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.initial_inputarg_consts = live_values
             .iter()
             .map(|v| {
@@ -3363,7 +3369,6 @@ impl<M: Clone> MetaInterp<M> {
         );
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
-        ctx.recorder.unfinalize();
         ctx.recorder.cut(cut_at);
 
         if crate::majit_log_enabled() {
@@ -3903,7 +3908,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key, permanent
                 );
             }
-            ctx.recorder.abort();
+            // Dropping `ctx` at end of scope releases the recorder.
             self.warm_state.abort_tracing(green_key, permanent);
             self.pending_token = None;
             // Stash green_key / permanent for the subsequent
@@ -4312,11 +4317,7 @@ impl<M: Clone> MetaInterp<M> {
         ctx.apply_replacements();
         let green_key = ctx.green_key;
 
-        let mut recorder = ctx.recorder;
-        // The trace already has GUARD_ALWAYS_FAILS + FINISH ops recorded
-        // by jitdriver.rs segmenting. Mark recorder as finalized so
-        // get_trace() succeeds.
-        recorder.tracing_done();
+        let recorder = ctx.recorder;
         let trace = recorder.get_trace();
         let trace_snapshots = trace.snapshots.clone();
 
@@ -5824,7 +5825,6 @@ impl<M: Clone> MetaInterp<M> {
     /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
     fn cut_tentative_op(&mut self, cut_at: crate::recorder::TracePosition) {
         if let Some(ctx) = self.tracing.as_mut() {
-            ctx.recorder.unfinalize();
             ctx.recorder.cut(cut_at);
         }
     }
@@ -6727,7 +6727,10 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_input_types = fail_descr.fail_arg_types();
         let recorder = self.warm_state.start_retrace(bridge_input_types);
         self.force_finish_trace = false;
-        self.tracing = Some(crate::trace_ctx::TraceCtx::new(recorder, green_key));
+        let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key);
+        // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot for bridge traces.
+        ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
+        self.tracing = Some(ctx);
 
         // RPython uses global ConstInt/ConstPtr boxes, so a bridge that
         // references a parent-loop constant and a bridge that allocates
