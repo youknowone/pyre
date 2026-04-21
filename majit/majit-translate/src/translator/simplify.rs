@@ -254,6 +254,71 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     newexits
 }
 
+/// RPython `constfold_exitswitch(graph)` (simplify.py:218-239).
+///
+/// ```python
+/// def constfold_exitswitch(graph):
+///     block = graph.startblock
+///     seen = set([block])
+///     stack = list(block.exits)
+///     while stack:
+///         link = stack.pop()
+///         target = link.target
+///         if target in seen:
+///             continue
+///         source = link.prevblock
+///         switch = source.exitswitch
+///         if (isinstance(switch, Constant) and not source.canraise):
+///             exits = replace_exitswitch_by_constant(source, switch)
+///             stack.extend(exits)
+///         else:
+///             seen.add(target)
+///             stack.extend(target.exits)
+/// ```
+pub fn constfold_exitswitch(graph: &FunctionGraph) {
+    let mut seen: HashSet<BlockKey> = HashSet::new();
+    seen.insert(BlockKey::of(&graph.startblock));
+    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.iter().cloned().collect();
+
+    while let Some(link) = stack.pop() {
+        let (prev_rc, target_rc) = {
+            let l = link.borrow();
+            (
+                l.prevblock.as_ref().and_then(|w| w.upgrade()),
+                l.target.clone(),
+            )
+        };
+        let Some(target_rc) = target_rc else {
+            continue;
+        };
+        if seen.contains(&BlockKey::of(&target_rc)) {
+            continue;
+        }
+        let Some(prev_rc) = prev_rc else {
+            continue;
+        };
+
+        // upstream: `switch = source.exitswitch`.
+        let (is_const_switch, const_val, is_canraise) = {
+            let b = prev_rc.borrow();
+            match &b.exitswitch {
+                Some(Hlvalue::Constant(c)) => (true, Some(c.clone()), b.canraise()),
+                _ => (false, None, b.canraise()),
+            }
+        };
+
+        if is_const_switch && !is_canraise {
+            let const_val = const_val.expect("const_val set when is_const_switch");
+            let new_exits = replace_exitswitch_by_constant(&prev_rc, &const_val);
+            stack.extend(new_exits);
+        } else {
+            seen.insert(BlockKey::of(&target_rc));
+            let more: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+            stack.extend(more);
+        }
+    }
+}
+
 /// RPython `remove_trivial_links(graph)` (simplify.py:242-268).
 ///
 /// ```python
@@ -709,6 +774,71 @@ mod tests {
         // Start still has 2 exits, merge still has 1 op-list, returnblock unchanged.
         assert_eq!(start.borrow().exits.len(), 2);
         assert_eq!(ops_before, ops_after);
+    }
+
+    #[test]
+    fn constfold_exitswitch_picks_matching_exit() {
+        // start has a Bool(true) exitswitch with two exits:
+        //   exitcase=False -> left
+        //   exitcase=True  -> right (should survive)
+        // After folding, start has a single exit with exitcase=None
+        // targeting `right`.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let v = Variable::new();
+        let left = Block::shared(vec![Hlvalue::Variable(Variable::new())]);
+        let right = Block::shared(vec![Hlvalue::Variable(Variable::new())]);
+        let start = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let returnblock = graph.returnblock.clone();
+
+        start.borrow_mut().exitswitch = Some(Hlvalue::Constant(C::new(CV::Bool(true))));
+        let l_link = Link::new(
+            vec![Hlvalue::Variable(v.clone())],
+            Some(left.clone()),
+            Some(Hlvalue::Constant(C::new(CV::Bool(false)))),
+        )
+        .into_ref();
+        let r_link = Link::new(
+            vec![Hlvalue::Variable(v.clone())],
+            Some(right.clone()),
+            Some(Hlvalue::Constant(C::new(CV::Bool(true)))),
+        )
+        .into_ref();
+        start
+            .borrow_mut()
+            .closeblock(vec![l_link.clone(), r_link.clone()]);
+        l_link.borrow_mut().prevblock = Some(Rc::downgrade(&start));
+        r_link.borrow_mut().prevblock = Some(Rc::downgrade(&start));
+
+        // left and right each exit to returnblock so the graph is
+        // structurally closed (though checkgraph is not invoked here).
+        let left_end = Link::new(
+            vec![left.borrow().inputargs[0].clone()],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        left.borrow_mut().closeblock(vec![left_end.clone()]);
+        left_end.borrow_mut().prevblock = Some(Rc::downgrade(&left));
+        let right_end = Link::new(
+            vec![right.borrow().inputargs[0].clone()],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        right.borrow_mut().closeblock(vec![right_end.clone()]);
+        right_end.borrow_mut().prevblock = Some(Rc::downgrade(&right));
+
+        constfold_exitswitch(&graph);
+
+        let s = start.borrow();
+        assert!(s.exitswitch.is_none());
+        assert_eq!(s.exits.len(), 1);
+        assert!(s.exits[0].borrow().exitcase.is_none());
+        assert!(Rc::ptr_eq(
+            s.exits[0].borrow().target.as_ref().unwrap(),
+            &right
+        ));
     }
 
     #[test]
