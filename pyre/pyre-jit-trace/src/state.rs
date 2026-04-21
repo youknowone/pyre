@@ -258,6 +258,18 @@ impl MetaInterpStaticData {
         self.jitcodes.push(jitcode);
         ptr
     }
+
+    /// Return the existing SD entry only when its payload is already
+    /// populated. Skeleton entries must still go through the compile
+    /// callback so `CallControl` can drain and fill the bytecode body.
+    fn compiled_jitcode_lookup(&self, code: *const ()) -> Option<*const JitCode> {
+        let idx = *self.by_code.get(&(code as usize))?;
+        let jitcode = &self.jitcodes[idx];
+        if jitcode.payload.metadata.pc_map.is_empty() {
+            return None;
+        }
+        Some(&**jitcode as *const JitCode)
+    }
 }
 
 /// RPython assembler.py:234-248 `Assembler._encode_liveness` parity:
@@ -437,6 +449,9 @@ pub fn set_compile_jitcode_fn(f: CompileJitcodeFn) {
 /// code object per trace-side reference; see `set_compile_jitcode_fn`.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
+    if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
+        return existing;
+    }
     let cb = COMPILE_JITCODE_FN.load(std::sync::atomic::Ordering::Relaxed);
     let supplied = if cb.is_null() {
         None
@@ -5840,5 +5855,28 @@ mod indirectcalltargets_tests {
         assert!(sd.bytecode_for_address(0x100).is_none());
         assert!(sd.bytecode_for_address(0x200).is_some());
         assert!(sd.bytecode_for_address(0x300).is_some());
+    }
+
+    #[test]
+    fn compiled_jitcode_lookup_ignores_skeleton_payload() {
+        let mut sd = MetaInterpStaticData::new();
+        let code = 0x1234usize as *const ();
+        let skeleton = Arc::new(crate::PyJitCode::skeleton(None));
+        let inserted = sd.jitcode_for(code, Some(skeleton));
+        assert!(std::ptr::eq(inserted, sd.jitcodes[0].as_ref()));
+        assert!(sd.compiled_jitcode_lookup(code).is_none());
+    }
+
+    #[test]
+    fn compiled_jitcode_lookup_returns_populated_entry() {
+        let mut sd = MetaInterpStaticData::new();
+        let code = 0x5678usize as *const ();
+        let mut pyjit = crate::PyJitCode::skeleton(None);
+        pyjit.metadata.pc_map.push(0);
+        let inserted = sd.jitcode_for(code, Some(Arc::new(pyjit)));
+        let hit = sd
+            .compiled_jitcode_lookup(code)
+            .expect("populated payload should short-circuit callback");
+        assert!(std::ptr::eq(inserted, hit));
     }
 }
