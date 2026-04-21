@@ -254,6 +254,99 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     newexits
 }
 
+/// RPython `remove_trivial_links(graph)` (simplify.py:242-268).
+///
+/// ```python
+/// def remove_trivial_links(graph):
+///     """Remove trivial links by merging their source and target blocks
+///
+///     A link is trivial if it has no arguments, is the single exit of its
+///     source and the single parent of its target.
+///     """
+///     entrymap = mkentrymap(graph)
+///     block = graph.startblock
+///     seen = set([block])
+///     stack = list(block.exits)
+///     while stack:
+///         link = stack.pop()
+///         if link.target in seen:
+///             continue
+///         source = link.prevblock
+///         target = link.target
+///         if (not link.args and source.exitswitch is None and
+///                 len(entrymap[target]) == 1 and
+///                 target.exits):  # stop at the returnblock
+///             assert len(source.exits) == 1
+///             source.operations.extend(target.operations)
+///             source.exitswitch = newexitswitch = target.exitswitch
+///             source.recloseblock(*target.exits)
+///             stack.extend(source.exits)
+///         else:
+///             seen.add(target)
+///             stack.extend(target.exits)
+/// ```
+pub fn remove_trivial_links(graph: &FunctionGraph) {
+    let entrymap = mkentrymap(graph);
+    let mut seen: HashSet<BlockKey> = HashSet::new();
+    seen.insert(BlockKey::of(&graph.startblock));
+    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.iter().cloned().collect();
+
+    while let Some(link) = stack.pop() {
+        let (prev_rc, target_rc, link_args_empty) = {
+            let l = link.borrow();
+            let prev = l.prevblock.as_ref().and_then(|w| w.upgrade());
+            let target = l.target.clone();
+            // upstream `not link.args` — treat `Vec<Option<Hlvalue>>` as
+            // empty when there are no args at all. Transient-merge
+            // `None` slots are valid args in upstream semantics.
+            let args_empty = l.args.is_empty();
+            (prev, target, args_empty)
+        };
+        let Some(target_rc) = target_rc else {
+            continue;
+        };
+        if seen.contains(&BlockKey::of(&target_rc)) {
+            continue;
+        }
+        let Some(prev_rc) = prev_rc else {
+            continue;
+        };
+
+        let source_switch_none = prev_rc.borrow().exitswitch.is_none();
+        let target_entry_count = entrymap
+            .get(&BlockKey::of(&target_rc))
+            .map(Vec::len)
+            .unwrap_or(0);
+        let target_has_exits = !target_rc.borrow().exits.is_empty();
+
+        let is_trivial =
+            link_args_empty && source_switch_none && target_entry_count == 1 && target_has_exits;
+
+        if is_trivial {
+            assert_eq!(
+                prev_rc.borrow().exits.len(),
+                1,
+                "remove_trivial_links: source block has exitswitch=None but != 1 exit"
+            );
+            // upstream: `source.operations.extend(target.operations)`.
+            let target_ops = target_rc.borrow().operations.clone();
+            prev_rc.borrow_mut().operations.extend(target_ops);
+            // upstream: `source.exitswitch = target.exitswitch`.
+            let new_switch = target_rc.borrow().exitswitch.clone();
+            prev_rc.borrow_mut().exitswitch = new_switch;
+            // upstream: `source.recloseblock(*target.exits)`.
+            let target_exits: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+            prev_rc.recloseblock(target_exits);
+            let source_exits: Vec<LinkRef> = prev_rc.borrow().exits.iter().cloned().collect();
+            stack.extend(source_exits);
+        } else {
+            seen.insert(BlockKey::of(&target_rc));
+            let more: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+            stack.extend(more);
+        }
+    }
+}
+
 /// RPython `join_blocks(graph)` (simplify.py:271-319).
 ///
 /// ```python
@@ -616,5 +709,99 @@ mod tests {
         // Start still has 2 exits, merge still has 1 op-list, returnblock unchanged.
         assert_eq!(start.borrow().exits.len(), 2);
         assert_eq!(ops_before, ops_after);
+    }
+
+    #[test]
+    fn remove_trivial_links_merges_empty_link() {
+        // start -> mid (via trivial link, no args) -> return.
+        // `mid` has 1 op and 1 entry/exit. The source→mid link has no
+        // args, so remove_trivial_links folds mid into start.
+        let v = Variable::new();
+        let mid = Block::shared(vec![]);
+        mid.borrow_mut()
+            .operations
+            .push(crate::flowspace::model::SpaceOperation::new(
+                "int_zero",
+                vec![],
+                Hlvalue::Variable(v.clone()),
+            ));
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let returnblock = graph.returnblock.clone();
+
+        // Trivial link start -> mid (no args — mid.inputargs also empty).
+        let start_link = Link::new(vec![], Some(mid.clone()), None).into_ref();
+        start.borrow_mut().closeblock(vec![start_link.clone()]);
+        start_link.borrow_mut().prevblock = Some(Rc::downgrade(&start));
+
+        let mid_link = Link::new(
+            vec![Hlvalue::Variable(v.clone())],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        mid.borrow_mut().closeblock(vec![mid_link.clone()]);
+        mid_link.borrow_mut().prevblock = Some(Rc::downgrade(&mid));
+
+        remove_trivial_links(&graph);
+
+        let s = start.borrow();
+        // mid's op now lives on start.
+        assert_eq!(s.operations.len(), 1);
+        assert_eq!(s.operations[0].opname, "int_zero");
+        // start's exit now targets returnblock directly.
+        assert_eq!(s.exits.len(), 1);
+        assert!(Rc::ptr_eq(
+            s.exits[0].borrow().target.as_ref().unwrap(),
+            &returnblock
+        ));
+    }
+
+    #[test]
+    fn remove_trivial_links_preserves_links_carrying_args() {
+        // start -> mid with 1 arg. `link.args` is non-empty so
+        // remove_trivial_links must NOT fold (args-less precondition
+        // fails); mid's op stays on mid.
+        let v_in = Variable::new();
+        let mid = Block::shared(vec![Hlvalue::Variable(v_in.clone())]);
+        mid.borrow_mut()
+            .operations
+            .push(crate::flowspace::model::SpaceOperation::new(
+                "noop",
+                vec![Hlvalue::Variable(v_in.clone())],
+                Hlvalue::Variable(Variable::new()),
+            ));
+        let start_in = Variable::new();
+        let start = Block::shared(vec![Hlvalue::Variable(start_in.clone())]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let returnblock = graph.returnblock.clone();
+
+        let start_link = Link::new(
+            vec![Hlvalue::Variable(start_in.clone())],
+            Some(mid.clone()),
+            None,
+        )
+        .into_ref();
+        start.borrow_mut().closeblock(vec![start_link.clone()]);
+        start_link.borrow_mut().prevblock = Some(Rc::downgrade(&start));
+
+        let mid_link = Link::new(
+            vec![Hlvalue::Variable(Variable::new())],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        mid.borrow_mut().closeblock(vec![mid_link.clone()]);
+        mid_link.borrow_mut().prevblock = Some(Rc::downgrade(&mid));
+
+        remove_trivial_links(&graph);
+
+        // start still has no operations (not folded).
+        assert!(start.borrow().operations.is_empty());
+        // start's exit still targets mid (not rewired).
+        assert!(Rc::ptr_eq(
+            start.borrow().exits[0].borrow().target.as_ref().unwrap(),
+            &mid
+        ));
     }
 }
