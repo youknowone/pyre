@@ -544,12 +544,21 @@ pub fn builtin_int(
         [ConstValue::Bool(b)] => Some(ConstValue::Int(if *b { 1 } else { 0 })),
         [ConstValue::Str(s)] => s.parse::<i64>().ok().map(ConstValue::Int),
         [ConstValue::Float(bits)] => {
+            // upstream `int(float_const)` raises OverflowError when the
+            // truncated value does not fit, which `constpropagate`
+            // catches and falls back to `s_result` (builtin.py:34-39).
+            // Reject non-finite floats and values that would saturate
+            // an i64 cast, matching that behaviour instead of pinning a
+            // wrong constant.
             let f = f64::from_bits(*bits);
-            if f.is_finite() {
-                Some(ConstValue::Int(f.trunc() as i64))
-            } else {
-                None
+            if !f.is_finite() {
+                return None;
             }
+            let truncated = f.trunc();
+            if truncated < i64::MIN as f64 || truncated >= (i64::MAX as f64 + 1.0) {
+                return None;
+            }
+            Some(ConstValue::Int(truncated as i64))
         }
         [ConstValue::Str(s), ConstValue::Int(base)] => {
             if *base >= 2 && *base <= 36 {
@@ -753,7 +762,7 @@ pub fn builtin_list(
     }
     // upstream: `s_iter = s_iterable.iter(); return bk.newlist(s_iter.next())`.
     let s_iter = SomeIterator::new(s_iterable.clone(), vec![]);
-    let s_item = someiterator_next_stub(&s_iter);
+    let s_item = someiterator_next_stub(bk, &s_iter);
     Ok(SomeValue::List(bk.newlist(&[s_item], None)?))
 }
 
@@ -769,15 +778,15 @@ pub fn builtin_zip(
     let s_iter1 = SomeIterator::new(s_iter1.clone(), vec![]);
     let s_iter2 = SomeIterator::new(s_iter2.clone(), vec![]);
     let s_tup = SomeValue::Tuple(SomeTuple::new(vec![
-        someiterator_next_stub(&s_iter1),
-        someiterator_next_stub(&s_iter2),
+        someiterator_next_stub(bk, &s_iter1),
+        someiterator_next_stub(bk, &s_iter2),
     ]));
     Ok(SomeValue::List(bk.newlist(&[s_tup], None)?))
 }
 
 /// Upstream `builtin_min(*s_values)` (builtin.py:169-174).
 pub fn builtin_min(
-    _bk: &Rc<Bookkeeper>,
+    bk: &Rc<Bookkeeper>,
     args_s: &[SomeValue],
     _kwds: &HashMap<String, SomeValue>,
 ) -> Result<SomeValue, AnnotatorError> {
@@ -787,7 +796,7 @@ pub fn builtin_min(
     if args_s.len() == 1 {
         // upstream: `s_iter = s_values[0].iter(); return s_iter.next()`.
         let s_iter = SomeIterator::new(args_s[0].clone(), vec![]);
-        return Ok(someiterator_next_stub(&s_iter));
+        return Ok(someiterator_next_stub(bk, &s_iter));
     }
     // upstream: `return union(*s_values)`.
     union_many(args_s)
@@ -795,7 +804,7 @@ pub fn builtin_min(
 
 /// Upstream `builtin_max(*s_values)` (builtin.py:176-188).
 pub fn builtin_max(
-    _bk: &Rc<Bookkeeper>,
+    bk: &Rc<Bookkeeper>,
     args_s: &[SomeValue],
     _kwds: &HashMap<String, SomeValue>,
 ) -> Result<SomeValue, AnnotatorError> {
@@ -804,19 +813,25 @@ pub fn builtin_max(
     }
     if args_s.len() == 1 {
         let s_iter = SomeIterator::new(args_s[0].clone(), vec![]);
-        return Ok(someiterator_next_stub(&s_iter));
+        return Ok(someiterator_next_stub(bk, &s_iter));
     }
     let mut s = union_many(args_s)?;
-    // upstream: if SomeInteger and not nonneg, widen to nonneg when ALL
-    // incoming values were nonneg. The Rust SomeInteger union tracks
-    // `nonneg` already; the extra check here promotes the result when
-    // the per-value scan all agreed on `nonneg` (matches upstream's
-    // `nonneg |= s1.nonneg`).
+    // upstream (builtin.py:182-188):
+    //
+    //     if type(s) is SomeInteger and not s.nonneg:
+    //         nonneg = False
+    //         for s1 in s_values:
+    //             nonneg |= s1.nonneg
+    //         if nonneg:
+    //             s = SomeInteger(nonneg=True, knowntype=s.knowntype)
+    //
+    // `nonneg |= s1.nonneg` is an OR-fold, not AND — any single nonneg
+    // operand wins because `max(nonneg, whatever) >= nonneg >= 0`.
     if let SomeValue::Integer(ref i) = s
         && !i.nonneg
     {
-        let all_nonneg = args_s.iter().all(nonneg_of);
-        if all_nonneg {
+        let any_nonneg = args_s.iter().any(nonneg_of);
+        if any_nonneg {
             // upstream: `SomeInteger(nonneg=True, knowntype=s.knowntype)`
             // — pin the existing knowntype to avoid widening r_uint to int.
             s = SomeValue::Integer(SomeInteger::new_with_knowntype(true, i.base.knowntype));
@@ -1121,30 +1136,52 @@ fn union_many(s_values: &[SomeValue]) -> Result<SomeValue, AnnotatorError> {
     Ok(acc)
 }
 
-/// Minimal upstream `SomeIterator.next()` stand-in used by
-/// [`builtin_list`] / [`builtin_zip`] / [`builtin_min`] / [`builtin_max`].
+/// Upstream `s_iterable.iter().next()` — used by [`builtin_list`] /
+/// [`builtin_zip`] / [`builtin_min`] / [`builtin_max`].
 ///
-/// Upstream calls `s_iterable.iter().next()` to read an element
-/// annotation out of the container. `unaryop::someiterator_next` is
-/// the precise port but requires an `RPythonAnnotator` reference for
-/// position tracking. The four callers above deliberately use the
-/// unpositioned path — every upstream analyser site above does
-/// `s_iterable.iter().next()` outside of any reflow frame, so falling
-/// back to `SomeValue::Impossible` when no element annotation is
-/// trivially available matches upstream's "no info available" return.
-fn someiterator_next_stub(it: &SomeIterator) -> SomeValue {
-    match &*it.s_container {
-        SomeValue::List(s) => s.listdef.read_item(None),
-        SomeValue::Tuple(t) if !t.items.is_empty() => {
-            union_many(&t.items).unwrap_or_else(|_| s_impossible_value())
-        }
-        SomeValue::String(_) => SomeValue::Char(SomeChar::new(false)),
-        SomeValue::UnicodeString(_) => {
-            SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(false))
-        }
-        SomeValue::Dict(d) => d.dictdef.read_key(None),
-        _ => s_impossible_value(),
+/// Delegates to [`super::unaryop::container_getanyitem`], the shared
+/// port of upstream `container.getanyitem(position, *variant)`
+/// (unaryop.py:341-342 / :402-403 / :480-500 / :664-665). The caller
+/// passes the iterator's `s_container` plus the variant string from
+/// `SomeIterator.variant` (upstream's `*variant` tuple), matching the
+/// logic in `unaryop.rs::someiterator_next` without requiring a live
+/// `RPythonAnnotator` reference.
+///
+/// When the iterator wraps another `SomeIterator` (upstream `xs.iter()`
+/// then `.iter()` again — returns self via `unaryop.py:808-810`), we
+/// recurse on the inner iterator so the element annotation still
+/// surfaces correctly.
+fn someiterator_next_stub(bk: &Rc<Bookkeeper>, it: &SomeIterator) -> SomeValue {
+    // upstream `if s_None.contains(self.s_container): return s_ImpossibleValue`
+    // (unaryop.py:819-820).
+    if matches!(&*it.s_container, SomeValue::None_(_)) {
+        return s_impossible_value();
     }
+    // upstream `if self.variant and self.variant[0] == "enumerate": ...`
+    // (unaryop.py:822-824).
+    if it.variant.first().map(String::as_str) == Some("enumerate") {
+        let s_item =
+            super::unaryop::container_getanyitem(&it.s_container, None, bk.current_position_key());
+        return SomeValue::Tuple(SomeTuple::new(vec![
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            s_item,
+        ]));
+    }
+    // upstream `if variant == ("reversed",): variant = ()` (unaryop.py:826-827).
+    let variant: Option<&str> = if it.variant.len() == 1 && it.variant[0] == "reversed" {
+        None
+    } else {
+        it.variant.first().map(String::as_str)
+    };
+    // When the container is itself a `SomeIterator`, unwrap once — upstream
+    // `SomeIterator.iter()` returns self (unaryop.py:808-810), so chaining
+    // `.iter().next()` reaches the underlying container. The direct
+    // `container_getanyitem` dispatch does not recognise Iterator inputs, so
+    // we route them through another `someiterator_next_stub` hop first.
+    if let SomeValue::Iterator(inner) = &*it.s_container {
+        return someiterator_next_stub(bk, inner);
+    }
+    super::unaryop::container_getanyitem(&it.s_container, variant, bk.current_position_key())
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1428,75 @@ mod tests {
         );
 
         bk.leave();
+    }
+
+    #[test]
+    fn builtin_list_on_iterator_routes_through_next() {
+        // Codex P1: `list(reversed(xs))` should keep the element type
+        // instead of collapsing to SomeImpossibleValue. Upstream chains
+        // `s_iterable.iter().next()` which delegates to
+        // `SomeIterator.next()` for SomeIterator inputs.
+        use crate::annotator::model::{SomeInteger, SomeList};
+        let bk = bk();
+        let inner = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        );
+        let inner_list = SomeValue::List(SomeList::new(inner));
+        let s_iter =
+            SomeValue::Iterator(SomeIterator::new(inner_list, vec!["reversed".to_string()]));
+        let out = builtin_list(&bk, &[s_iter], &no_kwds()).unwrap();
+        match out {
+            SomeValue::List(list) => {
+                let item = list.listdef.read_item(None);
+                assert!(
+                    matches!(item, SomeValue::Integer(ref i) if i.nonneg),
+                    "expected nonneg SomeInteger element, got {item:?}"
+                );
+            }
+            other => panic!("expected SomeList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_max_keeps_nonneg_when_any_operand_is_nonneg() {
+        // Codex P2: upstream `nonneg |= s1.nonneg` is an OR-fold —
+        // `max(nonneg, maybe_negative)` stays nonneg.
+        use crate::annotator::model::SomeInteger;
+        let bk = bk();
+        let a = SomeValue::Integer(SomeInteger::new(true, false));
+        let b = SomeValue::Integer(SomeInteger::new(false, false));
+        let out = builtin_max(&bk, &[a, b], &no_kwds()).unwrap();
+        match out {
+            SomeValue::Integer(i) => assert!(
+                i.nonneg,
+                "max(nonneg, maybe_neg) must remain nonneg per builtin.py:182-188"
+            ),
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_int_rejects_out_of_range_float_constant() {
+        // Codex P2: `int(1e20)` would saturate to i64::MAX if we let the
+        // Rust cast do its default behaviour — upstream raises OverflowError
+        // which constpropagate catches. Non-finite / out-of-range floats
+        // must fall through to the conservative `s_result`.
+        let bk = bk();
+        let huge = ConstValue::float(1.0e20_f64);
+        let s_huge = bk.immutablevalue(&huge).unwrap();
+        let out = builtin_int(&bk, &[s_huge], &no_kwds()).unwrap();
+        match out {
+            SomeValue::Integer(i) => {
+                assert!(
+                    i.base.const_box.is_none(),
+                    "int(out-of-range float) must not pin a constant"
+                );
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
     }
 
     #[test]

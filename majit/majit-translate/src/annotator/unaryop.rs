@@ -3046,7 +3046,7 @@ fn someiterator_next(ann: &RPythonAnnotator, it: &SomeIterator) -> SomeValue {
 /// * SomeList (unaryop.py:402-403):  `self.listdef.read_item(position)`.
 /// * SomeDict (unaryop.py:480-500):  variant-dispatched.
 /// * SomeStringOrUnicode (unaryop.py:664-665): `self.basecharclass()`.
-fn container_getanyitem(
+pub fn container_getanyitem(
     s_container: &SomeValue,
     variant: Option<&str>,
     position: Option<super::bookkeeper::PositionKey>,
