@@ -11,12 +11,18 @@
 //! remaining descriptor kinds are still pending.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
 use crate::model::{LinkArg, ValueId};
 use crate::regalloc::RegAllocResult;
+
+static REF_CONST_TOKENS: LazyLock<Mutex<HashMap<ConstValue, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_REF_CONST_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Assembler — converts SSARepr to JitCode.
 ///
@@ -524,19 +530,7 @@ impl Assembler {
             LinkArg::Value(v) => self.lookup_reg_with_kind(*v, regallocs),
             LinkArg::Const(cv) => {
                 let kind = crate::flatten::constvalue_kind(cv);
-                let byte = match kind {
-                    'i' => match cv {
-                        ConstValue::Int(n) => self.emit_const_i(*n, state),
-                        ConstValue::Bool(b) => self.emit_const_i(*b as i64, state),
-                        ConstValue::SpecTag(tag) => self.emit_const_i(*tag as i64, state),
-                        other => {
-                            panic!("integer-kind constant not supported by emit_const_i: {other:?}")
-                        }
-                    },
-                    'r' => self.emit_const_r(cv, state),
-                    'f' => self.emit_const_f(cv, state),
-                    other => panic!("unknown LinkArg kind {other:?} for {cv:?}"),
-                };
+                let byte = self.emit_const(cv, kind, state);
                 (byte, kind)
             }
         }
@@ -1209,6 +1203,25 @@ impl Assembler {
 
     /// RPython assembler.py:80-138: emit_const for integer constants.
     /// Adds to constant pool and returns the index byte.
+    fn emit_const(&mut self, value: &ConstValue, kind: char, state: &mut AssemblyState) -> u8 {
+        match kind {
+            'i' => self.emit_const_i_from_const(value, state),
+            'r' => self.emit_const_r(value, state),
+            'f' => self.emit_const_f(value, state),
+            other => panic!("unknown constant kind {other:?} for {value:?}"),
+        }
+    }
+
+    fn emit_const_i_from_const(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
+        let value = match value {
+            ConstValue::Int(n) => *n,
+            ConstValue::Bool(b) => *b as i64,
+            ConstValue::SpecTag(tag) => *tag as i64,
+            other => panic!("integer-kind constant not supported by emit_const_i: {other:?}"),
+        };
+        self.emit_const_i(value, state)
+    }
+
     fn emit_const_i(&mut self, value: i64, state: &mut AssemblyState) -> u8 {
         // Check if already in pool
         for (i, &existing) in state.constants_i.iter().enumerate() {
@@ -1232,10 +1245,7 @@ impl Assembler {
     }
 
     fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
-        let bits = match value {
-            ConstValue::HostObject(obj) => obj.identity_id() as u64,
-            other => panic!("raise/r constant pool does not support {other:?}"),
-        };
+        let bits = ref_const_bits(value);
         if let Some(index) = state
             .constants_r
             .iter()
@@ -1261,6 +1271,22 @@ impl Assembler {
         }
         state.constants_f.push(bits);
         (state.num_regs_f + state.constants_f.len() - 1) as u8
+    }
+}
+
+fn ref_const_bits(value: &ConstValue) -> u64 {
+    match value {
+        ConstValue::None => 0,
+        ConstValue::HostObject(obj) => obj.identity_id() as u64,
+        other => {
+            let mut tokens = REF_CONST_TOKENS.lock().unwrap();
+            if let Some(&token) = tokens.get(other) {
+                return token;
+            }
+            let token = NEXT_REF_CONST_TOKEN.fetch_add(1, Ordering::Relaxed);
+            tokens.insert(other.clone(), token);
+            token
+        }
     }
 }
 
@@ -1586,20 +1612,11 @@ impl Default for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::LinkArg;
     use crate::regalloc;
 
-    #[test]
-    fn assemble_basic() {
-        let mut flat = SSARepr {
-            name: "test".into(),
-            insns: vec![],
-            num_values: 0,
-            num_blocks: 1,
-            value_kinds: HashMap::new(),
-            insns_pos: None,
-        };
-
-        // Empty regalloc results
+    fn empty_regallocs() -> HashMap<RegKind, regalloc::RegAllocResult> {
         let mut regallocs = HashMap::new();
         regallocs.insert(
             RegKind::Int,
@@ -1622,6 +1639,21 @@ mod tests {
                 num_regs: 0,
             },
         );
+        regallocs
+    }
+
+    #[test]
+    fn assemble_basic() {
+        let mut flat = SSARepr {
+            name: "test".into(),
+            insns: vec![],
+            num_values: 0,
+            num_blocks: 1,
+            value_kinds: HashMap::new(),
+            insns_pos: None,
+        };
+
+        let regallocs = empty_regallocs();
         let mut asm = Assembler::new();
         let body = asm.assemble(&mut flat, &regallocs);
 
@@ -1630,6 +1662,47 @@ mod tests {
         assert_eq!(body.c_num_regs_r as usize, 0);
         assert_eq!(body.c_num_regs_f as usize, 0);
         assert_eq!(asm.count_jitcodes(), 1);
+    }
+
+    #[test]
+    fn assemble_ref_return_with_none_constant() {
+        let mut flat = SSARepr {
+            name: "return_none".into(),
+            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::None))],
+            num_values: 0,
+            num_blocks: 1,
+            value_kinds: HashMap::new(),
+            insns_pos: None,
+        };
+
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+
+        assert_eq!(body.constants_r, vec![0]);
+        assert!(asm.insns.contains_key("ref_return/r"));
+    }
+
+    #[test]
+    fn assemble_ref_return_with_string_constant() {
+        let mut flat = SSARepr {
+            name: "return_string".into(),
+            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::Str(
+                "hello".into(),
+            )))],
+            num_values: 0,
+            num_blocks: 1,
+            value_kinds: HashMap::new(),
+            insns_pos: None,
+        };
+
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+
+        assert_eq!(body.constants_r.len(), 1);
+        assert_ne!(body.constants_r[0], 0);
+        assert!(asm.insns.contains_key("ref_return/r"));
     }
 
     #[test]

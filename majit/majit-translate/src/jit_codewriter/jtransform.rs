@@ -146,7 +146,7 @@ pub struct GraphTransformNote {
 }
 
 /// Result of a graph transformation pass.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct GraphTransformResult {
     pub graph: FunctionGraph,
     pub notes: Vec<GraphTransformNote>,

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::flowspace::model::ConstValue;
-use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
+use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
 use crate::translate_legacy::annotator::annrpython::AnnotationState;
 
 /// Concrete low-level type (RPython Repr.lowleveltype).
@@ -82,32 +82,15 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     }
 
     // Cross-block: propagate through Link args → target inputargs.
-    // Upstream `flowspace/model.py:244 renamevariables` iterates
-    // `for link in self.exits: link.args` to rename across block
-    // boundaries, so walk the same Block.exits list here.
+    // Keep the exception-link split explicit, mirroring upstream's
+    // `_convert_link()` handling of `last_exception` /
+    // `last_exc_value` before the per-arg conversion loop.
     for block in &graph.blocks {
         for link in &block.exits {
-            let target_block = graph.block(link.target);
-            for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                if state.get(*dst) == &ConcreteType::Unknown {
-                    let src_ty = match src {
-                        crate::model::LinkArg::Value(src) => state.get(*src).clone(),
-                        crate::model::LinkArg::Const(_)
-                            if Some(src) == link.last_exception.as_ref() =>
-                        {
-                            ConcreteType::Signed
-                        }
-                        crate::model::LinkArg::Const(_)
-                            if Some(src) == link.last_exc_value.as_ref() =>
-                        {
-                            ConcreteType::GcRef
-                        }
-                        crate::model::LinkArg::Const(value) => const_value_to_concrete(value),
-                    };
-                    if src_ty != ConcreteType::Unknown {
-                        state.concrete_types.insert(*dst, src_ty);
-                    }
-                }
+            if link_is_raise_like(link) {
+                convert_raise_link(&mut state, graph, link);
+            } else {
+                convert_link(&mut state, graph, link);
             }
         }
     }
@@ -129,6 +112,51 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::Code(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_) => ConcreteType::GcRef,
+    }
+}
+
+fn link_is_raise_like(link: &Link) -> bool {
+    link.last_exception.is_some() && link.last_exc_value.is_some()
+}
+
+fn convert_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) {
+    let target_block = graph.block(link.target);
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+        maybe_seed_concrete_type(state, *dst, link_arg_concrete_type(state, src));
+    }
+}
+
+fn convert_raise_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) {
+    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
+        maybe_seed_concrete_type(state, *value, ConcreteType::Signed);
+    }
+    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
+        maybe_seed_concrete_type(state, *value, ConcreteType::GcRef);
+    }
+
+    let target_block = graph.block(link.target);
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+        let src_ty = if Some(src) == link.last_exception.as_ref() {
+            ConcreteType::Signed
+        } else if Some(src) == link.last_exc_value.as_ref() {
+            ConcreteType::GcRef
+        } else {
+            link_arg_concrete_type(state, src)
+        };
+        maybe_seed_concrete_type(state, *dst, src_ty);
+    }
+}
+
+fn link_arg_concrete_type(state: &TypeResolutionState, src: &LinkArg) -> ConcreteType {
+    match src {
+        LinkArg::Value(src) => state.get(*src).clone(),
+        LinkArg::Const(value) => const_value_to_concrete(value),
+    }
+}
+
+fn maybe_seed_concrete_type(state: &mut TypeResolutionState, dst: ValueId, src_ty: ConcreteType) {
+    if state.get(dst) == &ConcreteType::Unknown && src_ty != ConcreteType::Unknown {
+        state.concrete_types.insert(dst, src_ty);
     }
 }
 
@@ -207,7 +235,9 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FunctionGraph, OpKind, ValueType};
+    use crate::model::{
+        ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, exception_exitcase,
+    };
     use crate::translate_legacy::annotator::annrpython as annotate;
 
     #[test]
@@ -259,5 +289,36 @@ mod tests {
         let annotations = annotate::annotate(&graph);
         let types = resolve_types(&graph, &annotations);
         assert_eq!(types.get(phi), &ConcreteType::Signed);
+    }
+
+    #[test]
+    fn resolves_raise_link_exception_pair() {
+        let mut graph = FunctionGraph::new("raise_link");
+        let entry = graph.startblock;
+        let (exc_block, etype, evalue) = graph.exceptblock_args();
+        let last_exception = graph.alloc_value();
+        let last_exc_value = graph.alloc_value();
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![
+                Link::new(
+                    vec![last_exception, last_exc_value],
+                    exc_block,
+                    Some(exception_exitcase()),
+                )
+                .extravars(
+                    Some(LinkArg::from(last_exception)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
+            ],
+        );
+
+        let annotations = annotate::annotate(&graph);
+        let types = resolve_types(&graph, &annotations);
+        assert_eq!(types.get(last_exception), &ConcreteType::Signed);
+        assert_eq!(types.get(last_exc_value), &ConcreteType::GcRef);
+        assert_eq!(types.get(etype), &ConcreteType::Signed);
+        assert_eq!(types.get(evalue), &ConcreteType::GcRef);
     }
 }

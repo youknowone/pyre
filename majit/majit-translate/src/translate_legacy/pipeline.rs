@@ -64,7 +64,7 @@ pub struct PipelineConfig {
 /// Result of running the full pipeline on a single function.
 ///
 /// RPython: the result of `transform_graph_to_jitcode()` — one per function.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PipelineResult {
     pub name: String,
     pub original_blocks: usize,
@@ -74,6 +74,10 @@ pub struct PipelineResult {
     pub calls_classified: usize,
     pub transform_notes: Vec<crate::jtransform::GraphTransformNote>,
     /// RPython: the SSARepr produced by flatten_graph().
+    ///
+    /// This stays in-memory only. Build artifacts persist the assembled
+    /// jitcodes and arm table, not the debug SSA dump.
+    #[serde(skip, default)]
     pub flattened: SSARepr,
 }
 
@@ -103,11 +107,12 @@ pub struct PipelineOpcodeArm {
     /// Flattened SSARepr — kept for debug / snapshot diff. The orthodox
     /// pipeline produces its own flattened repr inside
     /// `transform_graph_to_jitcode`; this field is the parser-level view.
+    #[serde(skip, default)]
     pub flattened: Option<SSARepr>,
 }
 
 /// Result of running the pipeline on a full program.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProgramPipelineResult {
     pub functions: Vec<PipelineResult>,
     pub opcode_dispatch: Vec<PipelineOpcodeArm>,
@@ -217,8 +222,16 @@ pub fn analyze_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::front;
+    use crate::jitcode::JitCode;
     use crate::jtransform::GraphTransformConfig;
+    use crate::{
+        flatten::{FlatOp, SSARepr},
+        flowspace::model::ConstValue,
+        model::LinkArg,
+    };
 
     #[test]
     fn pipeline_e2e_simple_function() {
@@ -320,5 +333,51 @@ mod tests {
             )
         });
         assert!(has_jump, "flattened fib should have conditional jumps");
+    }
+
+    #[test]
+    fn serialized_program_pipeline_skips_flattened_ssa_consts() {
+        let flattened = SSARepr {
+            name: "consts".into(),
+            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::Str(
+                "hello".into(),
+            )))],
+            num_values: 0,
+            num_blocks: 1,
+            value_kinds: Default::default(),
+            insns_pos: None,
+        };
+        let program = ProgramPipelineResult {
+            functions: vec![PipelineResult {
+                name: "consts".into(),
+                original_blocks: 1,
+                annotations_count: 0,
+                concrete_types_count: 0,
+                vable_rewrites: 0,
+                calls_classified: 0,
+                transform_notes: Vec::new(),
+                flattened: flattened.clone(),
+            }],
+            opcode_dispatch: vec![PipelineOpcodeArm {
+                arm_id: 7,
+                selector: OpcodeDispatchSelector::Unsupported,
+                entry_jitcode_index: Some(0),
+                flattened: Some(flattened),
+            }],
+            jitcodes: vec![Arc::new(JitCode::new("consts"))],
+            insns: std::collections::HashMap::new(),
+            descrs: Vec::new(),
+            total_blocks: 1,
+            total_ops: 1,
+            total_vable_rewrites: 0,
+        };
+
+        let json = serde_json::to_string(&program).expect("program pipeline should serialize");
+        assert!(
+            !json.contains("flattened"),
+            "serialized artifact should not persist debug SSA payloads"
+        );
+        serde_json::to_string(&program.opcode_dispatch)
+            .expect("opcode dispatch artifact should serialize without SSARepr");
     }
 }

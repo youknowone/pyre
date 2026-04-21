@@ -616,11 +616,10 @@ pub enum ExitCase {
 }
 
 /// RPython `flowspace/model.py:109-168` `Link`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub args: Vec<LinkArg>,
     pub target: BlockId,
-    #[serde(skip, default)]
     pub exitcase: Option<ExitCase>,
     /// RPython `Link.prevblock` — the block this Link exits from.
     pub prevblock: Option<BlockId>,
@@ -630,7 +629,6 @@ pub struct Link {
     /// identity constant; pyre carries it as a full `ConstValue` so
     /// non-Int llexitcase shapes (`lltype.Ptr`, host class objects)
     /// round-trip to the backend intact.
-    #[serde(skip, default)]
     pub llexitcase: Option<ConstValue>,
     pub last_exception: Option<LinkArg>,
     pub last_exc_value: Option<LinkArg>,
@@ -688,7 +686,7 @@ pub fn exception_exitcase() -> ExitCase {
 }
 
 /// RPython `Link.args` items are Variables or Constants.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkArg {
     Value(ValueId),
     Const(ConstValue),
@@ -723,7 +721,7 @@ impl From<ConstValue> for LinkArg {
 /// `Link`, bool branches are `exitswitch=Variable` with two Links
 /// carrying `Bool(false)`/`Bool(true)` exitcases, can-raise is
 /// `exitswitch=c_last_exception`, and final blocks have `exits=()`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub id: BlockId,
     /// Phi-node inputs: values provided by incoming Links.
@@ -808,7 +806,7 @@ where
     (exitswitch, exits)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
     pub startblock: BlockId,
@@ -820,11 +818,9 @@ pub struct FunctionGraph {
     /// RPython `FunctionGraph.exceptblock` — `Block([etype, evalue])`.
     pub exceptblock: BlockId,
     pub blocks: Vec<Block>,
-    #[serde(default)]
     pub notes: Vec<String>,
     next_value: usize,
     /// Variable names for debugging (RPython Variable._name).
-    #[serde(default)]
     pub value_names: std::collections::HashMap<ValueId, String>,
 }
 
@@ -979,21 +975,24 @@ impl FunctionGraph {
 
     /// RPython `flowspace/model.py:250 recloseblock(*exits)` — stamp
     /// `link.prevblock` on each exit and install them as the block's
-    /// exits, overwriting any previous contents.  In pyre, exitswitch
-    /// is kept in step: callers wanting to set a branch pass the
-    /// exitswitch alongside via `set_branch`; a bare `recloseblock`
-    /// defaults to `exitswitch = None`, matching upstream single-exit
-    /// fall-through.
+    /// exits, overwriting any previous contents.  Like upstream, this
+    /// does not touch `exitswitch`; callers that want to change the
+    /// branch/raise discriminator must set it separately before
+    /// `closeblock`/`recloseblock`.
     pub fn recloseblock(&mut self, block: BlockId, exits: Vec<Link>) {
-        self.set_control_flow_metadata(block, None, exits);
+        self.blocks[block.0].exits = exits
+            .into_iter()
+            .map(|link| link.with_prevblock(block))
+            .collect();
     }
 
     /// RPython `flowspace/model.py:246 closeblock(*exits)` —
     /// `assert self.exits == [], "block already closed"` before
-    /// delegating to `recloseblock`.  pyre mirrors the pre-closure
-    /// invariant on the `Block.exits` vector.
+    /// delegating to `recloseblock`.  Keep the invariant as a regular
+    /// assert, not `debug_assert!`, so release builds match upstream's
+    /// fail-fast behavior.
     pub fn closeblock(&mut self, block: BlockId, exits: Vec<Link>) {
-        debug_assert!(
+        assert!(
             self.blocks[block.0].exits.is_empty(),
             "block {:?} already closed",
             block
@@ -1245,5 +1244,40 @@ mod tests {
         assert_eq!(entry_block.exits[0].prevblock, Some(entry));
         assert_eq!(entry_block.exits[0].target, graph.returnblock);
         assert_eq!(entry_block.exits[0].args, vec![LinkArg::from(value)]);
+    }
+
+    #[test]
+    fn recloseblock_preserves_existing_exitswitch() {
+        let mut graph = FunctionGraph::new("demo");
+        let entry = graph.startblock;
+        let cond = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let target = graph.create_block();
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+
+        graph.recloseblock(entry, vec![Link::new(vec![], target, None)]);
+
+        assert_eq!(graph.block(entry).exitswitch, Some(ExitSwitch::Value(cond)));
+        assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
+    }
+
+    #[test]
+    #[should_panic(expected = "already closed")]
+    fn closeblock_panics_when_called_twice() {
+        let mut graph = FunctionGraph::new("demo");
+        let entry = graph.startblock;
+        let first = graph.create_block();
+        let second = graph.create_block();
+
+        graph.closeblock(entry, vec![Link::new(vec![], first, None)]);
+        graph.closeblock(entry, vec![Link::new(vec![], second, None)]);
     }
 }

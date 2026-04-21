@@ -92,7 +92,7 @@ pub struct ResolvedCall {
     pub impl_type: Option<String>,
     pub trait_name: Option<String>,
     /// Canonical semantic graph for this resolved target.
-    #[serde(default)]
+    #[serde(skip, default)]
     pub graph: Option<model::FunctionGraph>,
 }
 
@@ -110,7 +110,7 @@ pub struct TraitImplInfo {
 pub struct MethodInfo {
     pub name: String,
     /// Canonical semantic graph for this method when available.
-    #[serde(default)]
+    #[serde(skip, default)]
     pub graph: Option<model::FunctionGraph>,
     /// RPython: op.result.concretetype — return type for array identity.
     #[serde(default)]

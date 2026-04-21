@@ -29,7 +29,7 @@ pub enum IntOvfOp {
 /// A flattened instruction (post-CFG).
 ///
 /// RPython equivalent: SSARepr instruction tuples from flatten.py.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlatOp {
     /// Label definition (target for jumps).
     Label(Label),
@@ -136,7 +136,7 @@ pub enum RegKind {
 }
 
 /// Result of the flatten pass.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SSARepr {
     pub name: String,
     pub insns: Vec<FlatOp>,
@@ -145,14 +145,12 @@ pub struct SSARepr {
     /// Number of basic blocks in the source graph.
     pub num_blocks: usize,
     /// Value kinds inferred from the type resolution pass.
-    #[serde(default)]
     pub value_kinds: std::collections::HashMap<ValueId, RegKind>,
     /// flatten.py / assembler.py `ssarepr._insns_pos` — byte position
     /// of each instruction in the final bytecode, populated by the
     /// assembler.  `format.py:57-60` uses it to prefix every line with
     /// the position when set.  `None` when the SSARepr has not yet been
     /// assembled, matching upstream's `if ssarepr._insns_pos:` guard.
-    #[serde(default)]
     pub insns_pos: Option<Vec<usize>>,
 }
 

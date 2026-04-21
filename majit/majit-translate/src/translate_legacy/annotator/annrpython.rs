@@ -10,7 +10,7 @@
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
 use crate::flowspace::model::ConstValue;
-use crate::model::{FunctionGraph, LinkArg, OpKind, ValueId, ValueType};
+use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
 use std::collections::HashMap;
 
 /// Annotation state: maps ValueId → inferred ValueType.
@@ -70,24 +70,71 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
             // iterates `for link in block.exits` and unions each
             // `link.args[i]` annotation into `link.target.inputargs[i]`.
             for link in &block.exits {
-                let target_block = graph.block(link.target);
-                for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                    let src_ty = match src {
-                        LinkArg::Value(src) => state.get(*src).clone(),
-                        LinkArg::Const(value) => const_value_type(value),
-                    };
-                    let current = state.get(*dst).clone();
-                    let merged = union_type(&current, &src_ty);
-                    if merged != current {
-                        state.set(*dst, merged);
-                        changed = true;
-                    }
-                }
+                let link_changed = if link_is_raise_like(link) {
+                    follow_raise_link(&mut state, graph, link)
+                } else {
+                    follow_link(&mut state, graph, link)
+                };
+                changed |= link_changed;
             }
         }
     }
 
     state
+}
+
+fn link_is_raise_like(link: &Link) -> bool {
+    link.last_exception.is_some() && link.last_exc_value.is_some()
+}
+
+fn follow_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
+    let mut changed = false;
+    let target_block = graph.block(link.target);
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+        changed |= merge_value_type(state, *dst, link_arg_type(state, src));
+    }
+    changed
+}
+
+fn follow_raise_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
+    let mut changed = false;
+    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
+        changed |= merge_value_type(state, *value, ValueType::Ref);
+    }
+    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
+        changed |= merge_value_type(state, *value, ValueType::Int);
+    }
+
+    let target_block = graph.block(link.target);
+    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+        let src_ty = if Some(src) == link.last_exception.as_ref() {
+            ValueType::Int
+        } else if Some(src) == link.last_exc_value.as_ref() {
+            ValueType::Ref
+        } else {
+            link_arg_type(state, src)
+        };
+        changed |= merge_value_type(state, *dst, src_ty);
+    }
+    changed
+}
+
+fn link_arg_type(state: &AnnotationState, src: &LinkArg) -> ValueType {
+    match src {
+        LinkArg::Value(src) => state.get(*src).clone(),
+        LinkArg::Const(value) => const_value_type(value),
+    }
+}
+
+fn merge_value_type(state: &mut AnnotationState, dst: ValueId, src_ty: ValueType) -> bool {
+    let current = state.get(dst).clone();
+    let merged = union_type(&current, &src_ty);
+    if merged != current {
+        state.set(dst, merged);
+        true
+    } else {
+        false
+    }
 }
 
 fn const_value_type(value: &ConstValue) -> ValueType {
@@ -211,7 +258,9 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+    use crate::model::{
+        CallTarget, ExitSwitch, FunctionGraph, Link, OpKind, ValueType, exception_exitcase,
+    };
 
     #[test]
     fn annotates_const_int() {
@@ -319,5 +368,35 @@ mod tests {
             &ValueType::Int,
             "Phi node should receive Int annotation from Link args"
         );
+    }
+
+    #[test]
+    fn raise_link_propagates_exception_pair_with_special_types() {
+        let mut graph = FunctionGraph::new("raise_link");
+        let entry = graph.startblock;
+        let (exc_block, etype, evalue) = graph.exceptblock_args();
+        let last_exception = graph.alloc_value();
+        let last_exc_value = graph.alloc_value();
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![
+                Link::new(
+                    vec![last_exception, last_exc_value],
+                    exc_block,
+                    Some(exception_exitcase()),
+                )
+                .extravars(
+                    Some(LinkArg::from(last_exception)),
+                    Some(LinkArg::from(last_exc_value)),
+                ),
+            ],
+        );
+
+        let state = annotate(&graph);
+        assert_eq!(state.get(last_exception), &ValueType::Int);
+        assert_eq!(state.get(last_exc_value), &ValueType::Ref);
+        assert_eq!(state.get(etype), &ValueType::Int);
+        assert_eq!(state.get(evalue), &ValueType::Ref);
     }
 }

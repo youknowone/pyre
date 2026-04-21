@@ -16,17 +16,15 @@ use crate::model::{
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AstGraphOptions;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SemanticFunction {
     pub name: String,
     pub graph: FunctionGraph,
     /// RPython: `op.result.concretetype` — full return type string.
     /// Used for array identity resolution on Call result values.
-    #[serde(default)]
     pub return_type: Option<String>,
     /// Owner type for impl methods (e.g. "MyStruct" for `impl MyStruct { fn foo() }`).
     /// Used to construct the full CallPath for return_type registration.
-    #[serde(default)]
     pub self_ty_root: Option<String>,
     /// RPython: function-level hints set by GC transformer / decorators.
     /// "close_stack" → _gctransformer_hint_close_stack_
@@ -34,7 +32,6 @@ pub struct SemanticFunction {
     /// "gc_effects" → random_effects_on_gcobjs
     /// "elidable" → _elidable_function_
     /// "loopinvariant" → _jit_loop_invariant_
-    #[serde(default)]
     pub hints: Vec<String>,
 }
 
@@ -63,13 +60,12 @@ impl StructFieldRegistry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SemanticProgram {
     pub functions: Vec<SemanticFunction>,
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
     pub known_struct_names: std::collections::HashSet<String>,
     /// Known trait names used to canonicalize local `dyn Trait` family keys.
-    #[serde(default)]
     pub known_trait_names: std::collections::HashSet<String>,
     /// RPython: struct field types for resolving `op.args[0].concretetype`
     /// on FieldRead-produced array bases.
@@ -78,7 +74,6 @@ pub struct SemanticProgram {
     /// Maps exact callee path (e.g. "a::helper", "Type::method") → return type.
     /// Stored here so that downstream consumers (parse.rs method graph building)
     /// can use them for array type identity resolution.
-    #[serde(default)]
     pub fn_return_types: HashMap<String, String>,
     /// RPython: `_immutable_fields_ = [...]` declared on a class body.
     /// Maps struct name → `(field_name, rank)` pairs whose value never
@@ -86,7 +81,6 @@ pub struct SemanticProgram {
     /// qualified struct keys are inserted (mirroring `struct_fields`) so
     /// the same lookup logic works across module-prefix variants.  Rank
     /// encoding follows `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
-    #[serde(default)]
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
 }
 

@@ -1389,38 +1389,6 @@ impl HostEnv {
         self.lookup_exception_class(name)
             .and_then(|cls| cls.reusable_prebuilt_instance())
     }
-
-    fn builtin_singleton_name<'a>(&'a self, obj: &HostObject) -> Option<&'a str> {
-        self.builtins
-            .get_key_value(obj.qualname())
-            .and_then(|(name, builtin)| (builtin == obj).then_some(name.as_str()))
-            .or_else(|| {
-                self.builtins
-                    .iter()
-                    .find_map(|(name, builtin)| (builtin == obj).then_some(name.as_str()))
-            })
-    }
-
-    fn imported_module_name(&self, obj: &HostObject) -> Option<String> {
-        let mods = self.modules.lock().unwrap();
-        mods.get_key_value(obj.qualname())
-            .and_then(|(name, module)| (module == obj).then_some(name.clone()))
-            .or_else(|| {
-                mods.iter()
-                    .find_map(|(name, module)| (module == obj).then_some(name.clone()))
-            })
-    }
-
-    fn standard_exception_instance_name(&self, obj: &HostObject) -> Option<String> {
-        let cls = obj.instance_class()?;
-        let class_name = cls.qualname();
-        let builtin_cls = self.lookup_exception_class(class_name)?;
-        if builtin_cls != *cls {
-            return None;
-        }
-        let standard = self.lookup_standard_exception_instance(class_name)?;
-        (standard == *obj).then_some(class_name.to_owned())
-    }
 }
 
 /// 프로세스 전역 host namespace singleton. bootstrap 은 upstream
@@ -1512,102 +1480,6 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::Code(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
         }
-    }
-}
-
-/// Serialize / Deserialize are required wherever `Link.args` /
-/// `Link.last_exception` / `Link.last_exc_value` flow through a
-/// bincode-serialized `SSARepr` (see
-/// `pyre-jit-trace/build.rs`).  The simple leaf variants round-trip
-/// faithfully; `HostObject` only round-trips for bootstrap singletons
-/// that have an upstream-stable identity (`__builtin__` entries,
-/// imported stdlib module placeholders, standard exception reusable
-/// instances).  Unsupported host payloads fail closed during serialize
-/// instead of silently decoding to the wrong object.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SerializableConstValue {
-    Placeholder,
-    Int(i64),
-    Float(u64),
-    Str(String),
-    Bool(bool),
-    None,
-    SpecTag(u64),
-    BuiltinSingleton(String),
-    ImportedModule(String),
-    StandardExceptionInstance(String),
-    /// Complex variants without a cross-process identity serialize as
-    /// `Opaque` and deserialize back to `ConstValue::Placeholder`.
-    Opaque,
-}
-
-impl serde::Serialize for ConstValue {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let tag = match self {
-            ConstValue::Placeholder => SerializableConstValue::Placeholder,
-            ConstValue::Int(value) => SerializableConstValue::Int(*value),
-            ConstValue::Float(bits) => SerializableConstValue::Float(*bits),
-            ConstValue::Str(value) => SerializableConstValue::Str(value.clone()),
-            ConstValue::Bool(value) => SerializableConstValue::Bool(*value),
-            ConstValue::None => SerializableConstValue::None,
-            ConstValue::SpecTag(id) => SerializableConstValue::SpecTag(*id),
-            ConstValue::HostObject(obj) => match HOST_ENV.builtin_singleton_name(obj) {
-                Some(name) => SerializableConstValue::BuiltinSingleton(name.to_owned()),
-                None => match HOST_ENV.standard_exception_instance_name(obj) {
-                    Some(name) => SerializableConstValue::StandardExceptionInstance(name),
-                    None => match HOST_ENV.imported_module_name(obj) {
-                        Some(name) => SerializableConstValue::ImportedModule(name),
-                        None => {
-                            return Err(<S::Error as serde::ser::Error>::custom(format!(
-                                "unsupported HostObject serialization for {}",
-                                obj.qualname()
-                            )));
-                        }
-                    },
-                },
-            },
-            ConstValue::Atom(_)
-            | ConstValue::Dict(_)
-            | ConstValue::Tuple(_)
-            | ConstValue::List(_)
-            | ConstValue::Code(_)
-            | ConstValue::Function(_) => SerializableConstValue::Opaque,
-        };
-        <SerializableConstValue as serde::Serialize>::serialize(&tag, serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ConstValue {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let tag = <SerializableConstValue as serde::Deserialize<'de>>::deserialize(deserializer)?;
-        Ok(match tag {
-            SerializableConstValue::Placeholder | SerializableConstValue::Opaque => {
-                ConstValue::Placeholder
-            }
-            SerializableConstValue::Int(value) => ConstValue::Int(value),
-            SerializableConstValue::Float(bits) => ConstValue::Float(bits),
-            SerializableConstValue::Str(value) => ConstValue::Str(value),
-            SerializableConstValue::Bool(value) => ConstValue::Bool(value),
-            SerializableConstValue::None => ConstValue::None,
-            SerializableConstValue::SpecTag(id) => ConstValue::SpecTag(id),
-            SerializableConstValue::BuiltinSingleton(name) => {
-                match HOST_ENV.lookup_builtin(&name) {
-                    Some(obj) => ConstValue::HostObject(obj),
-                    None => ConstValue::Placeholder,
-                }
-            }
-            SerializableConstValue::ImportedModule(name) => match HOST_ENV.import_module(&name) {
-                Some(obj) => ConstValue::HostObject(obj),
-                None => ConstValue::Placeholder,
-            },
-            SerializableConstValue::StandardExceptionInstance(name) => {
-                match HOST_ENV.lookup_standard_exception_instance(&name) {
-                    Some(obj) => ConstValue::HostObject(obj),
-                    None => ConstValue::Placeholder,
-                }
-            }
-        })
     }
 }
 
@@ -3904,50 +3776,6 @@ mod tests {
     fn mro_on_non_class_returns_none() {
         let m = HostObject::new_module("pkg");
         assert!(m.mro().is_none());
-    }
-
-    #[test]
-    fn builtin_exception_class_roundtrips_with_identity() {
-        let value = ConstValue::HostObject(
-            HOST_ENV
-                .lookup_exception_class("OverflowError")
-                .expect("missing builtin OverflowError"),
-        );
-        let encoded = serde_json::to_string(&value).expect("serialize builtin exception class");
-        let decoded: ConstValue =
-            serde_json::from_str(&encoded).expect("deserialize builtin exception class");
-        assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn standard_exception_instance_roundtrips_with_identity() {
-        let value = ConstValue::HostObject(
-            HOST_ENV
-                .lookup_standard_exception_instance("OverflowError")
-                .expect("missing standard OverflowError instance"),
-        );
-        let encoded = serde_json::to_string(&value).expect("serialize standard exception instance");
-        let decoded: ConstValue =
-            serde_json::from_str(&encoded).expect("deserialize standard exception instance");
-        assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn unsupported_host_object_serialize_errors() {
-        let user_exc = HostObject::new_class(
-            "UserExc",
-            vec![
-                HOST_ENV
-                    .lookup_builtin("Exception")
-                    .expect("missing builtin Exception"),
-            ],
-        );
-        let value = ConstValue::HostObject(HostObject::new_instance(user_exc, Vec::new()));
-        let err = serde_json::to_string(&value).expect_err("unsupported host object should fail");
-        assert!(
-            err.to_string()
-                .contains("unsupported HostObject serialization")
-        );
     }
 
     #[test]
