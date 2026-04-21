@@ -1582,7 +1582,16 @@ impl TraceRecordBuffer {
             (SMALL_INT_START..SMALL_INT_STOP).contains(&value),
             "value {value} out of SMALL_INT range — use _encode_bigint"
         );
-        tag(TAGINT, value as u32) as i64
+        // RPython `tag(TAGINT, value)` evaluates with Python's
+        // arbitrary-precision signed ints — `(-1) << 2 | 0 == -4`.
+        // The `u32`-based `tag()` helper works for snapshot array
+        // positions where values are always non-negative, but
+        // SMALL_INT values are signed and `value as u32` zero-extends
+        // negatives into a 32-bit positive that exceeds MAX_VALUE on
+        // `append_int`. Use i64 arithmetic so the sign survives the
+        // encode/decode round trip — `_untag`'s `tagged >> TAG_SHIFT`
+        // is already an i64 arithmetic shift.
+        (value << TAG_SHIFT) | (TAGINT as i64)
     }
 
     /// opencoder.py:609-622 _encode for ConstInt that does NOT fit in
@@ -4167,5 +4176,159 @@ mod tests {
         assert_eq!((j0, p0), (1, 10), "framestack[0] == outermost");
         assert_eq!((j1, p1), (2, 20), "framestack[1] == middle");
         assert_eq!((j2, p2), (3, 30), "framestack[2] == innermost");
+    }
+
+    // ── Phase C: RPython test_opencoder.py parity ports ─────────────────
+    // Line-by-line ports of the canonical tests in
+    // `rpython/jit/metainterp/test/test_opencoder.py`. Each Rust test cites
+    // the upstream line it mirrors so regressions stay traceable to the
+    // Python fixture.
+
+    /// test_opencoder.py:71 `TestOpencoder.test_simple_iterator` —
+    /// canonical two-op `IntAdd` chain with a small-int constant argument.
+    /// Ensures `record_op2` + `ByteTraceIter::new_with_pool` round-trip
+    /// the op list with the expected arity, opcode, and arg identities.
+    #[test]
+    fn test_simple_iterator_c() {
+        let mut t = TraceRecordBuffer::new(2, empty_sd());
+        let i0 = t.record_input_arg(Type::Int);
+        let i1 = t.record_input_arg(Type::Int);
+        // add = t.record_op(rop.INT_ADD, [i0, i1])
+        let add_pos = t.record_op2(OpCode::IntAdd, Box::ResOp(i0.0), Box::ResOp(i1.0), None);
+        // t.record_op(rop.INT_ADD, [add, ConstInt(1)])
+        let _ = t.record_op2(OpCode::IntAdd, Box::ResOp(add_pos), Box::ConstInt(1), None);
+
+        // `self.unpack(t)` equivalent — ConstInt(1) decodes via the pool.
+        let mut pool = crate::constant_pool::ConstantPool::new();
+        let mut it = ByteTraceIter::new_with_pool(
+            &t,
+            t._start as usize,
+            t._pos,
+            t.max_num_inputargs,
+            Some(&mut pool),
+        );
+        let fresh_i0 = it.inputargs[0];
+        let fresh_i1 = it.inputargs[1];
+        let l0 = it.next().expect("first IntAdd");
+        let l1 = it.next().expect("second IntAdd");
+        assert!(it.done(), "only two ops recorded");
+        // assert l[0].opnum == rop.INT_ADD
+        assert_eq!(l0.opcode, OpCode::IntAdd);
+        // assert l[1].opnum == rop.INT_ADD
+        assert_eq!(l1.opcode, OpCode::IntAdd);
+        // assert l[0].getarg(0) is i0; getarg(1) is i1
+        assert_eq!(l0.args[0], fresh_i0);
+        assert_eq!(l0.args[1], fresh_i1);
+        // assert l[1].getarg(0) is l[0]
+        assert_eq!(l1.args[0], l0.pos);
+        // assert l[1].getarg(1).getint() == 1 — pool-resolved constant.
+        drop(it);
+        assert_eq!(pool.get_value(l1.args[1]), Some(majit_ir::Value::Int(1)));
+    }
+
+    /// test_opencoder.py:250 `test_constint_small` —
+    /// SMALL_INT values encode to 2 or 4 bytes depending on the varint
+    /// boundary, leave `_consts_bigint` untouched (no bigint pool use),
+    /// and round-trip to the original value via `ByteTraceIter::_untag`.
+    ///
+    /// RPython uses Hypothesis; pyre iterates a hand-picked representative
+    /// sample that spans the 2-byte / 4-byte split (upstream's `-2**12`
+    /// boundary) plus SMALL_INT_START / SMALL_INT_STOP extremes.
+    #[test]
+    fn test_constint_small_c() {
+        // Representative sample matching RPython's Hypothesis strategy
+        // `integers(SMALL_INT_START, SMALL_INT_STOP - 1)`.
+        let sample: &[i64] = &[
+            0,
+            1,
+            -1,
+            127,
+            -128,
+            (1 << 12) - 1,
+            -(1 << 12),
+            (1 << 12),
+            -(1 << 12) - 1,
+            SMALL_INT_START,
+            SMALL_INT_STOP - 1,
+        ];
+        for &num in sample {
+            let mut t = TraceRecordBuffer::new(0, empty_sd());
+            // t.append_int(t._encode(ConstInt(num))) — SMALL_INT path.
+            t.append_int(TraceRecordBuffer::_encode_smallint(num));
+            // assert t._consts_bigint == 0
+            assert_eq!(
+                t._consts_bigint, 0,
+                "SMALL_INT must not hit bigint pool for {num}"
+            );
+            // _pos counts only the appended varint (no inputargs reserve
+            // because `max_num_inputargs == 0`).
+            let expected_len = if (-(1i64 << 12)..(1i64 << 12)).contains(&num) {
+                2
+            } else {
+                4
+            };
+            assert_eq!(
+                t._pos, expected_len,
+                "SMALL_INT {num} should encode as {expected_len} bytes, got {}",
+                t._pos,
+            );
+            // Round-trip: `it._next()` reads the tagged i64, `_untag`
+            // returns an OpRef that resolves to `Value::Int(num)` via the
+            // constant pool.
+            let mut pool = crate::constant_pool::ConstantPool::new();
+            let mut it =
+                ByteTraceIter::new_with_pool(&t, 0, t._pos, t.max_num_inputargs, Some(&mut pool));
+            let tagged = it._next();
+            let opref = it._untag(tagged);
+            drop(it);
+            assert_eq!(
+                pool.get_value(opref),
+                Some(majit_ir::Value::Int(num)),
+                "SMALL_INT {num} round-trip via ByteTraceIter",
+            );
+        }
+    }
+
+    /// test_opencoder.py:263 `test_varint_hypothesis` —
+    /// `encode_varint_signed` / `decode_varint_signed` round-trip over
+    /// the full `[MIN_VALUE, MAX_VALUE]` range, including the case where
+    /// the encoded bytes sit behind an arbitrary prefix (decoder's
+    /// `start` offset). Pyre samples the hypothesis surface with a
+    /// hand-picked set of boundary values.
+    #[test]
+    fn test_varint_hypothesis_c() {
+        let values: &[i64] = &[
+            0,
+            1,
+            -1,
+            (1 << 14) - 1,
+            -(1 << 14),
+            1 << 14,
+            -(1 << 14) - 1,
+            (1 << 20),
+            -(1 << 20),
+            MIN_VALUE,
+            MAX_VALUE,
+        ];
+        let prefixes: &[&[u8]] = &[&[], &[0xAA], &[0x00, 0xFF, 0x42]];
+        for &i in values {
+            let mut encoded = Vec::new();
+            encode_varint_signed(&mut encoded, i);
+            // Bare decode.
+            let (res, consumed) = decode_varint_signed(&encoded);
+            assert_eq!(res, i, "bare decode roundtrip for {i}");
+            assert_eq!(consumed, encoded.len(), "consumed full encoding for {i}");
+            // Decode after an arbitrary prefix — `decode_varint_signed`
+            // operates on a slice starting at the varint, so pyre mirrors
+            // RPython's `decode_varint_signed(prefix + b, len(prefix))`
+            // by slicing off the prefix before the call.
+            for &prefix in prefixes {
+                let mut combined = prefix.to_vec();
+                combined.extend_from_slice(&encoded);
+                let (res, consumed) = decode_varint_signed(&combined[prefix.len()..]);
+                assert_eq!(res, i, "prefixed decode roundtrip for {i}");
+                assert_eq!(consumed, encoded.len(), "prefixed consumed for {i}");
+            }
+        }
     }
 }
