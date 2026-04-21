@@ -727,15 +727,29 @@ fn successors(block: &crate::model::Block) -> Vec<BlockId> {
 ///
 /// Emits the ordered series of `%s_copy` / `%s_push` / `%s_pop` ops
 /// that resolve a link's argument-to-inputarg renaming, breaking any
-/// cycles via `reorder_renaming_list`. Upstream groups by register
-/// kind so it can emit `int_copy` / `ref_copy` / `float_copy` under
-/// different opnames; this helper emits generic `FlatOp::Move` /
-/// `Push` / `Pop` and defers the per-kind opname selection to the
-/// assembler (`assembler.rs::write_insn`), which looks up each value's
-/// kind via the RegAllocResult coloring. Cycle-break correctness is
-/// preserved because cycles live entirely within one kind's register
-/// bank — a single global `reorder_renaming_list` call produces the
-/// same (src, dst) sequence as three per-kind calls would.
+/// cycles via `reorder_renaming_list`. Mirrors upstream's structure
+/// line-by-line:
+///
+/// 1. Build `lst = [(src_color, dst_color)]` filtering extravars.
+/// 2. `lst.sort(key=lambda (v, w): w.index)` — global sort by dst color
+///    (`flatten.py:312`).
+/// 3. Skip identity entries (`flatten.py:314 if v == w: continue`) and
+///    group by `w.kind` (`flatten.py:316-318`).
+/// 4. For each kind in `KINDS = ['int', 'ref', 'float']` order, run
+///    `reorder_renaming_list` on that kind's `(frm, to)` pair and
+///    emit `{kind}_push` / `{kind}_pop` / `{kind}_copy`
+///    (`flatten.py:319-333`).
+/// 5. Tail-emit `generate_last_exc` (`flatten.py:334`).
+///
+/// pyre's `FlatOp::Move` / `Push` / `Pop` do not carry an explicit
+/// `kind` field — the assembler (`assembler.rs::write_insn`) looks
+/// each ValueId's kind up through `value_kinds` and emits the
+/// matching `{kind}_copy` / `{kind}_push` / `{kind}_pop` opname.
+/// The kind-grouping loop therefore affects emission ORDER (upstream's
+/// `int_copy`s all come before `ref_copy`s, which come before
+/// `float_copy`s) rather than opname selection, and the cycle-break is
+/// computed per kind so that a Push in one kind's bank cannot pair
+/// with a Pop in another kind's bank.
 ///
 /// `regallocs` supplies `getcolor(v)` per upstream — cycle detection
 /// operates on colors, not ValueIds, so it remains correct whether
@@ -791,15 +805,15 @@ pub fn insert_renamings(
         Const(ConstValue),
     }
 
-    // Resolve each ValueId to its regalloc-assigned color, mirroring
-    // upstream's `self.getcolor(v)` + `self.getcolor(inputargs[i])`.
-    // Cycle-break must operate on colors, not ValueIds: two distinct
-    // ValueIds can share a color after `coalesce_variables`, and two
-    // kind-separated banks use independent color spaces.
-    let get_color = |v: ValueId| -> Option<usize> {
-        for ra in regallocs.values() {
+    // Resolve each ValueId to its regalloc-assigned `(kind, color)`,
+    // mirroring upstream's `self.getcolor(v)` + `self.getcolor(w)`.
+    // Returning the kind alongside the color lets the `flatten.py:317`
+    // `renamings.setdefault(w.kind, ...)` grouping key come from the
+    // coloring rather than a separate `value_kinds` lookup.
+    let get_kind_color = |v: ValueId| -> Option<(RegKind, usize)> {
+        for (&kind, ra) in regallocs {
             if let Some(&c) = ra.coloring.get(&v) {
-                return Some(c);
+                return Some((kind, c));
             }
         }
         None
@@ -809,65 +823,102 @@ pub fn insert_renamings(
     // len(link.target.inputargs)` — the helper assumes equality and
     // indexes both sides pairwise. The graph builder must provide
     // well-formed links; any mismatch is a front-end bug.
-    //
-    // Parallel color lists for `reorder_renaming_list` + representative
-    // ValueIds for emitting back into `FlatOp::Move/Push/Pop`. Each
-    // kept pair satisfies `v_color != w_color` (upstream `if v == w:
-    // continue` — after regalloc, equal colors mean equal variables).
     assert_eq!(
         link.args.len(),
         target_inputargs.len(),
         "insert_renamings: link.args and target.inputargs must have equal length"
     );
-    let cap = link.args.len();
-    let mut frm_colors: Vec<RenameItem> = Vec::with_capacity(cap);
-    let mut to_colors: Vec<RenameItem> = Vec::with_capacity(cap);
-    let mut src_vids: Vec<(usize, ValueId)> = Vec::with_capacity(cap);
-    let mut dst_vids: Vec<ValueId> = Vec::with_capacity(cap);
+
+    // Each entry captures one raw (src, dst) pair with its dst `(kind,
+    // color)` alongside the original ValueIds — the ValueIds are
+    // needed to reconstruct `FlatOp::Move/Push/Pop` after
+    // `reorder_renaming_list` has shuffled the group.
+    struct Entry {
+        src: RenameItem,
+        src_vid: Option<ValueId>,
+        dst_color: usize,
+        dst_kind: RegKind,
+        dst_vid: ValueId,
+    }
+    let mut lst: Vec<Entry> = Vec::with_capacity(link.args.len());
     for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
         // `flatten.py:310-311` skip.
         if Some(v) == link.last_exception.as_ref() || Some(v) == link.last_exc_value.as_ref() {
             continue;
         }
-        let Some(w_col) = get_color(*w) else { continue };
-        let src_item = match v {
+        let Some((dst_kind, dst_color)) = get_kind_color(*w) else {
+            continue;
+        };
+        let (src, src_vid) = match v {
             LinkArg::Value(value) => {
-                let Some(v_col) = get_color(*value) else {
+                let Some((_, v_color)) = get_kind_color(*value) else {
                     continue;
                 };
-                if v_col == w_col {
+                // `flatten.py:314 if v == w: continue` — after regalloc,
+                // equal colors mean the renaming is the identity.
+                if v_color == dst_color {
                     continue;
                 }
-                src_vids.push((v_col, *value));
-                RenameItem::Color(v_col)
+                (RenameItem::Color(v_color), Some(*value))
             }
-            LinkArg::Const(value) => RenameItem::Const(value.clone()),
+            LinkArg::Const(value) => (RenameItem::Const(value.clone()), None),
         };
-        frm_colors.push(src_item);
-        to_colors.push(RenameItem::Color(w_col));
-        dst_vids.push(*w);
+        lst.push(Entry {
+            src,
+            src_vid,
+            dst_color,
+            dst_kind,
+            dst_vid: *w,
+        });
     }
 
-    if !frm_colors.is_empty() {
-        // `result = reorder_renaming_list(frm, to)` — cycle-safe
-        // ordering over the color pairs.
-        let result = reorder_renaming_list(&frm_colors, &to_colors);
+    // `flatten.py:312` `lst.sort(key=lambda (v, w): w.index)` — global
+    // stable sort by destination color.  Within a kind group (post
+    // split), the sort order is preserved — so each kind's `frm` /
+    // `to` list is internally sorted by dst color.
+    lst.sort_by_key(|e| e.dst_color);
 
-        // Map a color back to a representative ValueId so downstream
-        // passes that still use ValueId identity (liveness backward
-        // walk, assembler `lookup_reg_with_kind`) keep working.
+    // `flatten.py:316-318` `renamings.setdefault(w.kind, ([], []))`
+    // group by destination kind, preserving the sort order from above.
+    let mut by_kind: HashMap<RegKind, Vec<Entry>> = HashMap::new();
+    for entry in lst {
+        by_kind.entry(entry.dst_kind).or_default().push(entry);
+    }
+
+    // `flatten.py:319-333` iterate kinds in `KINDS = ['int', 'ref',
+    // 'float']` order so upstream's emission sequence (`int_copy` runs,
+    // then `ref_copy` runs, then `float_copy` runs) is reproduced.
+    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+        let Some(entries) = by_kind.remove(&kind) else {
+            continue;
+        };
+        let frm: Vec<RenameItem> = entries.iter().map(|e| e.src.clone()).collect();
+        let to: Vec<RenameItem> = entries
+            .iter()
+            .map(|e| RenameItem::Color(e.dst_color))
+            .collect();
+        let result = reorder_renaming_list(&frm, &to);
+
+        // Map a color back to a representative ValueId in the current
+        // kind group so `FlatOp::Move/Push/Pop` carry the original
+        // identity.  Cycle-break keeps src/dst colors inside this group,
+        // so the search is bounded by `entries`.
         let find_src_vid = |c: usize| -> ValueId {
-            src_vids
+            entries
                 .iter()
-                .find_map(|(src_c, value)| (*src_c == c).then_some(*value))
+                .find_map(|e| match e.src {
+                    RenameItem::Color(sc) if sc == c => e.src_vid,
+                    _ => None,
+                })
                 .unwrap_or_else(|| panic!("reorder_renaming_list missing source for color {c}"))
         };
         let find_dst_vid = |c: usize| -> ValueId {
-            let idx = to_colors
+            entries
                 .iter()
-                .position(|tc| matches!(tc, RenameItem::Color(tc_color) if *tc_color == c))
-                .expect("reorder_renaming_list dst color must come from to_colors");
-            dst_vids[idx]
+                .find_map(|e| (e.dst_color == c).then_some(e.dst_vid))
+                .unwrap_or_else(|| {
+                    panic!("reorder_renaming_list missing destination for color {c}")
+                })
         };
 
         for (v, w) in result {
@@ -1561,8 +1612,12 @@ mod tests {
 
     #[test]
     fn insert_renamings_breaks_swap_cycle_with_push_pop() {
-        // Swap `%0 <-> %1` — reorder_renaming_list returns
-        // [(0,None), (1,0), (None,1)] which maps to push/copy/pop.
+        // Swap `%0 <-> %1` — the raw `(src,dst)` pairs are `(0,1)` and
+        // `(1,0)`.  `flatten.py:312` `lst.sort(key=lambda (v,w): w.index)`
+        // reorders by dst color → `(1,0)` comes first, then `(0,1)`.
+        // `reorder_renaming_list([1,0], [0,1])` then picks the first
+        // pending entry for the cycle break → push ValueId(1);
+        // copy ValueId(0)->ValueId(1); pop ValueId(0).
         let regallocs = identity_regallocs(8);
         let mut ops: Vec<FlatOp> = Vec::new();
         let link = plain_link(&[ValueId(0), ValueId(1)]);
@@ -1570,12 +1625,12 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                FlatOp::Push(ValueId(0)),
+                FlatOp::Push(ValueId(1)),
                 FlatOp::Move {
-                    dst: ValueId(0),
-                    src: LinkArg::Value(ValueId(1)),
+                    dst: ValueId(1),
+                    src: LinkArg::Value(ValueId(0)),
                 },
-                FlatOp::Pop(ValueId(1)),
+                FlatOp::Pop(ValueId(0)),
             ]
         );
     }
@@ -1644,6 +1699,77 @@ mod tests {
             ops.iter().any(|o| matches!(o, FlatOp::Pop(_))),
             "color-level 2-cycle must emit a Pop, got {:?}",
             ops
+        );
+    }
+
+    /// `flatten.py:312` `lst.sort(key=lambda (v,w): w.index)` + per-kind
+    /// grouping emits each kind's renamings contiguously, sorted by dst
+    /// color within the group.  With mixed Int + Ref link args, the
+    /// output shows all Int-bank Moves before the Ref-bank Move even
+    /// when the link args interleave the kinds.
+    #[test]
+    fn insert_renamings_groups_by_kind_and_sorts_by_dst() {
+        let mut int_coloring: std::collections::HashMap<ValueId, usize> =
+            std::collections::HashMap::new();
+        int_coloring.insert(ValueId(0), 0);
+        int_coloring.insert(ValueId(1), 3);
+        int_coloring.insert(ValueId(2), 1);
+        int_coloring.insert(ValueId(3), 2);
+        let mut ref_coloring: std::collections::HashMap<ValueId, usize> =
+            std::collections::HashMap::new();
+        ref_coloring.insert(ValueId(10), 0);
+        ref_coloring.insert(ValueId(11), 5);
+        let mut regallocs = std::collections::HashMap::new();
+        regallocs.insert(
+            RegKind::Int,
+            crate::regalloc::RegAllocResult {
+                coloring: int_coloring,
+                num_regs: 4,
+            },
+        );
+        regallocs.insert(
+            RegKind::Ref,
+            crate::regalloc::RegAllocResult {
+                coloring: ref_coloring,
+                num_regs: 6,
+            },
+        );
+        // Link args interleave Ref (10->11) with two Int renamings, one
+        // going to a higher dst color (v0->v1 i.e. 0->3) and one going
+        // to a lower dst color (v2->v3 i.e. 1->2).  Upstream sorts by
+        // dst color (Int 2 before Int 3) and emits kinds in
+        // `['int', 'ref', 'float']` order:
+        //
+        //   Move v2 -> v3  (Int, dst color 2)
+        //   Move v0 -> v1  (Int, dst color 3)
+        //   Move v10 -> v11 (Ref, dst color 5)
+        let mut ops: Vec<FlatOp> = Vec::new();
+        let link = plain_link(&[ValueId(0), ValueId(10), ValueId(2)]);
+        insert_renamings(
+            &link,
+            &[ValueId(1), ValueId(11), ValueId(3)],
+            &regallocs,
+            &mut ops,
+        );
+        assert_eq!(
+            ops,
+            vec![
+                // Int group, dst color 2 (v2 -> v3)
+                FlatOp::Move {
+                    dst: ValueId(3),
+                    src: LinkArg::Value(ValueId(2)),
+                },
+                // Int group, dst color 3 (v0 -> v1)
+                FlatOp::Move {
+                    dst: ValueId(1),
+                    src: LinkArg::Value(ValueId(0)),
+                },
+                // Ref group, dst color 5 (v10 -> v11)
+                FlatOp::Move {
+                    dst: ValueId(11),
+                    src: LinkArg::Value(ValueId(10)),
+                },
+            ]
         );
     }
 }
