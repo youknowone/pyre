@@ -12311,6 +12311,88 @@ mod tests {
         o
     }
 
+    /// Drift-check: this crate carries an inline duplicate of
+    /// `jitframe_custom_trace` because `majit-metainterp` optionally
+    /// depends on this crate and the reverse dep would be cyclic. The
+    /// two implementations must report the same slot pointers for any
+    /// JitFrame layout so this test rebuilds a JitFrame in raw bytes,
+    /// drives both tracers with identical input, and asserts the slot
+    /// lists match exactly (see jitframe.py:104-136).
+    #[test]
+    fn test_jitframe_custom_trace_matches_metainterp() {
+        // Allocate enough raw memory for: JitFrame header + length word
+        // + 3 frame items. Offsets match the #[repr(C)] layout the
+        // metainterp JitFrame struct uses.
+        const FRAME_LEN: usize = 3;
+        let byte_size = JF_FRAME_ITEM0_OFS as usize + FRAME_LEN * SIGN_SIZE;
+        let mut frame: Vec<u8> = vec![0u8; byte_size];
+
+        // Populate the five GCREF header fields with distinct non-null
+        // sentinels so the GC callback would observe a slot-contents
+        // pattern, but the tracer only hands out slot ADDRESSES.
+        let write_usize = |buf: &mut [u8], at: usize, v: usize| {
+            buf[at..at + UNSIGN_SIZE].copy_from_slice(&v.to_ne_bytes());
+        };
+        write_usize(&mut frame, JF_DESCR_OFS as usize, 0x1111_1111);
+        write_usize(&mut frame, JF_FORCE_DESCR_OFS as usize, 0x2222_2222);
+        write_usize(&mut frame, JF_SAVEDATA_OFS as usize, 0x3333_3333);
+        write_usize(&mut frame, JF_GUARD_EXC_OFS as usize, 0x4444_4444);
+        write_usize(&mut frame, JF_FORWARD_OFS as usize, 0x5555_5555);
+        // jf_frame_length
+        write_usize(&mut frame, JF_FRAME_LENGTH_OFS as usize, FRAME_LEN);
+
+        // gcmap: [length_words:isize=1, word0:usize = bits {0,2}]
+        // so trace walks frame_items at indices 0 and 2.
+        let mut gcmap: Vec<u8> = vec![0u8; GCMAPBASEOFS + UNSIGN_SIZE];
+        let gcmap_len: isize = 1;
+        gcmap[GCMAPLENGTHOFS..GCMAPLENGTHOFS + SIGN_SIZE].copy_from_slice(&gcmap_len.to_ne_bytes());
+        let word0: usize = (1usize << 0) | (1usize << 2);
+        gcmap[GCMAPBASEOFS..GCMAPBASEOFS + UNSIGN_SIZE].copy_from_slice(&word0.to_ne_bytes());
+        let gcmap_ptr: *const u8 = gcmap.as_ptr();
+        write_usize(&mut frame, JF_GCMAP_OFS as usize, gcmap_ptr as usize);
+
+        // Drive both tracers and collect slot pointers as byte offsets
+        // from the frame base (pointer equality isn't portable because
+        // the two call sites might rematerialize addresses through
+        // different paths).
+        let base = frame.as_mut_ptr() as usize;
+        let mut local_slots: Vec<usize> = Vec::new();
+        unsafe {
+            jitframe_custom_trace(base, &mut |slot: *mut GcRef| {
+                local_slots.push(slot as usize - base);
+            });
+        }
+
+        let mut metainterp_slots: Vec<usize> = Vec::new();
+        let metainterp_trace = majit_metainterp::jitframe::jitframe_type_info()
+            .custom_trace
+            .expect("metainterp jitframe_type_info must carry a custom_trace hook");
+        unsafe {
+            metainterp_trace(base, &mut |slot: *mut GcRef| {
+                metainterp_slots.push(slot as usize - base);
+            });
+        }
+
+        assert_eq!(
+            local_slots, metainterp_slots,
+            "jitframe_custom_trace drifted from majit_metainterp::jitframe::jitframe_custom_trace",
+        );
+
+        // Sanity: the trace must cover all five header fields + the
+        // two gcmap-selected frame slots (indices 0 and 2), in upstream
+        // order.
+        let expected: Vec<usize> = vec![
+            JF_DESCR_OFS as usize,
+            JF_FORCE_DESCR_OFS as usize,
+            JF_SAVEDATA_OFS as usize,
+            JF_GUARD_EXC_OFS as usize,
+            JF_FORWARD_OFS as usize,
+            JF_FRAME_ITEM0_OFS as usize + 0 * SIGN_SIZE,
+            JF_FRAME_ITEM0_OFS as usize + 2 * SIGN_SIZE,
+        ];
+        assert_eq!(local_slots, expected);
+    }
+
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr
     /// Backend trait method must delegate to the active gc_ll_descr.
