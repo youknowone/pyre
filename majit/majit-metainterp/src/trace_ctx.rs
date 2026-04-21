@@ -1644,9 +1644,22 @@ impl TraceCtx {
     ///     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
     ///                          calldescr, False, False)
     /// ```
-    fn emit_force_virtualizable(&mut self, vable_opref: OpRef) {
+    fn emit_force_virtualizable(&mut self, fielddescr: &DescrRef, vable_opref: OpRef) {
         //     vinfo = fielddescr.get_vinfo()
         //     assert vinfo is not None
+        //
+        // pyre's `FieldDescr` trait (majit-ir/descr.rs) does not carry a
+        // `VirtualizableInfo` backreference today, so the `fielddescr ->
+        // vinfo` dispatch reduces to reading `self.virtualizable_info` —
+        // the active vinfo for the currently-traced jitdriver.  This is a
+        // PRE-EXISTING-ADAPTATION: upstream resolves per-field ownership
+        // via the Python `FieldDescr.get_vinfo()` instance attribute;
+        // adding an Arc<VirtualizableInfo> backref to every
+        // `FieldDescr` means touching every constructor in
+        // majit-backend/jit_codewriter, which is an independent refactor.
+        // The `fielddescr` parameter is preserved on the signature so the
+        // eventual backref port lights up without another churn.
+        let _ = fielddescr;
         let info = self
             .virtualizable_info
             .clone()
@@ -1821,7 +1834,7 @@ impl TraceCtx {
         //             rop.COND_CALL, [condbox, funcbox, box],
         //             vinfo.clear_vable_descr, False, False)
         if !self.heap_cache.is_unescaped(vable_opref) {
-            self.emit_force_virtualizable(vable_opref);
+            self.emit_force_virtualizable(fielddescr, vable_opref);
         }
         // Step 5b: mark this box as a known nonstandard virtualizable so
         // future accesses short-circuit at Step 1.
