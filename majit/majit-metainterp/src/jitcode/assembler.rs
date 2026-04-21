@@ -1005,6 +1005,22 @@ impl JitCodeBuilder {
         self.push_u16(src);
     }
 
+    /// `flatten.py:329` `self.emitline('int_push', v)` / `blackhole.py:662-663`
+    /// `bhimpl_int_push(a)` — save `src` into the int-kind scratch slot.
+    pub fn push_i(&mut self, src: u16) {
+        self.touch_reg(src);
+        self.push_u8(jitcode::BC_INT_PUSH);
+        self.push_u16(src);
+    }
+
+    /// `flatten.py:331` `self.emitline('int_pop', "->", w)` / `blackhole.py:672-673`
+    /// `bhimpl_int_pop()` — load `dst` from the int-kind scratch slot.
+    pub fn pop_i(&mut self, dst: u16) {
+        self.touch_reg(dst);
+        self.push_u8(jitcode::BC_INT_POP);
+        self.push_u16(dst);
+    }
+
     pub fn ensure_i_regs(&mut self, count: u16) {
         self.num_regs_i = max(self.num_regs_i, count);
     }
@@ -1037,6 +1053,22 @@ impl JitCodeBuilder {
         self.push_u8(jitcode::BC_MOVE_R);
         self.push_u16(dst);
         self.push_u16(src);
+    }
+
+    /// `flatten.py:329` `self.emitline('ref_push', v)` / `blackhole.py:665-666`
+    /// `bhimpl_ref_push(a)` — save `src` into the ref-kind scratch slot.
+    pub fn push_r(&mut self, src: u16) {
+        self.touch_ref_reg(src);
+        self.push_u8(jitcode::BC_REF_PUSH);
+        self.push_u16(src);
+    }
+
+    /// `flatten.py:331` `self.emitline('ref_pop', "->", w)` / `blackhole.py:675-676`
+    /// `bhimpl_ref_pop()` — load `dst` from the ref-kind scratch slot.
+    pub fn pop_r(&mut self, dst: u16) {
+        self.touch_ref_reg(dst);
+        self.push_u8(jitcode::BC_REF_POP);
+        self.push_u16(dst);
     }
 
     pub fn call_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -1128,6 +1160,22 @@ impl JitCodeBuilder {
         self.push_u8(jitcode::BC_MOVE_F);
         self.push_u16(dst);
         self.push_u16(src);
+    }
+
+    /// `flatten.py:329` `self.emitline('float_push', v)` / `blackhole.py:668-669`
+    /// `bhimpl_float_push(a)` — save `src` into the float-kind scratch slot.
+    pub fn push_f(&mut self, src: u16) {
+        self.touch_float_reg(src);
+        self.push_u8(jitcode::BC_FLOAT_PUSH);
+        self.push_u16(src);
+    }
+
+    /// `flatten.py:331` `self.emitline('float_pop', "->", w)` / `blackhole.py:678-679`
+    /// `bhimpl_float_pop()` — load `dst` from the float-kind scratch slot.
+    pub fn pop_f(&mut self, dst: u16) {
+        self.touch_float_reg(dst);
+        self.push_u8(jitcode::BC_FLOAT_POP);
+        self.push_u16(dst);
     }
 
     pub fn call_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {

@@ -103,6 +103,8 @@ impl SSAReprEmitter {
     pub fn emit_portal_jit_merge_point(
         &mut self,
         ssarepr: &mut SSARepr,
+        _graph: &mut super::flow::FunctionGraph,
+        _current_block: &super::flow::BlockRef,
         next_instr: usize,
         w_code: i64,
         frame_reg: u16,
@@ -127,14 +129,15 @@ impl SSAReprEmitter {
         let greens_i: &[u8] = &[gi_next_instr_reg, gi_is_profiled_reg];
         let greens_r: &[u8] = &[gr_pycode_reg];
         let reds_r: &[u8] = &[frame_reg, ec_reg];
-        ssarepr.insns.push(Insn::op(
+        let insn = Insn::op(
             "jit_merge_point",
             vec![
                 list_of_regs(Kind::Int, greens_i),
                 list_of_regs(Kind::Ref, greens_r),
                 list_of_regs(Kind::Ref, reds_r),
             ],
-        ));
+        );
+        ssarepr.insns.push(insn.clone());
     }
 
     // ---- finalization ----

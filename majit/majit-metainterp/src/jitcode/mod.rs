@@ -126,6 +126,16 @@ pub(crate) const BC_GOTO_IF_NOT_PTR_NE: u8 = 105;
 // specialises the bool exitswitch into `goto_if_not_int_is_zero/iL`.
 pub(crate) const BC_GOTO_IF_NOT_INT_IS_ZERO: u8 = 106;
 
+// blackhole.py:661-679 bhimpl_int_push / bhimpl_ref_push /
+// bhimpl_float_push and matching pops — one-slot scratch for the
+// cycle-break path emitted by flatten.py:326-332 `insert_renamings`.
+pub(crate) const BC_INT_PUSH: u8 = 107;
+pub(crate) const BC_REF_PUSH: u8 = 108;
+pub(crate) const BC_FLOAT_PUSH: u8 = 109;
+pub(crate) const BC_INT_POP: u8 = 110;
+pub(crate) const BC_REF_POP: u8 = 111;
+pub(crate) const BC_FLOAT_POP: u8 = 112;
+
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// Fixed majit blackhole opcode-name table.
@@ -184,6 +194,17 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("goto_if_not_ptr_eq/rrL", BC_GOTO_IF_NOT_PTR_EQ);
     m.insert("goto_if_not_ptr_ne/rrL", BC_GOTO_IF_NOT_PTR_NE);
     m.insert("goto_if_not_int_is_zero/iL", BC_GOTO_IF_NOT_INT_IS_ZERO);
+
+    // flatten.py:326-332 `insert_renamings` cycle-break push/pop pairs.
+    // Argcodes follow assembler.py:162-196 / blackhole.py:661-679:
+    // push takes one register source (`i`/`r`/`f`), pop writes one
+    // register destination (`>i`/`>r`/`>f`).
+    m.insert("int_push/i", BC_INT_PUSH);
+    m.insert("ref_push/r", BC_REF_PUSH);
+    m.insert("float_push/f", BC_FLOAT_PUSH);
+    m.insert("int_pop/>i", BC_INT_POP);
+    m.insert("ref_pop/>r", BC_REF_POP);
+    m.insert("float_pop/>f", BC_FLOAT_POP);
 
     m
 }

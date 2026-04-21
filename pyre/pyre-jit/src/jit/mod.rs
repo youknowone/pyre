@@ -3,6 +3,7 @@ pub mod call;
 pub mod codewriter;
 pub mod cpu;
 pub mod flatten;
+pub mod flow;
 pub mod liveness;
 mod regalloc;
 mod ssa_emitter;

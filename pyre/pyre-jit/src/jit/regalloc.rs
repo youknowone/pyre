@@ -153,7 +153,7 @@ pub(super) fn allocate_registers(
                 rename.insert((kind, pre), post);
             }
         }
-        num_regs.insert(kind, alloc.num_colors());
+        num_regs.insert(kind, alloc.find_num_colors());
     }
     AllocationResult { rename, num_regs }
 }
@@ -225,6 +225,15 @@ fn enforce_input_args(
 /// RPython `regalloc.py:6` `perform_register_allocation(graph, kind)`
 /// + `tool/algo/regalloc.py:8-15`. Builds a `RegAllocator` and runs
 /// the three-stage pipeline.
+///
+/// pyre-jit does not yet feed a `FunctionGraph` into regalloc, so it
+/// cannot perform upstream's exact link-level
+/// `link.args ↔ link.target.inputargs` coalescing
+/// (`tool/algo/regalloc.py:79-96`). Preserve the long-standing
+/// SSARepr-level fallback until the flow-graph pipeline is wired:
+/// scan kind-matching `*_copy` ops and try to coalesce their source
+/// and destination colors. This remains a strict subset of RPython's
+/// behavior, but removing it entirely would regress existing parity.
 fn perform_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
@@ -297,8 +306,8 @@ impl RegAllocator {
             return r1;
         }
         // RPython UnionFind picks by weight; a deterministic
-        // smaller-index rep keeps coalesce results identical across
-        // runs without affecting correctness.
+        // smaller-index rep keeps coalesce results stable across runs
+        // without affecting correctness.
         let (rep, loser) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
         self.unionfind.insert(loser, rep);
         rep
@@ -418,17 +427,16 @@ impl RegAllocator {
     /// for every block-exit link. Pyre's `SSARepr` is post-flatten
     /// and has no `link.args ↔ inputargs` pairing — the flatten step
     /// dropped it in favor of pinned PyFrame slot indices. The
-    /// SSARepr-level remnant of jump-edge unification is the
-    /// `move_X` instruction, which expresses
-    /// `target_register := source_register`. Coalescing `move_X`'s
-    /// source and result lets the chordal coloring assign them the
-    /// same color, turning the move into a NOP at runtime
-    /// (assembler.rs `move_*` emission becomes a no-op when src==dst).
+    /// SSARepr-level remnant of jump-edge unification is the `*_copy`
+    /// instruction, which expresses `target_register := source`.
+    /// Coalescing `*_copy`'s source and result lets the chordal
+    /// coloring assign them the same color, turning the copy into a
+    /// runtime no-op when src == dst.
     ///
-    /// PRE-EXISTING-ADAPTATION: SSARepr-level move coalescing
-    /// instead of FunctionGraph-level link.args coalescing. The
-    /// effect is a strict subset of RPython's because pyre never
-    /// sees the cross-block link representation.
+    /// PRE-EXISTING-ADAPTATION: SSARepr-level copy coalescing instead
+    /// of FunctionGraph-level link.args coalescing. The effect is a
+    /// strict subset of RPython's because pyre still does not see the
+    /// original cross-block link representation.
     fn coalesce_variables(&mut self, ssarepr: &SSARepr, kind: Kind) {
         let copy_op = match kind {
             Kind::Int => "int_copy",
@@ -527,9 +535,9 @@ impl RegAllocator {
         }
     }
 
-    /// `regalloc.py:122-127` `RegAllocator.find_num_colors` →
-    /// `max(coloring.values())+1` or 0.
-    fn num_colors(&self) -> u16 {
+    /// `rpython/tool/algo/regalloc.py:122-127` `RegAllocator.find_num_colors`:
+    /// `max(self._coloring.values())+1 if self._coloring else 0`.
+    fn find_num_colors(&self) -> u16 {
         self.coloring.values().copied().max().map_or(0, |m| m + 1)
     }
 }
@@ -730,11 +738,11 @@ mod tests {
         assert_eq!(result.num_regs.get(&Kind::Float).copied(), Some(0));
     }
 
-    /// (d) `coalesce_variables` unifies a `move_X dst <- src` source
+    /// (d) `coalesce_variables` unifies a `*_copy dst <- src` source
     /// and target into the same color when they don't interfere.
     #[test]
     fn move_source_and_target_coalesce_to_same_color() {
-        // r5 = produce; ref_copy r6 <- r5; use r6
+        // r5 = produce; ref_copy r6 <- r5; use r6.
         // r5 dies at the copy; r6 takes over. With coalescing they
         // should share a color.
         let mut ssarepr = SSARepr::new("t");

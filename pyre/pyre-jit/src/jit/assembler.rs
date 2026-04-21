@@ -532,6 +532,34 @@ fn dispatch_op(
             }
             other => panic!("float_copy expects Register or ConstFloat, got {:?}", other),
         },
+        // `flatten.py:329` `self.emitline('%s_push' % kind, v)` — cycle-break
+        // save into the kind-typed scratch slot.
+        "int_push" => {
+            let src = expect_reg(&args[0], Kind::Int);
+            state.builder.push_i(src);
+        }
+        "ref_push" => {
+            let src = expect_reg(&args[0], Kind::Ref);
+            state.builder.push_r(src);
+        }
+        "float_push" => {
+            let src = expect_reg(&args[0], Kind::Float);
+            state.builder.push_f(src);
+        }
+        // `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)` —
+        // cycle-break load from the kind-typed scratch slot.
+        "int_pop" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state.builder.pop_i(dst);
+        }
+        "ref_pop" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Ref);
+            state.builder.pop_r(dst);
+        }
+        "float_pop" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Float);
+            state.builder.pop_f(dst);
+        }
         "load_const_i" => {
             let (dst, value) = expect_load_const_i(args, result);
             state.builder.load_const_i_value(dst, value);

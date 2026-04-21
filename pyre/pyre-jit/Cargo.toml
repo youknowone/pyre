@@ -14,6 +14,7 @@ dynasm = ["jit", "majit-backend-dynasm", "majit-metainterp/dynasm", "pyre-jit-tr
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+num-traits = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }

@@ -15,6 +15,7 @@
 /// The Assembler (majit JitCodeBuilder) is RPython's assembler.py equivalent.
 use std::cell::{OnceCell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use majit_ir::OpCode;
 use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
@@ -22,7 +23,7 @@ use pyre_jit_trace::{PyJitCode, PyJitCodeMetadata};
 
 use super::assembler::Assembler;
 use super::ssa_emitter::SSAReprEmitter;
-use pyre_interpreter::bytecode::{CodeObject, Instruction, OpArgState};
+use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState};
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
@@ -46,6 +47,562 @@ use super::flatten::{
 #[inline]
 fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
+}
+
+#[inline]
+fn entry_arg_slots(code: &CodeObject) -> usize {
+    let mut argcount = code.arg_count as usize + code.kwonlyarg_count as usize;
+    if code.flags.contains(CodeFlags::VARARGS) {
+        argcount += 1;
+    }
+    if code.flags.contains(CodeFlags::VARKEYWORDS) {
+        argcount += 1;
+    }
+    argcount
+}
+
+fn entry_inputargs(code: &CodeObject) -> Vec<super::flow::FlowValue> {
+    (0..entry_arg_slots(code))
+        .map(|idx| {
+            super::flow::Variable::new(super::flow::VariableId(idx as u32), Kind::Ref).into()
+        })
+        .collect()
+}
+
+fn frame_blocks_for_offset(code: &CodeObject, next_offset: usize) -> Vec<FrameBlock> {
+    if next_offset >= code.instructions.len() {
+        return Vec::new();
+    }
+
+    pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable)
+        .into_iter()
+        .filter(|entry| next_offset >= entry.start as usize && next_offset < entry.end as usize)
+        .map(|entry| FrameBlock {
+            start_offset: entry.start as usize,
+            end_offset: entry.end as usize,
+            handler_offset: entry.target as usize,
+            stack_depth: entry.depth as u16,
+            push_lasti: entry.push_lasti,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrameBlock {
+    start_offset: usize,
+    end_offset: usize,
+    handler_offset: usize,
+    stack_depth: u16,
+    push_lasti: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrameState {
+    /// `rpython/flowspace/framestate.py:20` `locals_w`.
+    locals_w: Vec<Option<super::flow::FlowValue>>,
+    /// `framestate.py:21` `stack`.
+    stack: Vec<super::flow::FlowValue>,
+    /// `framestate.py:22` `last_exception`.
+    last_exception: Option<(super::flow::FlowValue, super::flow::FlowValue)>,
+    /// `framestate.py:23` `blocklist`.
+    blocklist: Vec<FrameBlock>,
+    /// `framestate.py:24` `next_offset`.
+    next_offset: usize,
+}
+
+impl FrameState {
+    fn new(
+        locals_w: Vec<Option<super::flow::FlowValue>>,
+        stack: Vec<super::flow::FlowValue>,
+        last_exception: Option<(super::flow::FlowValue, super::flow::FlowValue)>,
+        blocklist: Vec<FrameBlock>,
+        next_offset: usize,
+    ) -> Self {
+        Self {
+            locals_w,
+            stack,
+            last_exception,
+            blocklist,
+            next_offset,
+        }
+    }
+
+    fn mergeable(&self) -> Vec<Option<super::flow::FlowValue>> {
+        let mut data = self.locals_w.clone();
+        data.extend(self.stack.iter().cloned().map(Some));
+        if let Some((w_type, w_value)) = &self.last_exception {
+            data.push(Some(w_type.clone()));
+            data.push(Some(w_value.clone()));
+        } else {
+            data.push(Some(super::flow::Constant::none().into()));
+            data.push(Some(super::flow::Constant::none().into()));
+        }
+        data
+    }
+
+    fn copy<F>(&self, fresh_variable: &mut F) -> Self
+    where
+        F: FnMut(Option<Kind>) -> super::flow::Variable,
+    {
+        Self {
+            locals_w: self
+                .locals_w
+                .iter()
+                .map(|value| copy_optional_flow_value(value.as_ref(), fresh_variable))
+                .collect(),
+            stack: self
+                .stack
+                .iter()
+                .map(|value| copy_flow_value(value, fresh_variable))
+                .collect(),
+            last_exception: self.last_exception.as_ref().map(|(w_type, w_value)| {
+                (
+                    copy_flow_value(w_type, fresh_variable),
+                    copy_flow_value(w_value, fresh_variable),
+                )
+            }),
+            blocklist: self.blocklist.clone(),
+            next_offset: self.next_offset,
+        }
+    }
+
+    fn getvariables(&self) -> Vec<super::flow::FlowValue> {
+        self.mergeable()
+            .into_iter()
+            .flatten()
+            .filter(|value| matches!(value, super::flow::FlowValue::Variable(_)))
+            .collect()
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        assert_eq!(self.blocklist, other.blocklist);
+        assert_eq!(self.next_offset, other.next_offset);
+        let mergeable = self.mergeable();
+        let other_mergeable = other.mergeable();
+        if mergeable.len() != other_mergeable.len() {
+            return false;
+        }
+        for (left, right) in mergeable.iter().zip(other_mergeable.iter()) {
+            if left == right {
+                continue;
+            }
+            if matches!(
+                (left, right),
+                (
+                    Some(super::flow::FlowValue::Variable(_)),
+                    Some(super::flow::FlowValue::Variable(_))
+                )
+            ) {
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+
+    fn union<F>(&self, other: &Self, fresh_variable: &mut F) -> Option<Self>
+    where
+        F: FnMut(Option<Kind>) -> super::flow::Variable,
+    {
+        if self.next_offset != other.next_offset
+            || self.locals_w.len() != other.locals_w.len()
+            || self.stack.len() != other.stack.len()
+        {
+            return None;
+        }
+
+        let locals_w = self
+            .locals_w
+            .iter()
+            .zip(other.locals_w.iter())
+            .map(|(left, right)| union_optional_flow_value(left, right, fresh_variable))
+            .collect();
+        let stack = self
+            .stack
+            .iter()
+            .zip(other.stack.iter())
+            .map(|(left, right)| union_flow_value(left, right, fresh_variable))
+            .collect::<Option<Vec<_>>>()?;
+        let last_exception = match (&self.last_exception, &other.last_exception) {
+            (None, None) => None,
+            (Some((left_type, left_value)), Some((right_type, right_value))) => Some((
+                union_flow_value(left_type, right_type, fresh_variable)?,
+                union_flow_value(left_value, right_value, fresh_variable)?,
+            )),
+            (Some((left_type, left_value)), None) => Some((
+                union_flow_value(
+                    left_type,
+                    &super::flow::Constant::none().into(),
+                    fresh_variable,
+                )?,
+                union_flow_value(
+                    left_value,
+                    &super::flow::Constant::none().into(),
+                    fresh_variable,
+                )?,
+            )),
+            (None, Some((right_type, right_value))) => Some((
+                union_flow_value(
+                    &super::flow::Constant::none().into(),
+                    right_type,
+                    fresh_variable,
+                )?,
+                union_flow_value(
+                    &super::flow::Constant::none().into(),
+                    right_value,
+                    fresh_variable,
+                )?,
+            )),
+        };
+        Some(Self::new(
+            locals_w,
+            stack,
+            last_exception,
+            self.blocklist.clone(),
+            self.next_offset,
+        ))
+    }
+
+    fn getoutputargs(&self, targetstate: &Self) -> Vec<super::flow::FlowValue> {
+        let mergeable = self.mergeable();
+        let mut result = Vec::new();
+        for (index, target_value) in targetstate.mergeable().iter().enumerate() {
+            if matches!(target_value, Some(super::flow::FlowValue::Variable(_))) {
+                result.push(
+                    mergeable[index]
+                        .clone()
+                        .expect("target variable must correspond to a mergeable source value"),
+                );
+            }
+        }
+        result
+    }
+}
+
+fn copy_optional_flow_value<F>(
+    value: Option<&super::flow::FlowValue>,
+    fresh_variable: &mut F,
+) -> Option<super::flow::FlowValue>
+where
+    F: FnMut(Option<Kind>) -> super::flow::Variable,
+{
+    value.map(|value| copy_flow_value(value, fresh_variable))
+}
+
+fn copy_flow_value<F>(
+    value: &super::flow::FlowValue,
+    fresh_variable: &mut F,
+) -> super::flow::FlowValue
+where
+    F: FnMut(Option<Kind>) -> super::flow::Variable,
+{
+    match value {
+        super::flow::FlowValue::Variable(variable) => fresh_variable(variable.kind).into(),
+        super::flow::FlowValue::Constant(constant) => constant.clone().into(),
+    }
+}
+
+fn union_optional_flow_value<F>(
+    left: &Option<super::flow::FlowValue>,
+    right: &Option<super::flow::FlowValue>,
+    fresh_variable: &mut F,
+) -> Option<super::flow::FlowValue>
+where
+    F: FnMut(Option<Kind>) -> super::flow::Variable,
+{
+    match (left, right) {
+        (Some(left), Some(right)) => union_flow_value(left, right, fresh_variable),
+        (None, _) | (_, None) => None,
+    }
+}
+
+fn union_flow_value<F>(
+    left: &super::flow::FlowValue,
+    right: &super::flow::FlowValue,
+    fresh_variable: &mut F,
+) -> Option<super::flow::FlowValue>
+where
+    F: FnMut(Option<Kind>) -> super::flow::Variable,
+{
+    if left == right {
+        return Some(left.clone());
+    }
+    match (left, right) {
+        (super::flow::FlowValue::Variable(left), super::flow::FlowValue::Variable(right)) => {
+            Some(fresh_variable(union_kind(left.kind, right.kind)).into())
+        }
+        (
+            super::flow::FlowValue::Variable(variable),
+            super::flow::FlowValue::Constant(constant),
+        )
+        | (
+            super::flow::FlowValue::Constant(constant),
+            super::flow::FlowValue::Variable(variable),
+        ) => Some(fresh_variable(union_kind(variable.kind, constant.kind)).into()),
+        (super::flow::FlowValue::Constant(left), super::flow::FlowValue::Constant(right)) => {
+            Some(fresh_variable(union_kind(left.kind, right.kind)).into())
+        }
+    }
+}
+
+fn union_kind(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
+    if left == right { left } else { None }
+}
+
+fn entry_frame_state(code: &CodeObject) -> FrameState {
+    let inputargs = entry_inputargs(code);
+    let mut locals_w = vec![None; code.varnames.len()];
+    for (index, value) in inputargs.into_iter().enumerate() {
+        if index < locals_w.len() {
+            locals_w[index] = Some(value);
+        }
+    }
+    FrameState::new(
+        locals_w,
+        Vec::new(),
+        None,
+        frame_blocks_for_offset(code, 0),
+        0,
+    )
+}
+
+#[derive(Debug)]
+struct SpamBlock {
+    /// `flowcontext.py:40` underlying `Block`.
+    block: super::flow::BlockRef,
+    /// `flowcontext.py:40` `block.framestate`.
+    framestate: Option<FrameState>,
+    /// `flowcontext.py:41` `block.dead`.
+    dead: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SpamBlockRef(Rc<RefCell<SpamBlock>>);
+
+impl SpamBlockRef {
+    fn new(block: super::flow::BlockRef, framestate: Option<FrameState>) -> Self {
+        Self(Rc::new(RefCell::new(SpamBlock {
+            block,
+            framestate,
+            dead: false,
+        })))
+    }
+
+    fn block(&self) -> super::flow::BlockRef {
+        self.0.borrow().block.clone()
+    }
+
+    fn framestate(&self) -> Option<FrameState> {
+        self.0.borrow().framestate.clone()
+    }
+
+    fn set_framestate(&self, framestate: FrameState) {
+        self.0.borrow_mut().framestate = Some(framestate);
+    }
+
+    fn mark_dead(&self) {
+        self.0.borrow_mut().dead = true;
+    }
+
+    fn dead(&self) -> bool {
+        self.0.borrow().dead
+    }
+}
+
+impl PartialEq for SpamBlockRef {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SpamBlockRef {}
+
+fn fresh_variable_for_state(
+    graph: &mut super::flow::FunctionGraph,
+    kind: Option<Kind>,
+) -> super::flow::Variable {
+    match kind {
+        Some(kind) => graph.fresh_variable(kind),
+        None => graph.fresh_untyped_variable(),
+    }
+}
+
+fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
+    link.borrow_mut().prevblock = Some(block.downgrade());
+    block.borrow_mut().exits.push(link);
+}
+
+fn initialize_spam_block(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    target: &SpamBlockRef,
+    source_state: &FrameState,
+    next_offset: usize,
+) -> FrameState {
+    if let Some(state) = target.framestate() {
+        return state;
+    }
+
+    let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+    let mut target_state = source_state.copy(&mut fresh);
+    target_state.blocklist = frame_blocks_for_offset(code, next_offset);
+    target_state.next_offset = next_offset;
+    target.block().borrow_mut().inputargs = target_state.getvariables();
+    target.set_framestate(target_state.clone());
+    target_state
+}
+
+fn make_next_block(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    currentblock: &SpamBlockRef,
+    currentstate: &FrameState,
+    next_offset: usize,
+) -> SpamBlockRef {
+    let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+    let mut newstate = currentstate.copy(&mut fresh);
+    newstate.blocklist = frame_blocks_for_offset(code, next_offset);
+    newstate.next_offset = next_offset;
+    let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
+    newblock.block().borrow_mut().inputargs = newstate.getvariables();
+    let outputargs = currentstate.getoutputargs(&newstate);
+    append_exit(
+        &currentblock.block(),
+        super::flow::Link::new(outputargs, Some(newblock.block()), None).into_ref(),
+    );
+    newblock
+}
+
+fn mergeblock(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    joinpoints: &mut HashMap<usize, Vec<SpamBlockRef>>,
+    pc_blocks: &mut [Option<SpamBlockRef>],
+    currentblock: &SpamBlockRef,
+    currentstate: &FrameState,
+    next_offset: usize,
+) -> SpamBlockRef {
+    let candidates = joinpoints.entry(next_offset).or_default();
+    for index in 0..candidates.len() {
+        let block = candidates[index].clone();
+        let block_state = block
+            .framestate()
+            .expect("joinpoint candidate must carry a FrameState");
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        let Some(mut newstate) = block_state.union(currentstate, &mut fresh) else {
+            continue;
+        };
+        if newstate.matches(&block_state) {
+            let outputargs = currentstate.getoutputargs(&newstate);
+            append_exit(
+                &currentblock.block(),
+                super::flow::Link::new(outputargs, Some(block.block()), None).into_ref(),
+            );
+            pc_blocks[next_offset] = Some(block.clone());
+            return block;
+        }
+
+        for (name, value) in code.varnames.iter().zip(newstate.locals_w.iter_mut()) {
+            if let Some(super::flow::FlowValue::Variable(variable)) = value.as_mut() {
+                variable.rename(name);
+            }
+        }
+        let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
+        newblock.block().borrow_mut().inputargs = newstate.getvariables();
+        let outputargs = currentstate.getoutputargs(&newstate);
+        append_exit(
+            &currentblock.block(),
+            super::flow::Link::new(outputargs, Some(newblock.block()), None).into_ref(),
+        );
+
+        block.mark_dead();
+        block.block().borrow_mut().operations.clear();
+        block.block().borrow_mut().exitswitch = None;
+        let old_outputargs = block_state.getoutputargs(&newstate);
+        block.block().recloseblock(vec![
+            super::flow::Link::new(old_outputargs, Some(newblock.block()), None).into_ref(),
+        ]);
+
+        candidates.remove(index);
+        candidates.insert(0, newblock.clone());
+        pc_blocks[next_offset] = Some(newblock.clone());
+        return newblock;
+    }
+
+    let newblock = make_next_block(code, graph, currentblock, currentstate, next_offset);
+    candidates.insert(0, newblock.clone());
+    pc_blocks[next_offset] = Some(newblock.clone());
+    newblock
+}
+
+fn ensure_pc_block(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    joinpoints: &mut HashMap<usize, Vec<SpamBlockRef>>,
+    pc_blocks: &mut [Option<SpamBlockRef>],
+    current_state: &FrameState,
+    py_pc: usize,
+) -> SpamBlockRef {
+    if let Some(block) = pc_blocks[py_pc].clone() {
+        return block;
+    }
+    if let Some(block) = joinpoints
+        .get(&py_pc)
+        .and_then(|blocks| blocks.first())
+        .cloned()
+    {
+        pc_blocks[py_pc] = Some(block.clone());
+        return block;
+    }
+
+    let block = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+    initialize_spam_block(code, graph, &block, current_state, py_pc);
+    joinpoints
+        .entry(py_pc)
+        .or_default()
+        .insert(0, block.clone());
+    pc_blocks[py_pc] = Some(block.clone());
+    block
+}
+
+fn fresh_ref_value(graph: &mut super::flow::FunctionGraph) -> super::flow::FlowValue {
+    graph.fresh_variable(Kind::Ref).into()
+}
+
+fn sync_stack_state(graph: &mut super::flow::FunctionGraph, state: &mut FrameState, depth: u16) {
+    while state.stack.len() > depth as usize {
+        state.stack.pop();
+    }
+    while state.stack.len() < depth as usize {
+        state.stack.push(fresh_ref_value(graph));
+    }
+}
+
+fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
+    let start_inputargs = entry_frame_state(code).getvariables();
+    let return_var = Some(super::flow::Variable::new(
+        super::flow::VariableId(start_inputargs.len() as u32),
+        Kind::Ref,
+    ));
+    super::flow::FunctionGraph::new(
+        code.obj_name.to_string(),
+        super::flow::Block::shared(start_inputargs),
+        return_var,
+    )
+}
+
+fn attach_catch_exception_edge(
+    block: &super::flow::BlockRef,
+    target: super::flow::BlockRef,
+) -> super::flow::LinkRef {
+    let link = super::flow::Link::new(Vec::new(), Some(target), None).into_ref();
+    let mut block_mut = block.borrow_mut();
+    block_mut.exitswitch = Some(super::flow::ExitSwitch::Value(
+        super::flow::c_last_exception().into(),
+    ));
+    drop(block_mut);
+    append_exit(block, link.clone());
+    link
 }
 
 // `PyJitCode` and `PyJitCodeMetadata` live in `pyre_jit_trace::pyjitcode`
@@ -435,13 +992,24 @@ fn decode_exception_catch_sites(
 /// shape (jtransform.py:414-435 `rewrite_call` parity).
 fn emit_residual_call(
     ssarepr: &mut SSARepr,
+    _graph: &mut super::flow::FunctionGraph,
+    current_block: &super::flow::BlockRef,
     flavor: CallFlavor,
     fn_idx: u16,
     call_args: &[majit_metainterp::jitcode::JitCallArg],
     reskind: ResKind,
     dst: Option<u16>,
 ) {
-    emit_residual_call_shape(ssarepr, flavor, fn_idx, call_args, reskind, dst);
+    emit_residual_call_shape(
+        ssarepr,
+        _graph,
+        current_block,
+        flavor,
+        fn_idx,
+        call_args,
+        reskind,
+        dst,
+    );
 }
 
 /// Upstream-shape Insn builder for the walker-local `ssarepr`. See
@@ -477,6 +1045,8 @@ fn emit_residual_call(
 /// statically today.
 fn emit_residual_call_shape(
     ssarepr: &mut SSARepr,
+    _graph: &mut super::flow::FunctionGraph,
+    _current_block: &super::flow::BlockRef,
     flavor: CallFlavor,
     fn_idx: u16,
     // Arguments in the C function's parameter order. `JitCallArg` carries
@@ -556,7 +1126,7 @@ fn emit_residual_call_shape(
         (Some(_), None) => panic!("residual_call with non-void reskind requires dst"),
         (None, Some(_)) => panic!("residual_call with void reskind must not have dst"),
     };
-    ssarepr.insns.push(insn);
+    ssarepr.insns.push(insn.clone());
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +1386,59 @@ impl CodeWriter {
         let (catch_for_pc, catch_sites, handler_depth_at) =
             decode_exception_catch_sites(&mut assembler, code, num_instrs);
 
+        // Step 6.1 Phase 2a: shadow `FunctionGraph` alongside `ssarepr`.
+        //
+        // RPython's flow space keeps `framestate` on each `SpamBlock`
+        // (`flowcontext.py:38-44`) and derives `Link.args ↔
+        // target.inputargs` from `FrameState.getoutputargs()`. Pyre's
+        // walker is still single-pass over Python bytecode, but the
+        // shadow graph now carries the same per-block `FrameState`
+        // object instead of a topology-only `BlockRef`.
+        let mut graph = new_shadow_graph(code);
+        let mut pc_blocks: Vec<Option<SpamBlockRef>> = vec![None; num_instrs];
+        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
+        let start_state = entry_frame_state(code);
+        if num_instrs > 0 {
+            let start_block =
+                SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
+            pc_blocks[0] = Some(start_block.clone());
+            joinpoints.insert(0, vec![start_block]);
+        }
+        let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> =
+            HashMap::with_capacity(catch_sites.len());
+        for site in &catch_sites {
+            catch_landing_blocks.insert(
+                site.landing_label,
+                SpamBlockRef::new(graph.new_block(Vec::new()), None),
+            );
+        }
+        // The walker emits into `current_block`; `emit_mark_label_pc!` and
+        // `emit_mark_label_catch_landing!` reassign it as the walker enters
+        // each block. Initialised to the first PC block so the PcAnchor /
+        // live_placeholder / jit_merge_point emissions that precede the
+        // first `emit_mark_label_pc!` belong to it.
+        let mut current_block: SpamBlockRef = pc_blocks
+            .first()
+            .and_then(|block| block.clone())
+            .unwrap_or_else(|| {
+                SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()))
+            });
+        let mut current_state = current_block
+            .framestate()
+            .unwrap_or_else(|| start_state.clone());
+        // Tracks whether the current block still needs an implicit
+        // fallthrough `Link` on the next `emit_mark_label_pc!`. Reset
+        // to `true` at every block entry; terminator macros that fully
+        // close the block (`emit_goto!` / `emit_ref_return!` /
+        // `emit_raise!` / `emit_reraise!` / `emit_abort_permanent!`)
+        // clear it. Terminators that leave fallthrough open —
+        // `emit_goto_if_not!`, `emit_goto_if_not_int_is_zero!`,
+        // `emit_catch_exception!` — keep it set. Mirrors RPython
+        // `flatten.py:240-267` where a conditional / exception exit
+        // always coexists with the straight-line successor on
+        // `Block.exits`.
+        let mut needs_fallthrough: bool = true;
+
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
         // Python backward jump.  jtransform.py:1714-1723
@@ -916,11 +1539,12 @@ impl CodeWriter {
         macro_rules! emit_last_exc_value {
             ($ssarepr:expr, $dst:expr) => {{
                 let dst = $dst;
-                $ssarepr.insns.push(Insn::op_with_result(
+                let insn = Insn::op_with_result(
                     "last_exc_value",
                     Vec::new(),
                     Register::new(Kind::Ref, dst),
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
 
@@ -982,11 +1606,12 @@ impl CodeWriter {
             ($ssarepr:expr, $dst:expr, $value:expr $(,)?) => {{
                 let dst = $dst;
                 let value: i64 = $value;
-                $ssarepr.insns.push(Insn::op_with_result(
+                let insn = Insn::op_with_result(
                     "int_copy",
                     vec![Operand::ConstInt(value)],
                     Register::new(Kind::Int, dst),
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
 
@@ -1002,15 +1627,23 @@ impl CodeWriter {
         // return path; `assembler.py:221` turns that into the `ref_return/r`
         // bytecode key.
         macro_rules! emit_ref_return {
-            ($ssarepr:expr, $src:expr) => {{
+            ($ssarepr:expr, $src:expr, $retval:expr) => {{
                 let src = $src;
-                $ssarepr
-                    .insns
-                    .push(Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]));
+                let retval = $retval;
+                let insn = Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
+                $ssarepr.insns.push(insn.clone());
                 // `rpython/jit/codewriter/flatten.py:144-146`: terminators
                 // emit `('---',)` so the backward liveness pass clears its
                 // alive set.
                 $ssarepr.insns.push(Insn::Unreachable);
+                // Step 6.1 Phase 2c: attach the return edge to
+                // `graph.returnblock` (`model.py:18`). The return value
+                // now comes from the symbolic `FrameState` stack,
+                // matching `flatten.py:130-139` `make_return(args)`.
+                let link =
+                    super::flow::Link::new(vec![retval], Some(graph.returnblock.clone()), None);
+                append_exit(&current_block.block(), link.into_ref());
+                needs_fallthrough = false;
             }};
         }
 
@@ -1024,15 +1657,36 @@ impl CodeWriter {
         macro_rules! emit_goto {
             ($ssarepr:expr, $target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
-                $ssarepr.insns.push(Insn::op(
+                let insn = Insn::op(
                     "goto",
                     vec![Operand::TLabel(TLabel::new(format!("pc{}", target_py_pc)))],
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
                 // `rpython/jit/codewriter/flatten.py:111-112`: an
                 // unconditional goto implicitly ends a block so the
                 // liveness pass (`liveness.py:68-69`) can reset the alive
                 // set.
                 $ssarepr.insns.push(Insn::Unreachable);
+                // Step 6.1 Phase 2b: attach a single unconditional
+                // `Link` from the current block to the target PC's
+                // block. `flatten.py:161` `self.emitline('goto',
+                // TLabel(link.target))` is the serialised view of the
+                // same edge.
+                mergeblock(
+                    code,
+                    &mut graph,
+                    &mut joinpoints,
+                    &mut pc_blocks,
+                    &current_block,
+                    &{
+                        let mut branch_state = current_state.clone();
+                        branch_state.next_offset = target_py_pc;
+                        branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
+                        branch_state
+                    },
+                    target_py_pc,
+                );
+                needs_fallthrough = false;
             }};
         }
 
@@ -1045,10 +1699,8 @@ impl CodeWriter {
         macro_rules! emit_loop_header {
             ($ssarepr:expr, $jdindex:expr) => {{
                 let jdindex: u16 = $jdindex;
-                $ssarepr.insns.push(Insn::op(
-                    "loop_header",
-                    vec![Operand::ConstInt(jdindex as i64)],
-                ));
+                let insn = Insn::op("loop_header", vec![Operand::ConstInt(jdindex as i64)]);
+                $ssarepr.insns.push(insn.clone());
             }};
         }
 
@@ -1068,7 +1720,13 @@ impl CodeWriter {
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
             ($ssarepr:expr) => {{
-                $ssarepr.insns.push(Insn::op("abort_permanent", Vec::new()));
+                let insn = Insn::op("abort_permanent", Vec::new());
+                $ssarepr.insns.push(insn.clone());
+                // pyre-only dead-end: the block has no successor in
+                // the shadow graph. Leaving `needs_fallthrough = false`
+                // blocks the auto-fallthrough at the next
+                // `emit_mark_label_pc!`.
+                needs_fallthrough = false;
             }};
         }
 
@@ -1080,9 +1738,23 @@ impl CodeWriter {
         macro_rules! emit_raise {
             ($ssarepr:expr, $src:expr) => {{
                 let src = $src;
-                $ssarepr
-                    .insns
-                    .push(Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]));
+                let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
+                $ssarepr.insns.push(insn.clone());
+                // Step 6.1 Phase 2c: attach the raise edge to
+                // `graph.exceptblock` (`model.py:22-23`). Like
+                // `emit_ref_return!`, link args are placeholder
+                // Constants until pyre materialises SSA Variables
+                // for exception type/value.
+                let link = super::flow::Link::new(
+                    vec![
+                        super::flow::Constant::signed(0).into(),
+                        super::flow::Constant::signed(0).into(),
+                    ],
+                    Some(graph.exceptblock.clone()),
+                    None,
+                );
+                append_exit(&current_block.block(), link.into_ref());
+                needs_fallthrough = false;
             }};
         }
 
@@ -1092,7 +1764,22 @@ impl CodeWriter {
         // `reraise/`. pyre emits this for RAISE_VARARGS with argc == 0.
         macro_rules! emit_reraise {
             ($ssarepr:expr) => {{
-                $ssarepr.insns.push(Insn::op("reraise", Vec::new()));
+                let insn = Insn::op("reraise", Vec::new());
+                $ssarepr.insns.push(insn.clone());
+                // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
+                // re-raise opname shares the `Block.exits` topology
+                // (`flatten.py` emits the two as alternative codings
+                // of the same exception exit).
+                let link = super::flow::Link::new(
+                    vec![
+                        super::flow::Constant::signed(0).into(),
+                        super::flow::Constant::signed(0).into(),
+                    ],
+                    Some(graph.exceptblock.clone()),
+                    None,
+                );
+                append_exit(&current_block.block(), link.into_ref());
+                needs_fallthrough = false;
             }};
         }
 
@@ -1108,13 +1795,25 @@ impl CodeWriter {
         macro_rules! emit_catch_exception {
             ($ssarepr:expr, $catch_label:expr) => {{
                 let catch_label = $catch_label;
-                $ssarepr.insns.push(Insn::op(
+                let insn = Insn::op(
                     "catch_exception",
                     vec![Operand::TLabel(TLabel::new(format!(
                         "catch_landing_{}",
                         catch_label
                     )))],
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
+                // Step 6.1 Phase 2b: attach the exception edge to the
+                // current PC's block. In RPython this is the
+                // `Constant(last_exception)` exit added by
+                // `flatten.py` when the block `canraise`; the matching
+                // normal-control-flow Link (fallthrough / goto) is
+                // added by its own emit macro so the two edges coexist
+                // on `Block.exits`.
+                attach_catch_exception_edge(
+                    &current_block.block(),
+                    catch_landing_blocks[&catch_label].block(),
+                );
             }};
         }
 
@@ -1135,6 +1834,36 @@ impl CodeWriter {
                         "pc{}",
                         py_pc
                     ))));
+                // Step 6.1 Phase 2d: if the previous block still needs
+                // a fallthrough edge, attach one before switching
+                // `current_block`. `new_block != current_block` skips
+                // the self-link on the very first PC (where both refs
+                // are `pc_blocks[0]`).
+                let new_block = if needs_fallthrough {
+                    mergeblock(
+                        code,
+                        &mut graph,
+                        &mut joinpoints,
+                        &mut pc_blocks,
+                        &current_block,
+                        &current_state,
+                        py_pc,
+                    )
+                } else {
+                    ensure_pc_block(
+                        code,
+                        &mut graph,
+                        &mut joinpoints,
+                        &mut pc_blocks,
+                        &current_state,
+                        py_pc,
+                    )
+                };
+                current_block = new_block;
+                current_state = current_block
+                    .framestate()
+                    .expect("block state should exist at label");
+                needs_fallthrough = true;
             }};
         }
         macro_rules! emit_mark_label_catch_landing {
@@ -1146,6 +1875,19 @@ impl CodeWriter {
                         "catch_landing_{}",
                         landing_label
                     ))));
+                // Step 6.1 Phase 2a: switch the shadow graph's
+                // `current_block` into the pre-allocated catch-landing
+                // block. Matches `flatten.py:180` `Label(block)` being the
+                // block-entry marker in RPython. Catch landings are
+                // reached via `catch_exception` edges rather than
+                // fallthrough, so no implicit Link is inserted here —
+                // reset `needs_fallthrough` for the landing block's
+                // own emission sequence.
+                current_block = catch_landing_blocks[&landing_label].clone();
+                if let Some(state) = current_block.framestate() {
+                    current_state = state;
+                }
+                needs_fallthrough = true;
             }};
         }
 
@@ -1174,26 +1916,67 @@ impl CodeWriter {
             ($ssarepr:expr, $cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
-                $ssarepr.insns.push(Insn::op(
+                let insn = Insn::op(
                     "goto_if_not",
                     vec![
                         Operand::reg(Kind::Int, cond),
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
+                // Step 6.1 Phase 2b: attach the conditional-False edge
+                // to `pc_blocks[py_pc]`. RPython `flatten.py:240-267`
+                // records both the False target and the fallthrough on
+                // the block's `exits`; the fallthrough link is added
+                // implicitly at the next `emit_mark_label_pc!` in a
+                // follow-up slice when pyre's walker learns to insert
+                // fallthrough Links for non-terminating blocks.
+                mergeblock(
+                    code,
+                    &mut graph,
+                    &mut joinpoints,
+                    &mut pc_blocks,
+                    &current_block,
+                    &{
+                        let mut branch_state = current_state.clone();
+                        branch_state.next_offset = py_pc;
+                        branch_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                        branch_state
+                    },
+                    py_pc,
+                );
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
             ($ssarepr:expr, $cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
-                $ssarepr.insns.push(Insn::op(
+                let insn = Insn::op(
                     "goto_if_not_int_is_zero",
                     vec![
                         Operand::reg(Kind::Int, cond),
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
+                // Step 6.1 Phase 2b: same as `emit_goto_if_not!` — the
+                // specialised `int_is_zero` form is the pyre-port of
+                // `flatten.py:247` `goto_if_not_int_is_zero`; Link
+                // shape is identical.
+                mergeblock(
+                    code,
+                    &mut graph,
+                    &mut joinpoints,
+                    &mut pc_blocks,
+                    &current_block,
+                    &{
+                        let mut branch_state = current_state.clone();
+                        branch_state.next_offset = py_pc;
+                        branch_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                        branch_state
+                    },
+                    py_pc,
+                );
             }};
         }
 
@@ -1215,24 +1998,26 @@ impl CodeWriter {
             ($ssarepr:expr, $dst:expr, $field_idx:expr) => {{
                 let dst = $dst;
                 let field_idx = $field_idx;
-                $ssarepr.insns.push(Insn::op_with_result(
+                let insn = Insn::op_with_result(
                     "getfield_vable_ref",
                     vec![Operand::ConstInt(field_idx as i64)],
                     Register::new(Kind::Ref, dst),
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
         macro_rules! emit_vable_setfield_int {
             ($ssarepr:expr, $field_idx:expr, $src:expr) => {{
                 let field_idx = $field_idx;
                 let src = $src;
-                $ssarepr.insns.push(Insn::op(
+                let insn = Insn::op(
                     "setfield_vable_int",
                     vec![
                         Operand::ConstInt(field_idx as i64),
                         Operand::reg(Kind::Int, src),
                     ],
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
         macro_rules! emit_vable_getarrayitem_ref {
@@ -1240,14 +2025,15 @@ impl CodeWriter {
                 let dst = $dst;
                 let field_idx = $field_idx;
                 let index = $index;
-                $ssarepr.insns.push(Insn::op_with_result(
+                let insn = Insn::op_with_result(
                     "getarrayitem_vable_r",
                     vec![
                         Operand::ConstInt(field_idx as i64),
                         Operand::reg(Kind::Int, index),
                     ],
                     Register::new(Kind::Ref, dst),
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
         macro_rules! emit_vable_setarrayitem_ref {
@@ -1255,14 +2041,15 @@ impl CodeWriter {
                 let field_idx = $field_idx;
                 let index = $index;
                 let src = $src;
-                $ssarepr.insns.push(Insn::op(
+                let insn = Insn::op(
                     "setarrayitem_vable_r",
                     vec![
                         Operand::ConstInt(field_idx as i64),
                         Operand::reg(Kind::Int, index),
                         Operand::reg(Kind::Ref, src),
                     ],
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
 
@@ -1276,11 +2063,12 @@ impl CodeWriter {
             ($ssarepr:expr, $dst:expr, $src:expr) => {{
                 let dst = $dst;
                 let src = $src;
-                $ssarepr.insns.push(Insn::op_with_result(
+                let insn = Insn::op_with_result(
                     "ref_copy",
                     vec![Operand::reg(Kind::Ref, src)],
                     Register::new(Kind::Ref, dst),
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
 
@@ -1303,14 +2091,15 @@ impl CodeWriter {
                             .collect(),
                     )
                 };
-                $ssarepr.insns.push(Insn::op(
+                let insn = Insn::op(
                     "jit_merge_point",
                     vec![
                         Operand::ListOfKind(to_list(Kind::Int, greens_i)),
                         Operand::ListOfKind(to_list(Kind::Ref, greens_r)),
                         Operand::ListOfKind(to_list(Kind::Ref, reds_r)),
                     ],
-                ));
+                );
+                $ssarepr.insns.push(insn.clone());
             }};
         }
 
@@ -1343,6 +2132,8 @@ impl CodeWriter {
                     //   reds = ['frame', 'ec']
                     assembler.emit_portal_jit_merge_point(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         py_pc,
                         w_code as i64,
                         portal_frame_reg,
@@ -1417,6 +2208,12 @@ impl CodeWriter {
                     } else {
                         emit_ref_copy!(ssarepr, stack_base + current_depth, reg);
                     }
+                    let loaded = current_state
+                        .locals_w
+                        .get(reg as usize)
+                        .and_then(|value| value.clone())
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    current_state.stack.push(loaded);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1431,6 +2228,10 @@ impl CodeWriter {
                     let reg = var_num.get(op_arg).as_usize() as u16;
                     current_depth -= 1;
                     emit_vsd!(current_depth);
+                    let stored = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     if is_portal {
                         emit_load_const_i!(
                             ssarepr,
@@ -1446,6 +2247,9 @@ impl CodeWriter {
                     } else {
                         emit_ref_copy!(ssarepr, reg, stack_base + current_depth);
                     }
+                    if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
+                        *slot = Some(stored);
+                    }
                 }
 
                 Instruction::LoadSmallInt { i } => {
@@ -1453,6 +2257,8 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, val);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::Plain,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
@@ -1460,6 +2266,9 @@ impl CodeWriter {
                         Some(obj_tmp0),
                     );
                     emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    current_state
+                        .stack
+                        .push(super::flow::Constant::signed(val).into());
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1471,6 +2280,8 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, idx as i64);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::Plain,
                         load_const_fn_idx,
                         &[
@@ -1481,6 +2292,23 @@ impl CodeWriter {
                         Some(obj_tmp0),
                     );
                     emit_ref_copy!(ssarepr, stack_base + current_depth, obj_tmp0);
+                    let value = match code.constants.get(idx) {
+                        Some(pyre_interpreter::bytecode::ConstantData::None) => {
+                            super::flow::Constant::none().into()
+                        }
+                        Some(pyre_interpreter::bytecode::ConstantData::Boolean { value }) => {
+                            super::flow::Constant::bool(*value).into()
+                        }
+                        Some(pyre_interpreter::bytecode::ConstantData::Integer { value }) => {
+                            use num_traits::ToPrimitive;
+                            value
+                                .to_i64()
+                                .map(|value| super::flow::Constant::signed(value).into())
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph))
+                        }
+                        _ => fresh_ref_value(&mut graph),
+                    };
+                    current_state.stack.push(value);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1507,9 +2335,23 @@ impl CodeWriter {
                     let reg_a = u32::from(pair.idx_1()) as u16;
                     let reg_b = u32::from(pair.idx_2()) as u16;
                     emit_ref_copy!(ssarepr, stack_base + current_depth, reg_a);
+                    current_state.stack.push(
+                        current_state
+                            .locals_w
+                            .get(reg_a as usize)
+                            .and_then(|value| value.clone())
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph)),
+                    );
                     current_depth += 1;
                     emit_vsd!(current_depth);
                     emit_ref_copy!(ssarepr, stack_base + current_depth, reg_b);
+                    current_state.stack.push(
+                        current_state
+                            .locals_w
+                            .get(reg_b as usize)
+                            .and_then(|value| value.clone())
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph)),
+                    );
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1524,6 +2366,10 @@ impl CodeWriter {
                     let load_reg = u32::from(pair.idx_2()) as u16;
                     current_depth -= 1;
                     emit_vsd!(current_depth);
+                    let stored = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     if is_portal {
                         emit_load_const_i!(
                             ssarepr,
@@ -1551,6 +2397,16 @@ impl CodeWriter {
                         emit_ref_copy!(ssarepr, store_reg, stack_base + current_depth);
                         emit_ref_copy!(ssarepr, stack_base + current_depth, load_reg);
                     }
+                    if let Some(slot) = current_state.locals_w.get_mut(store_reg as usize) {
+                        *slot = Some(stored);
+                    }
+                    current_state.stack.push(
+                        current_state
+                            .locals_w
+                            .get(load_reg as usize)
+                            .and_then(|value| value.clone())
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph)),
+                    );
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -1568,6 +2424,8 @@ impl CodeWriter {
                     emit_ref_copy!(ssarepr, arg_regs_start, stack_base + current_depth); // value
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         store_subscr_fn_idx,
                         &[
@@ -1616,6 +2474,8 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, op_code_reg, op_val as i64);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
@@ -1644,6 +2504,8 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, op_code_reg, op_val as i64);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
@@ -1676,6 +2538,8 @@ impl CodeWriter {
                     emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -1705,6 +2569,8 @@ impl CodeWriter {
                     emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -1741,8 +2607,12 @@ impl CodeWriter {
                 Instruction::ReturnValue => {
                     current_depth -= 1;
                     emit_vsd!(current_depth);
+                    let retval = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
-                    emit_ref_return!(ssarepr, obj_tmp0);
+                    emit_ref_return!(ssarepr, obj_tmp0, retval);
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call (residual)
@@ -1755,6 +2625,8 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, raw_namei);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         load_global_fn_idx,
                         &[
@@ -1835,6 +2707,8 @@ impl CodeWriter {
                         };
                         emit_residual_call(
                             &mut ssarepr,
+                            &mut graph,
+                            &current_block.block(),
                             CallFlavor::MayForce,
                             fn_idx,
                             &call_args,
@@ -1860,6 +2734,8 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, 0);
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
@@ -1874,6 +2750,8 @@ impl CodeWriter {
                     );
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
@@ -1933,6 +2811,8 @@ impl CodeWriter {
                     };
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         build_list_fn_idx,
                         &[
@@ -1987,6 +2867,8 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, 10); // isinstance op
                     emit_residual_call(
                         &mut ssarepr,
+                        &mut graph,
+                        &current_block.block(),
                         CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
@@ -2137,6 +3019,9 @@ impl CodeWriter {
                     emit_abort_permanent!(ssarepr);
                 }
             }
+            sync_stack_state(&mut graph, &mut current_state, current_depth);
+            current_state.next_offset = py_pc + 1;
+            current_state.blocklist = frame_blocks_for_offset(code, current_state.next_offset);
             if let Some(catch_label) = catch_for_pc[py_pc] {
                 emit_catch_exception!(ssarepr, catch_label);
             }
@@ -2169,6 +3054,8 @@ impl CodeWriter {
                 emit_load_const_i!(ssarepr, int_tmp0, site.lasti_py_pc as i64);
                 emit_residual_call(
                     &mut ssarepr,
+                    &mut graph,
+                    &current_block.block(),
                     CallFlavor::Plain,
                     box_int_fn_idx,
                     &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
@@ -2205,6 +3092,12 @@ impl CodeWriter {
             stack_base,
             max_stack_depth: max_stack_depth_observed,
         };
+        // `flow.rs` now models `Block.operations` as upstream
+        // `SpaceOperation`, not flattened `Insn`. The direct-dispatch
+        // walker still emits only SSA/flatten-level data, so the shadow
+        // graph remains topology-only until a pre-regalloc Variable
+        // environment is introduced.
+
         let alloc_result =
             super::regalloc::allocate_registers(&ssarepr, code.varnames.len(), inputs);
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
@@ -2687,13 +3580,61 @@ pub fn find_loop_header_pcs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{
+        FrameState, SpamBlockRef, attach_catch_exception_edge, entry_arg_slots, entry_frame_state,
+        entry_inputargs, mergeblock, new_shadow_graph,
+    };
     use crate::jit::assembler::ArcByPtr;
+    use crate::jit::flatten::Kind;
+    use crate::jit::flow::{
+        Constant, ExitSwitch, FlowValue, Variable, VariableId, c_last_exception,
+    };
+    use pyre_interpreter::bytecode::{CodeObject, ConstantData};
+    use pyre_interpreter::compile_exec;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<JitCode> {
         let mut jitcode = JitCodeBuilder::default().finish();
         jitcode.fnaddr = fnaddr as i64;
         Arc::new(jitcode)
+    }
+
+    fn first_nested_function_code(source: &str) -> CodeObject {
+        let module = compile_exec(source).expect("compile failed");
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("expected nested function code object")
+    }
+
+    fn fresh_variable_factory(start: u32) -> impl FnMut(Option<Kind>) -> Variable {
+        let mut next_id = start;
+        move |kind| {
+            let variable = Variable {
+                id: VariableId(next_id),
+                kind,
+            };
+            next_id += 1;
+            variable
+        }
+    }
+
+    fn sample_framestate() -> FrameState {
+        FrameState::new(
+            vec![
+                Some(Variable::new(VariableId(0), Kind::Ref).into()),
+                Some(Constant::none().into()),
+            ],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
+        )
     }
 
     #[test]
@@ -2768,6 +3709,172 @@ mod tests {
     }
 
     #[test]
+    fn entry_arg_slots_counts_kwonly_varargs_and_varkeywords() {
+        let code =
+            first_nested_function_code("def f(a, b, *args, c, d, **kw):\n    return a + b\n");
+
+        assert_eq!(entry_arg_slots(&code), 6);
+    }
+
+    #[test]
+    fn new_shadow_graph_uses_entry_inputargs_as_startblock_shape() {
+        let code =
+            first_nested_function_code("def f(a, b, *args, c, d, **kw):\n    return a + b\n");
+
+        let expected_inputargs = entry_inputargs(&code);
+        let graph = new_shadow_graph(&code);
+        let startblock = graph.startblock.borrow();
+        let returnblock = graph.returnblock.borrow();
+
+        assert_eq!(graph.name, "f");
+        assert_eq!(startblock.inputargs, expected_inputargs);
+        assert_eq!(startblock.inputargs.len(), 6);
+        for (idx, value) in startblock.inputargs.iter().enumerate() {
+            match value {
+                FlowValue::Variable(variable) => {
+                    assert_eq!(variable.id, VariableId(idx as u32));
+                    assert_eq!(variable.kind, Some(Kind::Ref));
+                }
+                other => panic!("expected variable inputarg, got {other:?}"),
+            }
+        }
+
+        assert_eq!(returnblock.inputargs.len(), 1);
+        match &returnblock.inputargs[0] {
+            FlowValue::Variable(variable) => {
+                assert_eq!(variable.id, VariableId(6));
+                assert_eq!(variable.kind, Some(Kind::Ref));
+            }
+            other => panic!("expected variable return arg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_frame_state_matches_pygraph_locals_shape() {
+        let code =
+            first_nested_function_code("def f(a, b, *args, c, d, **kw):\n    return a + b\n");
+        let state = entry_frame_state(&code);
+
+        assert_eq!(state.locals_w.len(), code.varnames.len());
+        assert_eq!(state.getvariables(), entry_inputargs(&code));
+        assert!(state.stack.is_empty());
+        assert!(state.last_exception.is_none());
+    }
+
+    #[test]
+    fn frame_blocks_follow_exception_table_ranges() {
+        let code = first_nested_function_code(
+            "def f(a):\n    try:\n        return a\n    except Exception:\n        return 0\n",
+        );
+        let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
+        assert!(!entries.is_empty());
+
+        let first = &entries[0];
+        let blocks = frame_blocks_for_offset(&code, first.start as usize);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start_offset, first.start as usize);
+        assert_eq!(blocks[0].end_offset, first.end as usize);
+        assert_eq!(blocks[0].handler_offset, first.target as usize);
+        assert_eq!(blocks[0].stack_depth, first.depth as u16);
+        assert_eq!(blocks[0].push_lasti, first.push_lasti);
+    }
+
+    #[test]
+    fn framestate_copy_refreshes_variables() {
+        let state = sample_framestate();
+        let mut fresh = fresh_variable_factory(10);
+        let copied = state.copy(&mut fresh);
+
+        assert!(state.matches(&copied));
+        assert_ne!(state, copied);
+        assert_eq!(copied.locals_w[1], Some(Constant::none().into()));
+    }
+
+    #[test]
+    #[should_panic]
+    fn framestate_matches_asserts_on_different_next_offset() {
+        let left = sample_framestate();
+        let right = FrameState::new(
+            left.locals_w.clone(),
+            left.stack.clone(),
+            left.last_exception.clone(),
+            left.blocklist.clone(),
+            1,
+        );
+
+        let _ = left.matches(&right);
+    }
+
+    #[test]
+    fn framestate_union_generalizes_different_constants() {
+        let state1 = sample_framestate();
+        let state2 = FrameState::new(
+            vec![
+                Some(Variable::new(VariableId(0), Kind::Ref).into()),
+                Some(Constant::signed(42).into()),
+            ],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
+        );
+        let mut fresh = fresh_variable_factory(20);
+        let union = state1
+            .union(&state2, &mut fresh)
+            .expect("union should succeed");
+
+        match union.locals_w[1].as_ref() {
+            Some(FlowValue::Variable(variable)) => assert_eq!(variable.id, VariableId(20)),
+            other => panic!("expected generalized variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn framestate_union_matches_more_general_variable_state() {
+        let state1 = sample_framestate();
+        let state2 = FrameState::new(
+            vec![
+                Some(Variable::new(VariableId(0), Kind::Ref).into()),
+                Some(Variable::new(VariableId(5), Kind::Ref).into()),
+            ],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
+        );
+        let mut fresh = fresh_variable_factory(20);
+        let union = state1
+            .union(&state2, &mut fresh)
+            .expect("union should succeed");
+
+        assert!(union.matches(&state2));
+    }
+
+    #[test]
+    fn framestate_getoutputargs_follows_target_variables() {
+        let state1 = sample_framestate();
+        let state2 = FrameState::new(
+            vec![
+                Some(Variable::new(VariableId(1), Kind::Ref).into()),
+                Some(Variable::new(VariableId(2), Kind::Ref).into()),
+            ],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
+        );
+
+        assert_eq!(
+            state1.getoutputargs(&state2),
+            vec![
+                Variable::new(VariableId(0), Kind::Ref).into(),
+                Constant::none().into(),
+            ]
+        );
+    }
+
+    #[test]
     fn callcontrol_compiled_lookup_ignores_skeleton_pyjitcode() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
@@ -2823,5 +3930,143 @@ mod tests {
             Arc::ptr_eq(&cached, &returned),
             "trace-side callback should return the already-cached populated Arc"
         );
+    }
+
+    #[test]
+    fn attach_catch_exception_edge_marks_block_as_canraise() {
+        let code = first_nested_function_code("def f():\n    return 1\n");
+        let mut graph = new_shadow_graph(&code);
+        let catch_block = graph.new_block(Vec::new());
+
+        let link = attach_catch_exception_edge(&graph.startblock, catch_block.clone());
+        let startblock = graph.startblock.borrow();
+
+        assert_eq!(
+            startblock.exitswitch,
+            Some(ExitSwitch::Value(c_last_exception().into()))
+        );
+        assert_eq!(startblock.exits.len(), 1);
+        assert_eq!(startblock.exits[0], link);
+
+        let link_borrow = startblock.exits[0].borrow();
+        assert_eq!(link_borrow.target, Some(catch_block));
+        assert_eq!(link_borrow.exitcase, None);
+    }
+
+    #[test]
+    fn mergeblock_reuses_matching_joinpoint() {
+        let code = first_nested_function_code("def f(a):\n    return a\n");
+        let mut graph = new_shadow_graph(&code);
+        let current_state = FrameState::new(
+            vec![
+                Some(Variable::new(VariableId(0), Kind::Ref).into()),
+                Some(Constant::none().into()),
+            ],
+            Vec::new(),
+            None,
+            Vec::new(),
+            1,
+        );
+        let current_block =
+            SpamBlockRef::new(graph.startblock.clone(), Some(current_state.clone()));
+        let target_state = FrameState::new(
+            current_state.locals_w.clone(),
+            current_state.stack.clone(),
+            current_state.last_exception.clone(),
+            Vec::new(),
+            1,
+        );
+        let target_block = SpamBlockRef::new(
+            graph.new_block(target_state.getvariables()),
+            Some(target_state),
+        );
+        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
+        let mut pc_blocks = vec![None; code.instructions.len().max(2)];
+        joinpoints.insert(1, vec![target_block.clone()]);
+
+        let merged = mergeblock(
+            &code,
+            &mut graph,
+            &mut joinpoints,
+            &mut pc_blocks,
+            &current_block,
+            &current_state,
+            1,
+        );
+
+        assert_eq!(merged, target_block);
+        assert_eq!(pc_blocks[1], Some(target_block.clone()));
+        let exits = current_block.block().borrow().exits.clone();
+        assert_eq!(exits.len(), 1);
+        let link = exits[0].borrow();
+        assert_eq!(link.target, Some(target_block.block()));
+        assert_eq!(
+            link.args,
+            vec![Some(Variable::new(VariableId(0), Kind::Ref).into())]
+        );
+    }
+
+    #[test]
+    fn mergeblock_generalizes_existing_joinpoint() {
+        let code = first_nested_function_code("def f(a):\n    return a\n");
+        let mut graph = new_shadow_graph(&code);
+        let source_state = FrameState::new(
+            vec![
+                Some(Variable::new(VariableId(0), Kind::Ref).into()),
+                Some(Constant::signed(7).into()),
+            ],
+            Vec::new(),
+            None,
+            Vec::new(),
+            2,
+        );
+        let current_block = SpamBlockRef::new(graph.startblock.clone(), Some(source_state.clone()));
+        let existing_state = FrameState::new(
+            vec![
+                Some(Variable::new(VariableId(0), Kind::Ref).into()),
+                Some(Constant::none().into()),
+            ],
+            Vec::new(),
+            None,
+            Vec::new(),
+            2,
+        );
+        let existing_block = SpamBlockRef::new(
+            graph.new_block(existing_state.getvariables()),
+            Some(existing_state),
+        );
+        let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
+        let mut pc_blocks = vec![None; code.instructions.len().max(3)];
+        joinpoints.insert(2, vec![existing_block.clone()]);
+
+        let merged = mergeblock(
+            &code,
+            &mut graph,
+            &mut joinpoints,
+            &mut pc_blocks,
+            &current_block,
+            &source_state,
+            2,
+        );
+
+        assert_ne!(merged, existing_block);
+        assert!(existing_block.dead());
+        assert_eq!(pc_blocks[2], Some(merged.clone()));
+        let merged_state = merged
+            .framestate()
+            .expect("merged block should keep framestate");
+        match merged_state.locals_w[1].as_ref() {
+            Some(FlowValue::Variable(_)) => {}
+            other => panic!("expected generalized variable, got {other:?}"),
+        }
+        match merged_state.locals_w[0].as_ref() {
+            Some(FlowValue::Variable(variable)) => assert!(variable.name().starts_with("a_")),
+            other => panic!("expected renamed local variable, got {other:?}"),
+        }
+        let existing_ref = existing_block.block();
+        let existing_borrow = existing_ref.borrow();
+        assert_eq!(existing_borrow.exits.len(), 1);
+        let forwarded = existing_borrow.exits[0].borrow();
+        assert_eq!(forwarded.target, Some(merged.block()));
     }
 }
