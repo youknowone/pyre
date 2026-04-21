@@ -5533,6 +5533,19 @@ pub struct CraneliftBackend {
     /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
     /// pyre PyObject layout: ob_type at offset 0.
     vtable_offset: Option<usize>,
+    /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments.
+    /// Each `Backend` instance owns its own copy of the metainterp-side
+    /// `DoneWithThisFrameDescr*` / `ExitFrameWithExceptionDescrRef` /
+    /// `PropagateExceptionDescr` singletons.  Reader sites that cannot
+    /// reach a `&self` receiver (Cranelift-emitted IR, extern-C
+    /// callbacks) continue to consult the per-thread slots in this
+    /// module — the setters write to both so the two views stay in sync.
+    done_descr_void: Option<majit_ir::DescrRef>,
+    done_descr_int: Option<majit_ir::DescrRef>,
+    done_descr_ref: Option<majit_ir::DescrRef>,
+    done_descr_float: Option<majit_ir::DescrRef>,
+    exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
+    propagate_exception_descr: Option<majit_ir::DescrRef>,
 }
 
 impl CraneliftBackend {
@@ -5685,6 +5698,12 @@ impl CraneliftBackend {
             //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
+            done_descr_void: None,
+            done_descr_int: None,
+            done_descr_ref: None,
+            done_descr_float: None,
+            exit_frame_with_exception_descr_ref: None,
+            propagate_exception_descr: None,
         }
     }
 
@@ -11528,21 +11547,27 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_void = Some(descr.clone());
         set_done_with_this_frame_descr_void(descr);
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_int = Some(descr.clone());
         set_done_with_this_frame_descr_int(descr);
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_ref = Some(descr.clone());
         set_done_with_this_frame_descr_ref(descr);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_float = Some(descr.clone());
         set_done_with_this_frame_descr_float(descr);
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        self.exit_frame_with_exception_descr_ref = Some(descr.clone());
         set_exit_frame_with_exception_descr_ref(descr);
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
+        self.propagate_exception_descr = Some(descr.clone());
         set_propagate_exception_descr(descr);
     }
 

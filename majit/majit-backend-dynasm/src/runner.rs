@@ -175,6 +175,20 @@ pub struct DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
+    /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments.
+    /// Each `Backend` instance owns its own copy of the metainterp-side
+    /// `DoneWithThisFrameDescr*` / `ExitFrameWithExceptionDescrRef` /
+    /// `PropagateExceptionDescr` singletons.  Reader sites that cannot
+    /// reach a `&self` receiver (JIT-emitted assembly, extern-C
+    /// trampoline) continue to consult the per-thread slots in
+    /// `guard.rs` — the setters write to both so the two views stay in
+    /// sync.
+    done_descr_void: Option<majit_ir::DescrRef>,
+    done_descr_int: Option<majit_ir::DescrRef>,
+    done_descr_ref: Option<majit_ir::DescrRef>,
+    done_descr_float: Option<majit_ir::DescrRef>,
+    exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
+    propagate_exception_descr: Option<majit_ir::DescrRef>,
 }
 
 impl DynasmBackend {
@@ -235,6 +249,12 @@ impl DynasmBackend {
             constants: std::collections::HashMap::new(),
             constant_types: std::collections::HashMap::new(),
             vtable_offset: None,
+            done_descr_void: None,
+            done_descr_int: None,
+            done_descr_ref: None,
+            done_descr_float: None,
+            exit_frame_with_exception_descr_ref: None,
+            propagate_exception_descr: None,
         }
     }
 
@@ -658,21 +678,27 @@ impl Backend for DynasmBackend {
     }
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_void = Some(descr.clone());
         crate::guard::set_done_with_this_frame_descr_void(descr);
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_int = Some(descr.clone());
         crate::guard::set_done_with_this_frame_descr_int(descr);
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_ref = Some(descr.clone());
         crate::guard::set_done_with_this_frame_descr_ref(descr);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
+        self.done_descr_float = Some(descr.clone());
         crate::guard::set_done_with_this_frame_descr_float(descr);
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
+        self.exit_frame_with_exception_descr_ref = Some(descr.clone());
         crate::guard::set_exit_frame_with_exception_descr_ref(descr);
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
+        self.propagate_exception_descr = Some(descr.clone());
         crate::guard::set_propagate_exception_descr(descr);
     }
 

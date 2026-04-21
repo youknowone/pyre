@@ -307,7 +307,7 @@ fn handle_fail_done_with_this_frame(descr_raw: usize, frame_ptr: *mut jitframe::
 /// into `PyError::from_exc_object` when the synthesized FailDescr
 /// carries `is_exit_frame_with_exception = true`.
 fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
-    unsafe { llmodel::get_int_value(frame_ptr, 0) as i64 }
+    unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 }
 }
 
 /// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
