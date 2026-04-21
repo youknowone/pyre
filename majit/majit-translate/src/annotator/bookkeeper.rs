@@ -232,10 +232,23 @@ pub struct Bookkeeper {
     /// `annotation()` call builds a fresh DictDef and the mutation
     /// dissolves.
     ///
-    /// Keyed on [`ConstValue`] directly — upstream uses
-    /// `Hashable(Constant(dict))` whose hash incorporates the Python
-    /// `type` of the value (see `rpython/tool/uid.py:27`), mirrored by
-    /// the Rust `ConstValue` enum's derived `Eq`/`Hash`.
+    /// **Precision deviation from upstream.** Upstream uses
+    /// `Hashable(Constant(x))` which for hashable values hashes on
+    /// `(type(x), x)` and falls back to `id(x)` for mutable
+    /// list/dict/set values (see `rpython/tool/uid.py:27-38`). The Rust
+    /// port keys this cache on the value-equal `ConstValue` enum, so two
+    /// distinct prebuilt `[]` / `{}` literals with identical contents
+    /// share a cache entry. Any `generalize` / `generalize_key` call on
+    /// the cached `ListDef` / `DictDef` then widens both literals'
+    /// annotations together — soundness is preserved (widening stays
+    /// monotonic in the lattice) but precision is lost across
+    /// structurally-equal distinct constants.
+    ///
+    /// The identity-based port needs `Hlvalue::Constant` to carry an
+    /// identity-bearing wrapper (`Rc<Constant>` or an atomic id field)
+    /// so the cache can key on the Rc pointer like upstream's `id(x)`
+    /// fallback. That refactor is deferred until the rtyper port (Phase
+    /// 6) exposes a site where the precision loss is user-visible.
     pub immutable_cache: RefCell<HashMap<ConstValue, SomeValue>>,
     /// RPython `self.pending_specializations = []` (bookkeeper.py:69).
     ///
