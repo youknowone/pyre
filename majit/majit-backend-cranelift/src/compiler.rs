@@ -115,6 +115,18 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFa
 // Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
 //          savedata:8, guard_exc:8, forward:8]  = 56 bytes
 // Array:  [length:8, item[0]:8, item[1]:8, ...]
+/// jitframe.py:8 — `SIZEOFSIGNED = rffi.sizeof(lltype.Signed)`.
+const SIZEOFSIGNED: usize = std::mem::size_of::<isize>();
+/// jitframe.py:9 — `IS_32BIT = (SIZEOFSIGNED == 4)`.
+const IS_32BIT: bool = SIZEOFSIGNED == 4;
+/// jitframe.py:101 — `SIGN_SIZE = llmemory.sizeof(lltype.Signed)`.
+const SIGN_SIZE: usize = SIZEOFSIGNED;
+/// jitframe.py:102 — `UNSIGN_SIZE = llmemory.sizeof(lltype.Unsigned)`.
+const UNSIGN_SIZE: usize = std::mem::size_of::<usize>();
+/// jitframe.py:97 — `GCMAPLENGTHOFS = arraylengthoffset(GCMAP)`.
+const GCMAPLENGTHOFS: usize = 0;
+/// jitframe.py:98 — `GCMAPBASEOFS = itemoffsetof(GCMAP, 0)`.
+const GCMAPBASEOFS: usize = SIZEOFSIGNED;
 /// Byte offset of `jf_descr` from JitFrame start.
 const JF_DESCR_OFS: i32 = 8;
 const JF_FORCE_DESCR_OFS: i32 = 16;
@@ -166,57 +178,53 @@ fn jitframe_gc_type_id_is_explicit() -> bool {
 
 /// Custom trace function for GC-managed jitframes.
 ///
-/// RPython parity: jitframe.py:104-136 `jitframe_trace`.
+/// RPython parity: jitframe.py:104-136 `jitframe_trace`. Mirrors
+/// `majit_metainterp::jitframe::jitframe_custom_trace`; the duplication
+/// exists because `majit-metainterp` optionally depends on this crate,
+/// so we cannot reuse the metainterp-side definition without a cycle.
 ///
-/// 1. Trace header ref fields (jf_descr..jf_forward) — jitframe.py:105-109
-/// 2. Read jf_gcmap pointer, trace ref slots in jf_frame — jitframe.py:115-136
+/// 1. Trace all five header GCREF fields — jitframe.py:105-109
+/// 2. Read jf_gcmap pointer, trace ref slots in jf_frame — jitframe.py:111-135
 ///
 /// # Safety
 /// `obj_addr` must point to a valid JitFrame payload (after GC header).
 unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
     let jf_ptr = obj_addr as *const u8;
 
-    // jitframe.py:105-109: trace header GC refs before consulting jf_gcmap.
-    // Only savedata/guard_exc/jf_forward are GC-managed pointers here.
-    let savedata_ptr = unsafe { jf_ptr.add(JF_SAVEDATA_OFS as usize) as *mut GcRef };
-    let savedata = unsafe { *savedata_ptr };
-    if !savedata.is_null() {
-        f(savedata_ptr);
-    }
+    // jitframe.py:105-109 — trace all five fixed GCREF header fields
+    // (jf_descr, jf_force_descr, jf_savedata, jf_guard_exc, jf_forward)
+    // in upstream order. No null-check; the GC callback is responsible
+    // for filtering non-managed pointers.
+    f(unsafe { jf_ptr.add(JF_DESCR_OFS as usize) as *mut GcRef });
+    f(unsafe { jf_ptr.add(JF_FORCE_DESCR_OFS as usize) as *mut GcRef });
+    f(unsafe { jf_ptr.add(JF_SAVEDATA_OFS as usize) as *mut GcRef });
+    f(unsafe { jf_ptr.add(JF_GUARD_EXC_OFS as usize) as *mut GcRef });
+    f(unsafe { jf_ptr.add(JF_FORWARD_OFS as usize) as *mut GcRef });
 
-    let guard_exc_ptr = unsafe { jf_ptr.add(JF_GUARD_EXC_OFS as usize) as *mut GcRef };
-    let guard_exc = unsafe { *guard_exc_ptr };
-    if !guard_exc.is_null() {
-        f(guard_exc_ptr);
-    }
-
-    let forward_ptr = unsafe { jf_ptr.add(JF_FORWARD_OFS as usize) as *mut GcRef };
-    let forward = unsafe { *forward_ptr };
-    if !forward.is_null() {
-        f(forward_ptr);
-    }
-
-    // jitframe.py:115: gcmap = (obj_addr + getofs('jf_gcmap')).address[0]
+    // jitframe.py:111-114
+    let max: usize = if IS_32BIT { 32 } else { 64 };
+    // jitframe.py:115 — gcmap = (obj_addr + getofs('jf_gcmap')).address[0]
     let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
     if gcmap_ptr.is_null() {
-        return;
+        return; // jitframe.py:116-117 — "done"
     }
-    // jitframe.py:117: gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
-    let gcmap_lgt = unsafe { *(gcmap_ptr as *const isize) };
+    // jitframe.py:118 — gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
+    let gcmap_lgt = unsafe { *(gcmap_ptr.add(GCMAPLENGTHOFS) as *const isize) };
     let frame_items = unsafe { jf_ptr.add(JF_FRAME_ITEM0_OFS as usize) };
-    // jitframe.py:118-136: iterate bitmap words
+    // jitframe.py:119-135
     let mut no: isize = 0;
     while no < gcmap_lgt {
-        let word = unsafe { *(gcmap_ptr.add(8 + 8 * no as usize) as *const usize) };
+        // jitframe.py:121 — cur = (gcmap + GCMAPBASEOFS + UNSIGN_SIZE * no).unsigned[0]
+        let cur =
+            unsafe { *(gcmap_ptr.add(GCMAPBASEOFS + UNSIGN_SIZE * no as usize) as *const usize) };
         let mut bitindex: usize = 0;
-        while bitindex < 64 {
-            if word & (1usize << bitindex) != 0 {
-                let index = no as usize * 64 + bitindex;
-                let slot_ptr = unsafe { frame_items.add(8 * index) as *mut GcRef };
-                let gcref = unsafe { *slot_ptr };
-                if !gcref.is_null() {
-                    f(slot_ptr);
-                }
+        while bitindex < max {
+            if cur & (1usize << bitindex) != 0 {
+                // jitframe.py:126 — index = no * SIZEOFSIGNED * 8 + bitindex
+                let index = no as usize * SIZEOFSIGNED * 8 + bitindex;
+                // jitframe.py:131-133 — obj_addr + getofs('jf_frame') + BASEITEMOFS + SIGN_SIZE * index
+                let slot_ptr = unsafe { frame_items.add(SIGN_SIZE * index) as *mut GcRef };
+                f(slot_ptr);
             }
             bitindex += 1;
         }
