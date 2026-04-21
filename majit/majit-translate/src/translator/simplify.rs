@@ -9,10 +9,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::{
-    BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue,
-    HostObject, LinkRef, SpaceOperation, Variable, checkgraph, mkentrymap,
+    BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphRef, HOST_ENV,
+    Hlvalue, HostObject, LinkRef, SpaceOperation, Variable, checkgraph, mkentrymap,
 };
 use crate::translator::backendopt::ssa::DataFlowFamilyBuilder;
+use crate::translator::translator::TranslationContext;
 
 /// RPython `eliminate_empty_blocks(graph)` (simplify.py:52-69).
 ///
@@ -253,6 +254,579 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     block.borrow_mut().exitswitch = None;
     block.recloseblock(newexits.clone());
     newexits
+}
+
+/// RPython `CanRemove = {...}` (simplify.py:405-417).
+///
+/// Upstream also fills `CanRemove` with everything from
+/// `lloperation.enum_ops_without_sideeffects()`; that rtyper-phase
+/// table is not yet ported, so the Rust port includes only the
+/// explicit high-level opname list. Annotator-phase callers
+/// (`transform_dead_op_vars` via `translator/transform.py`) see the
+/// exact same subset they'd see upstream during the annotator pass.
+fn can_remove_opnames() -> &'static HashSet<&'static str> {
+    use std::sync::OnceLock;
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        [
+            "newtuple",
+            "newlist",
+            "newdict",
+            "bool",
+            "is_",
+            "id",
+            "type",
+            "issubtype",
+            "isinstance",
+            "repr",
+            "str",
+            "len",
+            "hash",
+            "getattr",
+            "getitem",
+            "pos",
+            "neg",
+            "abs",
+            "hex",
+            "oct",
+            "ord",
+            "invert",
+            "add",
+            "sub",
+            "mul",
+            "truediv",
+            "floordiv",
+            "div",
+            "mod",
+            "divmod",
+            "pow",
+            "lshift",
+            "rshift",
+            "and_",
+            "or_",
+            "xor",
+            "int",
+            "float",
+            "long",
+            "lt",
+            "le",
+            "eq",
+            "ne",
+            "gt",
+            "ge",
+            "cmp",
+            "coerce",
+            "contains",
+            "iter",
+            "get",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// RPython `CanRemoveBuiltins = {hasattr: True}` (simplify.py:418-420).
+///
+/// Compared by HostObject identity against `HOST_ENV.lookup_builtin("hasattr")`.
+fn can_remove_builtins() -> Vec<HostObject> {
+    let mut v = Vec::new();
+    if let Some(h) = HOST_ENV.lookup_builtin("hasattr") {
+        v.push(h);
+    }
+    v
+}
+
+/// RPython `get_graph(arg, translator)` (simplify.py:20-33).
+///
+/// Returns the `FunctionGraph` associated with a `direct_call`'s
+/// constant callee, or `None` when the callee is a Variable or a
+/// non-function constant. The Rust port matches on the user-function
+/// shape exposed via `HostObject::user_function()` and walks the
+/// translator's `graphs` list for a graph whose name matches the
+/// function's `name` attribute — a lightweight stand-in for upstream's
+/// `lltype._ptr._obj.graph` traversal.
+fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
+    let Hlvalue::Constant(c) = arg else {
+        return None;
+    };
+    let ConstValue::HostObject(h) = &c.value else {
+        return None;
+    };
+    let gf = h.user_function()?;
+    let fn_name = &gf.name;
+    for g in translator.graphs.borrow().iter() {
+        if g.borrow().name == *fn_name {
+            return Some(g.clone());
+        }
+    }
+    None
+}
+
+/// RPython `has_no_side_effects(translator, graph, seen=None)`
+/// (simplify.py:355+). The full upstream logic recurses through
+/// `lloperation.LL_OPERATIONS[...].sideeffects` and the callgraph;
+/// neither piece is ported yet. Conservatively return `false` — the
+/// direct_call pruning branch then leaves the op alone, matching the
+/// upstream call shape when `translator is None`.
+fn has_no_side_effects(_translator: &TranslationContext, _graph: &GraphRef) -> bool {
+    false
+}
+
+/// RPython `transform_dead_op_vars(graph, translator=None)`
+/// (simplify.py:397-401). Thin wrapper around
+/// `transform_dead_op_vars_in_blocks`.
+pub fn transform_dead_op_vars(graph: &FunctionGraph, translator: Option<&TranslationContext>) {
+    transform_dead_op_vars_in_blocks(&graph.iterblocks(), &[graph as *const _], translator, graph);
+}
+
+/// RPython `transform_dead_op_vars_in_blocks(blocks, graphs, translator=None)`
+/// (simplify.py:422-524). The `graphs` parameter degenerates to
+/// a single graph reference plus the optional translator; the
+/// multi-graph case (upstream when called from `transform.py`) routes
+/// through `translator.annotator.annotated[block].startblock` which
+/// the Rust port models via the `annotator_lookup` closure argument
+/// on callers that need it (`translator/transform.rs::
+/// transform_dead_op_vars`).
+pub fn transform_dead_op_vars_in_blocks(
+    blocks: &[BlockRef],
+    _graphs_sentinel: &[*const FunctionGraph],
+    translator: Option<&TranslationContext>,
+    single_graph: &FunctionGraph,
+) {
+    // upstream: `set_of_blocks = set(blocks)`.
+    let set_of_blocks: HashSet<BlockKey> = blocks.iter().map(BlockKey::of).collect();
+    // upstream: `start_blocks = {graphs[0].startblock}` when single-
+    // graph. Multi-graph path (upstream path through
+    // `translator.annotator.annotated[block].startblock`) lands with
+    // the `ann.translator` wiring at the transform.py call site —
+    // here we operate on one graph at a time.
+    let start_block_key = BlockKey::of(&single_graph.startblock);
+    let can_remove_ops = can_remove_opnames();
+    let can_remove_builtins_list = can_remove_builtins();
+
+    // `read_vars`: set of Variables whose value is read downstream.
+    let mut read_vars: HashSet<Variable> = HashSet::new();
+    // `dependencies`: map from Var → [dependency Vars].
+    let mut dependencies: HashMap<Variable, HashSet<Variable>> = HashMap::new();
+
+    let canremove_op = |op: &SpaceOperation, block: &BlockRef| -> bool {
+        if !can_remove_ops.contains(op.opname.as_str()) {
+            return false;
+        }
+        // upstream: `op is not block.raising_op`.
+        let raising = block.borrow().raising_op().cloned();
+        match raising {
+            Some(r) => *op != r,
+            None => true,
+        }
+    };
+    let add_read_var = |read_vars: &mut HashSet<Variable>, v: &Hlvalue| {
+        if let Hlvalue::Variable(var) = v {
+            read_vars.insert(var.clone());
+        }
+    };
+    let add_dep =
+        |deps: &mut HashMap<Variable, HashSet<Variable>>, dest: &Hlvalue, src: &Hlvalue| {
+            if let (Hlvalue::Variable(dv), Hlvalue::Variable(sv)) = (dest, src) {
+                deps.entry(dv.clone()).or_default().insert(sv.clone());
+            }
+        };
+
+    // upstream: `for block in blocks: compute read_vars + dependencies`.
+    for block in blocks {
+        let b = block.borrow();
+        for op in &b.operations {
+            if !canremove_op(op, block) {
+                // upstream: `read_vars.update(op.args)`.
+                for a in &op.args {
+                    add_read_var(&mut read_vars, a);
+                }
+            } else {
+                for a in &op.args {
+                    add_dep(&mut dependencies, &op.result, a);
+                }
+            }
+        }
+        // upstream: `if isinstance(block.exitswitch, Variable): read_vars.add(block.exitswitch)`.
+        if let Some(Hlvalue::Variable(sw)) = &b.exitswitch {
+            read_vars.insert(sw.clone());
+        }
+
+        if !b.exits.is_empty() {
+            for link in &b.exits {
+                let link_b = link.borrow();
+                let Some(target) = link_b.target.as_ref() else {
+                    continue;
+                };
+                let target_key = BlockKey::of(target);
+                let target_inputargs = target.borrow().inputargs.clone();
+                let link_args: Vec<Option<Hlvalue>> = link_b.args.clone();
+                let in_set = set_of_blocks.contains(&target_key);
+                for (arg_opt, tgt) in link_args.iter().zip(target_inputargs.iter()) {
+                    let Some(arg) = arg_opt else { continue };
+                    if !in_set {
+                        // upstream: `read_vars.add(arg); read_vars.add(targetarg)`.
+                        add_read_var(&mut read_vars, arg);
+                        add_read_var(&mut read_vars, tgt);
+                    } else {
+                        add_dep(&mut dependencies, tgt, arg);
+                    }
+                }
+            }
+        } else {
+            // upstream: return/except blocks implicitly use inputargs.
+            for a in &b.inputargs {
+                add_read_var(&mut read_vars, a);
+            }
+        }
+
+        // upstream: start block's inputargs always live.
+        if BlockKey::of(block) == start_block_key {
+            for a in &b.inputargs {
+                add_read_var(&mut read_vars, a);
+            }
+        }
+    }
+
+    // upstream: `flow_read_var_backward(set(read_vars))`.
+    let mut pending: Vec<Variable> = read_vars.iter().cloned().collect();
+    while let Some(var) = pending.pop() {
+        if let Some(deps) = dependencies.get(&var).cloned() {
+            for prev in deps {
+                if read_vars.insert(prev.clone()) {
+                    pending.push(prev);
+                }
+            }
+        }
+    }
+
+    // upstream: iterate blocks again, prune removable ops whose result
+    // isn't read, prune link args whose target-inputarg isn't read.
+    for block in blocks {
+        // upstream: backward walk over operations.
+        let ops_len = block.borrow().operations.len();
+        let mut i = ops_len;
+        while i > 0 {
+            i -= 1;
+            let (op, result_used, opname, first_arg_builtin) = {
+                let b = block.borrow();
+                let op = b.operations[i].clone();
+                let result_used = match &op.result {
+                    Hlvalue::Variable(v) => read_vars.contains(v),
+                    Hlvalue::Constant(_) => true,
+                };
+                let first_arg_builtin = match op.args.first() {
+                    Some(Hlvalue::Constant(Constant {
+                        value: ConstValue::HostObject(h),
+                        ..
+                    })) => Some(h.clone()),
+                    _ => None,
+                };
+                let opname = op.opname.clone();
+                (op, result_used, opname, first_arg_builtin)
+            };
+            if result_used {
+                continue;
+            }
+            if canremove_op(&op, block) {
+                block.borrow_mut().operations.remove(i);
+            } else if opname == "simple_call" {
+                if let Some(h) = first_arg_builtin {
+                    if can_remove_builtins_list.iter().any(|b| b == &h) {
+                        block.borrow_mut().operations.remove(i);
+                    }
+                }
+            } else if opname == "direct_call" {
+                if let Some(trans) = translator {
+                    let Some(callee_arg) = op.args.first() else {
+                        continue;
+                    };
+                    if let Some(graph) = get_graph_for_call(callee_arg, trans) {
+                        let is_raising = block
+                            .borrow()
+                            .raising_op()
+                            .cloned()
+                            .map(|r| r == op)
+                            .unwrap_or(false);
+                        if has_no_side_effects(trans, &graph) && !is_raising {
+                            block.borrow_mut().operations.remove(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        // upstream: output vars never used — drop their positions from
+        // link.args. Must happen before block.inputargs is shrunk so
+        // the same-index cross-block invariant holds.
+        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+        for link in exits_snapshot {
+            let target = link.borrow().target.clone();
+            let Some(target) = target else { continue };
+            let target_inputargs = target.borrow().inputargs.clone();
+            let args_len = link.borrow().args.len();
+            assert_eq!(args_len, target_inputargs.len(), "link arity mismatch");
+            // upstream: back-to-front deletion.
+            let mut i = args_len;
+            while i > 0 {
+                i -= 1;
+                let tgt = &target_inputargs[i];
+                let drop = match tgt {
+                    Hlvalue::Variable(v) => !read_vars.contains(v),
+                    Hlvalue::Constant(_) => false,
+                };
+                if drop {
+                    link.borrow_mut().args.remove(i);
+                }
+            }
+        }
+    }
+
+    // upstream: final pass — drop unused inputargs (matching link.args
+    // are already gone).
+    for block in blocks {
+        let inputargs = block.borrow().inputargs.clone();
+        let mut i = inputargs.len();
+        while i > 0 {
+            i -= 1;
+            let drop = match &inputargs[i] {
+                Hlvalue::Variable(v) => !read_vars.contains(v),
+                Hlvalue::Constant(_) => false,
+            };
+            if drop {
+                block.borrow_mut().inputargs.remove(i);
+            }
+        }
+    }
+}
+
+/// RPython `class Representative` (simplify.py:526-531).
+///
+/// Info payload attached to each UF partition in
+/// `remove_identical_vars_SSA`. Stores the per-partition
+/// "representative" value; `absorb` is a no-op so the info that wins
+/// the weighted union keeps its `rep`.
+#[derive(Clone, Debug)]
+struct Representative {
+    rep: Hlvalue,
+}
+
+impl crate::tool::algo::unionfind::UnionFindInfo for Representative {
+    fn absorb(&mut self, _other: Self) {}
+}
+
+/// RPython `all_equal(lst)` (simplify.py:533-535).
+fn all_equal_hl(lst: &[Hlvalue]) -> bool {
+    match lst.first() {
+        None => true,
+        Some(first) => lst.iter().skip(1).all(|x| x == first),
+    }
+}
+
+/// RPython `isspecialvar(v)` (simplify.py:537-538).
+fn isspecialvar(v: &Hlvalue) -> bool {
+    match v {
+        Hlvalue::Variable(var) => {
+            let p = var.name_prefix();
+            p == "last_exception_" || p == "last_exc_value_"
+        }
+        _ => false,
+    }
+}
+
+/// Variable→Hlvalue counterpart of `Block::renamevariables` that
+/// upstream's `block.renamevariables(mapping)` needs when the mapping
+/// values are mixed Variable/Constant (as happens in
+/// `remove_identical_vars_SSA`). The Rust port's
+/// `Block::renamevariables` narrows to `HashMap<Variable, Variable>`;
+/// see the note above `rename_hl` for why we keep the wide path
+/// file-local.
+fn renamevariables_hl(block: &BlockRef, mapping: &HashMap<Variable, Hlvalue>) {
+    if mapping.is_empty() {
+        return;
+    }
+    let new_ops: Vec<SpaceOperation> = {
+        let b = block.borrow();
+        b.operations
+            .iter()
+            .map(|op| rename_op(op, mapping))
+            .collect()
+    };
+    let new_exitswitch = {
+        let b = block.borrow();
+        b.exitswitch.as_ref().map(|sw| rename_hl(sw, mapping))
+    };
+    {
+        let mut b = block.borrow_mut();
+        b.operations = new_ops;
+        b.exitswitch = new_exitswitch;
+    }
+    // link.args are Vec<Option<Hlvalue>>; rename in place.
+    let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+    for link in exits_snapshot {
+        let mut l = link.borrow_mut();
+        l.args = l
+            .args
+            .iter()
+            .map(|arg| arg.as_ref().map(|v| rename_hl(v, mapping)))
+            .collect();
+        if let Some(sw) = &l.last_exception {
+            l.last_exception = Some(rename_hl(sw, mapping));
+        }
+        if let Some(sw) = &l.last_exc_value {
+            l.last_exc_value = Some(rename_hl(sw, mapping));
+        }
+    }
+}
+
+/// RPython `remove_identical_vars_SSA(graph)` (simplify.py:540-595).
+///
+/// Upstream variant that uses its own `UnionFind(Representative)`
+/// instead of `DataFlowFamilyBuilder`, inlining the phi-node collapse
+/// loop over block inputs with linked `link.args[i]` as phi sources.
+pub fn remove_identical_vars_ssa(graph: &FunctionGraph) {
+    use crate::tool::algo::unionfind::UnionFind;
+
+    let mut uf: UnionFind<Hlvalue, Representative> =
+        UnionFind::new(|k: &Hlvalue| Representative { rep: k.clone() });
+
+    // upstream: `entrymap = mkentrymap(graph); del entrymap[startblock];
+    // entrymap.pop(returnblock, None); entrymap.pop(exceptblock, None)`.
+    let mut entrymap = mkentrymap(graph);
+    entrymap.remove(&BlockKey::of(&graph.startblock));
+    entrymap.remove(&BlockKey::of(&graph.returnblock));
+    entrymap.remove(&BlockKey::of(&graph.exceptblock));
+
+    // upstream: `inputs[block] = zip(block.inputargs, zip(*[link.args
+    // for link in links]))`. Rust: Vec<(Variable, Vec<Hlvalue>)> per
+    // block. We key by BlockKey and carry a BlockRef alongside for
+    // later iteration.
+    let mut inputs: HashMap<BlockKey, (BlockRef, Vec<(Variable, Vec<Hlvalue>)>)> = HashMap::new();
+    for (bkey, links) in entrymap.iter() {
+        let block = links
+            .first()
+            .and_then(|l| l.borrow().target.clone())
+            .expect("entrymap link missing target");
+        let inputargs = block.borrow().inputargs.clone();
+        let mut phis: Vec<(Variable, Vec<Hlvalue>)> = Vec::with_capacity(inputargs.len());
+        for (i, input) in inputargs.iter().enumerate() {
+            let Hlvalue::Variable(input_v) = input else {
+                continue;
+            };
+            let mut phi_args: Vec<Hlvalue> = Vec::with_capacity(links.len());
+            for link in links {
+                let la: Vec<Option<Hlvalue>> = link.borrow().args.clone();
+                let Some(Some(a)) = la.get(i).cloned() else {
+                    panic!(
+                        "remove_identical_vars_SSA: link.args[{i}] missing at block {:?}",
+                        bkey
+                    );
+                };
+                phi_args.push(a);
+            }
+            phis.push((input_v.clone(), phi_args));
+        }
+        inputs.insert(bkey.clone(), (block.clone(), phis));
+    }
+
+    // upstream: `progress = True; while progress: ... for block in
+    // inputs: if simplify_phis(block): progress = True`.
+    let block_keys: Vec<BlockKey> = inputs.keys().cloned().collect();
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for bkey in &block_keys {
+            if simplify_phis_inner(&mut uf, inputs.get_mut(bkey).unwrap()) {
+                progress = true;
+            }
+        }
+    }
+
+    // upstream: `renaming = dict((key, uf[key].rep) for key in uf)` —
+    // filter to Variable keys only (Constants-as-keys occur when
+    // linked args brought them into the UF, but we only rename
+    // Variables in block storage slots).
+    let renaming: HashMap<Variable, Hlvalue> = {
+        let keys: Vec<Hlvalue> = uf.keys().cloned().collect();
+        let mut out: HashMap<Variable, Hlvalue> = HashMap::new();
+        for k in keys {
+            let Hlvalue::Variable(kv) = k.clone() else {
+                continue;
+            };
+            if let Some(info) = uf.get(&k) {
+                out.insert(kv, info.rep.clone());
+            }
+        }
+        out
+    };
+
+    // upstream: rewrite each block's inputargs and every incoming
+    // link's args to match the pruned `inputs[block]`. The order
+    // matters — inputargs shrink before renamevariables runs so the
+    // eliminated inputs' references in ops get the rep instead.
+    for (bkey, (block, phis)) in inputs.iter() {
+        let links = entrymap
+            .get(bkey)
+            .cloned()
+            .expect("entrymap lookup consistent with inputs");
+        let new_inputs: Vec<Hlvalue> = phis
+            .iter()
+            .map(|(v, _)| Hlvalue::Variable(v.clone()))
+            .collect();
+        // `per_link_args[link_idx][phi_idx] = phis[phi_idx].1[link_idx]`.
+        let per_link_args: Vec<Vec<Option<Hlvalue>>> = (0..links.len())
+            .map(|li| phis.iter().map(|(_, pa)| Some(pa[li].clone())).collect())
+            .collect();
+        block.borrow_mut().inputargs = new_inputs;
+        assert_eq!(links.len(), per_link_args.len());
+        for (link, args) in links.iter().zip(per_link_args.into_iter()) {
+            link.borrow_mut().args = args;
+        }
+    }
+
+    for (_, (block, _)) in inputs.iter() {
+        renamevariables_hl(block, &renaming);
+    }
+}
+
+/// Inner of `remove_identical_vars_ssa`'s `simplify_phis(block)` closure
+/// (simplify.py:555-573).
+fn simplify_phis_inner(
+    uf: &mut crate::tool::algo::unionfind::UnionFind<Hlvalue, Representative>,
+    slot: &mut (BlockRef, Vec<(Variable, Vec<Hlvalue>)>),
+) -> bool {
+    let (_block, phis) = slot;
+    let mut to_remove: Vec<usize> = Vec::new();
+    let mut unique_phis: HashMap<Vec<Hlvalue>, Variable> = HashMap::new();
+    for (i, (input, phi_args)) in phis.iter().enumerate() {
+        // upstream: `new_args = [uf.find_rep(arg) for arg in phi_args]`.
+        let new_args: Vec<Hlvalue> = phi_args.iter().map(|a| uf.find_rep(a.clone())).collect();
+        // upstream: `if all_equal(new_args) and not isspecialvar(new_args[0]):`
+        let first = new_args.first().cloned();
+        if let Some(first) = first {
+            if all_equal_hl(&new_args) && !isspecialvar(&first) {
+                uf.union(first, Hlvalue::Variable(input.clone()));
+                to_remove.push(i);
+                continue;
+            }
+        }
+        // upstream: else branch — group by identical phi-tuple.
+        let key = new_args;
+        if let Some(existing) = unique_phis.get(&key).cloned() {
+            uf.union(
+                Hlvalue::Variable(existing),
+                Hlvalue::Variable(input.clone()),
+            );
+            to_remove.push(i);
+        } else {
+            unique_phis.insert(key, input.clone());
+        }
+    }
+    // upstream: `for i in reversed(to_remove): del phis[i]`.
+    for i in to_remove.iter().rev() {
+        phis.remove(*i);
+    }
+    !to_remove.is_empty()
 }
 
 /// RPython `remove_identical_vars(graph)` (simplify.py:597-653).
@@ -1788,6 +2362,89 @@ mod tests {
         .into_ref();
         start.closeblock(vec![link]);
         simplify_exceptions(&graph);
+    }
+
+    #[test]
+    fn remove_identical_vars_ssa_dedupes_duplicate_phis() {
+        // Same fixture as remove_identical_vars_dedupes_duplicate_phi_inputs
+        // — verify the SSA variant collapses constant-fed duplicate
+        // phis to a single input.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C};
+        let v_a = Variable::new();
+        let v_b = Variable::new();
+        let body = Block::shared(vec![
+            Hlvalue::Variable(v_a.clone()),
+            Hlvalue::Variable(v_b.clone()),
+        ]);
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        let returnblock = graph.returnblock.clone();
+
+        let link_sb = Link::new(
+            vec![
+                Hlvalue::Constant(C::new(CV::Int(1))),
+                Hlvalue::Constant(C::new(CV::Int(1))),
+            ],
+            Some(body.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link_sb]);
+        let link_br = Link::new(
+            vec![body.borrow().inputargs[0].clone()],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        body.closeblock(vec![link_br]);
+
+        remove_identical_vars_ssa(&graph);
+        // body lost at least one inputarg.
+        assert!(body.borrow().inputargs.len() < 2);
+    }
+
+    #[test]
+    fn transform_dead_op_vars_drops_unused_pure_ops() {
+        // Block: two unused `add` ops whose results don't flow into
+        // link.args / exitswitch / return. transform_dead_op_vars
+        // should drop them.
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
+        let v_live = Variable::new();
+        let start = Block::shared(vec![Hlvalue::Variable(v_live.clone())]);
+        // dead_a = add v_live, 1
+        // dead_b = add v_live, 2
+        let dead_a = Variable::new();
+        let dead_b = Variable::new();
+        start.borrow_mut().operations.push(SO::new(
+            "add",
+            vec![
+                Hlvalue::Variable(v_live.clone()),
+                Hlvalue::Constant(C::new(CV::Int(1))),
+            ],
+            Hlvalue::Variable(dead_a.clone()),
+        ));
+        start.borrow_mut().operations.push(SO::new(
+            "add",
+            vec![
+                Hlvalue::Variable(v_live.clone()),
+                Hlvalue::Constant(C::new(CV::Int(2))),
+            ],
+            Hlvalue::Variable(dead_b.clone()),
+        ));
+
+        let graph = FunctionGraph::new("f", start.clone());
+        let link = Link::new(
+            vec![Hlvalue::Variable(v_live.clone())],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link]);
+
+        transform_dead_op_vars(&graph, None);
+
+        // Both dead ops are gone; block.operations is empty.
+        assert!(start.borrow().operations.is_empty());
     }
 
     #[test]
