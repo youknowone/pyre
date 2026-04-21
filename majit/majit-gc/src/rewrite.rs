@@ -107,18 +107,26 @@ pub struct JitFrameDescrs {
 }
 
 impl JitFrameDescrs {
-    /// llmodel.py:97-104 getarraydescr_for_frame + unpack_arraydescr_size
-    /// parity — itemsize of the per-arg-type frame arraydescr.
+    /// llmodel.py:80-90 + llmodel.py:97-104 — itemsize of the per-arg-type
+    /// frame arraydescr (signedarraydescr / refarraydescr / floatarraydescr),
+    /// read via getarraydescr_for_frame + unpack_arraydescr_size.
     ///
-    /// RPython has three distinct frame array descriptors
-    /// (floatarraydescr / refarraydescr / signedarraydescr); majit's
-    /// JitFrame layout stores every slot as a Signed-sized machine word
-    /// regardless of box type, so all three resolve to `sign_size`. The
-    /// per-type dispatch is kept so the lookup follows the upstream
-    /// route rather than inlining a constant.
+    /// Upstream builds:
+    ///   signedarraydescr = ad                        (itemsize = WORD)
+    ///   refarraydescr    = ArrayDescr(.., ad.itemsize, ..)
+    ///   floatarraydescr  = ArrayDescr(..,
+    ///         ad.itemsize * 2 if WORD == 4 else ad.itemsize, ..)
+    /// so on 32-bit builds a FLOAT slot spans two Signed words.
     fn frame_itemsize(&self, ty: Type) -> i64 {
         match ty {
-            Type::Int | Type::Ref | Type::Float => self.sign_size as i64,
+            Type::Int | Type::Ref => self.sign_size as i64,
+            Type::Float => {
+                if self.sign_size == 4 {
+                    (self.sign_size * 2) as i64
+                } else {
+                    self.sign_size as i64
+                }
+            }
             Type::Void => panic!("CALL_ASSEMBLER arg must have a concrete type"),
         }
     }
