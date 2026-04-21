@@ -1284,12 +1284,6 @@ impl HostEnv {
         ] {
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
-        // RPython-only overflow-check sentinel — upstream
-        // `rpython/rlib/rarithmetic.py` exports `ovfcheck` as a plain
-        // function. `translator/simplify.py:78` compares against
-        // `Constant(rarithmetic.ovfcheck)`, so the sentinel needs a
-        // stable `HostObject` identity in `HOST_ENV`.
-        self.insert_builtin("ovfcheck", HostObject::new_builtin_callable("ovfcheck"));
     }
 
     fn bootstrap_std_modules(&mut self) {
@@ -1302,6 +1296,16 @@ impl HostEnv {
         let os_path = HostObject::new_module("os.path");
         let rfile = HostObject::new_module("rpython.rlib.rfile");
         let rpath = HostObject::new_module("rpython.rlib.rpath");
+        // `rpython.rlib.rarithmetic` 모듈 — upstream 은 `ovfcheck` 를
+        // 이 모듈에 export 하며 `translator/simplify.py:78` 의
+        // `Constant(rarithmetic.ovfcheck)` 는 module attribute 로
+        // 접근한다. Rust 포트는 이 모듈 객체에 `ovfcheck` sentinel 을
+        // 달아 둔다 — builtin 테이블에 넣지 않음으로써
+        // `find_global("ovfcheck")` 는 upstream 처럼 실패하고,
+        // `translator::simplify::transform_ovfcheck` 만 이 sentinel 을
+        // 직접 조회한다.
+        let rarithmetic = HostObject::new_module("rpython.rlib.rarithmetic");
+        rarithmetic.module_set("ovfcheck", HostObject::new_builtin_callable("ovfcheck"));
 
         os.module_set("fdopen", HostObject::new_builtin_callable("os.fdopen"));
         os.module_set("tmpfile", HostObject::new_builtin_callable("os.tmpfile"));
@@ -1365,6 +1369,7 @@ impl HostEnv {
         mods.insert("os.path".into(), os_path);
         mods.insert("rpython.rlib.rfile".into(), rfile);
         mods.insert("rpython.rlib.rpath".into(), rpath);
+        mods.insert("rpython.rlib.rarithmetic".into(), rarithmetic);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

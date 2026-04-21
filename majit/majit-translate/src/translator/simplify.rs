@@ -1600,9 +1600,14 @@ pub fn remove_assertion_errors(graph: &FunctionGraph) {
 /// first via `join_blocks` and re-enters; the Rust port mirrors that
 /// fixpoint loop.
 pub fn transform_ovfcheck(graph: &FunctionGraph) {
+    // upstream `covf = Constant(rarithmetic.ovfcheck)`. The sentinel
+    // lives on the `rpython.rlib.rarithmetic` module; looking it up
+    // through the module keeps `find_global("ovfcheck")` upstream-
+    // accurate (unqualified `ovfcheck` still raises ImportError).
     let ovfcheck_sentinel: HostObject = HOST_ENV
-        .lookup_builtin("ovfcheck")
-        .expect("HOST_ENV missing ovfcheck sentinel");
+        .import_module("rpython.rlib.rarithmetic")
+        .and_then(|m| m.module_get("ovfcheck"))
+        .expect("rpython.rlib.rarithmetic missing ovfcheck sentinel");
 
     loop {
         let mut any_block_needs_merge = false;
@@ -2704,7 +2709,10 @@ mod tests {
         use crate::flowspace::model::{
             ConstValue as CV, Constant as C, HOST_ENV as HE, SpaceOperation as SO,
         };
-        let ovf_sentinel = HE.lookup_builtin("ovfcheck").unwrap();
+        let ovf_sentinel = HE
+            .import_module("rpython.rlib.rarithmetic")
+            .and_then(|m| m.module_get("ovfcheck"))
+            .unwrap();
         let v1 = Variable::new();
         let v2 = Variable::new();
         let t = Variable::new();

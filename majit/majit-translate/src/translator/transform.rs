@@ -37,7 +37,7 @@
 //! `insert_ll_stackcheck` (transform.py:200-243) is rtyper-phase and
 //! therefore out of scope for the annotator-phase port.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
@@ -443,36 +443,44 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
 /// ```
 ///
 /// Delegates to `simplify::transform_dead_op_vars_in_blocks` with the
-/// annotator's translator hooked up. Upstream's multi-graph
-/// `start_blocks` set (`translator.annotator.annotated[block].startblock`)
-/// is computed here and threaded through as a graph-resolver closure
-/// (Rust doesn't have Python's `for block in blocks: ...annotated[block]
-/// .startblock` concise expression).
+/// annotator's translator hooked up. Upstream passes the block subset
+/// directly — `block_subset` may be smaller than any one graph's full
+/// block list (e.g. `complete_helpers()` threads `self.added_blocks`
+/// only). The pass mutates only those blocks; `dependencies` /
+/// `read_vars` still flow correctly because cross-subset link targets
+/// contribute `read_vars` for their inputargs via the `target not in
+/// set_of_blocks` branch.
+///
+/// Upstream's `start_blocks` set (`{translator.annotator.annotated[block]
+/// .startblock for block in blocks}`) is reproduced per-graph: the
+/// Rust port iterates the distinct owning graphs covered by
+/// `block_subset`, grouping the subset by graph and forwarding only
+/// that subset to `transform_dead_op_vars_in_blocks`. The
+/// `single_graph` argument names the per-graph startblock whose
+/// inputargs must survive.
 pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
     use crate::translator::simplify;
-    // upstream: `set_of_blocks = set(blocks)`; start_blocks computed
-    // by `ann.translator.annotated[block].startblock`. The Rust port
-    // splits this: `simplify::transform_dead_op_vars_in_blocks` takes
-    // a single-graph reference + translator; iterate the distinct
-    // graphs covered by block_subset and run the pass per-graph. The
-    // Rust model's `annotated` map is keyed by block identity, so the
-    // same dispatch produces the same set of graphs upstream would
-    // build via `{translator.annotator.annotated[block].startblock
-    // for block in blocks}`.
-    let mut seen: HashSet<GraphKey> = HashSet::new();
     let annotated = ann.annotated.borrow();
+    // upstream's `start_blocks = {...annotated[block].startblock for
+    // block in blocks}` — group the requested blocks by their owning
+    // graph, dropping unannotated ones (upstream would raise KeyError
+    // here; the Rust port follows the `if block in annotated` guard
+    // the callers already observe).
+    let mut groups: HashMap<GraphKey, (GraphRef, Vec<BlockRef>)> = HashMap::new();
     for block in block_subset {
         let Some(Some(graph)) = annotated.get(&BlockKey::of(block)) else {
             continue;
         };
-        let gkey = GraphKey::of(graph);
-        if !seen.insert(gkey) {
-            continue;
-        }
-        let graph_blocks = graph.borrow().iterblocks();
-        let _ = graph_blocks.len();
+        let entry = groups
+            .entry(GraphKey::of(graph))
+            .or_insert_with(|| (graph.clone(), Vec::new()));
+        entry.1.push(block.clone());
+    }
+    drop(annotated);
+
+    for (_gkey, (graph, subset)) in groups {
         simplify::transform_dead_op_vars_in_blocks(
-            &graph_blocks,
+            &subset,
             &[graph.as_ptr() as *const _],
             Some(&ann.translator.borrow()),
             &graph.borrow(),
