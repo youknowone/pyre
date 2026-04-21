@@ -12,4 +12,5 @@
 
 pub mod rtyper;
 pub mod simplify;
+pub mod transform;
 pub mod translator;

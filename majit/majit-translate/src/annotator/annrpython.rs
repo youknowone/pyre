@@ -733,19 +733,15 @@ impl RPythonAnnotator {
     ///
     /// The Rust port routes the fixpoint call through the bookkeeper's
     /// `compute_at_fixpoint` and invokes `eliminate_empty_blocks` over
-    /// the translator's graph set. `transform_graph` and
-    /// `perform_normalizations` remain as no-op placeholders until
-    /// `rpython/translator/transform.py` and `rpython/rtyper/
-    /// normalizecalls.py` land.
-    ///
-    /// `extra_passes` is a typed-opaque pass-through — upstream hands
-    /// it straight to `transform_graph` (which is deferred). Taking
-    /// `Option<&[()]>` keeps the upstream 2-parameter shape visible
-    /// at call sites without committing to a pass interface before
-    /// `translator/transform.py` lands.
-    pub fn simplify(&self, block_subset: Option<&[BlockRef]>, _extra_passes: Option<&[()]>) {
-        // upstream: `transform.transform_graph(self, block_subset=..., extra_passes=...)` —
-        // deferred until translator/transform.py port lands.
+    /// the translator's graph set. `perform_normalizations` remains a
+    /// no-op placeholder until `rpython/rtyper/normalizecalls.py` lands.
+    pub fn simplify(
+        &self,
+        block_subset: Option<&[BlockRef]>,
+        extra_passes: Option<&[super::super::translator::transform::TransformPass]>,
+    ) {
+        // upstream: `transform.transform_graph(self, block_subset=..., extra_passes=...)`.
+        super::super::translator::transform::transform_graph(self, extra_passes, block_subset);
         // upstream:
         //   if block_subset is None:
         //       graphs = self.translator.graphs
