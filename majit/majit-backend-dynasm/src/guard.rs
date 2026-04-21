@@ -210,30 +210,40 @@ impl std::fmt::Debug for DynasmFailDescr {
 /// compare `jf_descr` against `Arc::as_ptr` of the same `Arc` the
 /// metainterp reads back in `handle_fail`.
 ///
-/// The attachment happens once during `MetaInterp::new`; the setters
-/// tolerate repeated calls and silently ignore attempts to change an
-/// already-set value (RPython-equivalent behaviour: the metainterp
-/// only ever constructs the pair once per CPU).
-static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
-static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
-static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
-static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
-static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
-static PROPAGATE_EXCEPTION_DESCR: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
+/// `compile.py:665` `setattr(cpu, name, descr)` binds the descr to a
+/// specific cpu instance; each `(metainterp_sd, cpu)` pair gets its own
+/// attachment, and re-running `make_and_attach_done_descrs` overwrites.
+/// Pyre stores the descrs in per-thread slots instead of per-`Backend`
+/// instance fields: the extern-C CA helper trampoline
+/// (`runner.rs::call_assembler_helper_trampoline`) and Cranelift-emitted
+/// machine code resolve the identity without a backend receiver in
+/// scope, and production deploys one backend per thread — so the
+/// thread-local captures the same "one attachment per backend" lifetime
+/// the RPython instance attribute does.  Tests that spin up multiple
+/// backend instances on the same thread observe last-attach-wins, also
+/// matching `setattr` semantics.
+thread_local! {
+    static DONE_WITH_THIS_FRAME_DESCR_VOID: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static DONE_WITH_THIS_FRAME_DESCR_INT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static DONE_WITH_THIS_FRAME_DESCR_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static PROPAGATE_EXCEPTION_DESCR: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// PRE-EXISTING-ADAPTATION: standalone backend tests construct a
-/// `DynasmBackend` without a `MetaInterp`, so the OnceLocks above
-/// remain unpopulated.  These fallbacks preserve the per-result-type
-/// distinct-pointer invariant the tests assert.  In the production
+/// `DynasmBackend` without a `MetaInterp`, so the thread-local slots
+/// above remain unpopulated.  These fallbacks preserve the per-result-
+/// type distinct-pointer invariant the tests assert.  In the production
 /// path `MetaInterp::new` runs `attach_descrs_to_cpu` first, which
-/// fills the OnceLocks; the getter functions prefer the OnceLock
-/// result and only fall back here when it is still `None`.
+/// fills the slots; the getter functions prefer the attached value and
+/// only fall back here when the slot is still `None`.
 static FALLBACK_DONE_VOID: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     std::sync::LazyLock::new(|| Arc::new(DynasmFailDescr::new(u32::MAX, 0, vec![], true)));
 static FALLBACK_DONE_INT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
@@ -246,35 +256,37 @@ static FALLBACK_DONE_FLOAT: std::sync::LazyLock<Arc<DynasmFailDescr>> =
     });
 
 pub(crate) fn set_done_with_this_frame_descr_void(descr: majit_ir::DescrRef) {
-    let _ = DONE_WITH_THIS_FRAME_DESCR_VOID.set(descr);
+    DONE_WITH_THIS_FRAME_DESCR_VOID.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_int(descr: majit_ir::DescrRef) {
-    let _ = DONE_WITH_THIS_FRAME_DESCR_INT.set(descr);
+    DONE_WITH_THIS_FRAME_DESCR_INT.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_ref(descr: majit_ir::DescrRef) {
-    let _ = DONE_WITH_THIS_FRAME_DESCR_REF.set(descr);
+    DONE_WITH_THIS_FRAME_DESCR_REF.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_float(descr: majit_ir::DescrRef) {
-    let _ = DONE_WITH_THIS_FRAME_DESCR_FLOAT.set(descr);
+    DONE_WITH_THIS_FRAME_DESCR_FLOAT.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_exit_frame_with_exception_descr_ref(descr: majit_ir::DescrRef) {
-    let _ = EXIT_FRAME_WITH_EXCEPTION_DESCR_REF.set(descr);
+    EXIT_FRAME_WITH_EXCEPTION_DESCR_REF.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
-    let _ = PROPAGATE_EXCEPTION_DESCR.set(descr);
+    PROPAGATE_EXCEPTION_DESCR.with(|c| *c.borrow_mut() = Some(descr));
 }
 
 /// `Arc::as_ptr` of the metainterp-attached descr, falling back to
 /// the local `DynasmFailDescr` singleton when no attachment has
 /// happened (backend-only tests).
 fn descr_ref_ptr(
-    slot: &std::sync::OnceLock<majit_ir::DescrRef>,
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
     fallback: &std::sync::LazyLock<Arc<DynasmFailDescr>>,
 ) -> usize {
-    if let Some(arc) = slot.get() {
-        return Arc::as_ptr(arc) as *const () as usize;
-    }
-    Arc::as_ptr(fallback) as usize
+    let attached = slot.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|arc| Arc::as_ptr(arc) as *const () as usize)
+    });
+    attached.unwrap_or_else(|| Arc::as_ptr(fallback) as usize)
 }
 
 /// compile.py:667 done_with_this_frame_descr_void
@@ -295,17 +307,21 @@ pub fn done_with_this_frame_descr_float_ptr() -> usize {
 }
 /// compile.py:671 exit_frame_with_exception_descr_ref
 pub fn exit_frame_with_exception_descr_ref_ptr() -> usize {
-    EXIT_FRAME_WITH_EXCEPTION_DESCR_REF
-        .get()
-        .map(|arc| Arc::as_ptr(arc) as *const () as usize)
-        .unwrap_or(0)
+    EXIT_FRAME_WITH_EXCEPTION_DESCR_REF.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|arc| Arc::as_ptr(arc) as *const () as usize)
+            .unwrap_or(0)
+    })
 }
 /// pyjitpl.py:2283 propagate_exception_descr
 pub fn propagate_exception_descr_ptr() -> usize {
-    PROPAGATE_EXCEPTION_DESCR
-        .get()
-        .map(|arc| Arc::as_ptr(arc) as *const () as usize)
-        .unwrap_or(0)
+    PROPAGATE_EXCEPTION_DESCR.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|arc| Arc::as_ptr(arc) as *const () as usize)
+            .unwrap_or(0)
+    })
 }
 
 /// Return the type-appropriate done_with_this_frame_descr pointer.

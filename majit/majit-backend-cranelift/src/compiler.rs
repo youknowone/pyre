@@ -154,33 +154,51 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFa
 // via `Backend::set_done_with_this_frame_descr_*`.  Used for the
 // jf_descr pointer written at FINISH emission so that pointer
 // identity matches the `Arc` stored on `MetaInterpStaticData`.
+//
+// `compile.py:665` `setattr(cpu, name, descr)` binds the descr to a
+// specific cpu instance; each `(metainterp_sd, cpu)` pair gets its
+// own attachment, and re-running `make_and_attach_done_descrs`
+// overwrites.  Pyre stores the descrs in per-thread slots instead of
+// per-`Backend` instance fields: Cranelift-emitted machine code and
+// extern-C callbacks resolve the identity without a backend receiver
+// in scope, and production deploys one backend per thread — so the
+// thread-local captures the same "one attachment per backend"
+// lifetime the RPython instance attribute does.  Tests that spin up
+// multiple backend instances on the same thread observe
+// last-attach-wins, also matching `setattr` semantics.
 
-static METAINTERP_DONE_VOID: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
-static METAINTERP_DONE_INT: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
-static METAINTERP_DONE_REF: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
-static METAINTERP_DONE_FLOAT: std::sync::OnceLock<majit_ir::DescrRef> = std::sync::OnceLock::new();
-static METAINTERP_EXIT_EXC_REF: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
-static METAINTERP_PROPAGATE_EXC: std::sync::OnceLock<majit_ir::DescrRef> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static METAINTERP_DONE_VOID: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_DONE_INT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_DONE_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_DONE_FLOAT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_EXIT_EXC_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+    static METAINTERP_PROPAGATE_EXC: std::cell::RefCell<Option<majit_ir::DescrRef>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 pub(crate) fn set_done_with_this_frame_descr_void(descr: majit_ir::DescrRef) {
-    let _ = METAINTERP_DONE_VOID.set(descr);
+    METAINTERP_DONE_VOID.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_int(descr: majit_ir::DescrRef) {
-    let _ = METAINTERP_DONE_INT.set(descr);
+    METAINTERP_DONE_INT.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_ref(descr: majit_ir::DescrRef) {
-    let _ = METAINTERP_DONE_REF.set(descr);
+    METAINTERP_DONE_REF.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_done_with_this_frame_descr_float(descr: majit_ir::DescrRef) {
-    let _ = METAINTERP_DONE_FLOAT.set(descr);
+    METAINTERP_DONE_FLOAT.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_exit_frame_with_exception_descr_ref(descr: majit_ir::DescrRef) {
-    let _ = METAINTERP_EXIT_EXC_REF.set(descr);
+    METAINTERP_EXIT_EXC_REF.with(|c| *c.borrow_mut() = Some(descr));
 }
 pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
-    let _ = METAINTERP_PROPAGATE_EXC.set(descr);
+    METAINTERP_PROPAGATE_EXC.with(|c| *c.borrow_mut() = Some(descr));
 }
 
 /// `pyjitpl.py:2222` parity: pointer of the metainterp-attached
@@ -190,26 +208,34 @@ pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
 /// classifier path keeps working in either case because both
 /// pointers route through the same FINISH fast path.
 fn done_with_this_frame_descr_ptr(result_types: &[Type]) -> i64 {
-    let slot = match result_types {
-        [Type::Float] => &METAINTERP_DONE_FLOAT,
-        [Type::Ref] => &METAINTERP_DONE_REF,
-        [] => &METAINTERP_DONE_VOID,
-        _ => &METAINTERP_DONE_INT,
-    };
-    if let Some(arc) = slot.get() {
-        return Arc::as_ptr(arc) as *const () as i64;
+    fn attached_ptr(
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
+    ) -> Option<i64> {
+        slot.with(|c| {
+            c.borrow()
+                .as_ref()
+                .map(|arc| Arc::as_ptr(arc) as *const () as i64)
+        })
     }
-    Arc::as_ptr(done_with_this_frame_descr(result_types)) as i64
+    let attached = match result_types {
+        [Type::Float] => attached_ptr(&METAINTERP_DONE_FLOAT),
+        [Type::Ref] => attached_ptr(&METAINTERP_DONE_REF),
+        [] => attached_ptr(&METAINTERP_DONE_VOID),
+        _ => attached_ptr(&METAINTERP_DONE_INT),
+    };
+    attached.unwrap_or_else(|| Arc::as_ptr(done_with_this_frame_descr(result_types)) as i64)
 }
 
 /// `compile.py:658` parity: pointer of the metainterp-attached
 /// `Arc<ExitFrameWithExceptionDescrRef>`.  Falls back to the
 /// cranelift-side singleton when the metainterp has not attached yet.
 fn exit_frame_with_exception_descr_ref_ptr() -> i64 {
-    if let Some(arc) = METAINTERP_EXIT_EXC_REF.get() {
-        return Arc::as_ptr(arc) as *const () as i64;
-    }
-    Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as i64
+    let attached = METAINTERP_EXIT_EXC_REF.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|arc| Arc::as_ptr(arc) as *const () as i64)
+    });
+    attached.unwrap_or_else(|| Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as i64)
 }
 
 /// Match `jf_descr_raw` against the metainterp-attached
@@ -222,8 +248,26 @@ fn match_metainterp_finish_descr(
     jf_descr_raw: i64,
 ) -> Option<(majit_ir::DescrRef, Arc<CraneliftFailDescr>)> {
     let ptr = jf_descr_raw as usize;
+    fn check(
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
+        expected: usize,
+    ) -> Option<majit_ir::DescrRef> {
+        slot.with(|c| {
+            c.borrow().as_ref().and_then(|arc| {
+                if Arc::as_ptr(arc) as *const () as usize == expected {
+                    Some(arc.clone())
+                } else {
+                    None
+                }
+            })
+        })
+    }
     for (slot, cl_singleton) in [
-        (&METAINTERP_DONE_INT, &*DONE_WITH_THIS_FRAME_DESCR_INT),
+        (
+            &METAINTERP_DONE_INT
+                as &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
+            &*DONE_WITH_THIS_FRAME_DESCR_INT,
+        ),
         (&METAINTERP_DONE_FLOAT, &*DONE_WITH_THIS_FRAME_DESCR_FLOAT),
         (&METAINTERP_DONE_REF, &*DONE_WITH_THIS_FRAME_DESCR_REF),
         (&METAINTERP_DONE_VOID, &*DONE_WITH_THIS_FRAME_DESCR_VOID),
@@ -232,10 +276,8 @@ fn match_metainterp_finish_descr(
             &*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL,
         ),
     ] {
-        if let Some(arc) = slot.get() {
-            if Arc::as_ptr(arc) as *const () as usize == ptr {
-                return Some((arc.clone(), cl_singleton.clone()));
-            }
+        if let Some(arc) = check(slot, ptr) {
+            return Some((arc, cl_singleton.clone()));
         }
     }
     None
