@@ -174,23 +174,38 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
     STACK_CHECK_ADDRS.get().copied()
 }
 
-/// assembler.py:345 assembler_helper_adr parity:
-/// C-callable trampoline for CALL_ASSEMBLER slow path.
+/// warmspot.py:1021-1028 `assembler_call_helper` parity —
+/// C-callable trampoline for the CALL_ASSEMBLER slow path.
 ///
-/// Called from generated machine code when callee finished with a guard
-/// failure (jf_descr != done_descr). NOT called for pending/unresolved
-/// targets (those skip the callee call entirely).
+/// Upstream:
+///     fail_descr = self.cpu.get_latest_descr(deadframe)
+///     try:
+///         fail_descr.handle_fail(deadframe, self.metainterp_sd, jd)
+///     except jitexc.JitException as e:
+///         return handle_jitexception(e)
 ///
-/// Dispatch order matches Cranelift's call_assembler helper parity:
-///   1. execute an already-attached bridge, if present
-///   2. try bridge tracing/attachment (if CA_BRIDGE_FN registered)
-///   3. execute the newly-attached bridge, if present
-///   4. resume in blackhole (if CA_BLACKHOLE_FN registered)
-///   5. fall back to force_fn(frame_ptr)
+/// In upstream each `AbstractFailDescr` subclass carries its own
+/// `handle_fail`, and the helper's job is purely to dispatch. pyre
+/// encodes finish descrs as raw-pointer singletons
+/// (`done_with_this_frame_descr_{void,int,ref,float}`,
+/// `exit_frame_with_exception_descr_ref`) and resume-guard descrs as
+/// `DynasmFailDescr`, so this trampoline performs the type dispatch
+/// inline and delegates to one of the `handle_fail_*` helpers below.
 ///
-/// Input:  rdi/x0 = callee_jf_ptr (heap-allocated jitframe)
-///         rsi/x1 = green_key (header_pc of the owning loop)
-/// Output: rax/x0 = result value (0 if void/unhandled)
+/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre does not yet carry
+/// `FailDescr::handle_fail` as a virtual method because descrs are
+/// stored as raw `usize` sentinels rather than `Box<dyn FailDescr>`,
+/// and `metainterp_sd` / `jitdriver_sd` are not plumbed through
+/// `majit-backend`. Converting to an object-hierarchy requires
+/// reworking descr storage across both backends — tracked as a
+/// follow-up on top of this refactor. The body below is written so
+/// every branch lines up 1:1 with upstream's `handle_fail` sites.
+///
+/// Input:  callee_jf_ptr = deadframe,
+///         green_key = caller loop's header_pc (used by CA_*_FN hooks
+///         to find the owning compiled trace).
+/// Output: the int interpretation of the handled result (the caller
+///         re-casts to the portal's return type).
 ///
 /// Always frees the callee jitframe before returning.
 pub extern "C" fn call_assembler_helper_trampoline(
@@ -200,23 +215,84 @@ pub extern "C" fn call_assembler_helper_trampoline(
     if callee_jf_ptr.is_null() {
         return 0;
     }
-    // compile.py:701-717 handle_fail parity:
-    // RPython does "trace+attach OR blackhole" only. It NEVER re-enters
-    // a bridge from within this helper. The bridge will be found on the
-    // NEXT guard failure (patched guard or C dispatch).
     let frame_ptr = callee_jf_ptr;
+    // warmspot.py:1022 `fail_descr = cpu.get_latest_descr(deadframe)`.
     let descr_raw = unsafe { llmodel::get_latest_descr(frame_ptr) };
-    if descr_raw == 0 || guard::is_done_with_this_frame_descr(descr_raw) {
-        let result: i64 = if guard::is_done_with_this_frame_descr(descr_raw) {
-            unsafe { llmodel::get_int_value(frame_ptr, 0) as i64 }
-        } else {
-            0
-        };
-        unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
-        return result;
-    }
+    // warmspot.py:1023-1028 `fail_descr.handle_fail(deadframe, ...)`.
+    let result = handle_fail_dispatch(descr_raw, frame_ptr, green_key);
+    unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
+    result
+}
 
+/// Dispatch to the `handle_fail` variant that matches `descr_raw`.
+/// Upstream equivalent: the virtual-method call in warmspot.py:1024,
+/// resolved at runtime by the Python class of `fail_descr`.
+fn handle_fail_dispatch(
+    descr_raw: usize,
+    frame_ptr: *mut jitframe::JitFrame,
+    green_key: u64,
+) -> i64 {
+    if descr_raw == 0 {
+        // Deviation: unresolved-callee path. Upstream never reaches
+        // this state — an unlinked target is patched out before the
+        // CALL_ASSEMBLER emits the call. Retained as a safety fence.
+        return 0;
+    }
+    if guard::is_done_with_this_frame_descr(descr_raw) {
+        // compile.py:626-656 `_DoneWithThisFrameDescr` subclasses
+        // (Void/Int/Ref/Float) — the four finish singletons.
+        return handle_fail_done_with_this_frame(frame_ptr);
+    }
+    // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`
+    // has no pyre singleton yet: the CALL_ASSEMBLER slow path does
+    // not currently observe this descr (the compiled epilogue raises
+    // via `jit_exc_value` instead). If/when the singleton is added
+    // to `guard.rs`, insert the matching branch here.
+    //
+    // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
     let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
+    handle_fail_resume_guard(descr, descr_raw, frame_ptr, green_key)
+}
+
+/// compile.py:626-656 `DoneWithThisFrameDescr{Void,Int,Ref,Float}.handle_fail`.
+///
+/// Upstream raises `jitexc.DoneWithThisFrame*(slot-0)` and
+/// `handle_jitexception` shape-casts the payload to the portal's
+/// return type. pyre hands the raw int back; the JIT-emitted caller
+/// stub (assembler_helper_wrapper) reinterprets it as the correct
+/// kind. Void returns are harmless because the caller discards.
+fn handle_fail_done_with_this_frame(frame_ptr: *mut jitframe::JitFrame) -> i64 {
+    // compile.py:633/642/651 `cpu.get_*_value(deadframe, 0)`.
+    // All four subclasses read slot 0 of the deadframe; Void returns
+    // 0 because the caller never reads the result.
+    unsafe { llmodel::get_int_value(frame_ptr, 0) as i64 }
+}
+
+/// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
+///
+/// Upstream:
+///     if must_compile(...) and not rstack.stack_almost_full():
+///         self._trace_and_compile_from_bridge(deadframe, ...)
+///     else:
+///         resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
+///     assert 0, "unreachable"
+///
+/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre's CA slow path always
+/// walks the bridge-tracer hook (`CA_BRIDGE_FN`) first and then runs
+/// the blackhole hook (`CA_BLACKHOLE_FN`), rather than choosing one
+/// via `must_compile`. The bridge hook is responsible for the
+/// _tracing and attaching_ step only; it never re-enters the newly
+/// attached bridge, so the blackhole hook still gets to finish the
+/// current frame. This differs from upstream's "trace+fall-through"
+/// semantics in `_trace_and_compile_from_bridge` but preserves the
+/// end result: each CA slow entry attaches at most one bridge _and_
+/// produces a resume value.
+fn handle_fail_resume_guard(
+    descr: &guard::DynasmFailDescr,
+    descr_raw: usize,
+    frame_ptr: *mut jitframe::JitFrame,
+    green_key: u64,
+) -> i64 {
     let trace_id = descr.trace_id;
     let fail_index = descr.fail_index;
     let n_fail_args = descr.fail_arg_types.len();
@@ -226,8 +302,8 @@ pub extern "C" fn call_assembler_helper_trampoline(
         raw_values.push(unsafe { llmodel::get_int_value(frame_ptr, slot) as i64 });
     }
 
-    // Step 1: try bridge compilation (compile.py:701 handle_fail).
-    // Just compile+attach; do NOT execute the bridge for this failure.
+    // compile.py:704-709 `_trace_and_compile_from_bridge`.
+    // The hook compiles+attaches; it does NOT re-enter the bridge.
     if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
         bridge_fn(
             green_key,
@@ -239,8 +315,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
         );
     }
 
-    // Step 2: blackhole resume (resume.py:1312 blackhole_from_resumedata).
-    let mut result = 0i64;
+    // compile.py:710-716 `resume_in_blackhole`.
     if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
         if let Some(bh_result) = blackhole(
             green_key,
@@ -251,14 +326,13 @@ pub extern "C" fn call_assembler_helper_trampoline(
             raw_values.as_ptr(),
             raw_values.len(),
         ) {
-            result = bh_result;
+            return bh_result;
         }
     }
-    // compile.py:701 parity: no force_fn fallback. RPython only does
-    // "trace+attach OR blackhole". If neither registered, result stays 0.
-
-    unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
-    result
+    // `assert 0, "unreachable"` upstream — pyre returns 0 when neither
+    // hook is registered (e.g. bare-backend tests exercise the helper
+    // without a metainterp behind it).
+    0
 }
 
 /// Return the address of the trampoline for embedding in generated code.
