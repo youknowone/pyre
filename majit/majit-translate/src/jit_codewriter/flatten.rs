@@ -807,20 +807,21 @@ pub fn insert_renamings(
         None
     };
 
-    // Graph-construction divergence (not this helper's fault):
-    // majit's synthesized graphs occasionally produce a `Terminator`
-    // with `args.len() > target.inputargs.len()` — upstream rejects
-    // that at `FunctionGraph` build time, so `insert_renamings` can
-    // assume equality. The root fix lives in the graph builder;
-    // `.zip()` truncation here keeps the prefix renaming parity
-    // correct for the well-formed portion and matches the original
-    // (pre-insert_renamings) flatten() behavior exactly.
+    // Upstream `flatten.py:308` requires `len(link.args) ==
+    // len(link.target.inputargs)` — the helper assumes equality and
+    // indexes both sides pairwise. The graph builder must provide
+    // well-formed links; any mismatch is a front-end bug.
     //
     // Parallel color lists for `reorder_renaming_list` + representative
     // ValueIds for emitting back into `FlatOp::Move/Push/Pop`. Each
     // kept pair satisfies `v_color != w_color` (upstream `if v == w:
     // continue` — after regalloc, equal colors mean equal variables).
-    let cap = link.args.len().min(target_inputargs.len());
+    assert_eq!(
+        link.args.len(),
+        target_inputargs.len(),
+        "insert_renamings: link.args and target.inputargs must have equal length"
+    );
+    let cap = link.args.len();
     let mut frm_colors: Vec<RenameItem> = Vec::with_capacity(cap);
     let mut to_colors: Vec<RenameItem> = Vec::with_capacity(cap);
     let mut src_vids: Vec<(usize, ValueId)> = Vec::with_capacity(cap);

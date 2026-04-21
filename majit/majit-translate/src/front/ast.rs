@@ -1313,91 +1313,145 @@ fn lower_expr(
                 return None;
             }
 
-            let merge = graph.create_block();
-            let mut arm_results = Vec::new();
-
+            // Lower each arm body into its own block, collecting both
+            // the ENTRY block (what the outer Branch/Goto jumps to)
+            // and the TAIL block (what jumps to merge). lower_expr
+            // takes `&mut arm_block` and may rewire arm_block to the
+            // arm's tail (e.g., nested if/match's merge). We capture
+            // the entry before calling so the outer terminator targets
+            // the right landing pad.
+            //
+            // The merge block's inputarg list must have the same
+            // length as every outgoing Goto's args (flatten.py:308
+            // assumption), so we defer merge creation until we know
+            // whether any arm actually produced a value.
+            let mut arm_entries: Vec<BlockId> = Vec::with_capacity(m.arms.len());
+            let mut arm_tails: Vec<(BlockId, Option<ValueId>)> = Vec::with_capacity(m.arms.len());
             for arm in &m.arms {
-                let mut arm_block = graph.create_block();
-                // Each arm gets its own block (simplified: no pattern matching guards)
-                let result = lower_expr(graph, &mut arm_block, &arm.body, options, ctx);
-                arm_results.push((arm_block, result));
-                if graph.block(arm_block).is_open() {
-                    let goto_args = result.map_or(vec![], |v| vec![v]);
-                    graph.set_goto(arm_block, merge, goto_args);
+                let entry = graph.create_block();
+                let mut tail = entry;
+                let result = lower_expr(graph, &mut tail, &arm.body, options, ctx);
+                arm_entries.push(entry);
+                arm_tails.push((tail, result));
+            }
+
+            // Any-arm-has-value → merge gets a Phi inputarg; otherwise
+            // merge is a plain block and all arm gotos carry no args.
+            let any_has_value = arm_tails.iter().any(|(_, r)| r.is_some());
+            let (merge, merge_phi) = if any_has_value {
+                let (m_block, phi_args) = graph.create_block_with_args(1);
+                (m_block, Some(phi_args[0]))
+            } else {
+                (graph.create_block(), None)
+            };
+
+            for (tail, result) in &arm_tails {
+                if !graph.block(*tail).is_open() {
+                    continue;
                 }
+                let goto_args = if any_has_value {
+                    vec![result.unwrap_or_else(|| graph.alloc_value())]
+                } else {
+                    Vec::new()
+                };
+                graph.set_goto(*tail, merge, goto_args);
             }
 
             // First arm as default branch (simplified)
             if m.arms.len() == 1 {
-                graph.set_goto(*block, arm_results[0].0, vec![]);
+                graph.set_goto(*block, arm_entries[0], vec![]);
             } else {
-                // Binary branch on scrutinee for first arm, else second
-                let first_block = arm_results[0].0;
-                let second_block = arm_results.get(1).map(|a| a.0).unwrap_or(merge);
-                graph.set_branch(*block, scrutinee, first_block, vec![], second_block, vec![]);
+                // Binary branch on scrutinee for first arm, else second.
+                // If the else-fallthrough goes to `merge` directly
+                // (arm count < 2), carry the matching phi argument so
+                // merge's inputarg arity is respected.
+                let first_block = arm_entries[0];
+                let second_block = arm_entries.get(1).copied().unwrap_or(merge);
+                let false_args = if second_block == merge && any_has_value {
+                    vec![graph.alloc_value()]
+                } else {
+                    Vec::new()
+                };
+                graph.set_branch(
+                    *block,
+                    scrutinee,
+                    first_block,
+                    vec![],
+                    second_block,
+                    false_args,
+                );
             }
 
             *block = merge;
-            None
+            merge_phi
         }
 
         // ── while → header block + body block + exit block ──
         syn::Expr::While(w) => {
-            let mut header = graph.create_block();
-            let mut body = graph.create_block();
+            let header_entry = graph.create_block();
+            let body_entry = graph.create_block();
             let exit = graph.create_block();
 
-            // Current block → header
-            graph.set_goto(*block, header, vec![]);
+            // Current block → header_entry (loop-head, 0 inputargs).
+            graph.set_goto(*block, header_entry, vec![]);
 
-            // Header: evaluate condition, branch to body or exit
-            let cond = lower_expr(graph, &mut header, &w.cond, options, ctx)
+            // Header: evaluate condition, branch to body or exit.
+            // `lower_expr(&mut header_tail, ...)` may rewire to a
+            // sub-merge; the cond-branch attaches to header_tail so
+            // the branch lives at the header's actual end.
+            let mut header_tail = header_entry;
+            let cond = lower_expr(graph, &mut header_tail, &w.cond, options, ctx)
                 .unwrap_or_else(|| graph.alloc_value());
-            graph.set_branch(header, cond, body, vec![], exit, vec![]);
+            graph.set_branch(header_tail, cond, body_entry, vec![], exit, vec![]);
 
-            // Body → back to header
+            // Body → back to header_entry (entry, not tail —
+            // header_entry is the 0-inputarg loop-head).
+            let mut body_tail = body_entry;
             for stmt in &w.body.stmts {
-                lower_stmt(graph, &mut body, stmt, options, ctx);
+                lower_stmt(graph, &mut body_tail, stmt, options, ctx);
             }
-            if graph.block(body).is_open() {
-                graph.set_goto(body, header, vec![]);
+            if graph.block(body_tail).is_open() {
+                graph.set_goto(body_tail, header_entry, vec![]);
             }
 
             *block = exit;
             None
         }
         syn::Expr::Loop(l) => {
-            let mut body = graph.create_block();
+            let body_entry = graph.create_block();
             let exit = graph.create_block();
 
-            graph.set_goto(*block, body, vec![]);
+            graph.set_goto(*block, body_entry, vec![]);
 
+            let mut body_tail = body_entry;
             for stmt in &l.body.stmts {
-                lower_stmt(graph, &mut body, stmt, options, ctx);
+                lower_stmt(graph, &mut body_tail, stmt, options, ctx);
             }
-            if graph.block(body).is_open() {
-                graph.set_goto(body, body, vec![]);
+            if graph.block(body_tail).is_open() {
+                graph.set_goto(body_tail, body_entry, vec![]);
             }
 
             *block = exit;
             None
         }
         syn::Expr::ForLoop(f) => {
-            let mut header = graph.create_block();
-            let mut body = graph.create_block();
+            let header_entry = graph.create_block();
+            let body_entry = graph.create_block();
             let exit = graph.create_block();
 
-            graph.set_goto(*block, header, vec![]);
+            graph.set_goto(*block, header_entry, vec![]);
 
-            lower_expr(graph, &mut header, &f.expr, options, ctx);
+            let mut header_tail = header_entry;
+            lower_expr(graph, &mut header_tail, &f.expr, options, ctx);
             let iter_cond = graph.alloc_value();
-            graph.set_branch(header, iter_cond, body, vec![], exit, vec![]);
+            graph.set_branch(header_tail, iter_cond, body_entry, vec![], exit, vec![]);
 
+            let mut body_tail = body_entry;
             for stmt in &f.body.stmts {
-                lower_stmt(graph, &mut body, stmt, options, ctx);
+                lower_stmt(graph, &mut body_tail, stmt, options, ctx);
             }
-            if graph.block(body).is_open() {
-                graph.set_goto(body, header, vec![]);
+            if graph.block(body_tail).is_open() {
+                graph.set_goto(body_tail, header_entry, vec![]);
             }
 
             *block = exit;
