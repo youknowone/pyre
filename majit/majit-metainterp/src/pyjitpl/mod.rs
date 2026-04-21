@@ -2635,6 +2635,8 @@ impl<M: Clone> MetaInterp<M> {
                         if let Some(ctx) = self.tracing.take() {
                             self.warm_state.abort_tracing(ctx.green_key, false);
                         }
+                        // Keep tracing + session in lockstep (pyjitpl.py:3015).
+                        self.clear_trace_session();
                         return CompileOutcome::Aborted;
                     }
                     // Not too many — clear retrace state and fall through
@@ -2649,6 +2651,8 @@ impl<M: Clone> MetaInterp<M> {
                     if let Some(ctx) = self.tracing.take() {
                         self.warm_state.abort_tracing(ctx.green_key, false);
                     }
+                    // Keep tracing + session in lockstep (pyjitpl.py:3015).
+                    self.clear_trace_session();
                     return CompileOutcome::Aborted;
                 }
             }
@@ -4065,6 +4069,12 @@ impl<M: Clone> MetaInterp<M> {
             // None→None set is a no-op.
             self.clear_trace_session();
         }
+        // `pyjitpl.py:3015` — cancel/abort unwinds the tracing state
+        // atomically. Keep `self.tracing` and `self.active_trace_session`
+        // in lockstep: leaving `active_trace_session = Some` after
+        // `self.tracing = None` would leak a stale session into the next
+        // `begin_trace_session`, which asserts the slot is empty.
+        self.clear_trace_session();
     }
 
     /// Finish the current trace with a terminal `FINISH`, then optimize and compile it.
