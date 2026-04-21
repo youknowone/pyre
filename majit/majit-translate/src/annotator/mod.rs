@@ -33,6 +33,7 @@ pub mod annrpython;
 pub mod argument;
 pub mod binaryop;
 pub mod bookkeeper;
+pub mod builtin;
 pub mod classdesc;
 pub mod description;
 pub mod dictdef;
