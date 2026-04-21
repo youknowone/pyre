@@ -112,35 +112,19 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFa
 }
 
 // ── JitFrame layout constants (jitframe.py:61-83) ───────────────────
-// Header: [frame_info:8, descr:8, force_descr:8, gcmap:8,
-//          savedata:8, guard_exc:8, forward:8]  = 56 bytes
-// Array:  [length:8, item[0]:8, item[1]:8, ...]
-/// jitframe.py:8 — `SIZEOFSIGNED = rffi.sizeof(lltype.Signed)`.
-const SIZEOFSIGNED: usize = std::mem::size_of::<isize>();
-/// jitframe.py:9 — `IS_32BIT = (SIZEOFSIGNED == 4)`.
-const IS_32BIT: bool = SIZEOFSIGNED == 4;
-/// jitframe.py:101 — `SIGN_SIZE = llmemory.sizeof(lltype.Signed)`.
-const SIGN_SIZE: usize = SIZEOFSIGNED;
-/// jitframe.py:102 — `UNSIGN_SIZE = llmemory.sizeof(lltype.Unsigned)`.
-const UNSIGN_SIZE: usize = std::mem::size_of::<usize>();
-/// jitframe.py:97 — `GCMAPLENGTHOFS = arraylengthoffset(GCMAP)`.
-const GCMAPLENGTHOFS: usize = 0;
-/// jitframe.py:98 — `GCMAPBASEOFS = itemoffsetof(GCMAP, 0)`.
-const GCMAPBASEOFS: usize = SIZEOFSIGNED;
-/// Byte offset of `jf_descr` from JitFrame start.
-const JF_DESCR_OFS: i32 = 8;
-const JF_FORCE_DESCR_OFS: i32 = 16;
-/// Byte offset of `jf_gcmap` from JitFrame start.
-const JF_GCMAP_OFS: i32 = 24;
-const JF_SAVEDATA_OFS: i32 = 32;
-const JF_GUARD_EXC_OFS: i32 = 40;
-const JF_FORWARD_OFS: i32 = 48;
-/// Byte offset of `jf_frame_length` from JitFrame start.
-const JF_FRAME_LENGTH_OFS: i32 = 56;
-/// Byte offset of `jf_frame[0]` from JitFrame start (header + length field).
-const JF_FRAME_ITEM0_OFS: i32 = 64; // 56 + 8
-/// Number of fixed header fields in JITFRAME (regalloc.py:1094, 1106).
-const JITFRAME_FIXED_SIZE: u32 = 7;
+//
+// The canonical layout lives in `majit_backend::jitframe`; re-export the
+// byte offsets here so uses inside this file stay terse.
+use majit_backend::jitframe::{
+    BASEITEMOFS, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
+    JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS,
+};
+/// Byte offset of `jf_frame_length` from JitFrame start
+/// (`jitframe.py:84` — `jf_frame`'s length word sits at the array base).
+const JF_FRAME_LENGTH_OFS: i32 = JF_FRAME_OFS as i32;
+/// Byte offset of `jf_frame[0]` from JitFrame start
+/// (`jitframe.py:99` — `BASEITEMOFS`: first item follows the length word).
+const JF_FRAME_ITEM0_OFS: i32 = JF_FRAME_OFS as i32 + BASEITEMOFS as i32;
 /// GC type id for JitFrame objects, assigned at runtime by the frontend
 /// that owns the GC type registry (pyre-jit registers OBJECT / W_INT /
 /// W_FLOAT before JITFRAME, so the JITFRAME id depends on that ordering
@@ -176,62 +160,6 @@ fn jitframe_gc_type_id_is_explicit() -> bool {
     JITFRAME_GC_TYPE_ID_IS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Custom trace function for GC-managed jitframes.
-///
-/// RPython parity: jitframe.py:104-136 `jitframe_trace`. Mirrors
-/// `majit_metainterp::jitframe::jitframe_custom_trace`; the duplication
-/// exists because `majit-metainterp` optionally depends on this crate,
-/// so we cannot reuse the metainterp-side definition without a cycle.
-///
-/// 1. Trace all five header GCREF fields — jitframe.py:105-109
-/// 2. Read jf_gcmap pointer, trace ref slots in jf_frame — jitframe.py:111-135
-///
-/// # Safety
-/// `obj_addr` must point to a valid JitFrame payload (after GC header).
-unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
-    let jf_ptr = obj_addr as *const u8;
-
-    // jitframe.py:105-109 — trace all five fixed GCREF header fields
-    // (jf_descr, jf_force_descr, jf_savedata, jf_guard_exc, jf_forward)
-    // in upstream order. No null-check; the GC callback is responsible
-    // for filtering non-managed pointers.
-    f(unsafe { jf_ptr.add(JF_DESCR_OFS as usize) as *mut GcRef });
-    f(unsafe { jf_ptr.add(JF_FORCE_DESCR_OFS as usize) as *mut GcRef });
-    f(unsafe { jf_ptr.add(JF_SAVEDATA_OFS as usize) as *mut GcRef });
-    f(unsafe { jf_ptr.add(JF_GUARD_EXC_OFS as usize) as *mut GcRef });
-    f(unsafe { jf_ptr.add(JF_FORWARD_OFS as usize) as *mut GcRef });
-
-    // jitframe.py:111-114
-    let max: usize = if IS_32BIT { 32 } else { 64 };
-    // jitframe.py:115 — gcmap = (obj_addr + getofs('jf_gcmap')).address[0]
-    let gcmap_ptr = unsafe { *(jf_ptr.add(JF_GCMAP_OFS as usize) as *const *const u8) };
-    if gcmap_ptr.is_null() {
-        return; // jitframe.py:116-117 — "done"
-    }
-    // jitframe.py:118 — gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
-    let gcmap_lgt = unsafe { *(gcmap_ptr.add(GCMAPLENGTHOFS) as *const isize) };
-    let frame_items = unsafe { jf_ptr.add(JF_FRAME_ITEM0_OFS as usize) };
-    // jitframe.py:119-135
-    let mut no: isize = 0;
-    while no < gcmap_lgt {
-        // jitframe.py:121 — cur = (gcmap + GCMAPBASEOFS + UNSIGN_SIZE * no).unsigned[0]
-        let cur =
-            unsafe { *(gcmap_ptr.add(GCMAPBASEOFS + UNSIGN_SIZE * no as usize) as *const usize) };
-        let mut bitindex: usize = 0;
-        while bitindex < max {
-            if cur & (1usize << bitindex) != 0 {
-                // jitframe.py:126 — index = no * SIZEOFSIGNED * 8 + bitindex
-                let index = no as usize * SIZEOFSIGNED * 8 + bitindex;
-                // jitframe.py:131-133 — obj_addr + getofs('jf_frame') + BASEITEMOFS + SIGN_SIZE * index
-                let slot_ptr = unsafe { frame_items.add(SIGN_SIZE * index) as *mut GcRef };
-                f(slot_ptr);
-            }
-            bitindex += 1;
-        }
-        no += 1;
-    }
-}
-
 /// Ensure the JITFRAME GC type is registered, and that
 /// `JITFRAME_GC_TYPE_ID` reflects the id the GC assigned to it.
 ///
@@ -239,9 +167,11 @@ unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) 
 /// called from jitframe_allocate (jitframe.py:49).
 ///
 /// Lazy path (no frontend registration): register JITFRAME directly on
-/// each allocator and return the runtime-local type id.
+/// each allocator and return the runtime-local type id. The `TypeInfo`
+/// comes from `majit_backend::jitframe::jitframe_type_info()` so the
+/// layout, item size, and custom-trace hook stay in sync with every
+/// other consumer of JITFRAME.
 fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
-    use majit_gc::TypeInfo;
     if gc.type_count() == 0 {
         return None; // Stub GC (TrackingGc), no type registry
     }
@@ -250,20 +180,7 @@ fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
         assert_ne!(id, u32::MAX, "explicit JITFRAME GC type id missing");
         return Some(id);
     }
-    // JITFRAME is a varsize GC struct:
-    //   base_size = 64 (7 header fields × 8 + length field 8)
-    //   item_size = 8 (each jf_frame slot is Signed)
-    //   length_offset = 56 (jf_frame_length at byte 56 from payload start)
-    let mut info = TypeInfo::varsize(
-        64,     // base_size
-        8,      // item_size
-        56,     // length_offset
-        false,  // items_have_gc_ptrs (custom_trace handles this)
-        vec![], // no fixed gc_ptr_offsets (custom_trace handles this)
-    );
-    info.has_gc_ptrs = true;
-    info.custom_trace = Some(jitframe_custom_trace);
-    let id = gc.register_type(info);
+    let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     set_jitframe_gc_type_id_lazy(id);
     Some(id)
 }
@@ -12309,88 +12226,6 @@ mod tests {
         let mut o = Op::new(opcode, args);
         o.pos = OpRef(pos);
         o
-    }
-
-    /// Drift-check: this crate carries an inline duplicate of
-    /// `jitframe_custom_trace` because `majit-metainterp` optionally
-    /// depends on this crate and the reverse dep would be cyclic. The
-    /// two implementations must report the same slot pointers for any
-    /// JitFrame layout so this test rebuilds a JitFrame in raw bytes,
-    /// drives both tracers with identical input, and asserts the slot
-    /// lists match exactly (see jitframe.py:104-136).
-    #[test]
-    fn test_jitframe_custom_trace_matches_metainterp() {
-        // Allocate enough raw memory for: JitFrame header + length word
-        // + 3 frame items. Offsets match the #[repr(C)] layout the
-        // metainterp JitFrame struct uses.
-        const FRAME_LEN: usize = 3;
-        let byte_size = JF_FRAME_ITEM0_OFS as usize + FRAME_LEN * SIGN_SIZE;
-        let mut frame: Vec<u8> = vec![0u8; byte_size];
-
-        // Populate the five GCREF header fields with distinct non-null
-        // sentinels so the GC callback would observe a slot-contents
-        // pattern, but the tracer only hands out slot ADDRESSES.
-        let write_usize = |buf: &mut [u8], at: usize, v: usize| {
-            buf[at..at + UNSIGN_SIZE].copy_from_slice(&v.to_ne_bytes());
-        };
-        write_usize(&mut frame, JF_DESCR_OFS as usize, 0x1111_1111);
-        write_usize(&mut frame, JF_FORCE_DESCR_OFS as usize, 0x2222_2222);
-        write_usize(&mut frame, JF_SAVEDATA_OFS as usize, 0x3333_3333);
-        write_usize(&mut frame, JF_GUARD_EXC_OFS as usize, 0x4444_4444);
-        write_usize(&mut frame, JF_FORWARD_OFS as usize, 0x5555_5555);
-        // jf_frame_length
-        write_usize(&mut frame, JF_FRAME_LENGTH_OFS as usize, FRAME_LEN);
-
-        // gcmap: [length_words:isize=1, word0:usize = bits {0,2}]
-        // so trace walks frame_items at indices 0 and 2.
-        let mut gcmap: Vec<u8> = vec![0u8; GCMAPBASEOFS + UNSIGN_SIZE];
-        let gcmap_len: isize = 1;
-        gcmap[GCMAPLENGTHOFS..GCMAPLENGTHOFS + SIGN_SIZE].copy_from_slice(&gcmap_len.to_ne_bytes());
-        let word0: usize = (1usize << 0) | (1usize << 2);
-        gcmap[GCMAPBASEOFS..GCMAPBASEOFS + UNSIGN_SIZE].copy_from_slice(&word0.to_ne_bytes());
-        let gcmap_ptr: *const u8 = gcmap.as_ptr();
-        write_usize(&mut frame, JF_GCMAP_OFS as usize, gcmap_ptr as usize);
-
-        // Drive both tracers and collect slot pointers as byte offsets
-        // from the frame base (pointer equality isn't portable because
-        // the two call sites might rematerialize addresses through
-        // different paths).
-        let base = frame.as_mut_ptr() as usize;
-        let mut local_slots: Vec<usize> = Vec::new();
-        unsafe {
-            jitframe_custom_trace(base, &mut |slot: *mut GcRef| {
-                local_slots.push(slot as usize - base);
-            });
-        }
-
-        let mut metainterp_slots: Vec<usize> = Vec::new();
-        let metainterp_trace = majit_metainterp::jitframe::jitframe_type_info()
-            .custom_trace
-            .expect("metainterp jitframe_type_info must carry a custom_trace hook");
-        unsafe {
-            metainterp_trace(base, &mut |slot: *mut GcRef| {
-                metainterp_slots.push(slot as usize - base);
-            });
-        }
-
-        assert_eq!(
-            local_slots, metainterp_slots,
-            "jitframe_custom_trace drifted from majit_metainterp::jitframe::jitframe_custom_trace",
-        );
-
-        // Sanity: the trace must cover all five header fields + the
-        // two gcmap-selected frame slots (indices 0 and 2), in upstream
-        // order.
-        let expected: Vec<usize> = vec![
-            JF_DESCR_OFS as usize,
-            JF_FORCE_DESCR_OFS as usize,
-            JF_SAVEDATA_OFS as usize,
-            JF_GUARD_EXC_OFS as usize,
-            JF_FORWARD_OFS as usize,
-            JF_FRAME_ITEM0_OFS as usize + 0 * SIGN_SIZE,
-            JF_FRAME_ITEM0_OFS as usize + 2 * SIGN_SIZE,
-        ];
-        assert_eq!(local_slots, expected);
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework

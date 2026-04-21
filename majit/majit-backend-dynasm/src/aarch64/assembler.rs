@@ -24,7 +24,7 @@ use crate::codebuf;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::guard::DynasmFailDescr;
 use crate::jitframe::{
-    FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
+    FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
 };
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;

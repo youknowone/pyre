@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_ir::{Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
 
+pub mod jitframe;
+
 /// Lightweight execution result that avoids DeadFrame boxing.
 ///
 /// Used by `execute_token_ints_raw` to return guard failure data
