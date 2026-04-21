@@ -738,6 +738,17 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     continue;
                 };
                 let mut items: HashMap<ConstValue, ConstValue> = HashMap::new();
+                // Track the canonical (`hash(True) == hash(1) == hash(1.0)`)
+                // form of every key we have already absorbed. Python's
+                // dict keeps the FIRST inserted key on a hash collision
+                // (see `Objects/dictobject.c:insertdict` "K != KEY"
+                // branch), so we dedup via the canonical form but store
+                // the original `ConstValue` to preserve the key's
+                // inferred type. Without this split the rewritten
+                // annotation would widen `[True]` from `SomeBool` to
+                // `SomeInteger`, diverging from upstream.
+                let mut seen_canonical: std::collections::HashSet<ConstValue> =
+                    std::collections::HashSet::new();
                 let mut all_constant = true;
                 for v in newlist_args {
                     let s = ann
@@ -780,12 +791,17 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     }
                     // upstream `items[s.const] = None` relies on Python
                     // dict key semantics where `1 == 1.0 == True` all
-                    // hash to the same bucket. `ConstValue`'s derived
-                    // `Eq`/`Hash` treats `Int(1)`, `Float(1.0)`, and
-                    // `Bool(true)` as distinct, so normalise the key
-                    // before inserting to keep the rewritten dict the
-                    // same size/shape upstream would produce.
-                    items.insert(canonical_dict_key(key), ConstValue::None);
+                    // hash to the same bucket and the FIRST insertion
+                    // wins. `ConstValue`'s derived `Eq`/`Hash` treats
+                    // `Int(1)`, `Float(1.0)`, and `Bool(true)` as
+                    // distinct, so dedup via `canonical_dict_key` but
+                    // store the ORIGINAL key so the DictDef annotation
+                    // keeps the caller's inferred type (e.g. `SomeBool`
+                    // for `[True]`, not widened `SomeInteger`).
+                    let canonical = canonical_dict_key(key.clone());
+                    if seen_canonical.insert(canonical) {
+                        items.insert(key, ConstValue::None);
+                    }
                 }
                 if all_constant {
                     block.borrow_mut().operations[i].args[0] =
@@ -1319,12 +1335,12 @@ mod tests {
 
     #[test]
     fn transform_list_contains_canonicalises_nested_bool_in_tuple() {
-        // Codex P2 (round 7): `[(True,)]` and `[(1,)]` must collapse
-        // to the same dict bucket, matching Python's recursive key
-        // semantics. Verify by calling `canonical_dict_key` directly —
-        // the end-to-end path also needs a matching-typed needle to
-        // survive the annotator's generalize_key union, which isn't
-        // the property under test here.
+        // Codex P2 (round 7): `(True,)` and `(1,)` must collapse to
+        // the same bucket under `canonical_dict_key` (recursive
+        // numeric tower). Direct helper check — the end-to-end path
+        // also needs a matching-typed needle to survive the
+        // annotator's generalize_key union, which isn't the property
+        // under test here.
         use crate::flowspace::model::ConstValue as CV;
 
         let a = canonical_dict_key(CV::Tuple(vec![CV::Bool(true)]));
@@ -1338,6 +1354,62 @@ mod tests {
         assert_eq!(
             a, c,
             "integral Float(1.0) inside a tuple must also canonicalise to Int(1)"
+        );
+    }
+
+    #[test]
+    fn transform_list_contains_keeps_first_inserted_key_on_numeric_collision() {
+        // Codex P2 (round 8): Python dict keeps the FIRST inserted
+        // key on hash collision — `{True: 1, 1: 2}` stays `{True: 2}`
+        // with key type `bool`. The Rust rewrite must preserve the
+        // caller's original `ConstValue` rather than canonicalising
+        // to `Int(1)`; otherwise the subsequent annotation widens
+        // `[True]` from `SomeBool` to `SomeInteger`.
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        // [True, 1] — after rewrite the dict must retain Bool(true)
+        // (first inserted), not Int(1).
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![
+                Hlvalue::Constant(C::new(CV::Bool(true))),
+                Hlvalue::Constant(C::new(CV::Int(1))),
+            ],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        let Hlvalue::Constant(dict_c) = &ops[1].args[0] else {
+            panic!("contains lhs should be rewritten to Constant(dict)");
+        };
+        let CV::Dict(items) = &dict_c.value else {
+            panic!("contains lhs constant should carry Dict");
+        };
+        assert_eq!(items.len(), 1, "True and 1 must collapse to one key");
+        assert!(
+            items.contains_key(&CV::Bool(true)),
+            "first-inserted Bool(true) must win over Int(1); got {items:?}"
         );
     }
 
