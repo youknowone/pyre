@@ -466,6 +466,62 @@ impl<'a> TraceIterator<'a> {
 
 /// opencoder.py:249-406 `TraceIterator`.  Byte-stream walker over
 /// `TraceRecordBuffer._ops`.
+/// opencoder.py:408-427 `class CutTrace(BaseTrace)` — thin view over
+/// a `TraceRecordBuffer` that starts iteration at `start` (a byte
+/// offset captured from `cut_point()`) and substitutes a fresh
+/// inputarg list for the op stream between `start` and
+/// `trace._pos`.
+///
+/// `CutTrace` borrows its parent trace shared-read; the bridge
+/// compilation path produces one per guard failure that triggers a
+/// sub-trace retrace.
+pub struct CutTrace<'a> {
+    pub trace: &'a TraceRecordBuffer,
+    pub start: usize,
+    pub count: u32,
+    pub index: u32,
+    /// Templates: each `Box::ResOp(p)` names an op position in the
+    /// parent trace; `get_iter` seeds `_cache[p]` with the fresh
+    /// OpRef so downstream TAGBOX(p) decodes resolve to the new
+    /// iterator-local inputarg.
+    pub inputargs: Vec<Box>,
+}
+
+impl<'a> CutTrace<'a> {
+    /// opencoder.py:420-427 `CutTrace.get_iter` — build a
+    /// `ByteTraceIter` that walks the parent trace from `start` to
+    /// `trace._pos`, with `_cache` / `inputargs` seeded from the cut's
+    /// inputarg templates.
+    pub fn get_iter(&self) -> ByteTraceIter<'a> {
+        ByteTraceIter::new_for_cut(
+            self.trace,
+            self.start,
+            self.trace._pos,
+            self.count,
+            self.index,
+            &self.inputargs,
+            None,
+        )
+    }
+
+    /// Pool-aware variant for TAGINT / TAGCONST* decode (matches
+    /// `get_byte_iter_with_pool` on the parent trace).
+    pub fn get_iter_with_pool(
+        &self,
+        const_pool: &'a mut crate::constant_pool::ConstantPool,
+    ) -> ByteTraceIter<'a> {
+        ByteTraceIter::new_for_cut(
+            self.trace,
+            self.start,
+            self.trace._pos,
+            self.count,
+            self.index,
+            &self.inputargs,
+            Some(const_pool),
+        )
+    }
+}
+
 pub struct ByteTraceIter<'a> {
     /// Enclosing trace buffer — source of `_ops`, `_refs`, `_bigints`,
     /// `_floats`, `_descrs`, `metainterp_sd.all_descrs`.
@@ -546,6 +602,64 @@ impl<'a> ByteTraceIter<'a> {
             _count: start as u32,
             _index: start as u32,
             start_index: start as u32,
+            _fresh,
+            const_pool,
+        }
+    }
+
+    /// opencoder.py:250-273 + opencoder.py:421-427 `CutTrace.get_iter`
+    /// — specialised `TraceIterator` constructor for `cut_trace_from`
+    /// that seeds `_cache` from explicit inputarg templates (Boxes
+    /// whose `ResOp` position is the location the op originally lived
+    /// at in the uncut trace).  The seeded fresh OpRefs are the
+    /// iterator-local inputargs the cut sub-trace operates over.
+    pub fn new_for_cut(
+        trace: &'a TraceRecordBuffer,
+        start: usize,
+        end: usize,
+        count: u32,
+        index: u32,
+        inputarg_templates: &[Box],
+        const_pool: Option<&'a mut crate::constant_pool::ConstantPool>,
+    ) -> Self {
+        let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
+        let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
+        let mut inputargs: Vec<OpRef> = Vec::with_capacity(inputarg_templates.len());
+        let mut _fresh = 0u32;
+        for &template in inputarg_templates {
+            let fresh_ref = OpRef(_fresh);
+            _fresh += 1;
+            inputargs.push(fresh_ref);
+            // Only `ResOp(p)` templates carry a raw position we can map.
+            // Constant templates would imply the cut sub-trace treats a
+            // literal as an inputarg — not a shape RPython's
+            // `cut_trace_from` emits — so panic rather than silently
+            // drop the seed.
+            match template {
+                Box::ResOp(p) => {
+                    let slot = p as usize;
+                    if slot >= _cache.len() {
+                        _cache.resize(slot + 1, None);
+                    }
+                    _cache[slot] = Some(fresh_ref);
+                }
+                _ => panic!(
+                    "ByteTraceIter::new_for_cut: non-ResOp inputarg template {:?} has \
+                     no original trace position to map into `_cache`",
+                    template
+                ),
+            }
+        }
+        ByteTraceIter {
+            trace,
+            _cache,
+            inputargs,
+            start,
+            pos: start,
+            end,
+            _count: count,
+            _index: index,
+            start_index: index,
             _fresh,
             const_pool,
         }
@@ -1541,6 +1655,29 @@ impl TraceRecordBuffer {
         self._index = end.2;
         // `end.3`, `end.4` are the snapshot data lengths; RPython ignores
         // them in `cut_at` — keep parity.
+    }
+
+    /// opencoder.py:577-578 `cut_trace_from((start, count, index, _, _),
+    /// inputargs)` — produces a `CutTrace` view over this trace's byte
+    /// stream that iterates from the cut_point onward, treating
+    /// `inputargs` as the new iterator-local inputargs.
+    ///
+    /// Used by bridge compilation: when a guard fails at some cut_point,
+    /// the tracer resumes a new trace from that point, with the
+    /// guard's fail_args (which reference ops recorded before the cut)
+    /// acting as fresh inputargs for the resumed trace.
+    pub fn cut_trace_from(
+        &self,
+        cut: (usize, u32, u32, usize, usize),
+        inputargs: Vec<Box>,
+    ) -> CutTrace<'_> {
+        CutTrace {
+            trace: self,
+            start: cut.0,
+            count: cut.1,
+            index: cut.2,
+            inputargs,
+        }
     }
 
     /// opencoder.py:546-562 tracing_done() — finalize the trace.
@@ -4312,6 +4449,51 @@ mod tests {
         let _ = t.capture_resumedata(&mut stack, &vable, &vref, None, 0, &[], false);
         // assert t.get_live_ranges() == [4, 4, 4, 4]
         assert_eq!(t.get_live_ranges(), vec![4, 4, 4, 4]);
+    }
+
+    /// test_opencoder.py:163 `TestOpencoder.test_cut_trace_from` —
+    /// record a prefix, take a cut_point, continue recording, then call
+    /// `cut_trace_from(cut_point, new_inputargs)` to produce a CutTrace
+    /// that iterates only the post-cut ops with `new_inputargs` acting
+    /// as iterator-local inputargs. The first op's args should resolve
+    /// to the fresh inputarg OpRefs (not the original trace positions).
+    #[test]
+    fn test_cut_trace_from_c() {
+        let mut t = TraceRecordBuffer::new(3, empty_sd());
+        let i0 = t.record_input_arg(Type::Int);
+        let i1 = t.record_input_arg(Type::Int);
+        let _i2 = t.record_input_arg(Type::Int);
+        // add1 = t.record_op(rop.INT_ADD, [i0, i1])
+        let add1 = t.record_op2(OpCode::IntAdd, Box::ResOp(i0.0), Box::ResOp(i1.0), None);
+        // cut_point = t.cut_point()
+        let cut_point = t.cut_point();
+        // add2 = t.record_op(rop.INT_ADD, [add1, i1])
+        let add2 = t.record_op2(OpCode::IntAdd, Box::ResOp(add1), Box::ResOp(i1.0), None);
+        // t.record_op(rop.GUARD_TRUE, [add2])
+        let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(add2), None);
+        // t.record_op(rop.INT_SUB, [add2, add1])
+        let _ = t.record_op2(OpCode::IntSub, Box::ResOp(add2), Box::ResOp(add1), None);
+        // t2 = t.cut_trace_from(cut_point, [add1, i1])
+        let cut = t.cut_trace_from(cut_point, vec![Box::ResOp(add1), Box::ResOp(i1.0)]);
+        // (i0, i1), l, iter = self.unpack(t2)
+        let mut it = cut.get_iter();
+        let fresh_add1 = it.inputargs[0];
+        let fresh_i1 = it.inputargs[1];
+        let mut ops = Vec::new();
+        while let Some(op) = it.next() {
+            ops.push(op);
+        }
+        // assert len(l) == 3
+        assert_eq!(ops.len(), 3, "cut sub-trace contains 3 ops");
+        // assert l[0].getarglist() == [add1_fresh, i1_fresh]
+        // (RPython writes this as `[i0, i1]` because the test rebinds
+        // the outer `i0, i1` identifiers to the cut's unpacked
+        // inputargs; the pyre port keeps the names distinct.)
+        assert_eq!(ops[0].opcode, OpCode::IntAdd);
+        assert_eq!(ops[0].args.as_slice(), &[fresh_add1, fresh_i1]);
+        // Second op is the guard; third is the INT_SUB tail.
+        assert_eq!(ops[1].opcode, OpCode::GuardTrue);
+        assert_eq!(ops[2].opcode, OpCode::IntSub);
     }
 
     /// test_opencoder.py:178 `TestOpencoder.test_virtualizable_virtualref` —
