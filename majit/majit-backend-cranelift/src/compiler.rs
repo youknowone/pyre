@@ -189,11 +189,6 @@ pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
 /// singleton) when the metainterp has not attached yet; the
 /// classifier path keeps working in either case because both
 /// pointers route through the same FINISH fast path.
-///
-/// Unused until the full cranelift FINISH-emit unification lands;
-/// the helper stays alongside `match_metainterp_finish_descr` so the
-/// follow-up has a single place to flip the emit path.
-#[allow(dead_code)]
 fn done_with_this_frame_descr_ptr(result_types: &[Type]) -> i64 {
     let slot = match result_types {
         [Type::Float] => &METAINTERP_DONE_FLOAT,
@@ -205,6 +200,16 @@ fn done_with_this_frame_descr_ptr(result_types: &[Type]) -> i64 {
         return Arc::as_ptr(arc) as *const () as i64;
     }
     Arc::as_ptr(done_with_this_frame_descr(result_types)) as i64
+}
+
+/// `compile.py:658` parity: pointer of the metainterp-attached
+/// `Arc<ExitFrameWithExceptionDescrRef>`.  Falls back to the
+/// cranelift-side singleton when the metainterp has not attached yet.
+fn exit_frame_with_exception_descr_ref_ptr() -> i64 {
+    if let Some(arc) = METAINTERP_EXIT_EXC_REF.get() {
+        return Arc::as_ptr(arc) as *const () as i64;
+    }
+    Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as i64
 }
 
 /// Match `jf_descr_raw` against the metainterp-attached
@@ -2336,15 +2341,20 @@ fn register_call_assembler_target(
     invalidate_ca_thread_cache(token.number);
     // Create/update dispatch slot for direct call
     ca_dispatch_slot(token.number, compiled.code_ptr);
-    // Set the finish_descr_ptr so the direct call path can compare jf_descr
-    // with the finish FailDescr pointer (RPython done_with_this_frame parity).
-    // compile.py:665-674: use the cranelift-side singleton (paired with
-    // the same result_type slot the metainterp-side `Arc` occupies); full
-    // identity unification with the metainterp `Arc` is tracked in the
-    // follow-up noted in `majit-metainterp/src/compile.rs` (Identity
-    // follow-up block).
+    // `compile.py:665-674` parity: the direct CA call path embeds the
+    // finish descr pointer as a compile-time constant in the caller,
+    // and the callee writes the same pointer into `jf_descr` at FINISH
+    // emission (see `fail_descr_ptr` block in this file).  Both sides
+    // resolve through `done_with_this_frame_descr_ptr` so they always
+    // pick the metainterp-attached `Arc<DoneWithThisFrameDescr*>` when
+    // available and fall back to the cranelift-side singleton in its
+    // absence (backend-only tests).
     if let Some(finish_descr) = compiled.fail_descrs.iter().find(|d| d.is_finish()) {
-        let ptr = Arc::as_ptr(done_with_this_frame_descr(&finish_descr.fail_arg_types)) as i64;
+        let ptr = if finish_descr.is_exit_frame_with_exception {
+            exit_frame_with_exception_descr_ref_ptr()
+        } else {
+            done_with_this_frame_descr_ptr(&finish_descr.fail_arg_types)
+        };
         ca_dispatch_set_finish_descr_ptr(token.number, ptr);
     }
     with_call_assembler_registry(|m| m.insert(token.number, target));
@@ -2881,8 +2891,15 @@ fn call_assembler_guard_failure_inner(
         // CMP [eax + jf_descr_ofs], done_descr → JE path B
         let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
         if jf_descr_raw != 0 {
-            let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
-            if descr.is_finish() {
+            // `compile.py:665-674` metainterp-attached FINISH descr: when
+            // the callee wrote an `Arc<DoneWithThisFrameDescr*>` pointer
+            // into `jf_descr`, a raw `*const CraneliftFailDescr` cast
+            // would misread layout.  Route through the classifier first.
+            let is_finish_exit = match_metainterp_finish_descr(jf_descr_raw).is_some() || {
+                let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
+                descr.is_finish()
+            };
+            if is_finish_exit {
                 // _call_assembler_load_result (x86/assembler.py:2291-2303):
                 // MOV eax, [eax + ofs] — load from returned frame, not original.
                 let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
@@ -2924,8 +2941,13 @@ fn call_assembler_guard_failure_inner(
                 let result_jf = unsafe { func(jf_ptr) };
                 let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
                 if jf_descr_raw != 0 {
-                    let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
-                    if descr.is_finish() {
+                    // `compile.py:665-674` metainterp-attached FINISH descr
+                    // classifier (see twin in the upstream bridge fast path).
+                    let is_finish_exit = match_metainterp_finish_descr(jf_descr_raw).is_some() || {
+                        let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
+                        descr.is_finish()
+                    };
+                    if is_finish_exit {
                         // x86/assembler.py:2291-2303: load from returned frame.
                         let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
                         return unsafe { *result_jf.add(header_words) };
@@ -11256,6 +11278,11 @@ fn collect_guards(
         let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
             let vi = fd.vector_info();
             descr.vector_info = vi.clone();
+            // `compile.py:658` ExitFrameWithExceptionDescrRef identity
+            // propagation: mirror the metainterp FailDescr flag onto the
+            // backend-local CraneliftFailDescr so downstream runtime
+            // classifiers (`is_exit_frame_with_exception`) keep parity.
+            descr.is_exit_frame_with_exception = fd.is_exit_frame_with_exception();
             vi
         } else {
             Vec::new()
@@ -11298,17 +11325,17 @@ fn collect_guards(
         // pointer. This makes _call_assembler_check_descr (assembler.py:2274)
         // work across bridges (bridge's Finish descr == main trace's).
         let fail_descr_ptr = if is_finish {
-            // compile.py:665-674 parity: write the metainterp-attached
-            // `Arc<DoneWithThisFrameDescr*>` pointer into jf_descr.  The
-            // classifier path (`match_metainterp_finish_descr`) routes
-            // this pointer back to a `CraneliftFailDescr` singleton for
+            // `compile.py:665-674` + `compile.py:658` parity: write the
+            // metainterp-attached `Arc<DoneWithThisFrameDescr*>` or
+            // `Arc<ExitFrameWithExceptionDescrRef>` pointer into jf_descr.
+            // The classifier path (`match_metainterp_finish_descr`) routes
+            // the pointer back to a `CraneliftFailDescr` singleton for
             // downstream consumers that need `bridge_ref`/fail_arg_types.
-            // TODO: the bridge FINISH path is currently crash-prone with
-            // this change (fib_recursive SIGSEGV under cranelift).  Keep
-            // the legacy cranelift singleton pointer for now until the
-            // blackhole-resume path is audited; the dynasm backend
-            // already uses the metainterp Arc cleanly.
-            Arc::as_ptr(done_with_this_frame_descr(&descr.fail_arg_types)) as i64
+            if descr.is_exit_frame_with_exception {
+                exit_frame_with_exception_descr_ref_ptr()
+            } else {
+                done_with_this_frame_descr_ptr(&descr.fail_arg_types)
+            }
         } else {
             Arc::as_ptr(&descr) as i64
         };

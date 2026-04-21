@@ -2030,8 +2030,21 @@ impl AssemblerARM64 {
                 } else {
                     fail_arg_types[0]
                 };
-                let global_descr_ptr =
-                    crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64;
+                // `compile.py:658` ExitFrameWithExceptionDescrRef identity:
+                // route to the metainterp `exit_frame_with_exception_descr_ref`
+                // when the FINISH was emitted for
+                // `pyjitpl.py:3238 compile_exit_frame_with_exception`.
+                let is_exit_exc = op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_fail_descr())
+                    .map(|fd| fd.is_exit_frame_with_exception())
+                    .unwrap_or(false);
+                let global_descr_ptr = if is_exit_exc {
+                    crate::guard::exit_frame_with_exception_descr_ref_ptr() as i64
+                } else {
+                    crate::guard::done_with_this_frame_descr_ptr_for_type(result_type) as i64
+                };
                 let descr = Arc::new(DynasmFailDescr::new(
                     fail_index,
                     self.trace_id,
