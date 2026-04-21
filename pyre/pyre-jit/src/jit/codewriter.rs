@@ -3066,7 +3066,14 @@ impl CodeWriter {
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, site.landing_label);
+            // RPython pyframe.py:379-417 pushvalue parity: each push updates
+            // the virtualizable-backed stack array slot AND valuestackdepth.
+            // Without this mirror, the handler's first opcode (and any
+            // compiled-trace re-entry via ContinueRunningNormally) reads
+            // stale vable state because only the SSA register slot was
+            // populated.
             let mut exc_slot = stack_base + site.stack_depth;
+            let mut depth: u16 = site.stack_depth;
             if site.push_lasti {
                 emit_load_const_i!(ssarepr, int_tmp0, site.lasti_py_pc as i64);
                 emit_residual_call(
@@ -3080,9 +3087,29 @@ impl CodeWriter {
                     Some(obj_tmp0),
                 );
                 emit_ref_copy!(ssarepr, exc_slot, obj_tmp0);
+                if is_portal {
+                    emit_load_const_i!(
+                        ssarepr,
+                        int_tmp0,
+                        (stack_base_absolute + depth as usize) as i64,
+                    );
+                    emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, exc_slot);
+                }
+                depth += 1;
+                emit_vsd!(depth);
                 exc_slot += 1;
             }
             emit_last_exc_value!(ssarepr, exc_slot);
+            if is_portal {
+                emit_load_const_i!(
+                    ssarepr,
+                    int_tmp0,
+                    (stack_base_absolute + depth as usize) as i64,
+                );
+                emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, exc_slot);
+            }
+            depth += 1;
+            emit_vsd!(depth);
             emit_goto!(ssarepr, site.handler_py_pc);
         }
 
