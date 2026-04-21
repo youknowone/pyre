@@ -283,6 +283,21 @@ fn match_metainterp_finish_descr(
     None
 }
 
+/// `compile.py:665-674` / `x86/assembler.py:2274-2278` parity: the CALL_ASSEMBLER
+/// fast-path slot-0 result loader must fire ONLY for normal
+/// `DoneWithThisFrame*` finish, not `ExitFrameWithExceptionDescrRef`. Exception
+/// finish goes through the slow-path / top-level classifier instead.
+fn is_normal_finish_descr(jf_descr_raw: i64) -> bool {
+    if let Some((descr_ref, _)) = match_metainterp_finish_descr(jf_descr_raw) {
+        if let Some(fd) = descr_ref.as_fail_descr() {
+            return fd.is_finish() && !fd.is_exit_frame_with_exception();
+        }
+        return false;
+    }
+    let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
+    descr.is_finish() && !descr.is_exit_frame_with_exception
+}
+
 // ── JitFrame layout constants (jitframe.py:61-83) ───────────────────
 //
 // The canonical layout lives in `majit_backend::jitframe`; re-export the
@@ -2391,12 +2406,12 @@ fn register_call_assembler_target(
     // pick the metainterp-attached `Arc<DoneWithThisFrameDescr*>` when
     // available and fall back to the cranelift-side singleton in its
     // absence (backend-only tests).
-    if let Some(finish_descr) = compiled.fail_descrs.iter().find(|d| d.is_finish()) {
-        let ptr = if finish_descr.is_exit_frame_with_exception {
-            exit_frame_with_exception_descr_ref_ptr()
-        } else {
-            done_with_this_frame_descr_ptr(&finish_descr.fail_arg_types)
-        };
+    if let Some(finish_descr) = compiled
+        .fail_descrs
+        .iter()
+        .find(|d| d.is_finish() && !d.is_exit_frame_with_exception)
+    {
+        let ptr = done_with_this_frame_descr_ptr(&finish_descr.fail_arg_types);
         ca_dispatch_set_finish_descr_ptr(token.number, ptr);
     }
     with_call_assembler_registry(|m| m.insert(token.number, target));
@@ -2932,24 +2947,16 @@ fn call_assembler_guard_failure_inner(
         // _call_assembler_check_descr (x86/assembler.py:2274-2278):
         // CMP [eax + jf_descr_ofs], done_descr → JE path B
         let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-        if jf_descr_raw != 0 {
-            // `compile.py:665-674` metainterp-attached FINISH descr: when
-            // the callee wrote an `Arc<DoneWithThisFrameDescr*>` pointer
-            // into `jf_descr`, a raw `*const CraneliftFailDescr` cast
-            // would misread layout.  Route through the classifier first.
-            let is_finish_exit = match_metainterp_finish_descr(jf_descr_raw).is_some() || {
-                let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
-                descr.is_finish()
-            };
-            if is_finish_exit {
-                // _call_assembler_load_result (x86/assembler.py:2291-2303):
-                // MOV eax, [eax + ofs] — load from returned frame, not original.
-                let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
-                let result = unsafe { *result_jf.add(header_words) };
-                return result;
-            }
+        if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw) {
+            // _call_assembler_load_result (x86/assembler.py:2291-2303):
+            // MOV eax, [eax + ofs] — load from returned frame, not original.
+            let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+            let result = unsafe { *result_jf.add(header_words) };
+            return result;
         }
-        // Bridge didn't finish — fall through to blackhole/force.
+        // Bridge didn't finish (or finished with exception) — fall through
+        // to blackhole/force so the exception is raised, not treated as
+        // a Done return value.
     }
 
     // Slow path: target lookup + fail_count increment.
@@ -2982,20 +2989,14 @@ fn call_assembler_guard_failure_inner(
                 };
                 let result_jf = unsafe { func(jf_ptr) };
                 let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-                if jf_descr_raw != 0 {
-                    // `compile.py:665-674` metainterp-attached FINISH descr
-                    // classifier (see twin in the upstream bridge fast path).
-                    let is_finish_exit = match_metainterp_finish_descr(jf_descr_raw).is_some() || {
-                        let descr = unsafe { &*(jf_descr_raw as *const CraneliftFailDescr) };
-                        descr.is_finish()
-                    };
-                    if is_finish_exit {
-                        // x86/assembler.py:2291-2303: load from returned frame.
-                        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
-                        return unsafe { *result_jf.add(header_words) };
-                    }
+                if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw) {
+                    // x86/assembler.py:2291-2303: load from returned frame.
+                    let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+                    return unsafe { *result_jf.add(header_words) };
                 }
-                // Bridge didn't finish — fall through to blackhole/force.
+                // Bridge didn't finish (or finished with exception) — fall
+                // through to blackhole/force so the exception routes through
+                // the top-level classifier, not the normal Done loader.
             }
         }
     }
