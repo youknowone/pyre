@@ -2165,29 +2165,22 @@ impl MIFrame {
         // Branch guards resume at `other_target` (the runtime jump destination,
         // not the POP_JUMP_IF_* opcode's orgpc). At `other_target` the Python
         // interpreter has already popped the comparison truth, so the snapshot
-        // must reflect the POST-POP register file. `pre_opcode_registers_r`
-        // and `pre_opcode_vsd` were captured at the START of POP_JUMP_IF
-        // (PRE-POP) and still carry the Int truth — using them here would
-        // emit a `Box(truth_opref, Int)` at a Ref-declared
-        // `locals_cells_stack_w` slot and corrupt the PyFrame when the
-        // guard resumes (the decoder writes a raw i64 where a PyObjectRef
-        // is expected).
+        // must reflect the POST-POP stack state. `pre_opcode_stack` /
+        // `pre_opcode_vsd` were captured at the START of POP_JUMP_IF (PRE-POP)
+        // and still carry the Int truth — using them here would emit a
+        // `Box(truth_opref, Int)` at a Ref-declared `locals_cells_stack_w`
+        // slot and corrupt the PyFrame when the guard resumes (the decoder
+        // writes a raw i64 where a PyObjectRef is expected).
         //
-        // pyjitpl.py:2586-2602 capture_resumedata mutates `frame.pc` to
-        // `resumepc` for the duration of the capture and restores it on
-        // exit; RPython has no pre-opcode snapshot because its jitcode is
-        // register-machine and liveness is per-PC. Pyre's pre_opcode_*
-        // fields are a NEW-DEVIATION that will be removed once per-PC
-        // liveness is ported (codewriter/liveness.py). Until then, clear
-        // them here so flush_to_frame_for_guard, get_list_of_active_boxes,
-        // and build_virtualizable_boxes all read the current (post-pop)
-        // `registers_r` / valuestackdepth. The next trace_code_step
-        // re-captures the snapshot, so no restore is needed.
-        {
-            let s = self.sym_mut();
-            s.pre_opcode_vsd = None;
-            s.pre_opcode_registers_r = None;
-        }
+        // Temporarily suppress the pre-opcode snapshot for the duration of
+        // the branch guard capture so `flush_to_frame_for_guard`,
+        // `get_list_of_active_boxes`, and `build_virtualizable_boxes` all
+        // read the current (post-pop) registers_r / valuestackdepth. The
+        // pre-opcode snapshot was renamed from `pre_opcode_stack` +
+        // `pre_opcode_stack_types` to a single `pre_opcode_registers_r`
+        // (see `state.rs:1073`) when the register-machine port landed.
+        let saved_pre_opcode_vsd = self.sym_mut().pre_opcode_vsd.take();
+        let saved_pre_opcode_registers_r = self.sym_mut().pre_opcode_registers_r.take();
 
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
@@ -2273,6 +2266,8 @@ impl MIFrame {
         let s = self.sym_mut();
         s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
+        s.pre_opcode_vsd = saved_pre_opcode_vsd;
+        s.pre_opcode_registers_r = saved_pre_opcode_registers_r;
     }
 
     /// pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity.

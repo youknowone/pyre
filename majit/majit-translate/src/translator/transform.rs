@@ -462,42 +462,29 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
 /// `read_vars` still flow correctly because cross-subset link targets
 /// contribute `read_vars` for their inputargs via the `target not in
 /// set_of_blocks` branch.
-///
-/// Upstream's `start_blocks` set (`{translator.annotator.annotated[block]
-/// .startblock for block in blocks}`) is reproduced per-graph: the
-/// Rust port iterates the distinct owning graphs covered by
-/// `block_subset`, grouping the subset by graph and forwarding only
-/// that subset to `transform_dead_op_vars_in_blocks`. The
-/// `single_graph` argument names the per-graph startblock whose
-/// inputargs must survive.
 pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
     use crate::translator::simplify;
-    let annotated = ann.annotated.borrow();
-    // upstream's `start_blocks = {...annotated[block].startblock for
-    // block in blocks}` — group the requested blocks by their owning
-    // graph, dropping unannotated ones (upstream would raise KeyError
-    // here; the Rust port follows the `if block in annotated` guard
-    // the callers already observe).
-    let mut groups: HashMap<GraphKey, (GraphRef, Vec<BlockRef>)> = HashMap::new();
-    for block in block_subset {
-        let Some(Some(graph)) = annotated.get(&BlockKey::of(block)) else {
-            continue;
-        };
-        let entry = groups
-            .entry(GraphKey::of(graph))
-            .or_insert_with(|| (graph.clone(), Vec::new()));
-        entry.1.push(block.clone());
-    }
-    drop(annotated);
-
-    for (_gkey, (graph, subset)) in groups {
-        simplify::transform_dead_op_vars_in_blocks(
-            &subset,
-            &[graph.as_ptr() as *const _],
-            Some(&ann.translator.borrow()),
-            &graph.borrow(),
+    // Upstream's `transform_dead_op_vars_in_blocks` accepts an empty
+    // block subset and simply iterates nothing. The Rust port needs a
+    // representative `graph` reference for side-table construction; if
+    // the translator carries no graphs (e.g. `RPythonAnnotator::new`
+    // smoke tests that drive `simplify(None, None)` on an empty
+    // annotator) there is no work to do, so short-circuit.
+    let translator = ann.translator.borrow();
+    let graphs_len = translator.graphs.borrow().len();
+    let Some(single_graph) = translator.graphs.borrow().first().cloned() else {
+        debug_assert!(
+            block_subset.is_empty(),
+            "transform_dead_op_vars: block_subset is non-empty but translator has no graphs"
         );
-    }
+        return;
+    };
+    simplify::transform_dead_op_vars_in_blocks(
+        block_subset,
+        graphs_len,
+        Some(&translator),
+        &single_graph.borrow(),
+    );
 }
 
 /// RPython `transform.py:36-50` — `transform_allocate(self, block_subset)`.
@@ -764,7 +751,14 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                         .const_()
                         .cloned()
                         .expect("transform_list_contains: immutable constant missing const");
-                    items.insert(key, ConstValue::None);
+                    // upstream `items[s.const] = None` relies on Python
+                    // dict key semantics where `1 == 1.0 == True` all
+                    // hash to the same bucket. `ConstValue`'s derived
+                    // `Eq`/`Hash` treats `Int(1)`, `Float(1.0)`, and
+                    // `Bool(true)` as distinct, so normalise the key
+                    // before inserting to keep the rewritten dict the
+                    // same size/shape upstream would produce.
+                    items.insert(canonical_dict_key(key), ConstValue::None);
                 }
                 if all_constant {
                     block.borrow_mut().operations[i].args[0] =
@@ -782,6 +776,39 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                 }
             }
         }
+    }
+}
+
+/// Map a [`ConstValue`] to the key Python's built-in `dict` would
+/// bucket it under.
+///
+/// Python's numeric tower makes `True`, `1`, and `1.0` interchangeable
+/// as dict keys: `hash(True) == hash(1) == hash(1.0)` and equality
+/// spans the three. `ConstValue` derives `Eq`/`Hash` from its enum
+/// shape, so `Bool(true)` / `Int(1)` / `Float(bits_of_1.0)` are three
+/// separate keys.
+///
+/// Canonical rules used here:
+///
+/// * `Bool(b)` → `Int(0|1)` — upstream dict collapse.
+/// * `Float(bits)` where the value is finite and equals its truncation
+///   and fits an `i64` → `Int(value as i64)`. Non-integral / non-finite
+///   floats keep their `Float` form (Python hashes `1.5` and `Int(1)`
+///   into different buckets).
+/// * Everything else returns as-is.
+fn canonical_dict_key(cv: ConstValue) -> ConstValue {
+    match cv {
+        ConstValue::Bool(b) => ConstValue::Int(if b { 1 } else { 0 }),
+        ConstValue::Float(bits) => {
+            let f = f64::from_bits(bits);
+            if f.is_finite() && f == f.trunc() && f >= i64::MIN as f64 && f < i64::MAX as f64 + 1.0
+            {
+                ConstValue::Int(f as i64)
+            } else {
+                ConstValue::Float(bits)
+            }
+        }
+        other => other,
     }
 }
 

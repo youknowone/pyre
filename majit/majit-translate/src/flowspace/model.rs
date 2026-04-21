@@ -30,6 +30,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::bytecode::HostCode;
 use crate::annotator::model::SomeValue;
+use crate::translator::rtyper::lltypesystem::lltype::_ptr;
 
 // RPython `Variable.annotation` holds a `SomeObject` subclass instance
 // (annotator/model.py:SomeObject). Rust stores `Option<Rc<SomeValue>>`
@@ -1455,6 +1456,8 @@ pub enum ConstValue {
     Code(Box<HostCode>),
     /// Python function object.
     Function(Box<GraphFunc>),
+    /// RPython `lltype._ptr` function pointer constant.
+    LLPtr(Box<_ptr>),
     /// Arbitrary host-level Python object (class, module, builtin
     /// callable, instance). upstream `Constant.value` 에 담기는 임의
     /// object 를 흉내내는 일반 carrier — `HostObject` 참조.
@@ -1491,6 +1494,7 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
             | ConstValue::Code(_)
+            | ConstValue::LLPtr(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
         }
     }
@@ -1546,6 +1550,7 @@ impl Hash for ConstValue {
                 func.firstlineno.hash(state);
                 func.code.as_ref().map(|code| &code.co_name).hash(state);
             }
+            ConstValue::LLPtr(ptr) => ptr.hash(state),
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
         }
@@ -1907,6 +1912,7 @@ impl Constant {
             // 아래는 upstream 의 최종 `return False`.
             ConstValue::Atom(_)
             | ConstValue::Placeholder
+            | ConstValue::LLPtr(_)
             | ConstValue::Function(_)
             | ConstValue::SpecTag(_) => false,
         }
@@ -1948,6 +1954,7 @@ impl ConstValue {
             ConstValue::Bool(value) => Some(*value),
             ConstValue::None => Some(false),
             ConstValue::Code(_) => Some(true),
+            ConstValue::LLPtr(_) => Some(true),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
@@ -2569,6 +2576,8 @@ impl BlockRefExt for BlockRef {
 pub struct GraphFunc {
     /// Python function `__name__`.
     pub name: String,
+    /// Upstream `func._sandbox_external_name`.
+    pub _sandbox_external_name: Option<String>,
     /// Optional method owner, mirroring upstream `func.class_`.
     pub class_: Option<HostObject>,
     /// Upstream `func._annspecialcase_` decorator tag consulted by
@@ -2616,6 +2625,7 @@ impl GraphFunc {
     pub fn new(name: impl Into<String>, globals: Constant) -> Self {
         GraphFunc {
             name: name.into(),
+            _sandbox_external_name: None,
             class_: None,
             annspecialcase: None,
             _generator_next_method_of_: None,

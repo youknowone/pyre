@@ -149,6 +149,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::List(_)
         | ConstValue::None
         | ConstValue::Code(_)
+        | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_) => ValueType::Ref,
     }

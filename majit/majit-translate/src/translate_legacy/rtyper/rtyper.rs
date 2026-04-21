@@ -110,6 +110,7 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::List(_)
         | ConstValue::None
         | ConstValue::Code(_)
+        | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_) => ConcreteType::GcRef,
     }

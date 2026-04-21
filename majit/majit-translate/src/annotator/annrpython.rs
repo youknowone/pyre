@@ -308,12 +308,13 @@ impl RPythonAnnotator {
         // TranslationContext when caller passes None.
         let translator = translator.unwrap_or_else(TranslationContext::new);
         // Upstream `Bookkeeper.__init__(self, annotator)` stores
-        // `self.annotator = annotator` — the reverse reference. Rust
-        // uses `Rc::new_cyclic` so the bookkeeper's `Weak<RPythonAnnotator>`
-        // field can be installed with the final `Rc<Self>` before any
-        // caller observes it.
+        // `self.annotator = annotator` and `RPythonAnnotator.__init__`
+        // stores `translator.annotator = self`. Rust uses
+        // `Rc::new_cyclic` so both Weak back-references can be
+        // installed before any caller observes the final `Rc<Self>`.
         Rc::new_cyclic(|weak: &std::rc::Weak<Self>| {
             bookkeeper.set_annotator(weak.clone());
+            translator.set_annotator(weak.clone());
             RPythonAnnotator {
                 translator: RefCell::new(translator),
                 genpendingblocks: RefCell::new(vec![HashMap::new()]),

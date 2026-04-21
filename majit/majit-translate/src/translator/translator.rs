@@ -9,8 +9,21 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 
+use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{BlockKey, GraphKey, GraphRef};
+use crate::translator::rtyper::rtyper::RPythonTyper;
+
+#[derive(Clone, Debug, Default)]
+pub struct TranslationOptions {
+    pub sandbox: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TranslationConfig {
+    pub translation: TranslationOptions,
+}
 
 /// Key for [`TranslationContext::callgraph`]. Matches upstream's
 /// Python dict key `(caller_graph, callee_graph, position_tag)` at
@@ -39,6 +52,16 @@ pub struct CallGraphEdge {
 /// Held by [`RPythonAnnotator`]; fields land incrementally as the
 /// annotator driver's `self.translator.*` calls manifest.
 pub struct TranslationContext {
+    /// RPython `self.config`.
+    pub config: TranslationConfig,
+    /// RPython `self.annotator = None` (translator.py:31).
+    ///
+    /// Upstream stores a direct back-reference to the live
+    /// `RPythonAnnotator`. Rust uses `Weak` to avoid an Rc cycle with
+    /// `RPythonAnnotator.translator`.
+    pub annotator: RefCell<Option<Weak<RPythonAnnotator>>>,
+    /// RPython `self.rtyper = None` (translator.py:32).
+    pub rtyper: RefCell<Option<Rc<RPythonTyper>>>,
     /// RPython `self.graphs = []` — every flow graph known to the
     /// translator. `RPythonAnnotator.complete()` iterates this to force
     /// annotation of each return variable.
@@ -57,10 +80,38 @@ pub struct TranslationContext {
 impl TranslationContext {
     pub fn new() -> Self {
         TranslationContext {
+            config: TranslationConfig::default(),
+            annotator: RefCell::new(None),
+            rtyper: RefCell::new(None),
             graphs: RefCell::new(Vec::new()),
             entry_point_graph: RefCell::new(None),
             callgraph: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// RPython `translator.annotator = self` assignment performed in
+    /// `RPythonAnnotator.__init__` (annrpython.py:30-35).
+    pub fn set_annotator(&self, annotator: Weak<RPythonAnnotator>) {
+        *self.annotator.borrow_mut() = Some(annotator);
+    }
+
+    pub fn annotator(&self) -> Option<Rc<RPythonAnnotator>> {
+        self.annotator.borrow().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// RPython `TranslationContext.buildrtyper()` (translator.py:77-84).
+    pub fn buildrtyper(&self) -> Rc<RPythonTyper> {
+        let annotator = self.annotator().expect("ValueError: no annotator");
+        if self.rtyper.borrow().is_some() {
+            panic!("ValueError: we already have an rtyper");
+        }
+        let rtyper = Rc::new(RPythonTyper::new(&annotator));
+        *self.rtyper.borrow_mut() = Some(rtyper.clone());
+        rtyper
+    }
+
+    pub fn rtyper(&self) -> Option<Rc<RPythonTyper>> {
+        self.rtyper.borrow().as_ref().cloned()
     }
 
     /// RPython `TranslationContext.update_call_graph(caller_graph,
@@ -147,5 +198,23 @@ mod tests {
         ctx.update_call_graph(&caller, &callee, (BlockKey::of(&block), 1));
         ctx.update_call_graph(&caller, &callee, (BlockKey::of(&block), 2));
         assert_eq!(ctx.callgraph.borrow().len(), 2);
+    }
+
+    #[test]
+    fn new_context_starts_without_annotator() {
+        let ctx = TranslationContext::new();
+        assert!(ctx.annotator().is_none());
+    }
+
+    #[test]
+    fn new_context_starts_without_rtyper() {
+        let ctx = TranslationContext::new();
+        assert!(ctx.rtyper().is_none());
+    }
+
+    #[test]
+    fn new_context_starts_with_sandbox_disabled() {
+        let ctx = TranslationContext::new();
+        assert!(!ctx.config.translation.sandbox);
     }
 }

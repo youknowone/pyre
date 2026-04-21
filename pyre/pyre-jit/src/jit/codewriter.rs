@@ -2674,9 +2674,10 @@ impl CodeWriter {
                 // Here we pop args and callable from the stack into
                 // registers, then call the helper with explicit args.
                 //
+                // shared_opcode.rs:56 opcode_call parity:
                 // Stack layout before CALL(argc):
-                //   [NULL, callable, arg0, arg1, ..., arg(argc-1)]
-                // We pop in reverse: args first, then callable, then NULL.
+                //   [callable, null_or_self, arg0, ..., arg(argc-1)]
+                // Pop in reverse: args, null_or_self, callable.
                 Instruction::Call { argc } => {
                     let nargs = argc.get(op_arg) as usize;
                     for i in (0..nargs).rev() {

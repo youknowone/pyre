@@ -218,6 +218,25 @@ pub struct Bookkeeper {
     pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
     pub emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
+    /// RPython `self.immutable_cache = {}` (bookkeeper.py:61), keyed by
+    /// `Constant(x)` for the List / Dict / OrderedDict / r_dict branches
+    /// of `immutablevalue` (bookkeeper.py:255-298). Upstream's cache
+    /// memoises the returned `SomeList` / `SomeDict` so downstream
+    /// `generalize_key` / `generalize` mutations on the cached
+    /// `DictDef` / `ListDef` persist across calls.
+    ///
+    /// `transform_list_contains` (translator/transform.py:115-134)
+    /// relies on this: it calls `self.annotation(Constant(dict))` after
+    /// rewriting the contains lhs, then mutates the returned SomeDict's
+    /// dictdef via `generalize_key`. Without the cache the second
+    /// `annotation()` call builds a fresh DictDef and the mutation
+    /// dissolves.
+    ///
+    /// Keyed on [`ConstValue`] directly — upstream uses
+    /// `Hashable(Constant(dict))` whose hash incorporates the Python
+    /// `type` of the value (see `rpython/tool/uid.py:27`), mirrored by
+    /// the Rust `ConstValue` enum's derived `Eq`/`Hash`.
+    pub immutable_cache: RefCell<HashMap<ConstValue, SomeValue>>,
     /// RPython `self.pending_specializations = []` (bookkeeper.py:69).
     ///
     /// List of callbacks drained by
@@ -396,6 +415,7 @@ impl Bookkeeper {
                 Rc::new(RefCell::new(CallFamily::new(*desc)))
             })),
             emulated_pbc_calls: RefCell::new(HashMap::new()),
+            immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
             position_entered: std::cell::Cell::new(false),
         }
@@ -1564,26 +1584,54 @@ impl Bookkeeper {
                 Ok(SomeValue::Tuple(SomeTuple::new(items_s)))
             }
             ConstValue::List(items) => {
-                // upstream bookkeeper.py:255-265 memoises via
-                // `immutable_cache[Constant(x)]`. Rust skips the cache
-                // (perf-only deviation, see module doc).
+                // upstream bookkeeper.py:255-265:
+                //
+                //     key = Constant(x)
+                //     try: return self.immutable_cache[key]
+                //     except KeyError:
+                //         result = SomeList(ListDef(self, s_ImpossibleValue))
+                //         self.immutable_cache[key] = result
+                //         for e in x:
+                //             result.listdef.generalize(self.immutablevalue(e))
+                //         result.const_box = key
+                //         return result
+                if let Some(hit) = self.immutable_cache.borrow().get(x).cloned() {
+                    return Ok(hit);
+                }
                 let listdef = ListDef::new(Some(self.clone()), SomeValue::Impossible, false, false);
+                let mut result = SomeList::new(listdef.clone());
+                result.base.const_box = Some(Constant::new(x.clone()));
+                // Upstream stores the cache entry BEFORE populating the
+                // listdef so recursive immutablevalue() hits on nested
+                // lists re-use the in-flight cell. Matches
+                // bookkeeper.py:261.
+                self.immutable_cache
+                    .borrow_mut()
+                    .insert(x.clone(), SomeValue::List(result.clone()));
                 for e in items {
                     let s_e = self.immutablevalue(e)?;
                     listdef
                         .generalize(&s_e)
                         .map_err(|e| AnnotatorError::new(e.msg))?;
                 }
-                let mut result = SomeList::new(listdef);
-                result.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::List(result))
             }
             ConstValue::Dict(items) => {
-                // upstream bookkeeper.py:266-298 memoises via
-                // `immutable_cache` and handles OrderedDict / r_dict
-                // via the dict type. Mirror upstream's `for ek, ev in
-                // items: generalize_key(immutablevalue(ek));
-                // generalize_value(immutablevalue(ev))`.
+                // upstream bookkeeper.py:266-298:
+                //
+                //     key = Constant(x)
+                //     try: return self.immutable_cache[key]
+                //     except KeyError:
+                //         result = SomeDict(DictDef(self, ...))
+                //         self.immutable_cache[key] = result
+                //         for ek, ev in x.iteritems():
+                //             result.dictdef.generalize_key(self.immutablevalue(ek))
+                //             result.dictdef.generalize_value(self.immutablevalue(ev))
+                //         result.const_box = key
+                //         return result
+                if let Some(hit) = self.immutable_cache.borrow().get(x).cloned() {
+                    return Ok(hit);
+                }
                 let dictdef = DictDef::new(
                     Some(self.clone()),
                     SomeValue::Impossible,
@@ -1592,6 +1640,11 @@ impl Bookkeeper {
                     false,
                     false,
                 );
+                let mut result = SomeDict::new(dictdef.clone());
+                result.base.const_box = Some(Constant::new(x.clone()));
+                self.immutable_cache
+                    .borrow_mut()
+                    .insert(x.clone(), SomeValue::Dict(result.clone()));
                 for (k, v) in items {
                     let s_k = self.immutablevalue(k)?;
                     let s_v = self.immutablevalue(v)?;
@@ -1602,13 +1655,12 @@ impl Bookkeeper {
                         .generalize_value(&s_v)
                         .map_err(|e| AnnotatorError::new(e.msg))?;
                 }
-                let mut result = SomeDict::new(dictdef);
-                result.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Dict(result))
             }
             ConstValue::HostObject(obj) => self.immutablevalue_hostobject(obj, x),
             ConstValue::Code(_)
             | ConstValue::Function(_)
+            | ConstValue::LLPtr(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder => {
