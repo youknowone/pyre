@@ -11,18 +11,12 @@
 //! remaining descriptor kinds are still pending.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
 
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
 use crate::model::{LinkArg, ValueId};
 use crate::regalloc::RegAllocResult;
-
-static REF_CONST_TOKENS: LazyLock<Mutex<HashMap<ConstValue, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_REF_CONST_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Assembler — converts SSARepr to JitCode.
 ///
@@ -1245,7 +1239,10 @@ impl Assembler {
     }
 
     fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
-        let bits = ref_const_bits(value);
+        let bits = match value {
+            ConstValue::HostObject(obj) => obj.identity_id() as u64,
+            other => panic!("raise/r constant pool does not support {other:?}"),
+        };
         if let Some(index) = state
             .constants_r
             .iter()
@@ -1271,22 +1268,6 @@ impl Assembler {
         }
         state.constants_f.push(bits);
         (state.num_regs_f + state.constants_f.len() - 1) as u8
-    }
-}
-
-fn ref_const_bits(value: &ConstValue) -> u64 {
-    match value {
-        ConstValue::None => 0,
-        ConstValue::HostObject(obj) => obj.identity_id() as u64,
-        other => {
-            let mut tokens = REF_CONST_TOKENS.lock().unwrap();
-            if let Some(&token) = tokens.get(other) {
-                return token;
-            }
-            let token = NEXT_REF_CONST_TOKEN.fetch_add(1, Ordering::Relaxed);
-            tokens.insert(other.clone(), token);
-            token
-        }
     }
 }
 
@@ -1612,7 +1593,7 @@ impl Default for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flowspace::model::ConstValue;
+    use crate::flowspace::model::{ConstValue, HostObject};
     use crate::model::LinkArg;
     use crate::regalloc;
 
@@ -1665,30 +1646,12 @@ mod tests {
     }
 
     #[test]
-    fn assemble_ref_return_with_none_constant() {
+    fn assemble_ref_return_with_host_object_constant() {
+        let module = HostObject::new_module("hello");
         let mut flat = SSARepr {
-            name: "return_none".into(),
-            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::None))],
-            num_values: 0,
-            num_blocks: 1,
-            value_kinds: HashMap::new(),
-            insns_pos: None,
-        };
-
-        let regallocs = empty_regallocs();
-        let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
-
-        assert_eq!(body.constants_r, vec![0]);
-        assert!(asm.insns.contains_key("ref_return/r"));
-    }
-
-    #[test]
-    fn assemble_ref_return_with_string_constant() {
-        let mut flat = SSARepr {
-            name: "return_string".into(),
-            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::Str(
-                "hello".into(),
+            name: "return_host_object".into(),
+            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::HostObject(
+                module.clone(),
             )))],
             num_values: 0,
             num_blocks: 1,
@@ -1700,8 +1663,7 @@ mod tests {
         let mut asm = Assembler::new();
         let body = asm.assemble(&mut flat, &regallocs);
 
-        assert_eq!(body.constants_r.len(), 1);
-        assert_ne!(body.constants_r[0], 0);
+        assert_eq!(body.constants_r, vec![module.identity_id() as u64]);
         assert!(asm.insns.contains_key("ref_return/r"));
     }
 

@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
-use crate::model::{Block, FunctionGraph, ValueId};
+use crate::model::{Block, FunctionGraph, LinkArg, ValueId};
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 
@@ -304,6 +304,15 @@ impl RegAllocator {
     fn coalesce_variables(&mut self, graph: &FunctionGraph, consider: &dyn Fn(ValueId) -> bool) {
         for block in &graph.blocks {
             for link in &block.exits {
+                // RPython `regalloc.py:92-95`: add `link.last_exception` and
+                // `link.last_exc_value` to the dep graph so subsequent
+                // `_try_coalesce` calls find a node for them in
+                // `DependencyGraph.coalesce`'s `neighbours[vnew]`
+                // lookup.  Without this, coalescing a link arg into an
+                // exception-target inputarg leaves the rep outside
+                // `neighbours`, and `find_node_coloring` silently skips
+                // it (`color.py:25-27 getnodes()` filters
+                // `all_nodes` by `neighbours.contains_key`).
                 if let Some(arg) = &link.last_exception {
                     if let Some(v) = arg.as_value() {
                         if consider(v) {
