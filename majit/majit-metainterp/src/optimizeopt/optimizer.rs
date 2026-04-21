@@ -2471,6 +2471,28 @@ impl Optimizer {
         // but incorrectly dropped valid ops (e.g., IntAddOvf referencing
         // inputarg positions beyond final_num_inputs in bridge traces).
 
+        // `compile.py:327` order:
+        //   `[start_label] + preamble_ops + extra_same_as +
+        //    extra_before_label + [label_op] + loop_ops`.
+        // The SameAs aliases emitted in the JUMP-arg dedup loop above
+        // (`shortpreamble.py:432-440 extra_same_as`) and any `flush()` /
+        // `drain_extra_operations_from` ops that followed are structurally
+        // part of `extra_same_as`; upstream splices that list BETWEEN
+        // `preamble_ops` and the label, so in pyre's single-phase flow
+        // they must sit before the preamble-terminating JUMP. Move the
+        // last JUMP to the tail to restore that ordering — running AFTER
+        // all emits but BEFORE the remap pass so positions stay
+        // sequential in trace order.
+        if let Some(jump_idx) = ctx
+            .new_operations
+            .iter()
+            .rposition(|op| op.opcode == OpCode::Jump)
+            && jump_idx + 1 < ctx.new_operations.len()
+        {
+            let jump_op = ctx.new_operations.remove(jump_idx);
+            ctx.new_operations.push(jump_op);
+        }
+
         // Remap ALL positions: virtual inputs go to num_inputs..final_num_inputs,
         // This ensures no position collisions between input block params and ops.
         if num_virtual_inputs > 0 {
