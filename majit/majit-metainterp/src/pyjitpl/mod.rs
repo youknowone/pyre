@@ -1219,21 +1219,26 @@ impl<M: Clone> MetaInterp<M> {
     pub fn set_result_type(&mut self, tp: Type) {
         self.result_type = tp;
         self.ensure_default_driver_sd();
-        {
-            let sd = std::sync::Arc::get_mut(&mut self.staticdata)
-                .expect("set_result_type: staticdata has other owners");
-            for jd in sd.jitdrivers_sd.iter_mut() {
-                jd.result_type = tp;
-                // `warmspot.py:1013-1017` build_portal_calldescr reads
-                // `self.result_type`; a stale descr from an earlier
-                // set_result_type call must be rebuilt.
-                jd.build_portal_calldescr();
-            }
-            // `pyjitpl.py:2275-2279` portal_finishtoken is keyed by
-            // `jd.result_type` — re-run the attachment so each driver
-            // picks the correct `done_with_this_frame_descr_*` sibling.
-            sd.finish_setup_descrs_for_jitdrivers();
+        let Self {
+            staticdata,
+            backend,
+            ..
+        } = self;
+        let sd = std::sync::Arc::get_mut(staticdata)
+            .expect("set_result_type: staticdata has other owners");
+        for jd in sd.jitdrivers_sd.iter_mut() {
+            jd.result_type = tp;
+            // `warmspot.py:1013-1017` build_portal_calldescr reads
+            // `self.result_type`; a stale descr from an earlier
+            // set_result_type call must be rebuilt.
+            jd.build_portal_calldescr();
         }
+        // `pyjitpl.py:2275-2283` portal_finishtoken is keyed by
+        // `jd.result_type`, and the backend's `propagate_exception_descr`
+        // is re-bound inside the same method — re-run the attachment so
+        // each driver picks the correct `done_with_this_frame_descr_*`
+        // sibling and the cpu observes the shared exc_descr.
+        sd.finish_setup_descrs_for_jitdrivers(backend);
     }
 
     /// warmspot.py:449 — the per-driver static result_type.
@@ -11211,13 +11216,19 @@ impl MetaInterpStaticData {
     /// `pyjitpl.py:2266` `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`,
     /// except pyre populates the table incrementally as drivers register
     /// instead of taking it wholesale from the codewriter's CallControl.
-    pub fn register_jitdriver_sd(&mut self, jd: crate::jitdriver::JitDriverStaticData) -> usize {
+    pub fn register_jitdriver_sd(
+        &mut self,
+        jd: crate::jitdriver::JitDriverStaticData,
+        cpu: &mut dyn majit_backend::Backend,
+    ) -> usize {
         let idx = self.jitdrivers_sd.len();
         self.jitdrivers_sd.push(jd);
         // `pyjitpl.py:2273-2281` — reattach the finish/exc descrs whenever
         // the jitdriver list changes so new drivers pick up the same
-        // `portal_finishtoken` / `propagate_exc_descr` as the rest.
-        self.finish_setup_descrs_for_jitdrivers();
+        // `portal_finishtoken` / `propagate_exc_descr` as the rest, and
+        // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr`
+        // so the backend half of the pair observes the same instance.
+        self.finish_setup_descrs_for_jitdrivers(cpu);
         idx
     }
 
@@ -11259,11 +11270,11 @@ impl MetaInterpStaticData {
     ///
     /// pyre runs this after every `register_jitdriver_sd` so fresh
     /// drivers inherit the already-wired descrs without a separate
-    /// `finish_setup(codewriter)` call.  The `cpu.propagate_exception_descr`
-    /// assignment is deferred until `Backend::propagate_exception_descr`
-    /// landings (follow-up commit); `self.propagate_exception_descr`
-    /// already stores the shared instance.
-    pub fn finish_setup_descrs_for_jitdrivers(&mut self) {
+    /// `finish_setup(codewriter)` call.  The backend handle is threaded
+    /// in to match `pyjitpl.py:2283 self.cpu.propagate_exception_descr
+    /// = exc_descr` — upstream binds the descr to the cpu instance
+    /// inside the same method body.
+    pub fn finish_setup_descrs_for_jitdrivers(&mut self, cpu: &mut dyn majit_backend::Backend) {
         // `pyjitpl.py:2273` `exc_descr = compile.PropagateExceptionDescr()` —
         // a *single* shared instance across every jitdriver + the cpu.
         // pyre's `register_jitdriver_sd` calls this method on every
@@ -11274,12 +11285,15 @@ impl MetaInterpStaticData {
             None => {
                 let fresh: majit_ir::DescrRef =
                     std::sync::Arc::new(crate::compile::PropagateExceptionDescr::new());
-                // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr` —
-                // the MetaInterpStaticData half of the (self, cpu) pair.
                 self.propagate_exception_descr = Some(fresh.clone());
                 fresh
             }
         };
+        // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr` —
+        // bind the shared instance to the backend half of the pair. Idempotent
+        // across repeated `register_jitdriver_sd` calls because the backend
+        // setters accept the same `Arc` by identity.
+        cpu.set_propagate_exception_descr(exc_descr.clone());
         // `pyjitpl.py:2274-2281` per-driver attachment.
         for jd in self.jitdrivers_sd.iter_mut() {
             // `pyjitpl.py:2275-2279` `token = getattr(self,
@@ -11658,9 +11672,15 @@ mod metainterp_static_data_tests {
             portal_finishtoken: None,
             propagate_exc_descr: None,
         };
-        let _ = std::sync::Arc::get_mut(&mut meta.staticdata)
-            .unwrap()
-            .register_jitdriver_sd(driver);
+        {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            let sd = std::sync::Arc::get_mut(staticdata).unwrap();
+            let _ = sd.register_jitdriver_sd(driver, backend);
+        }
         meta.framestack.push(crate::pyjitpl::MIFrame::new(
             std::sync::Arc::new(jitcode),
             0,
@@ -13129,9 +13149,16 @@ mod metainterp_static_data_tests {
         // Register a non-recursive jitdriver: still false.
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         jd.is_recursive = false;
-        let idx = std::sync::Arc::get_mut(&mut meta.staticdata)
-            .unwrap()
-            .register_jitdriver_sd(jd);
+        let idx = {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            std::sync::Arc::get_mut(staticdata)
+                .unwrap()
+                .register_jitdriver_sd(jd, backend)
+        };
         jc.jitdriver_sd = Some(idx);
         assert!(!meta.is_main_jitcode(&jc));
     }
@@ -13141,9 +13168,16 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         jd.is_recursive = true;
-        let idx = std::sync::Arc::get_mut(&mut meta.staticdata)
-            .unwrap()
-            .register_jitdriver_sd(jd);
+        let idx = {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            std::sync::Arc::get_mut(staticdata)
+                .unwrap()
+                .register_jitdriver_sd(jd, backend)
+        };
 
         let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
         jc.jitdriver_sd = Some(idx);
