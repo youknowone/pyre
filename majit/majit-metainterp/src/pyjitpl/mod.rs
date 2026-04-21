@@ -1496,7 +1496,7 @@ impl<M: Clone> MetaInterp<M> {
     /// production path hasn't registered one yet, then propagates to
     /// every registered jitdriver_sd so per-driver readers
     /// (`_do_jit_force_virtual`, `vable_*_residual_call`) see the info.
-    pub fn set_virtualizable_info(&mut self, info: VirtualizableInfo) {
+    pub fn set_virtualizable_info(&mut self, info: std::sync::Arc<VirtualizableInfo>) {
         self.ensure_default_driver_sd();
         let sd = std::sync::Arc::get_mut(&mut self.staticdata)
             .expect("set_virtualizable_info: staticdata has other owners");
@@ -1512,7 +1512,7 @@ impl<M: Clone> MetaInterp<M> {
     /// populated.  `set_virtualizable_info` lazy-creates
     /// `jitdrivers_sd[0]`, so production callers see the info as soon
     /// as the host installs it at JIT init.
-    pub fn virtualizable_info(&self) -> Option<&VirtualizableInfo> {
+    pub fn virtualizable_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
         self.staticdata
             .jitdrivers_sd
             .iter()
@@ -6998,7 +6998,7 @@ impl<M: Clone> MetaInterp<M> {
             fail_values,
             None, // deadframe_types
             Some(&self.virtualref_info as &dyn crate::resume::VRefInfo),
-            vinfo.map(|v| v as &dyn crate::resume::VirtualizableInfo),
+            vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
             &allocator,
         );
@@ -13653,7 +13653,7 @@ mod tests {
         live_values: &[Value],
         array_lengths: Vec<usize>,
     ) {
-        meta.set_virtualizable_info(info);
+        meta.set_virtualizable_info(std::sync::Arc::new(info));
         meta.set_vable_array_lengths(array_lengths);
         let action = meta.force_start_tracing(777, (0, 0), None, live_values);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -13695,7 +13695,7 @@ mod tests {
         let obj = TraceEntryObj { arr: &array };
 
         let mut meta = MetaInterp::<()>::new(10);
-        meta.set_virtualizable_info(info.clone());
+        meta.set_virtualizable_info(std::sync::Arc::new(info.clone()));
         meta.set_vable_ptr((&obj as *const TraceEntryObj).cast());
         meta.set_vable_array_lengths(vec![1]);
 
@@ -14146,7 +14146,7 @@ mod tests {
     fn optimizer_vable_config_requires_standard_virtualizable_boxes() {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
-        meta.set_virtualizable_info(info.clone());
+        meta.set_virtualizable_info(std::sync::Arc::new(info.clone()));
         assert!(
             meta.current_virtualizable_optimizer_config().is_none(),
             "virtualizable config should only exist while tracing is active"

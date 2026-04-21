@@ -105,7 +105,7 @@ pub struct JitDriverStaticData {
     /// `MetaInterp::register_jitdriver_sd` propagates from MetaInterp
     /// to here when both are present so per-driver readers stay in
     /// sync without forcing the production registration refactor.
-    pub virtualizable_info: Option<crate::virtualizable::VirtualizableInfo>,
+    pub virtualizable_info: Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
     /// jitdriver.py:17 + warmspot.py:520-525 `jd.greenfield_info`.
     ///
     /// Per-driver `GreenFieldInfo` populated when `jd.jitdriver.greens`
@@ -1818,7 +1818,7 @@ impl<S: JitState> JitDriver<S> {
                 let ok = state.sync_named_virtualizable_before_jit(
                     meta,
                     &virtualizable.name,
-                    self.meta.virtualizable_info(),
+                    self.meta.virtualizable_info().map(|a| a.as_ref()),
                 );
                 if !ok {
                     return false;
@@ -1864,7 +1864,7 @@ impl<S: JitState> JitDriver<S> {
         state.sync_named_virtualizable_after_jit(
             meta,
             &virtualizable.name,
-            self.meta.virtualizable_info(),
+            self.meta.virtualizable_info().map(|a| a.as_ref()),
         );
     }
 
@@ -1905,7 +1905,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Set virtualizable info for frame virtualization.
-    pub fn set_virtualizable_info(&mut self, info: VirtualizableInfo) {
+    pub fn set_virtualizable_info(&mut self, info: std::sync::Arc<VirtualizableInfo>) {
         self.meta.set_virtualizable_info(info);
     }
 
@@ -3700,7 +3700,8 @@ mod tests {
             fn validate_close(_: &(), _: &()) -> bool {
                 true
             }
-            fn __build_virtualizable_info() -> Option<crate::virtualizable::VirtualizableInfo> {
+            fn __build_virtualizable_info()
+            -> Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
                 let mut info = crate::virtualizable::VirtualizableInfo::new(24);
                 info.add_field("pc", Type::Int, 8);
                 info.add_array_field(
@@ -3711,8 +3712,7 @@ mod tests {
                     0,
                     majit_ir::make_array_descr(0, 8, Type::Ref),
                 );
-                info.set_parent_descr(majit_ir::descr::make_size_descr(64));
-                Some(info)
+                Some(info.finalize_arc(majit_ir::descr::make_size_descr(64)))
             }
         }
 

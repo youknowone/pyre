@@ -15,6 +15,7 @@
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 use majit_ir::{DescrRef, Type, descr::descr_identity};
 
@@ -206,6 +207,15 @@ impl majit_translate::call::VirtualizableInfoHandle for VirtualizableInfo {
     }
 }
 
+/// majit-ir's `FieldDescr::get_vinfo()` returns `Option<Arc<dyn VinfoMarker>>`;
+/// pyre's owning vinfo is a `VirtualizableInfo`. Implementing the marker
+/// here bridges the crate split (majit-ir → majit-metainterp).
+impl majit_ir::descr::VinfoMarker for VirtualizableInfo {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl VirtualizableInfo {
     /// Create a new VirtualizableInfo.
     pub fn new(token_offset: usize) -> Self {
@@ -238,18 +248,52 @@ impl VirtualizableInfo {
     /// immediately after `build_virtualizable_info()`, before the
     /// JIT pipeline starts emitting field-typed ops.
     pub fn set_parent_descr(&mut self, descr: DescrRef) {
-        self.parent_descr = Some(descr.clone());
+        self.build_descriptors(&descr, None);
+        self.parent_descr = Some(descr);
+    }
+
+    /// Consume self + wrap into `Arc<Self>` with every field descriptor
+    /// carrying the `VinfoMarker` backreference that
+    /// `FieldDescr::get_vinfo()` returns. Mirrors `set_parent_descr` +
+    /// the RPython `descr._vinfo = self` stamping pattern
+    /// (pyjitpl.py:1148-1149 `vinfo = fielddescr.get_vinfo()`).
+    ///
+    /// Uses `Arc::new_cyclic` so the descriptors built during
+    /// construction observe the final `Weak<Self>` — a single-pass
+    /// build that avoids rewriting the descriptors after the Arc is
+    /// formed.
+    pub fn finalize_arc(mut self, descr: DescrRef) -> Arc<Self> {
+        Arc::new_cyclic(|weak: &Weak<Self>| {
+            let vinfo_weak: Weak<dyn majit_ir::descr::VinfoMarker> = weak.clone();
+            self.build_descriptors(&descr, Some(vinfo_weak));
+            self.parent_descr = Some(descr);
+            self
+        })
+    }
+
+    /// Shared descriptor-building core for `set_parent_descr` and
+    /// `finalize_arc`. When `vinfo` is `Some`, every built field
+    /// descriptor carries that weak backreference so
+    /// `FieldDescr::get_vinfo()` resolves upstream-faithfully. When
+    /// `None`, the descriptors fall through to the trait's default
+    /// `None` (legacy by-value path).
+    fn build_descriptors(
+        &mut self,
+        descr: &DescrRef,
+        vinfo: Option<Weak<dyn majit_ir::descr::VinfoMarker>>,
+    ) {
         // virtualizable.py:28: self.vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
         // descr.py:214-215 + heaptracker.py:97: index_in_parent counts
         // non-void, non-typeptr fields in struct declaration order.
         // Layout: [typeptr, vable_token(0), static_0(1), ..., array_ptr_0(n+1), ...]
         self.vable_token_descr = Some(Self::build_field_descr(
-            &descr,
+            descr,
             self.token_offset,
             item_size_for_type(Type::Int),
             Type::Int,
             majit_ir::ArrayFlag::Unsigned,
             0,
+            vinfo.clone(),
         ));
         // virtualizable.py:71-72: self.static_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
         let num_static = self.static_fields.len();
@@ -260,12 +304,13 @@ impl VirtualizableInfo {
             .map(|(i, f)| {
                 let flag = majit_ir::ArrayFlag::from_field_type(f.field_type);
                 Self::build_field_descr(
-                    &descr,
+                    descr,
                     f.offset,
                     item_size_for_type(f.field_type),
                     f.field_type,
                     flag,
                     1 + i,
+                    vinfo.clone(),
                 )
             })
             .collect();
@@ -279,12 +324,13 @@ impl VirtualizableInfo {
             .map(|(j, a)| {
                 let offset = a.field_offset;
                 Self::build_field_descr(
-                    &descr,
+                    descr,
                     offset,
                     std::mem::size_of::<usize>(),
                     Type::Ref,
                     majit_ir::ArrayFlag::Pointer,
                     1 + num_static + j,
+                    vinfo.clone(),
                 )
             })
             .collect();
@@ -304,8 +350,8 @@ impl VirtualizableInfo {
             .collect();
     }
 
-    /// Build a FieldDescr carrying parent_descr.
-    /// Helper for set_parent_descr() descriptor caching.
+    /// Build a FieldDescr carrying parent_descr (+ optional vinfo backref).
+    /// Helper for `set_parent_descr` / `finalize_arc` descriptor caching.
     fn build_field_descr(
         parent: &DescrRef,
         offset: usize,
@@ -313,12 +359,15 @@ impl VirtualizableInfo {
         field_type: Type,
         flag: majit_ir::ArrayFlag,
         index_in_parent: usize,
+        vinfo: Option<Weak<dyn majit_ir::descr::VinfoMarker>>,
     ) -> DescrRef {
-        std::sync::Arc::new(
-            majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
-                .with_flag(flag)
-                .with_parent_descr(parent.clone(), index_in_parent),
-        )
+        let mut descr = majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
+            .with_flag(flag)
+            .with_parent_descr(parent.clone(), index_in_parent);
+        if let Some(w) = vinfo {
+            descr = descr.with_vinfo(w);
+        }
+        Arc::new(descr)
     }
 
     /// virtualizable.py:293-301 `finish()` registers the `clear_vable_ptr`
@@ -1346,6 +1395,67 @@ mod tests {
             items_offset,
             descr,
         );
+    }
+
+    #[test]
+    fn finalize_arc_stamps_vinfo_backref_on_field_descrs() {
+        // pyjitpl.py:1148-1149 parity — after `finalize_arc`, every
+        // field descriptor returned by the vinfo (vable_token_descr +
+        // static + array) must answer `get_vinfo() == Some(info)`.
+        let mut info = VirtualizableInfo::new(24);
+        info.add_field("pc", Type::Int, 8);
+        test_add_array_field(&mut info, "locals_w", Type::Ref, 16, 0, 0);
+        let descr: DescrRef = majit_ir::descr::make_size_descr(64);
+        let info = info.finalize_arc(descr);
+
+        let token = info
+            .vable_token_descr
+            .as_ref()
+            .and_then(|d| d.as_field_descr())
+            .expect("vable_token_descr is a FieldDescr")
+            .get_vinfo()
+            .expect("token descr carries vinfo");
+        assert!(std::ptr::eq(
+            token.as_any().downcast_ref::<VirtualizableInfo>().unwrap() as *const _,
+            Arc::as_ptr(&info),
+        ));
+
+        for d in info._static_field_descrs.iter() {
+            let v = d
+                .as_field_descr()
+                .unwrap()
+                .get_vinfo()
+                .expect("static fd has vinfo");
+            assert!(std::ptr::eq(
+                v.as_any().downcast_ref::<VirtualizableInfo>().unwrap() as *const _,
+                Arc::as_ptr(&info),
+            ));
+        }
+        for d in info._array_field_descrs.iter() {
+            let v = d
+                .as_field_descr()
+                .unwrap()
+                .get_vinfo()
+                .expect("array fd has vinfo");
+            assert!(std::ptr::eq(
+                v.as_any().downcast_ref::<VirtualizableInfo>().unwrap() as *const _,
+                Arc::as_ptr(&info),
+            ));
+        }
+    }
+
+    #[test]
+    fn set_parent_descr_leaves_vinfo_backref_none() {
+        // Legacy by-value path: `set_parent_descr` does NOT populate
+        // vinfo backref (no Arc<Self> to weak-ref). `get_vinfo()` falls
+        // through to the trait default `None`.
+        let mut info = VirtualizableInfo::new(24);
+        info.add_field("pc", Type::Int, 8);
+        let descr: DescrRef = majit_ir::descr::make_size_descr(64);
+        info.set_parent_descr(descr);
+
+        let token = info.vable_token_descr.as_ref().unwrap();
+        assert!(token.as_field_descr().unwrap().get_vinfo().is_none());
     }
 
     #[test]

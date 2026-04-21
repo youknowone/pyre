@@ -927,6 +927,22 @@ pub trait SizeDescr: Descr {
     }
 }
 
+/// Type-erased marker for `VirtualizableInfo`. Upstream parity:
+/// pyjitpl.py:1148-1158 `emit_force_virtualizable` begins with
+/// `vinfo = fielddescr.get_vinfo()` — in RPython every field descriptor
+/// carries a backreference to the owning `VirtualizableInfo`.
+///
+/// `VirtualizableInfo` itself lives in `majit-metainterp`, which already
+/// depends on `majit-ir`; reversing that dependency would be circular.
+/// This trait is the minimal Rust bridge: `majit-metainterp` implements
+/// `VinfoMarker for VirtualizableInfo`, and `FieldDescr::get_vinfo()`
+/// returns `Option<Arc<dyn VinfoMarker>>` — callers that need the
+/// concrete `VirtualizableInfo` downcast via `as_any()`.
+pub trait VinfoMarker: std::fmt::Debug + Send + Sync + std::any::Any {
+    /// Downcast helper so callers can recover `&VirtualizableInfo`.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// Descriptor for a field within a struct.
 ///
 /// Mirrors rpython/jit/backend/llsupport/descr.py FieldDescr.
@@ -989,6 +1005,16 @@ pub trait FieldDescr: Descr {
     /// generic path and the Rust port's `ensure_ptr_info_arg0` panics
     /// rather than installing a malformed PtrInfo.
     fn get_parent_descr(&self) -> Option<DescrRef> {
+        None
+    }
+
+    /// pyjitpl.py:1148-1149 `vinfo = fielddescr.get_vinfo()` — backreference
+    /// to the `VirtualizableInfo` that owns this field. Populated only
+    /// for field descriptors built by `VirtualizableInfo::finalize_arc`;
+    /// all other descriptors fall through to the default `None` and the
+    /// upstream `assert vinfo is not None` is enforced at the call site
+    /// (`emit_force_virtualizable`).
+    fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
         None
     }
 
@@ -1382,6 +1408,13 @@ pub struct SimpleFieldDescr {
     /// SizeDescr → FieldDescr → SizeDescr Arc cycle introduced by
     /// `make_simple_descr_group`.
     pub parent_descr: Option<Weak<dyn Descr>>,
+    /// pyjitpl.py:1148-1149 `vinfo = fielddescr.get_vinfo()` — backref to
+    /// the owning `VirtualizableInfo`. Stored as `Weak<dyn VinfoMarker>`
+    /// because the vinfo Arc keeps the descriptor alive (via its
+    /// `_static_field_descrs` / `_array_field_descrs` / `vable_token_descr`
+    /// slots); a strong back-ref would form a reference cycle. Populated
+    /// by `VirtualizableInfo::finalize_arc` via `Arc::new_cyclic`.
+    pub vinfo: Option<Weak<dyn VinfoMarker>>,
 }
 
 impl Clone for SimpleFieldDescr {
@@ -1399,6 +1432,7 @@ impl Clone for SimpleFieldDescr {
             virtualizable: self.virtualizable,
             index_in_parent: self.index_in_parent,
             parent_descr: self.parent_descr.clone(),
+            vinfo: self.vinfo.clone(),
         }
     }
 }
@@ -1427,6 +1461,7 @@ impl SimpleFieldDescr {
             virtualizable: false,
             index_in_parent: 0,
             parent_descr: None,
+            vinfo: None,
         }
     }
 
@@ -1455,6 +1490,7 @@ impl SimpleFieldDescr {
             virtualizable: false,
             index_in_parent: 0,
             parent_descr: None,
+            vinfo: None,
         }
     }
 
@@ -1495,6 +1531,15 @@ impl SimpleFieldDescr {
     pub fn with_parent_descr(mut self, parent: DescrRef, index_in_parent: usize) -> Self {
         self.parent_descr = Some(Arc::downgrade(&parent));
         self.index_in_parent = index_in_parent;
+        self
+    }
+
+    /// Builder: attach the owning `VirtualizableInfo` backreference that
+    /// `FieldDescr::get_vinfo()` returns. `vinfo` is stored as a `Weak`
+    /// reference; upgrades succeed for as long as the owning vinfo Arc
+    /// is alive. Upstream: pyjitpl.py:1148-1149 `fielddescr.get_vinfo()`.
+    pub fn with_vinfo(mut self, vinfo: Weak<dyn VinfoMarker>) -> Self {
+        self.vinfo = Some(vinfo);
         self
     }
 }
@@ -1560,6 +1605,9 @@ impl FieldDescr for SimpleFieldDescr {
     }
     fn get_parent_descr(&self) -> Option<DescrRef> {
         self.parent_descr.as_ref().and_then(|p| p.upgrade())
+    }
+    fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
+        self.vinfo.as_ref().and_then(|w| w.upgrade())
     }
 }
 
@@ -1717,6 +1765,7 @@ pub fn make_simple_descr_group(
                     virtualizable: spec.virtualizable,
                     index_in_parent: spec.index_in_parent,
                     parent_descr: Some(parent_descr.clone()),
+                    vinfo: None,
                 })
             })
             .collect();

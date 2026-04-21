@@ -69,9 +69,8 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
     }
 }
 
-pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
+pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
     let mut info = crate::virtualizable_gen::build_virtualizable_info();
-    info.set_parent_descr(crate::state::pyframe_size_descr());
     // rpython/jit/metainterp/virtualizable.py:293-301 `clear_vable_ptr`
     // + `clear_vable_descr`. The descr must carry
     // EffectInfo.MOST_GENERAL + OopSpecIndex.JitForceVirtualizable
@@ -81,7 +80,12 @@ pub fn build_pyframe_virtualizable_info() -> VirtualizableInfo {
     // `make_call_descr(.., EffectInfo::default())` here would drop
     // the CANNOT_RAISE / OS_JIT_FORCE_VIRTUALIZABLE flags and cause
     // the optimizer to treat the call as a raising general call.
+    //
+    // Populate clear_vable BEFORE `finalize_arc`: finalize consumes self
+    // and rebuilds descriptors inside `Arc::new_cyclic`, so any fields
+    // set here survive into the returned Arc. After the Arc is formed
+    // the vinfo is immutable through the shared handle.
     info.clear_vable_ptr = Some(pyre_clear_vable_token as *const () as usize);
     info.clear_vable_descr = Some(VirtualizableInfo::make_clear_vable_descr());
-    info
+    info.finalize_arc(crate::state::pyframe_size_descr())
 }

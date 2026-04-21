@@ -82,7 +82,7 @@ use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 const JIT_THRESHOLD: u32 = 200;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
-    majit_metainterp::virtualizable::VirtualizableInfo,
+    std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
 );
 
 thread_local! {
@@ -317,7 +317,7 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 pub(crate) fn get_virtualizable_info() -> *const majit_metainterp::virtualizable::VirtualizableInfo
 {
     let pair = driver_pair();
-    &pair.1 as *const _
+    std::sync::Arc::as_ptr(&pair.1)
 }
 
 /// pypy/module/pypyjit/interp_jit.py → PyPyJitDriver(JitDriver).

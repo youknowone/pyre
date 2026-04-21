@@ -464,8 +464,14 @@ pub trait JitState: Sized {
 
     /// RPython virtualizable.py: build VirtualizableInfo.
     /// Override when the interpreter has a virtualizable object.
+    ///
+    /// Returns `Arc<VirtualizableInfo>` so the field descriptors built
+    /// by `finalize_arc` can carry the vinfo backref that
+    /// `FieldDescr::get_vinfo()` returns at `emit_force_virtualizable`
+    /// time (pyjitpl.py:1148-1149).
     #[allow(non_snake_case)]
-    fn __build_virtualizable_info() -> Option<crate::virtualizable::VirtualizableInfo> {
+    fn __build_virtualizable_info()
+    -> Option<std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
         None
     }
 

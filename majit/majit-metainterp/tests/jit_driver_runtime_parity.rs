@@ -1615,7 +1615,7 @@ fn declarative_driver_can_reject_virtualizable_sync_before_tracing_starts() {
         DeclarativeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
     let mut driver = JitDriver::<VirtualizableSyncState>::with_descriptor(2, descriptor);
-    driver.set_virtualizable_info(VirtualizableInfo::new(0));
+    driver.set_virtualizable_info(std::sync::Arc::new(VirtualizableInfo::new(0)));
     let mut state = VirtualizableSyncState {
         frame: 1,
         stack: 2,

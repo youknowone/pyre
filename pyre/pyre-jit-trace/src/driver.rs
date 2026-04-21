@@ -16,7 +16,7 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// Type alias for the JIT driver pair. Must match pyre-jit/eval.rs JitDriverPair.
 pub type JitDriverPair = (
     majit_metainterp::JitDriver<PyreJitState>,
-    majit_metainterp::virtualizable::VirtualizableInfo,
+    std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
 );
 
 /// Get the JIT driver pair through callbacks.

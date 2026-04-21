@@ -1665,7 +1665,7 @@ pub fn blackhole_resume_via_rd_numb(
             None,                   // rd_pendingfields
             rd_guard_pendingfields, // rd_guard_pendingfields
             None,                   // vrefinfo — pyre has no virtualref mechanism
-            Some(&vinfo as &dyn resume::VirtualizableInfo),
+            Some(vinfo.as_ref() as &dyn resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
             &allocator,
         )

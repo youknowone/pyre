@@ -176,7 +176,7 @@ impl Default for StandaloneFrameStack {
 #[derive(Clone)]
 struct ActiveStandardVirtualizable {
     vable_opref: OpRef,
-    info: crate::virtualizable::VirtualizableInfo,
+    info: std::sync::Arc<crate::virtualizable::VirtualizableInfo>,
     obj_ptr: *mut u8,
 }
 
