@@ -11025,6 +11025,15 @@ fn collect_guards(
                     .collect();
                 frame.slots = new_slots;
                 frame.slot_types = Some(new_slot_types);
+                // resume.py:250 jitcode_index parity: overwrite the
+                // identity layout's default 0 with the innermost frame's
+                // jitcode_index from rd_numb. rd_numb encodes frames in
+                // [callee(top), caller(parent)] order (see compile.rs:281-284),
+                // so `frames[0]` is the innermost — the same frame the
+                // identity layout represents.
+                if let Some(topmost) = frames.first() {
+                    frame.jitcode_index = topmost.jitcode_index;
+                }
             }
 
             // Build virtual_layouts from rd_virtuals.
