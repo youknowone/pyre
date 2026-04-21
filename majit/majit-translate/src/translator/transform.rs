@@ -747,24 +747,34 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                         all_constant = false;
                         break;
                     }
-                    let key = s
-                        .const_()
-                        .cloned()
-                        .expect("transform_list_contains: immutable constant missing const");
+                    let Some(key) = const_value_from(&s) else {
+                        // Upstream `s.is_immutable_constant()` implies
+                        // `s.const` is readable because Python's
+                        // SomeTuple/SomeList synthesise the const on
+                        // demand. The Rust port only pins `const_box`
+                        // for scalar carriers, so composite
+                        // `SomeTuple(const,const,...)` without an
+                        // explicit const_box returns None here even
+                        // though `is_immutable_constant()` was True.
+                        // Bail out conservatively instead of panicking;
+                        // the original `contains` op stays intact.
+                        all_constant = false;
+                        break;
+                    };
                     // Python keeps distinct `nan` keys (`nan != nan`)
                     // in a dict by design — `{nan1: 1, nan2: 2}` has
                     // two entries and `x in dict` resolves via hash +
                     // (identity-or-equality), letting same-object lookups
-                    // succeed. Rust `HashMap<ConstValue, _>` collapses
-                    // bit-equal NaN floats under derived `Eq`, so the
-                    // rewritten dict would drop entries. Skip the
-                    // optimisation when any constant key is NaN so the
-                    // original list-iteration path (which Python's
-                    // `list.__contains__` runs with identity-or-equality)
+                    // succeed. The inequality propagates up through
+                    // tuple equality, so `(nan,)` / `(1, nan)` behave
+                    // the same way. Rust `HashMap<ConstValue, _>`
+                    // collapses bit-equal NaN floats under derived
+                    // `Eq`, which would drop entries. Skip the rewrite
+                    // when any transitive constant is NaN so the
+                    // original list-iteration path (Python's
+                    // `list.__contains__` with identity-or-equality)
                     // stays intact.
-                    if let ConstValue::Float(bits) = key
-                        && f64::from_bits(bits).is_nan()
-                    {
+                    if contains_nan(&key) {
                         all_constant = false;
                         break;
                     }
@@ -812,6 +822,8 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
 ///   and fits an `i64` → `Int(value as i64)`. Non-integral / non-finite
 ///   floats keep their `Float` form (Python hashes `1.5` and `Int(1)`
 ///   into different buckets).
+/// * `Tuple(items)` — recurse so `(True,)` and `(1,)` collapse the
+///   same way upstream's Python dict would.
 /// * Everything else returns as-is.
 fn canonical_dict_key(cv: ConstValue) -> ConstValue {
     match cv {
@@ -825,7 +837,53 @@ fn canonical_dict_key(cv: ConstValue) -> ConstValue {
                 ConstValue::Float(bits)
             }
         }
+        ConstValue::Tuple(items) => {
+            ConstValue::Tuple(items.into_iter().map(canonical_dict_key).collect())
+        }
         other => other,
+    }
+}
+
+/// `true` iff `cv` — or any transitively-contained value — is a NaN
+/// float. `transform_list_contains` uses this to bail out before
+/// rewriting a list whose elements include NaN at any nesting depth:
+/// Python keeps distinct NaN keys in a dict (recursive `nan != nan`),
+/// but Rust `HashMap<ConstValue, _>` collapses bit-equal NaN floats
+/// under derived `Eq`, which would drop entries.
+fn contains_nan(cv: &ConstValue) -> bool {
+    match cv {
+        ConstValue::Float(bits) => f64::from_bits(*bits).is_nan(),
+        ConstValue::Tuple(items) | ConstValue::List(items) => items.iter().any(contains_nan),
+        _ => false,
+    }
+}
+
+/// Recover a plain [`ConstValue`] from a [`SomeValue`] that passed
+/// `is_immutable_constant()`.
+///
+/// Upstream Python's `SomeTuple.const` / `SomeList.const` properties
+/// synthesise the container from `self.items` at access time. The Rust
+/// port only pins `const_box` for scalar carriers, so composite
+/// annotations with all-constant elements need explicit
+/// reconstruction.
+///
+/// Returns `None` when `s` is not an immutable-constant carrier or a
+/// transitively constant composite.
+fn const_value_from(s: &super::super::annotator::model::SomeValue) -> Option<ConstValue> {
+    use super::super::annotator::model::SomeValue;
+    // Fast path: the carrier pinned `const_box`.
+    if let Some(cv) = s.const_() {
+        return Some(cv.clone());
+    }
+    match s {
+        SomeValue::Tuple(t) => {
+            let mut items = Vec::with_capacity(t.items.len());
+            for item in &t.items {
+                items.push(const_value_from(item)?);
+            }
+            Some(ConstValue::Tuple(items))
+        }
+        _ => None,
     }
 }
 
@@ -1214,6 +1272,73 @@ mod tests {
 
         let ops = &block.borrow().operations;
         assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
+    }
+
+    #[test]
+    fn transform_list_contains_skips_when_nested_tuple_has_nan() {
+        // Codex P2 (round 7): `[(nan,)]` must skip the rewrite too —
+        // Python's tuple equality propagates `nan != nan`, but Rust's
+        // HashMap<ConstValue, _> would collapse bit-equal tuple keys.
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        let nan_bits = f64::NAN.to_bits();
+        let nan_tuple = CV::Tuple(vec![CV::Float(nan_bits)]);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Constant(C::new(nan_tuple))],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        assert!(
+            matches!(ops[1].args[0], Hlvalue::Variable(_)),
+            "NaN-nested tuple must not be rewritten to Constant(dict)"
+        );
+    }
+
+    #[test]
+    fn transform_list_contains_canonicalises_nested_bool_in_tuple() {
+        // Codex P2 (round 7): `[(True,)]` and `[(1,)]` must collapse
+        // to the same dict bucket, matching Python's recursive key
+        // semantics. Verify by calling `canonical_dict_key` directly —
+        // the end-to-end path also needs a matching-typed needle to
+        // survive the annotator's generalize_key union, which isn't
+        // the property under test here.
+        use crate::flowspace::model::ConstValue as CV;
+
+        let a = canonical_dict_key(CV::Tuple(vec![CV::Bool(true)]));
+        let b = canonical_dict_key(CV::Tuple(vec![CV::Int(1)]));
+        assert_eq!(
+            a, b,
+            "canonical_dict_key must recurse so (True,) and (1,) collapse"
+        );
+
+        let c = canonical_dict_key(CV::Tuple(vec![CV::Float(1.0_f64.to_bits())]));
+        assert_eq!(
+            a, c,
+            "integral Float(1.0) inside a tuple must also canonicalise to Int(1)"
+        );
     }
 
     #[test]
