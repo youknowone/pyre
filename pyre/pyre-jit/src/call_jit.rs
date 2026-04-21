@@ -420,13 +420,13 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     // _trace_and_compile_from_bridge or resume_in_blackhole.
     // Bridge compilation is driven by must_compile() in jitdriver.
     // This force path always resumes in the interpreter (blackhole).
-    let _descr = unsafe { JitFrame::get_latest_descr(jf) };
+    let _descr = unsafe { majit_backend::llmodel::get_latest_descr(jf) };
 
     // For now, reconstruct a PyFrame and run it in the interpreter.
     // This is the "blackhole" path — RPython resume.py parity.
     //
     // Step 1: read the raw int arg from jf_frame[0]
-    let raw_arg = unsafe { JitFrame::get_int_value(jf, 0) };
+    let raw_arg = unsafe { majit_backend::llmodel::get_int_value(jf, 0) };
 
     // Step 2: get caller frame from the force context
     #[cfg(feature = "cranelift")]

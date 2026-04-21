@@ -20,6 +20,7 @@ pub mod frame;
 pub mod gcmap;
 pub mod guard;
 pub use majit_backend::jitframe;
+pub use majit_backend::llmodel;
 pub mod jump;
 pub mod regalloc;
 pub mod regloc;
@@ -204,10 +205,10 @@ pub extern "C" fn call_assembler_helper_trampoline(
     // a bridge from within this helper. The bridge will be found on the
     // NEXT guard failure (patched guard or C dispatch).
     let frame_ptr = callee_jf_ptr;
-    let descr_raw = unsafe { jitframe::JitFrame::get_latest_descr(frame_ptr) };
+    let descr_raw = unsafe { llmodel::get_latest_descr(frame_ptr) };
     if descr_raw == 0 || guard::is_done_with_this_frame_descr(descr_raw) {
         let result: i64 = if guard::is_done_with_this_frame_descr(descr_raw) {
-            unsafe { jitframe::JitFrame::get_int_value(frame_ptr, 0) as i64 }
+            unsafe { llmodel::get_int_value(frame_ptr, 0) as i64 }
         } else {
             0
         };
@@ -222,7 +223,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
     for i in 0..n_fail_args {
         let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
-        raw_values.push(unsafe { jitframe::JitFrame::get_int_value(frame_ptr, slot) as i64 });
+        raw_values.push(unsafe { llmodel::get_int_value(frame_ptr, slot) as i64 });
     }
 
     // Step 1: try bridge compilation (compile.py:701 handle_fail).
@@ -332,9 +333,9 @@ mod tests {
         unsafe {
             libc::memset(ptr as *mut std::ffi::c_void, 0, size);
             jitframe::JitFrame::init(ptr, jitframe::NULLFRAMEINFO, depth);
-            jitframe::JitFrame::set_latest_descr(ptr, descr);
+            llmodel::set_latest_descr(ptr, descr);
             for (index, value) in slots.iter().copied().enumerate() {
-                jitframe::JitFrame::set_int_value(ptr, index, value as isize);
+                llmodel::set_int_value(ptr, index, value as isize);
             }
         }
         ptr
@@ -342,8 +343,8 @@ mod tests {
 
     extern "C" fn test_bridge_finish_int(jf: *mut jitframe::JitFrame) -> *mut jitframe::JitFrame {
         unsafe {
-            jitframe::JitFrame::set_latest_descr(jf, guard::done_with_this_frame_descr_int_ptr());
-            jitframe::JitFrame::set_int_value(jf, 0, 321);
+            llmodel::set_latest_descr(jf, guard::done_with_this_frame_descr_int_ptr());
+            llmodel::set_int_value(jf, 0, 321);
         }
         jf
     }

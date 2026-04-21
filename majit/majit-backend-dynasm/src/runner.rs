@@ -739,12 +739,13 @@ impl Backend for DynasmBackend {
                 Value::Float(f) => f.to_bits() as i64,
                 Value::Void => 0,
             };
-            unsafe { JitFrame::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
+            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
         }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             for (i, arg) in args.iter().enumerate() {
-                let raw = unsafe { JitFrame::get_int_value(jf_ptr, Self::input_slot(i)) as i64 };
+                let raw =
+                    unsafe { crate::llmodel::get_int_value(jf_ptr, Self::input_slot(i)) as i64 };
                 eprintln!("[dynasm]   arg[{}] = {:#018x} ({:?})", i, raw as u64, arg);
             }
             eprintln!(
@@ -807,7 +808,7 @@ impl Backend for DynasmBackend {
         }
 
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
-        let jf_descr_raw = unsafe { JitFrame::get_latest_descr(result_jf) as i64 };
+        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -827,7 +828,7 @@ impl Backend for DynasmBackend {
             if i < n_locs {
                 match descr.fail_arg_locs[i] {
                     Some(slot) => {
-                        let val = unsafe { JitFrame::get_int_value(result_jf, slot) as i64 };
+                        let val = unsafe { crate::llmodel::get_int_value(result_jf, slot) as i64 };
                         if std::env::var_os("MAJIT_LOG").is_some() && i < 10 {
                             eprintln!(
                                 "[dynasm] fail_arg[{}]: slot={} val={:#018x}",
@@ -839,7 +840,7 @@ impl Backend for DynasmBackend {
                     None => raw_values.push(0),
                 }
             } else {
-                raw_values.push(unsafe { JitFrame::get_int_value(result_jf, i) as i64 });
+                raw_values.push(unsafe { crate::llmodel::get_int_value(result_jf, i) as i64 });
             }
         }
 
@@ -876,20 +877,20 @@ impl Backend for DynasmBackend {
         unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
 
         for (i, &val) in args.iter().enumerate() {
-            unsafe { JitFrame::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
+            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
         }
 
         let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr) };
 
-        let jf_descr_raw = unsafe { JitFrame::get_latest_descr(result_jf) as i64 };
+        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
 
         let num_fail_args = descr.fail_arg_types.len();
         let mut outputs: Vec<i64> = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
-            outputs.push(unsafe { JitFrame::get_int_value(result_jf, i) as i64 });
+            outputs.push(unsafe { crate::llmodel::get_int_value(result_jf, i) as i64 });
         }
         let mut typed_outputs = Vec::with_capacity(num_fail_args);
         for i in 0..num_fail_args {

@@ -1,9 +1,15 @@
-//! JitFrame — RPython `rpython/jit/backend/llsupport/jitframe.py` 1:1 port.
+//! JitFrame layout + GC trace — `rpython/jit/backend/llsupport/jitframe.py`.
 //!
-//! Shared between all majit backends (cranelift, dynasm) and
-//! `majit-metainterp`. The upstream counterpart lives under
-//! `rpython/jit/backend/llsupport/`, so the majit home for this file is
-//! the backend-support layer rather than metainterp.
+//! This module owns only the responsibilities that upstream's
+//! `jitframe.py` owns: the `JITFRAMEINFO` / `JITFRAME` struct shape,
+//! byte offsets, allocation primitives (`alloc_size`, `init`), the
+//! `jitframe_resolve` walk, and the GC `jitframe_trace` +
+//! `jitframe_type_info` registration.
+//!
+//! Cpu-level deadframe accessors (`get_int_value`, `get_ref_value`,
+//! `get_float_value`, `get_latest_descr`, `get_savedata_ref`,
+//! `set_savedata_ref`) live in `crate::llmodel` to mirror upstream's
+//! split between `jitframe.py` and `llmodel.py` on `AbstractLLCPU`.
 
 // jitframe.py:8
 // SIZEOFSIGNED = rffi.sizeof(lltype.Signed)
@@ -244,90 +250,6 @@ impl JitFrame {
     /// Const variant of `slot_ptr`.
     pub unsafe fn slot_ptr_const(ptr: *const JitFrame, index: usize) -> *const isize {
         unsafe { (ptr as *const u8).add(FIRST_ITEM_OFFSET + index * SIZEOFSIGNED) as *const isize }
-    }
-
-    // ── llmodel.py:412-462 CPU value accessors ──────────────────
-
-    /// llmodel.py:412-420 — get_latest_descr.
-    ///
-    /// Returns the `jf_descr` field, which holds the descr pointer
-    /// of the last GUARD or FINISH operation executed.
-    pub unsafe fn get_latest_descr(ptr: *const JitFrame) -> usize {
-        unsafe { (*ptr).jf_descr }
-    }
-
-    /// Store the `jf_descr` field directly. Used by host-side tests /
-    /// arena runners that bypass compiled-code write paths.
-    pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
-        unsafe {
-            (*ptr).jf_descr = descr;
-        }
-    }
-
-    /// llmodel.py:437-444 — get_int_value.
-    ///
-    /// Read the `index`-th Signed slot from `jf_frame`.
-    /// `index` is a slot index (not byte offset).
-    pub unsafe fn get_int_value(ptr: *const JitFrame, index: usize) -> isize {
-        unsafe { *Self::slot_ptr_const(ptr, index) }
-    }
-
-    /// Symmetric setter for `get_int_value`. Used by host-side test and
-    /// arena runners.
-    pub unsafe fn set_int_value(ptr: *mut JitFrame, index: usize, value: isize) {
-        unsafe {
-            *Self::slot_ptr(ptr, index) = value;
-        }
-    }
-
-    /// llmodel.py:446-453 — get_ref_value.
-    ///
-    /// Read the `index`-th slot as a reference (pointer-sized).
-    pub unsafe fn get_ref_value(ptr: *const JitFrame, index: usize) -> usize {
-        unsafe {
-            let base = (ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const usize;
-            *base.add(index)
-        }
-    }
-
-    /// llmodel.py:455-462 — get_float_value.
-    pub unsafe fn get_float_value(ptr: *const JitFrame, index: usize) -> u64 {
-        unsafe {
-            let base = (ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const u64;
-            *base.add(index)
-        }
-    }
-
-    /// llmodel.py:248-251 — get_savedata_ref.
-    pub unsafe fn get_savedata_ref(ptr: *const JitFrame) -> usize {
-        unsafe { (*ptr).jf_savedata }
-    }
-
-    /// llmodel.py:252-257 — set_savedata_ref.
-    pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
-        unsafe {
-            (*ptr).jf_savedata = value;
-        }
-    }
-
-    // ── warmspot.py:1021 assembler_call_helper parity ────────────
-
-    /// Check if jf_descr indicates a "done with this frame" finish.
-    ///
-    /// compile.py:626-656 — DoneWithThisFrameDescr*.handle_fail
-    /// raises DoneWithThisFrame{Void,Int,Ref,Float} JitException.
-    ///
-    /// Returns true if jf_descr matches a known finish descr.
-    pub unsafe fn is_done_with_this_frame(ptr: *const JitFrame, done_descr: usize) -> bool {
-        unsafe { (*ptr).jf_descr == done_descr }
-    }
-
-    /// Read the integer result from a finished jitframe.
-    ///
-    /// compile.py:632-638 — DoneWithThisFrameDescrInt.get_result
-    /// reads `cpu.get_int_value(deadframe, 0)`.
-    pub unsafe fn get_finish_result_int(ptr: *const JitFrame) -> isize {
-        unsafe { Self::get_int_value(ptr, 0) }
     }
 }
 

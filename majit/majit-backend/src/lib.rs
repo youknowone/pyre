@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use majit_ir::{Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
 
 pub mod jitframe;
+pub mod llmodel;
 
 /// Lightweight execution result that avoids DeadFrame boxing.
 ///
