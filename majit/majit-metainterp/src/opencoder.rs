@@ -4289,6 +4289,76 @@ mod tests {
         }
     }
 
+    /// test_opencoder.py:200 `TestOpencoder.test_liveranges` —
+    /// NEW_WITH_VTABLE + GUARD_TRUE + capture_resumedata with non-empty
+    /// vable/vref arrays but an empty framestack. Drives the snapshot
+    /// chain through `update_liveranges` and asserts every input +
+    /// NEW_WITH_VTABLE slot is marked live at the guard's index (4).
+    #[test]
+    fn test_liveranges_c() {
+        let mut t = TraceRecordBuffer::new(3, empty_sd());
+        let i0 = t.record_input_arg(Type::Int);
+        let i1 = t.record_input_arg(Type::Int);
+        let i2 = t.record_input_arg(Type::Int);
+        // p0 = t.record_op(rop.NEW_WITH_VTABLE, [], descr=SomeDescr())
+        let some_descr: majit_ir::DescrRef = majit_ir::descr::make_size_descr(64);
+        let p0 = t.record_op0(OpCode::NewWithVtable, Some(&some_descr));
+        // t.record_op(rop.GUARD_TRUE, [i0])
+        let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(i0.0), None);
+        // t.capture_resumedata([], [i1, i2, p0], [p0, i1])
+        let vable = [Box::ResOp(i1.0), Box::ResOp(i2.0), Box::ResOp(p0)];
+        let vref = [Box::ResOp(p0), Box::ResOp(i1.0)];
+        let mut stack: Vec<crate::pyjitpl::MIFrame> = Vec::new();
+        let _ = t.capture_resumedata(&mut stack, &vable, &vref, None, 0, &[], false);
+        // assert t.get_live_ranges() == [4, 4, 4, 4]
+        assert_eq!(t.get_live_ranges(), vec![4, 4, 4, 4]);
+    }
+
+    /// test_opencoder.py:189 `TestOpencoder.test_virtualizable_bug` —
+    /// 128 virtualizable boxes (p0 + 127 × i1) exercise the array-length
+    /// varint at the 1-byte / 2-byte threshold. The canonical assertion
+    /// is that the snapshot decoder returns the exact same box list in
+    /// order; i.e. `SnapshotIterator::unpack_array(vable_array)` must
+    /// decode `[p0, i1, i1, ..., i1]` (128 entries) without truncation.
+    #[test]
+    fn test_virtualizable_bug_c() {
+        let mut t = TraceRecordBuffer::new(3, empty_sd());
+        let _i0 = t.record_input_arg(Type::Int);
+        let i1 = t.record_input_arg(Type::Int);
+        let _i2 = t.record_input_arg(Type::Int);
+        let some_descr: majit_ir::DescrRef = majit_ir::descr::make_size_descr(64);
+        let p0 = t.record_op0(OpCode::NewWithVtable, Some(&some_descr));
+        let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
+        // capture_resumedata([], [i1] * 127 + [p0], [p0, i1])
+        let mut vable: Vec<Box> = (0..127).map(|_| Box::ResOp(i1.0)).collect();
+        vable.push(Box::ResOp(p0));
+        let vref = [Box::ResOp(p0), Box::ResOp(i1.0)];
+        let mut stack: Vec<crate::pyjitpl::MIFrame> = Vec::new();
+        let snap = t.capture_resumedata(&mut stack, &vable, &vref, None, 0, &[], false);
+        // Unpack the snapshot and decode the vable/vref arrays. The
+        // 128-entry vable array stresses the varint length field
+        // (threshold at 2**7 / 2**14 = 128). If the encoder framed the
+        // length as a single byte, the decoder would truncate or spill.
+        let it = t.get_snapshot_iter(snap as usize);
+        let vable_decoded: Vec<i64> = it.iter_vable_array().collect();
+        let vref_decoded: Vec<i64> = it.iter_vref_array().collect();
+        assert_eq!(vable_decoded.len(), 128, "128 vable entries decoded");
+        assert_eq!(vref_decoded.len(), 2, "2 vref entries decoded");
+        // `_list_of_boxes_virtualizable_from_boxes` writes the last entry
+        // first, then the remaining forward — matching RPython's
+        // `_list_of_boxes(virt)` with an already-rotated list. The
+        // decoded stream should therefore open with p0 and continue with
+        // 127 × i1.
+        let p0_tag = TraceRecordBuffer::_encode_box_position(p0);
+        let i1_tag = TraceRecordBuffer::_encode_box_position(i1.0);
+        assert_eq!(vable_decoded[0], p0_tag);
+        for (idx, entry) in vable_decoded.iter().enumerate().skip(1) {
+            assert_eq!(*entry, i1_tag, "vable[{idx}] == i1");
+        }
+        assert_eq!(vref_decoded[0], p0_tag);
+        assert_eq!(vref_decoded[1], i1_tag);
+    }
+
     /// test_opencoder.py:263 `test_varint_hypothesis` —
     /// `encode_varint_signed` / `decode_varint_signed` round-trip over
     /// the full `[MIN_VALUE, MAX_VALUE]` range, including the case where
