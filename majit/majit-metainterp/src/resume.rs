@@ -222,12 +222,18 @@ pub struct SnapshotFrame {
 
 impl Snapshot {
     /// Create a simple single-frame snapshot (pyre common case).
-    pub fn single_frame(pc: i32, boxes: Vec<majit_ir::OpRef>) -> Self {
+    ///
+    /// `jitcode_index` identifies the code this frame is running — the
+    /// index into `METAINTERP_SD.jitcodes`. Required so the decoder's
+    /// `frame_value_count_at(jitcode_index, pc)` query resolves the
+    /// frame's liveness in the correct jitcode instead of silently
+    /// falling through the pc-out-of-range LiveVars path on `jitcodes[0]`.
+    pub fn single_frame(jitcode_index: i32, pc: i32, boxes: Vec<majit_ir::OpRef>) -> Self {
         Snapshot {
             vable_array: Vec::new(),
             vref_array: Vec::new(),
             framestack: vec![SnapshotFrame {
-                jitcode_index: 0,
+                jitcode_index,
                 pc,
                 boxes,
             }],
@@ -4331,7 +4337,7 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.constants
             .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
-        let snapshot = Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
+        let snapshot = Snapshot::single_frame(0, 8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
@@ -4369,7 +4375,7 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.constants
             .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
-        let snapshot = Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
+        let snapshot = Snapshot::single_frame(0, 8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
         numb_state.writer.patch(1, numb_state.num_boxes);
@@ -4400,7 +4406,7 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.virtuals.insert(2); // OpRef(2) is virtual (Ref type)
         env.types.insert(2, majit_ir::Type::Ref);
-        let snapshot = Snapshot::single_frame(10, vec![OpRef(1), OpRef(2), OpRef(3)]);
+        let snapshot = Snapshot::single_frame(0, 10, vec![OpRef(1), OpRef(2), OpRef(3)]);
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: finish() patches with len(newboxes) which is num_boxes
         // (not liveboxes which includes virtuals).
@@ -4430,7 +4436,7 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
-        let snapshot = Snapshot::single_frame(10, vec![OpRef(1), OpRef(2), OpRef(3)]);
+        let snapshot = Snapshot::single_frame(0, 10, vec![OpRef(1), OpRef(2), OpRef(3)]);
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
@@ -4524,8 +4530,11 @@ mod tests {
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
 
-        let snapshot =
-            Snapshot::single_frame(8, vec![OpRef::from_const(1), OpRef(1), OpRef(2), OpRef(3)]);
+        let snapshot = Snapshot::single_frame(
+            0,
+            8,
+            vec![OpRef::from_const(1), OpRef(1), OpRef(2), OpRef(3)],
+        );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None);

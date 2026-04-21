@@ -3290,8 +3290,8 @@ impl OptContext {
             }
             Snapshot::multi_frame(frames)
         } else {
-            let pc = frame_pcs.first().map(|&(_, pc)| pc).unwrap_or(0);
-            Snapshot::single_frame(pc, snapshot_boxes.clone())
+            let (jitcode_index, pc) = frame_pcs.first().copied().unwrap_or((0, 0));
+            Snapshot::single_frame(jitcode_index, pc, snapshot_boxes.clone())
         };
         // pyjitpl.py:2588: vable_array stores virtualizable_boxes.
         // ni/vsd are constants (TAGINT/TAGCONST) so they don't affect
