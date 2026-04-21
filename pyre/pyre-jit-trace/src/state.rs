@@ -238,6 +238,16 @@ impl MetaInterpStaticData {
         let key = code as usize;
         if let Some(&idx) = self.by_code.get(&key) {
             if let Some(arc) = supplied {
+                // codewriter.py:67-68 parity — the SD-local position is
+                // invariant across `merge_point_pc`-driven recompiles of
+                // the same CodeObject; the new payload must carry the
+                // same `jitcode.index` as the old one so any
+                // outstanding `frame.jitcode.index` read still maps to
+                // the same `metainterp_sd.jitcodes[idx]` slot.  Stamp
+                // BEFORE installing so the replacement is always
+                // consistent even if a reader races on `self.jitcodes[
+                // idx].payload`.
+                Self::stamp_payload_index(idx as i32, &arc);
                 self.jitcodes[idx].payload = arc;
             }
             return &*self.jitcodes[idx] as *const JitCode;
@@ -253,14 +263,10 @@ impl MetaInterpStaticData {
         // `Arc<majit_metainterp::jitcode::JitCode>` so a snapshot whose
         // `frame.jitcode` points to this allocation encodes the
         // correct `metainterp_sd.jitcodes[index]` lookup target on the
-        // resume side.  The atomic store works regardless of the outer
-        // Arc<PyJitCode> refcount; without interior mutability the
-        // back-stamp would require Arc::get_mut which fails as soon as
-        // CallControl.jitcodes also holds the same allocation.
-        payload
-            .jitcode
-            .index
-            .store(index as i64, std::sync::atomic::Ordering::Relaxed);
+        // resume side.  Same helper serves the hit path above — both
+        // paths must keep the shared `JitCode` object's `index` field
+        // aligned with the SD slot.
+        Self::stamp_payload_index(index, &payload);
         let jitcode = Box::new(JitCode {
             code,
             index,
@@ -270,6 +276,22 @@ impl MetaInterpStaticData {
         self.by_code.insert(key, self.jitcodes.len());
         self.jitcodes.push(jitcode);
         ptr
+    }
+
+    /// codewriter.py:67-68 parity — stamp the SD-local `idx` onto the
+    /// shared `Arc<majit_metainterp::jitcode::JitCode>` carried by the
+    /// payload.  Shared helper used by both the by_code miss path
+    /// (fresh SD slot) and the by_code hit path (payload swap driven
+    /// by `merge_point_pc` refinement in CallControl).  The atomic
+    /// store works regardless of the outer Arc<PyJitCode> refcount;
+    /// without interior mutability the back-stamp would require
+    /// Arc::get_mut which fails as soon as CallControl.jitcodes also
+    /// holds the same allocation.
+    fn stamp_payload_index(idx: i32, payload: &std::sync::Arc<crate::PyJitCode>) {
+        payload
+            .jitcode
+            .index
+            .store(idx as i64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Return the existing SD entry only when its payload is already
@@ -5916,5 +5938,49 @@ mod indirectcalltargets_tests {
             .compiled_jitcode_lookup(code)
             .expect("populated payload should short-circuit callback");
         assert!(std::ptr::eq(inserted, hit));
+    }
+
+    /// codewriter.py:67-68 parity for the `by_code` hit path.  When a
+    /// subsequent `jitcode_for(code, Some(new_arc))` call replaces a
+    /// previously-registered payload (e.g. a `merge_point_pc`-driven
+    /// recompile in CallControl), the new payload's shared
+    /// `Arc<majit JitCode>` must carry the SAME `index` as the
+    /// original — otherwise a snapshot whose `frame.jitcode` holds the
+    /// new allocation would encode a stale index that no longer maps
+    /// to the correct `metainterp_sd.jitcodes` slot.
+    #[test]
+    fn jitcode_for_hit_path_restamps_payload_index() {
+        use std::sync::atomic::Ordering;
+        let mut sd = MetaInterpStaticData::new();
+        // Prime the SD with TWO distinct codes so the second allocation
+        // lands at wrapper.index == 1.  This makes the regression test
+        // sensitive to whether the hit-path re-stamp uses the actual
+        // SD slot (1) rather than the inner JitCode's default (0).
+        let code_a = 0xA000usize as *const ();
+        let code_b = 0xB000usize as *const ();
+        let _ = sd.jitcode_for(code_a, Some(Arc::new(crate::PyJitCode::skeleton(None))));
+        let first = Arc::new(crate::PyJitCode::skeleton(None));
+        let _ = sd.jitcode_for(code_b, Some(first.clone()));
+        assert_eq!(first.jitcode.index.load(Ordering::Relaxed), 1);
+
+        // Now swap in a second PyJitCode for the SAME code (hit path).
+        // The replacement's inner JitCode starts with index=0 (the
+        // default from JitCodeBuilder::finish); after jitcode_for, it
+        // must carry index=1 — matching the SD slot it fills.
+        let second = Arc::new(crate::PyJitCode::skeleton(None));
+        assert_eq!(
+            second.jitcode.index.load(Ordering::Relaxed),
+            0,
+            "fresh PyJitCode starts with default index=0"
+        );
+        let _ = sd.jitcode_for(code_b, Some(second.clone()));
+        assert_eq!(
+            second.jitcode.index.load(Ordering::Relaxed),
+            1,
+            "hit-path replacement payload must be re-stamped with the SD slot"
+        );
+        // The first PyJitCode is no longer the payload but still carries
+        // its own index=1 — the stamp is idempotent, not a swap.
+        assert_eq!(first.jitcode.index.load(Ordering::Relaxed), 1);
     }
 }
