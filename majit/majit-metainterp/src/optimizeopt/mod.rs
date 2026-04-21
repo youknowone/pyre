@@ -491,7 +491,18 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 return tp;
             }
         }
-        // RPython box.type parity: snapshot Box carries its type.
+        // RPython box.type parity: every Box carries its type intrinsically.
+        // `value_types` aggregates the four upstream sources (original trace
+        // ops, prev-phase carry, inputarg types, transformed trace result
+        // types) seeded in `Optimizer::make_ctx`, plus every non-Void op
+        // emitted so far via `register_value_type`. It is a strict superset
+        // of the tracing-time `snapshot_box_types` cache (which only covers
+        // `SnapshotTagged::Box` positions).
+        if let Some(&tp) = self.ctx.value_types.get(&opref.0) {
+            if tp != majit_ir::Type::Void {
+                return tp;
+            }
+        }
         if let Some(&tp) = self.ctx.snapshot_box_types.get(&opref.0) {
             if tp != majit_ir::Type::Void {
                 return tp;
