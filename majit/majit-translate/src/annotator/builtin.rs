@@ -115,6 +115,31 @@ pub fn lookup(qualname: &str) -> Option<BuiltinAnalyzer> {
     analyzers().get(qualname).copied()
 }
 
+/// Per-analyser allow-list of `s_`-prefixed keyword argument names.
+///
+/// Upstream's dispatch is `self.analyser(*args_s, **kwds_s)`, which
+/// raises `TypeError` when an unknown keyword reaches the analyser's
+/// Python signature. The Rust dispatcher must reject the same cases
+/// before calling the function pointer, so each analyser declares the
+/// set of keywords it accepts here. The default (missing entry) means
+/// "no keywords accepted".
+fn allowed_kwds(qualname: &str) -> &'static [&'static str] {
+    match qualname {
+        // builtin_int(s_obj, s_base=None)
+        "int" => &["s_base"],
+        // builtin_enumerate(s_obj, s_start=None)
+        "enumerate" => &["s_start"],
+        // robjmodel_instantiate(s_clspbc, s_nonmovable=None)
+        "rpython.rlib.objectmodel.instantiate" => &["s_nonmovable"],
+        // _r_dict_helper(cls, s_eqfn, s_hashfn, s_force_non_null,
+        //                s_simple_hash_eq)
+        "rpython.rlib.objectmodel.r_dict" | "rpython.rlib.objectmodel.r_ordereddict" => {
+            &["s_force_non_null", "s_simple_hash_eq"]
+        }
+        _ => &[],
+    }
+}
+
 /// Upstream `SomeBuiltin.call(self, args)` dispatcher
 /// (unaryop.py:940-946).
 ///
@@ -126,6 +151,13 @@ pub fn lookup(qualname: &str) -> Option<BuiltinAnalyzer> {
 ///         kwds_s['s_'+key] = s_value
 ///     return self.analyser(*args_s, **kwds_s)
 /// ```
+///
+/// In addition to the direct dispatch, the Rust port rejects keyword
+/// arguments whose `s_<name>` is not in [`allowed_kwds`] for this
+/// `analyser_name`. Upstream gets that check for free from Python's
+/// signature binding; the Rust dispatcher emulates it so calls like
+/// `list(xs, foo=1)` or `bool(x, foo=1)` fail cleanly instead of
+/// silently dropping `foo=1`.
 pub fn call_builtin(
     bk: &Rc<Bookkeeper>,
     analyser_name: &str,
@@ -137,6 +169,14 @@ pub fn call_builtin(
             "SomeBuiltin.call(): no analyser registered for {analyser_name}"
         )));
     };
+    let allowed = allowed_kwds(analyser_name);
+    for key in kwds_s.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(AnnotatorError::new(format!(
+                "{analyser_name}() got an unexpected keyword argument {key:?}"
+            )));
+        }
+    }
     analyser(bk, args_s, kwds_s)
 }
 
@@ -478,23 +518,72 @@ pub fn builtin_reversed(
 }
 
 /// Upstream `builtin_bool(s_obj)` (builtin.py:102-103).
+///
+/// Upstream dispatches `s_obj.bool()` which is registered per-`Some*`
+/// in `unaryop.py`. The annotator-phase subset used by `builtin_bool`
+/// reduces to:
+///
+/// * constant immutable receivers → `SomeBool(bool(s_obj.const))`
+/// * empty-tuple literal `()` → `SomeBool(False)` (unaryop.py:347-351)
+/// * everything else → unrefined `SomeBool()`
+///
+/// Knowntypedata propagation (`SomeObject._propagate_knowntypedata`) is
+/// an analyser-driven optimisation and is handled by the OpKind::Bool
+/// dispatch in `unaryop.rs`; the annotator-phase `builtin_bool` path
+/// used by `call_builtin` does not have the HLOperation context to
+/// track that side channel and leaves the per-branch refinements to
+/// the surrounding flow-level dispatch.
 pub fn builtin_bool(
     _bk: &Rc<Bookkeeper>,
     args_s: &[SomeValue],
     _kwds: &HashMap<String, SomeValue>,
 ) -> Result<SomeValue, AnnotatorError> {
-    let [_s_obj] = args_s else {
+    let [s_obj] = args_s else {
         return Err(AnnotatorError::new("bool() takes exactly one argument"));
     };
-    // upstream: `return s_obj.bool()` which for `SomeObject` is
-    // `SomeBool() + knowntypedata propagation`. The Rust `.bool()` is
-    // dispatched through `OpKind::Bool` and needs an active
-    // `RPythonAnnotator` for knowntypedata tracking; in the annotator-
-    // phase `builtin_bool` call path that machinery is not available,
-    // so we fall back to the default `SomeBool()` which matches
-    // upstream's correctness envelope (knowntypedata is an
-    // optimisation, not a soundness requirement).
-    Ok(SomeValue::Bool(SomeBool::new()))
+    let mut r = SomeBool::new();
+
+    // upstream `SomeTuple.bool` (unaryop.py:347-351): empty tuple is
+    // always falsy.
+    if let SomeValue::Tuple(t) = s_obj
+        && t.items.is_empty()
+    {
+        r.base.const_box = Some(super::super::flowspace::model::Constant::new(
+            ConstValue::Bool(false),
+        ));
+        return Ok(SomeValue::Bool(r));
+    }
+
+    // upstream default + primitive overrides: when the operand is a
+    // constant immutable value, pin `r.const = bool(value)`.
+    if is_immutable_constant(s_obj)
+        && let Some(c) = s_obj.const_()
+    {
+        let truthy = match c {
+            ConstValue::Bool(b) => *b,
+            ConstValue::Int(n) => *n != 0,
+            ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
+            ConstValue::Str(s) => !s.is_empty(),
+            ConstValue::None => false,
+            ConstValue::Tuple(items) | ConstValue::List(items) => !items.is_empty(),
+            ConstValue::Dict(m) => !m.is_empty(),
+            // HostObject / Function / Code etc. have no `__bool__`
+            // override metadata in the Rust port, so take Python's
+            // default `True`.
+            ConstValue::HostObject(_)
+            | ConstValue::Function(_)
+            | ConstValue::Code(_)
+            | ConstValue::Atom(_)
+            | ConstValue::SpecTag(_) => true,
+            // Placeholder never appears in production flow; stay
+            // conservative rather than crash.
+            ConstValue::Placeholder => return Ok(SomeValue::Bool(r)),
+        };
+        r.base.const_box = Some(super::super::flowspace::model::Constant::new(
+            ConstValue::Bool(truthy),
+        ));
+    }
+    Ok(SomeValue::Bool(r))
 }
 
 /// Upstream `builtin_int(s_obj, s_base=None)` (builtin.py:105-115).
@@ -511,6 +600,18 @@ pub fn builtin_int(
             return Err(AnnotatorError::new("int() takes at least one argument"));
         }
     };
+    // upstream's Python dispatch raises TypeError when the same
+    // parameter is supplied both positionally and as a keyword. Bind
+    // `base` manually because `ArgumentsForTranslation.unpack()` is
+    // signature-agnostic at this call site.
+    if args_s.len() >= 2 && kwds.contains_key("s_base") {
+        return Err(AnnotatorError::new(
+            "int() got multiple values for argument 'base'",
+        ));
+    }
+    if args_s.len() > 2 {
+        return Err(AnnotatorError::new("int() takes at most 2 arguments"));
+    }
     let s_base = args_s
         .get(1)
         .cloned()
@@ -1617,6 +1718,98 @@ mod tests {
             },
             other => panic!("expected SomeBool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn builtin_bool_folds_constant_none_to_false() {
+        // Codex P2: `bool(None)` must pin `r.const = False` instead of
+        // returning an unrefined SomeBool.
+        let bk = bk();
+        let s_none_val = bk.immutablevalue(&ConstValue::None).unwrap();
+        let out = builtin_bool(&bk, &[s_none_val], &no_kwds()).unwrap();
+        match out {
+            SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {
+                Some(ConstValue::Bool(false)) => {}
+                other => panic!("expected constant Bool(false), got {other:?}"),
+            },
+            other => panic!("expected SomeBool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_bool_folds_constant_int_to_true() {
+        let bk = bk();
+        let s_int = bk.immutablevalue(&ConstValue::Int(42)).unwrap();
+        let out = builtin_bool(&bk, &[s_int], &no_kwds()).unwrap();
+        match out {
+            SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {
+                Some(ConstValue::Bool(true)) => {}
+                other => panic!("expected constant Bool(true), got {other:?}"),
+            },
+            other => panic!("expected SomeBool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_builtin_rejects_unknown_keyword() {
+        // Codex P2: `list(xs, foo=1)` must raise instead of silently
+        // ignoring `foo=1`. The dispatcher now rejects kwds outside
+        // each analyser's allow-list.
+        let bk = bk();
+        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
+        kwds.insert(
+            "s_foo".into(),
+            bk.immutablevalue(&ConstValue::Int(1)).unwrap(),
+        );
+        let err = call_builtin(&bk, "list", &[], &kwds).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("unexpected keyword argument"),
+            "err was {:?}",
+            err.msg
+        );
+    }
+
+    #[test]
+    fn call_builtin_accepts_declared_keyword() {
+        // `int(s, base=16)` is the positive path — `base` is declared
+        // allowed for `int` in the allow-list.
+        let bk = bk();
+        let s_str = bk.immutablevalue(&ConstValue::Str("1a".into())).unwrap();
+        let s_base = bk.immutablevalue(&ConstValue::Int(16)).unwrap();
+        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
+        kwds.insert("s_base".into(), s_base);
+        let out = call_builtin(&bk, "int", &[s_str], &kwds).unwrap();
+        match out {
+            SomeValue::Integer(i) => match i.base.const_box.as_ref().map(|c| &c.value) {
+                Some(ConstValue::Int(n)) => assert_eq!(*n, 26),
+                other => panic!("expected constant Int(26), got {other:?}"),
+            },
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_int_rejects_positional_and_keyword_base() {
+        // Codex P2: `int(x, 10, base=16)` must raise the duplicate-arg
+        // error that upstream's Python dispatch produces.
+        let bk = bk();
+        let s_str = bk.immutablevalue(&ConstValue::Str("1a".into())).unwrap();
+        let s_base_pos = bk.immutablevalue(&ConstValue::Int(10)).unwrap();
+        let s_base_kw = bk.immutablevalue(&ConstValue::Int(16)).unwrap();
+        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
+        kwds.insert("s_base".into(), s_base_kw);
+        let err = builtin_int(&bk, &[s_str, s_base_pos], &kwds).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("multiple values for argument 'base'"),
+            "err was {:?}",
+            err.msg
+        );
     }
 
     #[test]
