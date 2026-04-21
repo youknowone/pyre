@@ -265,7 +265,7 @@ impl MetaInterpStaticData {
     fn compiled_jitcode_lookup(&self, code: *const ()) -> Option<*const JitCode> {
         let idx = *self.by_code.get(&(code as usize))?;
         let jitcode = &self.jitcodes[idx];
-        if jitcode.payload.metadata.pc_map.is_empty() {
+        if !jitcode.payload.is_populated() {
             return None;
         }
         Some(&**jitcode as *const JitCode)

@@ -2432,7 +2432,7 @@ impl CodeWriter {
             // `Arc`.
             let pyjitcode =
                 self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
-            let key = code_ptr as usize;
+            let key = super::call::CallControl::jitcode_key(code_ptr, w_code);
             let raw_ptr = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
             all_jitcodes.push(raw_ptr);
@@ -2475,7 +2475,12 @@ impl CodeWriter {
             .jitdrivers_sd
             .iter()
             .enumerate()
-            .map(|(idx, jd)| (jd.portal_graph as usize, idx))
+            .map(|(idx, jd)| {
+                (
+                    super::call::CallControl::jitcode_key(jd.portal_graph, jd.w_code),
+                    idx,
+                )
+            })
             .collect();
         for (key, idx) in assignments {
             if let Some(arc) = cc.jitcodes.get_mut(&key) {
@@ -2631,12 +2636,18 @@ fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitC
         return None;
     }
     let code = unsafe { &*raw_code };
+    if let Some(existing) = CodeWriter::instance()
+        .callcontrol()
+        .find_compiled_jitcode_arc(code as *const _, w_code)
+    {
+        return Some(existing);
+    }
     compile_jitcode_for_callee(code, w_code);
     // Hand the populated `Arc` back to the trace-side caller so the
     // SD entry stores the same allocation as `CallControl.jitcodes`.
     CodeWriter::instance()
         .callcontrol()
-        .find_jitcode_arc(code as *const _)
+        .find_compiled_jitcode_arc(code as *const _, w_code)
 }
 
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where
@@ -2717,7 +2728,7 @@ mod tests {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let w_code = pyre_interpreter::box_code_constant(&code);
-        let key = &code as *const pyre_interpreter::CodeObject as usize;
+        let key = w_code as *const () as usize;
 
         let _ = writer
             .callcontrol()
@@ -2748,11 +2759,69 @@ mod tests {
         );
         let pyjit = writer
             .callcontrol()
-            .find_jitcode(&code as *const _)
+            .find_jitcode(&code as *const _, w_code as *const ())
             .unwrap();
         assert!(
             !pyjit.metadata.pc_map.is_empty(),
             "drain must populate bytecode metadata on the existing entry"
+        );
+    }
+
+    #[test]
+    fn callcontrol_compiled_lookup_ignores_skeleton_pyjitcode() {
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = &code as *const pyre_interpreter::CodeObject;
+
+        let _ = writer
+            .callcontrol()
+            .get_jitcode(&code, w_code as *const (), None);
+        assert!(
+            writer
+                .callcontrol()
+                .find_jitcode_arc(code_ptr, w_code as *const ())
+                .is_some()
+        );
+        assert!(
+            writer
+                .callcontrol()
+                .find_compiled_jitcode_arc(code_ptr, w_code as *const ())
+                .is_none(),
+            "fresh shells must not be treated as populated jitcodes"
+        );
+
+        writer.drain_unfinished_graphs();
+        assert!(
+            writer
+                .callcontrol()
+                .find_compiled_jitcode_arc(code_ptr, w_code as *const ())
+                .is_some(),
+            "drained jitcodes must become visible through the compiled-only lookup"
+        );
+    }
+
+    #[test]
+    fn compile_jitcode_via_w_code_reuses_existing_compiled_arc() {
+        let writer = CodeWriter::instance();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code_ref = unsafe { &*code_ptr };
+
+        compile_jitcode_for_callee(code_ref, w_code as *const ());
+        let cached = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr, w_code as *const ())
+            .expect("callee compile must cache a populated jitcode");
+
+        let returned = compile_jitcode_via_w_code(w_code as *const ())
+            .expect("callback should reuse existing populated jitcode");
+        assert!(
+            Arc::ptr_eq(&cached, &returned),
+            "trace-side callback should return the already-cached populated Arc"
         );
     }
 }

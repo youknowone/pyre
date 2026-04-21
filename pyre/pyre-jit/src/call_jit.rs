@@ -765,8 +765,7 @@ pub fn resume_in_blackhole(
         // set on portal). virtualizable.py:126-137: code from resume
         // data, not heap. Lookup-only: trace setup already compiled.
         let w_code = section.code;
-        let _ = w_code;
-        let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
+        let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _, w_code) {
             Some(pjc) => pjc,
             None => {
                 release_chain_bh(prev_bh);
@@ -1532,8 +1531,9 @@ pub fn blackhole_resume_via_rd_numb(
             return None;
         }
         let code = unsafe { &*raw_code };
-        let _ = code_ptr;
-        let pyjitcode = writer.callcontrol().find_jitcode(code as *const _)?;
+        let pyjitcode = writer
+            .callcontrol()
+            .find_jitcode(code as *const _, code_ptr)?;
         if pyjitcode.has_abort_opcode() {
             return None;
         }

@@ -72,6 +72,13 @@ impl PyJitCode {
         self.has_abort
     }
 
+    /// RPython's freshly-allocated `JitCode` shells have empty bytecode
+    /// arrays until `assembler.assemble(...)` fills them. pyre's split
+    /// wrapper uses `pc_map.is_empty()` as the same "still a shell" test.
+    pub fn is_populated(&self) -> bool {
+        !self.metadata.pc_map.is_empty()
+    }
+
     /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
     /// (call.py:168 `jitcode = JitCode(graph.name, fnaddr, calldescr, ...)`).
     ///

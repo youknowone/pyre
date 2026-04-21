@@ -128,9 +128,12 @@ pub struct CallControl {
 
     /// call.py:29 `self.jitcodes = {}` — map `{graph: jitcode}`.
     ///
-    /// pyre keys on the opaque `CodeObject*` (erased to `usize`) rather
-    /// than a flow-graph reference because pyre's "graph" is a Python
-    /// bytecode object; the identity semantics are the same.
+    /// pyre keys on the wrapping `w_code` object when available,
+    /// falling back to the raw `CodeObject*` only for tests or local
+    /// callers that have no wrapper pointer. That keeps the cache
+    /// closer to RPython's "graph object identity" and aligns it with
+    /// the trace-side `MetaInterpStaticData.by_code` table, which is
+    /// already keyed by `w_code`.
     ///
     /// Values are `Arc<PyJitCode>` so the same allocation can sit in
     /// `MetaInterpStaticData.jitcodes` too. RPython's two stores hold
@@ -223,8 +226,10 @@ impl CallControl {
     /// directly after `make_jitcodes()` has populated the dict; no
     /// compilation side effect. Returns `None` if `code` has not been
     /// compiled yet.
-    pub fn find_jitcode(&self, code: *const CodeObject) -> Option<&PyJitCode> {
-        self.jitcodes.get(&(code as usize)).map(|arc| arc.as_ref())
+    pub fn find_jitcode(&self, code: *const CodeObject, w_code: *const ()) -> Option<&PyJitCode> {
+        self.jitcodes
+            .get(&Self::jitcode_key(code, w_code))
+            .map(|arc| arc.as_ref())
     }
 
     /// `Arc`-cloning variant used by the trace-side `state::jitcode_for`
@@ -233,10 +238,31 @@ impl CallControl {
     /// `MetaInterpStaticData.jitcodes` and `CallControl.jitcodes`
     /// hold the same Python `JitCode` objects via refcount semantics;
     /// this helper is the Rust analog.
-    pub fn find_jitcode_arc(&self, code: *const CodeObject) -> Option<std::sync::Arc<PyJitCode>> {
+    pub fn find_jitcode_arc(
+        &self,
+        code: *const CodeObject,
+        w_code: *const (),
+    ) -> Option<std::sync::Arc<PyJitCode>> {
         self.jitcodes
-            .get(&(code as usize))
+            .get(&Self::jitcode_key(code, w_code))
             .map(std::sync::Arc::clone)
+    }
+
+    /// Compiled-only variant used by the trace-side callback: return the
+    /// shared `Arc<PyJitCode>` only once the shell has been populated by
+    /// the codewriter drain. Mirrors RPython's "read self.jitcodes[graph]"
+    /// runtime pattern, where callers expect the cached object to already
+    /// carry bytecode instead of an empty constructor shell.
+    pub fn find_compiled_jitcode_arc(
+        &self,
+        code: *const CodeObject,
+        w_code: *const (),
+    ) -> Option<std::sync::Arc<PyJitCode>> {
+        let arc = self.jitcodes.get(&Self::jitcode_key(code, w_code))?;
+        if !arc.is_populated() {
+            return None;
+        }
+        Some(std::sync::Arc::clone(arc))
     }
 
     /// Reverse lookup: find the `PyJitCode` whose inner `JitCode` matches
@@ -358,7 +384,7 @@ impl CallControl {
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) -> &'static PyJitCode {
-        let key = code as *const CodeObject as usize;
+        let key = Self::jitcode_key(code as *const CodeObject, w_code);
         let needs_rebuild = if let Some(existing) = self.jitcodes.get(&key) {
             merge_point_pc.is_some() && existing.merge_point_pc != merge_point_pc
         } else {
@@ -435,6 +461,14 @@ impl CallControl {
         let raw_ptr = std::sync::Arc::as_ptr(&arc);
         self.jitcodes.insert(key, arc);
         raw_ptr
+    }
+
+    pub(crate) fn jitcode_key(code: *const CodeObject, w_code: *const ()) -> usize {
+        if !w_code.is_null() {
+            w_code as usize
+        } else {
+            code as usize
+        }
     }
 }
 
