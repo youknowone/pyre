@@ -732,33 +732,57 @@ pub fn transform_extend_with_char_count(ann: &RPythonAnnotator, block_subset: &[
 ///                     s_dict.dictdef.generalize_key(self.binding(op.args[1]))
 /// ```
 ///
-/// The port runs as an intentional no-op pending the rtyper-phase
-/// port. Two Rust-side prerequisites block the rewrite:
-///
-/// 1. **ConstValue key typing.** Upstream stores `s.const` (any
-///    immutable Python value — int, str, float …) as the dict key,
-///    but the Rust [`ConstValue::Dict`] variant is
-///    `HashMap<String, ConstValue>` and only supports string keys. A
-///    faithful rewrite of `[2, 3]` into a `Dict{ ... }` cannot
-///    preserve the original keys, and any string-substitute scheme
-///    (e.g. `format!("{:?}", key)`) changes the runtime dict to be
-///    keyed by debug-formatted strings — `contains(2, dict)` would
-///    then return False and the program would silently miscompile.
-/// 2. **Downstream lowering.** The rewrite's sole benefit is runtime
-///    O(1) dict lookup in place of linear list scan, which only
-///    materialises once the rtyper lowers the Constant(dict) into a
-///    real hash-map literal. The Rust port is currently
-///    annotator-only; no rtyper exists to consume the rewritten
-///    `contains(x, dict)`. Rewriting without a consumer has no
-///    observable effect (since the rewritten Constant never
-///    executes) while risking the miscompilation path above.
-///
-/// The pass therefore stays in [`DEFAULT_EXTRA_PASSES`] for
-/// line-by-line parity with upstream's pass list, but with an empty
-/// body until the rtyper port lands and [`ConstValue::Dict`] (or a
-/// new companion variant) supports arbitrary-typed keys.
-pub fn transform_list_contains(_ann: &RPythonAnnotator, _block_subset: &[BlockRef]) {
-    // Intentional no-op — see the doc comment above.
+pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
+    for block in block_subset {
+        let mut newlist_sources: HashMap<Variable, Vec<Hlvalue>> = HashMap::new();
+        let ops_len = block.borrow().operations.len();
+        for i in 0..ops_len {
+            let op = block.borrow().operations[i].clone();
+            if op.opname == "newlist" {
+                let Hlvalue::Variable(result_v) = &op.result else {
+                    continue;
+                };
+                newlist_sources.insert(result_v.clone(), op.args.clone());
+            } else if op.opname == "contains" {
+                let Some(Hlvalue::Variable(arg0_v)) = op.args.first() else {
+                    continue;
+                };
+                let Some(newlist_args) = newlist_sources.get(arg0_v) else {
+                    continue;
+                };
+                let mut items: HashMap<ConstValue, ConstValue> = HashMap::new();
+                let mut all_constant = true;
+                for v in newlist_args {
+                    let s = ann
+                        .annotation(v)
+                        .expect("transform_list_contains: missing annotation");
+                    if !s.is_immutable_constant() {
+                        all_constant = false;
+                        break;
+                    }
+                    let key = s
+                        .const_()
+                        .cloned()
+                        .expect("transform_list_contains: immutable constant missing const");
+                    items.insert(key, ConstValue::None);
+                }
+                if all_constant {
+                    block.borrow_mut().operations[i].args[0] =
+                        Hlvalue::Constant(Constant::new(ConstValue::Dict(items)));
+                    let s_dict = ann
+                        .annotation(&block.borrow().operations[i].args[0])
+                        .expect("transform_list_contains: dict annotation missing");
+                    let SomeValue::Dict(s_dict) = s_dict else {
+                        panic!("transform_list_contains: rewritten contains lhs is not SomeDict");
+                    };
+                    s_dict
+                        .dictdef
+                        .generalize_key(&ann.binding(&op.args[1]))
+                        .expect("transform_list_contains: generalize_key failed");
+                }
+            }
+        }
+    }
 }
 
 // References to unused imports during deferred-port phase would trip
@@ -1061,5 +1085,90 @@ mod tests {
             panic!();
         };
         assert_eq!(arg3, &s);
+    }
+
+    #[test]
+    fn transform_list_contains_rewrites_constant_newlist_to_dict_constant() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![
+                Hlvalue::Constant(C::new(CV::Int(2))),
+                Hlvalue::Constant(C::new(CV::Int(3))),
+            ],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        let Hlvalue::Constant(dict_c) = &ops[1].args[0] else {
+            panic!("contains lhs should be rewritten to Constant(dict)");
+        };
+        let CV::Dict(items) = &dict_c.value else {
+            panic!("contains lhs constant should carry Dict");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items.get(&CV::Int(2)), Some(&CV::None));
+        assert_eq!(items.get(&CV::Int(3)), Some(&CV::None));
+    }
+
+    #[test]
+    fn transform_list_contains_leaves_nonconstant_newlist_alone() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let mut source = Variable::new();
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        source.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Variable(source.clone())],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
     }
 }

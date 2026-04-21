@@ -1717,7 +1717,7 @@ impl FlowContext {
 
     fn find_global(&self, varname: &str) -> Result<Hlvalue, FlowContextError> {
         if let Some(globals) = self.w_globals.value.dict_items() {
-            if let Some(value) = globals.get(varname) {
+            if let Some(value) = globals.get(&ConstValue::Str(varname.to_string())) {
                 return Ok(Hlvalue::Constant(Constant::new(value.clone())));
             }
         } else {
@@ -3513,7 +3513,10 @@ mod test {
         ctx
     }
 
-    fn flow_context_with_globals(src: &str, globals: HashMap<String, ConstValue>) -> FlowContext {
+    fn flow_context_with_globals(
+        src: &str,
+        globals: HashMap<ConstValue, ConstValue>,
+    ) -> FlowContext {
         let host = HostCode::from_code(&compile_function_body(src));
         let inputargs = (0..host.formalargcount())
             .map(|_| Hlvalue::Variable(Variable::new()))
@@ -3650,7 +3653,7 @@ mod test {
     #[test]
     fn find_global_reads_function_globals_before_builtins() {
         let mut globals = HashMap::new();
-        globals.insert("sentinel".to_owned(), ConstValue::Int(42));
+        globals.insert(ConstValue::Str("sentinel".to_owned()), ConstValue::Int(42));
         let ctx = flow_context_with_globals("def f():\n    return sentinel\n", globals);
         assert_eq!(ctx.find_global("sentinel").unwrap(), iconst(42));
         let print_obj = HOST_ENV.lookup_builtin("print").unwrap();

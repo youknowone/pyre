@@ -1581,9 +1581,9 @@ impl Bookkeeper {
             ConstValue::Dict(items) => {
                 // upstream bookkeeper.py:266-298 memoises via
                 // `immutable_cache` and handles OrderedDict / r_dict
-                // via the dict type. Our ConstValue::Dict keys are
-                // strings only (flowspace globals), so we build a
-                // plain SomeDict with string key type.
+                // via the dict type. Mirror upstream's `for ek, ev in
+                // items: generalize_key(immutablevalue(ek));
+                // generalize_value(immutablevalue(ev))`.
                 let dictdef = DictDef::new(
                     Some(self.clone()),
                     SomeValue::Impossible,
@@ -1593,7 +1593,7 @@ impl Bookkeeper {
                     false,
                 );
                 for (k, v) in items {
-                    let s_k = SomeValue::String(SomeString::new(false, !k.contains('\x00')));
+                    let s_k = self.immutablevalue(k)?;
                     let s_v = self.immutablevalue(v)?;
                     dictdef
                         .generalize_key(&s_k)

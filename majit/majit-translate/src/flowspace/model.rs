@@ -1430,8 +1430,10 @@ pub enum ConstValue {
     /// `Eq`). Use `ConstValue::float(value)` / `ConstValue::as_float()`
     /// to convert.
     Float(u64),
-    /// Python dict constant. Used for `func.__globals__`.
-    Dict(HashMap<String, ConstValue>),
+    /// Python dict constant. Mirrors upstream `Constant(dict)` and is
+    /// used both for `func.__globals__` and optimizer rewrites like
+    /// `transform_list_contains`.
+    Dict(HashMap<ConstValue, ConstValue>),
     /// Python string constant. Used by `checkgraph()` to validate
     /// single-character switch exitcases and `"default"` ordering.
     Str(String),
@@ -1503,11 +1505,22 @@ impl Hash for ConstValue {
             ConstValue::Int(value) => value.hash(state),
             ConstValue::Float(bits) => bits.hash(state),
             ConstValue::Dict(items) => {
-                let mut entries: Vec<_> = items.iter().collect();
-                entries.sort_by(|left, right| left.0.cmp(right.0));
-                for (key, value) in entries {
-                    key.hash(state);
-                    value.hash(state);
+                // HashMap iteration order is nondeterministic; hash
+                // each entry independently and sort the resulting
+                // u64s so `ConstValue::Dict` remains stable under
+                // hashing regardless of insertion order.
+                let mut entry_hashes: Vec<u64> = items
+                    .iter()
+                    .map(|(key, value)| {
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        key.hash(&mut h);
+                        value.hash(&mut h);
+                        h.finish()
+                    })
+                    .collect();
+                entry_hashes.sort_unstable();
+                for entry_hash in entry_hashes {
+                    entry_hash.hash(state);
                 }
             }
             ConstValue::Str(value) => value.hash(state),
@@ -1942,7 +1955,7 @@ impl ConstValue {
         }
     }
 
-    pub fn dict_items(&self) -> Option<&HashMap<String, ConstValue>> {
+    pub fn dict_items(&self) -> Option<&HashMap<ConstValue, ConstValue>> {
         match self {
             ConstValue::Dict(items) => Some(items),
             _ => None,
@@ -1961,10 +1974,7 @@ impl ConstValue {
     /// Line-by-line port for the `ConstValue` variants that can appear
     /// as `w_stararg.value` in practice: tuple/list (flow-space's
     /// BUILD_TUPLE/BUILD_LIST output), str (per-char iteration matches
-    /// Python semantics), dict (iteration over keys in insertion order;
-    /// HashMap iteration order is used in the Rust port — upstream's
-    /// dict is also unordered before the flow-graph builder sorts
-    /// explicitly, so this matches upstream's pre-sort state).
+    /// Python semantics), dict (iteration over keys).
     pub fn iter_items(&self) -> Option<Vec<ConstValue>> {
         match self {
             ConstValue::Tuple(items) | ConstValue::List(items) => Some(items.clone()),
@@ -1974,7 +1984,7 @@ impl ConstValue {
                     .map(|c| ConstValue::Str(c.to_string()))
                     .collect(),
             ),
-            ConstValue::Dict(items) => Some(items.keys().cloned().map(ConstValue::Str).collect()),
+            ConstValue::Dict(items) => Some(items.keys().cloned().collect()),
             _ => None,
         }
     }
