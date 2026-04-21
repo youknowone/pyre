@@ -1741,15 +1741,19 @@ impl CodeWriter {
                 let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
                 $ssarepr.insns.push(insn.clone());
                 // Step 6.1 Phase 2c: attach the raise edge to
-                // `graph.exceptblock` (`model.py:22-23`). Like
-                // `emit_ref_return!`, link args are placeholder
-                // Constants until pyre materialises SSA Variables
-                // for exception type/value.
+                // `graph.exceptblock` (`model.py:22-23`). Upstream
+                // `flowspace/flowcontext.py:1253` closes the block with
+                // `Link([w_exc.w_type, w_exc.w_value], exceptblock)` —
+                // source-side Variables (not Constants) whose regalloc
+                // colors later coalesce with `exceptblock.inputargs`.
+                // pyre has no statically-tracked etype so we allocate
+                // a fresh Variable; evalue is also fresh for now —
+                // wiring the tracing-side exception register through
+                // is slice 2h.
+                let etype_var: super::flow::FlowValue = graph.fresh_untyped_variable().into();
+                let evalue_var: super::flow::FlowValue = graph.fresh_untyped_variable().into();
                 let link = super::flow::Link::new(
-                    vec![
-                        super::flow::Constant::signed(0).into(),
-                        super::flow::Constant::signed(0).into(),
-                    ],
+                    vec![etype_var, evalue_var],
                     Some(graph.exceptblock.clone()),
                     None,
                 );
@@ -1769,12 +1773,15 @@ impl CodeWriter {
                 // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
                 // re-raise opname shares the `Block.exits` topology
                 // (`flatten.py` emits the two as alternative codings
-                // of the same exception exit).
+                // of the same exception exit).  Upstream
+                // `flowspace/flowcontext.py:1253` wires real
+                // `(w_type, w_value)` FlowValues; pyre has no tracked
+                // identity here so allocate fresh Variables rather
+                // than Constant placeholders.
+                let etype_var: super::flow::FlowValue = graph.fresh_untyped_variable().into();
+                let evalue_var: super::flow::FlowValue = graph.fresh_untyped_variable().into();
                 let link = super::flow::Link::new(
-                    vec![
-                        super::flow::Constant::signed(0).into(),
-                        super::flow::Constant::signed(0).into(),
-                    ],
+                    vec![etype_var, evalue_var],
                     Some(graph.exceptblock.clone()),
                     None,
                 );

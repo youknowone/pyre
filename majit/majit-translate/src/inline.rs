@@ -292,8 +292,22 @@ fn remap_callee_values(
         // exitswitch variable is always a block-local value referenced
         // by the raising op / branch condition, so it is already in
         // `op_value_refs` — but the per-link args must be copied here.
+        // Upstream `rpython/translator/backendopt/inline.py:268-269
+        // copy_link` also renames `link.last_exception` and
+        // `link.last_exc_value`, so the extravars must be present in
+        // the value map before `remap_control_flow_metadata` runs.
         for link in &block.exits {
             for arg in &link.args {
+                if let Some(v) = arg.as_value() {
+                    map.entry(v).or_insert_with(|| graph.alloc_value());
+                }
+            }
+            if let Some(arg) = &link.last_exception {
+                if let Some(v) = arg.as_value() {
+                    map.entry(v).or_insert_with(|| graph.alloc_value());
+                }
+            }
+            if let Some(arg) = &link.last_exc_value {
                 if let Some(v) = arg.as_value() {
                     map.entry(v).or_insert_with(|| graph.alloc_value());
                 }

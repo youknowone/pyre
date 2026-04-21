@@ -298,9 +298,26 @@ impl RegAllocator {
     /// RPython: `RegAllocator.coalesce_variables()` — regalloc.py:79-96.
     /// Coalesce link.args[i] with target.inputargs[i] for every exit
     /// link, matching upstream's `for link in block.exits: ...` loop.
+    /// Upstream also pre-seeds the depgraph with nodes for
+    /// `link.last_exception` / `link.last_exc_value` so any downstream
+    /// `getcolor(v)` against those extravars finds a colored node.
     fn coalesce_variables(&mut self, graph: &FunctionGraph, consider: &dyn Fn(ValueId) -> bool) {
         for block in &graph.blocks {
             for link in &block.exits {
+                if let Some(arg) = &link.last_exception {
+                    if let Some(v) = arg.as_value() {
+                        if consider(v) {
+                            self.depgraph.add_node(v);
+                        }
+                    }
+                }
+                if let Some(arg) = &link.last_exc_value {
+                    if let Some(v) = arg.as_value() {
+                        if consider(v) {
+                            self.depgraph.add_node(v);
+                        }
+                    }
+                }
                 let target_block = graph.block(link.target);
                 for (v, &w) in link.args.iter().zip(target_block.inputargs.iter()) {
                     if let Some(v) = v.as_value() {
