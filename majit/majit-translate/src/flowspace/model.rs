@@ -153,7 +153,36 @@ enum HostObjectKind {
     /// (bookkeeper.py:299-306). `referent=None` models a dead
     /// weakref whose target has been garbage-collected.
     Weakref { referent: Option<HostObject> },
+    /// Host-side native callable — wraps a Rust closure that represents
+    /// a Python-callable whose behaviour we actually need to execute at
+    /// annotation time.
+    ///
+    /// Upstream RPython evaluates e.g. `x._freeze_()` (bookkeeper.py:332)
+    /// or `prop.fget(self)` (descriptor getattr) directly against the
+    /// Python object. The Rust port has no Python runtime, so test
+    /// fixtures and bootstrap code register the concrete native closure
+    /// that implements those methods. The helper
+    /// [`HostObject::call_host`] is the single entry-point for invoking
+    /// these — higher-level call helpers (property getter dispatch,
+    /// `_freeze_` / `_cleanup_` enforcement, …) all route through it.
+    ///
+    /// Rust language adaptation (parity rule #1, CLAUDE.md): Python
+    /// stores bound callables directly as `__dict__` values and invokes
+    /// them via the descriptor protocol. Rust lacks an embedded Python
+    /// interpreter, so the carrier is specialised. Mirror behaviour —
+    /// not structure — is preserved.
+    NativeCallable { func: HostCallableFn },
 }
+
+/// Zero- or N-arg host callable. `args[0]` is the bound `self` if any
+/// (matching how upstream `BoundMethod.__call__` forwards `self` to
+/// `__func__`); zero-arg getters / `_freeze_` / `_cleanup_` pass a
+/// single-element slice.
+///
+/// Result: `Ok(ConstValue)` holds the concrete return, `Err(String)`
+/// propagates host-side failures (upstream `TypeError`, unhandled
+/// descriptor case, …) which callers rewrap into `AnnotatorError`.
+pub type HostCallableFn = Arc<dyn Fn(&[ConstValue]) -> Result<ConstValue, String> + Send + Sync>;
 
 impl PartialEq for HostObject {
     fn eq(&self, other: &Self) -> bool {
@@ -403,6 +432,9 @@ impl HostObject {
             HostObjectKind::ClassMethod { .. } => HOST_ENV.lookup_builtin("classmethod"),
             HostObjectKind::BoundMethod { .. } => HOST_ENV.lookup_builtin("method"),
             HostObjectKind::Weakref { .. } => HOST_ENV.lookup_builtin("weakref"),
+            HostObjectKind::NativeCallable { .. } => {
+                HOST_ENV.lookup_builtin("builtin_function_or_method")
+            }
         }
     }
 
@@ -680,12 +712,150 @@ impl HostObject {
             _ => None,
         }
     }
+
+    /// Construct a host callable from a Rust closure.
+    ///
+    /// `qualname` is the debug identifier (upstream `func.__qualname__`);
+    /// `func` is invoked by [`Self::call_host`] with the positional args.
+    pub fn new_native_callable(qualname: impl Into<String>, func: HostCallableFn) -> Self {
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname: qualname.into(),
+                kind: HostObjectKind::NativeCallable { func },
+            }),
+        }
+    }
+
+    pub fn is_native_callable(&self) -> bool {
+        matches!(self.inner.kind, HostObjectKind::NativeCallable { .. })
+    }
+
+    /// Invoke the host callable — upstream Python `obj(*args)`.
+    ///
+    /// Dispatches by kind:
+    /// * `NativeCallable { func }` → `func(args)` directly.
+    /// * `BoundMethod { self_obj, func }` → prepend `self_obj` to
+    ///   `args` and recurse into `func` (upstream
+    ///   `BoundMethod.__call__ = self.__func__(self.__self__, *args)`).
+    /// * `UserFunction { graph_func }` →
+    ///   `Err(HostCallError::RequiresFlowEvaluator)` — running a user
+    ///   graph requires the annotator / flowspace; the caller must
+    ///   route through `Bookkeeper::pbc_call` instead of executing
+    ///   host-side.
+    /// * `BuiltinCallable` with no registered closure →
+    ///   `Err(HostCallError::NoNativeImpl)`.
+    /// * everything else → `Err(HostCallError::NotCallable)`.
+    ///
+    /// `HostCallError::RequiresFlowEvaluator` is a specific boundary
+    /// marker: upstream RPython evaluates the `_freeze_` /
+    /// `_cleanup_` / `property.fget` call through real Python, but
+    /// the Rust port has no host-side evaluator for user graphs yet.
+    /// Callers (`call_freeze_method`, `call_cleanup_method`,
+    /// `host_descriptor_get`) translate this variant into an
+    /// `AnnotatorError` / `HostGetAttrError::Unsupported` citing the
+    /// Phase 6 graph-evaluator dependency, so the boundary stays
+    /// discoverable.
+    pub fn call_host(&self, args: &[ConstValue]) -> Result<ConstValue, HostCallError> {
+        match &self.inner.kind {
+            HostObjectKind::NativeCallable { func } => func(args).map_err(HostCallError::Native),
+            HostObjectKind::BoundMethod { self_obj, func, .. } => {
+                let mut bound_args: Vec<ConstValue> = Vec::with_capacity(args.len() + 1);
+                bound_args.push(ConstValue::HostObject(self_obj.clone()));
+                bound_args.extend_from_slice(args);
+                func.call_host(&bound_args)
+            }
+            HostObjectKind::UserFunction { .. } => {
+                Err(HostCallError::RequiresFlowEvaluator(self.qualname().into()))
+            }
+            HostObjectKind::BuiltinCallable => {
+                Err(HostCallError::NoNativeImpl(self.qualname().into()))
+            }
+            _ => Err(HostCallError::NotCallable(self.qualname().into())),
+        }
+    }
+
+    /// Predicate: `true` when [`Self::call_host`] can return
+    /// `Ok(...)` directly — i.e. the inner kind is a
+    /// `NativeCallable` or a `BoundMethod` whose `__func__`
+    /// transitively reaches one. `false` for `UserFunction` /
+    /// unregistered `BuiltinCallable` / non-callable — these
+    /// require the host-graph evaluator that hasn't landed yet.
+    pub fn is_host_executable(&self) -> bool {
+        match &self.inner.kind {
+            HostObjectKind::NativeCallable { .. } => true,
+            HostObjectKind::BoundMethod { func, .. } => func.is_host_executable(),
+            _ => false,
+        }
+    }
+}
+
+/// Discriminated error channel for [`HostObject::call_host`]. Upstream
+/// Python `obj(*args)` collapses all three failure modes into whatever
+/// exception the callee raises; the Rust port splits them because
+/// different annotator callsites need different fallbacks — the
+/// `RequiresFlowEvaluator` marker in particular is the boundary
+/// between "host-side executable" (NativeCallable) and
+/// "annotator-side PBC call required" (UserFunction).
+#[derive(Clone, Debug)]
+pub enum HostCallError {
+    /// upstream Python `TypeError: 'X' object is not callable` —
+    /// reached when a class / module / instance without a registered
+    /// `__call__` is invoked.
+    NotCallable(String),
+    /// `BuiltinCallable` shell without a registered native impl —
+    /// use `HostObject::new_native_callable` to wire one up.
+    NoNativeImpl(String),
+    /// `UserFunction` (or `BoundMethod` of one) — running the call
+    /// requires the host-graph evaluator. Until that Phase 6 piece
+    /// lands, the annotator surfaces this as a specific error so the
+    /// limitation is discoverable instead of a generic "not callable".
+    RequiresFlowEvaluator(String),
+    /// `NativeCallable` closure raised — upstream's arbitrary Python
+    /// exception path.
+    Native(String),
+}
+
+impl std::fmt::Display for HostCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HostCallError::NotCallable(q) => {
+                write!(f, "HostObject::call_host: {q:?} is not callable")
+            }
+            HostCallError::NoNativeImpl(q) => write!(
+                f,
+                "HostObject::call_host: builtin {q:?} has no native impl registered (use HostObject::new_native_callable)",
+            ),
+            HostCallError::RequiresFlowEvaluator(q) => write!(
+                f,
+                "HostObject::call_host: user function {q:?} has no host-level body (route through Bookkeeper::pbc_call; Phase 6 host-graph evaluator not yet landed)",
+            ),
+            HostCallError::Native(msg) => f.write_str(msg),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostGetAttrError {
     Missing,
     Unsupported,
+}
+
+/// Upstream Python predicate `type(v).__set__` / `__delete__` exists — a
+/// class-dict entry qualifying as a *data descriptor* in the descriptor
+/// protocol (`object.__getattribute__` CPython `Objects/object.c`
+/// `_PyObject_GenericGetAttrWithDict`).
+///
+/// Data descriptors win against the instance `__dict__`; non-data
+/// descriptors lose. The Rust HostObject model only represents one data
+/// descriptor today: `property` (has `__set__` / `__delete__` even when
+/// `fset` / `fdel` are `None` — the setter slot still exists on the
+/// descriptor type). `staticmethod` / `classmethod` / regular functions
+/// / `NativeCallable` are non-data descriptors.
+fn is_data_descriptor(value: &ConstValue) -> bool {
+    match value {
+        ConstValue::HostObject(h) => h.is_property(),
+        _ => false,
+    }
 }
 
 fn host_class_mro_lookup(cls: &HostObject, name: &str) -> Option<(ConstValue, HostObject)> {
@@ -728,13 +898,50 @@ fn host_descriptor_get(
             )))
         }
         ConstValue::HostObject(host) if host.is_property() => {
-            if self_obj.is_some() {
-                Err(HostGetAttrError::Unsupported)
+            // upstream property descriptor: `prop.__get__(obj, cls)`
+            // returns `prop.fget(obj)` when `obj is not None` and the
+            // getter is defined; otherwise the raw property descriptor
+            // is returned (for class-level lookup).
+            let Some(self_obj) = self_obj else {
+                return Ok(ConstValue::HostObject(host));
+            };
+            let Some(fget) = host.property_fget().cloned() else {
+                // Property without fget — upstream Python raises
+                // `AttributeError: unreadable attribute`, identical to
+                // a missing name. Route through Missing so callers that
+                // handle AttributeError (instance-dict fallback,
+                // FrozenDesc.has_attribute) treat it the same.
+                return Err(HostGetAttrError::Missing);
+            };
+            // upstream executes the fget in real Python. The Rust
+            // port dispatches via `HostObject::call_host` — that
+            // runs `NativeCallable` directly, and returns
+            // `HostCallError::RequiresFlowEvaluator` for
+            // `UserFunction` (the Phase 6 host-graph evaluator isn't
+            // landed yet). Either failure maps to `Unsupported` here:
+            // the attribute exists, the value just can't be obtained
+            // host-side.
+            fget.call_host(&[ConstValue::HostObject(self_obj.clone())])
+                .map_err(|_| HostGetAttrError::Unsupported)
+        }
+        ConstValue::HostObject(host) if host.is_user_function() => {
+            if let Some(self_obj) = self_obj {
+                Ok(ConstValue::HostObject(HostObject::new_bound_method(
+                    format!("{}.{}", self_obj.qualname(), name),
+                    self_obj.clone(),
+                    host,
+                    name,
+                    origin_class.clone(),
+                )))
             } else {
                 Ok(ConstValue::HostObject(host))
             }
         }
-        ConstValue::HostObject(host) if host.is_user_function() => {
+        ConstValue::HostObject(host) if host.is_native_callable() => {
+            // Native Rust-backed method stored in the class dict. Upstream
+            // treats any callable in `cls.__dict__` as a regular function
+            // descriptor — instance lookup binds `self`, class lookup
+            // returns the raw callable.
             if let Some(self_obj) = self_obj {
                 Ok(ConstValue::HostObject(HostObject::new_bound_method(
                     format!("{}.{}", self_obj.qualname(), name),
@@ -751,6 +958,45 @@ fn host_descriptor_get(
     }
 }
 
+/// Rust equivalent of upstream Python `getattr(obj, name)` applied to
+/// a flow-space / annotator constant — the single code path shared
+/// between `flowspace::operation::GetAttr.constfold` (operation.py:624-646)
+/// and `unaryop::OpKind::GetAttr` (unaryop.py:215-229) for constant
+/// receivers. The divergence lives only at the wrap step: flowspace
+/// re-wraps with `const(result)`; the annotator re-wraps with
+/// `bookkeeper.immutablevalue(result)`.
+///
+/// Returns:
+/// * `Ok(Some(value))` — attribute lookup succeeded.
+/// * `Ok(None)` — upstream's `WrapException` swallow path
+///   (operation.py:643-646): the result couldn't be wrapped as a
+///   Constant; fold declines silently.
+/// * `Err(msg)` — upstream's "always raises" branch
+///   (operation.py:637-642); caller raises `FlowingError` (flowspace)
+///   or an `AnnotatorError` (annotator).
+///
+/// PRE-EXISTING-ADAPTATION: primitive constants (Int / Float / Str / …)
+/// would upstream execute Python's real `getattr` — e.g. `(1).real`
+/// evaluates through Python's `int.real` descriptor — and the Rust
+/// port has no Python runtime to defer to. Those paths currently
+/// return `Ok(None)` so the call falls through to the annotator's
+/// `find_method` / host-method emulators, matching upstream's
+/// `WrapException` swallow where `const` can't re-wrap the result.
+pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>, String> {
+    match obj {
+        ConstValue::HostObject(h) => match host_getattr(h, name) {
+            Ok(value) => Ok(Some(value)),
+            Err(HostGetAttrError::Missing) => Err(format!(
+                "getattr({}, {:?}) always raises AttributeError",
+                h.qualname(),
+                name
+            )),
+            Err(HostGetAttrError::Unsupported) => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
 /// Best-effort host-level `getattr(obj, name)` over the HostObject
 /// kinds modelled by the current Rust port.
 ///
@@ -759,11 +1005,16 @@ fn host_descriptor_get(
 /// * modules read from the module dict;
 /// * class lookup walks the class MRO, applies `staticmethod.__get__`,
 ///   and materialises bound methods for `classmethod`;
-/// * instance lookup consults `__dict__` first, then the class MRO, and
-///   materialises bound methods for plain functions / classmethods.
+/// * instance lookup follows upstream `object.__getattribute__`:
+///   class-MRO lookup first, data descriptors (`property`) fire
+///   before the instance dict, then `__dict__[name]`, then non-data
+///   descriptors / raw class attrs, then `AttributeError`.
 ///
-/// Descriptors that would require executing Python code, notably
-/// instance `property` getters, still remain unresolved here.
+/// Instance `property` getters are evaluated through
+/// [`HostObject::call_host`] against `property.fget`. A missing `fget`
+/// surfaces as `HostGetAttrError::Missing` (upstream's
+/// `AttributeError: unreadable attribute`); a host-side failure during
+/// the getter call surfaces as `HostGetAttrError::Unsupported`.
 pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGetAttrError> {
     if pyobj.is_module() {
         return pyobj
@@ -778,16 +1029,32 @@ pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGe
         return host_descriptor_get(value, name, None, pyobj, &origin_class);
     }
     if pyobj.is_instance() {
-        if let Some(value) = pyobj.instance_get(name) {
-            return Ok(value);
-        }
         let cls = pyobj
             .instance_class()
             .ok_or(HostGetAttrError::Unsupported)?;
-        let Some((value, origin_class)) = host_class_mro_lookup(cls, name) else {
-            return Err(HostGetAttrError::Missing);
-        };
-        return host_descriptor_get(value, name, Some(pyobj), cls, &origin_class);
+        // upstream CPython `object.__getattribute__` descriptor order
+        // (`_PyObject_GenericGetAttrWithDict`, Objects/object.c):
+        //   1. walk `type(obj).__mro__` for `name`;
+        //   2. if the class-level entry is a *data descriptor* (has
+        //      `__set__` / `__delete__`), call `__get__` and return;
+        //   3. look up `obj.__dict__[name]`;
+        //   4. if the class-level entry exists but is a non-data
+        //      descriptor (has `__get__` only) or a plain attribute,
+        //      call `__get__` / return the raw value;
+        //   5. AttributeError.
+        let class_hit = host_class_mro_lookup(cls, name);
+        if let Some((value, origin_class)) = &class_hit
+            && is_data_descriptor(value)
+        {
+            return host_descriptor_get(value.clone(), name, Some(pyobj), cls, origin_class);
+        }
+        if let Some(value) = pyobj.instance_get(name) {
+            return Ok(value);
+        }
+        if let Some((value, origin_class)) = class_hit {
+            return host_descriptor_get(value, name, Some(pyobj), cls, &origin_class);
+        }
+        return Err(HostGetAttrError::Missing);
     }
     Err(HostGetAttrError::Unsupported)
 }
@@ -3681,5 +3948,201 @@ mod tests {
             err.to_string()
                 .contains("unsupported HostObject serialization")
         );
+    }
+
+    #[test]
+    fn native_callable_invokes_closure() {
+        let f = HostObject::new_native_callable(
+            "pkg.always_true",
+            Arc::new(|_args| Ok(ConstValue::Bool(true))),
+        );
+        assert!(f.is_native_callable());
+        let out = f.call_host(&[]).expect("invocation succeeds");
+        assert_eq!(out, ConstValue::Bool(true));
+    }
+
+    #[test]
+    fn native_callable_receives_positional_args() {
+        let f = HostObject::new_native_callable(
+            "pkg.add_one",
+            Arc::new(|args| match args {
+                [ConstValue::Int(n)] => Ok(ConstValue::Int(n + 1)),
+                _ => Err("add_one: expected one int".to_string()),
+            }),
+        );
+        let out = f.call_host(&[ConstValue::Int(41)]).unwrap();
+        assert_eq!(out, ConstValue::Int(42));
+    }
+
+    #[test]
+    fn native_callable_propagates_closure_error() {
+        let f = HostObject::new_native_callable(
+            "pkg.explode",
+            Arc::new(|_args| Err("boom".to_string())),
+        );
+        let err = f.call_host(&[]).unwrap_err();
+        assert!(matches!(err, HostCallError::Native(ref m) if m.contains("boom")));
+    }
+
+    #[test]
+    fn bound_method_prepends_self_to_call_host() {
+        // BoundMethod.__call__(self, *args) → func(self_obj, *args).
+        let self_obj = HostObject::new_opaque("pkg.self_marker");
+        let inner = HostObject::new_native_callable(
+            "pkg.echo_self",
+            Arc::new(|args| match args {
+                [ConstValue::HostObject(h)] => Ok(ConstValue::HostObject(h.clone())),
+                _ => Err(format!("echo_self: wrong args ({})", args.len())),
+            }),
+        );
+        let origin = HostObject::new_class("pkg.Origin", vec![]);
+        let method = HostObject::new_bound_method(
+            "pkg.Origin.echo_self",
+            self_obj.clone(),
+            inner,
+            "echo_self",
+            origin,
+        );
+        let out = method.call_host(&[]).unwrap();
+        assert_eq!(out, ConstValue::HostObject(self_obj));
+    }
+
+    #[test]
+    fn call_host_on_non_callable_returns_error() {
+        let cls = HostObject::new_class("pkg.Plain", vec![]);
+        assert!(cls.call_host(&[]).is_err());
+        let m = HostObject::new_module("pkg.mod");
+        assert!(m.call_host(&[]).is_err());
+    }
+
+    #[test]
+    fn host_getattr_runs_property_fget_on_instance() {
+        // upstream descriptor protocol: instance getattr on a name
+        // bound to a `property` descriptor executes `prop.fget(self)`.
+        // The Rust port invokes the fget via `HostObject::call_host`.
+        let cls = HostObject::new_class("pkg.Box", vec![]);
+        let fget = HostObject::new_native_callable(
+            "pkg.Box.value_fget",
+            Arc::new(|args| match args {
+                [ConstValue::HostObject(_self)] => Ok(ConstValue::Int(7)),
+                other => Err(format!(
+                    "value_fget: expected [self], got {} args",
+                    other.len()
+                )),
+            }),
+        );
+        let prop = HostObject::new_property("pkg.Box.value", Some(fget), None, None);
+        cls.class_set("value", ConstValue::HostObject(prop));
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let out = host_getattr(&inst, "value").expect("getter must fire");
+        assert_eq!(out, ConstValue::Int(7));
+    }
+
+    #[test]
+    fn host_getattr_on_property_without_fget_is_missing() {
+        // A property without fget (pure setter). Instance access
+        // upstream raises `AttributeError: unreadable attribute`,
+        // identical semantics to a missing attribute — the Rust port
+        // surfaces `HostGetAttrError::Missing` so callers can fall
+        // through to whatever AttributeError branch they already have.
+        let cls = HostObject::new_class("pkg.Box", vec![]);
+        let prop = HostObject::new_property("pkg.Box.value", None, None, None);
+        cls.class_set("value", ConstValue::HostObject(prop));
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let err = host_getattr(&inst, "value").unwrap_err();
+        assert_eq!(err, HostGetAttrError::Missing);
+    }
+
+    #[test]
+    fn host_getattr_property_beats_instance_dict_for_data_descriptor() {
+        // Upstream CPython descriptor order: a data descriptor in the
+        // class wins against `obj.__dict__[name]`. If the instance dict
+        // has `value=99` *and* the class has `value=property(fget)`,
+        // `obj.value` still calls the fget.
+        let cls = HostObject::new_class("pkg.Box", vec![]);
+        let fget = HostObject::new_native_callable(
+            "pkg.Box.value_fget",
+            Arc::new(|args| match args {
+                [ConstValue::HostObject(_self)] => Ok(ConstValue::Int(7)),
+                other => Err(format!(
+                    "value_fget: expected [self], got {} args",
+                    other.len()
+                )),
+            }),
+        );
+        let prop = HostObject::new_property("pkg.Box.value", Some(fget), None, None);
+        cls.class_set("value", ConstValue::HostObject(prop));
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        inst.instance_set("value", ConstValue::Int(99));
+        let out = host_getattr(&inst, "value").expect("descriptor wins");
+        // Data descriptor `fget` beats the instance dict.
+        assert_eq!(out, ConstValue::Int(7));
+    }
+
+    #[test]
+    fn host_getattr_instance_dict_beats_non_data_descriptor() {
+        // A class-level `NativeCallable` is a non-data descriptor
+        // (no `__set__` / `__delete__`). The instance dict wins over
+        // it — `obj.method` returns whatever is shadowed in
+        // `obj.__dict__`.
+        let cls = HostObject::new_class("pkg.Box", vec![]);
+        let method =
+            HostObject::new_native_callable("pkg.Box.method", Arc::new(|_| Ok(ConstValue::Int(1))));
+        cls.class_set("method", ConstValue::HostObject(method));
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        inst.instance_set("method", ConstValue::Int(42));
+        let out = host_getattr(&inst, "method").expect("instance dict wins");
+        assert_eq!(out, ConstValue::Int(42));
+    }
+
+    #[test]
+    fn host_getattr_property_lookup_on_class_returns_descriptor() {
+        // Class-level lookup (no `self`): the raw property descriptor
+        // is returned, matching Python's descriptor protocol when
+        // `__get__` is called with `obj is None`.
+        let cls = HostObject::new_class("pkg.Box", vec![]);
+        let fget = HostObject::new_native_callable(
+            "pkg.Box.value_fget",
+            Arc::new(|_args| Ok(ConstValue::Int(7))),
+        );
+        let prop = HostObject::new_property("pkg.Box.value", Some(fget), None, None);
+        cls.class_set("value", ConstValue::HostObject(prop.clone()));
+        let out = host_getattr(&cls, "value").expect("class-level lookup");
+        match out {
+            ConstValue::HostObject(h) => assert_eq!(h, prop),
+            other => panic!("expected property descriptor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_function_call_host_is_not_supported() {
+        // UserFunction carries a graph; executing it requires the
+        // Phase 6 host-graph evaluator, so call_host returns the
+        // discriminated `RequiresFlowEvaluator` marker so callsites
+        // (`call_freeze_method`, `host_descriptor_get` property.fget)
+        // can fall back to their annotator-side routing.
+        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let gf = GraphFunc::new("pkg.user_fn", globals);
+        let f = HostObject::new_user_function(gf);
+        let err = f.call_host(&[]).unwrap_err();
+        assert!(matches!(err, HostCallError::RequiresFlowEvaluator(_)));
+        assert!(!f.is_host_executable());
+    }
+
+    #[test]
+    fn native_callable_is_host_executable() {
+        let f = HostObject::new_native_callable("pkg.f", Arc::new(|_| Ok(ConstValue::Int(0))));
+        assert!(f.is_host_executable());
+        // A BoundMethod whose __func__ is NativeCallable is also
+        // executable — upstream wraps the `self` prepend invisibly.
+        let self_obj = HostObject::new_opaque("pkg.self");
+        let bm = HostObject::new_bound_method(
+            "pkg.f_bound",
+            self_obj,
+            f,
+            "f",
+            HostObject::new_class("pkg.C", vec![]),
+        );
+        assert!(bm.is_host_executable());
     }
 }

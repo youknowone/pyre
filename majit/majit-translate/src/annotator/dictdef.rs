@@ -3,9 +3,6 @@
 //!
 //! RPython upstream: `rpython/annotator/dictdef.py` (117 LOC).
 //!
-//! Phase 5 P5.1 port. Closes the "same_as" identity gap that Phase 4
-//! A4.4 deferred for `SomeDict` / `SomeOrderedDict`.
-//!
 //! Rust adaptation (parity rule #1, minimum deviation):
 //!
 //! * Upstream `class DictKey(ListItem)` / `class DictValue(ListItem)`

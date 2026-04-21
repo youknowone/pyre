@@ -2,21 +2,23 @@
 //!
 //! RPython upstream: `rpython/annotator/bookkeeper.py` (614 LOC).
 //!
-//! **Phase 5 P5.2 in progress.** Ports the `immutablevalue` /
-//! `newlist` / `newdict` subset that downstream modules
-//! (builtin.py, description.py, binaryop.py) invoke directly on the
-//! bookkeeper. Fields that require the descriptor / class machinery
-//! — `descs`, `classdefs`, `methoddescs`, `emulated_pbc_calls`,
-//! `classpbc_attr_families`, `all_specializations`, etc. — land in
-//! commit 2 alongside `description.py` / `classdesc.py`.
+//! Structural port of `immutablevalue` / `newlist` / `newdict` and the
+//! descriptor / class machinery (`descs`, `classdefs`, `methoddescs`,
+//! `emulated_pbc_calls`, `frozenpbc_attr_families`, …). Fields not yet
+//! landed are documented at the site that still dispatches through the
+//! deferred branch.
 //!
-//! ## Phase 5 P5.2+ dependency-blocked helpers
+//! ## Dependency-blocked paths
 //!
-//! * `immutablevalue(HostObject)` — bound-method / weakref / extregistry
-//!   branches still return `AnnotatorError` until the corresponding
-//!   upstream helpers land (bookkeeper.py:299-333).
-//! * `register_builtins()` / `BUILTIN_ANALYZERS` registry — blocked
-//!   on `builtin.py`.
+//! * `immutablevalue(HostObject)` — the `extregistry.is_registered(x)`
+//!   branch (bookkeeper.py:312-314) returns `AnnotatorError` until the
+//!   extregistry bridge lands.
+//! * `BUILTIN_ANALYZERS` registry — blocked on `builtin.py`; the
+//!   registry stays empty and `SomeBuiltin` is seeded from the host
+//!   qualname so `specialcase.rs` can dispatch once analysers register.
+//! * `classpbc_attr_families` / `all_specializations` — not yet
+//!   mirrored on the Rust bookkeeper; reachable only from rtyper-phase
+//!   consumers.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -25,8 +27,8 @@ use std::rc::{Rc, Weak};
 use super::argument::{ArgumentsForTranslation, complex_args, simple_args};
 use super::classdesc::{ClassDef, ClassDesc};
 use super::description::{
-    CallFamily, ClassDefKey, DescEntry, DescKey, FrozenAttrFamily, FrozenDesc, FunctionDesc,
-    MethodDesc,
+    CallFamily, ClassAttrFamily, ClassDefKey, DescEntry, DescKey, FrozenAttrFamily, FrozenDesc,
+    FunctionDesc, MethodDesc,
 };
 use super::dictdef::DictDef;
 use super::listdef::ListDef;
@@ -199,6 +201,11 @@ pub struct Bookkeeper {
     /// RPython `self.frozenpbc_attr_families = UnionFind(FrozenAttrFamily)`
     /// (bookkeeper.py:63).
     pub frozenpbc_attr_families: RefCell<UnionFind<DescKey, Rc<RefCell<FrozenAttrFamily>>>>,
+    /// RPython `self.classpbc_attr_families = {}` (bookkeeper.py:62) —
+    /// lazy `attrname -> UnionFind(ClassAttrFamily)` map materialised by
+    /// `get_classpbc_attr_families(attrname)` (bookkeeper.py:447-456).
+    pub classpbc_attr_families:
+        RefCell<HashMap<String, UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>>>,
     /// RPython `self.pbc_maximal_call_families = UnionFind(CallFamily)`
     /// (bookkeeper.py:64).
     pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
@@ -311,6 +318,50 @@ impl EmulatedPbcCallKey {
     }
 }
 
+/// Variant wrapper over the two concrete attribute-family types that
+/// `pbc_getattr` (bookkeeper.py:458-496) consumes polymorphically —
+/// `ClassAttrFamily` for ClassDesc PBCs, `FrozenAttrFamily` for
+/// FrozenDesc PBCs. Exposes the exact trio upstream touches:
+/// `read_locations`, `get_s_value(attr)`, `set_s_value(attr, ...)`.
+enum PbcAttrFamily {
+    Class(Rc<RefCell<ClassAttrFamily>>),
+    Frozen(Rc<RefCell<FrozenAttrFamily>>),
+}
+
+impl PbcAttrFamily {
+    fn add_read_location(&self, pos: PositionKey) {
+        match self {
+            PbcAttrFamily::Class(rc) => {
+                rc.borrow_mut().read_locations.insert(pos, ());
+            }
+            PbcAttrFamily::Frozen(rc) => {
+                rc.borrow_mut().read_locations.insert(pos, ());
+            }
+        }
+    }
+
+    fn read_locations(&self) -> Vec<PositionKey> {
+        match self {
+            PbcAttrFamily::Class(rc) => rc.borrow().read_locations.keys().cloned().collect(),
+            PbcAttrFamily::Frozen(rc) => rc.borrow().read_locations.keys().cloned().collect(),
+        }
+    }
+
+    fn get_s_value(&self, attr: &str) -> SomeValue {
+        match self {
+            PbcAttrFamily::Class(rc) => rc.borrow().get_s_value(attr),
+            PbcAttrFamily::Frozen(rc) => rc.borrow().get_s_value(attr),
+        }
+    }
+
+    fn set_s_value(&self, attr: &str, v: SomeValue) {
+        match self {
+            PbcAttrFamily::Class(rc) => rc.borrow_mut().set_s_value(attr, v),
+            PbcAttrFamily::Frozen(rc) => rc.borrow_mut().set_s_value(attr, v),
+        }
+    }
+}
+
 impl Bookkeeper {
     /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py:52-76).
     /// Once the annotator driver lands, this constructor takes an
@@ -333,6 +384,7 @@ impl Bookkeeper {
             frozenpbc_attr_families: RefCell::new(UnionFind::new(|desc: &DescKey| {
                 Rc::new(RefCell::new(FrozenAttrFamily::new(*desc)))
             })),
+            classpbc_attr_families: RefCell::new(HashMap::new()),
             pbc_maximal_call_families: RefCell::new(UnionFind::new(|desc: &DescKey| {
                 Rc::new(RefCell::new(CallFamily::new(*desc)))
             })),
@@ -845,11 +897,10 @@ impl Bookkeeper {
                 AnnotatorError::new("Bookkeeper.getdesc(bound method): __func__ is not a function")
             })?;
 
-            if self_obj.is_instance()
-                && self_obj
-                    .instance_class()
-                    .is_some_and(|cls| cls.class_get("_freeze_").is_some())
-            {
+            if self_obj.is_instance() {
+                call_cleanup_method(self_obj)?;
+            }
+            if self_obj.is_instance() && call_freeze_method(self_obj)? {
                 let frozendesc = self.getdesc(self_obj)?.as_frozen().ok_or_else(|| {
                     AnnotatorError::new(
                         "Bookkeeper.getdesc(bound method): frozen self did not produce FrozenDesc",
@@ -1003,6 +1054,35 @@ impl Bookkeeper {
         rc
     }
 
+    /// RPython `Bookkeeper.get_classpbc_attr_families(attrname)`
+    /// (bookkeeper.py:447-456).
+    ///
+    /// ```python
+    /// def get_classpbc_attr_families(self, attrname):
+    ///     map = self.classpbc_attr_families
+    ///     try:
+    ///         access_sets = map[attrname]
+    ///     except KeyError:
+    ///         access_sets = map[attrname] = UnionFind(description.ClassAttrFamily)
+    ///     return access_sets
+    /// ```
+    ///
+    /// Rust exposes the lookup via a closure so the returned mutable
+    /// handle doesn't escape the `RefCell::borrow_mut()` borrow. The
+    /// attrname's UnionFind is materialised on first access with the
+    /// `ClassAttrFamily`-factory, matching upstream's lazy creation.
+    pub fn with_classpbc_attr_families<T>(
+        &self,
+        attrname: &str,
+        f: impl FnOnce(&mut UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>) -> T,
+    ) -> T {
+        let mut map = self.classpbc_attr_families.borrow_mut();
+        let entry = map.entry(attrname.to_string()).or_insert_with(|| {
+            UnionFind::new(|desc: &DescKey| Rc::new(RefCell::new(ClassAttrFamily::new(*desc))))
+        });
+        f(entry)
+    }
+
     /// RPython `bookkeeper.classdefs.append(classdef)` — invoked from
     /// `ClassDesc._init_classdef` (classdesc.py:674). Callers hand over
     /// the fresh `Rc<RefCell<ClassDef>>` so the bookkeeper retains the
@@ -1097,6 +1177,168 @@ impl Bookkeeper {
     ///     return s_result
     /// ```
     ///
+    /// RPython `Bookkeeper.pbc_getattr(pbc, s_attr)` (bookkeeper.py:458-496).
+    ///
+    /// ```python
+    /// def pbc_getattr(self, pbc, s_attr):
+    ///     assert s_attr.is_constant()
+    ///     attr = s_attr.const
+    ///     descs = list(pbc.descriptions)
+    ///     first = descs[0]
+    ///     if len(descs) == 1:
+    ///         return first.s_read_attribute(attr)
+    ///     change = first.mergeattrfamilies(descs[1:], attr)
+    ///     attrfamily = first.getattrfamily(attr)
+    ///     position = self.position_key
+    ///     attrfamily.read_locations[position] = True
+    ///     actuals = []
+    ///     for desc in descs:
+    ///         actuals.append(desc.s_read_attribute(attr))
+    ///     s_result = unionof(*actuals)
+    ///     s_oldvalue = attrfamily.get_s_value(attr)
+    ///     attrfamily.set_s_value(attr, unionof(s_result, s_oldvalue))
+    ///     if change:
+    ///         for position in attrfamily.read_locations:
+    ///             self.annotator.reflowfromposition(position)
+    ///     if isinstance(s_result, SomeImpossibleValue):
+    ///         for desc in descs:
+    ///             try:
+    ///                 attrs = desc.read_attribute('_attrs_')
+    ///             except AttributeError:
+    ///                 continue
+    ///             if isinstance(attrs, Constant):
+    ///                 attrs = attrs.value
+    ///             if attr in attrs:
+    ///                 raise HarmlesslyBlocked("getattr on enforced attr")
+    ///     return s_result
+    /// ```
+    pub fn pbc_getattr(
+        self: &Rc<Self>,
+        pbc: &SomePBC,
+        s_attr: &SomeValue,
+    ) -> Result<SomeValue, super::model::AnnotatorException> {
+        use super::classdesc::{ClassDesc, ClassDictEntry};
+        use super::description::FrozenDesc;
+        use super::model::{AnnotatorException, HarmlesslyBlocked, unionof};
+
+        // upstream: `assert s_attr.is_constant(); attr = s_attr.const`.
+        let Some(attr_const) = s_attr.const_() else {
+            return Err(AnnotatorError::new(format!(
+                "pbc_getattr: s_attr must be constant, got {s_attr:?}"
+            ))
+            .into());
+        };
+        let attr_name = match attr_const {
+            ConstValue::Str(s) => s.clone(),
+            other => {
+                return Err(AnnotatorError::new(format!(
+                    "pbc_getattr: attr must be a string, got {other:?}"
+                ))
+                .into());
+            }
+        };
+
+        // upstream: `descs = list(pbc.descriptions); first = descs[0]`.
+        let descs: Vec<DescEntry> = pbc.descriptions.values().cloned().collect();
+        let first = descs[0].clone();
+
+        // upstream: `if len(descs) == 1: return first.s_read_attribute(attr)`.
+        if descs.len() == 1 {
+            return Ok(first.s_read_attribute(&attr_name)?);
+        }
+
+        // upstream multi-desc path — mergeattrfamilies + getattrfamily +
+        // attrfamily bookkeeping. Dispatch by Desc kind, since ClassDesc
+        // and FrozenDesc each own their own UnionFind (bookkeeper.py:62-63).
+        let (change, pbc_family) = match &first {
+            DescEntry::Class(first_cd) => {
+                let others_cd: Vec<Rc<RefCell<ClassDesc>>> =
+                    descs[1..].iter().filter_map(|d| d.as_class()).collect();
+                let change = ClassDesc::mergeattrfamilies(first_cd, &others_cd, &attr_name);
+                let family = ClassDesc::getattrfamily(first_cd, &attr_name).ok_or_else(|| {
+                    AnnotatorError::new(
+                        "pbc_getattr: ClassDesc.getattrfamily unavailable (bookkeeper dropped)",
+                    )
+                })?;
+                (change, PbcAttrFamily::Class(family))
+            }
+            DescEntry::Frozen(first_fd) => {
+                let others_refs: Vec<Rc<RefCell<FrozenDesc>>> =
+                    descs[1..].iter().filter_map(|d| d.as_frozen()).collect();
+                let borrows: Vec<_> = others_refs.iter().map(|rc| rc.borrow()).collect();
+                let others_ptrs: Vec<&FrozenDesc> = borrows.iter().map(|b| &**b).collect();
+                let change = first_fd.borrow().mergeattrfamilies(&others_ptrs)?;
+                let family = first_fd.borrow().getattrfamily()?;
+                (change, PbcAttrFamily::Frozen(family))
+            }
+            _ => {
+                return Err(AnnotatorError::new(format!(
+                    "pbc_getattr: multi-desc PBC of kind {:?} has no attrfamily support",
+                    first.kind()
+                ))
+                .into());
+            }
+        };
+
+        // upstream: `position = self.position_key;
+        //            attrfamily.read_locations[position] = True`.
+        if let Some(pos) = self.position_key.borrow().clone() {
+            pbc_family.add_read_location(pos);
+        }
+
+        // upstream: `actuals = [desc.s_read_attribute(attr) for desc in descs]
+        //            s_result = unionof(*actuals)`.
+        let mut actuals: Vec<SomeValue> = Vec::with_capacity(descs.len());
+        for d in &descs {
+            actuals.push(d.s_read_attribute(&attr_name)?);
+        }
+        let s_result = unionof(actuals.iter())
+            .map_err(|e| AnnotatorError::new(format!("pbc_getattr unionof failed: {e:?}")))?;
+
+        // upstream: `s_oldvalue = attrfamily.get_s_value(attr);
+        //            attrfamily.set_s_value(attr, unionof(s_result, s_oldvalue))`.
+        let s_old = pbc_family.get_s_value(&attr_name);
+        let merged = unionof([&s_result, &s_old])
+            .map_err(|e| AnnotatorError::new(format!("pbc_getattr merge unionof failed: {e:?}")))?;
+        pbc_family.set_s_value(&attr_name, merged);
+
+        // upstream: `if change: for position in read_locations: reflowfromposition`.
+        if change {
+            let positions = pbc_family.read_locations();
+            if let Some(ann) = self.annotator.borrow().upgrade() {
+                for pos in positions {
+                    ann.reflowfromposition(&pos);
+                }
+            }
+        }
+
+        // upstream: HarmlesslyBlocked when s_result is Impossible and
+        // attr is in some desc's enforced `_attrs_` set.
+        if matches!(s_result, SomeValue::Impossible) {
+            for d in &descs {
+                let Some(cdesc) = d.as_class() else {
+                    continue;
+                };
+                let attrs_entry = ClassDesc::read_attribute(&cdesc, "_attrs_");
+                let Some(ClassDictEntry::Constant(c)) = attrs_entry else {
+                    continue;
+                };
+                let contains = match &c.value {
+                    // upstream `_attrs_` is typically a tuple of strings.
+                    ConstValue::Tuple(vs) | ConstValue::List(vs) => vs
+                        .iter()
+                        .any(|v| matches!(v, ConstValue::Str(s) if *s == attr_name)),
+                    _ => false,
+                };
+                if contains {
+                    return Err(AnnotatorException::Harmless(HarmlesslyBlocked));
+                }
+            }
+        }
+
+        Ok(s_result)
+    }
+
     /// Python's three-state `emulated` parameter (`None` / `True` /
     /// `<position_key>`) maps onto [`PbcCallEmulated`] in Rust.
     pub fn pbc_call(
@@ -1268,12 +1510,11 @@ impl Bookkeeper {
     /// without the upstream `immutable_cache` memoisation (perf-only
     /// deviation, correctness unchanged).
     ///
-    /// The function / class / bound-method / weakref / frozen-PBC
-    /// / symbolic-constant / PBC branches (bookkeeper.py:218-325)
-    /// require `description.py` + `classdesc.py` + `rlib/rarithmetic`
-    /// / `rlib/objectmodel` imports that are Phase 5 P5.2+ deps. Those
-    /// inputs surface as [`AnnotatorError`] so the missing branch is
-    /// observable at the call site.
+    /// The function / class / bound-method / weakref / frozen-PBC /
+    /// property / instance branches (bookkeeper.py:218-348) route
+    /// through [`Self::immutablevalue_hostobject`]. The
+    /// `extregistry.is_registered(x)` branch (bookkeeper.py:312-314)
+    /// still surfaces as [`AnnotatorError`].
     pub fn immutablevalue(self: &Rc<Self>, x: &ConstValue) -> Result<SomeValue, AnnotatorError> {
         match x {
             ConstValue::Bool(b) => {
@@ -1495,7 +1736,7 @@ impl Bookkeeper {
         // a `_freeze_` member routes to the frozen-PBC path regardless
         // of its kind (Instance / Module / Opaque all surface their
         // attribute dict the same way).
-        if has_freeze_method(obj) {
+        if call_freeze_method(obj)? {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
             pbc.base.const_box = Some(Constant::new(raw.clone()));
@@ -1505,9 +1746,9 @@ impl Bookkeeper {
         // x.__class__.__module__ != '__builtin__'` →
         // `getuniqueclassdef(x.__class__) + see_instance + SomeInstance`.
         if let Some(class_obj) = obj.instance_class() {
-            // `hasattr(x, '_cleanup_'): x._cleanup_()` (upstream line
-            // 341-342) is omitted — we can't invoke Python-side
-            // `_cleanup_`.
+            // upstream bookkeeper.py:341-342:
+            //     if hasattr(x, '_cleanup_'): x._cleanup_()
+            call_cleanup_method(obj)?;
             let classdef = self.getuniqueclassdef(class_obj)?;
             super::classdesc::ClassDef::see_instance(&classdef, obj)?;
             let mut inst = super::model::SomeInstance::new(
@@ -1534,25 +1775,95 @@ impl Default for Bookkeeper {
     }
 }
 
-/// RPython `hasattr(x, '_freeze_')` (bookkeeper.py:332). In the Rust
-/// port we take "class defines `_freeze_` in its __dict__" (for
-/// Instance hosts) / "module dict has `_freeze_`" (for Module hosts)
-/// as the structural equivalent. Matches upstream's assertion
-/// `assert x._freeze_() is True` — only True-returning `_freeze_`
-/// methods are expected.
-fn has_freeze_method(obj: &HostObject) -> bool {
-    if let Some(class_obj) = obj.instance_class() {
-        if class_obj.class_get("_freeze_").is_some() {
-            return true;
-        }
+/// RPython `hasattr(x, '_freeze_'); assert x._freeze_() is True`
+/// (bookkeeper.py:332-333).
+///
+/// Returns `Ok(true)` when `_freeze_` is present and returns `True`;
+/// `Ok(false)` when `_freeze_` is absent (caller falls through to the
+/// instance / fallback branch); `Err` when `_freeze_` is present but
+/// the invocation fails or returns something other than `True`
+/// (mirrors the Python `assert x._freeze_() is True` AssertionError).
+///
+/// Upstream RPython runs the `_freeze_` body through real Python. The
+/// Rust port routes through [`HostObject::call_host`], which handles
+/// `NativeCallable` (test fixtures / bootstrap builtins register
+/// these) directly and returns
+/// [`HostCallError::RequiresFlowEvaluator`] for a `UserFunction`
+/// body. The latter surfaces as an explicit
+/// "Phase 6 host-graph evaluator not yet landed" `AnnotatorError`
+/// rather than a generic call failure — this keeps the boundary
+/// between host-executable and flowspace-required callables
+/// discoverable at the callsite.
+fn call_freeze_method(obj: &HostObject) -> Result<bool, AnnotatorError> {
+    let method = match lookup_zero_arg_method(obj, "_freeze_")? {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    let result = method.call_host(&[]).map_err(|err| {
+        AnnotatorError::new(match err {
+            crate::flowspace::model::HostCallError::RequiresFlowEvaluator(q) => format!(
+                "_freeze_() on {q:?} requires the Phase 6 host-graph evaluator \
+                 (user function body cannot be executed host-side yet)"
+            ),
+            other => format!("_freeze_() call failed: {other}"),
+        })
+    })?;
+    match result {
+        ConstValue::Bool(true) => Ok(true),
+        other => Err(AnnotatorError::new(format!(
+            "_freeze_() must return True, got {other:?}"
+        ))),
     }
-    if obj.is_class() && obj.class_get("_freeze_").is_some() {
-        return true;
+}
+
+/// RPython `if hasattr(x, '_cleanup_'): x._cleanup_()` (bookkeeper.py:341-342).
+///
+/// Fires the cleanup method for side-effects and ignores the return
+/// value. Absence of `_cleanup_` is silently accepted. A `UserFunction`
+/// body surfaces the same `Phase 6 host-graph evaluator` marker as
+/// `call_freeze_method` so the two boundary limitations are visible
+/// at a single grep point.
+fn call_cleanup_method(obj: &HostObject) -> Result<(), AnnotatorError> {
+    let Some(method) = lookup_zero_arg_method(obj, "_cleanup_")? else {
+        return Ok(());
+    };
+    method.call_host(&[]).map(|_| ()).map_err(|err| {
+        AnnotatorError::new(match err {
+            crate::flowspace::model::HostCallError::RequiresFlowEvaluator(q) => format!(
+                "_cleanup_() on {q:?} requires the Phase 6 host-graph evaluator \
+                 (user function body cannot be executed host-side yet)"
+            ),
+            other => format!("_cleanup_() call failed: {other}"),
+        })
+    })
+}
+
+/// Helper: resolve a zero-arg method `name` on `obj`, binding `self`
+/// where applicable (Instance / Module / Class host kinds).
+///
+/// Returns `Some(callable)` when the name is present and resolves to
+/// a callable HostObject (BoundMethod or NativeCallable); `None`
+/// otherwise. Non-callable attributes that would raise `TypeError`
+/// at call time are deliberately returned as `Some` so
+/// [`HostObject::call_host`] can surface the failure with the
+/// upstream shape.
+fn lookup_zero_arg_method(
+    obj: &HostObject,
+    name: &str,
+) -> Result<Option<HostObject>, AnnotatorError> {
+    use crate::flowspace::model::host_getattr;
+    match host_getattr(obj, name) {
+        Ok(ConstValue::HostObject(h)) => Ok(Some(h)),
+        Ok(other) => Err(AnnotatorError::new(format!(
+            "{} exists on {:?} but is not callable: {other:?}",
+            name,
+            obj.qualname()
+        ))),
+        Err(crate::flowspace::model::HostGetAttrError::Missing) => Ok(None),
+        Err(crate::flowspace::model::HostGetAttrError::Unsupported) => Err(AnnotatorError::new(
+            format!("{} lookup on {:?} is unsupported", name, obj.qualname()),
+        )),
     }
-    if obj.is_module() && obj.module_get("_freeze_").is_some() {
-        return true;
-    }
-    false
 }
 
 /// RPython `CallOp.build_args(args_s)` dispatch by opname
@@ -1767,7 +2078,8 @@ impl Drop for PositionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotator::model::{SomeByteArray, SomeChar, SomeFloat, SomeString};
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomeByteArray, SomeChar, SomeFloat};
     use crate::flowspace::model::GraphFunc;
 
     fn bk() -> Rc<Bookkeeper> {
@@ -2106,12 +2418,21 @@ mod tests {
     #[test]
     fn immutablevalue_module_with_freeze_routes_to_some_pbc() {
         // upstream bookkeeper.py:332-338 — any host with `_freeze_`
-        // routes through SomePBC([getdesc(x)]). The Rust port detects
-        // module `_freeze_` via `module_get("_freeze_")`.
+        // routes through SomePBC([getdesc(x)]). Upstream first checks
+        // `hasattr(x, '_freeze_')` then asserts `x._freeze_() is True`,
+        // so the Rust port registers `_freeze_` as a NativeCallable
+        // that returns `Bool(true)`.
         use crate::flowspace::model::HostObject;
+        use std::sync::Arc;
         let bk = bk();
         let mod_obj = HostObject::new_module("m");
-        mod_obj.module_set("_freeze_", HostObject::new_builtin_callable("m._freeze_"));
+        mod_obj.module_set(
+            "_freeze_",
+            HostObject::new_native_callable(
+                "m._freeze_",
+                Arc::new(|_args| Ok(ConstValue::Bool(true))),
+            ),
+        );
         let s = bk
             .immutablevalue(&ConstValue::HostObject(mod_obj))
             .expect("module with _freeze_ must route to SomePBC");
@@ -2152,17 +2473,24 @@ mod tests {
 
     #[test]
     fn immutablevalue_freeze_instance_routes_to_some_pbc() {
-        // upstream bookkeeper.py:332-338 — `hasattr(x, '_freeze_')`
-        // routes to `SomePBC([getdesc(x)])`. The Rust port detects
-        // `_freeze_` via `class_obj.class_get("_freeze_")`.
+        // upstream bookkeeper.py:332-338 — `hasattr(x, '_freeze_')` +
+        // `assert x._freeze_() is True` routes to
+        // `SomePBC([getdesc(x)])`. The Rust port registers `_freeze_`
+        // as a NativeCallable on the class dict so the descriptor
+        // protocol binds `self` and `call_host` executes it.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::HostObject;
+        use std::sync::Arc;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let bk = ann.bookkeeper.clone();
         let cls = HostObject::new_class("pkg.Frozen", vec![]);
-        // Mark `_freeze_` as defined on the class; the presence alone
-        // is structurally equivalent to upstream's `hasattr + returns True`.
-        cls.class_set("_freeze_", ConstValue::Bool(true));
+        cls.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.Frozen._freeze_",
+                Arc::new(|_args| Ok(ConstValue::Bool(true))),
+            )),
+        );
         let inst = HostObject::new_instance(cls.clone(), vec![]);
         let s = bk
             .immutablevalue(&ConstValue::HostObject(inst))
@@ -2176,11 +2504,169 @@ mod tests {
     }
 
     #[test]
+    fn immutablevalue_freeze_returning_false_raises_annotator_error() {
+        // upstream bookkeeper.py:333 `assert x._freeze_() is True` —
+        // a `_freeze_` returning False triggers AssertionError. The
+        // Rust port surfaces this as an `AnnotatorError`.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        use std::sync::Arc;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.NotFrozen", vec![]);
+        cls.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.NotFrozen._freeze_",
+                Arc::new(|_args| Ok(ConstValue::Bool(false))),
+            )),
+        );
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let err = bk
+            .immutablevalue(&ConstValue::HostObject(inst))
+            .expect_err("_freeze_ returning False must raise");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("_freeze_() must return True")
+        );
+    }
+
+    #[test]
+    fn immutablevalue_non_callable_freeze_raises_annotator_error() {
+        // upstream bookkeeper.py:332-333 performs `x._freeze_()`;
+        // if `_freeze_` exists but is not callable, Python raises
+        // `TypeError`. The Rust port surfaces that as an AnnotatorError.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.BadFrozen", vec![]);
+        cls.class_set("_freeze_", ConstValue::Bool(true));
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let err = bk
+            .immutablevalue(&ConstValue::HostObject(inst))
+            .expect_err("non-callable _freeze_ must raise");
+        assert!(err.msg.unwrap_or_default().contains("_freeze_ exists on"));
+    }
+
+    #[test]
+    fn immutablevalue_runs_cleanup_on_instance() {
+        // upstream bookkeeper.py:341-342:
+        //     if hasattr(x, '_cleanup_'): x._cleanup_()
+        // The Rust port invokes `_cleanup_` for side effects. We verify
+        // the call happens via an AtomicBool (HostCallableFn requires
+        // `Send + Sync`, so a plain `Cell` is not shareable into the
+        // closure).
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let cls = HostObject::new_class("pkg.Cleaned", vec![]);
+        let called = Arc::new(AtomicBool::new(false));
+        let called_cl = called.clone();
+        cls.class_set(
+            "_cleanup_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.Cleaned._cleanup_",
+                Arc::new(move |_args| {
+                    called_cl.store(true, Ordering::SeqCst);
+                    Ok(ConstValue::None)
+                }),
+            )),
+        );
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let _ = bk
+            .immutablevalue(&ConstValue::HostObject(inst))
+            .expect("instance with _cleanup_ must not fail");
+        assert!(
+            called.load(Ordering::SeqCst),
+            "_cleanup_ must have been invoked"
+        );
+    }
+
+    #[test]
+    fn getdesc_bound_method_of_frozen_instance_runs_cleanup_and_returns_method_of_frozen() {
+        use crate::annotator::model::DescKind;
+        use crate::flowspace::model::{Constant, GraphFunc, HostObject};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func = HostObject::new_user_function(GraphFunc::new("m", globals));
+        let cls = HostObject::new_class("pkg.Frozen", vec![]);
+        cls.class_set("m", ConstValue::HostObject(func.clone()));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_cl = cleaned.clone();
+        cls.class_set(
+            "_cleanup_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.Frozen._cleanup_",
+                Arc::new(move |_args| {
+                    cleaned_cl.store(true, Ordering::SeqCst);
+                    Ok(ConstValue::None)
+                }),
+            )),
+        );
+        cls.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.Frozen._freeze_",
+                Arc::new(|_args| Ok(ConstValue::Bool(true))),
+            )),
+        );
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let meth = HostObject::new_bound_method("pkg.Frozen.m", inst, func, "m", cls);
+
+        let entry = bk.getdesc(&meth).expect("frozen bound method desc");
+
+        assert_eq!(entry.kind(), DescKind::MethodOfFrozen);
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "_cleanup_ must run before frozen bound-method classification"
+        );
+    }
+
+    #[test]
+    fn getdesc_bound_method_freeze_returning_false_raises() {
+        use crate::flowspace::model::{Constant, GraphFunc, HostObject};
+        use std::sync::Arc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func = HostObject::new_user_function(GraphFunc::new("m", globals));
+        let cls = HostObject::new_class("pkg.NotFrozen", vec![]);
+        cls.class_set("m", ConstValue::HostObject(func.clone()));
+        cls.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.NotFrozen._freeze_",
+                Arc::new(|_args| Ok(ConstValue::Bool(false))),
+            )),
+        );
+        let inst = HostObject::new_instance(cls.clone(), vec![]);
+        let meth = HostObject::new_bound_method("pkg.NotFrozen.m", inst, func, "m", cls);
+
+        let err = bk
+            .getdesc(&meth)
+            .expect_err("_freeze_ returning False must raise");
+
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("_freeze_() must return True")
+        );
+    }
+
+    #[test]
     fn newlist_creates_somelist_and_generalizes() {
-        // Use two SomeInteger variants so the Phase 4 A4.6 pair-union
-        // subset (Int ∪ Int) can widen them — upstream's multi-type
-        // lists exercise broader pair unions which are Phase 5 P5.2+
-        // pending.
+        // Two SomeInteger variants so the `Int ∪ Int` pair-union
+        // widens them (signed `∪` nonneg → signed).
         let bk = bk();
         let s_nonneg = SomeValue::Integer(SomeInteger::new(true, false));
         let s_signed = SomeValue::Integer(SomeInteger::new(false, false));
@@ -2288,7 +2774,7 @@ mod tests {
         }
     }
 
-    // --- Phase 5 P5.2 classdesc c2: descs / classdefs / getdesc ---
+    // --- classdesc: descs / classdefs / getdesc ---
 
     #[test]
     fn getdesc_for_user_function_returns_function_entry() {

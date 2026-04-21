@@ -7,15 +7,12 @@
 //! `specialize:argtype(N)` / … directive strings to the per-policy
 //! specializer methods.
 //!
-//! ## Phase 5 P5.2+ dependency-blocked paths
+//! ## Dependency-blocked paths
 //!
-//! * Specializer bodies (`default_specialize`, `memo`,
-//!   `specialize_argvalue`, `specialize_argtype`,
-//!   `specialize_arglistitemtype`, `specialize_arg_or_var`,
-//!   `specialize_call_location`) come from
-//!   `rpython/annotator/specialize.py` — **not yet ported**. The
-//!   [`Specializer`] enum variants name each one so callers can
-//!   dispatch once specialize.py lands.
+//! * `specialize.memo` (specialize.py:275-313) requires evaluating
+//!   `value = func(*args)` at annotation time — impossible without a
+//!   Python runtime. The [`Specializer::Memo`] variant surfaces as
+//!   [`AnnotatorError`] matching upstream's `pyobj is None` path.
 //! * `specialize__ll` / `specialize__ll_and_arg` — forward to
 //!   `rpython/rtyper/annlowlevel.py:LowLevelAnnotatorPolicy` —
 //!   deferred until the rtyper's annlowlevel lands.
@@ -47,10 +44,10 @@ use crate::annotator::bookkeeper::Bookkeeper;
 /// Each variant names one function in
 /// `rpython/annotator/specialize.py` (or
 /// `rpython/rtyper/annlowlevel.py` for the `Ll` / `LlAndArg`
-/// variants). Dispatch is currently resolved at lookup time —
-/// [`AnnotatorPolicy::get_specializer`] returns a `Specializer`
-/// tag, and the annotator-driver port will invoke the real
-/// specializer body once specialize.py lands.
+/// variants). Bodies are executed by
+/// [`super::description::FunctionDesc::specialize`] — the `Memo` and
+/// `Ll*` variants still raise because they depend on infrastructure
+/// (Python runtime / rtyper annlowlevel) that hasn't landed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Specializer {
     /// RPython `default_specialize` (specialize.py) — the no-op

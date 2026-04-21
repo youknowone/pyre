@@ -3,10 +3,6 @@
 //!
 //! RPython upstream: `rpython/annotator/listdef.py` (207 LOC).
 //!
-//! Phase 5 P5.1 port. Closes the "same_as" identity gap that Phase 4
-//! A4.4 deferred (see the review #2 entry in
-//! `majit-translate/src/annotator/model.rs`).
-//!
 //! Rust adaptation (parity rule #1, minimum deviation):
 //!
 //! * Upstream identity: `ListDef.same_as(other)` reduces to

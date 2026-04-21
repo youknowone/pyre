@@ -33,7 +33,7 @@ use super::annrpython::RPythonAnnotator;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltinMethod, SomeFloat, SomeInteger, SomeIterator,
     SomeObjectTrait, SomeString, SomeTuple, SomeTypeOf, SomeUnicodeString, SomeValue, SomeValueTag,
-    s_impossible_value, s_none,
+    add_knowntypedata, s_bool, s_impossible_value, s_none,
 };
 
 /// RPython `UNARY_OPERATIONS` (unaryop.py:26-28).
@@ -268,6 +268,54 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
+    // unaryop.py:78-87 / 151-156 — bool(self): bool_behavior +
+    // truth-branch knowntypedata via nonnoneify().
+    register(
+        reg,
+        OpKind::Bool,
+        SomeValueTag::Object,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_obj = ann.annotation(&hl.args[0]).expect("bool: object unbound");
+                let mut r = SomeBool::new();
+                match &s_obj {
+                    SomeValue::PBC(pbc) if !pbc.can_be_none => {
+                        r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
+                    }
+                    SomeValue::None_(_) => {
+                        r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
+                    }
+                    _ => {
+                        if s_obj.is_immutable_constant()
+                            && let Some(c) = s_obj.const_()
+                            && let Some(truthy) = c.truthy()
+                        {
+                            r.base.const_box = Some(Constant::new(ConstValue::Bool(truthy)));
+                        } else {
+                            let len_op = HLOperation::new(OpKind::Len, vec![hl.args[0].clone()]);
+                            let s_len = len_op.consider(ann).expect("bool: len() dispatch failed");
+                            if let Some(ConstValue::Int(n)) = s_len.const_() {
+                                r.base.const_box = Some(Constant::new(ConstValue::Bool(*n > 0)));
+                            }
+                        }
+                    }
+                }
+                let mut s_nonnone_obj = s_obj.clone();
+                if s_nonnone_obj.can_be_none() {
+                    s_nonnone_obj = s_nonnone_obj.nonnoneify();
+                }
+                let vars = match &hl.args[0] {
+                    Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
+                    Hlvalue::Constant(_) => Vec::new(),
+                };
+                let mut knowntypedata = std::collections::HashMap::new();
+                add_knowntypedata(&mut knowntypedata, true, &vars, s_nonnone_obj);
+                r.set_knowntypedata(knowntypedata);
+                SomeValue::Bool(r)
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
     // unaryop.py:169-170 — hash: raise AnnotatorError("cannot use hash() in RPython").
     register(
         reg,
@@ -342,7 +390,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:215-229 — getattr(self, s_attr).
+    // unaryop.py:215-229 — SomeObject.getattr(self, s_attr).
     register(
         reg,
         OpKind::GetAttr,
@@ -360,12 +408,27 @@ fn init_someobject_defaults(
                 if let Some(s_method) = s_self.find_method(&attr) {
                     return s_method;
                 }
-                if s_self.is_immutable_constant() {
-                    if let Some(ConstValue::HostObject(pyobj)) = s_self.const_() {
-                        if let Ok(value) = crate::flowspace::model::host_getattr(pyobj, &attr) {
+                // upstream unaryop.py:215-229 constant receiver path
+                // shares the `getattr(obj, name)` call with
+                // `flowspace::operation::GetAttr.constfold`; both
+                // route through `const_runtime_getattr` and only
+                // diverge at the wrap step (annotator wraps via
+                // `immutablevalue`, flowspace via `const`).
+                if s_self.is_immutable_constant()
+                    && let Some(c) = s_self.const_()
+                {
+                    match crate::flowspace::model::const_runtime_getattr(c, &attr) {
+                        Ok(Some(value)) => {
                             return ann.bookkeeper.immutablevalue(&value).unwrap_or_else(|err| {
                                 panic!("getattr immutablevalue failed: {}", err)
                             });
+                        }
+                        Ok(None) => {
+                            // upstream `WrapException` swallow — fall
+                            // through to the "cannot find attr" panic.
+                        }
+                        Err(msg) => {
+                            panic!("AnnotatorError in getattr constant path: {msg}")
                         }
                     }
                 }
@@ -373,6 +436,60 @@ fn init_someobject_defaults(
                     "AnnotatorError: Cannot find attribute {:?} on {:?}",
                     attr, s_self
                 )
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    // unaryop.py:972-980 — SomePBC.getattr(self, s_attr).
+    //
+    //   def getattr(self, s_attr):
+    //       assert s_attr.is_constant()
+    //       if s_attr.const == '__name__':
+    //           from rpython.annotator.classdesc import ClassDesc
+    //           if self.getKind() is ClassDesc:
+    //               return SomeString()
+    //       bookkeeper = getbookkeeper()
+    //       return bookkeeper.pbc_getattr(self, s_attr)
+    register(
+        reg,
+        OpKind::GetAttr,
+        SomeValueTag::PBC,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_self = ann
+                    .annotation(&hl.args[0])
+                    .expect("pbc getattr: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("pbc getattr: attr unbound");
+                let SomeValue::PBC(pbc) = &s_self else {
+                    unreachable!("PBC-tag dispatch must carry SomePBC, got {s_self:?}");
+                };
+                let Some(ConstValue::Str(attr)) = s_attr.const_().cloned() else {
+                    panic!(
+                        "AnnotatorError: pbc getattr({:?}, {:?}) has non-constant argument",
+                        s_self, s_attr
+                    );
+                };
+                // __name__ special-case: ClassDesc PBC → SomeString.
+                if attr == "__name__" && matches!(pbc.get_kind(), Ok(super::model::DescKind::Class))
+                {
+                    return SomeValue::String(SomeString::new(false, false));
+                }
+                match ann.bookkeeper.pbc_getattr(pbc, &s_attr) {
+                    Ok(s) => s,
+                    Err(super::model::AnnotatorException::Annotator(e)) => {
+                        panic!("AnnotatorError in pbc_getattr: {e}")
+                    }
+                    Err(super::model::AnnotatorException::Harmless(_)) => {
+                        // upstream lets `HarmlesslyBlocked` propagate out of
+                        // flowin; the Rust port has no exception channel
+                        // across Specialization::apply yet, so surface as
+                        // Impossible and let the reflow loop retry once the
+                        // enforced attr family widens.
+                        super::model::s_impossible_value()
+                    }
+                }
             }),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
@@ -1023,19 +1140,14 @@ pub fn list_method_extend(
         // upstream:
         //     s_iter = s_iterable.iter()
         //     self.method_append(s_iter.next())
-        let mut v_iterable = Variable::named("list_extend_iterable");
-        ann.setbinding(&mut v_iterable, s_iterable.clone());
-        let hl_iter = HLOperation::new(OpKind::Iter, vec![Hlvalue::Variable(v_iterable)]);
-        let s_iter = hl_iter
-            .consider(ann)
-            .expect("list.method_extend: iter() dispatch failed");
-
-        let mut v_iter = Variable::named("list_extend_iter");
-        ann.setbinding(&mut v_iter, s_iter);
-        let hl_next = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v_iter)]);
-        let s_item = hl_next
-            .consider(ann)
-            .expect("list.method_extend: next() dispatch failed");
+        //
+        // `SomeIterator(s_iterable, variant=())` mirrors every
+        // `SomeX.iter()` handler (unaryop.py:337/389/660/806/…),
+        // which all reduce to `SomeIterator(self)` on the iterable.
+        // `someiterator_next` is the extracted body of upstream
+        // `SomeIterator.next` (unaryop.py:818-828).
+        let s_iter = SomeIterator::new(s_iterable.clone(), vec![]);
+        let s_item = someiterator_next(ann, &s_iter);
         list_method_append(ann, s_self, &s_item);
     }
     SomeValue::Impossible
@@ -1265,6 +1377,16 @@ pub fn dict_method_update(
 }
 
 #[allow(dead_code)]
+pub fn dict_method_prepare_dict_update(
+    _ann: &RPythonAnnotator,
+    _s_self: &super::model::SomeDict,
+    _s_num: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:518-519 — pass.
+    SomeValue::Impossible
+}
+
+#[allow(dead_code)]
 pub fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:521-523 — bk.newlist(self.dictdef.read_key(bk.position_key)).
     let position = ann.bookkeeper.current_position_key();
@@ -1388,6 +1510,97 @@ pub fn dict_method_pop(
     s_self.dictdef.read_value(position)
 }
 
+#[allow(dead_code)]
+pub fn dict_method_contains_with_hash(
+    ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+    s_key: &SomeValue,
+    _s_hash: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:562-565.
+    let position = ann.bookkeeper.current_position_key();
+    dict_contains(s_self, s_key, position)
+}
+
+#[allow(dead_code)]
+pub fn dict_method_setitem_with_hash(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+    s_key: &SomeValue,
+    _s_hash: &SomeValue,
+    s_value: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:567-568.
+    s_self
+        .dictdef
+        .generalize_key(s_key)
+        .expect("generalize_key failed");
+    s_self
+        .dictdef
+        .generalize_value(s_value)
+        .expect("generalize_value failed");
+    SomeValue::Impossible
+}
+
+#[allow(dead_code)]
+pub fn dict_method_getitem_with_hash(
+    ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+    s_key: &SomeValue,
+    _s_hash: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:570-574 — copy of binaryop.getitem_SomeDict.
+    s_self
+        .dictdef
+        .generalize_key(s_key)
+        .expect("generalize_key failed");
+    let position = ann.bookkeeper.current_position_key();
+    s_self.dictdef.read_value(position)
+}
+
+#[allow(dead_code)]
+pub fn dict_method_delitem_with_hash(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+    s_key: &SomeValue,
+    _s_hash: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:576-577.
+    s_self
+        .dictdef
+        .generalize_key(s_key)
+        .expect("generalize_key failed");
+    SomeValue::Impossible
+}
+
+#[allow(dead_code)]
+pub fn dict_method_delitem_if_value_is(
+    ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+    s_key: &SomeValue,
+    s_value: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:579-581.
+    let _ = dict_method_setitem_with_hash(ann, s_self, s_key, &s_impossible_value(), s_value);
+    dict_method_delitem_with_hash(ann, s_self, s_key, &s_impossible_value())
+}
+
+#[allow(dead_code)]
+pub fn dict_method_move_to_end(
+    ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+    s_key: &SomeValue,
+    s_last: &SomeValue,
+) -> SomeValue {
+    // unaryop.py:588-591 on SomeOrderedDict. Rust collapses SomeDict =
+    // SomeOrderedDict (model.py:416), so the same analyzer lives on SomeDict.
+    assert!(
+        s_bool().contains(s_last),
+        "AnnotatorError: move_to_end(last) expects SomeBool"
+    );
+    dict_method_delitem_with_hash(ann, s_self, s_key, &s_impossible_value())
+}
+
 // =====================================================================
 // unaryop.py:593-690 — @op.contains.register(SomeString|SomeUnicodeString)
 // + class __extend__(SomeString, SomeUnicodeString) shared overrides
@@ -1402,17 +1615,34 @@ fn init_somestring_overrides(
     // unaryop.py:593-605 — contains_String:
     //   if const '\0': knowntypedata-based refinement, else SomeObject fallback.
     //   can_only_throw=[].
-    //
-    // Rust port: the '\0' fast path depends on SomeString::nonnulify()
-    // (not yet ported). Land the fallback-only implementation now; the
-    // knowntypedata refinement joins Commit 6a2 together with
-    // bool_SomeObject / set_knowntypedata plumbing.
     register(
         reg,
         OpKind::Contains,
         SomeValueTag::String,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Bool(SomeBool::new())),
+            apply: Box::new(|ann, hl| {
+                let s_string = ann
+                    .annotation(&hl.args[0])
+                    .expect("contains(String): string unbound");
+                let s_char = ann
+                    .annotation(&hl.args[1])
+                    .expect("contains(String): char unbound");
+                if const_str_of(&s_char).as_deref() == Some("\0") {
+                    let mut r = SomeBool::new();
+                    let mut knowntypedata = std::collections::HashMap::new();
+                    let vars = match &hl.args[0] {
+                        Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
+                        Hlvalue::Constant(_) => Vec::new(),
+                    };
+                    let s_nonnul = s_string
+                        .nonnulify()
+                        .expect("contains(String): nonnulify must succeed");
+                    add_knowntypedata(&mut knowntypedata, false, &vars, s_nonnul);
+                    r.set_knowntypedata(knowntypedata);
+                    return SomeValue::Bool(r);
+                }
+                SomeValue::Bool(SomeBool::new())
+            }),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1492,7 +1722,29 @@ fn init_someunicodestring_overrides(
         OpKind::Contains,
         SomeValueTag::UnicodeString,
         Specialization {
-            apply: Box::new(|_ann, _hl| SomeValue::Bool(SomeBool::new())),
+            apply: Box::new(|ann, hl| {
+                let s_string = ann
+                    .annotation(&hl.args[0])
+                    .expect("contains(UnicodeString): string unbound");
+                let s_char = ann
+                    .annotation(&hl.args[1])
+                    .expect("contains(UnicodeString): char unbound");
+                if const_str_of(&s_char).as_deref() == Some("\0") {
+                    let mut r = SomeBool::new();
+                    let mut knowntypedata = std::collections::HashMap::new();
+                    let vars = match &hl.args[0] {
+                        Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
+                        Hlvalue::Constant(_) => Vec::new(),
+                    };
+                    let s_nonnul = s_string
+                        .nonnulify()
+                        .expect("contains(UnicodeString): nonnulify must succeed");
+                    add_knowntypedata(&mut knowntypedata, false, &vars, s_nonnul);
+                    r.set_knowntypedata(knowntypedata);
+                    return SomeValue::Bool(r);
+                }
+                SomeValue::Bool(SomeBool::new())
+            }),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1799,7 +2051,7 @@ pub fn str_method_join(
     s_self: &SomeValue,
     s_list: &SomeValue,
 ) -> SomeValue {
-    // unaryop.py:646-655.
+    // unaryop.py:648-658.
     if s_none().contains(s_list) {
         return SomeValue::Impossible;
     }
@@ -1809,22 +2061,30 @@ pub fn str_method_join(
     let position = ann.bookkeeper.current_position_key();
     let s_item = s_list.listdef.read_item(position);
     if s_none().contains(&s_item) {
-        let empty = match s_self {
-            SomeValue::UnicodeString(_) => String::new(),
-            _ => String::new(),
-        };
-        let mut s = match s_self {
+        // upstream unaryop.py:653-656:
+        //     if isinstance(self, SomeUnicodeString):
+        //         return immutablevalue(u"")
+        //     return immutablevalue("")
+        // The SomeString branch routes through bookkeeper.immutablevalue
+        // so no_nul / const_box carry the same invariants as any other
+        // empty-string constant. The Rust port has no ConstValue::UStr
+        // yet, so the SomeUnicodeString branch mirrors the same shape
+        // inline until unicode-const support lands.
+        let s_empty = ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::Str(String::new()))
+            .expect("immutablevalue(\"\") must succeed");
+        return match s_self {
             SomeValue::UnicodeString(_) => {
-                return {
-                    let mut u = SomeUnicodeString::new(false, false);
-                    u.inner.base.const_box = Some(Constant::new(ConstValue::Str(empty)));
-                    SomeValue::UnicodeString(u)
+                let SomeValue::String(s) = s_empty else {
+                    unreachable!("immutablevalue(\"\") always returns SomeString");
                 };
+                let mut u = SomeUnicodeString::new(false, s.inner.no_nul);
+                u.inner.base.const_box = s.inner.base.const_box;
+                SomeValue::UnicodeString(u)
             }
-            _ => SomeString::new(false, false),
+            _ => s_empty,
         };
-        s.inner.base.const_box = Some(Constant::new(ConstValue::Str(empty)));
-        return SomeValue::String(s);
     }
     let no_nul = stringish_no_nul(s_self) && stringish_no_nul(&s_item);
     basestring_of(s_self, no_nul)
@@ -1874,10 +2134,11 @@ pub fn str_method_rsplit(
 
 #[allow(dead_code)]
 pub fn str_method_upper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
-    // unaryop.py:736-737 / 793-797 — SomeChar.upper returns self; SomeString.upper returns SomeString().
+    // unaryop.py:736-737 / 793-797 — SomeChar.upper returns self;
+    // SomeString/SomeUnicodeString inherit basestringclass().
     match _s_self {
         SomeValue::Char(_) => _s_self.clone(),
-        _ => SomeValue::String(SomeString::new(false, false)),
+        _ => basestring_of(_s_self, false),
     }
 }
 
@@ -1885,7 +2146,7 @@ pub fn str_method_upper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeVal
 pub fn str_method_lower(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     match _s_self {
         SomeValue::Char(_) => _s_self.clone(),
-        _ => SomeValue::String(SomeString::new(false, false)),
+        _ => basestring_of(_s_self, false),
     }
 }
 
@@ -1981,6 +2242,7 @@ pub fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> 
             "get" | "setdefault" => "dict_method_get",
             "copy" => "dict_method_copy",
             "update" => "dict_method_update",
+            "__prepare_dict_update" => "dict_method_prepare_dict_update",
             "keys" => "dict_method_keys",
             "values" => "dict_method_values",
             "items" => "dict_method_items",
@@ -1992,6 +2254,12 @@ pub fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> 
             "clear" => "dict_method_clear",
             "popitem" => "dict_method_popitem",
             "pop" => "dict_method_pop",
+            "contains_with_hash" => "dict_method_contains_with_hash",
+            "setitem_with_hash" => "dict_method_setitem_with_hash",
+            "getitem_with_hash" => "dict_method_getitem_with_hash",
+            "delitem_with_hash" => "dict_method_delitem_with_hash",
+            "delitem_if_value_is" => "dict_method_delitem_if_value_is",
+            "move_to_end" => "dict_method_move_to_end",
             _ => return None,
         },
         SomeValue::String(_) => match name {
@@ -2075,6 +2343,30 @@ fn builtin_method_arg_error(method: &SomeBuiltinMethod) -> AnnotatorError {
     ))
 }
 
+/// Model upstream `SomeBuiltinMethod.call(self, args)` argument
+/// binding (unaryop.py:961-967):
+///
+/// ```python
+/// def call(self, args, implicit_init=False):
+///     args_s, kwds = args.unpack()
+///     # prefix keyword arguments with 's_'
+///     kwds_s = {}
+///     for key, s_value in kwds.items():
+///         kwds_s['s_'+key] = s_value
+///     return self.analyser(self.s_self, *args_s, **kwds_s)
+/// ```
+///
+/// In RPython the final `self.analyser(self.s_self, *args_s, **kwds_s)`
+/// relies on Python's native calling convention to pair positional
+/// args + `s_`-prefixed kwargs against the `method_X(self, ...)`
+/// signature, plus the method's default values for missing positions.
+/// Rust has no reflection, so the port binds the arguments explicitly
+/// through [`ArgumentsForTranslation::match_signature`] (the Rust
+/// port of `argument.py:126-133`) with the analyser's formal
+/// `argnames` and `defaults` threaded in from each dispatch arm.
+/// The resulting `Vec<SomeValue>` matches positional order 1:1 with
+/// the analyser's formals, letting the call sites destructure via
+/// `let [..] = scope.as_slice()` without inspecting `kwds` again.
 fn bind_builtin_method_args(
     args_s: Vec<SomeValue>,
     kwds: std::collections::HashMap<String, SomeValue>,
@@ -2086,6 +2378,7 @@ fn bind_builtin_method_args(
         None,
         None,
     );
+    // upstream: `kwds_s['s_'+key] = s_value`.
     let prefixed_kwds = kwds
         .into_iter()
         .map(|(key, value)| (format!("s_{key}"), value))
@@ -2214,6 +2507,16 @@ pub fn call_builtin_method(
             };
             dict_method_update(ann, s_self, s_other)
         }
+        "dict_method_prepare_dict_update" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_num"], None)?;
+            let [s_num] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_prepare_dict_update(ann, s_self, s_num)
+        }
         "dict_method_keys" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
@@ -2328,6 +2631,67 @@ pub fn call_builtin_method(
             } else {
                 dict_method_pop(ann, s_self, s_key, Some(s_dfl))
             }
+        }
+        "dict_method_contains_with_hash" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_key", "s_hash"], None)?;
+            let [s_key, s_hash] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_contains_with_hash(ann, s_self, s_key, s_hash)
+        }
+        "dict_method_setitem_with_hash" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope =
+                bind_builtin_method_args(args_s, kwds, &["s_key", "s_hash", "s_value"], None)?;
+            let [s_key, s_hash, s_value] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_setitem_with_hash(ann, s_self, s_key, s_hash, s_value)
+        }
+        "dict_method_getitem_with_hash" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_key", "s_hash"], None)?;
+            let [s_key, s_hash] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_getitem_with_hash(ann, s_self, s_key, s_hash)
+        }
+        "dict_method_delitem_with_hash" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_key", "s_hash"], None)?;
+            let [s_key, s_hash] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_delitem_with_hash(ann, s_self, s_key, s_hash)
+        }
+        "dict_method_delitem_if_value_is" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_key", "s_value"], None)?;
+            let [s_key, s_value] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_delitem_if_value_is(ann, s_self, s_key, s_value)
+        }
+        "dict_method_move_to_end" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &["s_key", "s_last"], None)?;
+            let [s_key, s_last] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_move_to_end(ann, s_self, s_key, s_last)
         }
         "str_method_startswith" => {
             let scope = bind_builtin_method_args(args_s, kwds, &["s_frag"], None)?;
@@ -2624,27 +2988,7 @@ fn init_someiterator_overrides(
                     SomeValue::Iterator(i) => i,
                     _ => panic!("iterator.next: arg 0 not SomeIterator"),
                 };
-                let position = ann.bookkeeper.current_position_key();
-                // upstream: `if s_None.contains(self.s_container): return s_ImpossibleValue`.
-                if matches!(&*it.s_container, SomeValue::None_(_)) {
-                    return s_impossible_value();
-                }
-                // upstream: `if self.variant and self.variant[0] == "enumerate": ...`.
-                if it.variant.first().map(String::as_str) == Some("enumerate") {
-                    let s_item = container_getanyitem(&it.s_container, None, position.clone());
-                    return SomeValue::Tuple(SomeTuple::new(vec![
-                        SomeValue::Integer(SomeInteger::new(true, false)),
-                        s_item,
-                    ]));
-                }
-                // upstream: `if variant == ("reversed",): variant = ()`.
-                let variant: Option<&str> = if it.variant.len() == 1 && it.variant[0] == "reversed"
-                {
-                    None
-                } else {
-                    it.variant.first().map(String::as_str)
-                };
-                container_getanyitem(&it.s_container, variant, position)
+                someiterator_next(ann, &it)
             }),
             can_only_throw: CanOnlyThrow::Callable(Box::new(|args_s| {
                 // upstream `_can_only_throw` (unaryop.py:812-816):
@@ -2662,6 +3006,34 @@ fn init_someiterator_overrides(
             })),
         },
     );
+}
+
+/// RPython `SomeIterator.next(self)` (unaryop.py:818-828). Extracted
+/// into a free function so `list_method_extend` (unaryop.py:363-369)
+/// can call `s_iterable.iter().next()` directly without going through
+/// the HLOperation dispatch framework — upstream also calls it as a
+/// plain method invocation on a SomeIterator value.
+fn someiterator_next(ann: &RPythonAnnotator, it: &SomeIterator) -> SomeValue {
+    let position = ann.bookkeeper.current_position_key();
+    // upstream: `if s_None.contains(self.s_container): return s_ImpossibleValue`.
+    if matches!(&*it.s_container, SomeValue::None_(_)) {
+        return s_impossible_value();
+    }
+    // upstream: `if self.variant and self.variant[0] == "enumerate": ...`.
+    if it.variant.first().map(String::as_str) == Some("enumerate") {
+        let s_item = container_getanyitem(&it.s_container, None, position.clone());
+        return SomeValue::Tuple(SomeTuple::new(vec![
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            s_item,
+        ]));
+    }
+    // upstream: `if variant == ("reversed",): variant = ()`.
+    let variant: Option<&str> = if it.variant.len() == 1 && it.variant[0] == "reversed" {
+        None
+    } else {
+        it.variant.first().map(String::as_str)
+    };
+    container_getanyitem(&it.s_container, variant, position)
 }
 
 /// RPython `container.getanyitem(position, *variant)` dispatch —
@@ -3674,6 +4046,50 @@ mod tests {
     }
 
     #[test]
+    fn consider_someobject_bool_on_none_is_constant_false() {
+        let (hl, ann) = hl1(
+            OpKind::Bool,
+            SomeValue::None_(super::super::model::SomeNone::new()),
+        );
+        let r = hl.consider(&ann).unwrap();
+        let SomeValue::Bool(b) = r else {
+            panic!("expected SomeBool");
+        };
+        assert_eq!(b.base.const_box.unwrap().value, ConstValue::Bool(false));
+    }
+
+    #[test]
+    fn consider_someobject_bool_adds_truth_branch_nonnone_refinement() {
+        let ann = mk_ann();
+        let mut v = Variable::named("maybe_s");
+        ann.setbinding(&mut v, SomeValue::String(SomeString::new(true, false)));
+        let hl = HLOperation::new(OpKind::Bool, vec![Hlvalue::Variable(v.clone())]);
+        let r = hl.consider(&ann).unwrap();
+        let SomeValue::Bool(b) = r else {
+            panic!("expected SomeBool");
+        };
+        let ktd = b.knowntypedata.expect("knowntypedata must be populated");
+        let narrowed = ktd
+            .get(&true)
+            .and_then(|inner| inner.get(&Rc::new(v)))
+            .expect("truth branch must refine the object");
+        match narrowed {
+            SomeValue::String(s) => assert!(!s.inner.can_be_none),
+            other => panic!("expected SomeString refinement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consider_someobject_bool_uses_constant_len_when_available() {
+        let (hl, ann) = hl1(OpKind::Bool, SomeValue::Tuple(SomeTuple::new(vec![])));
+        let r = hl.consider(&ann).unwrap();
+        let SomeValue::Bool(b) = r else {
+            panic!("expected SomeBool");
+        };
+        assert_eq!(b.base.const_box.unwrap().value, ConstValue::Bool(false));
+    }
+
+    #[test]
     fn consider_someinteger_abs_is_nonneg() {
         let (hl, ann) = hl1(OpKind::Abs, SomeValue::Integer(SomeInteger::default()));
         let r = hl.consider(&ann).unwrap();
@@ -3957,6 +4373,58 @@ mod tests {
     }
 
     #[test]
+    fn consider_somepbc_class_name_returns_somestring() {
+        let ann = mk_ann();
+        let class_host =
+            super::super::super::flowspace::model::HostObject::new_class("Abc", vec![]);
+        let desc = ann.bookkeeper.getdesc(&class_host).expect("class desc");
+        let mut v_cls = Variable::named("cls");
+        ann.setbinding(
+            &mut v_cls,
+            SomeValue::PBC(super::super::model::SomePBC::new([desc], false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v_cls),
+                Hlvalue::Constant(Constant::new(ConstValue::Str("__name__".into()))),
+            ],
+        );
+        let r = hl.consider(&ann).expect("class __name__ getattr");
+        assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_somepbc_single_desc_routes_through_s_read_attribute() {
+        // upstream pbc_getattr single-desc fast path: `if len(descs) == 1:
+        // return first.s_read_attribute(attr)`. Construct a ClassDesc PBC
+        // whose class has a const attribute and read it through PBC.getattr.
+        let ann = mk_ann();
+        let class_host =
+            super::super::super::flowspace::model::HostObject::new_class("Box", vec![]);
+        class_host.class_set("N", ConstValue::Int(42));
+        let desc = ann.bookkeeper.getdesc(&class_host).expect("class desc");
+        let mut v_cls = Variable::named("cls");
+        ann.setbinding(
+            &mut v_cls,
+            SomeValue::PBC(super::super::model::SomePBC::new([desc], false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v_cls),
+                Hlvalue::Constant(Constant::new(ConstValue::Str("N".into()))),
+            ],
+        );
+        let r = hl.consider(&ann).expect("class const attr getattr");
+        assert!(
+            matches!(r.const_(), Some(ConstValue::Int(42))),
+            "got {:?}",
+            r
+        );
+    }
+
+    #[test]
     fn consider_somenone_len_returns_impossible() {
         let (hl, ann) = hl1(
             OpKind::Len,
@@ -3974,6 +4442,74 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_contains_string_nul_sets_false_branch_nonnul_refinement() {
+        let ann = mk_ann();
+        let mut v_string = Variable::named("s");
+        ann.setbinding(
+            &mut v_string,
+            SomeValue::String(SomeString::new(false, false)),
+        );
+        let mut nul_char = super::super::model::SomeChar::new(false);
+        nul_char.inner.base.const_box = Some(Constant::new(ConstValue::Str("\0".into())));
+        let mut v_char = Variable::named("c");
+        ann.setbinding(&mut v_char, SomeValue::Char(nul_char));
+        let hl = HLOperation::new(
+            OpKind::Contains,
+            vec![
+                Hlvalue::Variable(v_string.clone()),
+                Hlvalue::Variable(v_char),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap();
+        let SomeValue::Bool(b) = r else {
+            panic!("expected SomeBool");
+        };
+        let ktd = b.knowntypedata.expect("knowntypedata must be populated");
+        let narrowed = ktd
+            .get(&false)
+            .and_then(|inner| inner.get(&Rc::new(v_string)))
+            .expect("false branch must refine the string");
+        match narrowed {
+            SomeValue::String(s) => assert!(s.inner.no_nul),
+            other => panic!("expected SomeString refinement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consider_contains_unicode_nul_sets_false_branch_nonnul_refinement() {
+        let ann = mk_ann();
+        let mut v_string = Variable::named("u");
+        ann.setbinding(
+            &mut v_string,
+            SomeValue::UnicodeString(SomeUnicodeString::new(false, false)),
+        );
+        let mut nul_cp = super::super::model::SomeUnicodeCodePoint::new(false);
+        nul_cp.inner.base.const_box = Some(Constant::new(ConstValue::Str("\0".into())));
+        let mut v_char = Variable::named("c");
+        ann.setbinding(&mut v_char, SomeValue::UnicodeCodePoint(nul_cp));
+        let hl = HLOperation::new(
+            OpKind::Contains,
+            vec![
+                Hlvalue::Variable(v_string.clone()),
+                Hlvalue::Variable(v_char),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap();
+        let SomeValue::Bool(b) = r else {
+            panic!("expected SomeBool");
+        };
+        let ktd = b.knowntypedata.expect("knowntypedata must be populated");
+        let narrowed = ktd
+            .get(&false)
+            .and_then(|inner| inner.get(&Rc::new(v_string)))
+            .expect("false branch must refine the unicode string");
+        match narrowed {
+            SomeValue::UnicodeString(s) => assert!(s.inner.no_nul),
+            other => panic!("expected SomeUnicodeString refinement, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4063,6 +4599,40 @@ mod tests {
     }
 
     #[test]
+    fn str_method_upper_preserves_unicode_family() {
+        let ann = mk_ann();
+        let unicode = SomeValue::UnicodeString(SomeUnicodeString::new(false, false));
+        let codepoint =
+            SomeValue::UnicodeCodePoint(super::super::model::SomeUnicodeCodePoint::new(false));
+
+        assert!(matches!(
+            str_method_upper(&ann, &unicode),
+            SomeValue::UnicodeString(_)
+        ));
+        assert!(matches!(
+            str_method_upper(&ann, &codepoint),
+            SomeValue::UnicodeString(_)
+        ));
+    }
+
+    #[test]
+    fn str_method_lower_preserves_unicode_family() {
+        let ann = mk_ann();
+        let unicode = SomeValue::UnicodeString(SomeUnicodeString::new(false, false));
+        let codepoint =
+            SomeValue::UnicodeCodePoint(super::super::model::SomeUnicodeCodePoint::new(false));
+
+        assert!(matches!(
+            str_method_lower(&ann, &unicode),
+            SomeValue::UnicodeString(_)
+        ));
+        assert!(matches!(
+            str_method_lower(&ann, &codepoint),
+            SomeValue::UnicodeString(_)
+        ));
+    }
+
+    #[test]
     fn dict_method_items_returns_list_of_pairs() {
         let ann = mk_ann();
         let pk = super::super::bookkeeper::PositionKey::new(7, 0, 0);
@@ -4081,5 +4651,81 @@ mod tests {
             panic!("expected SomeList");
         };
         assert!(matches!(list.listdef.read_item(None), SomeValue::Tuple(_)));
+    }
+
+    #[test]
+    fn find_method_exposes_dict_hash_and_move_to_end_surface() {
+        let ann = mk_ann();
+        let dictdef = super::super::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let s_dict = SomeValue::Dict(super::super::model::SomeDict::new(dictdef));
+
+        let SomeValue::BuiltinMethod(getitem) = s_dict.find_method("getitem_with_hash").unwrap()
+        else {
+            panic!("dict.getitem_with_hash must be recognized");
+        };
+        assert_eq!(getitem.analyser_name, "dict_method_getitem_with_hash");
+
+        let SomeValue::BuiltinMethod(move_to_end) = s_dict.find_method("move_to_end").unwrap()
+        else {
+            panic!("dict.move_to_end must be recognized");
+        };
+        assert_eq!(move_to_end.analyser_name, "dict_method_move_to_end");
+    }
+
+    #[test]
+    fn dict_method_getitem_with_hash_reads_value_type() {
+        let ann = mk_ann();
+        let pk = super::super::bookkeeper::PositionKey::new(9, 0, 0);
+        ann.bookkeeper.set_position_key(Some(pk));
+        let dictdef = super::super::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let s_dict = super::super::model::SomeDict::new(dictdef);
+        let result = dict_method_getitem_with_hash(
+            &ann,
+            &s_dict,
+            &SomeValue::Integer(SomeInteger::default()),
+            &SomeValue::Integer(SomeInteger::default()),
+        );
+        assert!(matches!(result, SomeValue::String(_)));
+    }
+
+    #[test]
+    fn builtin_method_call_binds_hash_method_keywords() {
+        let ann = mk_ann();
+        let dictdef = super::super::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let method = SomeBuiltinMethod::new(
+            "dict_method_contains_with_hash",
+            SomeValue::Dict(super::super::model::SomeDict::new(dictdef)),
+            "contains_with_hash",
+        );
+        let mut kwds = std::collections::HashMap::new();
+        kwds.insert("hash".to_string(), s_const_int(11));
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::default())],
+            Some(kwds),
+            None,
+        );
+        let result = call_builtin_method(&ann, &method, &args).expect("builtin call must bind");
+        assert!(matches!(result, SomeValue::Bool(_)));
     }
 }

@@ -2,17 +2,16 @@
 //!
 //! RPython upstream: `rpython/annotator/exception.py` (7 LOC).
 //!
-//! Phase 5 P5.1 port + c1b migration — classdefs land as
-//! `Rc<RefCell<classdesc::ClassDef>>` so identity equality (`Rc::ptr_eq`)
-//! matches upstream's Python class identity.
+//! ClassDefs surface as `Rc<RefCell<classdesc::ClassDef>>` so identity
+//! equality (`Rc::ptr_eq`) matches upstream's Python class identity.
 //!
 //! Rust adaptation (parity rule #1): upstream imports live Python
 //! exception classes (`TypeError`, `OverflowError`, …) and
 //! `rstackovf._StackOverflow`. The Rust port uses
 //! [`classdesc::ClassDef::new_standalone`] to build fresh classdef
-//! shells under the upstream qualnames; when Phase 5's bookkeeper.py
-//! provides a real ClassDesc registry these callers route through
-//! `bookkeeper.getdesc(cls).getuniqueclassdef()` instead.
+//! shells under the upstream qualnames; once a real ClassDesc registry
+//! is wired into the builtin-module port these callers should route
+//! through `bookkeeper.getdesc(cls).getuniqueclassdef()` instead.
 
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -7,7 +7,7 @@
 //! | upstream | Rust |
 //! |---|---|
 //! | `Attribute` (classdesc.py:72-134) | [`Attribute`] |
-//! | `ClassDef` data + structural methods (classdesc.py:136-431) | [`ClassDef`] (c3 hooks deferred) |
+//! | `ClassDef` data + structural methods (classdesc.py:136-431) | [`ClassDef`] |
 //! | `InstanceSource` (classdesc.py:435-464) | [`InstanceSource`] |
 //! | `NoSuchAttrError` (classdesc.py:466-468) | [`NoSuchAttrError`] |
 //! | `is_mixin` (classdesc.py:471) | [`is_mixin`] |
@@ -43,14 +43,6 @@
 //! `Rc<RefCell<ClassDef>>` and equality on the `Rc` is `Rc::ptr_eq`,
 //! matching upstream. Name-based comparisons must walk
 //! `borrow().name`.
-//!
-//! ## PRE-EXISTING-ADAPTATION: deferred c3 methods
-//!
-//! `ClassDef::{s_getattr, lookup_filter, check_missing_attribute_update,
-//! check_attr_here, see_instance}` surface as fail-fast
-//! [`AnnotatorError`] until c3 lands the bookkeeper + MethodDesc.bind_self
-//! machinery they depend on. Structural data/method parity is preserved so
-//! the c3 follow-up is a pure additive patch.
 //!
 //! ## PRE-EXISTING-ADAPTATION: HostObject class-dict reflection
 //!
@@ -578,19 +570,16 @@ impl Attribute {
 
 /// RPython `class ClassDesc(Desc)` (classdesc.py:488-600).
 ///
-/// Structural port complete for the annotator-visible surface:
-/// `__init__` body (mixin resolution, slots / _attrs_ detection,
+/// Structural port of the annotator-visible surface: `__init__` body
+/// (mixin resolution, slots / `_attrs_` detection,
 /// `is_builtin_exception_class` pre-population, `_immutable_fields_`
-/// enforcement) + `lookup`, `read_attribute`, `s_read_attribute`,
+/// enforcement), `lookup`, `read_attribute`, `s_read_attribute`,
 /// `s_get_value`, `add_source_attribute`, `add_mixins`,
 /// `add_sources_for_class`, `getclassdef`, `getuniqueclassdef`,
-/// `pycall`, `consider_call_site` (Phase 1 + Phase 2 with
-/// `getallbases` / `getcommonbase` / `MethodDesc` initdesc recursion),
-/// `getattrfamily`, `mergeattrfamilies`, and exception-class predicates.
-///
-/// Remaining deferred: `maybe_return_immutable_list`, `pythontype`
-/// helpers — rtyper-phase dependencies not reachable from the
-/// annotator fixpoint.
+/// `pycall`, `consider_call_site` (with `getallbases` /
+/// `getcommonbase` / `MethodDesc` initdesc recursion),
+/// `getattrfamily`, `mergeattrfamilies`, `maybe_return_immutable_list`,
+/// and exception-class predicates.
 #[derive(Debug)]
 pub struct ClassDesc {
     /// RPython `self.pyobj` — the live Python class object.
@@ -884,11 +873,10 @@ impl ClassDesc {
         // classdesc.py:582-588 — _must_be_light_finalizer_ check. The
         // inner `getattr(cls.__del__, '_must_be_light_finalizer_',
         // False)` probe walks a method-level attribute the HostObject
-        // model does not expose; the check stays deferred. Structural
-        // shape preserved so c3 flips this into a full guard with a
-        // single `add_method_attr_lookup` helper.
+        // model does not expose; the class-level side is kept so the
+        // method-level guard drops in once method-attr reflection lands.
         if cls.class_get("_must_be_light_finalizer_").is_some() && cls.class_has("__del__") {
-            // Deferred — c3 dep on method-level `_must_be_light_finalizer_`.
+            // method-attr reflection not modelled on HostObject yet.
         }
 
         Ok(me)
@@ -1248,10 +1236,6 @@ impl ClassDesc {
         } else {
             // upstream: `args = args.prepend(s_instance); s_init.call(args)`.
             let bound_args = args.prepend(s_instance.clone());
-            let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
-                AnnotatorError::new("ClassDesc.pycall: Bookkeeper backlink dropped")
-            })?;
-            let _guard = bk.at_position(None);
             s_init.call(&bound_args)?;
         }
         Ok(s_instance)
@@ -1380,6 +1364,91 @@ impl ClassDesc {
             None => Ok(super::model::s_impossible_value()),
             Some(cdesc) => Self::s_get_value(&cdesc, None, name),
         }
+    }
+
+    /// RPython `ClassDesc.getattrfamily(self, attrname)`
+    /// (classdesc.py:920-924).
+    ///
+    /// ```python
+    /// def getattrfamily(self, attrname):
+    ///     access_sets = self.bookkeeper.get_classpbc_attr_families(attrname)
+    ///     _, _, attrfamily = access_sets.find(self)
+    ///     return attrfamily
+    /// ```
+    pub fn getattrfamily(
+        this: &Rc<RefCell<Self>>,
+        attrname: &str,
+    ) -> Option<Rc<RefCell<super::description::ClassAttrFamily>>> {
+        use super::description::DescKey;
+        let key = DescKey::from_rc(this);
+        let bk = this.borrow().bookkeeper.upgrade()?;
+        Some(bk.with_classpbc_attr_families(attrname, |uf| {
+            let rep = uf.find_rep(key);
+            uf.get(&rep)
+                .cloned()
+                .expect("UnionFind.find_rep() must materialise a ClassAttrFamily")
+        }))
+    }
+
+    /// RPython `ClassDesc.queryattrfamily(self, attrname)`
+    /// (classdesc.py:926-933).
+    ///
+    /// ```python
+    /// def queryattrfamily(self, attrname):
+    ///     access_sets = self.bookkeeper.get_classpbc_attr_families(attrname)
+    ///     try:
+    ///         return access_sets[self]
+    ///     except KeyError:
+    ///         return None
+    /// ```
+    pub fn queryattrfamily(
+        this: &Rc<RefCell<Self>>,
+        attrname: &str,
+    ) -> Option<Rc<RefCell<super::description::ClassAttrFamily>>> {
+        use super::description::DescKey;
+        let key = DescKey::from_rc(this);
+        let bk = this.borrow().bookkeeper.upgrade()?;
+        bk.with_classpbc_attr_families(attrname, |uf| {
+            if !uf.contains(&key) {
+                return None;
+            }
+            uf.get(&key).cloned()
+        })
+    }
+
+    /// RPython `ClassDesc.mergeattrfamilies(self, others, attrname)`
+    /// (classdesc.py:935-942).
+    ///
+    /// ```python
+    /// def mergeattrfamilies(self, others, attrname):
+    ///     access_sets = self.bookkeeper.get_classpbc_attr_families(attrname)
+    ///     changed, rep, attrfamily = access_sets.find(self)
+    ///     for desc in others:
+    ///         changed1, rep, attrfamily = access_sets.union(rep, desc)
+    ///         changed = changed or changed1
+    ///     return changed
+    /// ```
+    pub fn mergeattrfamilies(
+        this: &Rc<RefCell<Self>>,
+        others: &[Rc<RefCell<Self>>],
+        attrname: &str,
+    ) -> bool {
+        use super::description::DescKey;
+        let Some(bk) = this.borrow().bookkeeper.upgrade() else {
+            return false;
+        };
+        let head_key = DescKey::from_rc(this);
+        bk.with_classpbc_attr_families(attrname, |uf| {
+            let mut rep = uf.find_rep(head_key);
+            let mut changed = false;
+            for desc in others {
+                let other_key = DescKey::from_rc(desc);
+                let (c, new_rep) = uf.union(rep, other_key);
+                changed |= c;
+                rep = new_rep;
+            }
+            changed
+        })
     }
 
     /// RPython `ClassDesc.s_get_value(self, classdef, name)`
@@ -2364,27 +2433,25 @@ impl ClassDef {
         this: &Rc<RefCell<ClassDef>>,
         attrname: &str,
         flags: &std::collections::BTreeMap<String, bool>,
-    ) -> Result<SomeValue, AnnotatorError> {
+    ) -> Result<SomeValue, super::model::AnnotatorException> {
         // upstream: `attrdef = self.find_attribute(attrname);
         //            s_result = attrdef.s_value`.
         let s_result = Self::find_attribute(this, attrname)?;
         match &s_result {
-            SomeValue::PBC(pbc) => Self::lookup_filter(this, pbc, Some(attrname), flags),
+            SomeValue::PBC(pbc) => Ok(Self::lookup_filter(this, pbc, Some(attrname), flags)?),
             SomeValue::Impossible => {
                 // upstream: `self.check_missing_attribute_update(attrname)`.
                 Self::check_missing_attribute_update(this, attrname)?;
                 // upstream: `for basedef in self.getmro(): if
                 //            basedef.classdesc.all_enforced_attrs is not None
                 //            and attrname in all_enforced_attrs:
-                //            raise HarmlesslyBlocked(...)`.
+                //            raise HarmlesslyBlocked("get enforced attr")`.
                 for basedef in Self::getmro(this) {
                     let cdesc = basedef.borrow().classdesc.clone();
                     let all_enforced = cdesc.borrow().all_enforced_attrs.clone();
                     if let Some(attrs) = all_enforced {
                         if attrs.contains(attrname) {
-                            return Err(AnnotatorError::new(format!(
-                                "HarmlesslyBlocked: get enforced attr {attrname}"
-                            )));
+                            return Err(super::model::HarmlesslyBlocked.into());
                         }
                     }
                 }
@@ -2394,7 +2461,9 @@ impl ClassDef {
                 // upstream: `s_result = self.classdesc.maybe_return_immutable_list(
                 //                          attrname, s_result)`.
                 let classdesc = this.borrow().classdesc.clone();
-                ClassDesc::maybe_return_immutable_list(&classdesc, attrname, &s_result)
+                Ok(ClassDesc::maybe_return_immutable_list(
+                    &classdesc, attrname, &s_result,
+                )?)
             }
             _ => Ok(s_result),
         }
@@ -2536,10 +2605,6 @@ impl ClassDef {
 
     /// RPython `ClassDef._generalize_attr(self, attr, s_value)`
     /// (classdesc.py:274-313).
-    ///
-    /// The `bookkeeper.update_attr` reflow at the tail is a Phase 5
-    /// P5.2+ bookkeeper-c2 dependency; c1 preserves the new-Attribute
-    /// installation + source merge.
     fn generalize_attr_internal(
         this: &Rc<RefCell<ClassDef>>,
         attr: &str,
@@ -2872,6 +2937,24 @@ mod tests {
         let classdef = ClassDef::new(&bk, &desc);
         let s_missing = src.s_get_value(Some(&classdef), "must_exist").unwrap();
         assert!(matches!(s_missing, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn s_getattr_enforced_attr_raises_harmlessly_blocked() {
+        // upstream classdesc.py:181-183: SomeImpossibleValue +
+        // attrname ∈ all_enforced_attrs → raise HarmlesslyBlocked.
+        use super::super::model::AnnotatorException;
+        let bk = make_bk();
+        let cls = HostObject::new_class("pkg.X", vec![]);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(&bk, cls, "pkg.X".into())));
+        desc.borrow_mut()
+            .all_enforced_attrs
+            .replace(HashSet::from([String::from("blocked_attr")]));
+        let classdef = ClassDef::new(&bk, &desc);
+        let flags = std::collections::BTreeMap::new();
+        let err = ClassDef::s_getattr(&classdef, "blocked_attr", &flags)
+            .expect_err("enforced attr getattr must raise");
+        assert!(matches!(err, AnnotatorException::Harmless(_)));
     }
 
     #[test]

@@ -36,6 +36,7 @@
 //! interior-mutability surface as Python's `self.later =` assignments.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 /// Callable queued by [`FlattenRecursion::call`]. Returning an error
 /// short-circuits the drain loop and propagates the error back to the
@@ -46,8 +47,8 @@ pub type DeferredCall<E> = Box<dyn FnOnce() -> Result<(), E>>;
 /// RPython `class FlattenRecursion(TlsClass)` (tool/flattenrec.py:13-31).
 pub struct FlattenRecursion<E> {
     /// RPython `self.later: list | None` — `None` when not currently
-    /// draining; `Some(vec)` while an outer call holds the queue.
-    later: RefCell<Option<Vec<DeferredCall<E>>>>,
+    /// draining; `Some(queue)` while an outer call holds the queue.
+    later: RefCell<Option<VecDeque<DeferredCall<E>>>>,
 }
 
 impl<E> FlattenRecursion<E> {
@@ -65,29 +66,25 @@ impl<E> FlattenRecursion<E> {
         // upstream: `if self.later is not None: self.later.append(...)`.
         let is_outer = self.later.borrow().is_none();
         if !is_outer {
-            self.later.borrow_mut().as_mut().unwrap().push(func);
+            self.later.borrow_mut().as_mut().unwrap().push_back(func);
             return Ok(());
         }
         // upstream: `self.later = lst = []`.
-        *self.later.borrow_mut() = Some(Vec::new());
+        *self.later.borrow_mut() = Some(VecDeque::new());
         // upstream: `try: func(); for func, args, kwds in lst: func(...)`.
-        // The for-loop iterates `lst` in insertion order (FIFO); items
-        // appended while draining still get picked up because Python's
-        // for-loop re-reads `len(lst)` each step. `remove(0)` models the
-        // same draining order — new appends via nested `call()` land at
-        // the tail and get visited after the existing head.
+        // Python's for-loop over `lst` re-reads `len(lst)` each step, so
+        // appends *during* the drain (via nested `call()`) are visited
+        // after the existing head. VecDeque::pop_front matches that
+        // FIFO order in O(1).
         let result = (|| -> Result<(), E> {
             func()?;
             loop {
-                let next = {
-                    let mut later = self.later.borrow_mut();
-                    let q = later.as_mut().expect("later invariant");
-                    if q.is_empty() {
-                        None
-                    } else {
-                        Some(q.remove(0))
-                    }
-                };
+                let next = self
+                    .later
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("later invariant")
+                    .pop_front();
                 match next {
                     Some(f) => f()?,
                     None => break,

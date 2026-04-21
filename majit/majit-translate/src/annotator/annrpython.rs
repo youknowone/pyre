@@ -242,6 +242,16 @@ impl From<crate::annotator::model::AnnotatorError> for FlowinError {
     }
 }
 
+impl From<crate::annotator::model::AnnotatorException> for FlowinError {
+    fn from(e: crate::annotator::model::AnnotatorException) -> Self {
+        use crate::annotator::model::AnnotatorException;
+        match e {
+            AnnotatorException::Annotator(e) => FlowinError::Annotator(e),
+            AnnotatorException::Harmless(e) => FlowinError::Harmless(e),
+        }
+    }
+}
+
 /// RPython `gather_error(annotator, graph, block, operindex)`
 /// (tool/error.py:67-82) — thin wrapper that binds the
 /// [`crate::tool::error::gather_error`] port into annrpython's legacy
@@ -492,12 +502,20 @@ impl RPythonAnnotator {
     pub fn complete_helpers(&self) {
         let saved = self.added_blocks.borrow_mut().replace(HashMap::new());
         self.complete();
-        // `simplify(block_subset=…)` parity: block_subset plumbing lands
-        // with the translator/rtyper port — the current stub is the
-        // None-path simplify() which re-simplifies everything. Wire up
-        // the same call so the side effects observable by callers
-        // remain unchanged.
-        self.simplify();
+        // upstream annrpython.py:118 passes `block_subset=self.added_blocks`
+        // unconditionally (the dict we seeded at line 117), so simplify
+        // only touches graphs reachable from blocks added during this
+        // `complete()`. Passing `Some(&[])` (rather than `None`) when
+        // the set is empty matches upstream's empty-dict semantics —
+        // simplify then iterates zero graphs and skips
+        // `perform_normalizations`.
+        let subset_blocks: Vec<BlockRef> = self
+            .added_blocks
+            .borrow()
+            .as_ref()
+            .map(|set| set.values().cloned().collect())
+            .unwrap_or_default();
+        self.simplify(Some(subset_blocks.as_slice()), None);
         *self.added_blocks.borrow_mut() = saved;
     }
 
@@ -723,11 +741,39 @@ impl RPythonAnnotator {
     /// `perform_normalizations` remain as no-op placeholders until
     /// `rpython/translator/transform.py` and `rpython/rtyper/
     /// normalizecalls.py` land.
-    pub fn simplify(&self) {
-        // upstream: `transform.transform_graph(self, ...)` — deferred
-        // until translator/transform.py port lands.
+    ///
+    /// `extra_passes` is a typed-opaque pass-through — upstream hands
+    /// it straight to `transform_graph` (which is deferred). Taking
+    /// `Option<&[()]>` keeps the upstream 2-parameter shape visible
+    /// at call sites without committing to a pass interface before
+    /// `translator/transform.py` lands.
+    pub fn simplify(&self, block_subset: Option<&[BlockRef]>, _extra_passes: Option<&[()]>) {
+        // upstream: `transform.transform_graph(self, block_subset=..., extra_passes=...)` —
+        // deferred until translator/transform.py port lands.
+        // upstream:
+        //   if block_subset is None:
+        //       graphs = self.translator.graphs
+        //   else:
+        //       graphs = {}
+        //       for block in block_subset:
+        //           graph = self.annotated.get(block)
+        //           if graph:
+        //               graphs[graph] = True
+        let graphs: Vec<GraphRef> = match block_subset {
+            None => self.translator.borrow().graphs.borrow().clone(),
+            Some(blocks) => {
+                let mut seen: HashMap<GraphKey, GraphRef> = HashMap::new();
+                let annotated = self.annotated.borrow();
+                for block in blocks {
+                    let key = BlockKey::of(block);
+                    if let Some(Some(graph)) = annotated.get(&key) {
+                        seen.entry(GraphKey::of(graph)).or_insert(graph.clone());
+                    }
+                }
+                seen.into_values().collect()
+            }
+        };
         // upstream: `for graph in graphs: simplify.eliminate_empty_blocks(graph)`.
-        let graphs: Vec<_> = self.translator.borrow().graphs.borrow().clone();
         for graph_ref in graphs {
             let fg = graph_ref.borrow();
             super::super::translator::simplify::eliminate_empty_blocks(&fg);
@@ -736,6 +782,7 @@ impl RPythonAnnotator {
         self.bookkeeper.compute_at_fixpoint();
         // upstream: `if block_subset is None: perform_normalizations(self)`
         // — perform_normalizations is rtyper-phase; deferred.
+        let _ = block_subset;
     }
 
     /// RPython `apply_renaming(self, s_out, renaming)`
@@ -2184,9 +2231,10 @@ mod tests {
 
     #[test]
     fn simplify_invokes_bookkeeper_fixpoint() {
-        // No-op stub — exercise the call site.
+        // No-op stub — exercise the call site with the upstream
+        // `block_subset=None, extra_passes=None` shape.
         let ann = RPythonAnnotator::new(None, None, None, false);
-        ann.simplify();
+        ann.simplify(None, None);
     }
 
     #[test]

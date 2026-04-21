@@ -16,7 +16,7 @@
 //! [`AnnotationSpec`] enum. Each enum variant maps to one branch of
 //! upstream's `isinstance(t, …)` dispatch.
 //!
-//! ## Phase 5 P5.2+ dependency-blocked paths
+//! ## Dependency-blocked paths
 //!
 //! * `extregistry` branch (`_compute_annotation` signature.py:73-76,
 //!   `annotationoftype` signature.py:98-100) — deferred until
@@ -34,8 +34,8 @@ use super::bookkeeper::Bookkeeper;
 use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
-    AnnotatorError, SomeBool, SomeDict, SomeFloat, SomeInstance, SomeInteger, SomeList, SomeString,
-    SomeTuple, SomeType, SomeUnicodeString, SomeValue, s_none, union,
+    AnnotatorError, SomeBool, SomeDict, SomeFloat, SomeInstance, SomeInteger, SomeList,
+    SomeObjectTrait, SomeString, SomeTuple, SomeType, SomeUnicodeString, SomeValue, s_none, union,
 };
 use crate::flowspace::model::HostObject;
 
@@ -177,7 +177,7 @@ fn compute_annotation(
         // upstream: `elif type(t) is types.NoneType: return s_None`.
         AnnotationSpec::NoneType => Ok(s_none()),
         // upstream: everything else delegates to annotationoftype.
-        // extregistry / lltype branches are Phase 5 P5.2+ deps.
+        // extregistry / lltype branches remain rtyper-phase deps.
         _ => annotationoftype(spec, bookkeeper),
     }
 }
@@ -242,24 +242,103 @@ pub fn annotationoftype(
     }
 }
 
+/// Upstream `Sig.argtypes[i]` element taxonomy (signature.py:118-134).
+///
+/// Each variant maps to one branch of upstream's dispatch loop:
+///
+/// | Upstream predicate                                    | Rust variant           |
+/// |-------------------------------------------------------|------------------------|
+/// | `isinstance(argtype, (FunctionType, MethodType))`     | `DynamicCallable`      |
+/// | `argtype is lltype.Void`                              | `Void`                 |
+/// | `argtype is None`                                     | `PassThrough`          |
+/// | `argtype is NOT_CONSTANT`                             | `NotConstant`          |
+/// | `else` (type object / `AnnotationSpec`)               | `Spec(AnnotationSpec)` |
+///
+/// Keeping the variants distinct preserves upstream's assertions
+/// (e.g. `Void` requires the inputcell to be a constant `SomePBC` /
+/// `SomeNone`) and the `NOT_CONSTANT → not_const` semantics.
+#[derive(Clone)]
+pub enum SigArgType {
+    /// `types.FunctionType` / `types.MethodType` — upstream invokes
+    /// `argtype = argtype(*inputcells)` (signature.py:119-120) to
+    /// resolve the real argtype at call time. The Rust port models
+    /// the callable as a Rust closure that receives the inputcells
+    /// and returns the resolved [`SigArgType`].
+    DynamicCallable(Rc<dyn Fn(&[SomeValue]) -> Result<SigArgType, SignatureError>>),
+    /// `lltype.Void` — upstream requires the inputcell to be a
+    /// constant `SomePBC` / `SomeNone`; passes the inputcell through
+    /// unchanged (signature.py:121-127).
+    Void,
+    /// `argtype is None` — "no change", pass the inputcell through
+    /// unchanged (signature.py:128-129).
+    PassThrough,
+    /// `NOT_CONSTANT` sentinel — upstream drops the `const` tag on
+    /// the inputcell via `not_const` (signature.py:130-132).
+    NotConstant,
+    /// Plain type object / `AnnotationSpec` — upstream's `else`
+    /// branch dispatches to `annotation(argtype, bookkeeper=...)`
+    /// (signature.py:134).
+    Spec(AnnotationSpec),
+}
+
+impl std::fmt::Debug for SigArgType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SigArgType::DynamicCallable(_) => f.write_str("DynamicCallable(<closure>)"),
+            SigArgType::Void => f.write_str("Void"),
+            SigArgType::PassThrough => f.write_str("PassThrough"),
+            SigArgType::NotConstant => f.write_str("NotConstant"),
+            SigArgType::Spec(s) => write!(f, "Spec({s:?})"),
+        }
+    }
+}
+
+impl PartialEq for SigArgType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SigArgType::Void, SigArgType::Void) => true,
+            (SigArgType::PassThrough, SigArgType::PassThrough) => true,
+            (SigArgType::NotConstant, SigArgType::NotConstant) => true,
+            (SigArgType::Spec(a), SigArgType::Spec(b)) => a == b,
+            // `DynamicCallable` closures are opaque — match upstream
+            // `types.FunctionType` identity by Rc pointer equality.
+            (SigArgType::DynamicCallable(a), SigArgType::DynamicCallable(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SigArgType {}
+
+impl From<AnnotationSpec> for SigArgType {
+    fn from(spec: AnnotationSpec) -> Self {
+        SigArgType::Spec(spec)
+    }
+}
+
 /// RPython `class Sig` (signature.py:108-147).
 ///
 /// Carries the list of argument types declared via `@signature(...)`.
-/// [`Self::call`] walks `inputcells` against `argtypes`, builds
-/// `args_s` via [`annotation`], then union + `.contains(...)` check.
-/// `FunctionType` / `MethodType` argtypes (upstream line 119-120) are
-/// not representable in our [`AnnotationSpec`] enum; `lltype.Void` /
-/// `NOT_CONSTANT` branches (upstream 121-132) depend on rtyper hooks
-/// that aren't ported and surface as [`SignatureError`].
+/// [`Self::call`] walks `inputcells` against `argtypes`, branching per
+/// [`SigArgType`] variant (signature.py:118-134).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sig {
-    pub argtypes: Vec<AnnotationSpec>,
+    pub argtypes: Vec<SigArgType>,
 }
 
 impl Sig {
     /// RPython `Sig.__init__(*argtypes)` (signature.py:110-111).
-    pub fn new(argtypes: Vec<AnnotationSpec>) -> Self {
+    pub fn new(argtypes: Vec<SigArgType>) -> Self {
         Sig { argtypes }
+    }
+
+    /// Convenience constructor for the common case where every
+    /// argtype is a plain [`AnnotationSpec`]. Equivalent to
+    /// `Sig::new(specs.into_iter().map(SigArgType::Spec).collect())`.
+    pub fn from_specs(specs: Vec<AnnotationSpec>) -> Self {
+        Sig {
+            argtypes: specs.into_iter().map(SigArgType::Spec).collect(),
+        }
     }
 
     /// RPython `Sig.__call__(self, funcdesc, inputcells)`
@@ -294,23 +373,57 @@ impl Sig {
     ) -> Result<(), SignatureError> {
         // upstream: `args_s = []; for i, argtype in enumerate(self.argtypes):`.
         let mut args_s: Vec<SomeValue> = Vec::with_capacity(self.argtypes.len());
-        for (i, argtype) in self.argtypes.iter().enumerate() {
-            match argtype {
-                // upstream: `elif argtype is None: args_s.append(inputcells[i])`.
-                // Our [`AnnotationSpec`] cannot represent Python `None`
-                // directly; callers should use [`AnnotationSpec::NoneType`]
-                // for the explicit NoneType annotation and the closest
-                // analogue to upstream `argtype is None` (= "no type
-                // constraint") is `AnnotationSpec::Already(Impossible)`.
-                // Pass-through matches either interpretation because
-                // subsequent union/contains rejects type-mismatched
-                // inputs regardless.
-                AnnotationSpec::Already(s_arg) if matches!(s_arg, SomeValue::Impossible) => {
+        for (i, argtype_slot) in self.argtypes.iter().enumerate() {
+            // upstream signature.py:119-120 — a callable argtype
+            // resolves to the real argtype by invoking `argtype(*inputcells)`.
+            // Resolve the callable once so the subsequent branches can
+            // treat the result uniformly.
+            let resolved: SigArgType = match argtype_slot {
+                SigArgType::DynamicCallable(f) => f(inputcells)?,
+                other => other.clone(),
+            };
+            match resolved {
+                // upstream signature.py:121-127 — `lltype.Void` branch:
+                // assert the inputcell is a constant SomePBC/SomeNone,
+                // pass it through unchanged.
+                SigArgType::Void => {
+                    let Some(s_input) = inputcells.get(i) else {
+                        return Err(SignatureError::new(format!(
+                            "{funcname}: Void argtype at index {i} has no inputcell",
+                        )));
+                    };
+                    let is_pbc_or_none = matches!(s_input, SomeValue::PBC(_) | SomeValue::None_(_));
+                    if !(is_pbc_or_none && s_input.is_constant()) {
+                        return Err(SignatureError::new(format!(
+                            "{funcname}: Void argtype at index {i} expects a constant SomePBC/SomeNone, got {s_input:?}",
+                        )));
+                    }
+                    args_s.push(s_input.clone());
+                }
+                // upstream signature.py:128-129 — `argtype is None`:
+                // pass the inputcell through unchanged.
+                SigArgType::PassThrough => {
                     args_s.push(inputcells.get(i).cloned().unwrap_or(SomeValue::Impossible));
                 }
-                // upstream: `args_s.append(annotation(argtype, bookkeeper=funcdesc.bookkeeper))`.
-                spec => {
-                    args_s.push(annotation(spec, Some(bookkeeper))?);
+                // upstream signature.py:130-132 — `argtype is NOT_CONSTANT`:
+                // drop the constant tag via `not_const`.
+                SigArgType::NotConstant => {
+                    let s_input = inputcells.get(i).cloned().unwrap_or(SomeValue::Impossible);
+                    args_s.push(super::model::not_const(&s_input));
+                }
+                // upstream signature.py:134 — `else: args_s.append(
+                // annotation(argtype, bookkeeper=funcdesc.bookkeeper))`.
+                SigArgType::Spec(spec) => {
+                    args_s.push(annotation(&spec, Some(bookkeeper))?);
+                }
+                // `DynamicCallable` was resolved above; if `f` returns
+                // another `DynamicCallable` we reject to match upstream's
+                // `argtype(*inputcells)` returning a callable being the
+                // caller's programming error.
+                SigArgType::DynamicCallable(_) => {
+                    return Err(SignatureError::new(format!(
+                        "{funcname}: DynamicCallable at index {i} returned another DynamicCallable",
+                    )));
                 }
             }
         }
@@ -712,7 +825,7 @@ mod tests {
         // upstream signature.py:113-147 — Sig.__call__ rebuilds inputcells
         // from annotation(argtype, ...) when the arg contains the input.
         let bk = bk();
-        let sig = Sig::new(vec![AnnotationSpec::Int, AnnotationSpec::Bool]);
+        let sig = Sig::from_specs(vec![AnnotationSpec::Int, AnnotationSpec::Bool]);
         let mut inputs = vec![
             SomeValue::Integer(SomeInteger::new(true, false)),
             SomeValue::Bool(super::super::model::SomeBool::new()),
@@ -727,10 +840,57 @@ mod tests {
     #[test]
     fn sig_call_rejects_wrong_length() {
         let bk = bk();
-        let sig = Sig::new(vec![AnnotationSpec::Int, AnnotationSpec::Int]);
+        let sig = Sig::from_specs(vec![AnnotationSpec::Int, AnnotationSpec::Int]);
         let mut inputs = vec![SomeValue::Integer(SomeInteger::new(true, false))];
         let err = sig.call("f", &bk, &mut inputs).unwrap_err();
         assert!(err.0.contains("expected 2 args"));
+    }
+
+    #[test]
+    fn sig_call_passthrough_leaves_inputcell_untouched() {
+        // upstream signature.py:128-129 — `argtype is None`: inputcell
+        // passes through unchanged. The Rust port models this as
+        // `SigArgType::PassThrough` (distinct from Spec(Already(X))).
+        let bk = bk();
+        let sig = Sig::new(vec![SigArgType::PassThrough]);
+        let original = SomeValue::String(super::super::model::SomeString::default());
+        let mut inputs = vec![original.clone()];
+        sig.call("f", &bk, &mut inputs).expect("pass-through");
+        assert_eq!(inputs[0], original);
+    }
+
+    #[test]
+    fn sig_call_not_constant_drops_const_box() {
+        // upstream signature.py:130-132 — `argtype is NOT_CONSTANT`:
+        // route the inputcell through `not_const`. For a constant
+        // SomeInteger, the const_box should be cleared.
+        let bk = bk();
+        let mut s_one = SomeInteger::default();
+        s_one.base.const_box = Some(super::super::super::flowspace::model::Constant::new(
+            super::super::super::flowspace::model::ConstValue::Int(1),
+        ));
+        let sig = Sig::new(vec![SigArgType::NotConstant]);
+        let mut inputs = vec![SomeValue::Integer(s_one)];
+        sig.call("f", &bk, &mut inputs).expect("not-constant");
+        // Post-call: inputcell is still SomeInteger but non-constant.
+        match &inputs[0] {
+            SomeValue::Integer(v) => assert!(v.base.const_box.is_none()),
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_call_dynamic_callable_resolves_argtype() {
+        // upstream signature.py:119-120 — `argtype(*inputcells)` is
+        // invoked when the argtype is a FunctionType/MethodType. The
+        // resolved argtype then drives the normal Spec/Void/… dispatch.
+        let bk = bk();
+        let resolve: Rc<dyn Fn(&[SomeValue]) -> Result<SigArgType, SignatureError>> =
+            Rc::new(|_inputcells| Ok(SigArgType::Spec(AnnotationSpec::Int)));
+        let sig = Sig::new(vec![SigArgType::DynamicCallable(resolve)]);
+        let mut inputs = vec![SomeValue::Integer(SomeInteger::new(true, false))];
+        sig.call("f", &bk, &mut inputs).expect("dynamic callable");
+        assert!(matches!(inputs[0], SomeValue::Integer(_)));
     }
 
     #[test]
@@ -741,7 +901,7 @@ mod tests {
         // `.contains()` check) — matches upstream because Python's
         // `unionof(Int, Str)` raises UnionError which propagates up.
         let bk = bk();
-        let sig = Sig::new(vec![AnnotationSpec::Int]);
+        let sig = Sig::from_specs(vec![AnnotationSpec::Int]);
         let mut inputs = vec![SomeValue::String(super::super::model::SomeString::default())];
         let err = sig.call("f", &bk, &mut inputs).unwrap_err();
         // Either the upstream 'argument' message or the union error

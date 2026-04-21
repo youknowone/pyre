@@ -788,19 +788,18 @@ impl SomeObjectTrait for SomeUnicodeCodePoint {
 //
 // The upstream `listdef.ListDef` / `dictdef.DictDef` classes live in
 // rpython/annotator/listdef.py + dictdef.py and carry classdef /
-// bookkeeper references that land in Phase 5. A4.4 ships minimal
-// identity-only placeholder types so the enum variants are usable
-// today; the real bookkeeper-aware shape drops in as a follow-up.
+// bookkeeper references; the real implementations live in
+// [`super::listdef`] / [`super::dictdef`] and are re-exported here
+// so model.rs stays the single import surface for `SomeList` /
+// `SomeDict`-wielding code.
 // ---------------------------------------------------------------------------
 
-/// RPython `rpython/annotator/listdef.py:ListDef`. Phase 5 P5.1 port
-/// provides the real identity-based implementation — see
-/// [`super::listdef`]. This re-export keeps model.rs the single
-/// import surface for `SomeList`-wielding code.
+/// RPython `rpython/annotator/listdef.py:ListDef` — re-export of
+/// [`super::listdef::ListDef`].
 pub use super::listdef::ListDef;
 
-/// RPython `rpython/annotator/dictdef.py:DictDef`. Phase 5 P5.1 port —
-/// see [`super::dictdef`].
+/// RPython `rpython/annotator/dictdef.py:DictDef` — re-export of
+/// [`super::dictdef::DictDef`].
 pub use super::dictdef::DictDef;
 
 /// RPython `class SomeList(SomeObject)` (model.py:332-354).
@@ -949,11 +948,9 @@ impl SomeObjectTrait for SomeIterator {
 // Instance / PBC / Builtin / Exception / None / Weakref / TypeOf variants (A4.5).
 // ---------------------------------------------------------------------------
 
-// Phase 4 A4.5's `ClassDef` stub has been replaced by the real
-// [`classdesc::ClassDef`] port (Phase 5 P5.2 c1). The Rust enum now
-// re-uses that shared handle; callers reference classes through
-// `Rc<RefCell<classdesc::ClassDef>>` with identity equality via
-// `Rc::ptr_eq`, matching upstream Python class identity.
+// `ClassDef` lives in [`super::classdesc`]; the Rust enum references
+// classes through `Rc<RefCell<classdesc::ClassDef>>` with identity
+// equality via `Rc::ptr_eq`, matching upstream Python class identity.
 
 /// Identity equality for `Option<Rc<RefCell<ClassDef>>>` — two `Some`
 /// values are equal only if they point at the same `Rc`; `None` is
@@ -1978,6 +1975,26 @@ impl SomeValue {
         }
     }
 
+    /// RPython `s.nonnulify()` for `SomeStringOrUnicode`
+    /// (model.py:281-285).
+    pub fn nonnulify(&self) -> Result<SomeValue, UnionError> {
+        match self {
+            SomeValue::String(s) => Ok(SomeValue::String(SomeString::new(
+                s.inner.can_be_none,
+                true,
+            ))),
+            SomeValue::UnicodeString(s) => Ok(SomeValue::UnicodeString(SomeUnicodeString::new(
+                s.inner.can_be_none,
+                true,
+            ))),
+            _ => Err(UnionError {
+                lhs: self.clone(),
+                rhs: self.clone(),
+                msg: "RPython nonnulify() not supported for this annotation".into(),
+            }),
+        }
+    }
+
     /// RPython `s.const` property (ConstAccessDelegator at model.py
     /// top-level; resolves to `s.const_box.value`).
     ///
@@ -2501,9 +2518,9 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
 
         // SomeList ∪ SomeList — upstream dispatches through
         // `pair(SomeList, SomeList).union()` in binaryop.py which
-        // calls `self.listdef.union(other.listdef)`. The Phase 5
-        // P5.1 ListDef::union_with mutates both listdefs' listitems
-        // in place (via interior mutability) and patches sister
+        // calls `self.listdef.union(other.listdef)`.
+        // `ListDef::union_with` mutates both listdefs' listitems in
+        // place (via interior mutability) and patches sister
         // `ListDefInner`s so post-merge `same_as` returns True.
         //
         // Under `contains()`, the `SideEffectFreeGuard` is active ⇒
@@ -2709,6 +2726,62 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             msg: "no upstream pair(s1, s2).union() handler in Phase 4 A4.6 subset".into(),
         }),
     }
+}
+
+/// RPython `not_const(s_obj)` (model.py:803-812).
+///
+/// ```python
+/// def not_const(s_obj):
+///     if s_obj.is_constant() and not isinstance(s_obj, (SomePBC, SomeNone)):
+///         new_s_obj = SomeObject.__new__(s_obj.__class__)
+///         dic = new_s_obj.__dict__ = s_obj.__dict__.copy()
+///         if 'const' in dic:
+///             del new_s_obj.const
+///         else:
+///             del new_s_obj.const_box
+///         s_obj = new_s_obj
+///     return s_obj
+/// ```
+///
+/// Rust port clears `SomeObjectBase.const_box` on the cloned variant;
+/// `SomePBC` / `SomeNone` are explicitly excluded (upstream's constancy
+/// on these is structural, not stored in `const_box`).
+pub fn not_const(s: &SomeValue) -> SomeValue {
+    if !s.is_constant() {
+        return s.clone();
+    }
+    if matches!(s, SomeValue::PBC(_) | SomeValue::None_(_)) {
+        return s.clone();
+    }
+    let mut cloned = s.clone();
+    match &mut cloned {
+        SomeValue::Object(b) => b.const_box = None,
+        SomeValue::Type(v) => v.base.const_box = None,
+        SomeValue::Float(v) => v.base.const_box = None,
+        SomeValue::SingleFloat(v) => v.base.const_box = None,
+        SomeValue::LongFloat(v) => v.base.const_box = None,
+        SomeValue::Integer(v) => v.base.const_box = None,
+        SomeValue::Bool(v) => v.base.const_box = None,
+        SomeValue::String(v) => v.inner.base.const_box = None,
+        SomeValue::UnicodeString(v) => v.inner.base.const_box = None,
+        SomeValue::ByteArray(v) => v.inner.base.const_box = None,
+        SomeValue::Char(v) => v.inner.base.const_box = None,
+        SomeValue::UnicodeCodePoint(v) => v.inner.base.const_box = None,
+        SomeValue::List(v) => v.base.const_box = None,
+        SomeValue::Tuple(v) => v.base.const_box = None,
+        SomeValue::Dict(v) => v.base.const_box = None,
+        SomeValue::Iterator(v) => v.base.const_box = None,
+        SomeValue::Instance(v) => v.base.const_box = None,
+        SomeValue::Exception(v) => v.base.const_box = None,
+        SomeValue::Property(v) => v.base.const_box = None,
+        SomeValue::Builtin(v) => v.base.const_box = None,
+        SomeValue::BuiltinMethod(v) => v.base.const_box = None,
+        SomeValue::WeakRef(v) => v.base.const_box = None,
+        SomeValue::TypeOf(v) => v.base.const_box = None,
+        // Impossible / PBC / None_ handled above (early-return).
+        SomeValue::Impossible | SomeValue::PBC(_) | SomeValue::None_(_) => unreachable!(),
+    }
+    cloned
 }
 
 /// RPython `unionof(*somevalues)` (model.py:771-784). Returns the most
@@ -2924,6 +2997,47 @@ impl core::fmt::Display for HarmlesslyBlocked {
 }
 
 impl std::error::Error for HarmlesslyBlocked {}
+
+/// Either `AnnotatorError` or `HarmlesslyBlocked`.
+///
+/// In upstream RPython, these are two independent exception classes
+/// (`AnnotatorError` / `HarmlesslyBlocked`, both `Exception` subclasses)
+/// and they propagate up through the same call stack. Rust functions
+/// that can raise *either* (e.g. `ClassDef.s_getattr` at
+/// classdesc.py:168-187 — which raises `HarmlesslyBlocked` in the
+/// enforced-attrs branch) return this union so the flowin loop can
+/// discriminate them without collapsing `HarmlesslyBlocked` into a
+/// generic `AnnotatorError`.
+#[derive(Clone, Debug)]
+pub enum AnnotatorException {
+    /// upstream `AnnotatorError(...)`.
+    Annotator(AnnotatorError),
+    /// upstream `HarmlesslyBlocked(...)`.
+    Harmless(HarmlesslyBlocked),
+}
+
+impl From<AnnotatorError> for AnnotatorException {
+    fn from(e: AnnotatorError) -> Self {
+        AnnotatorException::Annotator(e)
+    }
+}
+
+impl From<HarmlesslyBlocked> for AnnotatorException {
+    fn from(e: HarmlesslyBlocked) -> Self {
+        AnnotatorException::Harmless(e)
+    }
+}
+
+impl fmt::Display for AnnotatorException {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AnnotatorException::Annotator(e) => e.fmt(f),
+            AnnotatorException::Harmless(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AnnotatorException {}
 
 /// RPython `read_can_only_throw(opimpl, *args)` (model.py:837-841).
 ///
@@ -3211,11 +3325,10 @@ mod tests {
     #[test]
     fn somelist_eq_uses_listdef_same_as() {
         // upstream: `SomeList.__eq__` (model.py:339-348) calls
-        // `self.listdef.same_as(other.listdef)`. After Phase 5 P5.1
-        // this is identity-based (`Rc::ptr_eq` on the listitem cell),
-        // so two independently constructed SomeLists compare
-        // UN-equal even when their element types agree — matches
-        // upstream exactly.
+        // `self.listdef.same_as(other.listdef)`. Identity is based on
+        // `Rc::ptr_eq` over the listitem cell, so two independently
+        // constructed SomeLists compare UN-equal even when their
+        // element types agree — matches upstream exactly.
         let a = SomeList::new(ld(SomeValue::Integer(SomeInteger::default())));
         let b = SomeList::new(ld(SomeValue::Integer(SomeInteger::default())));
         let c = SomeList::new(ld(SomeValue::Float(SomeFloat::new())));

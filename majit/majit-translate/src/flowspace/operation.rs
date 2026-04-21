@@ -41,9 +41,7 @@
 use std::collections::HashMap;
 
 use super::flowcontext::FlowingError;
-use super::model::{
-    ConstValue, Constant, Hlvalue, HostGetAttrError, SpaceOperation, Variable, host_getattr,
-};
+use super::model::{ConstValue, Constant, Hlvalue, SpaceOperation, Variable};
 
 /// RPython `NOT_REALLY_CONST` (operation.py:22-35). Maps a module
 /// qualname to the set of attribute names that are *real* constants
@@ -1069,7 +1067,7 @@ impl HLOperation {
             return Ok(None);
         }
 
-        match host_const_getattr(&w_obj.value, &name_str) {
+        match crate::flowspace::model::const_runtime_getattr(&w_obj.value, &name_str) {
             Ok(Some(value)) => Ok(Some(Hlvalue::Constant(Constant::new(value)))),
             // upstream WrapException path — flowspace couldn't wrap the
             // result, so fold declines silently. We report this as "no
@@ -1102,38 +1100,6 @@ impl HLOperation {
             Hlvalue::Variable(self.result),
             self.offset,
         )
-    }
-}
-
-/// Rust equivalent of upstream `getattr(obj, name)` applied to a
-/// flow-space constant. Returns:
-///
-/// * `Ok(Some(value))` — the attribute lookup succeeded; wrap the
-///   result as a `Constant` in the fold.
-/// * `Ok(None)` — no attribute surface on this host type; upstream's
-///   `const(result)` / `WrapException` path declines the fold silently.
-/// * `Err(msg)` — upstream's `except Exception as e` branch in
-///   `GetAttr.constfold` (operation.py:637-642) — the lookup raised,
-///   so the call surfaces as a `FlowingError`.
-fn host_const_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>, String> {
-    match obj {
-        ConstValue::HostObject(h) => match host_getattr(h, name) {
-            Ok(value) => Ok(Some(value)),
-            Err(HostGetAttrError::Missing) => Err(format!(
-                "getattr({}, {:?}) always raises AttributeError",
-                h.qualname(),
-                name
-            )),
-            Err(HostGetAttrError::Unsupported) => Ok(None),
-        },
-        // Primitive foldable constants (Int / Float / Str / …): upstream
-        // `getattr(1, 'real')` etc. produce bound methods / builtin ints
-        // that would round-trip through `const(result)` + `WrapException`
-        // (operation.py:640-642). The Rust port has no runtime Python
-        // introspection to emulate these, so the fold declines silently,
-        // matching the WrapException-swallow path — the result Variable
-        // stays unbound and the annotator sees the op at binding time.
-        _ => Ok(None),
     }
 }
 
@@ -2151,15 +2117,18 @@ mod tests {
         inst.instance_set("y", ConstValue::Int(7)); // instance-only
         // Need to make the instance foldable for the test — it isn't by
         // default (foldable() returns false for user instances). The
-        // exercise here is host_const_getattr itself, so call the
-        // helper directly through a module intermediary. Upstream's
+        // exercise here is `const_runtime_getattr` itself, so call the
+        // helper directly. Upstream's
         // w_obj.foldable() gate intentionally rejects user instances;
         // real folds hit this code path via `_freeze_` markers we
         // don't model. Verify the helper's correctness instead:
-        let r = super::host_const_getattr(&ConstValue::HostObject(inst.clone()), "x")
-            .expect("instance x lookup");
+        let r = crate::flowspace::model::const_runtime_getattr(
+            &ConstValue::HostObject(inst.clone()),
+            "x",
+        )
+        .expect("instance x lookup");
         assert_eq!(r, Some(ConstValue::Int(99))); // shadowed
-        let r2 = super::host_const_getattr(&ConstValue::HostObject(inst), "y")
+        let r2 = crate::flowspace::model::const_runtime_getattr(&ConstValue::HostObject(inst), "y")
             .expect("instance y lookup");
         assert_eq!(r2, Some(ConstValue::Int(7))); // instance-only
     }
@@ -2172,7 +2141,7 @@ mod tests {
         parent.class_set("z", ConstValue::Int(100));
         let child = HostObject::new_class("Child", vec![parent.clone()]);
         let inst = HostObject::new_instance(child, vec![]);
-        let r = super::host_const_getattr(&ConstValue::HostObject(inst), "z")
+        let r = crate::flowspace::model::const_runtime_getattr(&ConstValue::HostObject(inst), "z")
             .expect("inherited attribute lookup");
         assert_eq!(r, Some(ConstValue::Int(100)));
     }

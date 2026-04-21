@@ -200,10 +200,9 @@ impl CallFamily {
         }
     }
 
-    // `find_row(bookkeeper, descs, args, op)` (description.py:54-59) is
-    // deferred — it calls `build_calltable_row` which in turn invokes
-    // `desc.get_graph(args, op)`. `Desc.get_graph` lands in
-    // description.py commits 2/3 alongside the FunctionDesc port.
+    // `find_row(bookkeeper, descs, args, op)` (description.py:54-59)
+    // is consumed only by `rtyper/rpbc.py` and lands with the rtyper
+    // port.
 }
 
 impl UnionFindInfo for Rc<RefCell<CallFamily>> {
@@ -303,9 +302,8 @@ impl ClassAttrFamily {
 
     /// RPython `ClassAttrFamily.update(other)` (description.py:118-121).
     ///
-    /// Returns `Result<(), UnionError>` because `unionof` on the
-    /// attribute value can fail (the pair-union subset is still
-    /// Phase 5 P5.2+ dependent).
+    /// Returns `Result<(), UnionError>` because the attribute `union`
+    /// can fail (`UnionError` bubbles out of any pair-union branch).
     pub fn update(&mut self, other: &ClassAttrFamily) -> Result<(), super::model::UnionError> {
         for (k, v) in &other.descs {
             self.descs.insert(*k, *v);
@@ -335,6 +333,17 @@ impl ClassAttrFamily {
     /// (description.py:127-128).
     pub fn set_s_value(&mut self, _attrname: &str, s_value: SomeValue) {
         self.s_value = s_value;
+    }
+}
+
+impl UnionFindInfo for Rc<RefCell<ClassAttrFamily>> {
+    fn absorb(&mut self, other: Self) {
+        // `absorb = update` (description.py:122). `update` propagates a
+        // `UnionError`; `UnionFindInfo` has no Result channel, so we
+        // swallow here — the error surfaces at the next
+        // `get_s_value` / set_s_value consumer if the value becomes
+        // malformed.
+        let _ = self.borrow_mut().absorb(&other.borrow());
     }
 }
 
@@ -536,6 +545,31 @@ impl DescEntry {
             // upstream: `Desc.bind_under` default = `return self`.
             DescEntry::Frozen(_) | DescEntry::MethodOfFrozen(_) | DescEntry::Class(_) => {
                 self.clone()
+            }
+        }
+    }
+
+    /// RPython `desc.s_read_attribute(name)` dispatch — mirrors the
+    /// upstream polymorphism where `FrozenDesc` / `ClassDesc` define
+    /// the method and the remaining subclasses leave it absent
+    /// (upstream raises `AttributeError` at the Python level when
+    /// reached). `pbc_getattr` (bookkeeper.py:465, 475) consumes the
+    /// result directly so the contract here is:
+    ///
+    /// * `Frozen(fd)` → [`FrozenDesc::s_read_attribute`] (description.py:560-566)
+    /// * `Class(cd)` → [`super::classdesc::ClassDesc::s_read_attribute`] (classdesc.py:775-782)
+    /// * Function / Method / MethodOfFrozen → `AnnotatorError` matching
+    ///   upstream's "no s_read_attribute on this Desc" AttributeError.
+    pub fn s_read_attribute(&self, name: &str) -> Result<super::model::SomeValue, AnnotatorError> {
+        match self {
+            DescEntry::Frozen(rc) => rc.borrow().s_read_attribute(name),
+            DescEntry::Class(rc) => super::classdesc::ClassDesc::s_read_attribute(rc, name),
+            DescEntry::Function(_) | DescEntry::Method(_) | DescEntry::MethodOfFrozen(_) => {
+                Err(AnnotatorError::new(format!(
+                    "AttributeError: {:?} has no s_read_attribute (pbc_getattr of {:?})",
+                    self.kind(),
+                    name
+                )))
             }
         }
     }
@@ -795,9 +829,9 @@ impl FunctionDesc {
             });
         for d in defaults_source.unwrap_or_default() {
             // upstream: `if x is NODEFAULT: defs_s.append(None)`.
-            // We represent NODEFAULT as s_impossible_value, matching
-            // the Phase 5 P5.2 representation; a richer "missing"
-            // encoding lands when NODEFAULT surfaces as a real enum.
+            // NODEFAULT is not modelled as a dedicated sentinel; the
+            // immutablevalue path returns `s_impossible_value` for the
+            // placeholder Constant used to represent a missing default.
             let s = self.base.bookkeeper.immutablevalue(&d.value)?;
             defs_s.push(s);
         }
@@ -1281,8 +1315,9 @@ impl FunctionDesc {
                 // upstream `specialize_call_location(funcdesc,
                 // args_s, op)` (specialize.py:368-370) — key is
                 // `(op,)`, one specialisation per call site. When the
-                // caller hasn't threaded the position (annrpython
-                // driver not yet wired), fall back to a shared
+                // caller has no live position (emulated / callback
+                // `pbc_call` paths that do not originate from a
+                // flow-space op), fall back to a shared
                 // `"call_location"` bucket — over-merges but is
                 // conservative (no wrong specialisation).
                 let key = match op_key {
@@ -1947,13 +1982,17 @@ pub fn new_or_old_class(pyobj: &HostObject) -> Option<HostObject> {
 }
 
 /// RPython `read_attribute` callback type for [`FrozenDesc`]
-/// (description.py:532 `lambda attr: getattr(pyobj, attr)`). The
-/// closure returns `Some(ConstValue)` for a present attribute and
-/// `None` to signal upstream's `AttributeError`. Kept as a boxed `Fn`
-/// so subclasses / test harnesses can wire in custom attribute
-/// sources the way upstream allows the caller to pass
-/// `read_attribute=...` into `FrozenDesc.__init__`.
-pub type FrozenReadAttr = Box<dyn Fn(&str) -> Option<ConstValue>>;
+/// (description.py:532 `lambda attr: getattr(pyobj, attr)`). Returns
+/// `Ok(value)` for a present attribute, `Err(HostGetAttrError::Missing)`
+/// for upstream's `AttributeError`, and
+/// `Err(HostGetAttrError::Unsupported)` for every other host-side
+/// failure (upstream's non-AttributeError exceptions propagate instead
+/// of being swallowed). Kept as a boxed `Fn` so subclasses / test
+/// harnesses can wire in custom attribute sources the way upstream
+/// allows the caller to pass `read_attribute=...` into
+/// `FrozenDesc.__init__`.
+pub type FrozenReadAttr =
+    Box<dyn Fn(&str) -> Result<ConstValue, crate::flowspace::model::HostGetAttrError>>;
 
 /// RPython `class FrozenDesc(Desc)` (description.py:528-599).
 pub struct FrozenDesc {
@@ -2018,61 +2057,108 @@ impl FrozenDesc {
     /// `lambda attr: getattr(pyobj, attr)` (description.py:534).
     ///
     /// The Rust port routes through [`crate::flowspace::model::host_getattr`].
-    /// That helper mirrors the host kinds the current model can
-    /// represent, including staticmethod unwrapping. Descriptors whose
-    /// runtime result would require executing Python code still surface
-    /// as "attribute missing" until the host runtime grows that
-    /// capability.
+    /// Upstream's lambda raises `AttributeError` when the name is
+    /// absent and re-raises every other host exception untouched; the
+    /// Rust callback mirrors that contract by returning
+    /// `HostGetAttrError::Missing` / `HostGetAttrError::Unsupported`
+    /// verbatim rather than collapsing both to "attribute missing".
     pub fn default_read_attribute(pyobj: HostObject) -> FrozenReadAttr {
-        Box::new(move |attr: &str| host_getattr(&pyobj, attr).ok())
+        Box::new(move |attr: &str| host_getattr(&pyobj, attr))
     }
 
     /// RPython `FrozenDesc.has_attribute(attr)` (description.py:539-546).
-    pub fn has_attribute(&self, attr: &str) -> bool {
+    ///
+    /// Upstream wraps `self._read_attribute(attr)` in
+    /// `try: ... except AttributeError: return False`; every other
+    /// exception escapes. The Rust port mirrors that: `Missing` maps
+    /// to `Ok(false)`, `Unsupported` (and any other host-side failure)
+    /// escapes as an `AnnotatorError`.
+    pub fn has_attribute(&self, attr: &str) -> Result<bool, AnnotatorError> {
         if self.attrcache.borrow().contains_key(attr) {
-            return true;
+            return Ok(true);
         }
-        self.read_attribute_raw(attr).is_some()
+        match self.read_attribute_raw(attr) {
+            Ok(_) => Ok(true),
+            Err(crate::flowspace::model::HostGetAttrError::Missing) => Ok(false),
+            Err(crate::flowspace::model::HostGetAttrError::Unsupported) => {
+                Err(AnnotatorError::new(format!(
+                    "FrozenDesc.has_attribute({attr:?}): host getattr is unsupported",
+                )))
+            }
+        }
     }
 
     /// RPython `FrozenDesc.warn_missing_attribute(attr)` (description.py:548-551).
-    pub fn warn_missing_attribute(&self, attr: &str) -> bool {
-        !self.has_attribute(attr) && !attr.starts_with('$')
+    pub fn warn_missing_attribute(&self, attr: &str) -> Result<bool, AnnotatorError> {
+        Ok(!self.has_attribute(attr)? && !attr.starts_with('$'))
     }
 
     /// Internal helper — reads an attribute through the stored
-    /// `_read_attribute` closure. `None` means "attribute missing"
-    /// (upstream's `AttributeError`). When the caller supplied a
-    /// custom callback, this dispatches to it, matching
+    /// `_read_attribute` closure. `Err(Missing)` means upstream's
+    /// `AttributeError`; `Err(Unsupported)` means a non-AttributeError
+    /// host failure the caller must surface. When the caller supplied
+    /// a custom callback, this dispatches to it, matching
     /// `FrozenDesc._read_attribute(attr)` in description.py:543 /
     /// 557 / 570.
-    fn read_attribute_raw(&self, attr: &str) -> Option<ConstValue> {
+    fn read_attribute_raw(
+        &self,
+        attr: &str,
+    ) -> Result<ConstValue, crate::flowspace::model::HostGetAttrError> {
         (self._read_attribute)(attr)
     }
 
     /// RPython `FrozenDesc.read_attribute(attr)` (description.py:553-558).
+    ///
+    /// Upstream `read_attribute` propagates `AttributeError` (caller's
+    /// `s_read_attribute` then re-catches into `s_ImpossibleValue`)
+    /// and re-raises every other exception. The Rust port distinguishes
+    /// the two errors in the returned message so downstream callers can
+    /// decide whether to fall through (Missing) or bail (Unsupported).
     pub fn read_attribute(&self, attr: &str) -> Result<ConstValue, AnnotatorError> {
         if let Some(v) = self.attrcache.borrow().get(attr) {
             return Ok(v.clone());
         }
         match self.read_attribute_raw(attr) {
-            Some(v) => {
+            Ok(v) => {
                 self.attrcache
                     .borrow_mut()
                     .insert(attr.to_string(), v.clone());
                 Ok(v)
             }
-            None => Err(AnnotatorError::new(format!(
-                "AttributeError: frozen desc has no attribute {attr:?}"
-            ))),
+            Err(crate::flowspace::model::HostGetAttrError::Missing) => Err(AnnotatorError::new(
+                format!("AttributeError: frozen desc has no attribute {attr:?}"),
+            )),
+            Err(crate::flowspace::model::HostGetAttrError::Unsupported) => {
+                Err(AnnotatorError::new(format!(
+                    "FrozenDesc.read_attribute({attr:?}): host getattr is unsupported",
+                )))
+            }
         }
     }
 
     /// RPython `FrozenDesc.s_read_attribute(attr)` (description.py:560-566).
+    ///
+    /// Upstream catches only `AttributeError`; other exceptions
+    /// escape. The Rust port mirrors that split: `Missing` collapses
+    /// to `s_ImpossibleValue`, `Unsupported` (and any other
+    /// host-side failure) propagates as an `AnnotatorError`.
     pub fn s_read_attribute(&self, attr: &str) -> Result<SomeValue, AnnotatorError> {
-        match self.read_attribute(attr) {
-            Ok(value) => self.base.bookkeeper.immutablevalue(&value),
-            Err(_) => Ok(s_impossible_value()),
+        if let Some(v) = self.attrcache.borrow().get(attr) {
+            return self.base.bookkeeper.immutablevalue(v);
+        }
+        match self.read_attribute_raw(attr) {
+            Ok(v) => {
+                self.attrcache
+                    .borrow_mut()
+                    .insert(attr.to_string(), v.clone());
+                self.base.bookkeeper.immutablevalue(&v)
+            }
+            Err(crate::flowspace::model::HostGetAttrError::Missing) => Ok(s_impossible_value()),
+            Err(crate::flowspace::model::HostGetAttrError::Unsupported) => {
+                Err(AnnotatorError::new(format!(
+                    "FrozenDesc.s_read_attribute({attr:?}): host getattr is unsupported",
+                )))
+            }
         }
     }
 
@@ -2986,7 +3072,7 @@ mod tests {
         let fd = FrozenDesc::new(bk, pyobj).unwrap();
         let v = fd.read_attribute("x").unwrap();
         assert!(matches!(v, ConstValue::HostObject(_)));
-        assert!(fd.has_attribute("x"));
+        assert!(fd.has_attribute("x").unwrap());
     }
 
     #[test]
@@ -2994,7 +3080,7 @@ mod tests {
         let bk = bk();
         let pyobj = HostObject::new_module("os");
         let fd = FrozenDesc::new(bk, pyobj).unwrap();
-        assert!(!fd.has_attribute("missing"));
+        assert!(!fd.has_attribute("missing").unwrap());
         let err = fd.read_attribute("missing").unwrap_err();
         assert!(err.msg.unwrap_or_default().contains("AttributeError"));
     }
@@ -3004,8 +3090,8 @@ mod tests {
         let bk = bk();
         let pyobj = HostObject::new_module("os");
         let fd = FrozenDesc::new(bk, pyobj).unwrap();
-        assert!(fd.warn_missing_attribute("x"));
-        assert!(!fd.warn_missing_attribute("$memofield_x"));
+        assert!(fd.warn_missing_attribute("x").unwrap());
+        assert!(!fd.warn_missing_attribute("$memofield_x").unwrap());
     }
 
     #[test]
@@ -3089,13 +3175,15 @@ mod tests {
         let calls = Rc::new(std::cell::Cell::new(0usize));
         let callback: FrozenReadAttr = {
             let calls = calls.clone();
-            Box::new(move |attr: &str| -> Option<ConstValue> {
-                calls.set(calls.get() + 1);
-                match attr {
-                    "x" => Some(ConstValue::Int(42)),
-                    _ => None,
-                }
-            })
+            Box::new(
+                move |attr: &str| -> Result<ConstValue, crate::flowspace::model::HostGetAttrError> {
+                    calls.set(calls.get() + 1);
+                    match attr {
+                        "x" => Ok(ConstValue::Int(42)),
+                        _ => Err(crate::flowspace::model::HostGetAttrError::Missing),
+                    }
+                },
+            )
         };
         let fd = FrozenDesc::new_with_read_attribute(bk, pyobj, callback).unwrap();
         // First read hits the callback.
