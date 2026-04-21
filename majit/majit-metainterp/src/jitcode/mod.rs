@@ -372,6 +372,14 @@ pub struct JitCode {
     /// RPython `jitcode.py:17` `self.calldescr` — calling convention descriptor.
     /// Set by `call.py:get_jitcode_calldescr(graph)` from the function's type.
     pub calldescr: majit_translate::jitcode::BhCallDescr,
+    /// RPython `codewriter.py:68` `jitcode.index = index` — the
+    /// zero-based index of this jitcode in `metainterp_sd.jitcodes`.
+    /// Snapshot records encode this value as the caller's `jitcode`
+    /// identity (`opencoder.py:777 frame.jitcode.index`). Defaults to
+    /// `0` until the owning codewriter/setup path assigns it; the -1
+    /// sentinel for "empty snapshot" is handled on the snapshot side
+    /// (see `create_empty_top_snapshot`).
+    pub index: i64,
 
     // majit bytecode adapter extension.
     // These fields have no RPython JitCode counterpart. RPython's

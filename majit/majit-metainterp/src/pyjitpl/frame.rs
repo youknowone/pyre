@@ -8,6 +8,45 @@ use std::sync::Arc;
 use majit_ir::OpRef;
 
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
+use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
+
+/// Map an int register (OpRef, concrete value) to an `OpBox`.
+/// Constant OpRefs materialize as `ConstInt(value)`; real trace slots
+/// materialize as `ResOp(opref.0)`. Mirrors RPython's implicit
+/// isinstance dispatch in `_encode(box)` when the caller passes
+/// `self.registers_i[index]` (which is already a `ConstInt` /
+/// `InputArg` / `AbstractResOp`).
+#[inline]
+fn register_to_box_int(opref: OpRef, value: i64) -> OpBox {
+    if opref.is_constant() {
+        OpBox::ConstInt(value)
+    } else {
+        OpBox::ResOp(opref.0)
+    }
+}
+
+/// Map a ref register (OpRef, concrete address) to an `OpBox`.
+/// `value` stores the raw address of the GC ref (cast to i64 at write
+/// time).
+#[inline]
+fn register_to_box_ref(opref: OpRef, value: i64) -> OpBox {
+    if opref.is_constant() {
+        OpBox::ConstPtr(value as u64)
+    } else {
+        OpBox::ResOp(opref.0)
+    }
+}
+
+/// Map a float register (OpRef, raw bits) to an `OpBox`.
+/// `value` stores the bit-casted `f64` payload.
+#[inline]
+fn register_to_box_float(opref: OpRef, value: i64) -> OpBox {
+    if opref.is_constant() {
+        OpBox::ConstFloat(value as u64)
+    } else {
+        OpBox::ResOp(opref.0)
+    }
+}
 
 /// A single execution frame for jitcode bytecode.
 ///
@@ -53,6 +92,15 @@ pub struct MIFrame {
     /// `None` by `cleanup_registers` so a recycled frame does not keep
     /// the parked box alive.
     pub pushed_box: Option<OpRef>,
+    /// pyjitpl.py:93 `self.parent_snapshot = -1`.
+    ///
+    /// Set by `TraceRecordBuffer::_ensure_parent_resumedata` to the
+    /// snapshot_index returned by the paired `create_snapshot(back,
+    /// is_last)` call — so that a later `capture_resumedata` whose
+    /// framestack shares this frame as an ancestor can short-circuit
+    /// the parent chain walk by patching with `snapshot_add_prev(
+    /// target.parent_snapshot)` instead of re-emitting the snapshot.
+    pub parent_snapshot: i64,
 }
 
 impl MIFrame {
@@ -77,6 +125,7 @@ impl MIFrame {
             greenkey: None,
             _result_argcode: b'v',
             pushed_box: None,
+            parent_snapshot: -1,
         }
     }
 
@@ -156,8 +205,125 @@ impl MIFrame {
     /// `setup_call` consults `box.type`; pyre's `OpRef` does not carry
     /// type info, so the caller passes a typed `(kind, value, concrete)`
     /// tuple per arg.
+    ///
+    /// Also resets `parent_snapshot = -1`. In RPython this lives in
+    /// `MIFrame.setup()` (pyjitpl.py:93) which always precedes
+    /// `setup_call`; pyre's `MIFrame::new` already sets it, but any
+    /// future frame-recycling path (upstream `free_frames_list`) would
+    /// reuse an MIFrame and skip `new()`, so we reset here to match the
+    /// RPython "every call-entry clears parent_snapshot" invariant.
+    /// pyjitpl.py:177-234 `MIFrame.get_list_of_active_boxes`.
+    ///
+    /// Reads the LIVE-op liveness header preceding the current pc and
+    /// pushes each live register onto the trace's snapshot-array data
+    /// in int → ref → float order.  Returns the `_snapshot_array_data`
+    /// offset produced by `new_array` (RPython `storage`).
+    ///
+    /// `op_live` and `all_liveness` are threaded through from
+    /// `MetaInterpStaticData` (RPython
+    /// `self.metainterp.staticdata.op_live` /
+    /// `.liveness_info`) — pyre passes them explicitly so this method
+    /// does not depend on `MetaInterpStaticData` structurally.
+    ///
+    /// `in_a_call=true` branch is not yet wired: it requires
+    /// `CONST_FALSE` / `CONST_NULL` / `CONST_FZERO` OpRef seeding
+    /// (pyjitpl.py:188-192) which is tracked in the ConstantPool
+    /// follow-up. `create_top_snapshot` (the current capture_resumedata
+    /// caller for the topmost frame) passes `in_a_call=false`, so this
+    /// restriction does not block it.
+    pub fn get_list_of_active_boxes(
+        &mut self,
+        in_a_call: bool,
+        trace: &mut TraceRecordBuffer,
+        op_live: u8,
+        all_liveness: &[u8],
+        after_residual_call: bool,
+    ) -> i64 {
+        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
+        use majit_translate::liveness::{LivenessIterator, decode_offset};
+
+        // pyjitpl.py:180-193 — result_argcode clear when this frame is
+        // not the topmost frame.  Still unsupported; see docstring.
+        assert!(
+            !in_a_call,
+            "MIFrame::get_list_of_active_boxes: in_a_call=true branch \
+             (pyjitpl.py:180-193 result_argcode clear) needs CONST_FALSE / \
+             CONST_NULL / CONST_FZERO OpRef seeding; currently only the \
+             topmost-frame (in_a_call=false) path is wired."
+        );
+
+        // pyjitpl.py:194-198 — pick the pc of the preceding LIVE op.
+        let pc = if in_a_call || after_residual_call {
+            self.pc
+        } else {
+            self.pc - SIZE_LIVE_OP
+        };
+
+        // pyjitpl.py:199 `assert ord(self.jitcode.code[pc]) == op_live`.
+        debug_assert_eq!(self.jitcode.code[pc], op_live);
+
+        // pyjitpl.py:202-207 — decode offset + per-type lengths.
+        let mut offset = decode_offset(&self.jitcode.code, pc + 1);
+        let length_i = all_liveness[offset] as u32;
+        let length_r = all_liveness[offset + 1] as u32;
+        let length_f = all_liveness[offset + 2] as u32;
+        offset += 3;
+
+        // pyjitpl.py:209-214 — pre-allocate the storage array.
+        let total = (length_i + length_r + length_f) as usize;
+        let storage = trace.new_array(total);
+
+        // pyjitpl.py:216-221 — push live int registers.
+        if length_i > 0 {
+            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            while let Some(index) = it.next() {
+                let idx = index as usize;
+                let opref = self.int_regs[idx]
+                    .expect("get_list_of_active_boxes: int register uninitialized");
+                let value = self.int_values[idx]
+                    .expect("get_list_of_active_boxes: int value uninitialized");
+                let b = register_to_box_int(opref, value);
+                trace._add_box_to_storage_box(b);
+            }
+            offset = it.offset;
+        }
+
+        // pyjitpl.py:222-227 — push live ref registers.
+        if length_r > 0 {
+            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            while let Some(index) = it.next() {
+                let idx = index as usize;
+                let opref = self.ref_regs[idx]
+                    .expect("get_list_of_active_boxes: ref register uninitialized");
+                let value = self.ref_values[idx]
+                    .expect("get_list_of_active_boxes: ref value uninitialized");
+                let b = register_to_box_ref(opref, value);
+                trace._add_box_to_storage_box(b);
+            }
+            offset = it.offset;
+        }
+
+        // pyjitpl.py:228-233 — push live float registers.
+        if length_f > 0 {
+            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            while let Some(index) = it.next() {
+                let idx = index as usize;
+                let opref = self.float_regs[idx]
+                    .expect("get_list_of_active_boxes: float register uninitialized");
+                let value = self.float_values[idx]
+                    .expect("get_list_of_active_boxes: float value uninitialized");
+                let b = register_to_box_float(opref, value);
+                trace._add_box_to_storage_box(b);
+            }
+            let _ = it.offset; // offset no longer read after the last bank
+        }
+
+        storage
+    }
+
     pub fn setup_call(&mut self, argboxes: &[(JitArgKind, OpRef, i64)]) {
         self.pc = 0;
+        self.parent_snapshot = -1;
         let mut count_i = 0;
         let mut count_r = 0;
         let mut count_f = 0;
@@ -270,6 +436,102 @@ mod tests {
         assert_eq!(frame.ref_values[1], Some(201));
         assert_eq!(frame.float_regs[0], Some(OpRef(30)));
         assert_eq!(frame.float_values[0], Some(300));
+    }
+
+    /// Step 1b: `MIFrame::get_list_of_active_boxes` (non-in_a_call
+    /// path) pushes live int / ref / float registers onto the trace's
+    /// `_snapshot_array_data` in declaration order, returning the
+    /// `new_array` offset. Tests with `after_residual_call=true` so the
+    /// LIVE op sits exactly at `self.pc` (pyjitpl.py:194-195).
+    #[test]
+    fn get_list_of_active_boxes_populates_trace_snapshot_array() {
+        use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
+        use majit_ir::OpRef;
+        use std::sync::Arc;
+
+        // 1 int reg + 1 ref reg + 0 float regs live at pc=0.
+        let mut builder = JitCodeBuilder::new();
+        let mut jitcode = builder.finish();
+        jitcode.c_num_regs_i = 1;
+        jitcode.c_num_regs_r = 1;
+        jitcode.c_num_regs_f = 0;
+        const LIVE_OP: u8 = 0x42;
+        // bytecode: [LIVE_OP, offset_lo, offset_hi] at pc 0..3.
+        // decode_offset reads 2 bytes → liveness info at offset 0.
+        jitcode.code = vec![LIVE_OP, 0x00, 0x00];
+        let jitcode = Arc::new(jitcode);
+
+        // all_liveness at offset 0:
+        //   len_i=1 len_r=1 len_f=0  →  3 header bytes
+        //   int bitmask byte: bit 0 = register 0 live
+        //   ref bitmask byte: bit 0 = register 0 live
+        let all_liveness: Vec<u8> = vec![1, 1, 0, 0b0000_0001, 0b0000_0001];
+
+        let mut frame = MIFrame::new(jitcode, 0);
+        // int_regs[0] non-constant OpRef(5) → Box::ResOp(5).
+        frame.int_regs[0] = Some(OpRef(5));
+        frame.int_values[0] = Some(0);
+        // ref_regs[0] constant pointer addr=0xdead_beef → Box::ConstPtr.
+        frame.ref_regs[0] = Some(OpRef::from_const(7));
+        frame.ref_values[0] = Some(0xdead_beef);
+
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut trace = TraceRecordBuffer::new(16, sd);
+        let storage = frame.get_list_of_active_boxes(
+            /* in_a_call */ false,
+            &mut trace,
+            LIVE_OP,
+            &all_liveness,
+            /* after_residual_call */ true,
+        );
+
+        // Two boxes pushed → array length prefix + 2 varints.
+        // new_array(2) returns the offset before the length prefix.
+        assert!(
+            storage > 0,
+            "storage offset must be non-zero for non-empty array"
+        );
+
+        // Verify the encoded tagged values match what we expect:
+        // int: ResOp(5) encodes via _encode_box_position(5).
+        // ref: ConstPtr(0xdead_beef) encodes via _encode_ptr.
+        // Decode directly from _snapshot_array_data at `storage`.
+        let (length, consumed) =
+            crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[storage as usize..]);
+        assert_eq!(length, 2, "array length prefix");
+        let p0 = storage as usize + consumed;
+        let (tag0, c0) = crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[p0..]);
+        assert_eq!(
+            tag0,
+            TraceRecordBuffer::_encode_box_position(5),
+            "int register → TAGBOX(5)"
+        );
+        let p1 = p0 + c0;
+        let (tag1, _) = crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[p1..]);
+        assert!(tag1 != 0, "ref register should encode to non-zero tag");
+    }
+
+    #[test]
+    #[should_panic(expected = "in_a_call=true branch")]
+    fn get_list_of_active_boxes_in_a_call_is_not_yet_wired() {
+        use crate::opencoder::TraceRecordBuffer;
+        use std::sync::Arc;
+
+        let jitcode = make_jitcode_with_regs(1, 0, 0);
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[0] = Some(OpRef(0));
+        frame.int_values[0] = Some(0);
+
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut trace = TraceRecordBuffer::new(1, sd);
+        // Triggers the in_a_call guard — see docstring.
+        let _ = frame.get_list_of_active_boxes(
+            /* in_a_call */ true,
+            &mut trace,
+            /* op_live */ 0,
+            /* all_liveness */ &[],
+            /* after_residual_call */ false,
+        );
     }
 
     #[test]

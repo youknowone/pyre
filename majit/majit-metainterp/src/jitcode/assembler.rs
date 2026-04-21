@@ -1319,6 +1319,11 @@ impl JitCodeBuilder {
             jitdriver_sd: None,
             fnaddr: 0,
             calldescr: majit_translate::jitcode::BhCallDescr::default(),
+            // codewriter.py:68 `jitcode.index = index` — defaults to 0
+            // here; the owning codewriter/setup path assigns the real
+            // `metainterp_sd.jitcodes[]` position (a later commit on
+            // this branch back-stamps via `state::jitcode_for`).
+            index: 0,
             exec: super::JitCodeExecState {
                 opcodes: self.opcodes,
                 descrs: self.descrs,
