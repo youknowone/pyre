@@ -72,9 +72,13 @@ impl PyJitCode {
         self.has_abort
     }
 
-    /// RPython's freshly-allocated `JitCode` shells have empty bytecode
-    /// arrays until `assembler.assemble(...)` fills them. pyre's split
-    /// wrapper uses `pc_map.is_empty()` as the same "still a shell" test.
+    /// "Has `assembler.assemble` been run on this jitcode yet?" A
+    /// freshly-constructed RPython `JitCode(name, fnaddr, calldescr,
+    /// ...)` (jitcode.py:14, call.py:168) leaves `self.code` unset
+    /// until `setup` (jitcode.py:22) is invoked by
+    /// `assembler.assemble(ssarepr, jitcode, num_regs)`
+    /// (codewriter.py:67); pyre's split wrapper uses `pc_map.is_empty()`
+    /// as the same "still a shell" test.
     pub fn is_populated(&self) -> bool {
         !self.metadata.pc_map.is_empty()
     }

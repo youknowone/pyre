@@ -249,10 +249,19 @@ impl CallControl {
     }
 
     /// Compiled-only variant used by the trace-side callback: return the
-    /// shared `Arc<PyJitCode>` only once the shell has been populated by
-    /// the codewriter drain. Mirrors RPython's "read self.jitcodes[graph]"
-    /// runtime pattern, where callers expect the cached object to already
-    /// carry bytecode instead of an empty constructor shell.
+    /// shared `Arc<PyJitCode>` only when the shell has been populated by
+    /// the codewriter drain (`PyJitCode::is_populated`).
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython has no `is_populated` gate
+    /// because `make_jitcodes` (codewriter.py:74-89) drains every
+    /// unfinished graph synchronously before any trace runs, so no
+    /// caller of `self.jitcodes[graph]` (call.py:158) ever observes a
+    /// skeleton. Pyre compiles lazily from the trace-side callback
+    /// (`compile_jitcode_via_w_code` / `state::jitcode_for`), so a
+    /// cached entry here can still be an unassembled `JitCode(name,
+    /// fnaddr, calldescr, ...)` (call.py:168) waiting for the drain.
+    /// Returning `None` on a skeleton routes the caller through the
+    /// compile path first.
     pub fn find_compiled_jitcode_arc(
         &self,
         code: *const CodeObject,
@@ -426,9 +435,12 @@ impl CallControl {
         unsafe { &*(entry.as_ref() as *const PyJitCode) }
     }
 
-    /// RPython mutates the already-cached `JitCode` object in place.
-    /// Pyre can do the same while the slot's `Arc` is still unique;
-    /// otherwise it must fall back to replacing the shared `Arc`.
+    /// Reset the cached slot back to an empty skeleton — the state that
+    /// follows `JitCode(graph.name, fnaddr, calldescr, ...)` at
+    /// `call.py:168` before the drain re-runs `assembler.assemble`
+    /// (codewriter.py:67) on it. Mutates the cached object in place
+    /// via `Arc::get_mut` when the slot is still unique; falls back to
+    /// `Arc` replacement only when another store has already cloned it.
     pub fn reset_jitcode_skeleton(&mut self, key: usize, merge_point_pc: Option<usize>) {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
             if let Some(existing) = std::sync::Arc::get_mut(slot) {
@@ -444,10 +456,18 @@ impl CallControl {
 
     /// Publish the populated jitcode into `self.jitcodes[graph]`.
     ///
-    /// Matches RPython's `transform_graph_to_jitcode(graph, jitcode, ...)`
-    /// shape as closely as the current `Arc<PyJitCode>` split allows:
-    /// mutate the existing cached object when the slot is still unique,
-    /// replace the slot only when another store already cloned it.
+    /// RPython mutates the same `JitCode` object in place — the drain
+    /// at `codewriter.py:80` calls `transform_graph_to_jitcode(graph,
+    /// jitcode, ...)` where `jitcode` is the skeleton that was already
+    /// stored at `call.py:170` (`self.jitcodes[graph] = jitcode`), and
+    /// inside that call `self.assembler.assemble(ssarepr, jitcode,
+    /// num_regs)` (codewriter.py:67) fills the skeleton's fields.
+    ///
+    /// Pyre's `transform_graph_to_jitcode` returns a fresh `PyJitCode`
+    /// instead of mutating the skeleton, so this helper bridges the
+    /// split by mutating the cached object via `Arc::get_mut` when the
+    /// slot is still unique, falling back to `Arc` replacement only
+    /// when another store has already cloned the skeleton.
     pub fn publish_jitcode(&mut self, key: usize, pyjitcode: PyJitCode) -> *const PyJitCode {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
             if let Some(existing) = std::sync::Arc::get_mut(slot) {

@@ -262,6 +262,15 @@ impl MetaInterpStaticData {
     /// Return the existing SD entry only when its payload is already
     /// populated. Skeleton entries must still go through the compile
     /// callback so `CallControl` can drain and fill the bytecode body.
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython's `MetaInterpStaticData` never
+    /// observes a skeleton entry — every `self.jitcodes` slot is
+    /// populated by `make_jitcodes` (codewriter.py:74-89) before any
+    /// trace runs. Pyre compiles lazily via `set_compile_jitcode_fn`,
+    /// so a cached entry here can still be the shell produced by
+    /// `JitCode(name, fnaddr, calldescr, ...)` (call.py:168) before
+    /// `assembler.assemble(ssarepr, jitcode, num_regs)`
+    /// (codewriter.py:67) has run.
     fn compiled_jitcode_lookup(&self, code: *const ()) -> Option<*const JitCode> {
         let idx = *self.by_code.get(&(code as usize))?;
         let jitcode = &self.jitcodes[idx];
