@@ -4314,6 +4314,37 @@ mod tests {
         assert_eq!(t.get_live_ranges(), vec![4, 4, 4, 4]);
     }
 
+    /// test_opencoder.py:178 `TestOpencoder.test_virtualizable_virtualref` —
+    /// assert the vable/vref arrays decode in the canonical order:
+    /// `[p0, i1, i2]` (the virtualizable tail box moves to index 0) and
+    /// `[p0, i1]` (vref verbatim).
+    #[test]
+    fn test_virtualizable_virtualref_c() {
+        let mut t = TraceRecordBuffer::new(3, empty_sd());
+        let _i0 = t.record_input_arg(Type::Int);
+        let i1 = t.record_input_arg(Type::Int);
+        let i2 = t.record_input_arg(Type::Int);
+        let some_descr: majit_ir::DescrRef = majit_ir::descr::make_size_descr(64);
+        let p0 = t.record_op0(OpCode::NewWithVtable, Some(&some_descr));
+        let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
+        let vable = [Box::ResOp(i1.0), Box::ResOp(i2.0), Box::ResOp(p0)];
+        let vref = [Box::ResOp(p0), Box::ResOp(i1.0)];
+        let mut stack: Vec<crate::pyjitpl::MIFrame> = Vec::new();
+        let snap = t.capture_resumedata(&mut stack, &vable, &vref, None, 0, &[], false);
+        let it = t.get_snapshot_iter(snap as usize);
+        // Empty framestack — equivalent to `assert not l[1].framestack`.
+        assert!(it.framestack.is_empty());
+        let vable_decoded: Vec<i64> = it.iter_vable_array().collect();
+        let vref_decoded: Vec<i64> = it.iter_vref_array().collect();
+        let p0_tag = TraceRecordBuffer::_encode_box_position(p0);
+        let i1_tag = TraceRecordBuffer::_encode_box_position(i1.0);
+        let i2_tag = TraceRecordBuffer::_encode_box_position(i2.0);
+        // `virtualizables == [p0, i1, i2]` after the last-first rotation.
+        assert_eq!(vable_decoded, vec![p0_tag, i1_tag, i2_tag]);
+        // `vref_boxes == [p0, i1]` verbatim.
+        assert_eq!(vref_decoded, vec![p0_tag, i1_tag]);
+    }
+
     /// test_opencoder.py:189 `TestOpencoder.test_virtualizable_bug` —
     /// 128 virtualizable boxes (p0 + 127 × i1) exercise the array-length
     /// varint at the 1-byte / 2-byte threshold. The canonical assertion
