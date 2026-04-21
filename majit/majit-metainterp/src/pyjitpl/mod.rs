@@ -1206,8 +1206,34 @@ impl<M: Clone> MetaInterp<M> {
 
     /// warmspot.py:449 — set the per-driver result_type from the portal
     /// function's return signature. Called once during driver setup.
+    ///
+    /// `warmspot.py:449` assigns to `jd.result_type` on the jitdriver
+    /// static-data itself.  pyre stores a convenience copy on
+    /// `MetaInterp` for early lookups before any driver has been
+    /// registered, but the authoritative value lives on each
+    /// `JitDriverStaticData`.  Propagate the update to every registered
+    /// driver (auto-creating the default driver if needed) and
+    /// re-execute the downstream steps that depend on the result kind:
+    /// `jd.portal_calldescr` (`warmspot.py:1013`) and
+    /// `jd.portal_finishtoken` (`pyjitpl.py:2275-2279`).
     pub fn set_result_type(&mut self, tp: Type) {
         self.result_type = tp;
+        self.ensure_default_driver_sd();
+        {
+            let sd = std::sync::Arc::get_mut(&mut self.staticdata)
+                .expect("set_result_type: staticdata has other owners");
+            for jd in sd.jitdrivers_sd.iter_mut() {
+                jd.result_type = tp;
+                // `warmspot.py:1013-1017` build_portal_calldescr reads
+                // `self.result_type`; a stale descr from an earlier
+                // set_result_type call must be rebuilt.
+                jd.build_portal_calldescr();
+            }
+            // `pyjitpl.py:2275-2279` portal_finishtoken is keyed by
+            // `jd.result_type` — re-run the attachment so each driver
+            // picks the correct `done_with_this_frame_descr_*` sibling.
+            sd.finish_setup_descrs_for_jitdrivers();
+        }
     }
 
     /// warmspot.py:449 — the per-driver static result_type.
