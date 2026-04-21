@@ -623,52 +623,57 @@ pub fn builtin_chr(
 }
 
 /// Upstream `builtin_unichr(s_int)` (builtin.py:123-124).
+///
+/// `constpropagate` cannot handle the unicode path: the Rust `ConstValue`
+/// enum does not distinguish `str` from `unicode`, so
+/// `bk.immutablevalue(ConstValue::Str(...))` returns `SomeChar` /
+/// `SomeString`, which then fails the `s_result.contains(s_realresult)`
+/// check against `SomeUnicodeCodePoint`. Fold the constant case
+/// directly, mirroring upstream `constpropagate(unichr, ...)` semantics
+/// while pinning the result's `const_box` ourselves.
 pub fn builtin_unichr(
-    bk: &Rc<Bookkeeper>,
+    _bk: &Rc<Bookkeeper>,
     args_s: &[SomeValue],
     _kwds: &HashMap<String, SomeValue>,
 ) -> Result<SomeValue, AnnotatorError> {
     let [s_int] = args_s else {
         return Err(AnnotatorError::new("unichr() takes exactly one argument"));
     };
-    constpropagate(
-        bk,
-        &[s_int.clone()],
-        SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(false)),
-        |consts| match consts {
-            [ConstValue::Int(n)] => {
-                if (0..=0x10_FFFF).contains(n) {
-                    u32::try_from(*n)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .map(|ch| ConstValue::Str(ch.to_string()))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        },
-    )
+    let mut result = SomeUnicodeCodePoint::new(false);
+    if is_immutable_constant(s_int)
+        && let Some(ConstValue::Int(n)) = s_int.const_()
+        && (0..=0x10_FFFF).contains(n)
+        && let Some(ch) = u32::try_from(*n).ok().and_then(char::from_u32)
+    {
+        result.inner.base.const_box = Some(super::super::flowspace::model::Constant::new(
+            ConstValue::Str(ch.to_string()),
+        ));
+    }
+    Ok(SomeValue::UnicodeCodePoint(result))
 }
 
 /// Upstream `builtin_unicode(s_unicode)` (builtin.py:126-127).
+///
+/// See [`builtin_unichr`] for the constpropagate carve-out rationale —
+/// the Rust `ConstValue::Str` carrier cannot round-trip through
+/// `immutablevalue` without collapsing to `SomeString`.
 pub fn builtin_unicode(
-    bk: &Rc<Bookkeeper>,
+    _bk: &Rc<Bookkeeper>,
     args_s: &[SomeValue],
     _kwds: &HashMap<String, SomeValue>,
 ) -> Result<SomeValue, AnnotatorError> {
     let [s_unicode] = args_s else {
         return Err(AnnotatorError::new("unicode() takes exactly one argument"));
     };
-    constpropagate(
-        bk,
-        &[s_unicode.clone()],
-        SomeValue::UnicodeString(SomeUnicodeString::new(false, false)),
-        |consts| match consts {
-            [ConstValue::Str(s)] => Some(ConstValue::Str(s.clone())),
-            _ => None,
-        },
-    )
+    let mut result = SomeUnicodeString::new(false, false);
+    if is_immutable_constant(s_unicode)
+        && let Some(ConstValue::Str(s)) = s_unicode.const_()
+    {
+        result.inner.base.const_box = Some(super::super::flowspace::model::Constant::new(
+            ConstValue::Str(s.clone()),
+        ));
+    }
+    Ok(SomeValue::UnicodeString(result))
 }
 
 /// Upstream `builtin_bytearray(s_str)` (builtin.py:129-130).
@@ -698,16 +703,27 @@ pub fn builtin_hasattr(
         // Rust bookkeeper does not yet have a warning channel — record
         // the upstream guidance here so the port stays auditable.
         // (builtin.py:135-136: "hasattr is not RPythonic enough".)
+        return Ok(SomeValue::Bool(SomeBool::new()));
     }
-    let r = SomeBool::new();
+    let Some(ConstValue::Str(attr_name)) = s_attr.const_() else {
+        return Ok(SomeValue::Bool(SomeBool::new()));
+    };
+
+    let mut r = SomeBool::new();
     if s_obj.is_immutable_constant() {
         // upstream: `r.const = hasattr(s_obj.const, s_attr.const)`.
-        // The Rust HostObject lookup for arbitrary attrs is not
-        // available here without additional HostEnv wiring — this
-        // branch is conservative (leaves `r.const` unpinned) so the
-        // annotator still produces `SomeBool`. Deferred: route through
-        // `HostObject::get_attr` once the bookkeeper wiring lands.
-        let _ = s_obj;
+        // Resolve the attr through the host object's class / instance /
+        // module dicts (HostObject mirrors Python's attribute
+        // namespaces per kind). Matches the semantic of Python's
+        // `hasattr` for the constant-receiver path.
+        if let Some(ConstValue::HostObject(host)) = s_obj.const_() {
+            let found = host.class_get(attr_name).is_some()
+                || host.instance_get(attr_name).is_some()
+                || host.module_get(attr_name).is_some();
+            r.base.const_box = Some(super::super::flowspace::model::Constant::new(
+                ConstValue::Bool(found),
+            ));
+        }
     } else if let SomeValue::PBC(pbc) = s_obj {
         // upstream: `isinstance(s_obj, SomePBC) and s_obj.getKind() is FrozenDesc`.
         let all_frozen = !pbc.descriptions.is_empty()
@@ -718,13 +734,33 @@ pub fn builtin_hasattr(
                 )
             });
         if all_frozen {
-            // upstream scans answers across all descriptions and fixes
-            // `r.const` iff every FrozenDesc.s_read_attribute agrees.
-            // The Rust port mirrors the structure but needs
-            // `FrozenDesc::s_read_attribute` against the attr string —
-            // deferred until the FrozenDesc branch lands `s_read_attribute`.
-            let _ = FrozenDesc::s_read_attribute;
-            let _ = s_attr;
+            // upstream (builtin.py:142-147):
+            //
+            //     answers = {}
+            //     for d in s_obj.descriptions:
+            //         answer = (d.s_read_attribute(s_attr.const) !=
+            //                   s_ImpossibleValue)
+            //         answers[answer] = True
+            //     if len(answers) == 1:
+            //         r.const, = answers
+            let mut answers: std::collections::HashSet<bool> = Default::default();
+            for desc in pbc.descriptions.values() {
+                if let DescEntry::Frozen(fd) = desc {
+                    let result = fd.borrow().s_read_attribute(attr_name);
+                    // upstream returns `s_ImpossibleValue` for missing
+                    // attrs; the Rust port surfaces errors as
+                    // `AnnotatorError`, which we treat as "not found"
+                    // for the `hasattr` containment question.
+                    let found = matches!(result, Ok(ref v) if !matches!(v, SomeValue::Impossible));
+                    answers.insert(found);
+                }
+            }
+            if answers.len() == 1 {
+                let only = *answers.iter().next().unwrap();
+                r.base.const_box = Some(super::super::flowspace::model::Constant::new(
+                    ConstValue::Bool(only),
+                ));
+            }
         }
     }
     Ok(SomeValue::Bool(r))
@@ -1496,6 +1532,90 @@ mod tests {
                 );
             }
             other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registered_class_backed_builtin_lifts_to_somebuiltin() {
+        // Codex P1: class-backed builtins (`range`, `int`, `list`, …)
+        // are `HostObjectKind::Class` in HOST_ENV but still register
+        // analysers. `immutablevalue` must route them to `SomeBuiltin`
+        // so that `SomeBuiltin.call()` reaches the analyser, matching
+        // upstream bookkeeper.py:309-311's BUILTIN_ANALYZERS check
+        // firing before the `tp is type` branch.
+        use crate::flowspace::model::HOST_ENV;
+        let bk = bk();
+        let range_host = HOST_ENV
+            .lookup_builtin("range")
+            .expect("HOST_ENV must expose `range`");
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(range_host))
+            .expect("range class must annotate");
+        assert!(
+            matches!(s, SomeValue::Builtin(ref b) if b.analyser_name == "range"),
+            "expected SomeBuiltin(range), got {s:?}"
+        );
+    }
+
+    #[test]
+    fn builtin_unichr_const_integer_returns_constant_unicode_cp() {
+        // Codex P2: `unichr(65)` must keep the constant via the
+        // UnicodeCodePoint variant; constpropagate's re-annotation
+        // through immutablevalue does NOT because ConstValue::Str
+        // collapses to SomeChar/SomeString.
+        let bk = bk();
+        let s_int = bk.immutablevalue(&ConstValue::Int(65)).unwrap();
+        let out = builtin_unichr(&bk, &[s_int], &no_kwds()).unwrap();
+        match out {
+            SomeValue::UnicodeCodePoint(cp) => {
+                match cp.inner.base.const_box.as_ref().map(|c| &c.value) {
+                    Some(ConstValue::Str(s)) => assert_eq!(s, "A"),
+                    other => panic!("expected constant unicode 'A', got {other:?}"),
+                }
+            }
+            other => panic!("expected SomeUnicodeCodePoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_unicode_const_string_returns_constant_unicode_string() {
+        // Codex P2: `unicode("abc")` must return a constant
+        // SomeUnicodeString, not raise AnnotatorError.
+        let bk = bk();
+        let s_str = bk.immutablevalue(&ConstValue::Str("abc".into())).unwrap();
+        let out = builtin_unicode(&bk, &[s_str], &no_kwds()).unwrap();
+        match out {
+            SomeValue::UnicodeString(us) => {
+                match us.inner.base.const_box.as_ref().map(|c| &c.value) {
+                    Some(ConstValue::Str(s)) => assert_eq!(s, "abc"),
+                    other => panic!("expected constant unicode 'abc', got {other:?}"),
+                }
+            }
+            other => panic!("expected SomeUnicodeString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_hasattr_folds_constant_when_attr_exists_on_class() {
+        // Codex P2: for immutable constant receivers, `hasattr(C, "m")`
+        // must fold to a constant SomeBool. The HOST_ENV `range` class
+        // has no attribute members in this minimal env, so assert the
+        // False branch — checks the folding mechanism regardless of
+        // which members the host reflects.
+        use crate::flowspace::model::HOST_ENV;
+        let bk = bk();
+        let obj = HOST_ENV.lookup_builtin("range").unwrap();
+        let s_obj = bk.immutablevalue(&ConstValue::HostObject(obj)).unwrap();
+        let s_attr = bk
+            .immutablevalue(&ConstValue::Str("no_such_attr".into()))
+            .unwrap();
+        let out = builtin_hasattr(&bk, &[s_obj, s_attr], &no_kwds()).unwrap();
+        match out {
+            SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {
+                Some(ConstValue::Bool(false)) => {}
+                other => panic!("expected constant Bool(false) for missing attr, got {other:?}"),
+            },
+            other => panic!("expected SomeBool, got {other:?}"),
         }
     }
 

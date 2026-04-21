@@ -1681,12 +1681,25 @@ impl Bookkeeper {
         }
         // upstream bookkeeper.py:309-311 — `elif ishashable(x) and x
         // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`. The Rust
-        // port routes every `is_builtin_callable` through `SomeBuiltin`
-        // (not only registered ones) because `policy.rs` sandboxing
-        // dispatch inspects `SomeValue::Builtin` directly; see the
-        // registry note in the module header above. Analyser lookup
-        // happens at call time in [`super::builtin::call_builtin`].
-        if obj.is_builtin_callable() {
+        // port routes two kinds of host objects into `SomeBuiltin`:
+        //
+        //   1. `HostObjectKind::BuiltinCallable` — every builtin
+        //      function gets a `SomeBuiltin`, whether or not
+        //      `builtin.rs` registered an analyser for it, because
+        //      `policy.rs` sandboxing dispatch inspects
+        //      `SomeValue::Builtin` directly. Missing analysers surface
+        //      at call time via `call_builtin`'s "no analyser
+        //      registered" error.
+        //   2. `HostObjectKind::Class` whose qualname is registered in
+        //      `BUILTIN_ANALYZERS` (e.g. `range`, `int`, `float`,
+        //      `bool`, `list`, `tuple`, `enumerate`, `reversed`,
+        //      `bytearray`). Upstream Python models these as
+        //      `type`-valued callables, and `bookkeeper.py:309-311`'s
+        //      membership test fires before `bookkeeper.py:315-316`'s
+        //      `tp is type` branch. Route them to `SomeBuiltin` to
+        //      match.
+        let is_registered_class = obj.is_class() && super::builtin::is_registered(obj.qualname());
+        if obj.is_builtin_callable() || is_registered_class {
             let mut sb = SomeBuiltin::new(
                 obj.qualname().to_string(),
                 None,
