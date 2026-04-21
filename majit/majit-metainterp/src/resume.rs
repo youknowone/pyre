@@ -553,6 +553,7 @@ impl ResumeFrameLayoutSummary {
             header_pc: self.header_pc,
             source_guard: self.source_guard,
             pc: self.pc,
+            jitcode_index: self.jitcode_index,
             slots: self
                 .slot_layouts
                 .iter()
@@ -578,7 +579,7 @@ impl ResumeFrameLayoutSummary {
             trace_id: exit_frame.trace_id,
             header_pc: exit_frame.header_pc,
             source_guard: exit_frame.source_guard,
-            jitcode_index: 0,
+            jitcode_index: exit_frame.jitcode_index,
             pc: exit_frame.pc,
             slot_sources,
             slot_layouts,

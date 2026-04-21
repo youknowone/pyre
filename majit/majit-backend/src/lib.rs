@@ -535,6 +535,13 @@ pub struct ExitFrameLayout {
     pub source_guard: Option<(u64, u32)>,
     /// Interpreter program counter for the frame.
     pub pc: u64,
+    /// resume.py:250 `jitcode_index` — index into
+    /// `MetaInterpStaticData.jitcodes` identifying the code this frame is
+    /// running. Required so multi-frame inline snapshots can be decoded
+    /// with per-frame liveness via `frame_value_count_at(jitcode_index, pc)`.
+    /// Encoders that only produce single-frame exits may leave this at 0,
+    /// but multi-frame producers MUST populate it per frame.
+    pub jitcode_index: i32,
     /// Slot sources within this frame.
     pub slots: Vec<ExitValueSourceLayout>,
     /// Typed layout of the frame slots, when known by the backend.
@@ -548,6 +555,7 @@ impl ExitFrameLayout {
             header_pc: self.header_pc,
             source_guard: self.source_guard,
             pc: self.pc,
+            jitcode_index: self.jitcode_index,
             slots: self
                 .slots
                 .iter()

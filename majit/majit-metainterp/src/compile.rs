@@ -370,6 +370,7 @@ pub(crate) fn build_guard_metadata(
                                     header_pc: Some(frame.pc as u64),
                                     source_guard: None,
                                     pc: frame.pc as u64,
+                                    jitcode_index: frame.jitcode_index,
                                     slots,
                                     slot_types: Some(slot_types),
                                 }
@@ -710,6 +711,7 @@ pub(crate) fn build_guard_metadata(
                     header_pc: Some(pc),
                     source_guard: None,
                     pc,
+                    jitcode_index: 0,
                     slots,
                     slot_types: Some(exit_types.clone()),
                 }],

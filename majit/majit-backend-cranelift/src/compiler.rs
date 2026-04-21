@@ -657,6 +657,7 @@ fn caller_prefix_recovery_layout(
             header_pc: Some(header_pc),
             source_guard,
             pc: header_pc,
+            jitcode_index: 0,
             slots: slot_types
                 .iter()
                 .enumerate()
@@ -5345,6 +5346,7 @@ fn identity_recovery_layout(
         header_pc: Some(header_pc),
         source_guard,
         pc: guard_resume_pc.unwrap_or(header_pc),
+        jitcode_index: 0,
         slots: (0..slot_types.len())
             .map(ExitValueSourceLayout::ExitValue)
             .collect(),
@@ -13551,6 +13553,7 @@ mod tests {
                 header_pc: None,
                 source_guard: None,
                 pc: 4242,
+                jitcode_index: 0,
                 slots: vec![majit_backend::ExitValueSourceLayout::Constant(99)],
                 slot_types: Some(vec![Type::Int]),
             }],
@@ -13677,6 +13680,7 @@ mod tests {
                     header_pc: Some(900),
                     source_guard: Some((9, 0)),
                     pc: 900,
+                    jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
@@ -13685,6 +13689,7 @@ mod tests {
                     header_pc: Some(1000),
                     source_guard: None,
                     pc: 1000,
+                    jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
@@ -13858,6 +13863,7 @@ mod tests {
                     header_pc: None,
                     source_guard: None,
                     pc: 900,
+                    jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
@@ -13866,6 +13872,7 @@ mod tests {
                     header_pc: None,
                     source_guard: None,
                     pc: 1000,
+                    jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
@@ -13932,6 +13939,7 @@ mod tests {
                     header_pc: None,
                     source_guard: None,
                     pc: 444,
+                    jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },
@@ -13940,6 +13948,7 @@ mod tests {
                     header_pc: None,
                     source_guard: Some((290, 0)),
                     pc: 2000,
+                    jitcode_index: 0,
                     slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
                     slot_types: Some(vec![Type::Int]),
                 },

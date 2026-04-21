@@ -2549,6 +2549,7 @@ impl Assembler386 {
                     header_pc: Some(self.header_pc),
                     source_guard: None,
                     pc: self.header_pc,
+                    jitcode_index: 0,
                     slots: (0..slot_types.len())
                         .map(ExitValueSourceLayout::ExitValue)
                         .collect(),
