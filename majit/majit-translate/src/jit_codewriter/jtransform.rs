@@ -526,6 +526,18 @@ impl<'a> Transformer<'a> {
         'r' // default: ref (most Python values are GC refs)
     }
 
+    fn get_value_type(&self, v: ValueId) -> Option<ValueType> {
+        let ts = self.type_state?;
+        let ct = ts.concrete_types.get(&v)?;
+        match ct {
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed => Some(ValueType::Int),
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef => Some(ValueType::Ref),
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Float => Some(ValueType::Float),
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Void => Some(ValueType::Void),
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Unknown => None,
+        }
+    }
+
     // ── rewrite_op_* methods ──────────────────────────────────
 
     /// RPython: `Transformer.rewrite_op_hint(op)`.
@@ -595,6 +607,10 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        let typed_ty = op
+            .result
+            .and_then(|result| self.get_value_type(result))
+            .unwrap_or_else(|| ty.clone());
         // Track virtualizable array field reads
         if let Some(array_field) = self.config.vable_arrays.iter().find(|c| c.matches(field)) {
             if let Some(result) = op.result {
@@ -620,7 +636,7 @@ impl<'a> Transformer<'a> {
                 result: op.result,
                 kind: OpKind::VableFieldRead {
                     field_index: vable_field.index,
-                    ty: ty.clone(),
+                    ty: typed_ty.clone(),
                 },
             }]);
         }
@@ -683,7 +699,7 @@ impl<'a> Transformer<'a> {
                         kind: OpKind::FieldRead {
                             base: *base,
                             field: field.clone(),
-                            ty: ty.clone(),
+                            ty: typed_ty.clone(),
                             pure: true,
                         },
                     },
@@ -703,11 +719,25 @@ impl<'a> Transformer<'a> {
                     kind: OpKind::FieldRead {
                         base: *base,
                         field: field.clone(),
-                        ty: ty.clone(),
+                        ty: typed_ty.clone(),
                         pure: true,
                     },
                 }]);
             }
+        }
+        if &typed_ty != ty {
+            let OpKind::FieldRead { base, pure, .. } = &op.kind else {
+                return RewriteResult::Keep;
+            };
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result,
+                kind: OpKind::FieldRead {
+                    base: *base,
+                    field: field.clone(),
+                    ty: typed_ty,
+                    pure: *pure,
+                },
+            }]);
         }
         RewriteResult::Keep
     }
@@ -721,6 +751,7 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        let typed_ty = self.get_value_type(value).unwrap_or_else(|| ty.clone());
         if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -735,7 +766,21 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::VableFieldWrite {
                     field_index: vable_field.index,
                     value,
-                    ty: ty.clone(),
+                    ty: typed_ty,
+                },
+            }]);
+        }
+        if &typed_ty != ty {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result,
+                kind: OpKind::FieldWrite {
+                    base: match &op.kind {
+                        OpKind::FieldWrite { base, .. } => *base,
+                        _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
+                    },
+                    field: field.clone(),
+                    value,
+                    ty: typed_ty,
                 },
             }]);
         }
@@ -751,6 +796,10 @@ impl<'a> Transformer<'a> {
         item_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        let typed_item_ty = op
+            .result
+            .and_then(|result| self.get_value_type(result))
+            .unwrap_or_else(|| item_ty.clone());
         if let Some(&(arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -762,9 +811,23 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::VableArrayRead {
                     array_index: arr_idx,
                     elem_index: index,
-                    item_ty: item_ty.clone(),
+                    item_ty: typed_item_ty,
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,
+                },
+            }]);
+        }
+        if &typed_item_ty != item_ty {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result,
+                kind: OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: typed_item_ty,
+                    array_type_id: match &op.kind {
+                        OpKind::ArrayRead { array_type_id, .. } => array_type_id.clone(),
+                        _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
+                    },
                 },
             }]);
         }
@@ -781,6 +844,9 @@ impl<'a> Transformer<'a> {
         item_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        let typed_item_ty = self
+            .get_value_type(value)
+            .unwrap_or_else(|| item_ty.clone());
         if let Some(&(arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -793,9 +859,24 @@ impl<'a> Transformer<'a> {
                     array_index: arr_idx,
                     elem_index: index,
                     value,
-                    item_ty: item_ty.clone(),
+                    item_ty: typed_item_ty,
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,
+                },
+            }]);
+        }
+        if &typed_item_ty != item_ty {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result,
+                kind: OpKind::ArrayWrite {
+                    base,
+                    index,
+                    value,
+                    item_ty: typed_item_ty,
+                    array_type_id: match &op.kind {
+                        OpKind::ArrayWrite { array_type_id, .. } => array_type_id.clone(),
+                        _ => unreachable!("rewrite_op_setarrayitem called on non-ArrayWrite op"),
+                    },
                 },
             }]);
         }
@@ -2516,6 +2597,147 @@ mod tests {
             result.graph.block(graph.startblock).operations[0].kind,
             OpKind::FieldRead { .. }
         ));
+    }
+
+    #[test]
+    fn rewrite_graph_types_fieldwrite_from_value_kind() {
+        let mut graph = FunctionGraph::new("test");
+        let base = graph.alloc_value();
+        let value = graph.alloc_value();
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
+                value,
+                ty: ValueType::Unknown,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        type_state.concrete_types.insert(
+            value,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        match &result.graph.block(graph.startblock).operations[0].kind {
+            OpKind::FieldWrite { ty, .. } => assert_eq!(*ty, ValueType::Int),
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_graph_types_arraywrite_from_value_kind() {
+        let mut graph = FunctionGraph::new("test");
+        let base = graph.alloc_value();
+        let index = graph.alloc_value();
+        let value = graph.alloc_value();
+        graph.push_op(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base,
+                index,
+                value,
+                item_ty: ValueType::Unknown,
+                array_type_id: None,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        type_state.concrete_types.insert(
+            value,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        match &result.graph.block(graph.startblock).operations[0].kind {
+            OpKind::ArrayWrite { item_ty, .. } => assert_eq!(*item_ty, ValueType::Int),
+            other => panic!("expected ArrayWrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_graph_types_fieldread_from_result_kind() {
+        let mut graph = FunctionGraph::new("test");
+        let base = graph.alloc_value();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Unknown,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        type_state.concrete_types.insert(
+            result,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        match &result.graph.block(graph.startblock).operations[0].kind {
+            OpKind::FieldRead { ty, .. } => assert_eq!(*ty, ValueType::Int),
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_graph_types_arrayread_from_result_kind() {
+        let mut graph = FunctionGraph::new("test");
+        let base = graph.alloc_value();
+        let index = graph.alloc_value();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: ValueType::Unknown,
+                    array_type_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        type_state.concrete_types.insert(
+            result,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        match &result.graph.block(graph.startblock).operations[0].kind {
+            OpKind::ArrayRead { item_ty, .. } => assert_eq!(*item_ty, ValueType::Int),
+            other => panic!("expected ArrayRead, got {other:?}"),
+        }
     }
 
     #[test]

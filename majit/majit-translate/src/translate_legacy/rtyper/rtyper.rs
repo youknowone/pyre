@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use crate::flowspace::model::ConstValue;
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
 use crate::translate_legacy::annotator::annrpython::AnnotationState;
-use crate::translator::rtyper::rpbc::LLCallTable;
 
 /// Concrete low-level type (RPython Repr.lowleveltype).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,14 +33,12 @@ pub enum ConcreteType {
 /// Type resolution state: maps ValueId → ConcreteType.
 pub struct TypeResolutionState {
     pub concrete_types: HashMap<ValueId, ConcreteType>,
-    pub concrete_calltables: HashMap<usize, (LLCallTable, usize)>,
 }
 
 impl TypeResolutionState {
     pub fn new() -> Self {
         TypeResolutionState {
             concrete_types: HashMap::new(),
-            concrete_calltables: HashMap::new(),
         }
     }
 

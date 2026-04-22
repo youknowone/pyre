@@ -1982,4 +1982,247 @@ mod tests {
             field_descr_names
         );
     }
+
+    #[test]
+    fn assemble_typed_writes_use_canonical_non_v_opnames() {
+        use crate::flatten::flatten as flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("typed_writes");
+        let base = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let value = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "v".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base,
+                field: FieldDescriptor::new("x", Some("Point".into())),
+                value,
+                ty: ValueType::Unknown,
+            },
+            false,
+        );
+        graph.push_op(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base,
+                index,
+                value,
+                item_ty: ValueType::Unknown,
+                array_type_id: None,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        type_state.concrete_types.insert(
+            base,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef,
+        );
+        type_state.concrete_types.insert(
+            index,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+        type_state.concrete_types.insert(
+            value,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let rewritten = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph)
+            .graph;
+        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
+        let mut flat = flatten_graph(&rewritten, &regallocs);
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            asm.insns.contains_key("setfield_gc_i/rid"),
+            "expected canonical setfield_gc_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("setarrayitem_gc_i/riid"),
+            "expected canonical setarrayitem_gc_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("setfield_gc_v/rid"),
+            "unexpected setfield_gc_v key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("setfield_gc_v/iid"),
+            "unexpected setfield_gc_v/iid key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("setfield_gc_v/ird"),
+            "unexpected setfield_gc_v/ird key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("setarrayitem_gc_v/riid"),
+            "unexpected setarrayitem_gc_v key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("setarrayitem_gc_v/iiid"),
+            "unexpected setarrayitem_gc_v/iiid key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assemble_typed_reads_use_canonical_non_v_opnames() {
+        use crate::flatten::flatten as flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("typed_reads");
+        let base = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let field_result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Unknown,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let array_result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: ValueType::Unknown,
+                    array_type_id: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(array_result));
+
+        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        type_state.concrete_types.insert(
+            base,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef,
+        );
+        type_state.concrete_types.insert(
+            index,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+        type_state.concrete_types.insert(
+            field_result,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+        type_state.concrete_types.insert(
+            array_result,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let rewritten = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph)
+            .graph;
+        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
+        let mut flat = flatten_graph(&rewritten, &regallocs);
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            asm.insns.contains_key("getfield_gc_i/rd>i"),
+            "expected canonical getfield_gc_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("getarrayitem_gc_i/rid>i"),
+            "expected canonical getarrayitem_gc_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getfield_gc_v/rd>i"),
+            "unexpected getfield_gc_v/rd>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getfield_gc_v/id>i"),
+            "unexpected getfield_gc_v/id>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getarrayitem_gc_v/rid>i"),
+            "unexpected getarrayitem_gc_v/rid>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getarrayitem_gc_v/iid>i"),
+            "unexpected getarrayitem_gc_v/iid>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getarrayitem_gc_v/ird>i"),
+            "unexpected getarrayitem_gc_v/ird>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
 }

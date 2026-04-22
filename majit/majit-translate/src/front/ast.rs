@@ -974,6 +974,8 @@ fn lower_expr(
                 let base = lower_expr(graph, block, &field.base, options, ctx)
                     .unwrap_or_else(|| graph.alloc_value());
                 let field_name = member_name(&field.member);
+                let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
+                    .unwrap_or(ValueType::Unknown);
                 graph.push_op(
                     *block,
                     OpKind::FieldRead {
@@ -982,7 +984,7 @@ fn lower_expr(
                             field_name,
                             receiver_type_root(&field.base, ctx),
                         ),
-                        ty: ValueType::Unknown,
+                        ty,
                         pure: false,
                     },
                     true,
@@ -997,12 +999,14 @@ fn lower_expr(
             let index = lower_expr(graph, block, &idx.index, options, ctx)
                 .unwrap_or_else(|| graph.alloc_value());
             let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
+            let item_ty = array_item_value_type_from_array_type_id(array_type_id.as_deref())
+                .unwrap_or(ValueType::Unknown);
             graph.push_op(
                 *block,
                 OpKind::ArrayRead {
                     base,
                     index,
-                    item_ty: ValueType::Unknown,
+                    item_ty,
                     array_type_id,
                 },
                 true,
@@ -1050,6 +1054,8 @@ fn lower_expr(
                         let base = lower_expr(graph, block, &field.base, options, ctx)
                             .unwrap_or_else(|| graph.alloc_value());
                         let field_name = member_name(&field.member);
+                        let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
+                            .unwrap_or(ValueType::Unknown);
                         graph.push_op(
                             *block,
                             OpKind::FieldWrite {
@@ -1059,7 +1065,7 @@ fn lower_expr(
                                     receiver_type_root(&field.base, ctx),
                                 ),
                                 value,
-                                ty: ValueType::Unknown,
+                                ty,
                             },
                             false,
                         );
@@ -1071,13 +1077,16 @@ fn lower_expr(
                     let index = lower_expr(graph, block, &idx.index, options, ctx)
                         .unwrap_or_else(|| graph.alloc_value());
                     let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
+                    let item_ty =
+                        array_item_value_type_from_array_type_id(array_type_id.as_deref())
+                            .unwrap_or(ValueType::Unknown);
                     graph.push_op(
                         *block,
                         OpKind::ArrayWrite {
                             base,
                             index,
                             value,
-                            item_ty: ValueType::Unknown,
+                            item_ty,
                             array_type_id,
                         },
                         false,
@@ -2098,6 +2107,22 @@ fn type_string_to_value_type(type_str: &str) -> ValueType {
     }
 }
 
+fn field_value_type_from_expr(
+    base: &syn::Expr,
+    member: &syn::Member,
+    ctx: &GraphBuildContext,
+) -> Option<ValueType> {
+    let owner = receiver_type_root(base, ctx)?;
+    let field_name = member_name(member);
+    let field_type = ctx.struct_fields.field_type(&owner, &field_name)?;
+    Some(type_string_to_value_type(field_type))
+}
+
+fn array_item_value_type_from_array_type_id(array_type_id: Option<&str>) -> Option<ValueType> {
+    let elem_type = extract_element_type_from_str(array_type_id?)?;
+    Some(type_string_to_value_type(&elem_type))
+}
+
 /// For `arr[idx]`, returns the ELEMENT TYPE of `arr` from context.
 /// This is the Rust equivalent of RPython's `op.args[0].concretetype.TO`
 /// which gives `GcArray(T)` — the `T` is what distinguishes array types.
@@ -2237,6 +2262,71 @@ mod tests {
                 OpKind::FieldRead { field, .. } if field.name == "x"
             )),
             "expected FieldRead for 'x', got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn lowers_field_access_with_typed_fieldread_and_fieldwrite() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct S { x: i64, y: f64 }
+            fn mutate(s: S) -> i64 {
+                s.x = 1;
+                s.x
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, ty, .. }
+                    if field.name == "x" && *ty == ValueType::Int
+            )),
+            "expected typed FieldWrite for 'x', got {:?}",
+            ops
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty, .. }
+                    if field.name == "x" && *ty == ValueType::Int
+            )),
+            "expected typed FieldRead for 'x', got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn lowers_array_access_with_typed_arrayread_and_arraywrite() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn mutate(xs: Vec<i64>, i: usize) -> i64 {
+                xs[i] = 1;
+                xs[i]
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayWrite { item_ty, .. } if *item_ty == ValueType::Int
+            )),
+            "expected typed ArrayWrite, got {:?}",
+            ops
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayRead { item_ty, .. } if *item_ty == ValueType::Int
+            )),
+            "expected typed ArrayRead, got {:?}",
             ops
         );
     }

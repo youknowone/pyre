@@ -31,32 +31,38 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::model::{
     BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation,
 };
+use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType};
 use crate::translator::rtyper::rclass;
+use crate::translator::rtyper::rtyper::RPythonTyper;
 // `TypeResolutionState` lives under `translate_legacy` until majit-rtyper
 // (roadmap Phase 6) extracts it into a proper crate. Wiring bridge only.
 use crate::translate_legacy::rtyper::rtyper::TypeResolutionState;
 
 /// RPython `ConcreteCallTableRow(dict)` (rpbc.py:71-82).
-///
-/// PRE-EXISTING-ADAPTATION:
-/// upstream stores low-level callable objects (`llfn =
-/// rtyper.getcallable(graph)`). The current Rust source pipeline has no
-/// first-class `getcallable()` yet, so the row stores the concrete
-/// source graph witness (`Rc<PyGraph>`) directly and compares by the
-/// underlying `graph.graph` identity. This preserves the row-merging
-/// semantics needed by `LLCallTable.lookup/add` without inventing a
-/// side-table.
 #[derive(Clone, Debug)]
 pub struct ConcreteCallTableRow {
-    pub row: HashMap<DescKey, Rc<PyGraph>>,
+    pub row: HashMap<DescKey, _ptr>,
+    pub fntype: FuncType,
     pub attrname: Option<String>,
 }
 
 impl ConcreteCallTableRow {
     /// RPython `ConcreteCallTableRow.from_row(cls, rtyper, row)`.
-    pub fn from_row(row: &CallTableRow) -> Self {
+    pub fn from_row(rtyper: &RPythonTyper, row: &CallTableRow) -> Self {
+        let mut concrete_row = HashMap::new();
+        let mut last_llfn = None;
+        for (funcdesc, graph) in row {
+            let llfn = rtyper.getcallable(graph);
+            last_llfn = Some(llfn.clone());
+            concrete_row.insert(*funcdesc, llfn);
+        }
+        let fntype = last_llfn
+            .expect("ConcreteCallTableRow::from_row requires a non-empty row")
+            ._TYPE
+            .clone();
         ConcreteCallTableRow {
-            row: row.clone(),
+            row: concrete_row,
+            fntype,
             attrname: None,
         }
     }
@@ -64,18 +70,7 @@ impl ConcreteCallTableRow {
 
 impl PartialEq for ConcreteCallTableRow {
     fn eq(&self, other: &Self) -> bool {
-        if self.row.len() != other.row.len() {
-            return false;
-        }
-        for (desc, graph) in &self.row {
-            let Some(other_graph) = other.row.get(desc) else {
-                return false;
-            };
-            if !Rc::ptr_eq(&graph.graph, &other_graph.graph) {
-                return false;
-            }
-        }
-        true
+        self.row == other.row
     }
 }
 
@@ -94,10 +89,13 @@ impl LLCallTable {
     pub fn lookup(&self, row: &ConcreteCallTableRow) -> Result<(usize, ConcreteCallTableRow), ()> {
         for (existingindex, existingrow) in self.uniquerows.iter().enumerate() {
             let existingrow = existingrow.borrow();
+            if row.fntype != existingrow.fntype {
+                continue;
+            }
             let mut mismatched = false;
             for (funcdesc, llfn) in &row.row {
                 if let Some(existing_llfn) = existingrow.row.get(funcdesc) {
-                    if !Rc::ptr_eq(&llfn.graph, &existing_llfn.graph) {
+                    if llfn != existing_llfn {
                         mismatched = true;
                         break;
                     }
@@ -108,10 +106,11 @@ impl LLCallTable {
             }
             let mut merged = ConcreteCallTableRow {
                 row: row.row.clone(),
+                fntype: row.fntype.clone(),
                 attrname: row.attrname.clone(),
             };
-            for (desc, graph) in &existingrow.row {
-                merged.row.insert(*desc, graph.clone());
+            for (desc, llfn) in &existingrow.row {
+                merged.row.insert(*desc, llfn.clone());
             }
             if merged.row.len() == row.row.len() + existingrow.row.len() {
                 // no common funcdesc, not a match
@@ -137,13 +136,13 @@ impl LLCallTable {
 }
 
 /// RPython `build_concrete_calltable(rtyper, callfamily)` (rpbc.py:125-157).
-pub fn build_concrete_calltable(callfamily: &CallFamily) -> LLCallTable {
+pub fn build_concrete_calltable(rtyper: &RPythonTyper, callfamily: &CallFamily) -> LLCallTable {
     let mut llct = LLCallTable::default();
     let mut concreterows: HashMap<(CallShape, usize), ConcreteCallTableRow> = HashMap::new();
 
     for (shape, rows) in &callfamily.calltables {
         for (index, row) in rows.iter().enumerate() {
-            let concreterow = ConcreteCallTableRow::from_row(row);
+            let concreterow = ConcreteCallTableRow::from_row(rtyper, row);
             concreterows.insert((shape.clone(), index), concreterow.clone());
             llct.add(concreterow);
         }
@@ -173,21 +172,25 @@ pub fn build_concrete_calltable(callfamily: &CallFamily) -> LLCallTable {
 
 /// RPython `get_concrete_calltable(rtyper, callfamily)` (rpbc.py:159-174).
 pub fn get_concrete_calltable(
-    type_state: &mut TypeResolutionState,
+    rtyper: &RPythonTyper,
     callfamily: &Rc<RefCell<CallFamily>>,
 ) -> Result<LLCallTable, AnnotatorError> {
     let key = Rc::as_ptr(callfamily) as usize;
-    if let Some((llct, oldsize)) = type_state.concrete_calltables.get(&key) {
-        if *oldsize != callfamily.borrow().total_calltable_size {
-            return Err(AnnotatorError::new("call table was unexpectedly extended"));
+    {
+        let concrete_calltables = rtyper.concrete_calltables.borrow();
+        if let Some((llct, oldsize)) = concrete_calltables.get(&key) {
+            if *oldsize != callfamily.borrow().total_calltable_size {
+                return Err(AnnotatorError::new("call table was unexpectedly extended"));
+            }
+            return Ok(llct.clone());
         }
-        return Ok(llct.clone());
     }
 
-    let llct = build_concrete_calltable(&callfamily.borrow());
+    let llct = build_concrete_calltable(rtyper, &callfamily.borrow());
     let oldsize = callfamily.borrow().total_calltable_size;
-    type_state
+    rtyper
         .concrete_calltables
+        .borrow_mut()
         .insert(key, (llct.clone(), oldsize));
     Ok(llct)
 }
@@ -371,6 +374,7 @@ pub fn assert_no_indirect_call_targets(graph: &JitFunctionGraph) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::argument::ArgumentsForTranslation;
     use crate::annotator::bookkeeper::Bookkeeper;
     use crate::annotator::description::{DescEntry, FunctionDesc};
@@ -384,6 +388,12 @@ mod tests {
     use crate::model::{FunctionGraph, OpKind, ValueType};
     use crate::translate_legacy::annotator::annrpython::annotate;
     use crate::translate_legacy::rtyper::rtyper::resolve_types;
+    use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType, functionptr};
+
+    fn make_rtyper() -> RPythonTyper {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        RPythonTyper::new(&ann)
+    }
 
     fn make_pygraph(name: &str) -> Rc<PyGraph> {
         let arg = FlowHlvalue::Variable(FlowVariable::named("x"));
@@ -423,8 +433,21 @@ mod tests {
         )
     }
 
+    fn fake_llfn(name: &str, arity: usize) -> _ptr {
+        functionptr(
+            FuncType {
+                args: vec![(); arity],
+                result: (),
+            },
+            name,
+            None,
+            None,
+        )
+    }
+
     #[test]
     fn build_concrete_calltable_merges_overlapping_rows() {
+        let rtyper = make_rtyper();
         let mut family = CallFamily::new(DescKey(1));
         let shared = make_pygraph("shared");
         let mut row0 = CallTableRow::new();
@@ -442,7 +465,7 @@ mod tests {
             vec![row0, row1],
         );
 
-        let llct = build_concrete_calltable(&family);
+        let llct = build_concrete_calltable(&rtyper, &family);
         assert_eq!(llct.uniquerows.len(), 1);
         let merged = llct.uniquerows[0].borrow();
         assert_eq!(merged.row.len(), 3);
@@ -453,6 +476,7 @@ mod tests {
 
     #[test]
     fn build_concrete_calltable_assigns_variant_names_to_multiple_uniquerows() {
+        let rtyper = make_rtyper();
         let mut family = CallFamily::new(DescKey(1));
         let mut row0 = CallTableRow::new();
         row0.insert(DescKey(10), make_pygraph("a"));
@@ -467,7 +491,7 @@ mod tests {
             vec![row0, row1],
         );
 
-        let llct = build_concrete_calltable(&family);
+        let llct = build_concrete_calltable(&rtyper, &family);
         assert_eq!(llct.uniquerows.len(), 2);
         let mut attrnames: Vec<_> = llct
             .uniquerows
@@ -492,8 +516,33 @@ mod tests {
     }
 
     #[test]
+    fn llcalltable_lookup_rejects_rows_with_mismatched_fntype() {
+        let mut llct = LLCallTable::default();
+        llct.uniquerows
+            .push(Rc::new(RefCell::new(ConcreteCallTableRow {
+                row: HashMap::from([(DescKey(10), fake_llfn("a", 1))]),
+                fntype: FuncType {
+                    args: vec![()],
+                    result: (),
+                },
+                attrname: None,
+            })));
+
+        let row = ConcreteCallTableRow {
+            row: HashMap::from([(DescKey(10), fake_llfn("a", 1))]),
+            fntype: FuncType {
+                args: vec![(), ()],
+                result: (),
+            },
+            attrname: None,
+        };
+
+        assert!(llct.lookup(&row).is_err());
+    }
+
+    #[test]
     fn get_concrete_calltable_caches_and_rejects_extension() {
-        let mut state = TypeResolutionState::new();
+        let rtyper = make_rtyper();
         let family = Rc::new(RefCell::new(CallFamily::new(DescKey(1))));
         let mut row0 = CallTableRow::new();
         row0.insert(DescKey(10), make_pygraph("a"));
@@ -507,13 +556,13 @@ mod tests {
         );
         family.borrow_mut().total_calltable_size = 1;
 
-        let first = get_concrete_calltable(&mut state, &family).unwrap();
-        let second = get_concrete_calltable(&mut state, &family).unwrap();
+        let first = get_concrete_calltable(&rtyper, &family).unwrap();
+        let second = get_concrete_calltable(&rtyper, &family).unwrap();
         assert_eq!(first.uniquerows.len(), second.uniquerows.len());
-        assert_eq!(state.concrete_calltables.len(), 1);
+        assert_eq!(rtyper.concrete_calltables.borrow().len(), 1);
 
         family.borrow_mut().total_calltable_size = 2;
-        let err = get_concrete_calltable(&mut state, &family).unwrap_err();
+        let err = get_concrete_calltable(&rtyper, &family).unwrap_err();
         assert!(
             err.to_string()
                 .contains("call table was unexpectedly extended")

@@ -4462,19 +4462,29 @@ mod tests {
         }
 
         #[test]
-        fn wire_bhimpl_handlers_keeps_setfield_gc_v_ird_on_ref_handler() {
+        fn wire_bhimpl_handlers_leaves_dead_v_access_aliases_unwired() {
             let mut insns = HashMap::new();
-            insns.insert("setfield_gc_v/ird".to_string(), 0u8);
+            insns.insert("setfield_gc_v/rid".to_string(), 0u8);
+            insns.insert("getarrayitem_gc_v/rid>i".to_string(), 1u8);
+            insns.insert("setarrayitem_gc_v/riid".to_string(), 2u8);
+            insns.insert("getfield_gc_v/id>i".to_string(), 3u8);
+            insns.insert("getarrayitem_gc_v/iid>i".to_string(), 4u8);
+            insns.insert("getarrayitem_gc_v/ird>i".to_string(), 5u8);
+            insns.insert("setfield_gc_v/iid".to_string(), 6u8);
+            insns.insert("setfield_gc_v/ird".to_string(), 7u8);
+            insns.insert("setarrayitem_gc_v/iiid".to_string(), 8u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
             super::wire_bhimpl_handlers(&mut builder);
 
-            let wired = builder.dispatch_table[0];
-            assert_eq!(
-                wired as *const () as usize,
-                super::handler_setfield_gc_v_ird_pyre as *const () as usize
-            );
+            let placeholder = super::unwired_handler_placeholder as *const () as usize;
+            for &slot in &[0usize, 1, 2, 3, 4, 5, 6, 7, 8] {
+                assert_eq!(
+                    builder.dispatch_table[slot] as *const () as usize,
+                    placeholder
+                );
+            }
         }
     }
 }
@@ -5597,117 +5607,6 @@ fn handler_getarrayitem_gc_r(
     Ok(pos + 1)
 }
 
-// Pyre tagged-int variants of getfield_gc / getarrayitem_gc.
-//
-// The canonical RPython opnames (getfield_gc_i/rd>i, getarrayitem_gc_i/rid>i)
-// always carry the base pointer in a Ref register — upstream's rtyper
-// places every GC pointer in Ref storage. pyre's build-time graph
-// lowering sometimes colours a GC pointer as Int (tagged-int path
-// referenced by `bhhandler_ri_i` docs); the assembler's `OpKind::FieldRead`
-// arm (assembler.rs:541-564) and the default-branch `OpKind::ArrayRead`
-// path both derive the base's argcode from `lookup_reg_with_kind`, so the
-// emitted key becomes `getfield_gc_v/id>i` (field-type v, base in i
-// register) etc. instead of the RPython `getfield_gc_i/rd>i`.
-//
-// The bhimpl is the exact same `cpu.bh_getfield_gc_i` / `bh_getarrayitem_gc_i`
-// call — only the register-file read at operand-decode time differs.
-// Wiring these under the pyre-specific keys lets table-driven dispatch
-// consume both canonical and tagged-int encodings from the same jitcode
-// table.
-
-// pyre: `getfield_gc_v/id>i` — void-typed FieldRead (graph-level Unknown/Void
-// result) whose base sits in an Int register.
-fn handler_getfield_gc_v_id_i_pyre(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[pos] as usize] = cpu.bh_getfield_gc_i(struct_ptr, descr);
-    Ok(pos + 1)
-}
-
-// pyre: `getarrayitem_gc_v/iid>i` — array base + index both in Int registers.
-fn handler_getarrayitem_gc_v_iid_i_pyre(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[position] as usize];
-    let index = bh.registers_i[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
-    Ok(pos + 1)
-}
-
-// pyre: `getarrayitem_gc_v/ird>i` — array base in Int register, index in Ref
-// register (another tagged-int/tagged-ref-swap case).
-fn handler_getarrayitem_gc_v_ird_i_pyre(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[position] as usize];
-    let index = bh.registers_r[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
-    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
-    Ok(pos + 1)
-}
-
-// pyre: `setfield_gc_v/iid` — struct base colored into Int register (tagged-
-// int path documented on `bhhandler_ri_i`), value also Int, descr. Same
-// `bh_setfield_gc_i` primitive as the canonical `setfield_gc_i/rid`.
-fn handler_setfield_gc_v_iid_pyre(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
-    let value = bh.registers_i[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
-    Ok(pos)
-}
-
-// pyre: `setfield_gc_v/ird` — same tagged-int base path, but the stored
-// value lives in a Ref register. The blackhole side effect is still the
-// canonical `bh_setfield_gc_r`; only the base register file differs from
-// RPython's `setfield_gc_r/rrd`.
-fn handler_setfield_gc_v_ird_pyre(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
-    let value = bh.registers_r[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
-    Ok(pos)
-}
-
-// pyre: `setarrayitem_gc_v/iiid` — array base colored into Int register
-// (tagged-int path), index int, value int, descr. Same primitive as the
-// canonical `setarrayitem_gc_i/riid`.
-fn handler_setarrayitem_gc_v_iiid_pyre(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[position] as usize];
-    let index = bh.registers_i[code[position + 1] as usize];
-    let value = bh.registers_i[code[position + 2] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_setarrayitem_gc_i(array, index, value, descr);
-    Ok(pos)
-}
-
 // ── setarrayitem_gc (blackhole.py:1350-1358) ────────────────────────
 // @arguments("cpu", "r", "i", "X", "d")
 
@@ -6340,19 +6239,9 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_gc_i_pure/rd>i", handler_getfield_gc_i); // alias
     builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
-    // pyre tagged-int path: base pointer colored into Int register, so
-    // argcodes become `id>i` (not the RPython `rd>i`). Same bhimpl.
-    builder.wire_handler("getfield_gc_v/id>i", handler_getfield_gc_v_id_i_pyre);
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
-    // pyre-specific `_v` opname alias: `OpKind::FieldWrite { ty }` emits
-    // `setfield_gc_{kind}` with `_v` when the graph-level result type slot
-    // is Unknown/Void (assembler.rs op_kind_to_opname). The `rid` byte layout
-    // matches canonical `setfield_gc_i/rid`, so keep the alias on the integer
-    // bhimpl. The distinct `ird` tagged-int-base path is wired below to its
-    // dedicated Ref-value handler.
-    builder.wire_handler("setfield_gc_v/rid", handler_setfield_gc_i);
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
     // Array item operations (blackhole.py:1329-1365)
@@ -6360,34 +6249,8 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getarrayitem_gc_r/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("getarrayitem_gc_i_pure/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r_pure/rid>r", handler_getarrayitem_gc_r);
-    // pyre tagged-int path variants: base pointer in Int register, index
-    // in either Int or Ref register. Same bhimpl as the canonical i
-    // variant — only register-file reads differ.
-    builder.wire_handler(
-        "getarrayitem_gc_v/iid>i",
-        handler_getarrayitem_gc_v_iid_i_pyre,
-    );
-    builder.wire_handler(
-        "getarrayitem_gc_v/ird>i",
-        handler_getarrayitem_gc_v_ird_i_pyre,
-    );
-    // pyre `_v` opname alias: byte layout `rid>i` matches the canonical
-    // `getarrayitem_gc_i/rid>i`. Same comment as `setfield_gc_v/rid`.
-    builder.wire_handler("getarrayitem_gc_v/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);
     builder.wire_handler("setarrayitem_gc_r/rird", handler_setarrayitem_gc_r);
-    // pyre `_v` opname alias: byte layout `riid` matches canonical
-    // `setarrayitem_gc_i/riid`. Same comment as above.
-    builder.wire_handler("setarrayitem_gc_v/riid", handler_setarrayitem_gc_i);
-    // pyre tagged-int base variants: struct/array pointer sits in an Int
-    // register (same tagged-int deviation documented on `bhhandler_ri_i`).
-    // Distinct handlers read the base from `registers_i`.
-    builder.wire_handler("setfield_gc_v/iid", handler_setfield_gc_v_iid_pyre);
-    builder.wire_handler("setfield_gc_v/ird", handler_setfield_gc_v_ird_pyre);
-    builder.wire_handler(
-        "setarrayitem_gc_v/iiid",
-        handler_setarrayitem_gc_v_iiid_pyre,
-    );
 
     // Raw field operations (blackhole.py:1464-1502)
     builder.wire_handler("getfield_raw_i/id>i", handler_getfield_raw_i);
