@@ -4325,14 +4325,22 @@ impl AssemblerARM64 {
     fn genop_call(&mut self, op: &Op) {
         self._genop_call(op);
         if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+            if op.opcode.result_type() == Type::Float {
+                self.store_d0_to_result(op.pos);
+            } else {
+                self.store_rax_to_result(op.pos);
+            }
         }
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
         self._genop_call_with_arglocs(op, arglocs);
         if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+            if op.opcode.result_type() == Type::Float {
+                self.store_d0_to_result(op.pos);
+            } else {
+                self.store_rax_to_result(op.pos);
+            }
         }
     }
 
