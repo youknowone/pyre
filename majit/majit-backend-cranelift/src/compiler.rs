@@ -12922,6 +12922,11 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn pending_call_assembler_force_values() -> &'static Mutex<Vec<(i64, Option<i64>)>> {
+        static VALUES: OnceLock<Mutex<Vec<(i64, Option<i64>)>>> = OnceLock::new();
+        VALUES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
     thread_local! {
         static TEST_EXCEPTION_VALUE: Cell<i64> = const { Cell::new(0) };
         static TEST_EXCEPTION_CALL_LOG: std::cell::RefCell<Vec<bool>> =
@@ -13051,6 +13056,15 @@ mod tests {
             return get_ref_from_deadframe(&deadframe, 3).unwrap().0 as i64;
         }
         return_ref
+    }
+
+    extern "C" fn pending_call_assembler_force_probe(frame_ptr: i64) -> i64 {
+        let pending = take_pending_force_local0();
+        pending_call_assembler_force_values()
+            .lock()
+            .unwrap()
+            .push((frame_ptr, pending));
+        frame_ptr + pending.unwrap_or(0)
     }
 
     fn make_gc_backend() -> CraneliftBackend {
@@ -16865,6 +16879,36 @@ mod tests {
     }
 
     #[test]
+    fn test_call_assembler_fast_path_pending_target_uses_force_fallback() {
+        pending_call_assembler_force_values()
+            .lock()
+            .unwrap()
+            .clear();
+
+        let token_number = 1500_199;
+        register_pending_call_assembler_target(token_number, vec![Type::Int], 2, 1, -1);
+
+        let target_ptr = unsafe { fast_lookup_ca_target(token_number) };
+        assert!(!target_ptr.is_null(), "pending target should be registered");
+        let target = unsafe { &*target_ptr };
+        let mut outcome = [0i64; 2];
+        let result = call_assembler_fast_path(
+            target,
+            &[0x1234, 77],
+            outcome.as_mut_ptr(),
+            pending_call_assembler_force_probe,
+        );
+
+        assert_eq!(result as i64, 0x1234 + 77);
+        assert_eq!(outcome, [CALL_ASSEMBLER_OUTCOME_FINISH, 0]);
+        assert_eq!(
+            *pending_call_assembler_force_values().lock().unwrap(),
+            vec![(0x1234, Some(77))]
+        );
+        assert_eq!(take_pending_force_local0(), None);
+    }
+
+    #[test]
     fn test_call_assembler_compiles_before_target_is_registered() {
         let mut backend = CraneliftBackend::new();
 
@@ -17069,9 +17113,19 @@ mod tests {
         ];
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
+        let compiled = token
+            .compiled
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let guard_descr = &compiled.fail_descrs[0];
+
         let failed = backend.execute_token(&token, &[Value::Int(0)]);
-        let guard_descr = get_latest_descr_from_deadframe(&failed)
+        let failed_descr = get_latest_descr_from_deadframe(&failed)
             .expect("base-case guard should produce a valid descr");
+        assert_eq!(failed_descr.fail_index(), guard_descr.fail_index());
+        assert_eq!(guard_descr.get_fail_count(), 1);
 
         backend.set_constants(HashMap::new());
         let bridge_ops = vec![
@@ -17079,13 +17133,18 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(failed_descr, &inputargs, &bridge_ops, &token, &[])
             .unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(4)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 4);
+        assert_eq!(
+            guard_descr.get_fail_count(),
+            1,
+            "CALL_ASSEMBLER guard with attached bridge should dispatch directly without recounting the original faildescr",
+        );
 
         let raw = backend.execute_token_ints_raw(&token, &[4]);
         assert!(raw.is_finish);
