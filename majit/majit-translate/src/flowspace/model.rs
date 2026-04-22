@@ -37,12 +37,23 @@ use crate::translator::rtyper::lltypesystem::lltype::_ptr;
 // directly — `flowspace` and `annotator` are sibling modules inside
 // `majit-translate`, so the cross-module reference is just a `use`.
 
-/// Placeholder for `Repr.lowleveltype` attached by the rtyper.
+/// RPython `Variable.concretetype` / `Constant.concretetype` field
+/// type. Upstream carries a [`LowLevelType`] object assigned by the
+/// rtyper (`rtyper.py:setconcretetype`). Pyre aliases the
+/// upstream-orthodox type from
+/// `crate::translator::rtyper::lltypesystem::lltype::LowLevelType`
+/// for two reasons:
 ///
-/// RPython: `rtyper/rmodel.py:Repr`. Ported in roadmap Phase 6 as
-/// `majit-rtyper::Repr`; until then every concretetype slot carries
-/// `None`.
-pub type ConcretetypePlaceholder = ();
+/// 1. Upstream keeps the two surfaces separate — `flowspace/model.py`
+///    defines Variable/Constant while `rtyper/lltypesystem/lltype.py`
+///    defines `LowLevelType` and the primitive singletons. Pyre
+///    preserves that separation by re-exporting the alias here.
+/// 2. The previous placeholder `ConcretetypePlaceholder = ()` dropped
+///    Repr information; migrating to the real type closes part of
+///    Gap C (FUNC.RESULT CFG scan inference) from the epic plan,
+///    because `FuncType.args` / `FuncType.result` now carry the actual
+///    per-arg lowleveltypes instead of collapsing to unit.
+pub type ConcretetypePlaceholder = crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 /// RPython `Constant.value` 에 담기는 host-level Python object 의 일반
 /// carrier.
@@ -1679,7 +1690,7 @@ impl Clone for Variable {
             _name: self._name.clone(),
             _nr: std::cell::Cell::new(self._nr.get()),
             annotation: self.annotation.clone(),
-            concretetype: self.concretetype,
+            concretetype: self.concretetype.clone(),
         }
     }
 }
@@ -1834,7 +1845,7 @@ impl Variable {
         newvar._name = self._name.clone();
         newvar._nr.set(-1);
         newvar.annotation = self.annotation.clone();
-        newvar.concretetype = self.concretetype;
+        newvar.concretetype = self.concretetype.clone();
         newvar
     }
 
@@ -3486,7 +3497,8 @@ mod tests {
         use crate::annotator::model::{SomeInteger, SomeValue};
         let mut v = Variable::new();
         v.annotation = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
-        v.concretetype = Some(());
+        v.concretetype =
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed);
         let c = v.copy();
         let ca = c.annotation.as_ref().unwrap();
         let va = v.annotation.as_ref().unwrap();

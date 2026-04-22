@@ -453,7 +453,7 @@ pub fn ssi_to_ssa(graph: &FunctionGraph) {
         }
     }
     for (vname, vlist) in &variables_by_name {
-        let first_ct = vlist.first().and_then(|v| v.concretetype);
+        let first_ct = vlist.first().and_then(|v| v.concretetype.clone());
         for v in vlist {
             assert_eq!(
                 v.concretetype, first_ct,

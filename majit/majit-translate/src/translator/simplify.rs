@@ -2404,7 +2404,7 @@ mod tests {
         let arg = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(lltype::_ptr {
             _TYPE: lltype::FuncType {
                 args: vec![],
-                result: (),
+                result: lltype::LowLevelType::Void,
             },
             _obj0: Err(lltype::DelayedPointer),
         }))));

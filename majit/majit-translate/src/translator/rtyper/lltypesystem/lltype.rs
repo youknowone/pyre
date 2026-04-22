@@ -19,7 +19,7 @@
 //!   them.
 
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::flowspace::model::{ConcretetypePlaceholder, ConstValue, GraphKey, GraphRef, Hlvalue};
 
@@ -75,7 +75,7 @@ pub enum LowLevelType {
     /// RPython `class Ptr(LowLevelType)` (lltype.py:721-759) where the
     /// pointee is a function type. Other pointee variants (`Struct`,
     /// `Array`) land with consuming commits.
-    Ptr(Rc<FuncType>),
+    Ptr(Arc<FuncType>),
 }
 
 /// RPython `lltype.Void` singleton surface. Pure re-export of the enum
@@ -243,9 +243,18 @@ pub fn functionptr(
 }
 
 pub fn _getconcretetype(v: &Hlvalue) -> ConcretetypePlaceholder {
+    // PRE-EXISTING-ADAPTATION: upstream
+    // `rtyper.py:570-571 getcallable.getconcretetype` returns
+    // `self.bindingrepr(v).lowleveltype` and raises `AttributeError`
+    // when `v.concretetype` is unset. Pyre currently runs
+    // `getfunctionptr` before the rtyper has always populated
+    // concretetype (e.g. `generated::all_jitcodes()` caches a
+    // monomorphization-neutral registry), so the fallback picks
+    // `LowLevelType::Void` — structurally equivalent to upstream's
+    // "no concrete type assigned yet" state.
     match v {
-        Hlvalue::Variable(v) => v.concretetype.unwrap_or(()),
-        Hlvalue::Constant(c) => c.concretetype.unwrap_or(()),
+        Hlvalue::Variable(v) => v.concretetype.clone().unwrap_or(LowLevelType::Void),
+        Hlvalue::Constant(c) => c.concretetype.clone().unwrap_or(LowLevelType::Void),
     }
 }
 
@@ -291,6 +300,7 @@ mod tests {
         fn counting_getconcretetype(v: &Hlvalue) -> ConcretetypePlaceholder {
             let _ = v;
             CALLS.fetch_add(1, Ordering::Relaxed);
+            LowLevelType::Void
         }
 
         let start = Rc::new(RefCell::new(Block::new(vec![
@@ -351,9 +361,9 @@ mod tests {
             LowLevelType::Float,
             LowLevelType::Char,
             LowLevelType::UniChar,
-            LowLevelType::Ptr(Rc::new(FuncType {
+            LowLevelType::Ptr(Arc::new(FuncType {
                 args: vec![],
-                result: (),
+                result: LowLevelType::Void,
             })),
         ] {
             assert!(
@@ -390,9 +400,9 @@ mod tests {
         // upstream Ptr.__str__: `'* %s' % self.TO`. pyre stabilises the
         // FuncType body into "FuncType(N args)" for test-friendly
         // substring matching until a richer Debug impl lands.
-        let ft = Rc::new(FuncType {
-            args: vec![(), ()],
-            result: (),
+        let ft = Arc::new(FuncType {
+            args: vec![LowLevelType::Void, LowLevelType::Void],
+            result: LowLevelType::Void,
         });
         let ptr = LowLevelType::Ptr(ft);
         assert!(
@@ -427,7 +437,7 @@ mod tests {
         let ptr = _ptr {
             _TYPE: FuncType {
                 args: vec![],
-                result: (),
+                result: LowLevelType::Void,
             },
             _obj0: Err(DelayedPointer),
         };

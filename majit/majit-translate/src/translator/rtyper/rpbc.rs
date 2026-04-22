@@ -434,10 +434,11 @@ mod tests {
     }
 
     fn fake_llfn(name: &str, arity: usize) -> _ptr {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         functionptr(
             FuncType {
-                args: vec![(); arity],
-                result: (),
+                args: vec![LowLevelType::Void; arity],
+                result: LowLevelType::Void,
             },
             name,
             None,
@@ -517,13 +518,14 @@ mod tests {
 
     #[test]
     fn llcalltable_lookup_rejects_rows_with_mismatched_fntype() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut llct = LLCallTable::default();
         llct.uniquerows
             .push(Rc::new(RefCell::new(ConcreteCallTableRow {
                 row: HashMap::from([(DescKey(10), fake_llfn("a", 1))]),
                 fntype: FuncType {
-                    args: vec![()],
-                    result: (),
+                    args: vec![LowLevelType::Void],
+                    result: LowLevelType::Void,
                 },
                 attrname: None,
             })));
@@ -531,8 +533,8 @@ mod tests {
         let row = ConcreteCallTableRow {
             row: HashMap::from([(DescKey(10), fake_llfn("a", 1))]),
             fntype: FuncType {
-                args: vec![(), ()],
-                result: (),
+                args: vec![LowLevelType::Void, LowLevelType::Void],
+                result: LowLevelType::Void,
             },
             attrname: None,
         };
