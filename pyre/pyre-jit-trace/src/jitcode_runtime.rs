@@ -739,16 +739,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_int_add_reads_ri_operands_and_one_result_byte() {
-        // `int_add/ri>i` — 1+1 operand bytes + 1 result byte = 3 bytes
+    fn decode_int_add_reads_ii_operands_and_one_result_byte() {
+        // `int_add/ii>i` — 1+1 operand bytes + 1 result byte = 3 bytes
         // after the opcode.
         let op_byte = *insns_opname_to_byte()
-            .get("int_add/ri>i")
-            .expect("int_add/ri>i must be in insns table");
+            .get("int_add/ii>i")
+            .expect("int_add/ii>i must be in insns table");
         let code = [op_byte, 0x01, 0x02, 0x03];
         let op = decode_op_at(&code, 0).expect("int_add must decode");
         assert_eq!(op.opname, "int_add");
-        assert_eq!(op.argcodes, "ri>i");
+        assert_eq!(op.argcodes, "ii>i");
         assert_eq!(op.next_pc, 4);
     }
 
@@ -805,15 +805,17 @@ mod tests {
 
     #[test]
     fn resolve_int_add_reads_both_register_values() {
-        // `int_add/ri>i`: argcodes read ref-reg, int-reg, write int-reg.
+        // `int_add/ii>i`: canonical — both operands read from int-regs,
+        // result written to int-reg. RPython
+        // `blackhole.py:@arguments("i", "i", returns="i")`.
         let op_byte = *insns_opname_to_byte()
-            .get("int_add/ri>i")
-            .expect("int_add/ri>i must be in insns table");
-        // code: [opcode, r_idx=2, i_idx=1, dst=0]
+            .get("int_add/ii>i")
+            .expect("int_add/ii>i must be in insns table");
+        // code: [opcode, i_idx=2, i_idx=1, dst=0]
         let code = [op_byte, 0x02, 0x01, 0x00];
         let regs = RegisterFileView {
-            registers_i: &[0, 7, 0, 0],
-            registers_r: &[0, 0, 0x1234, 0],
+            registers_i: &[0, 7, 42, 0],
+            registers_r: &[],
             registers_f: &[],
         };
         let op = resolve_op_at(&code, 0, regs).expect("int_add must resolve");
@@ -821,12 +823,9 @@ mod tests {
         assert_eq!(op.operands.len(), 2);
         assert_eq!(
             op.operands[0],
-            ResolvedOperand::RefReg {
-                reg: 2,
-                value: 0x1234,
-            },
+            ResolvedOperand::IntReg { reg: 2, value: 42 }
         );
-        assert_eq!(op.operands[1], ResolvedOperand::IntReg { reg: 1, value: 7 },);
+        assert_eq!(op.operands[1], ResolvedOperand::IntReg { reg: 1, value: 7 });
         assert_eq!(op.result, Some(ResolvedResult::Int { reg: 0 }));
     }
 
@@ -846,15 +845,15 @@ mod tests {
 
     #[test]
     fn resolve_out_of_range_int_reg_returns_none() {
-        // int_add/ri>i: opcode reads registers_i[5], but registers_i is
+        // int_add/ii>i: opcode reads registers_i[5], but registers_i is
         // only 2 wide. Must surface as decode failure, not a silent 0.
         let op_byte = *insns_opname_to_byte()
-            .get("int_add/ri>i")
-            .expect("int_add/ri>i must be in insns table");
+            .get("int_add/ii>i")
+            .expect("int_add/ii>i must be in insns table");
         let code = [op_byte, 0x00, 0x05, 0x00];
         let regs = RegisterFileView {
             registers_i: &[10, 20],
-            registers_r: &[99],
+            registers_r: &[],
             registers_f: &[],
         };
         assert!(resolve_op_at(&code, 0, regs).is_none());

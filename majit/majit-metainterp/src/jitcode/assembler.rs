@@ -187,7 +187,7 @@ impl JitCodeBuilder {
     /// Load a scalar state field value into an int register.
     pub fn load_state_field(&mut self, field_idx: u16, dest: u16) {
         self.touch_reg(dest);
-        self.push_u8(jitcode::BC_LOAD_STATE_FIELD);
+        self.write_insn("load_state_field/di");
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
@@ -195,7 +195,7 @@ impl JitCodeBuilder {
     /// Store an int register value into a scalar state field.
     pub fn store_state_field(&mut self, field_idx: u16, src: u16) {
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_STORE_STATE_FIELD);
+        self.write_insn("store_state_field/di");
         self.push_u16(field_idx);
         self.push_u16(src);
     }
@@ -205,7 +205,7 @@ impl JitCodeBuilder {
     pub fn load_state_array(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(dest);
-        self.push_u8(jitcode::BC_LOAD_STATE_ARRAY);
+        self.write_insn("load_state_array/dii");
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -216,7 +216,7 @@ impl JitCodeBuilder {
     pub fn store_state_array(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_STORE_STATE_ARRAY);
+        self.write_insn("store_state_array/dii");
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -336,7 +336,7 @@ impl JitCodeBuilder {
     pub fn load_state_varray(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(dest);
-        self.push_u8(jitcode::BC_LOAD_STATE_VARRAY);
+        self.write_insn("load_state_varray/dii");
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -347,7 +347,7 @@ impl JitCodeBuilder {
     pub fn store_state_varray(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_STORE_STATE_VARRAY);
+        self.write_insn("store_state_varray/dii");
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -673,7 +673,7 @@ impl JitCodeBuilder {
     /// RPython blackhole.py:987 `last_exception/>i`.
     pub fn last_exception(&mut self, dst: u16) {
         self.touch_reg(dst);
-        self.push_u8(jitcode::BC_LAST_EXCEPTION);
+        self.write_insn("last_exception/>i");
         self.push_u16(dst);
     }
 
@@ -729,7 +729,7 @@ impl JitCodeBuilder {
     }
 
     pub fn abort(&mut self) {
-        self.push_u8(jitcode::BC_ABORT);
+        self.write_insn("abort/");
         self.has_abort = true;
     }
 
@@ -758,7 +758,7 @@ impl JitCodeBuilder {
     }
 
     pub fn abort_permanent(&mut self) {
-        self.push_u8(jitcode::BC_ABORT_PERMANENT);
+        self.write_insn("abort_permanent/");
     }
 
     /// blackhole.py bhimpl_raise(excvalue): raise exception from register.

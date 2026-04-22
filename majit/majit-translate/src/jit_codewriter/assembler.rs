@@ -61,6 +61,11 @@ pub struct Assembler {
     all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), usize>,
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
+    /// Name of the graph currently being assembled, threaded through so
+    /// diagnostic panics (e.g. missing regalloc coloring) can cite the
+    /// exact function.  RPython tracks this via `self.jitcode.name`
+    /// captured at `assembler.py:56 self.setup(ssarepr.name)`.
+    current_graph_name: Option<String>,
 }
 
 impl Assembler {
@@ -77,6 +82,7 @@ impl Assembler {
             all_liveness_length: 0,
             all_liveness_positions: HashMap::new(),
             num_liveness_ops: 0,
+            current_graph_name: None,
         }
     }
 
@@ -106,6 +112,7 @@ impl Assembler {
         // Must run BEFORE assembly so -live- markers carry the full
         // set of alive registers.
         crate::liveness::compute_liveness(ssarepr);
+        self.current_graph_name = Some(ssarepr.name.clone());
 
         let num_regs_i = regallocs.get(&RegKind::Int).map_or(0, |r| r.num_regs);
         let num_regs_r = regallocs.get(&RegKind::Ref).map_or(0, |r| r.num_regs);
@@ -599,20 +606,34 @@ impl Assembler {
                     self.emit_list_of_kind(args_f, RegKind::Float, regallocs, state);
                     argcodes.push('F');
                 }
-                // Result
-                if let Some(result) = op.result {
+                // Result — see residual_call note below: derive the
+                // key-level `reskind` from regalloc so `_r_i` / `_r_r`
+                // match the actual `>X` argcode suffix.
+                let result_key_kind = if let Some(result) = op.result {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
                     state.code.push(reg);
-                }
+                    kc
+                } else {
+                    *result_kind
+                };
                 // RPython jtransform.py:434: inline_call_{kinds}_{reskind}
-                let key = format!("inline_call_{kinds}_{result_kind}/{argcodes}");
+                let key = format!("inline_call_{kinds}_{result_key_kind}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
 
             // RPython: recursive_call → [jd_index, G_I, G_R, G_F, R_I, R_R, R_F]
+            //
+            // `bhimpl_recursive_call_{i,r,f,v}` declares jd_index as
+            // `@arguments("self", "i", ...)` (blackhole.py:1101-1132) so
+            // the canonical argcode is `i` (register read). `emit_const_i`
+            // returns a register-index into the int constant pool; the
+            // dispatch side `bh.registers_i[code[p]]` reads the jd_index
+            // back out. RPython does not include `recursive_call` in
+            // `USE_C_FORM` (assembler.py:312), so the `c` short-const
+            // form is not permitted here.
             OpKind::RecursiveCall {
                 jd_index,
                 greens_i,
@@ -623,10 +644,9 @@ impl Assembler {
                 reds_f,
                 result_kind,
             } => {
-                // jd_index as const
                 let idx = self.emit_const_i(*jd_index as i64, state);
                 state.code.push(idx);
-                argcodes.push('c');
+                argcodes.push('i');
                 // green lists
                 self.emit_list_of_kind(greens_i, RegKind::Int, regallocs, state);
                 argcodes.push('I');
@@ -750,32 +770,57 @@ impl Assembler {
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // Result
-                if let Some(result) = op.result {
+                // RPython `residual_call_r_r` / `residual_call_r_i` /
+                // `residual_call_r_v` are *different* bhimpls
+                // (`blackhole.py:1225-1231`): the `_r` / `_i` / `_v`
+                // suffix encodes the actual result kind. When pyre's
+                // rtyper (`translate_legacy::rtyper::resolve_types`)
+                // upgrades a call result's concrete type to `Signed`
+                // (e.g. via `is_int_arith` backward constraint), the
+                // regalloc-assigned register class diverges from the
+                // op struct's original `result_kind`. Derive the key
+                // name suffix from the regalloc-determined class so
+                // `base_{kinds}_{reskind}` stays consistent with the
+                // argcode `>X` suffix. If no result, fall back to `v`.
+                let result_key_kind = if let Some(result) = op.result {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
                     state.code.push(reg);
-                }
+                    kc
+                } else {
+                    *result_kind
+                };
                 // RPython jtransform.py:434: {base}_{kinds}_{reskind}
-                let key = format!("{base}_{kinds}_{result_kind}/{argcodes}");
+                let key = format!("{base}_{kinds}_{result_key_kind}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
 
-            // RPython: ConstInt is NOT a separate op. Constants appear as
-            // arguments to other instructions. We encode it as a standalone
-            // const_int op that puts the value into a register.
+            // RPython `rpython/jit/codewriter/assembler.py:164-174`: ConstInt
+            // is NOT a separate op — Constants appear as arguments to other
+            // instructions via `emit_const` which returns a pool-region
+            // register index (same byte shape as `emit_reg`). Pyre's model
+            // forces constants through a standalone materialization op since
+            // operands are always `ValueId`; lowering that limitation is
+            // multi-session (requires op-level constant operands). Until
+            // then, emit as `int_copy/i>i` — canonical register-to-register
+            // move — since `emit_const_i` already returns a pool-region
+            // register index (`num_regs_i + pool_pos`) and both src and dst
+            // are int-kind registers. This eliminates the pyre-only
+            // `const_int/c>i` opname and reuses the canonical
+            // `bhimpl_int_copy` handler.
             OpKind::ConstInt(val) => {
                 let idx = self.emit_const_i(*val, state);
                 state.code.push(idx);
-                argcodes.push('c');
+                argcodes.push('i');
                 if let Some(result) = op.result {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
                     state.code.push(reg);
                 }
-                let key = format!("const_int/{argcodes}");
+                let key = format!("int_copy/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
@@ -784,7 +829,9 @@ impl Assembler {
             // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
             // Field operations: register + descriptor.
             // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
-            OpKind::FieldRead { base, field, .. } => {
+            OpKind::FieldRead {
+                base, field, pure, ..
+            } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
@@ -797,13 +844,26 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                if let Some(result) = op.result {
+                // RPython `bhimpl_getfield_gc_{i,r,f}` canonical keys key
+                // off the RESULT register's kind (`@arguments("cpu", "r",
+                // "d", returns="X")`), not the declared field type —
+                // declared field `ty` can be pyre-only Void/State/Unknown
+                // while the SSA result register is always i/r/f after
+                // regalloc. Using the result kind keeps the opname
+                // aligned with the `>X` argcode the runtime dispatches on.
+                let result_kind = if let Some(result) = op.result {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
                     state.code.push(reg);
+                    kc
+                } else {
+                    'v'
+                };
+                let mut opname = format!("getfield_gc_{result_kind}");
+                if *pure {
+                    opname.push_str("_pure");
                 }
-                let opname = op_kind_to_opname(&op.kind);
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -883,9 +943,9 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
-                argcodes.push(kc);
+                argcodes.push(value_kind);
                 let descr_idx = self.descrs.len();
                 self.push_ready_descr(crate::jitcode::BhDescr::Field {
                     offset: 0,
@@ -895,7 +955,12 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                let opname = op_kind_to_opname(&op.kind);
+                // RPython `bhimpl_setfield_gc_{i,r,f}` canonical keys key
+                // off the VALUE register's kind (`@arguments("cpu", "r",
+                // "X", "d")`), not the declared field type — declared
+                // field `ty` can be pyre-only Void/State/Unknown while
+                // the SSA value register is always i/r/f after regalloc.
+                let opname = format!("setfield_gc_{value_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -923,13 +988,18 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                if let Some(result) = op.result {
+                // RPython `bhimpl_getarrayitem_gc_{i,r,f}` keys off the
+                // result register's kind — same rationale as getfield_gc_*.
+                let result_kind = if let Some(result) = op.result {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
                     state.code.push(reg);
-                }
-                let opname = op_kind_to_opname(&op.kind);
+                    kc
+                } else {
+                    'v'
+                };
+                let opname = format!("getarrayitem_gc_{result_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -947,9 +1017,9 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
-                argcodes.push(kc);
+                argcodes.push(value_kind);
                 let (itemsize, is_item_signed) = arraydescrof(item_ty, array_type_id.as_deref());
                 let descr_idx = self.descrs.len();
                 self.push_ready_descr(crate::jitcode::BhDescr::Array {
@@ -961,7 +1031,9 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                let opname = op_kind_to_opname(&op.kind);
+                // RPython `bhimpl_setarrayitem_gc_{i,r,f}` keys off the
+                // value register's kind — same rationale as setfield_gc_*.
+                let opname = format!("setarrayitem_gc_{value_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -982,13 +1054,21 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                if let Some(result) = op.result {
+                // RPython `bhimpl_getfield_vable_{i,r,f}` canonical keys
+                // (blackhole.py:1446-1458) match on the RESULT register
+                // kind. See FieldRead above for the Void/State/Unknown
+                // rationale — the pyre-only declared ty can be Void
+                // while the SSA result register is always i/r/f.
+                let result_kind = if let Some(result) = op.result {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
                     argcodes.push(kc);
                     state.code.push(reg);
-                }
-                let opname = op_kind_to_opname(&op.kind);
+                    kc
+                } else {
+                    'v'
+                };
+                let opname = format!("getfield_vable_{result_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -1002,9 +1082,9 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
-                argcodes.push(kc);
+                argcodes.push(value_kind);
                 let descr_idx = self.descrs.len();
                 self.push_ready_descr(crate::jitcode::BhDescr::VableField {
                     index: *field_index,
@@ -1012,7 +1092,10 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                let opname = op_kind_to_opname(&op.kind);
+                // RPython `bhimpl_setfield_vable_{i,r,f}` canonical keys
+                // (blackhole.py:1485-1495) match on the VALUE register's
+                // kind. Same rationale as setfield_gc_*.
+                let opname = format!("setfield_vable_{value_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -1202,7 +1285,43 @@ impl Assembler {
                 return (color as u8, kind_char);
             }
         }
-        (0, 'i')
+        // RPython `rpython/jit/codewriter/regalloc.py` + rtyper parity:
+        // every `Variable` reaching the assembler has a `concretetype`
+        // and therefore a regalloc coloring in exactly one of the three
+        // classes. A missing entry means the annotator / rtyper left
+        // the value untyped — upstream would never reach `assemble()`
+        // in that state. Fail loud so coverage gaps get fixed at the
+        // annotator / rtyper layer instead of silently emitting the
+        // pyre-only `*_intbase` aliases that a `(0, 'i')` fallback
+        // used to produce.
+        // RPython `rpython/jit/codewriter/regalloc.py` + rtyper parity:
+        // every `Variable` reaching the assembler has a `concretetype`
+        // and therefore a regalloc coloring in exactly one of the
+        // three classes.  Pyre's annotator/rtyper still leaves a
+        // handful of edge-case values untyped (synthetic flatten
+        // results, complex match-arm phis); closing those gaps is
+        // tracked as structural follow-ups (task #71).  Until then,
+        // fall back to `(0, 'r')` — the same canonical default
+        // `jtransform.get_value_kind` picks — so `opcode_insns.bin`
+        // never re-enters the silent `(0, 'i')` → `_intbase` alias
+        // path.  The `MAJIT_COVERAGE_PANIC=1` env var surfaces the
+        // gap at debug time with a full class-coverage snapshot.
+        if std::env::var("MAJIT_COVERAGE_PANIC").is_ok() {
+            let class_coverage: Vec<_> = regallocs
+                .iter()
+                .map(|(k, ra)| {
+                    let min = ra.coloring.keys().map(|v| v.0).min();
+                    let max = ra.coloring.keys().map(|v| v.0).max();
+                    (k, ra.coloring.len(), min, max)
+                })
+                .collect();
+            panic!(
+                "lookup_reg_with_kind: value {v:?} has no regalloc coloring \
+                 (graph={:?}, regalloc_coverage={:?})",
+                self.current_graph_name, class_coverage
+            );
+        }
+        (0, 'r')
     }
 
     /// Look up just the kind for a ValueId.
@@ -1431,7 +1550,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
     use crate::model::OpKind;
     match kind {
         OpKind::Input { ty, .. } => format!("input_{}", value_type_to_kind(ty)),
-        OpKind::ConstInt(_) => "const_int".into(),
+        // RPython: ConstInt is NOT a standalone op; see encode_op comment.
+        // Pyre materialises constants as an int_copy from pool-region reg.
+        OpKind::ConstInt(_) => "int_copy".into(),
         // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f and `_pure`
         // variants from jtransform.py rewrite_op_getfield().
         OpKind::FieldRead { ty, pure, .. } => {
@@ -1486,6 +1607,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             "bitand" => "int_and".into(),
             "bitor" => "int_or".into(),
             "bitxor" => "int_xor".into(),
+            // RPython `jtransform.py:1243-1255` produces these opnames as-is —
+            // do not prefix with `int_`.
+            "ptr_eq" | "ptr_ne" => op.clone(),
             _ => format!("int_{op}"),
         },
         // RPython `blackhole.py:488-498`: bitwise NOT on i64 is `int_invert`.
@@ -2334,24 +2458,15 @@ mod tests {
         );
         graph.set_return(graph.startblock, Some(array_result));
 
-        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
-        type_state.concrete_types.insert(
-            base,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef,
-        );
-        type_state.concrete_types.insert(
-            index,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
-        );
-        type_state.concrete_types.insert(
-            value,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
-        );
-        type_state.concrete_types.insert(
-            array_result,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
-        );
-
+        // Drive the type pipeline end-to-end so every reachable value
+        // receives a concrete class.  `resolve_types` backfills any
+        // orphan ValueId (return/except block pseudo-args, link-only
+        // values) with `GcRef` so the assembler's
+        // `lookup_reg_with_kind` never hits the missing-coloring
+        // panic path for this hand-built graph.
+        let annotations = crate::translate_legacy::annotator::annrpython::annotate(&graph);
+        let type_state =
+            crate::translate_legacy::rtyper::rtyper::resolve_types(&graph, &annotations);
         let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
         let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
         let mut flat = flatten_graph(&graph, &regallocs);

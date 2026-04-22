@@ -707,16 +707,20 @@ fn build_function_graph(
     // (RPython `call.py:220-221`).
     for param in &func.sig.inputs {
         match param {
-            syn::FnArg::Receiver(_) => {
+            syn::FnArg::Receiver(recv) => {
                 if let Some(self_ty_root) = &self_ty_root {
                     ctx.local_type_roots
                         .insert("self".to_string(), self_ty_root.clone());
                 }
+                // `self`, `&self`, `&mut self` — all three correspond to
+                // an `lltype.Ptr(<Self>)` register in RPython, so the
+                // formal parameter always lands in the Ref class.
+                let self_ty = classify_fn_arg_ty(&recv.ty);
                 if let Some(vid) = graph.push_op(
                     entry,
                     OpKind::Input {
                         name: "self".to_string(),
-                        ty: ValueType::Unknown,
+                        ty: self_ty,
                     },
                     true,
                 ) {
@@ -746,11 +750,23 @@ fn build_function_graph(
                 ) {
                     ctx.local_dyn_trait_roots.insert(name.clone(), trait_root);
                 }
+                // RPython `rpython/jit/codewriter/support.py:getkind`
+                // mapping: classify the Rust parameter type to one of
+                // the three register classes so the annotator + rtyper
+                // receive a non-`Unknown` seed. Upstream's rtyper
+                // assigns a concretetype to every `Variable`, and
+                // `assembler.py:write_insn` relies on every operand
+                // having a coloring. Using `ValueType::Unknown` here
+                // used to cascade into `build_value_kinds` dropping
+                // the value, which produced the `(0, 'i')` fallback at
+                // `lookup_reg_with_kind` — the source of the pyre-only
+                // `getfield_gc_*/id>*` `_intbase` aliases.
+                let arg_ty = classify_fn_arg_ty(&pat_type.ty);
                 if let Some(vid) = graph.push_op(
                     entry,
                     OpKind::Input {
                         name: name.clone(),
-                        ty: ValueType::Unknown,
+                        ty: arg_ty,
                     },
                     true,
                 ) {
@@ -910,13 +926,9 @@ fn lower_stmt(
             }
         }
         syn::Stmt::Macro(_) => {
-            graph.push_op(
-                *block,
-                OpKind::Unknown {
-                    kind: UnknownKind::MacroStmt,
-                },
-                false,
-            );
+            // Macros (`debug_assert!`, `println!`, etc.) are compile-time
+            // artifacts with no RPython analog. Skip — they do not belong
+            // in the flow graph.
         }
         syn::Stmt::Item(_) => {}
     }
@@ -1231,11 +1243,38 @@ fn lower_expr(
         }
 
         // ── literals ──
+        // RPython `rpython/annotator/model.py` + `rtyper/rclass.py` resolve
+        // every literal to a concrete SSA value at annotation time.  pyre
+        // handles the common RPython-usable cases here; cases that RPython
+        // itself does not support (f64 literals, char/str/byte literals
+        // inside annotated code) still fall through to `OpKind::Unknown`
+        // and are tracked as rtyper follow-ups.
         syn::Expr::Lit(lit) => {
-            if let syn::Lit::Int(int_lit) = &lit.lit {
-                if let Ok(v) = int_lit.base10_parse::<i64>() {
-                    return graph.push_op(*block, OpKind::ConstInt(v), true);
+            match &lit.lit {
+                syn::Lit::Int(int_lit) => {
+                    if let Ok(v) = int_lit.base10_parse::<i64>() {
+                        return graph.push_op(*block, OpKind::ConstInt(v), true);
+                    }
                 }
+                // RPython lowers `True`/`False` to `Constant(1)`/`Constant(0)`
+                // of `lltype.Bool`; at the codewriter level `getkind(Bool)`
+                // returns `'int'` (`rpython/jit/codewriter/flatten.py getkind`)
+                // so the value lives in an int register exactly like a
+                // regular integer constant.  Emit as `ConstInt` to match.
+                syn::Lit::Bool(b) => {
+                    return graph.push_op(*block, OpKind::ConstInt(b.value as i64), true);
+                }
+                // RPython treats `chr(x)` / single-char byte literals as
+                // `lltype.Char` which is also kind `'int'` (single unsigned
+                // byte).  Rust `b'x'` (syn::Lit::Byte) and `'x'`
+                // (syn::Lit::Char as u32) map to the same shape.
+                syn::Lit::Byte(b) => {
+                    return graph.push_op(*block, OpKind::ConstInt(b.value() as i64), true);
+                }
+                syn::Lit::Char(c) => {
+                    return graph.push_op(*block, OpKind::ConstInt(c.value() as i64), true);
+                }
+                _ => {}
             }
             graph.push_op(
                 *block,
@@ -1772,6 +1811,75 @@ fn canonical_pat_name(pat: &syn::Pat) -> String {
 
 /// RPython: lltype graph identity — returns the full type path.
 /// For `Foo` → "Foo", for `a::Foo` → "a::Foo".
+/// Classify a Rust parameter/return `syn::Type` into one of the three
+/// RPython `lltype` register classes (`Int`/`Ref`/`Float`).  This is the
+/// pyre-side bridge for what RPython does implicitly: each `Variable`
+/// carries `concretetype`, and `getkind(concretetype)` picks the class
+/// (`rpython/jit/codewriter/support.py:getkind`).  pyre's front-end
+/// records only a `syn::Type` so we reproduce the mapping here.
+///
+/// Returned value is assigned to `OpKind::Input { ty }` so the annotator
+/// + rtyper reach every function parameter with a concrete class; the
+/// assembler's `lookup_reg_with_kind` then finds a coloring for every
+/// operand it encounters, matching upstream's invariant that every
+/// Variable reaching `assembler.py:write_insn` has a `concretetype`.
+pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
+    use crate::model::ValueType;
+    match ty {
+        syn::Type::Path(path) => {
+            let last = match path.path.segments.last() {
+                Some(s) => s,
+                None => return ValueType::Ref,
+            };
+            let name = last.ident.to_string();
+            // `Box<T>` / `Rc<T>` / `Arc<T>` — classify on the inner type
+            // so `Box<i64>` stays Int (RPython `lltype.Ptr(Signed)`
+            // collapses to the primitive), matching the downstream
+            // `ValueType::Ref` vs `Int` distinction the assembler keys
+            // off.
+            if matches!(name.as_str(), "Box" | "Rc" | "Arc") {
+                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                    for arg in &args.args {
+                        if let syn::GenericArgument::Type(inner) = arg {
+                            return classify_fn_arg_ty(inner);
+                        }
+                    }
+                }
+                return ValueType::Ref;
+            }
+            match name.as_str() {
+                // RPython `rlib/rarithmetic.py` + `lltype.Signed` family.
+                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+                | "bool" | "char" => ValueType::Int,
+                // `lltype.Float` — `f32` widens up to f64 at the SSA
+                // level but stays in the Float class either way.
+                "f32" | "f64" => ValueType::Float,
+                // Anything else is a user type / GC ref / opaque struct.
+                _ => ValueType::Ref,
+            }
+        }
+        // `&T` / `&mut T` — pointer → Ref (lltype.Ptr in RPython).
+        syn::Type::Reference(_) => ValueType::Ref,
+        // `*const T` / `*mut T` — raw pointer, same class as Ref.  pyre
+        // often stores GC objects as `*mut PyObject`; classify as Ref
+        // so field/array bases reach the canonical `/rd>X` encoding
+        // rather than the pyre-only `*_intbase` aliases.
+        syn::Type::Ptr(_) => ValueType::Ref,
+        syn::Type::Paren(paren) => classify_fn_arg_ty(&paren.elem),
+        syn::Type::Group(group) => classify_fn_arg_ty(&group.elem),
+        // `dyn Trait` — GC pointer to a trait object.
+        syn::Type::TraitObject(_) => ValueType::Ref,
+        // Tuple/array/slice: treat as Ref (bulk data, not a register
+        // primitive).  RPython `lltype.Array` + `lltype.Struct` both
+        // flatten to `lltype.Ptr` at the call-site boundary.
+        syn::Type::Tuple(_) | syn::Type::Array(_) | syn::Type::Slice(_) => ValueType::Ref,
+        // `fn(T) -> T`, `impl Trait`, never — no runtime
+        // representation reaches the SSA level; default to Ref for
+        // safe-by-default classification.
+        _ => ValueType::Ref,
+    }
+}
+
 /// RPython's lltype.Struct objects have globally unique identities;
 /// returning all path segments ensures `a::Foo` and `b::Foo` don't alias.
 fn type_root_ident(ty: &syn::Type) -> Option<String> {

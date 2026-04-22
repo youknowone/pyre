@@ -480,6 +480,96 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Keep
             }
+            // pyre front-end uses Rust's syn::BinOp / syn::UnOp identifiers
+            // (`add_assign`, `deref`) which have no RPython counterpart —
+            // RPython's flow-space never sees Python-level `+=` or `*x` as
+            // distinct ops (Python bytecode expands `+=` to BINARY_ADD
+            // followed by STORE_FAST, and `*x` disappears at rtyper). After
+            // pyre's rtyper the SSA graph has already materialized the read
+            // + write as separate values, so the in-place / dereference
+            // semantics no longer carry information — the op degenerates to
+            // a plain `add` / identity. Canonicalize here so downstream
+            // layers (assembler, blackhole) see only the RPython opnames.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if binop_name == "add_assign" => RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result,
+                kind: OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: *lhs,
+                    rhs: *rhs,
+                    result_ty: result_ty.clone(),
+                },
+            }]),
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "bitand" | "bitor" | "bitxor") => {
+                let canonical = match binop_name.as_str() {
+                    "bitand" => "and",
+                    "bitor" => "or",
+                    "bitxor" => "xor",
+                    _ => unreachable!("matched bit op names above"),
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::BinOp {
+                        op: canonical.into(),
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        result_ty: result_ty.clone(),
+                    },
+                }])
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                result_ty,
+            } if unop_name == "deref" => RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result,
+                kind: OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: *operand,
+                    result_ty: result_ty.clone(),
+                },
+            }]),
+            // RPython `jtransform.py:1243-1255` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
+            // + `_rewrite_cmp_ptrs`: equality/inequality of two Ref operands is
+            // `ptr_eq`/`ptr_ne` (wired at `blackhole.py:585-590`), not `int_eq`/
+            // `int_ne`. Pyre's front-end emits a unified `BinOp { op: "eq"/"ne" }`
+            // because Rust's `==`/`!=` is one AST node regardless of operand type;
+            // the jtransform layer is where RPython branches on operand kind.
+            // Both operands Ref → rewrite to `ptr_eq`/`ptr_ne`. Mixed/Int operands
+            // stay as `int_eq`/`int_ne`.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if (binop_name == "eq" || binop_name == "ne")
+                && self.get_value_kind(*lhs) == 'r'
+                && self.get_value_kind(*rhs) == 'r' =>
+            {
+                let new_op = if binop_name == "eq" {
+                    "ptr_eq"
+                } else {
+                    "ptr_ne"
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::BinOp {
+                        op: new_op.into(),
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        result_ty: result_ty.clone(),
+                    },
+                }])
+            }
             _ => RewriteResult::Keep,
         }
     }
@@ -2558,6 +2648,32 @@ fn classify_call(
 mod tests {
     use super::*;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, ValueType};
+
+    #[test]
+    fn rewrite_graph_canonicalizes_frontend_bitops() {
+        let mut graph = FunctionGraph::new("bitops");
+        let lhs = graph.alloc_value();
+        let rhs = graph.alloc_value();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "bitxor".to_string(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        match &transformed.graph.block(graph.startblock).operations[0].kind {
+            OpKind::BinOp { op, .. } => assert_eq!(op, "xor"),
+            other => panic!("expected canonical BinOp, got {other:?}"),
+        }
+    }
 
     #[test]
     fn rewrite_graph_tags_vable_fields() {

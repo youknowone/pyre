@@ -330,6 +330,19 @@ impl RegAllocator {
                 let target_block = graph.block(link.target);
                 for (v, &w) in link.args.iter().zip(target_block.inputargs.iter()) {
                     if let Some(v) = v.as_value() {
+                        // RPython `regalloc.py` adds every link arg to the
+                        // dependency graph before attempting coalesce so
+                        // `find_node_coloring` visits it.  pyre's
+                        // `process_block` only enumerates block inputargs
+                        // and op results; a value that is referenced only
+                        // as a link arg (no local producer in the source
+                        // block) would otherwise be silently absent from
+                        // `neighbours`, and `getcolor` returns `None`,
+                        // which then propagates into the assembler as a
+                        // missing coloring panic.
+                        if consider(v) {
+                            self.depgraph.add_node(v);
+                        }
                         self.try_coalesce(v, w, consider);
                     }
                 }

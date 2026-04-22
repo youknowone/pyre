@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::annotator::model::KnownType;
 use crate::flowspace::model::{ConcretetypePlaceholder, ConstValue, GraphKey, GraphRef, Hlvalue};
+use crate::translator::rtyper::error::TyperError;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DelayedPointer;
@@ -2265,35 +2266,29 @@ impl PtrTarget {
     }
 }
 
-pub fn _getconcretetype(v: &Hlvalue) -> ConcretetypePlaceholder {
-    // PRE-EXISTING-ADAPTATION: upstream
-    // `rtyper.py:570-571 getcallable.getconcretetype` returns
-    // `self.bindingrepr(v).lowleveltype` and raises `AttributeError`
-    // when `v.concretetype` is unset. Pyre currently runs
-    // `getfunctionptr` before the rtyper has always populated
-    // concretetype (e.g. `generated::all_jitcodes()` caches a
-    // monomorphization-neutral registry), so the fallback picks
-    // `LowLevelType::Void` — structurally equivalent to upstream's
-    // "no concrete type assigned yet" state.
-    match v {
-        Hlvalue::Variable(v) => v
-            .concretetype
-            .clone()
-            .expect("_getconcretetype() requires an rtyped Variable.concretetype"),
-        Hlvalue::Constant(c) => c
-            .concretetype
-            .clone()
-            .expect("_getconcretetype() requires an rtyped Constant.concretetype"),
-    }
+pub fn _getconcretetype(v: &Hlvalue) -> Result<ConcretetypePlaceholder, TyperError> {
+    // RPython `rtyper.py:570-571 getcallable.getconcretetype` does not
+    // invent a fallback type: the callable path obtains
+    // `self.bindingrepr(v).lowleveltype`. This helper mirrors the raw
+    // `v.concretetype` lookup used by lltype-level tests and fails when
+    // the rtyper has not assigned a concrete type yet.
+    let concretetype = match v {
+        Hlvalue::Variable(v) => v.concretetype.clone(),
+        Hlvalue::Constant(c) => c.concretetype.clone(),
+    };
+    concretetype.ok_or_else(|| TyperError::message("missing concretetype for getfunctionptr"))
 }
 
-pub fn getfunctionptr(
-    graph: &GraphRef,
-    getconcretetype: fn(&Hlvalue) -> ConcretetypePlaceholder,
-) -> _ptr {
+pub fn getfunctionptr<F>(graph: &GraphRef, getconcretetype: F) -> Result<_ptr, TyperError>
+where
+    F: Fn(&Hlvalue) -> Result<ConcretetypePlaceholder, TyperError>,
+{
     let graph_b = graph.borrow();
-    let llinputs = graph_b.getargs().iter().map(getconcretetype).collect();
-    let lloutput = getconcretetype(&graph_b.getreturnvar());
+    let mut llinputs = Vec::new();
+    for arg in graph_b.getargs() {
+        llinputs.push(getconcretetype(&arg)?);
+    }
+    let lloutput = getconcretetype(&graph_b.getreturnvar())?;
     let ft = FuncType {
         args: llinputs,
         result: lloutput,
@@ -2301,7 +2296,12 @@ pub fn getfunctionptr(
     let name = graph_b.name.clone();
     let callable = graph_b.func.as_ref().map(|func| func.name.clone());
     drop(graph_b);
-    functionptr(ft, &name, Some(GraphKey::of(graph).as_usize()), callable)
+    Ok(functionptr(
+        ft,
+        &name,
+        Some(GraphKey::of(graph).as_usize()),
+        callable,
+    ))
 }
 
 /// RPython `class SomePtr(SomeObject)` (lltype.py:1520-1528).
@@ -2352,7 +2352,7 @@ mod tests {
             start,
             Hlvalue::Variable(ret),
         )));
-        let ptr = getfunctionptr(&graph, _getconcretetype);
+        let ptr = getfunctionptr(&graph, _getconcretetype).unwrap();
         let funcobj = ptr._obj().unwrap();
         let _ptr_obj::Func(funcobj) = funcobj else {
             panic!("functionptr must expose a function object");
@@ -2366,10 +2366,10 @@ mod tests {
 
         static CALLS: AtomicUsize = AtomicUsize::new(0);
 
-        fn counting_getconcretetype(v: &Hlvalue) -> ConcretetypePlaceholder {
+        fn counting_getconcretetype(v: &Hlvalue) -> Result<ConcretetypePlaceholder, TyperError> {
             let _ = v;
             CALLS.fetch_add(1, Ordering::Relaxed);
-            LowLevelType::Void
+            Ok(LowLevelType::Void)
         }
 
         let mut a0 = Variable::new();
@@ -2389,9 +2389,18 @@ mod tests {
         )));
         CALLS.store(0, Ordering::Relaxed);
 
-        let _ = getfunctionptr(&graph, counting_getconcretetype);
+        let _ = getfunctionptr(&graph, counting_getconcretetype).unwrap();
 
         assert_eq!(CALLS.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn getfunctionptr_rejects_missing_concretetype_instead_of_void_fallback() {
+        let arg = Hlvalue::Variable(crate::flowspace::model::Variable::new());
+        let start = Rc::new(RefCell::new(Block::new(vec![arg])));
+        let graph = Rc::new(RefCell::new(FunctionGraph::new("f", start)));
+
+        assert!(getfunctionptr(&graph, _getconcretetype).is_err());
     }
 
     #[test]

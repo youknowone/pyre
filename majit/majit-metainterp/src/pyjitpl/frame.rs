@@ -102,20 +102,29 @@ pub struct MIFrame {
     /// the parent chain walk by patching with `snapshot_add_prev(
     /// target.parent_snapshot)` instead of re-emitting the snapshot.
     pub parent_snapshot: i64,
+    /// pyjitpl.py:95 `self.unroll_iterations = 1`.
+    pub unroll_iterations: usize,
 }
 
 impl MIFrame {
     pub fn new(jitcode: Arc<JitCode>, pc: usize) -> Self {
+        // RPython `pyjitpl.py:81-90` `MIFrame.setup` creates the typed
+        // register arrays sized to `num_regs_and_consts_*()`.  pyre
+        // keeps the raw allocation step separate so low-level tests and
+        // resume paths can construct a frame without immediately
+        // interning constants into a `TraceCtx`.
+        //
+        // `MetaInterp::newframe`, `trace_jitcode_with_framestack`,
+        // `trace_jitcode`, and inline-call dispatch should call
+        // `MIFrame::setup(...)` below, which mirrors the rest of
+        // `pyjitpl.py:74-95`.
+        //
         // RPython `pyjitpl.py:2247-2253` `MIFrame.setup`:
         //   self.registers_i = [None] * jitcode.num_regs_and_consts_i()
         //   self.registers_r = [None] * jitcode.num_regs_and_consts_r()
         //   self.registers_f = [None] * jitcode.num_regs_and_consts_f()
-        // The register file spans working registers AND the constants
-        // area (`[num_regs_X .. num_regs_and_consts_X)`). `MIFrame.setup`
-        // then fills the constants slots with `Const{Int,Ptr,Float}`
-        // boxes. pyre currently leaves those slots as `None`; callers
-        // that need the constants materialised into the frame (tracer
-        // path) install them via a follow-up populate step.
+        // The register file spans working registers AND the constants area
+        // (`[num_regs_X .. num_regs_and_consts_X)`).
         let regs_and_consts_i = jitcode.num_regs_and_consts_i();
         let regs_and_consts_r = jitcode.num_regs_and_consts_r();
         let regs_and_consts_f = jitcode.num_regs_and_consts_f();
@@ -137,7 +146,32 @@ impl MIFrame {
             _result_argcode: b'v',
             pushed_box: None,
             parent_snapshot: -1,
+            unroll_iterations: 1,
         }
+    }
+
+    /// RPython `pyjitpl.py:74-95` `MIFrame.setup(jitcode, greenkey=None)`.
+    ///
+    /// This is the entry-point that should back normal frame creation:
+    /// allocate the typed register files, remember the recursive-portal
+    /// greenkey, copy constants into the register window, and reset the
+    /// per-frame bookkeeping fields that upstream initializes in
+    /// `setup()`.
+    pub fn setup(
+        jitcode: Arc<JitCode>,
+        pc: usize,
+        greenkey: Option<u64>,
+        ctx: Option<&mut crate::trace_ctx::TraceCtx>,
+    ) -> Self {
+        let mut frame = Self::new(jitcode, pc);
+        frame.greenkey = greenkey;
+        if let Some(ctx) = ctx {
+            frame.copy_constants(ctx);
+        }
+        frame._result_argcode = b'v';
+        frame.parent_snapshot = -1;
+        frame.unroll_iterations = 1;
+        frame
     }
 
     pub fn next_u8(&mut self) -> u8 {
@@ -1050,5 +1084,34 @@ mod tests {
         assert!(frame.int_regs.iter().all(|r| r.is_none()));
         assert!(frame.ref_regs.iter().all(|r| r.is_none()));
         assert!(frame.float_regs.iter().all(|r| r.is_none()));
+    }
+
+    #[test]
+    fn setup_populates_constants_and_greenkey_inline() {
+        let mut jitcode = make_jitcode_with_regs(1, 1, 1);
+        {
+            let jc = Arc::get_mut(&mut jitcode).expect("fresh Arc");
+            jc.constants_i = vec![123];
+            jc.constants_r = vec![0x1234];
+            jc.constants_f = vec![1.5f64.to_bits() as i64];
+        }
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut recorder = crate::recorder::Trace::new();
+        let _ = recorder.record_input_arg(Type::Int);
+        let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, 0, sd);
+
+        let frame = MIFrame::setup(jitcode, 7, Some(0xfeed), Some(&mut ctx));
+
+        assert_eq!(frame.pc, 7);
+        assert_eq!(frame.greenkey, Some(0xfeed));
+        assert_eq!(frame._result_argcode, b'v');
+        assert_eq!(frame.parent_snapshot, -1);
+        assert_eq!(frame.unroll_iterations, 1);
+        assert_eq!(frame.int_values[1], Some(123));
+        assert_eq!(frame.ref_values[1], Some(0x1234));
+        assert_eq!(frame.float_values[1], Some(1.5f64.to_bits() as i64));
+        assert!(frame.int_regs[1].is_some());
+        assert!(frame.ref_regs[1].is_some());
+        assert!(frame.float_regs[1].is_some());
     }
 }

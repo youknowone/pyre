@@ -607,6 +607,26 @@ pub struct MetaInterp<M: Clone> {
     /// the entries to identify which portal call a fail-arg belongs to.
     pub call_ids: Vec<u64>,
 
+    /// pyjitpl.py:2391 `self.portal_trace_positions = []`.
+    ///
+    /// Start/end markers for each recursive-main-jitcode portal frame
+    /// active during the current trace.  `newframe` appends
+    /// `(jd_no, Some(greenkey), trace_position)` when the entering
+    /// jitcode passes `is_main_jitcode` (pyjitpl.py:2443-2445) and
+    /// `popframe` appends `(jd_no, None, trace_position)` on the
+    /// symmetric exit (pyjitpl.py:2470-2472).  `find_biggest_function`
+    /// (pyjitpl.py:3514-3551) walks the list as a stack to compute the
+    /// longest-traced inlined function for abort reporting; the reset
+    /// to `None` at pyjitpl.py:2795 signals that the trace aborted.
+    ///
+    /// pyre's existing `find_biggest_function` (trace_ctx.rs:625) uses
+    /// `TraceCtx::inline_trace_positions` — a narrower subset that only
+    /// tracks active inlined callees.  Keeping this field here mirrors
+    /// RPython's shape so a future port of `find_biggest_function` can
+    /// line-by-line read the start/end stack; callers that merely want
+    /// the active-frame list should keep using `inline_trace_positions`.
+    pub portal_trace_positions: Option<Vec<(usize, Option<u64>, crate::recorder::TracePosition)>>,
+
     /// pyjitpl.py:2401 `self.current_call_id = 0`.
     ///
     /// Monotonically increasing counter that uniquely identifies each
@@ -1110,6 +1130,7 @@ impl<M: Clone> MetaInterp<M> {
             portal_call_depth: 0,
             call_ids: Vec::new(),
             current_call_id: 0,
+            portal_trace_positions: Some(Vec::new()),
             last_exc_value: 0,
             aborted_tracing_jitdriver: None,
             aborted_tracing_greenkey: None,
@@ -2389,6 +2410,10 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2793: find_biggest_function — if an inlined function
         // caused the bloat, disable just that function.
         let huge_fn_key = ctx.find_biggest_function();
+        // pyjitpl.py:2795: `self.portal_trace_positions = None` marks the
+        // abort boundary so post-abort consumers (e.g. test inspections
+        // at pyjitpl.py:3547) can detect a terminated trace session.
+        self.portal_trace_positions = None;
         // pyjitpl.py:2801 `if self.current_merge_points:` — outermost
         // loop's greenkey, used only when one exists (never for bridges).
         let outermost_merge_key = ctx.current_merge_points_first_greenkey();
@@ -8844,16 +8869,16 @@ impl<M: Clone> MetaInterp<M> {
         R: crate::pyjitpl::JitCodeRuntime,
     {
         // pyjitpl.py:2451: self.framestack.append(f) — push the root.
-        let mut root_frame = crate::pyjitpl::MIFrame::new(jitcode, pc);
-        {
-            // pyjitpl.py:86-90 `MIFrame.setup` calls `copy_constants`
-            // on each typed register array right after sizing.
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("trace_jitcode_with_framestack requires an active trace");
-            root_frame.copy_constants(ctx);
-        }
+        let root_frame = crate::pyjitpl::MIFrame::setup(
+            jitcode,
+            pc,
+            None,
+            Some(
+                self.tracing
+                    .as_mut()
+                    .expect("trace_jitcode_with_framestack requires an active trace"),
+            ),
+        );
         self.framestack.push(root_frame);
         let action = {
             // Split the &mut borrow so the trace context and framestack
@@ -8938,16 +8963,28 @@ impl<M: Clone> MetaInterp<M> {
         greenkey: Option<u64>,
     ) -> usize {
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
-        if jitcode.jitdriver_sd.is_some() {
+        if let Some(jd_no) = jitcode.jitdriver_sd {
             self.portal_call_depth += 1;
             // pyjitpl.py:2435: self.call_ids.append(self.current_call_id)
             self.call_ids.push(self.current_call_id);
-            // pyjitpl.py:2440-2441: enter_portal_frame on greenkey
+            // pyjitpl.py:2440-2441: enter_portal_frame(jitdriver_sd.index, unique_id)
             if let Some(unique_id) = greenkey {
-                self.enter_portal_frame(0, unique_id);
+                self.enter_portal_frame(jd_no, unique_id);
             }
             // pyjitpl.py:2442: self.current_call_id += 1
             self.current_call_id += 1;
+        }
+        // pyjitpl.py:2443-2445: `if greenkey is not None and
+        // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
+        //     (jitcode.jitdriver_sd, greenkey, self.history.get_trace_position()))`.
+        if let (Some(gk), Some(jd_no)) = (greenkey, jitcode.jitdriver_sd) {
+            if self.is_main_jitcode(&jitcode) {
+                if let (Some(positions), Some(ctx)) =
+                    (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
+                {
+                    positions.push((jd_no, Some(gk), ctx.get_trace_position()));
+                }
+            }
         }
         // Bump the existing TraceCtx inline-depth counter so trace
         // recorder bookkeeping (already wired through pyre's tracer)
@@ -8960,16 +8997,7 @@ impl<M: Clone> MetaInterp<M> {
         let raw = (greenkey.unwrap_or_default() as usize, 0);
         let _ = self.enter_inline_frame(raw);
         // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
-        let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
-        frame.greenkey = greenkey;
-        // pyjitpl.py:2450 `f.setup(jitcode, greenkey)` — `setup` calls
-        // `copy_constants` inline (pyjitpl.py:86-90) so the constants
-        // window is populated before the frame enters dispatch. Skip
-        // when there is no active trace (blackhole runs off its own
-        // register file and does not read MIFrame const slots).
-        if let Some(ctx) = self.tracing.as_mut() {
-            frame.copy_constants(ctx);
-        }
+        let frame = crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut());
         self.framestack.push(frame);
         self.framestack.len() - 1
     }
@@ -9021,13 +9049,25 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2463: frame = self.framestack.pop()
         if let Some(mut frame) = self.framestack.pop() {
             // pyjitpl.py:2465-2469: jitdriver_sd → portal_call_depth/leave_portal_frame/call_ids.
-            if frame.jitcode.jitdriver_sd.is_some() {
+            if let Some(jd_no) = frame.jitcode.jitdriver_sd {
                 self.portal_call_depth -= 1;
                 if leave_portal_frame {
-                    self.leave_portal_frame(0);
+                    self.leave_portal_frame(jd_no);
                 }
                 // pyjitpl.py:2469: self.call_ids.pop()
                 let _ = self.call_ids.pop();
+            }
+            // pyjitpl.py:2470-2472: `if frame.greenkey is not None and
+            // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
+            //     (jitcode.jitdriver_sd, None, self.history.get_trace_position()))`.
+            if let (Some(_gk), Some(jd_no)) = (frame.greenkey, frame.jitcode.jitdriver_sd) {
+                if self.is_main_jitcode(&frame.jitcode) {
+                    if let (Some(positions), Some(ctx)) =
+                        (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
+                    {
+                        positions.push((jd_no, None, ctx.get_trace_position()));
+                    }
+                }
             }
             // pyjitpl.py:2476: frame.cleanup_registers().
             frame.cleanup_registers();
@@ -13368,6 +13408,142 @@ mod metainterp_static_data_tests {
         assert_eq!(op.args.len(), 1);
         let jd_no = ctx.constants_get_value(op.args[0]).expect("jd_no constant");
         assert_eq!(jd_no, majit_ir::Value::Int(7));
+    }
+
+    #[test]
+    fn newframe_and_popframe_use_jitdriver_sd_index_for_portal_ops() {
+        // pyjitpl.py:2440-2441 / 2467:
+        // enter/leave portal ops receive jitcode.jitdriver_sd.index, not
+        // a hard-coded portal slot.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let mut jc = JitCodeBuilder::new().finish();
+        jc.jitdriver_sd = Some(5);
+        let jc = std::sync::Arc::new(jc);
+
+        meta.newframe(jc, Some(0xfeed));
+        meta.popframe(true);
+
+        let ctx = meta.trace_ctx().expect("tracing must be active");
+        let enter = ctx
+            .recorder
+            .ops()
+            .iter()
+            .find(|op| op.opcode == OpCode::EnterPortalFrame)
+            .expect("EnterPortalFrame must be recorded");
+        let leave = ctx
+            .recorder
+            .ops()
+            .iter()
+            .find(|op| op.opcode == OpCode::LeavePortalFrame)
+            .expect("LeavePortalFrame must be recorded");
+
+        assert_eq!(
+            ctx.constants_get_value(enter.args[0]),
+            Some(majit_ir::Value::Int(5))
+        );
+        assert_eq!(
+            ctx.constants_get_value(enter.args[1]),
+            Some(majit_ir::Value::Int(0xfeed))
+        );
+        assert_eq!(
+            ctx.constants_get_value(leave.args[0]),
+            Some(majit_ir::Value::Int(5))
+        );
+    }
+
+    #[test]
+    fn portal_trace_positions_records_enter_and_exit_for_main_jitcode() {
+        // pyjitpl.py:2443-2445 / 2470-2472 — newframe appends
+        // (jd_no, Some(greenkey), trace_position); popframe appends
+        // (jd_no, None, trace_position) on the matching exit.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd.is_recursive = true;
+        let idx = {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            std::sync::Arc::get_mut(staticdata)
+                .unwrap()
+                .register_jitdriver_sd(jd, backend)
+        };
+
+        let mut jc = JitCodeBuilder::new().finish();
+        jc.jitdriver_sd = Some(idx);
+        let jc = std::sync::Arc::new(jc);
+
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        meta.perform_call(jc, &[], Some(0xcafe)).unwrap_err();
+        assert_eq!(
+            meta.portal_trace_positions
+                .as_ref()
+                .expect("portal_trace_positions must be Some")
+                .len(),
+            1
+        );
+        let entry = &meta.portal_trace_positions.as_ref().unwrap()[0];
+        assert_eq!(entry.0, idx);
+        assert_eq!(entry.1, Some(0xcafe));
+
+        meta.popframe(true);
+        let positions = meta
+            .portal_trace_positions
+            .as_ref()
+            .expect("portal_trace_positions must still be Some");
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[1].0, idx);
+        assert_eq!(positions[1].1, None);
+    }
+
+    #[test]
+    fn portal_trace_positions_skips_non_recursive_jitdriver() {
+        // is_main_jitcode requires jd.is_recursive — non-recursive portals
+        // must not append to portal_trace_positions.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd.is_recursive = false;
+        let idx = {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            std::sync::Arc::get_mut(staticdata)
+                .unwrap()
+                .register_jitdriver_sd(jd, backend)
+        };
+
+        let mut jc = JitCodeBuilder::new().finish();
+        jc.jitdriver_sd = Some(idx);
+        let jc = std::sync::Arc::new(jc);
+
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        meta.perform_call(jc, &[], Some(0xbabe)).unwrap_err();
+        assert!(
+            meta.portal_trace_positions
+                .as_ref()
+                .expect("Some")
+                .is_empty(),
+            "non-recursive jitdriver must not record"
+        );
     }
 
     #[test]

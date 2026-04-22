@@ -3780,7 +3780,7 @@ mod tests {
             start,
             Hlvalue::Variable(ret),
         )));
-        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype);
+        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype).unwrap();
         let s_arg = SomeValue::Ptr(SomePtr::new(lltype::typeOf(&ptr)));
         let args = super::super::argument::ArgumentsForTranslation::new(vec![s_arg], None, None);
 

@@ -2403,6 +2403,10 @@ mod tests {
         v
     }
 
+    fn test_functionptr_void(graph: &GraphRef) -> lltype::_ptr {
+        lltype::getfunctionptr(graph, |_| Ok(lltype::LowLevelType::Void)).unwrap()
+    }
+
     #[test]
     fn get_graph_for_call_reads_llptr_funcobj_graph() {
         let start = Block::shared(vec![]);
@@ -2417,7 +2421,7 @@ mod tests {
         translator.graphs.borrow_mut().push(graph.clone());
 
         let arg = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(
-            lltype::getfunctionptr(&graph, lltype::_getconcretetype),
+            test_functionptr_void(&graph),
         ))));
 
         let got = get_graph_for_call(&arg, &translator).expect("expected graph");
@@ -2996,10 +3000,7 @@ mod tests {
         caller_start.borrow_mut().operations.push(SO::new(
             "direct_call",
             vec![
-                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
-                    &callee,
-                    lltype::_getconcretetype,
-                ))))),
+                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(test_functionptr_void(&callee))))),
                 Hlvalue::Variable(caller_arg.clone()),
             ],
             Hlvalue::Variable(call_res.clone()),
@@ -3055,9 +3056,8 @@ mod tests {
             rec_start.clone(),
             Hlvalue::Variable(signed_var()),
         )));
-        let rec_ptr = Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
+        let rec_ptr = Hlvalue::Constant(C::new(CV::LLPtr(Box::new(test_functionptr_void(
             &rec_graph,
-            lltype::_getconcretetype,
         )))));
         rec_start.borrow_mut().operations.push(SO::new(
             "direct_call",
@@ -3213,10 +3213,7 @@ mod tests {
         caller_start.borrow_mut().operations.push(SO::new(
             "direct_call",
             vec![
-                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
-                    &wrapper,
-                    lltype::_getconcretetype,
-                ))))),
+                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(test_functionptr_void(&wrapper))))),
                 Hlvalue::Variable(caller_arg.clone()),
                 Hlvalue::Variable(caller_runtime_funcptr),
             ],
@@ -3317,10 +3314,7 @@ mod tests {
         caller_start.borrow_mut().operations.push(SO::new(
             "direct_call",
             vec![
-                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
-                    &wrapper,
-                    lltype::_getconcretetype,
-                ))))),
+                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(test_functionptr_void(&wrapper))))),
                 Hlvalue::Variable(caller_arg.clone()),
                 Hlvalue::Variable(caller_runtime_funcptr),
             ],

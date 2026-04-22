@@ -1105,10 +1105,7 @@ where
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
                     })
                     .clone();
-                let mut sub_frame = MIFrame::new(sub_jitcode, pc);
-                // pyjitpl.py:86-90 `MIFrame.setup` calls `copy_constants`
-                // on each typed register array after sizing.
-                sub_frame.copy_constants(ctx);
+                let mut sub_frame = MIFrame::setup(sub_jitcode, pc, None, Some(ctx));
                 // dispatch.rs sub-jitcode inline frame (RPython pyjitpl
                 // perform_call for non-portal jitcodes). The structured
                 // greenkey has no pc-component meaning here — use
@@ -1900,11 +1897,7 @@ where
     let runtime = ClosureRuntime::new(label_at);
     let jitcode_arc = Arc::new(jitcode.clone());
     let mut standalone = StandaloneFrameStack::new();
-    let mut frame = MIFrame::new(jitcode_arc, pc);
-    // pyjitpl.py:86-90 `MIFrame.setup` calls `copy_constants` on each
-    // typed register array; bytecode operands indexed into
-    // `[num_regs_X .. num_regs_and_consts_X)` read these Const boxes.
-    frame.copy_constants(ctx);
+    let frame = MIFrame::setup(jitcode_arc, pc, None, Some(ctx));
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.run_to_end(ctx, sym, &runtime)

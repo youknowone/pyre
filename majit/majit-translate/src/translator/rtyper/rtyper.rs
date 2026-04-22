@@ -30,9 +30,7 @@ use crate::flowspace::model::{
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::{
-    _getconcretetype, _ptr, LowLevelType, getfunctionptr,
-};
+use crate::translator::rtyper::lltypesystem::lltype::{_ptr, LowLevelType, getfunctionptr};
 use crate::translator::rtyper::rmodel::{
     Repr, ReprKey, inputconst_from_lltype, rtyper_makekey, rtyper_makerepr,
 };
@@ -95,9 +93,10 @@ impl RPythonTyper {
     }
 
     /// RPython `RPythonTyper.getcallable(self, graph)` (rtyper.py:569-581).
-    pub fn getcallable(&self, graph: &Rc<PyGraph>) -> _ptr {
-        let _ = self;
-        getfunctionptr(&graph.graph, _getconcretetype)
+    pub fn getcallable(&self, graph: &Rc<PyGraph>) -> Result<_ptr, TyperError> {
+        getfunctionptr(&graph.graph, |v| {
+            self.bindingrepr(v).map(|r| r.lowleveltype().clone())
+        })
     }
 
     /// RPython `RPythonTyper.annotation(self, var)` (rtyper.py:166-168).
@@ -723,16 +722,18 @@ mod tests {
             for arg in graph_borrow.startblock.borrow_mut().inputargs.iter_mut() {
                 if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
                     v.concretetype = Some(LowLevelType::Signed);
+                    v.annotation = Some(Rc::new(SomeValue::Impossible));
                 }
             }
             for arg in graph_borrow.returnblock.borrow_mut().inputargs.iter_mut() {
                 if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
                     v.concretetype = Some(LowLevelType::Void);
+                    v.annotation = Some(Rc::new(SomeValue::Impossible));
                 }
             }
         }
 
-        let llfn = rtyper.getcallable(&graph);
+        let llfn = rtyper.getcallable(&graph).unwrap();
         use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, PtrTarget};
         let PtrTarget::Func(func_t) = &llfn._TYPE.TO else {
             panic!("expected Func ptr, got {:?}", llfn._TYPE.TO);

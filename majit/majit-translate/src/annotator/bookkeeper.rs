@@ -2443,7 +2443,7 @@ mod tests {
             start,
             Hlvalue::Variable(ret),
         )));
-        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype);
+        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype).unwrap();
         let expected_type = lltype::typeOf(&ptr);
 
         let s = bk

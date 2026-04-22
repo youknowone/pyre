@@ -42,6 +42,35 @@ impl AnnotationState {
 pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     let mut state = AnnotationState::new();
 
+    // Seed the terminal pseudo-block inputargs. RPython `flowspace/
+    // model.py:17-18` `returnblock = Block([return_var])` and
+    // `exceptblock = Block([etype, evalue])` carry implicit types that
+    // later Link propagation confirms but never introduces for Links
+    // that never reach the block.  Raising-only or void functions can
+    // leave these args untyped, which later drops them from
+    // `build_value_kinds` and trips the assembler's
+    // `lookup_reg_with_kind` panic.  `rpython/jit/codewriter/flatten.py:
+    // 169-172` assumes `etype: Int, evalue: Ref` and `return_var:
+    // <result_type>` unconditionally; pyre mirrors that by seeding the
+    // annotator state up front.
+    let exceptblock = graph.block(graph.exceptblock);
+    if let Some(&etype) = exceptblock.inputargs.first() {
+        state.set(etype, ValueType::Int);
+    }
+    if let Some(&evalue) = exceptblock.inputargs.get(1) {
+        state.set(evalue, ValueType::Ref);
+    }
+    // `returnblock.inputargs[0]` — the function's return value.  The
+    // declared return type isn't carried on `FunctionGraph` (pyre
+    // threads it through `CallControl.declared_return_kind` later), so
+    // seed a conservative `Ref` default.  Link propagation from the
+    // emit sites (`set_return`) overrides this when the actual
+    // return op produces an `Int` / `Float` value.
+    let returnblock = graph.block(graph.returnblock);
+    if let Some(&ret) = returnblock.inputargs.first() {
+        state.set(ret, ValueType::Ref);
+    }
+
     // Process all blocks (simple single-pass for acyclic; loops need fixpoint)
     let mut changed = true;
     let mut iterations = 0;
@@ -186,6 +215,21 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         OpKind::VableFieldWrite { .. } => ValueType::Void,
         OpKind::VableArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::VableArrayWrite { .. } => ValueType::Void,
+        OpKind::UnaryOp {
+            op,
+            operand,
+            result_ty,
+        } if op == "same_as" => {
+            if result_ty != &ValueType::Unknown {
+                result_ty.clone()
+            } else {
+                state
+                    .types
+                    .get(operand)
+                    .cloned()
+                    .unwrap_or(ValueType::Unknown)
+            }
+        }
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()

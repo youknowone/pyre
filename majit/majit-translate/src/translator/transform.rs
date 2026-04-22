@@ -1431,7 +1431,7 @@ mod tests {
             start,
             Hlvalue::Variable(ret),
         )));
-        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype);
+        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype).unwrap();
 
         let list_v = Variable::new();
         let mut needle = Variable::new();
