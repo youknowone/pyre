@@ -1,0 +1,753 @@
+//! RPython `rpython/rtyper/rmodel.py` — Repr base class + setup
+//! state machine + inputconst / mangle helpers + VoidRepr /
+//! SimplePointerRepr leaves.
+//!
+//! ## Scope of this scaffold
+//!
+//! Upstream rmodel.py is 474 LOC. This port lands the subset that
+//! `rpbc.py FunctionReprBase` / `rclass.py ClassRepr` directly consume:
+//!
+//! | upstream | Rust mirror |
+//! |---|---|
+//! | `setupstate` (`rmodel.py:10-15`) | [`Setupstate`] enum |
+//! | `class Repr(object)` (`rmodel.py:17-246`) | [`Repr`] trait + [`ReprState`] state helper |
+//! | `class VoidRepr(Repr)` + `impossible_repr` (`rmodel.py:353-359`) | [`VoidRepr`] + [`impossible_repr`] |
+//! | `class SimplePointerRepr(Repr)` (`rmodel.py:365-375`) | [`SimplePointerRepr`] |
+//! | `def inputconst(reqtype, value)` (`rmodel.py:379-395`) | [`inputconst`] |
+//! | `def mangle(prefix, name)` (`rmodel.py:402-408`) | [`mangle`] |
+//! | `class BrokenReprTyperError(TyperError)` (`rmodel.py:397-400`) | already ported in [`error::TyperError::BrokenRepr`][crate::translator::rtyper::error::TyperError::BrokenRepr] |
+//!
+//! ## Deferred to follow-up commits
+//!
+//! * `rtype_*` methods that take a `HighLevelOp` (e.g. `rtype_getattr`,
+//!   `rtype_str`, `rtype_bool`, `rtype_simple_call`, ...) — these land
+//!   when `HighLevelOp` is ported in the Commit 3.2 step
+//!   (`rpython/rtyper/rtyper.py:617+`).
+//! * `Repr.__getattr__` autosetup side effect (`rmodel.py:95-106`) —
+//!   Rust has no `__getattr__`. Callers that previously relied on it
+//!   must invoke [`Repr::setup`] explicitly before reading derived
+//!   fields; this matches upstream's own `setup()` call sequencing in
+//!   `rtyper.py:call_all_setups` (`:241`).
+//! * `CanBeNull` / `IteratorRepr` / `VoidRepr.get_ll_*` secondary
+//!   methods — land alongside `rtyper.py:bindingrepr` / `getrepr`
+//!   dispatch in Commit 3.2.
+//! * `pairtype(Repr, Repr)` default conversions (`rmodel.py:298-348`) —
+//!   upstream's double-dispatch mechanism lands with the conversion
+//!   table port.
+//!
+//! ## Parity checkpoints
+//!
+//! The full dispatch chain upstream is:
+//!
+//! ```text
+//! rtyper.specialize()                           rtyper.py:177
+//!   → specialize_more_blocks()                   rtyper.py:198
+//!     → specialize_block(block)                  rtyper.py:283
+//!       → for hop in highlevelops(...):           rtyper.py:307
+//!           translate_hl_to_ll(hop)               → rtyper.py:translate_op_*
+//!             → Repr.rtype_simple_call(hop)       ← pyre lands this in 3.2
+//!                → FunctionReprBase.call(hop)     ← pyre lands this in 3.3
+//!                   → emit direct_call            ← already backed by jtransform
+//! ```
+//!
+//! This commit scaffolds the bottom of the chain (`Repr` base + leaves)
+//! so follow-ups can land in order without retrofitting infrastructure.
+
+use std::fmt::{self, Debug};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::flowspace::model::{ConstValue, Constant};
+use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+/// RPython `setupstate` (`rmodel.py:10-15`).
+///
+/// ```python
+/// class setupstate(object):
+///     NOTINITIALIZED = 0
+///     INPROGRESS = 1
+///     BROKEN = 2
+///     FINISHED = 3
+///     DELAYED = 4
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Setupstate {
+    /// Initial state; [`Repr::setup`] still has to run.
+    NotInitialized = 0,
+    /// Inside an active [`Repr::_setup_repr`] call. Re-entry is an
+    /// `AssertionError` upstream (`rmodel.py:45-47`).
+    InProgress = 1,
+    /// `_setup_repr()` raised `TyperError`; subsequent `setup()` calls
+    /// re-raise `BrokenReprTyperError` (`rmodel.py:42-44`).
+    Broken = 2,
+    /// `_setup_repr()` returned normally; fields are ready to read.
+    Finished = 3,
+    /// `setup()` deferred pending an outer-pass pre-registration
+    /// (`rmodel.py:82-93`).
+    Delayed = 4,
+}
+
+impl Setupstate {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Setupstate::NotInitialized,
+            1 => Setupstate::InProgress,
+            2 => Setupstate::Broken,
+            3 => Setupstate::Finished,
+            4 => Setupstate::Delayed,
+            _ => unreachable!("invalid Setupstate u8={value}"),
+        }
+    }
+}
+
+/// RPython `Repr._initialized` field (`rmodel.py:26`).
+///
+/// Concrete Repr types embed a `ReprState` alongside their own fields.
+/// Interior mutability uses [`AtomicU8`] so Repr instances stored in
+/// `OnceLock`-backed singletons (`impossible_repr`, per-lltype caches)
+/// can survive Rust's `Sync` bound. Upstream Python is single-threaded
+/// so this only matters for the Rust adaptation; ordering is
+/// `Relaxed` since `setup()` is serialized by the rtyper's own
+/// sequential control flow.
+#[derive(Debug)]
+pub struct ReprState {
+    initialized: AtomicU8,
+}
+
+impl ReprState {
+    /// Construct a fresh state in [`Setupstate::NotInitialized`].
+    pub fn new() -> Self {
+        ReprState {
+            initialized: AtomicU8::new(Setupstate::NotInitialized as u8),
+        }
+    }
+
+    /// Current state (read).
+    pub fn get(&self) -> Setupstate {
+        Setupstate::from_u8(self.initialized.load(Ordering::Relaxed))
+    }
+
+    /// Force-set (write).
+    pub fn set(&self, state: Setupstate) {
+        self.initialized.store(state as u8, Ordering::Relaxed);
+    }
+}
+
+impl Default for ReprState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RPython `class Repr(object)` (`rmodel.py:17-246`).
+///
+/// Trait object so a `RPythonTyper.reprs: HashMap<SomeValue, Arc<dyn
+/// Repr>>` (future 3.2 commit) can store heterogeneous Repr instances.
+/// Most default methods match upstream's `Repr` base methods verbatim;
+/// only the required fields (`lowleveltype`, state) are abstract.
+pub trait Repr: Debug {
+    /// RPython `Repr.lowleveltype` (`rmodel.py:26` + each subclass).
+    fn lowleveltype(&self) -> &LowLevelType;
+
+    /// Access to the embedded [`ReprState`]. Concrete types store one
+    /// and return a reference here.
+    fn state(&self) -> &ReprState;
+
+    /// RPython `Repr.__repr__` (`rmodel.py:29-30`):
+    /// `return '<%s %s>' % (self.__class__.__name__, self.lowleveltype)`.
+    fn repr_string(&self) -> String {
+        format!(
+            "<{} {}>",
+            self.class_name(),
+            self.lowleveltype().short_name()
+        )
+    }
+
+    /// RPython `Repr.compact_repr` (`rmodel.py:32-33`):
+    /// `return '%s %s' % (self.__class__.__name__.replace('Repr','R'),
+    ///                    self.lowleveltype._short_name())`.
+    fn compact_repr(&self) -> String {
+        format!(
+            "{} {}",
+            self.class_name().replace("Repr", "R"),
+            self.lowleveltype().short_name()
+        )
+    }
+
+    /// Concrete class name (for the `__repr__` / `compact_repr`
+    /// formatters and TyperError messages). Rust does not have
+    /// `__class__.__name__`; each concrete Repr returns its type name
+    /// here.
+    fn class_name(&self) -> &'static str;
+
+    /// RPython `Repr.setup(self)` (`rmodel.py:35-59`).
+    ///
+    /// ```python
+    /// def setup(self):
+    ///     if self._initialized == setupstate.FINISHED:
+    ///         return
+    ///     elif self._initialized == setupstate.BROKEN:
+    ///         raise BrokenReprTyperError(
+    ///             "cannot setup already failed Repr: %r" %(self,))
+    ///     elif self._initialized == setupstate.INPROGRESS:
+    ///         raise AssertionError(
+    ///             "recursive invocation of Repr setup(): %r" %(self,))
+    ///     elif self._initialized == setupstate.DELAYED:
+    ///         raise AssertionError(
+    ///             "Repr setup() is delayed and cannot be called yet: %r" %(self,))
+    ///     assert self._initialized == setupstate.NOTINITIALIZED
+    ///     self._initialized = setupstate.INPROGRESS
+    ///     try:
+    ///         self._setup_repr()
+    ///     except TyperError:
+    ///         self._initialized = setupstate.BROKEN
+    ///         raise
+    ///     else:
+    ///         self._initialized = setupstate.FINISHED
+    /// ```
+    fn setup(&self) -> Result<(), TyperError> {
+        let state = self.state();
+        match state.get() {
+            Setupstate::Finished => return Ok(()),
+            Setupstate::Broken => {
+                return Err(TyperError::broken_repr(format!(
+                    "cannot setup already failed Repr: {}",
+                    self.repr_string()
+                )));
+            }
+            Setupstate::InProgress => {
+                // upstream `raise AssertionError` — pyre surfaces the
+                // same diagnostic through TyperError since Rust has no
+                // AssertionError class and callers already handle
+                // TyperError on the specialize path.
+                panic!(
+                    "recursive invocation of Repr setup(): {}",
+                    self.repr_string()
+                );
+            }
+            Setupstate::Delayed => {
+                panic!(
+                    "Repr setup() is delayed and cannot be called yet: {}",
+                    self.repr_string()
+                );
+            }
+            Setupstate::NotInitialized => {}
+        }
+        state.set(Setupstate::InProgress);
+        match self._setup_repr() {
+            Ok(()) => {
+                state.set(Setupstate::Finished);
+                Ok(())
+            }
+            Err(e) => {
+                state.set(Setupstate::Broken);
+                Err(e)
+            }
+        }
+    }
+
+    /// RPython `Repr._setup_repr(self)` (`rmodel.py:61-62`).
+    ///
+    /// Default no-op. Concrete subclasses override for recursive /
+    /// two-step initialization.
+    fn _setup_repr(&self) -> Result<(), TyperError> {
+        Ok(())
+    }
+
+    /// RPython `Repr.setup_final(self)` (`rmodel.py:64-74`).
+    ///
+    /// ```python
+    /// def setup_final(self):
+    ///     if self._initialized == setupstate.BROKEN:
+    ///         raise BrokenReprTyperError(...)
+    ///     assert self._initialized == setupstate.FINISHED
+    ///     self._setup_repr_final()
+    /// ```
+    fn setup_final(&self) -> Result<(), TyperError> {
+        let state = self.state();
+        match state.get() {
+            Setupstate::Broken => Err(TyperError::broken_repr(format!(
+                "cannot perform setup_final_touch on failed Repr: {}",
+                self.repr_string()
+            ))),
+            Setupstate::Finished => self._setup_repr_final(),
+            other => panic!(
+                "setup_final() on repr with state {other:?}: {}",
+                self.repr_string()
+            ),
+        }
+    }
+
+    /// RPython `Repr._setup_repr_final(self)` (`rmodel.py:76-77`).
+    /// Default no-op.
+    fn _setup_repr_final(&self) -> Result<(), TyperError> {
+        Ok(())
+    }
+
+    /// RPython `Repr.is_setup_delayed(self)` (`rmodel.py:79-80`).
+    fn is_setup_delayed(&self) -> bool {
+        matches!(self.state().get(), Setupstate::Delayed)
+    }
+
+    /// RPython `Repr.set_setup_delayed(self, flag)` (`rmodel.py:82-88`).
+    ///
+    /// ```python
+    /// def set_setup_delayed(self, flag):
+    ///     assert self._initialized in (setupstate.NOTINITIALIZED,
+    ///                                  setupstate.DELAYED)
+    ///     if flag:
+    ///         self._initialized = setupstate.DELAYED
+    ///     else:
+    ///         self._initialized = setupstate.NOTINITIALIZED
+    /// ```
+    fn set_setup_delayed(&self, flag: bool) {
+        let state = self.state();
+        let current = state.get();
+        assert!(
+            matches!(current, Setupstate::NotInitialized | Setupstate::Delayed),
+            "set_setup_delayed requires NotInitialized/Delayed, got {current:?}"
+        );
+        if flag {
+            state.set(Setupstate::Delayed);
+        } else {
+            state.set(Setupstate::NotInitialized);
+        }
+    }
+
+    /// RPython `Repr.set_setup_maybe_delayed(self)` (`rmodel.py:90-93`).
+    ///
+    /// ```python
+    /// def set_setup_maybe_delayed(self):
+    ///     if self._initialized == setupstate.NOTINITIALIZED:
+    ///         self._initialized = setupstate.DELAYED
+    ///     return self._initialized == setupstate.DELAYED
+    /// ```
+    fn set_setup_maybe_delayed(&self) -> bool {
+        let state = self.state();
+        if matches!(state.get(), Setupstate::NotInitialized) {
+            state.set(Setupstate::Delayed);
+        }
+        matches!(state.get(), Setupstate::Delayed)
+    }
+
+    /// RPython `Repr.convert_const(self, value)` (`rmodel.py:120-125`).
+    ///
+    /// ```python
+    /// def convert_const(self, value):
+    ///     "Convert the given constant value to the low-level repr of 'self'."
+    ///     if not self.lowleveltype._contains_value(value):
+    ///         raise TyperError("convert_const(self = %r, value = %r)" % (
+    ///             self, value))
+    ///     return value
+    /// ```
+    ///
+    /// Upstream returns the Python value directly (the `_contains_value`
+    /// predicate doubles as a type cast); the pyre adaptation wraps the
+    /// value in a `Constant` whose `concretetype` carries the repr's
+    /// lowleveltype, matching what `inputconst` / `specialize_block`
+    /// expect downstream.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        if !self.lowleveltype().contains_value(value) {
+            return Err(TyperError::message(format!(
+                "convert_const(self = {}, value = {:?})",
+                self.repr_string(),
+                value
+            )));
+        }
+        Ok(Constant::with_concretetype(
+            value.clone(),
+            self.lowleveltype().clone(),
+        ))
+    }
+
+    /// RPython `Repr.special_uninitialized_value(self)` (`rmodel.py:127-128`).
+    fn special_uninitialized_value(&self) -> Option<ConstValue> {
+        None
+    }
+
+    /// RPython `Repr.can_ll_be_null(self, s_value)` (`rmodel.py:150-155`).
+    ///
+    /// Default `true` (conservative) matching upstream.
+    fn can_ll_be_null(&self) -> bool {
+        true
+    }
+
+    /// RPython `Repr._freeze_(self)` (`rmodel.py:108-109`).
+    /// Always true — Repr instances are immutable once created.
+    fn freeze(&self) -> bool {
+        true
+    }
+}
+
+/// RPython `inputconst(reqtype, value)` (`rmodel.py:379-395`).
+///
+/// Upstream supports `reqtype` as either `Repr` or `LowLevelType`.
+/// Pyre splits into two functions because Rust's type system prefers
+/// explicit dispatch over Python-style duck typing. Use
+/// [`inputconst_from_lltype`] when the caller already has a bare
+/// `LowLevelType`.
+///
+/// ```python
+/// def inputconst(reqtype, value):
+///     if isinstance(reqtype, Repr):
+///         value = reqtype.convert_const(value)
+///         lltype = reqtype.lowleveltype
+///     elif isinstance(reqtype, LowLevelType):
+///         lltype = reqtype
+///     else:
+///         raise TypeError(repr(reqtype))
+///     if not lltype._contains_value(value):
+///         raise TyperError("inputconst(): expected a %r, got %r" %
+///                          (lltype, value))
+///     c = Constant(value)
+///     c.concretetype = lltype
+///     return c
+/// ```
+pub fn inputconst<R: Repr + ?Sized>(
+    reqtype: &R,
+    value: &ConstValue,
+) -> Result<Constant, TyperError> {
+    let c = reqtype.convert_const(value)?;
+    // `convert_const` already populated `concretetype`; double-check
+    // contains_value as upstream does post-convert.
+    if !reqtype.lowleveltype().contains_value(&c.value) {
+        return Err(TyperError::message(format!(
+            "inputconst(): expected a {}, got {:?}",
+            reqtype.lowleveltype().short_name(),
+            c.value
+        )));
+    }
+    Ok(c)
+}
+
+/// RPython `inputconst(LowLevelType, value)` overload (`rmodel.py:386-394`).
+pub fn inputconst_from_lltype(
+    lltype: &LowLevelType,
+    value: &ConstValue,
+) -> Result<Constant, TyperError> {
+    if !lltype.contains_value(value) {
+        return Err(TyperError::message(format!(
+            "inputconst(): expected a {}, got {:?}",
+            lltype.short_name(),
+            value
+        )));
+    }
+    Ok(Constant::with_concretetype(value.clone(), lltype.clone()))
+}
+
+/// RPython `mangle(prefix, name)` (`rmodel.py:402-408`).
+///
+/// ```python
+/// def mangle(prefix, name):
+///     """Make a unique identifier from the prefix and the name.  The name
+///     is allowed to start with $."""
+///     if name.startswith('$'):
+///         return '%sinternal_%s' % (prefix, name[1:])
+///     else:
+///         return '%s_%s' % (prefix, name)
+/// ```
+pub fn mangle(prefix: &str, name: &str) -> String {
+    if let Some(stripped) = name.strip_prefix('$') {
+        format!("{prefix}internal_{stripped}")
+    } else {
+        format!("{prefix}_{name}")
+    }
+}
+
+// ____________________________________________________________
+// Concrete Repr leaves that every downstream port needs.
+
+/// RPython `class VoidRepr(Repr)` (`rmodel.py:353-359`).
+///
+/// ```python
+/// class VoidRepr(Repr):
+///     lowleveltype = Void
+///     def get_ll_eq_function(self): return None
+///     def get_ll_hash_function(self): return ll_hash_void
+///     get_ll_fasthash_function = get_ll_hash_function
+///     def ll_str(self, nothing): raise AssertionError("unreachable code")
+/// impossible_repr = VoidRepr()
+/// ```
+#[derive(Debug)]
+pub struct VoidRepr {
+    state: ReprState,
+    lltype: LowLevelType,
+}
+
+impl VoidRepr {
+    pub fn new() -> Self {
+        VoidRepr {
+            state: ReprState::new(),
+            lltype: LowLevelType::Void,
+        }
+    }
+}
+
+impl Default for VoidRepr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Repr for VoidRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "VoidRepr"
+    }
+}
+
+/// RPython `impossible_repr = VoidRepr()` (`rmodel.py:359`) — the
+/// singleton VoidRepr used for `SomeImpossibleValue` (`rmodel.py:288+`).
+///
+/// Rust representation uses [`OnceLock`] for lazy, thread-safe init.
+pub fn impossible_repr() -> &'static VoidRepr {
+    static REPR: OnceLock<VoidRepr> = OnceLock::new();
+    REPR.get_or_init(VoidRepr::new)
+}
+
+/// RPython `class SimplePointerRepr(Repr)` (`rmodel.py:365-375`).
+///
+/// ```python
+/// class SimplePointerRepr(Repr):
+///     "Convenience Repr for simple ll pointer types with no operation on them."
+///
+///     def __init__(self, lowleveltype):
+///         self.lowleveltype = lowleveltype
+///
+///     def convert_const(self, value):
+///         if value is not None:
+///             raise TyperError("%r only supports None as prebuilt constant, "
+///                              "got %r" % (self, value))
+///         return lltype.nullptr(self.lowleveltype.TO)
+/// ```
+#[derive(Debug)]
+pub struct SimplePointerRepr {
+    state: ReprState,
+    lltype: LowLevelType,
+}
+
+impl SimplePointerRepr {
+    /// `lowleveltype` must be a [`LowLevelType::Ptr`] variant upstream
+    /// (`rmodel.py:365-375`); enforce via debug assertion.
+    pub fn new(lowleveltype: LowLevelType) -> Self {
+        debug_assert!(
+            matches!(lowleveltype, LowLevelType::Ptr(_)),
+            "SimplePointerRepr requires Ptr lowleveltype, got {lowleveltype:?}"
+        );
+        SimplePointerRepr {
+            state: ReprState::new(),
+            lltype: lowleveltype,
+        }
+    }
+}
+
+impl Repr for SimplePointerRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "SimplePointerRepr"
+    }
+
+    /// RPython override (`rmodel.py:371-375`): only accept `None`, emit
+    /// `nullptr(self.lowleveltype.TO)`.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        if !matches!(value, ConstValue::None) {
+            return Err(TyperError::message(format!(
+                "{} only supports None as prebuilt constant, got {value:?}",
+                self.repr_string()
+            )));
+        }
+        // upstream returns `lltype.nullptr(self.lowleveltype.TO)`; pyre
+        // stores the null sentinel via `ConstValue::None` with the
+        // Ptr lowleveltype on the Constant, matching what downstream
+        // emit_const_r pipes through.
+        Ok(Constant::with_concretetype(
+            ConstValue::None,
+            self.lltype.clone(),
+        ))
+    }
+}
+
+// VoidRepr and SimplePointerRepr must be Display-able via Repr's
+// `repr_string()` when formatted through Debug. Since `#[derive(Debug)]`
+// already handles it, no additional impl is required. (TyperError's
+// Display uses repr_string() through self.repr_string() calls.)
+impl fmt::Display for VoidRepr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.repr_string())
+    }
+}
+
+impl fmt::Display for SimplePointerRepr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.repr_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translator::rtyper::lltypesystem::lltype::FuncType;
+    use std::sync::Arc;
+
+    #[test]
+    fn voidrepr_lowleveltype_is_void_and_reprs_match_upstream() {
+        // rmodel.py:353-359: VoidRepr.lowleveltype = Void.
+        let r = VoidRepr::new();
+        assert_eq!(r.lowleveltype(), &LowLevelType::Void);
+        // rmodel.py:30 `<%s %s>` formatter.
+        assert_eq!(r.repr_string(), "<VoidRepr Void>");
+        // rmodel.py:33 compact_repr — "VoidRepr" → "VoidR" replacement,
+        // then short_name.
+        assert_eq!(r.compact_repr(), "VoidR Void");
+    }
+
+    #[test]
+    fn setup_transitions_notinitialized_to_finished() {
+        // rmodel.py:35-59: NOTINITIALIZED → INPROGRESS → FINISHED.
+        let r = VoidRepr::new();
+        assert_eq!(r.state().get(), Setupstate::NotInitialized);
+        r.setup().expect("setup should succeed on default VoidRepr");
+        assert_eq!(r.state().get(), Setupstate::Finished);
+        // Second call returns immediately (rmodel.py:40-41).
+        r.setup().expect("setup should be idempotent once FINISHED");
+        assert_eq!(r.state().get(), Setupstate::Finished);
+    }
+
+    #[test]
+    fn setup_on_broken_state_raises_broken_repr_typer_error() {
+        // rmodel.py:42-44.
+        let r = VoidRepr::new();
+        r.state().set(Setupstate::Broken);
+        let err = r.setup().unwrap_err();
+        assert!(err.is_broken_repr());
+        assert!(err.to_string().contains("<VoidRepr Void>"));
+    }
+
+    #[test]
+    #[should_panic(expected = "recursive invocation of Repr setup()")]
+    fn setup_on_inprogress_panics_like_upstream_assertion() {
+        // rmodel.py:45-47 uses `raise AssertionError` — pyre panics.
+        let r = VoidRepr::new();
+        r.state().set(Setupstate::InProgress);
+        let _ = r.setup();
+    }
+
+    #[test]
+    fn set_setup_delayed_toggles_state_both_ways() {
+        // rmodel.py:82-88.
+        let r = VoidRepr::new();
+        r.set_setup_delayed(true);
+        assert_eq!(r.state().get(), Setupstate::Delayed);
+        assert!(r.is_setup_delayed());
+        r.set_setup_delayed(false);
+        assert_eq!(r.state().get(), Setupstate::NotInitialized);
+        assert!(!r.is_setup_delayed());
+    }
+
+    #[test]
+    fn set_setup_maybe_delayed_only_promotes_from_notinitialized() {
+        // rmodel.py:90-93.
+        let r = VoidRepr::new();
+        assert!(r.set_setup_maybe_delayed());
+        assert_eq!(r.state().get(), Setupstate::Delayed);
+        // Already Delayed: returns true (the membership check) without
+        // changing state.
+        assert!(r.set_setup_maybe_delayed());
+    }
+
+    #[test]
+    fn convert_const_rejects_non_void_values_on_voidrepr() {
+        // rmodel.py:120-125 — _contains_value is the gate.
+        let r = VoidRepr::new();
+        // Void only accepts None.
+        let c = r.convert_const(&ConstValue::None).unwrap();
+        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Void));
+
+        let err = r.convert_const(&ConstValue::Int(42)).unwrap_err();
+        assert!(
+            err.to_string().contains("convert_const"),
+            "expected upstream-shaped error; got {err}"
+        );
+    }
+
+    #[test]
+    fn inputconst_wraps_value_and_records_lowleveltype() {
+        // rmodel.py:379-395.
+        let r = VoidRepr::new();
+        let c = inputconst(&r, &ConstValue::None).unwrap();
+        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Void));
+
+        let c2 = inputconst_from_lltype(&LowLevelType::Signed, &ConstValue::Int(7)).unwrap();
+        assert_eq!(c2.concretetype.as_ref(), Some(&LowLevelType::Signed));
+    }
+
+    #[test]
+    fn inputconst_from_lltype_rejects_mismatched_constant() {
+        let err = inputconst_from_lltype(&LowLevelType::Bool, &ConstValue::Int(0)).unwrap_err();
+        assert!(err.to_string().contains("inputconst"));
+    }
+
+    #[test]
+    fn mangle_uses_internal_prefix_for_dollar_names() {
+        // rmodel.py:402-408.
+        assert_eq!(mangle("cls", "$hidden"), "clsinternal_hidden");
+        assert_eq!(mangle("cls", "method"), "cls_method");
+    }
+
+    #[test]
+    fn impossible_repr_is_shared_singleton_pointer() {
+        // `impossible_repr = VoidRepr()` module-level singleton
+        // (rmodel.py:359). Two calls return the same instance.
+        let a: *const VoidRepr = impossible_repr();
+        let b: *const VoidRepr = impossible_repr();
+        assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn simple_pointer_repr_only_accepts_none_constant() {
+        // rmodel.py:365-375.
+        let ptr_ty = LowLevelType::Ptr(Arc::new(FuncType {
+            args: vec![],
+            result: LowLevelType::Void,
+        }));
+        let r = SimplePointerRepr::new(ptr_ty.clone());
+        assert_eq!(r.lowleveltype(), &ptr_ty);
+
+        let c = r.convert_const(&ConstValue::None).unwrap();
+        assert_eq!(c.concretetype.as_ref(), Some(&ptr_ty));
+
+        let err = r.convert_const(&ConstValue::Int(0)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supports None as prebuilt constant"),
+            "expected upstream phrase; got {err}"
+        );
+    }
+
+    #[test]
+    fn repr_default_predicates_match_upstream_defaults() {
+        // rmodel.py:108-109 `_freeze_` → True.
+        // rmodel.py:127-128 `special_uninitialized_value` → None.
+        // rmodel.py:150-155 `can_ll_be_null` → True.
+        let r = VoidRepr::new();
+        assert!(r.freeze());
+        assert!(r.special_uninitialized_value().is_none());
+        assert!(r.can_ll_be_null());
+    }
+}

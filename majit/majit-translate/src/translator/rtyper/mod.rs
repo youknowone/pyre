@@ -12,5 +12,6 @@ pub mod error;
 pub mod lltypesystem;
 pub mod normalizecalls;
 pub mod rclass;
+pub mod rmodel;
 pub mod rpbc;
 pub mod rtyper;
