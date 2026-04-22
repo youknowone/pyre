@@ -1508,21 +1508,62 @@ impl AssemblerARM64 {
                     self.emit_binop_3op(op.opcode, dst.value, lhs, src);
                 }
             }
-            // ── Unary integer (result in arglocs[0] register) ──
+            // ── Unary integer ──
             OpCode::IntNeg => {
-                if let Some(Loc::Reg(r)) = result_loc {
-                    dynasm!(self.mc ; .arch aarch64 ; neg X(r.value), X(r.value));
+                if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    let src_reg = match src {
+                        Loc::Reg(r) => r.value,
+                        Loc::Frame(f) => {
+                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                            17
+                        }
+                        Loc::Immed(i) => {
+                            self.emit_mov_imm64(17, i.value);
+                            17
+                        }
+                        _ => 17,
+                    };
+                    dynasm!(self.mc ; .arch aarch64 ; neg X(dst.value), X(src_reg as u8));
                 }
             }
             OpCode::IntInvert => {
-                if let Some(Loc::Reg(r)) = result_loc {
-                    dynasm!(self.mc ; .arch aarch64 ; mvn X(r.value), X(r.value));
+                if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    let src_reg = match src {
+                        Loc::Reg(r) => r.value,
+                        Loc::Frame(f) => {
+                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                            17
+                        }
+                        Loc::Immed(i) => {
+                            self.emit_mov_imm64(17, i.value);
+                            17
+                        }
+                        _ => 17,
+                    };
+                    dynasm!(self.mc ; .arch aarch64 ; mvn X(dst.value), X(src_reg as u8));
                 }
             }
             // ── Shifts ──
             OpCode::IntLshift | OpCode::IntRshift | OpCode::UintRshift => {
-                if let (Some(Loc::Reg(dst)), Some(shift_loc)) = (result_loc, arglocs.get(1)) {
-                    // aarch64: 3-operand shifts, no ECX constraint
+                if let (Some(Loc::Reg(dst)), Some(lhs), Some(shift_loc)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    // aarch64: shifts are true 3-operand forms (`lsl/asr/lsr
+                    // Rd, Rn, Rm`). The regalloc may pick `result_loc !=
+                    // arglocs[0]`, so we must read the real LHS from arg0,
+                    // not from the destination register.
+                    let lhs_reg = match lhs {
+                        Loc::Reg(r) => r.value,
+                        Loc::Frame(f) => {
+                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                            17
+                        }
+                        Loc::Immed(i) => {
+                            self.emit_mov_imm64(17, i.value);
+                            17
+                        }
+                        _ => 17,
+                    };
                     let sr = match shift_loc {
                         Loc::Reg(s) => s.value,
                         Loc::Immed(i) => {
@@ -1537,13 +1578,13 @@ impl AssemblerARM64 {
                     };
                     match op.opcode {
                         OpCode::IntLshift => {
-                            dynasm!(self.mc ; .arch aarch64 ; lsl X(dst.value), X(dst.value), X(sr as u8));
+                            dynasm!(self.mc ; .arch aarch64 ; lsl X(dst.value), X(lhs_reg as u8), X(sr as u8));
                         }
                         OpCode::IntRshift => {
-                            dynasm!(self.mc ; .arch aarch64 ; asr X(dst.value), X(dst.value), X(sr as u8));
+                            dynasm!(self.mc ; .arch aarch64 ; asr X(dst.value), X(lhs_reg as u8), X(sr as u8));
                         }
                         OpCode::UintRshift => {
-                            dynasm!(self.mc ; .arch aarch64 ; lsr X(dst.value), X(dst.value), X(sr as u8));
+                            dynasm!(self.mc ; .arch aarch64 ; lsr X(dst.value), X(lhs_reg as u8), X(sr as u8));
                         }
                         _ => {}
                     }
@@ -1612,10 +1653,22 @@ impl AssemblerARM64 {
                 }
             }
             OpCode::IntForceGeZero => {
-                if let Some(Loc::Reg(r)) = result_loc {
+                if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
+                    let src_reg = match src {
+                        Loc::Reg(r) => r.value,
+                        Loc::Frame(f) => {
+                            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x29, f.ebp_loc.value as u32]);
+                            17
+                        }
+                        Loc::Immed(i) => {
+                            self.emit_mov_imm64(17, i.value);
+                            17
+                        }
+                        _ => 17,
+                    };
                     dynasm!(self.mc ; .arch aarch64
-                        ; cmp X(r.value), xzr
-                        ; csel X(r.value), X(r.value), xzr, ge
+                        ; cmp X(src_reg as u8), xzr
+                        ; csel X(dst.value), X(src_reg as u8), xzr, ge
                     );
                 }
             }
@@ -1628,30 +1681,42 @@ impl AssemblerARM64 {
             }
             // ── Float binary ──
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
-                if let Some(Loc::Reg(dst)) = result_loc {
-                    // Ensure second arg is in an XMM register
-                    let src_reg = if let Some(Loc::Reg(s)) = arglocs.get(1) {
+                if let (Some(Loc::Reg(dst)), Some(lhs_loc), Some(rhs_loc)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    // aarch64 float ops are true 3-operand forms
+                    // (`fadd/fsub/fmul/fdiv Dd, Dn, Dm`). The regalloc may
+                    // choose `result_loc != arglocs[0]`, so we must read the
+                    // actual lhs from arg0 rather than assuming it already
+                    // lives in the destination register.
+                    let lhs_reg = match lhs_loc {
+                        Loc::Reg(r) => *r,
+                        _ => {
+                            let scratch = crate::regloc::RegLoc::new(15, true);
+                            self.regalloc_mov(lhs_loc, &Loc::Reg(scratch));
+                            scratch
+                        }
+                    };
+                    let src_reg = if let Loc::Reg(s) = rhs_loc {
                         *s
-                    } else if let Some(src_loc) = arglocs.get(1) {
+                    } else {
                         // Immed or Frame — load to scratch XMM (d14/xmm14)
                         let scratch = crate::regloc::RegLoc::new(14, true);
-                        self.regalloc_mov(src_loc, &Loc::Reg(scratch));
+                        self.regalloc_mov(rhs_loc, &Loc::Reg(scratch));
                         scratch
-                    } else {
-                        return; // shouldn't happen
                     };
                     match op.opcode {
                         OpCode::FloatAdd => {
-                            dynasm!(self.mc ; .arch aarch64 ; fadd D(dst.value), D(dst.value), D(src_reg.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fadd D(dst.value), D(lhs_reg.value), D(src_reg.value));
                         }
                         OpCode::FloatSub => {
-                            dynasm!(self.mc ; .arch aarch64 ; fsub D(dst.value), D(dst.value), D(src_reg.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fsub D(dst.value), D(lhs_reg.value), D(src_reg.value));
                         }
                         OpCode::FloatMul => {
-                            dynasm!(self.mc ; .arch aarch64 ; fmul D(dst.value), D(dst.value), D(src_reg.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fmul D(dst.value), D(lhs_reg.value), D(src_reg.value));
                         }
                         OpCode::FloatTrueDiv => {
-                            dynasm!(self.mc ; .arch aarch64 ; fdiv D(dst.value), D(dst.value), D(src_reg.value));
+                            dynasm!(self.mc ; .arch aarch64 ; fdiv D(dst.value), D(lhs_reg.value), D(src_reg.value));
                         }
                         _ => {}
                     }
