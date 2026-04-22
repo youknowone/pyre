@@ -468,15 +468,21 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
     // warmspot.py:972-975: extract portal args from merged lists.
     let next_instr = all_i.first().copied().unwrap_or(0) as usize;
     let _is_being_profiled = all_i.get(1).copied().unwrap_or(0);
-    let _pycode = all_r.first().copied().unwrap_or(0);
+    let pycode = all_r.first().copied().unwrap_or(0) as PyObjectRef;
     let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
-    let _ec = all_r.get(2).copied().unwrap_or(0);
+    let ec = all_r.get(2).copied().unwrap_or(0) as *const pyre_interpreter::PyExecutionContext;
 
     if frame_ptr.is_null() {
         return pyre_object::PY_NULL as i64;
     }
     let frame = unsafe { &mut *frame_ptr };
     // warmspot.py:976: set portal args on frame before dispatch.
+    if !pycode.is_null() {
+        frame.pycode = pycode as *const ();
+    }
+    if !ec.is_null() {
+        frame.execution_context = ec;
+    }
     frame.set_last_instr_from_next_instr(next_instr);
     crate::eval::portal_runner(frame) as i64
 }
