@@ -37,6 +37,10 @@ use syn::{
 /// 3. **`auto_calls = true`**
 ///    Infer helper policies from sidecar `#[elidable]` / `#[dont_look_inside]`
 ///    / `#[jit_inline]` attributes on every call site in the traced arms.
+///    Value-call inference is currently limited to helpers whose result bank
+///    is statically int-shaped; ref/float-return helpers still need explicit
+///    `calls = { helper => ... }` overrides such as `inline_ref`,
+///    `inline_float`, `residual_ref_wrapped`, or `residual_float_wrapped`.
 ///
 /// ### Module-level discovery
 ///
@@ -226,6 +230,8 @@ pub(crate) enum CallPolicyKind {
     LoopInvariantFloatWrapped,
     ElidableFloatWrapped,
     InlineInt,
+    InlineRef,
+    InlineFloat,
 }
 
 pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
@@ -259,6 +265,8 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "loopinvariant_float_wrapped" => CallPolicyKind::LoopInvariantFloatWrapped,
         "elidable_float_wrapped" => CallPolicyKind::ElidableFloatWrapped,
         "inline_int" => CallPolicyKind::InlineInt,
+        "inline_ref" => CallPolicyKind::InlineRef,
+        "inline_float" => CallPolicyKind::InlineFloat,
         _ => return None,
     })
 }
@@ -607,7 +615,7 @@ fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<CallPolic
             Some(parse_call_policy_kind(&kind).ok_or_else(|| {
                 syn::Error::new(
                     kind.span(),
-                    "call policy must be a supported residual/may_force/release_gil/loopinvariant policy or inline_int",
+                    "call policy must be a supported residual/may_force/release_gil/loopinvariant policy or inline_int/inline_ref/inline_float",
                 )
             })?)
         } else {

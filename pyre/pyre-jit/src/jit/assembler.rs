@@ -8,7 +8,7 @@
 //! `self.insns` into a runtime opcode table.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
 
@@ -40,6 +40,14 @@ pub struct NumRegs {
 /// relocation.
 #[derive(Debug, Default)]
 pub struct Assembler {
+    /// `assembler.py:20` `self.insns = {}`.
+    ///
+    /// RPython grows this dict in `write_insn()` with dense opcode ids.
+    /// pyre still emits majit's fixed runtime bytecodes, so the mirror here
+    /// records only the actually-emitted well-known keys with their runtime
+    /// opcode byte. That is sufficient for the lazy `finish_setup` cache
+    /// refresh in `pyre_jit_trace::state`.
+    insns: HashMap<String, u8>,
     /// `assembler.py:29` `self.all_liveness = []`.
     all_liveness: Vec<u8>,
     /// `assembler.py:30` `self.all_liveness_length = 0`.
@@ -121,6 +129,11 @@ impl Assembler {
         self.all_liveness_length
     }
 
+    /// Snapshot of the emitted well-known `opname/argcodes` keys.
+    pub fn insns_snapshot(&self) -> HashMap<String, u8> {
+        self.insns.clone()
+    }
+
     /// `assembler.py:32` accessor.
     pub fn num_liveness_ops(&self) -> usize {
         self.num_liveness_ops
@@ -161,6 +174,12 @@ impl Assembler {
     /// at exactly the same point as `codewriter.py:85`.
     pub fn finished(&mut self, callinfocollection: &super::call::CallInfoCollection) {
         let _ = callinfocollection;
+        pyre_jit_trace::assembler::publish_state(
+            &self.insns,
+            &self.all_liveness,
+            self.all_liveness_length,
+            self.num_liveness_ops,
+        );
     }
 
     /// `assembler.py:34-54` `assemble(self, ssarepr, jitcode=None, num_regs=None)`.
@@ -242,6 +261,7 @@ impl Assembler {
                     let patch_offset = state.builder.live_placeholder();
                     let offset = self.encode_liveness_info(&live_i, &live_r, &live_f);
                     state.builder.patch_live_offset(patch_offset, offset);
+                    self.record_insn_key(opname, args, None);
                     return;
                 }
                 // `assembler.py:208-209`:
@@ -262,6 +282,7 @@ impl Assembler {
                         }
                     }
                 }
+                self.record_insn_key(opname, args, result.as_ref());
                 // `assembler.py:197-206` registers descrs inline during op
                 // encoding into `Assembler.descrs`. pyre's runtime
                 // codewriter has no descr-consuming ops today, so no
@@ -357,13 +378,118 @@ impl Assembler {
             }
             pos
         };
-        pyre_jit_trace::assembler::publish_liveness(
+        pyre_jit_trace::assembler::publish_state(
+            &self.insns,
             &self.all_liveness,
             self.all_liveness_length,
             self.num_liveness_ops,
         );
         pos
     }
+
+    fn record_insn_key(&mut self, opname: &str, args: &[Operand], result: Option<&Register>) {
+        if is_adapter_only_helper_call_family(opname) {
+            return;
+        }
+        let key = if opname == super::flatten::OPNAME_LIVE {
+            "live/".to_string()
+        } else {
+            insn_key(opname, args, result)
+        };
+        if let Some(&opcode) = WELLKNOWN_BH_INSNS.get(key.as_str()) {
+            self.insns.entry(key).or_insert(opcode);
+        }
+    }
+}
+
+static WELLKNOWN_BH_INSNS: LazyLock<HashMap<&'static str, u8>> =
+    LazyLock::new(majit_metainterp::jitcode::wellknown_bh_insns);
+
+fn is_adapter_only_helper_call_family(opname: &str) -> bool {
+    matches!(
+        opname,
+        "conditional_call_ir_v"
+            | "conditional_call_value_ir_i"
+            | "conditional_call_value_ir_r"
+            | "record_known_result_i_ir_v"
+            | "record_known_result_r_ir_v"
+    )
+}
+
+fn insn_key(opname: &str, args: &[Operand], result: Option<&Register>) -> String {
+    let mut argcodes = String::new();
+    let allow_short = use_c_form(opname);
+    for arg in args {
+        match arg {
+            Operand::Register(reg) => argcodes.push(kind_char(reg.kind)),
+            Operand::ConstInt(value) => {
+                let code = if allow_short && (-128..=127).contains(value) {
+                    'c'
+                } else {
+                    'i'
+                };
+                argcodes.push(code);
+            }
+            Operand::ConstRef(_) => argcodes.push('r'),
+            Operand::ConstFloat(_) => argcodes.push('f'),
+            Operand::TLabel(_) => argcodes.push('L'),
+            Operand::ListOfKind(list) => argcodes.push(kind_char(list.kind).to_ascii_uppercase()),
+            Operand::Descr(_) => argcodes.push('d'),
+            Operand::IndirectCallTargets(_) => {}
+        }
+    }
+    if let Some(result) = result {
+        argcodes.push('>');
+        argcodes.push(kind_char(result.kind));
+    }
+    format!("{opname}/{argcodes}")
+}
+
+fn kind_char(kind: Kind) -> char {
+    match kind {
+        Kind::Int => 'i',
+        Kind::Ref => 'r',
+        Kind::Float => 'f',
+    }
+}
+
+fn use_c_form(opname: &str) -> bool {
+    matches!(
+        opname,
+        "copystrcontent"
+            | "getarrayitem_gc_pure_i"
+            | "getarrayitem_gc_pure_r"
+            | "getarrayitem_gc_i"
+            | "getarrayitem_gc_r"
+            | "goto_if_not_int_eq"
+            | "goto_if_not_int_ge"
+            | "goto_if_not_int_gt"
+            | "goto_if_not_int_le"
+            | "goto_if_not_int_lt"
+            | "goto_if_not_int_ne"
+            | "int_add"
+            | "int_and"
+            | "int_copy"
+            | "int_eq"
+            | "int_ge"
+            | "int_gt"
+            | "int_le"
+            | "int_lt"
+            | "int_ne"
+            | "int_return"
+            | "int_sub"
+            | "jit_merge_point"
+            | "new_array"
+            | "new_array_clear"
+            | "newstr"
+            | "setarrayitem_gc_i"
+            | "setarrayitem_gc_r"
+            | "setfield_gc_i"
+            | "strgetitem"
+            | "strsetitem"
+            | "foobar"
+            | "baz"
+    )
 }
 
 /// Test-only convenience wrapper — creates a throwaway `Assembler` per
@@ -420,16 +546,16 @@ fn dispatch_op(
     result: Option<&Register>,
 ) {
     match opname {
-        "goto" | "jump" => {
+        "goto" => {
             let label = expect_tlabel(&args[0]);
             let label_id = builder_label(state, &label.name);
             state.builder.jump(label_id);
         }
-        "goto_if_not" | "branch_reg_zero" => {
+        "goto_if_not" | "goto_if_not_int_is_true" => {
             let cond = expect_reg(&args[0], Kind::Int);
             let label = expect_tlabel(&args[1]);
             let label_id = builder_label(state, &label.name);
-            state.builder.branch_reg_zero(cond, label_id);
+            state.builder.goto_if_not_int_is_true(cond, label_id);
         }
         "goto_if_not_int_eq" => {
             let lhs = expect_reg(&args[0], Kind::Int);
@@ -445,11 +571,107 @@ fn dispatch_op(
             let label_id = builder_label(state, &label.name);
             state.builder.goto_if_not_int_ne(lhs, rhs, label_id);
         }
+        "goto_if_not_int_lt" => {
+            let lhs = expect_reg(&args[0], Kind::Int);
+            let rhs = expect_reg(&args[1], Kind::Int);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_int_lt(lhs, rhs, label_id);
+        }
+        "goto_if_not_int_le" => {
+            let lhs = expect_reg(&args[0], Kind::Int);
+            let rhs = expect_reg(&args[1], Kind::Int);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_int_le(lhs, rhs, label_id);
+        }
+        "goto_if_not_int_gt" => {
+            let lhs = expect_reg(&args[0], Kind::Int);
+            let rhs = expect_reg(&args[1], Kind::Int);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_int_gt(lhs, rhs, label_id);
+        }
+        "goto_if_not_int_ge" => {
+            let lhs = expect_reg(&args[0], Kind::Int);
+            let rhs = expect_reg(&args[1], Kind::Int);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_int_ge(lhs, rhs, label_id);
+        }
         "goto_if_not_int_is_zero" => {
             let cond = expect_reg(&args[0], Kind::Int);
             let label = expect_tlabel(&args[1]);
             let label_id = builder_label(state, &label.name);
             state.builder.goto_if_not_int_is_zero(cond, label_id);
+        }
+        "goto_if_not_float_lt" => {
+            let lhs = expect_reg(&args[0], Kind::Float);
+            let rhs = expect_reg(&args[1], Kind::Float);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_float_lt(lhs, rhs, label_id);
+        }
+        "goto_if_not_float_le" => {
+            let lhs = expect_reg(&args[0], Kind::Float);
+            let rhs = expect_reg(&args[1], Kind::Float);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_float_le(lhs, rhs, label_id);
+        }
+        "goto_if_not_float_eq" => {
+            let lhs = expect_reg(&args[0], Kind::Float);
+            let rhs = expect_reg(&args[1], Kind::Float);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_float_eq(lhs, rhs, label_id);
+        }
+        "goto_if_not_float_ne" => {
+            let lhs = expect_reg(&args[0], Kind::Float);
+            let rhs = expect_reg(&args[1], Kind::Float);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_float_ne(lhs, rhs, label_id);
+        }
+        "goto_if_not_float_gt" => {
+            let lhs = expect_reg(&args[0], Kind::Float);
+            let rhs = expect_reg(&args[1], Kind::Float);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_float_gt(lhs, rhs, label_id);
+        }
+        "goto_if_not_float_ge" => {
+            let lhs = expect_reg(&args[0], Kind::Float);
+            let rhs = expect_reg(&args[1], Kind::Float);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_float_ge(lhs, rhs, label_id);
+        }
+        "goto_if_not_ptr_eq" => {
+            let lhs = expect_reg(&args[0], Kind::Ref);
+            let rhs = expect_reg(&args[1], Kind::Ref);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_ptr_eq(lhs, rhs, label_id);
+        }
+        "goto_if_not_ptr_ne" => {
+            let lhs = expect_reg(&args[0], Kind::Ref);
+            let rhs = expect_reg(&args[1], Kind::Ref);
+            let label = expect_tlabel(&args[2]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_ptr_ne(lhs, rhs, label_id);
+        }
+        "goto_if_not_ptr_iszero" => {
+            let cond = expect_reg(&args[0], Kind::Ref);
+            let label = expect_tlabel(&args[1]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_ptr_iszero(cond, label_id);
+        }
+        "goto_if_not_ptr_nonzero" => {
+            let cond = expect_reg(&args[0], Kind::Ref);
+            let label = expect_tlabel(&args[1]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_not_ptr_nonzero(cond, label_id);
         }
         "catch_exception" => {
             let label = expect_tlabel(&args[0]);
@@ -497,7 +719,7 @@ fn dispatch_op(
         // `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
         // `v` is either a `Register` or a `Constant`. Register source
         // lowers to the primitive `move_{i,r,f}` builder method;
-        // Constant source lowers to `load_const_{i,r,f}_value`,
+        // Constant source lowers via the builder's constant-pool helper,
         // matching the two argcode variants emitted by
         // `assembler.py:162-174` (`i` for Register, `c` for Constant).
         "int_copy" => match source_operand(args, result) {
@@ -563,18 +785,6 @@ fn dispatch_op(
         "float_pop" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state.builder.pop_f(dst);
-        }
-        "load_const_i" => {
-            let (dst, value) = expect_load_const_i(args, result);
-            state.builder.load_const_i_value(dst, value);
-        }
-        "load_const_r" => {
-            let (dst, value) = expect_load_const_r(args, result);
-            state.builder.load_const_r_value(dst, value);
-        }
-        "load_const_f" => {
-            let (dst, value) = expect_load_const_f(args, result);
-            state.builder.load_const_f_value(dst, value);
         }
         "load_state_field" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
@@ -701,18 +911,116 @@ fn dispatch_op(
                 .vable_arraylen(dst, expect_small_u16(&args[0]));
         }
         "hint_force_virtualizable" => state.builder.vable_force(),
-        // `rpython/jit/metainterp/resoperation.py` / `jtransform.py`
-        // emit per-opname integer comparisons and arithmetic; the
-        // assembler lowers those names directly to the matching
-        // JitCodeBuilder entrypoints.
-        "int_eq" => {
-            let dst = expect_result_reg(result, Kind::Int, "int_eq needs result");
+        // Per-OpCode opname dispatch for integer / float primitives —
+        // RPython `rpython/jit/metainterp/blackhole.py:459-723` defines
+        // one `bhimpl_*` per opname; `assembler.py:162-222` routes each
+        // via its own insns key. The SSARepr layer carries the
+        // canonical opname so pyre dispatch picks the matching
+        // `record_binop_*` / `record_unary_*` helper without a generic
+        // OpCode-bearing wrapper insn. No `generic record_*` SSA
+        // opname exists; only the canonical RPython names.
+        "int_add" | "int_sub" | "int_mul" | "int_floordiv" | "int_mod" | "int_and" | "int_or"
+        | "int_xor" | "int_lshift" | "int_rshift" | "int_eq" | "int_ne" | "int_lt" | "int_le"
+        | "int_gt" | "int_ge" | "uint_rshift" | "uint_mul_high" | "uint_lt" | "uint_le"
+        | "uint_gt" | "uint_ge" => {
+            let dst = expect_result_reg(result, Kind::Int, "int binop needs result");
+            let opcode = match opname {
+                "int_add" => majit_ir::OpCode::IntAdd,
+                "int_sub" => majit_ir::OpCode::IntSub,
+                "int_mul" => majit_ir::OpCode::IntMul,
+                "int_floordiv" => majit_ir::OpCode::IntFloorDiv,
+                "int_mod" => majit_ir::OpCode::IntMod,
+                "int_and" => majit_ir::OpCode::IntAnd,
+                "int_or" => majit_ir::OpCode::IntOr,
+                "int_xor" => majit_ir::OpCode::IntXor,
+                "int_lshift" => majit_ir::OpCode::IntLshift,
+                "int_rshift" => majit_ir::OpCode::IntRshift,
+                "int_eq" => majit_ir::OpCode::IntEq,
+                "int_ne" => majit_ir::OpCode::IntNe,
+                "int_lt" => majit_ir::OpCode::IntLt,
+                "int_le" => majit_ir::OpCode::IntLe,
+                "int_gt" => majit_ir::OpCode::IntGt,
+                "int_ge" => majit_ir::OpCode::IntGe,
+                "uint_rshift" => majit_ir::OpCode::UintRshift,
+                "uint_mul_high" => majit_ir::OpCode::UintMulHigh,
+                "uint_lt" => majit_ir::OpCode::UintLt,
+                "uint_le" => majit_ir::OpCode::UintLe,
+                "uint_gt" => majit_ir::OpCode::UintGt,
+                "uint_ge" => majit_ir::OpCode::UintGe,
+                _ => unreachable!(),
+            };
             state.builder.record_binop_i(
                 dst,
-                majit_ir::OpCode::IntEq,
+                opcode,
                 expect_reg(&args[0], Kind::Int),
                 expect_reg(&args[1], Kind::Int),
             );
+        }
+        "int_neg" | "int_invert" => {
+            let dst = expect_result_reg(result, Kind::Int, "int unary needs result");
+            let opcode = match opname {
+                "int_neg" => majit_ir::OpCode::IntNeg,
+                "int_invert" => majit_ir::OpCode::IntInvert,
+                _ => unreachable!(),
+            };
+            state
+                .builder
+                .record_unary_i(dst, opcode, expect_reg(&args[0], Kind::Int));
+        }
+        "ptr_eq" | "ptr_ne" | "instance_ptr_eq" | "instance_ptr_ne" => {
+            let dst = expect_result_reg(result, Kind::Int, "ptr binop needs result");
+            let opcode = match opname {
+                "ptr_eq" => majit_ir::OpCode::PtrEq,
+                "ptr_ne" => majit_ir::OpCode::PtrNe,
+                "instance_ptr_eq" => majit_ir::OpCode::InstancePtrEq,
+                "instance_ptr_ne" => majit_ir::OpCode::InstancePtrNe,
+                _ => unreachable!(),
+            };
+            state.builder.record_binop_r(
+                dst,
+                opcode,
+                expect_reg(&args[0], Kind::Ref),
+                expect_reg(&args[1], Kind::Ref),
+            );
+        }
+        "ptr_iszero" => {
+            let dst = expect_result_reg(result, Kind::Int, "ptr_iszero needs result");
+            state
+                .builder
+                .ptr_iszero(dst, expect_reg(&args[0], Kind::Ref));
+        }
+        "ptr_nonzero" => {
+            let dst = expect_result_reg(result, Kind::Int, "ptr_nonzero needs result");
+            state
+                .builder
+                .ptr_nonzero(dst, expect_reg(&args[0], Kind::Ref));
+        }
+        "float_add" | "float_sub" | "float_mul" | "float_truediv" => {
+            let dst = expect_result_reg(result, Kind::Float, "float binop needs result");
+            let opcode = match opname {
+                "float_add" => majit_ir::OpCode::FloatAdd,
+                "float_sub" => majit_ir::OpCode::FloatSub,
+                "float_mul" => majit_ir::OpCode::FloatMul,
+                "float_truediv" => majit_ir::OpCode::FloatTrueDiv,
+                _ => unreachable!(),
+            };
+            state.builder.record_binop_f(
+                dst,
+                opcode,
+                expect_reg(&args[0], Kind::Float),
+                expect_reg(&args[1], Kind::Float),
+            );
+        }
+        "float_neg" | "float_abs" => {
+            let dst = expect_result_reg(result, Kind::Float, "float unary needs result");
+            let opcode = match opname {
+                "float_neg" => majit_ir::OpCode::FloatNeg,
+                "float_abs" => majit_ir::OpCode::FloatAbs,
+                _ => unreachable!(),
+            };
+            state
+                .builder
+                .record_unary_f(dst, opcode, expect_reg(&args[0], Kind::Float));
         }
         "call_void" | "residual_call_void" => {
             let fn_idx = expect_small_u16(&args[0]);
@@ -827,49 +1135,55 @@ fn dispatch_op(
                     .call_assembler_float_typed(fn_idx, &call_args, dst),
             }
         }
-        "conditional_call_void" => {
+        "conditional_call_ir_v" => {
             let fn_idx = expect_small_u16(&args[0]);
             let cond_reg = expect_reg(&args[1], Kind::Int);
             let call_args = expect_call_args(&args[2..]);
             state
                 .builder
-                .conditional_call_void_typed_args(fn_idx, cond_reg, &call_args);
+                .conditional_call_ir_v_typed_args(fn_idx, cond_reg, &call_args);
         }
-        "conditional_call_value_int" => {
+        "conditional_call_value_ir_i" => {
             let fn_idx = expect_small_u16(&args[0]);
             let value_reg = expect_reg(&args[1], Kind::Int);
-            let dst =
-                expect_result_reg(result, Kind::Int, "conditional_call_value_int needs result");
+            let dst = expect_result_reg(
+                result,
+                Kind::Int,
+                "conditional_call_value_ir_i needs result",
+            );
             let call_args = expect_call_args(&args[2..]);
             state
                 .builder
-                .conditional_call_value_int_typed_args(fn_idx, value_reg, &call_args, dst);
+                .conditional_call_value_ir_i_typed_args(fn_idx, value_reg, &call_args, dst);
         }
-        "conditional_call_value_ref" => {
+        "conditional_call_value_ir_r" => {
             let fn_idx = expect_small_u16(&args[0]);
-            let value_reg = expect_reg(&args[1], Kind::Int);
-            let dst =
-                expect_result_reg(result, Kind::Ref, "conditional_call_value_ref needs result");
+            let value_reg = expect_reg(&args[1], Kind::Ref);
+            let dst = expect_result_reg(
+                result,
+                Kind::Ref,
+                "conditional_call_value_ir_r needs result",
+            );
             let call_args = expect_call_args(&args[2..]);
             state
                 .builder
-                .conditional_call_value_ref_typed_args(fn_idx, value_reg, &call_args, dst);
+                .conditional_call_value_ir_r_typed_args(fn_idx, value_reg, &call_args, dst);
         }
-        "record_known_result_int" => {
+        "record_known_result_i_ir_v" => {
             let fn_idx = expect_small_u16(&args[0]);
             let result_reg = expect_reg(&args[1], Kind::Int);
             let call_args = expect_call_args(&args[2..]);
             state
                 .builder
-                .record_known_result_int_typed_args(fn_idx, result_reg, &call_args);
+                .record_known_result_i_ir_v_typed_args(fn_idx, result_reg, &call_args);
         }
-        "record_known_result_ref" => {
+        "record_known_result_r_ir_v" => {
             let fn_idx = expect_small_u16(&args[0]);
             let result_reg = expect_reg(&args[1], Kind::Ref);
             let call_args = expect_call_args(&args[2..]);
             state
                 .builder
-                .record_known_result_ref_typed_args(fn_idx, result_reg, &call_args);
+                .record_known_result_r_ir_v_typed_args(fn_idx, result_reg, &call_args);
         }
         // `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` shape.
         // 12 opname combinations: residual_call_{r,ir,irf}_{i,r,f,v}. Only
@@ -1006,7 +1320,11 @@ fn dispatch_residual_call(
 
     // Pick the same builder method the optimizeopt layer resolves from
     // `EffectInfo.extraeffect`. Reskind drives the return-value kind;
-    // flavor drives the effect branch.
+    // flavor drives the effect branch. Every `CallFlavor` variant
+    // corresponds to a concrete `JitCodeBuilder::call_*_typed` family,
+    // so the canonical `residual_call_{kinds}_{reskind}` SSA shape can
+    // round-trip through pyre even when the runtime bytecode still uses
+    // majit's fixed `BC_CALL_*` adapter opcodes.
     match (stub.flavor, reskind) {
         (CallFlavor::Plain, ResKind::Int) => {
             let dst = expect_result_reg(result, Kind::Int, "residual_call int needs result");
@@ -1041,18 +1359,146 @@ fn dispatch_residual_call(
                 .builder
                 .call_may_force_ref_typed(fn_idx, &call_args, dst);
         }
+        (CallFlavor::Plain, ResKind::Float) => {
+            let dst = expect_result_reg(result, Kind::Float, "residual_call float needs result");
+            state.builder.call_float_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::MayForce, ResKind::Float) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Float,
+                "residual_call may_force float needs result",
+            );
+            state
+                .builder
+                .call_may_force_float_typed(fn_idx, &call_args, dst);
+        }
         (CallFlavor::MayForce, ResKind::Void) => {
             state
                 .builder
                 .call_may_force_void_typed_args(fn_idx, &call_args);
         }
-        // Remaining (flavor, reskind) combinations are reachable once more
-        // bytecode handlers use them. Add arms as needed; the panic keeps
-        // the pyre-jit walker in sync with this dispatch table.
-        (flavor, reskind) => panic!(
-            "dispatch_residual_call: unsupported (flavor, reskind) = ({:?}, {:?})",
-            flavor, reskind
-        ),
+        (CallFlavor::Pure, ResKind::Int) => {
+            let dst = expect_result_reg(result, Kind::Int, "residual_call pure int needs result");
+            state.builder.call_pure_int_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Pure, ResKind::Ref) => {
+            let dst = expect_result_reg(result, Kind::Ref, "residual_call pure ref needs result");
+            state.builder.call_pure_ref_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Pure, ResKind::Float) => {
+            let dst =
+                expect_result_reg(result, Kind::Float, "residual_call pure float needs result");
+            state.builder.call_pure_float_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Pure, ResKind::Void) => {
+            panic!("dispatch_residual_call: pure void call is not a valid rewrite_call shape");
+        }
+        (CallFlavor::ReleaseGil, ResKind::Int) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Int,
+                "residual_call release_gil int needs result",
+            );
+            state
+                .builder
+                .call_release_gil_int_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::ReleaseGil, ResKind::Ref) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Ref,
+                "residual_call release_gil ref needs result",
+            );
+            state
+                .builder
+                .call_release_gil_ref_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::ReleaseGil, ResKind::Float) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Float,
+                "residual_call release_gil float needs result",
+            );
+            state
+                .builder
+                .call_release_gil_float_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::ReleaseGil, ResKind::Void) => {
+            state
+                .builder
+                .call_release_gil_void_typed_args(fn_idx, &call_args);
+        }
+        (CallFlavor::LoopInvariant, ResKind::Int) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Int,
+                "residual_call loopinvariant int needs result",
+            );
+            state
+                .builder
+                .call_loopinvariant_int_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::LoopInvariant, ResKind::Ref) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Ref,
+                "residual_call loopinvariant ref needs result",
+            );
+            state
+                .builder
+                .call_loopinvariant_ref_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::LoopInvariant, ResKind::Float) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Float,
+                "residual_call loopinvariant float needs result",
+            );
+            state
+                .builder
+                .call_loopinvariant_float_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::LoopInvariant, ResKind::Void) => {
+            state
+                .builder
+                .call_loopinvariant_void_typed_args(fn_idx, &call_args);
+        }
+        (CallFlavor::Assembler, ResKind::Int) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Int,
+                "residual_call assembler int needs result",
+            );
+            state
+                .builder
+                .call_assembler_int_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Assembler, ResKind::Ref) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Ref,
+                "residual_call assembler ref needs result",
+            );
+            state
+                .builder
+                .call_assembler_ref_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Assembler, ResKind::Float) => {
+            let dst = expect_result_reg(
+                result,
+                Kind::Float,
+                "residual_call assembler float needs result",
+            );
+            state
+                .builder
+                .call_assembler_float_typed(fn_idx, &call_args, dst);
+        }
+        (CallFlavor::Assembler, ResKind::Void) => {
+            state
+                .builder
+                .call_assembler_void_typed_args(fn_idx, &call_args);
+        }
     }
 }
 
@@ -1146,48 +1592,9 @@ fn source_operand<'a>(args: &'a [Operand], result: Option<&Register>) -> MoveSou
     }
 }
 
-fn expect_load_const_i(args: &[Operand], result: Option<&Register>) -> (u16, i64) {
-    if let Some(dst) = result {
-        let Operand::ConstInt(value) = &args[0] else {
-            panic!("load_const_i expects ConstInt, got {:?}", args[0]);
-        };
-        return (dst.index, *value);
-    }
-    let Operand::ConstInt(value) = &args[1] else {
-        panic!("load_const_i expects ConstInt, got {:?}", args[1]);
-    };
-    (expect_reg(&args[0], Kind::Int), *value)
-}
-
-fn expect_load_const_r(args: &[Operand], result: Option<&Register>) -> (u16, i64) {
-    if let Some(dst) = result {
-        let Operand::ConstRef(value) = &args[0] else {
-            panic!("load_const_r expects ConstRef, got {:?}", args[0]);
-        };
-        return (dst.index, *value);
-    }
-    let Operand::ConstRef(value) = &args[1] else {
-        panic!("load_const_r expects ConstRef, got {:?}", args[1]);
-    };
-    (expect_reg(&args[0], Kind::Ref), *value)
-}
-
-fn expect_load_const_f(args: &[Operand], result: Option<&Register>) -> (u16, i64) {
-    if let Some(dst) = result {
-        let Operand::ConstFloat(value) = &args[0] else {
-            panic!("load_const_f expects ConstFloat, got {:?}", args[0]);
-        };
-        return (dst.index, *value);
-    }
-    let Operand::ConstFloat(value) = &args[1] else {
-        panic!("load_const_f expects ConstFloat, got {:?}", args[1]);
-    };
-    (expect_reg(&args[0], Kind::Float), *value)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::flatten::{DescrOperand, Label, SwitchDictDescr};
+    use super::super::flatten::{CallDescrStub, CallFlavor, DescrOperand, Label, SwitchDictDescr};
     use super::*;
 
     fn r(kind: Kind, index: u16) -> Register {
@@ -1237,6 +1644,96 @@ mod tests {
     }
 
     #[test]
+    fn assemble_accumulates_used_wellknown_insns() {
+        let mut assembler = Assembler::new();
+
+        let mut first = SSARepr::new("first");
+        first
+            .insns
+            .push(Insn::live(vec![Operand::Register(r(Kind::Ref, 0))]));
+        first.insns.push(Insn::op(
+            "ref_return",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+        ));
+        assembler.assemble(
+            &mut first,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let mut second = SSARepr::new("second");
+        second
+            .insns
+            .push(Insn::op("goto", vec![Operand::TLabel(TLabel::new("L1"))]));
+        second.insns.push(Insn::Label(Label::new("L1")));
+        assembler.assemble(&mut second, JitCodeBuilder::default(), None);
+
+        let insns = assembler.insns_snapshot();
+        let wellknown = majit_metainterp::jitcode::wellknown_bh_insns();
+        assert_eq!(insns.get("live/"), wellknown.get("live/"));
+        assert_eq!(insns.get("ref_return/r"), wellknown.get("ref_return/r"));
+        assert_eq!(insns.get("goto/L"), wellknown.get("goto/L"));
+    }
+
+    #[test]
+    fn assemble_accumulates_canonical_last_exc_value_and_jit_merge_point_keys() {
+        let mut assembler = Assembler::new();
+
+        let mut ssarepr = SSARepr::new("portal");
+        ssarepr.insns.push(Insn::op(
+            "jit_merge_point",
+            vec![
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Int,
+                    vec![
+                        Operand::Register(Register::new(Kind::Int, 0)),
+                        Operand::Register(Register::new(Kind::Int, 1)),
+                    ],
+                )),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Ref,
+                    vec![Operand::Register(Register::new(Kind::Ref, 0))],
+                )),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Ref,
+                    vec![
+                        Operand::Register(Register::new(Kind::Ref, 1)),
+                        Operand::Register(Register::new(Kind::Ref, 2)),
+                    ],
+                )),
+            ],
+        ));
+        ssarepr.insns.push(Insn::op_with_result(
+            "last_exc_value",
+            Vec::new(),
+            Register::new(Kind::Ref, 3),
+        ));
+        assembler.assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 2,
+                ref_: 4,
+                ..NumRegs::default()
+            }),
+        );
+
+        let insns = assembler.insns_snapshot();
+        let wellknown = majit_metainterp::jitcode::wellknown_bh_insns();
+        assert_eq!(
+            insns.get("jit_merge_point/IRR"),
+            wellknown.get("jit_merge_point/IRR")
+        );
+        assert_eq!(
+            insns.get("last_exc_value/>r"),
+            wellknown.get("last_exc_value/>r")
+        );
+    }
+
+    #[test]
     fn assemble_patches_jumps_through_labels() {
         let mut ssarepr = SSARepr::new("jump");
         ssarepr
@@ -1258,6 +1755,331 @@ mod tests {
         );
 
         assert_eq!(jitcode.follow_jump(3), 3);
+    }
+
+    #[test]
+    fn assemble_int_copy_from_constant_uses_copy_opcode_and_constant_pool() {
+        let mut ssarepr = SSARepr::new("const_copy");
+        ssarepr.insns.push(Insn::op_with_result(
+            "int_copy",
+            vec![Operand::ConstInt(42)],
+            Register::new(Kind::Int, 0),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let copy_opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("int_copy/i>i")
+            .expect("int_copy must be registered in wellknown insns");
+        assert_eq!(jitcode.constants_i, vec![42]);
+        assert_eq!(jitcode.code[0], copy_opcode);
+        assert_eq!(u16::from_le_bytes([jitcode.code[1], jitcode.code[2]]), 1);
+        assert_eq!(u16::from_le_bytes([jitcode.code[3], jitcode.code[4]]), 0);
+    }
+
+    #[test]
+    fn assemble_ptr_nonzero_uses_canonical_ref_nullity_opcode() {
+        let mut ssarepr = SSARepr::new("ptr_nonzero");
+        ssarepr.insns.push(Insn::op_with_result(
+            "ptr_nonzero",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+            Register::new(Kind::Int, 0),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("ptr_nonzero/r>i")
+            .expect("ptr_nonzero must be registered in wellknown insns");
+        assert_eq!(jitcode.code[0], opcode);
+        assert_eq!(u16::from_le_bytes([jitcode.code[1], jitcode.code[2]]), 0);
+        assert_eq!(u16::from_le_bytes([jitcode.code[3], jitcode.code[4]]), 0);
+    }
+
+    #[test]
+    fn assemble_goto_if_not_ptr_nonzero_uses_canonical_branch_opcode() {
+        let mut ssarepr = SSARepr::new("ptr_branch");
+        ssarepr.insns.push(Insn::op(
+            "goto_if_not_ptr_nonzero",
+            vec![
+                Operand::Register(r(Kind::Ref, 0)),
+                Operand::TLabel(TLabel::new("L1")),
+            ],
+        ));
+        ssarepr.insns.push(Insn::Label(Label::new("L1")));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("goto_if_not_ptr_nonzero/rL")
+            .expect("ptr_nonzero branch must be registered in wellknown insns");
+        assert_eq!(jitcode.code[0], opcode);
+        assert_eq!(jitcode.follow_jump(5), 5);
+    }
+
+    #[test]
+    fn assemble_conditional_call_value_ir_r_keeps_ref_register_bank() {
+        let mut ssarepr = SSARepr::new("cond_call_value_ir_r");
+        ssarepr.insns.push(Insn::op_with_result(
+            "conditional_call_value_ir_r",
+            vec![
+                Operand::ConstInt(7),
+                Operand::Register(Register::new(Kind::Ref, 1)),
+                Operand::Register(Register::new(Kind::Int, 0)),
+                Operand::Register(Register::new(Kind::Ref, 2)),
+            ],
+            Register::new(Kind::Ref, 4),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ref_: 5,
+                ..NumRegs::default()
+            }),
+        );
+
+        assert_eq!(jitcode.num_regs_i(), 1);
+        assert_eq!(jitcode.num_regs_r(), 5);
+    }
+
+    #[test]
+    fn assemble_record_known_result_r_ir_v_keeps_ref_register_bank() {
+        let mut ssarepr = SSARepr::new("record_known_result_r_ir_v");
+        ssarepr.insns.push(Insn::op(
+            "record_known_result_r_ir_v",
+            vec![
+                Operand::ConstInt(7),
+                Operand::Register(Register::new(Kind::Ref, 2)),
+                Operand::Register(Register::new(Kind::Int, 0)),
+                Operand::Register(Register::new(Kind::Ref, 1)),
+            ],
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ref_: 3,
+                ..NumRegs::default()
+            }),
+        );
+
+        assert_eq!(jitcode.num_regs_i(), 1);
+        assert_eq!(jitcode.num_regs_r(), 3);
+    }
+
+    #[test]
+    fn assemble_canonical_helper_call_family_does_not_publish_false_insn_keys() {
+        let mut assembler = Assembler::new();
+
+        let mut ssarepr = SSARepr::new("canonical_call_family");
+        ssarepr.insns.push(Insn::op(
+            "conditional_call_ir_v",
+            vec![
+                Operand::ConstInt(7),
+                Operand::Register(Register::new(Kind::Int, 0)),
+                Operand::Register(Register::new(Kind::Int, 1)),
+                Operand::Register(Register::new(Kind::Ref, 0)),
+            ],
+        ));
+        ssarepr.insns.push(Insn::op_with_result(
+            "conditional_call_value_ir_r",
+            vec![
+                Operand::ConstInt(7),
+                Operand::Register(Register::new(Kind::Ref, 1)),
+                Operand::Register(Register::new(Kind::Int, 1)),
+                Operand::Register(Register::new(Kind::Ref, 0)),
+            ],
+            Register::new(Kind::Ref, 2),
+        ));
+        ssarepr.insns.push(Insn::op(
+            "record_known_result_r_ir_v",
+            vec![
+                Operand::ConstInt(7),
+                Operand::Register(Register::new(Kind::Ref, 2)),
+                Operand::Register(Register::new(Kind::Int, 1)),
+                Operand::Register(Register::new(Kind::Ref, 0)),
+            ],
+        ));
+        assembler.assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 2,
+                ref_: 3,
+                ..NumRegs::default()
+            }),
+        );
+
+        let insns = assembler.insns_snapshot();
+        assert_eq!(
+            insns.get("conditional_call_ir_v/iiIRd"),
+            None,
+            "helper-side conditional_call_ir_v payload is not canonical iiIRd",
+        );
+        assert_eq!(
+            insns.get("conditional_call_value_ir_r/riIRd>r"),
+            None,
+            "helper-side conditional_call_value_ir_r payload is not canonical riIRd>r",
+        );
+        assert_eq!(
+            insns.get("record_known_result_r_ir_v/riIRd"),
+            None,
+            "helper-side record_known_result_r_ir_v payload is not canonical riIRd",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unimplemented opname")]
+    fn assemble_legacy_conditional_call_alias_is_rejected() {
+        let mut ssarepr = SSARepr::new("legacy_conditional_call_alias");
+        ssarepr.insns.push(Insn::op(
+            "conditional_call_void",
+            vec![
+                Operand::ConstInt(7),
+                Operand::Register(Register::new(Kind::Int, 0)),
+                Operand::Register(Register::new(Kind::Int, 1)),
+                Operand::Register(Register::new(Kind::Ref, 0)),
+            ],
+        ));
+
+        let _ = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 2,
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unimplemented opname")]
+    fn assemble_legacy_record_known_result_alias_is_rejected() {
+        let mut ssarepr = SSARepr::new("legacy_record_known_result_alias");
+        ssarepr.insns.push(Insn::op(
+            "record_known_result_ref",
+            vec![
+                Operand::ConstInt(7),
+                Operand::Register(Register::new(Kind::Ref, 2)),
+                Operand::Register(Register::new(Kind::Int, 0)),
+                Operand::Register(Register::new(Kind::Ref, 1)),
+            ],
+        ));
+
+        let _ = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ref_: 3,
+                ..NumRegs::default()
+            }),
+        );
+    }
+
+    #[test]
+    fn assemble_residual_call_irf_f_supports_pure_float_flavor() {
+        let mut ssarepr = SSARepr::new("residual_call_irf_f");
+        ssarepr.insns.push(Insn::op_with_result(
+            "residual_call_irf_f",
+            vec![
+                Operand::ConstInt(7),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Int,
+                    vec![Operand::Register(Register::new(Kind::Int, 0))],
+                )),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Ref,
+                    vec![Operand::Register(Register::new(Kind::Ref, 0))],
+                )),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Float,
+                    vec![Operand::Register(Register::new(Kind::Float, 0))],
+                )),
+                Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+                    flavor: CallFlavor::Pure,
+                    arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Float],
+                })),
+            ],
+            Register::new(Kind::Float, 1),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ref_: 1,
+                float: 2,
+            }),
+        );
+
+        // majit jitcode/mod.rs: `BC_CALL_PURE_FLOAT = 35`.
+        assert_eq!(jitcode.code[0], 35);
+    }
+
+    #[test]
+    fn assemble_residual_call_ir_v_supports_release_gil_void_flavor() {
+        let mut ssarepr = SSARepr::new("residual_call_ir_v");
+        ssarepr.insns.push(Insn::op(
+            "residual_call_ir_v",
+            vec![
+                Operand::ConstInt(7),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Int,
+                    vec![Operand::Register(Register::new(Kind::Int, 0))],
+                )),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Ref,
+                    vec![Operand::Register(Register::new(Kind::Ref, 0))],
+                )),
+                Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+                    flavor: CallFlavor::ReleaseGil,
+                    arg_kinds: vec![Kind::Int, Kind::Ref],
+                })),
+            ],
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        // majit jitcode/mod.rs: `BC_CALL_RELEASE_GIL_VOID = 45`.
+        assert_eq!(jitcode.code[0], 45);
     }
 
     /// `assembler.py:197-206` parity: a `Descr` operand attached to an op

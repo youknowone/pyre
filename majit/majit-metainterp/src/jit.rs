@@ -789,7 +789,7 @@ pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const
 //   → jtransform `conditional_call_ir_v` JitCode bytecode
 //
 // Rust: `conditional_call!(condition, func_path, arg1, arg2, ...)`
-//   → jitcode_lower intercepts macro → `__builder.conditional_call_void_typed_args`
+//   → jitcode_lower intercepts macro → `__builder.conditional_call_ir_v_typed_args`
 //   → BC_COND_CALL_VOID JitCode bytecode
 //
 // Use the `conditional_call!` macro in `#[jit_interp]` functions for the

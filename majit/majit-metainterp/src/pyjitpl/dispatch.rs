@@ -497,21 +497,6 @@ where
 
         let bytecode = self.frames.current_mut().next_u8();
         match bytecode {
-            jitcode::BC_LOAD_CONST_I => {
-                let (dst, value) = {
-                    let frame = self.frames.current_mut();
-                    let dst = frame.next_u16() as usize;
-                    let const_idx = frame.next_u16() as usize;
-                    let value = *frame
-                        .jitcode
-                        .constants_i
-                        .get(const_idx)
-                        .expect("jitcode const index out of bounds");
-                    (dst, value)
-                };
-                self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
-            }
-
             // -- State field access (register/tape machines) --
             jitcode::BC_LOAD_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -823,7 +808,13 @@ where
             jitcode::BC_UINT_GE => self.trace_binop_i(ctx, OpCode::UintGe),
             jitcode::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
             jitcode::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
-            jitcode::BC_BRANCH_REG_ZERO => {
+            jitcode::BC_PTR_EQ => self.trace_binop_r_to_i(ctx, OpCode::PtrEq),
+            jitcode::BC_PTR_NE => self.trace_binop_r_to_i(ctx, OpCode::PtrNe),
+            jitcode::BC_INSTANCE_PTR_EQ => self.trace_binop_r_to_i(ctx, OpCode::InstancePtrEq),
+            jitcode::BC_INSTANCE_PTR_NE => self.trace_binop_r_to_i(ctx, OpCode::InstancePtrNe),
+            jitcode::BC_PTR_ISZERO => self.trace_ptr_nullity(ctx, false),
+            jitcode::BC_PTR_NONZERO => self.trace_ptr_nullity(ctx, true),
+            jitcode::BC_GOTO_IF_NOT_INT_IS_TRUE => {
                 let (cond_idx, target) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
@@ -970,6 +961,30 @@ where
                     self.frames.current_mut().code_cursor = target;
                 }
             }
+            jitcode::BC_GOTO_IF_NOT_PTR_ISZERO | jitcode::BC_GOTO_IF_NOT_PTR_NONZERO => {
+                let (src_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
+                };
+                let (src, src_value) = self.read_ref_reg(src_idx);
+                let null = ctx.const_null();
+                let (opcode, cond_value) = match bytecode {
+                    jitcode::BC_GOTO_IF_NOT_PTR_ISZERO => (OpCode::PtrEq, (src_value == 0) as i64),
+                    jitcode::BC_GOTO_IF_NOT_PTR_NONZERO => (OpCode::PtrNe, (src_value != 0) as i64),
+                    _ => unreachable!(),
+                };
+                let cond = ctx.record_op(opcode, &[src, null]);
+                let guard = if cond_value == 0 {
+                    OpCode::GuardFalse
+                } else {
+                    OpCode::GuardTrue
+                };
+                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
+                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                if cond_value == 0 {
+                    self.frames.current_mut().code_cursor = target;
+                }
+            }
             jitcode::BC_CATCH_EXCEPTION => {
                 let _target = self.frames.current_mut().next_u16();
             }
@@ -1071,6 +1086,9 @@ where
                     })
                     .clone();
                 let mut sub_frame = MIFrame::new(sub_jitcode, pc);
+                // RPython `pyjitpl.py:2247-2253` populates the constants
+                // window during `MIFrame.setup`.
+                sub_frame.fill_const_slots(ctx);
                 // dispatch.rs sub-jitcode inline frame (RPython pyjitpl
                 // perform_call for non-portal jitcodes). The structured
                 // greenkey has no pc-component meaning here — use
@@ -1287,8 +1305,11 @@ where
                     _ => unreachable!(),
                 }
             }
+            // RPython `blackhole.py:638-640` `bhimpl_int_copy`. Operand
+            // order is `[src][dst]` per argcode `i>i`
+            // (`assembler.py:165-174`).
             jitcode::BC_MOVE_I => {
-                let (dst, src) = {
+                let (src, dst) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
@@ -1397,22 +1418,9 @@ where
                 }
             }
             // -- Ref-typed bytecodes ----
-            jitcode::BC_LOAD_CONST_R => {
-                let (dst, value) = {
-                    let frame = self.frames.current_mut();
-                    let dst = frame.next_u16() as usize;
-                    let const_idx = frame.next_u16() as usize;
-                    let value = *frame
-                        .jitcode
-                        .constants_r
-                        .get(const_idx)
-                        .expect("jitcode const index out of bounds");
-                    (dst, value)
-                };
-                self.set_ref_reg(dst, Some(ctx.const_ref(value)), Some(value));
-            }
+            // RPython `blackhole.py:641-643` `bhimpl_ref_copy`. `[src][dst]` per `r>r`.
             jitcode::BC_MOVE_R => {
-                let (dst, src) = {
+                let (src, dst) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
@@ -1519,22 +1527,9 @@ where
                 }
             }
             // -- Float-typed bytecodes ---
-            jitcode::BC_LOAD_CONST_F => {
-                let (dst, value) = {
-                    let frame = self.frames.current_mut();
-                    let dst = frame.next_u16() as usize;
-                    let const_idx = frame.next_u16() as usize;
-                    let value = *frame
-                        .jitcode
-                        .constants_f
-                        .get(const_idx)
-                        .expect("jitcode const index out of bounds");
-                    (dst, value)
-                };
-                self.set_float_reg(dst, Some(ctx.const_float(value)), Some(value));
-            }
+            // RPython `blackhole.py:644-646` `bhimpl_float_copy`. `[src][dst]` per `f>f`.
             jitcode::BC_MOVE_F => {
-                let (dst, src) = {
+                let (src, dst) = {
                     let frame = self.frames.current_mut();
                     (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
@@ -1790,6 +1785,55 @@ where
         self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
     }
 
+    /// Ref binop tracer helper returning an int result.
+    fn trace_binop_r_to_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
+        let (dst, lhs_idx, rhs_idx) = {
+            let frame = self.frames.current_mut();
+            let dst = frame.next_u16() as usize;
+            let lhs_idx = frame.next_u16() as usize;
+            let rhs_idx = frame.next_u16() as usize;
+            (dst, lhs_idx, rhs_idx)
+        };
+        let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
+        let (rhs, rhs_value) = self.read_ref_reg(rhs_idx);
+        if lhs == rhs {
+            if let Some(fast) = fastpath_same_boxes(opcode) {
+                self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
+                return;
+            }
+        }
+        let value = match opcode {
+            OpCode::PtrEq | OpCode::InstancePtrEq => (lhs_value == rhs_value) as i64,
+            OpCode::PtrNe | OpCode::InstancePtrNe => (lhs_value != rhs_value) as i64,
+            other => panic!("trace_binop_r_to_i: unsupported opcode {other:?}"),
+        };
+        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
+    }
+
+    /// Unary ref nullity checks trace as PTR_EQ/PTR_NE against CONST_NULL.
+    fn trace_ptr_nullity(&mut self, ctx: &mut TraceCtx, nonzero: bool) {
+        let (dst, src_idx) = {
+            let frame = self.frames.current_mut();
+            let dst = frame.next_u16() as usize;
+            let src_idx = frame.next_u16() as usize;
+            (dst, src_idx)
+        };
+        let (src, src_value) = self.read_ref_reg(src_idx);
+        let null = ctx.const_null();
+        let opcode = if nonzero {
+            OpCode::PtrNe
+        } else {
+            OpCode::PtrEq
+        };
+        let value = if nonzero {
+            (src_value != 0) as i64
+        } else {
+            (src_value == 0) as i64
+        };
+        self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src, null])), Some(value));
+    }
+
+    /// Per-opname float binop tracer helper.
     fn trace_binop_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         let (dst, lhs_idx, rhs_idx) = {
             let frame = self.frames.current_mut();
@@ -1836,7 +1880,12 @@ where
     let runtime = ClosureRuntime::new(label_at);
     let jitcode_arc = Arc::new(jitcode.clone());
     let mut standalone = StandaloneFrameStack::new();
-    standalone.frames.push(MIFrame::new(jitcode_arc, pc));
+    let mut frame = MIFrame::new(jitcode_arc, pc);
+    // RPython `pyjitpl.py:2247-2253` `MIFrame.setup` fills the
+    // constants window; bytecode operands indexed into
+    // `[num_regs_X .. num_regs_and_consts_X)` read these Const boxes.
+    frame.fill_const_slots(ctx);
+    standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.run_to_end(ctx, sym, &runtime)
 }
@@ -1849,6 +1898,8 @@ pub(crate) fn fastpath_same_boxes(opcode: OpCode) -> Option<i64> {
     match opcode {
         OpCode::IntEq | OpCode::IntLe | OpCode::IntGe => Some(1),
         OpCode::IntNe | OpCode::IntLt | OpCode::IntGt => Some(0),
+        OpCode::PtrEq | OpCode::InstancePtrEq => Some(1),
+        OpCode::PtrNe | OpCode::InstancePtrNe => Some(0),
         _ => None,
     }
 }

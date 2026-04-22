@@ -690,42 +690,7 @@ pub trait FailDescr: Descr {
     /// The types of the fail arguments.
     fn fail_arg_types(&self) -> &[Type];
 
-    /// Backend regalloc state (not upstream `rd_locs`): physical
-    /// jf_frame slot for each logical failarg index, or `None` when
-    /// the value is virtualized / held in an immediate / otherwise
-    /// unmapped at regalloc time.  Upstream's `store_info_on_descr`
-    /// (assembler.py:240-278) materializes a 16-bit-wide mapped table
-    /// from this regalloc state and stores it as `descr.rd_locs`;
-    /// pyre mirrors that through `rd_locs()` below.  Keep
-    /// `fail_arg_locs` as the pre-materialization view so the regalloc
-    /// layer can still distinguish mapped slots from virtualized ones.
-    /// Default empty so non-guard descrs (DoneWithThisFrame*,
-    /// ExitFrameWithException, loop-version markers) don't override.
-    fn fail_arg_locs(&self) -> &[Option<usize>] {
-        &[]
-    }
-
-    /// `history.py:125` `AbstractFailDescr._attrs_.rd_locs` /
-    /// `llsupport/assembler.py:240-278 store_info_on_descr` parity —
-    /// the compiled slot-position table backing
-    /// `llmodel.py:422-424 _decode_pos`.  Each entry is an unsigned
-    /// 16-bit slot index (encoding follows upstream: stack locs become
-    /// `(loc.value - base_ofs) // WORD`, register locs become
-    /// `all_reg_indexes[loc.value]`, and `None` locs become `0xFFFF`).
-    /// Consumers of `_decode_pos` index this table directly; virtualized
-    /// entries never reach `_decode_pos` (upstream assumption), so this
-    /// array is plain `u16` without an `Option` layer.  Default empty so
-    /// non-guard descrs don't override.
-    fn rd_locs(&self) -> &[u16] {
-        &[]
-    }
-
     /// Whether this fail descriptor represents a FINISH exit.
-    /// Upstream: `compile.py:623 _DoneWithThisFrameDescr.final_descr =
-    /// True`. Also true for `ExitFrameWithExceptionDescrRef`
-    /// (compile.py:658) — the exit-with-exception path is final but
-    /// not finish-with-result, so check `is_exit_frame_with_exception`
-    /// to distinguish.
     fn is_finish(&self) -> bool {
         false
     }
@@ -740,18 +705,6 @@ pub trait FailDescr: Descr {
     /// `handle_fail` method of the corresponding descr subclass.
     fn is_exit_frame_with_exception(&self) -> bool {
         false
-    }
-
-    /// For finish descrs (`is_finish() == true`), the result-kind
-    /// upstream reads from `jitdriver_sd.result_type` when raising
-    /// `jitexc.DoneWithThisFrame*` (compile.py:636/645/654/628). In
-    /// upstream each `DoneWithThisFrameDescr{Void,Int,Ref,Float}`
-    /// subclass hard-codes its own kind; pyre still collapses the
-    /// four into a single descr struct so each impl returns the kind
-    /// it was built with. Default `Void` matches upstream's
-    /// `DoneWithThisFrameDescrVoid`.
-    fn finish_result_type(&self) -> Type {
-        Type::Void
     }
 
     /// history.py:470-499 TargetToken parity: whether this exit corresponds
@@ -846,165 +799,7 @@ pub trait FailDescr: Descr {
     fn vector_info(&self) -> Vec<AccumInfo> {
         Vec::new()
     }
-
-    /// `AbstractFailDescr.handle_fail(self, deadframe, metainterp_sd,
-    /// jitdriver_sd)` parity (history.py:129 — pure virtual upstream).
-    ///
-    /// No default body: `handle_fail` is object-safe (called on
-    /// `&dyn FailDescr` from the CALL_ASSEMBLER trampoline), and a
-    /// default body that coerces `&self` into `&dyn FailDescr` would
-    /// need `Self: Sized` and drop out of the vtable. Instead each
-    /// concrete impl supplies a one-line body (`ctx.resume_guard(self)`
-    /// for the resume-guard descr family, or one of the finish-path
-    /// helpers for `DoneWithThisFrame*` / `ExitFrameWithExceptionRef`).
-    fn handle_fail(&self, ctx: &mut dyn HandleFailContext) -> HandleFailResult;
 }
-
-/// Handler-side context for `FailDescr::handle_fail` — the Rust
-/// analogue of upstream's `(deadframe, metainterp_sd, jitdriver_sd)`
-/// triple threaded through `rpython/jit/metainterp/compile.py:627-717`.
-///
-/// Upstream `metainterp_sd.cpu.get_*_value(deadframe, idx)` is exposed
-/// as the `get_*_value` methods. The two resume flows `must_compile +
-/// _trace_and_compile_from_bridge` and `resume_in_blackhole`
-/// (compile.py:702-716) are expressed as `resume_guard`; finish
-/// paths live in `done_with_this_frame` / `exit_frame_with_exception_ref`.
-///
-/// Implementers live on the backend/frontend boundary (pyre-jit /
-/// dynasm / cranelift) so the IR crate stays free of runtime
-/// dependencies.
-pub trait HandleFailContext {
-    /// `metainterp_sd.cpu.get_int_value(deadframe, idx)`
-    /// (llmodel.py:437-444).
-    fn get_int_value(&self, idx: usize) -> i64;
-
-    /// `metainterp_sd.cpu.get_ref_value(deadframe, idx)`
-    /// (llmodel.py:446-453).
-    fn get_ref_value(&self, idx: usize) -> crate::GcRef;
-
-    /// `metainterp_sd.cpu.get_float_value(deadframe, idx)`
-    /// (llmodel.py:455-462).
-    fn get_float_value(&self, idx: usize) -> u64;
-
-    /// `metainterp_sd.cpu.grab_exc_value(deadframe)`
-    /// (llmodel.py:240-241): reads `deadframe.jf_guard_exc`, returning
-    /// the GC ref of the exception raised from within a guard (or
-    /// `GcRef::NULL` when the slot is empty — the upstream OOM-recovery
-    /// path at `compile.py:1096-1097` falls back to a pre-allocated
-    /// `memory_error` singleton in that case).
-    fn grab_exc_value(&self) -> crate::GcRef;
-
-    /// warmspot.py:1021 `green_key` — identifies the caller loop's
-    /// header PC. Surfaced here so `resume_guard` implementations can
-    /// look up the owning compiled trace without plumbing it through
-    /// every descr.
-    fn green_key(&self) -> u64;
-
-    /// compile.py:626-656 `_DoneWithThisFrameDescr.handle_fail` body.
-    /// Upstream raises `jitexc.DoneWithThisFrame*(slot-0)`. The
-    /// integer-coded `result_type` matches RPython's
-    /// `jitdriver_sd.result_type` (history.INT / REF / FLOAT / VOID).
-    fn done_with_this_frame(&mut self, result_type: Type) -> HandleFailResult;
-
-    /// compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`
-    /// body. Upstream raises `jitexc.ExitFrameWithExceptionRef(slot-0)`.
-    fn exit_frame_with_exception_ref(&mut self) -> HandleFailResult;
-
-    /// compile.py:1096-1097 `cast_instance_to_gcref(memory_error)`.
-    ///
-    /// The interpreter wires this to the preallocated `MemoryError()`
-    /// singleton used when `cpu.grab_exc_value(deadframe)` returns NULL.
-    fn memory_error_gcref(&mut self) -> crate::GcRef;
-
-    /// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail` body.
-    /// The implementation is responsible for running
-    /// `must_compile` + `_trace_and_compile_from_bridge` (compile.py:
-    /// 702-709) or `resume_in_blackhole` (compile.py:710-716) as
-    /// appropriate for the current runtime state.
-    fn resume_guard(&mut self, descr: &dyn FailDescr) -> HandleFailResult;
-}
-
-/// Convenience dispatcher that routes `descr.handle_fail(ctx)` across
-/// the three upstream arms in `rpython/jit/metainterp/compile.py`:
-///
-/// - `is_exit_frame_with_exception()` → `ctx.exit_frame_with_exception_ref()`
-///   (compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`)
-/// - `is_finish()` → `ctx.done_with_this_frame(descr.finish_result_type())`
-///   (compile.py:626-656 `_DoneWithThisFrameDescr.handle_fail`)
-/// - otherwise → `ctx.resume_guard(descr)`
-///   (compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`)
-///
-/// Step 1 uses this shim inside every `impl FailDescr` that doesn't
-/// already have its own dedicated body, until Step 2 objectifies
-/// `DoneWithThisFrameDescr{Void,Int,Ref,Float}` +
-/// `ExitFrameWithExceptionDescrRef` as distinct types each owning
-/// their own `handle_fail`. At that point each subtype's `handle_fail`
-/// becomes a single direct `ctx.*` call and this shim becomes dead.
-pub fn dispatch_handle_fail(
-    descr: &dyn FailDescr,
-    ctx: &mut dyn HandleFailContext,
-) -> HandleFailResult {
-    if descr.is_exit_frame_with_exception() {
-        ctx.exit_frame_with_exception_ref()
-    } else if descr.is_finish() {
-        ctx.done_with_this_frame(descr.finish_result_type())
-    } else {
-        ctx.resume_guard(descr)
-    }
-}
-
-/// Outcome of `FailDescr::handle_fail`, mirroring the five concrete
-/// subclasses of `jitexc.JitException` that `warmspot.handle_jitexception`
-/// (warmspot.py:1025-1026) inspects before producing a portal return
-/// value.  `rpython/jit/metainterp/jitexc.py:17-51` declares:
-///
-/// * `DoneWithThisFrameVoid(JitException)` — `__init__(self)`
-/// * `DoneWithThisFrameInt(JitException)` — `self.result: Signed`
-/// * `DoneWithThisFrameRef(JitException)` — `self.result: GCREF`
-/// * `DoneWithThisFrameFloat(JitException)` — `self.result: FLOATSTORAGE`
-/// * `ExitFrameWithExceptionRef(JitException)` — `self.value: GCREF`
-///
-/// `ContinueRunningNormally` (jitexc.py:53) is not reachable from
-/// `handle_fail`; it is raised during tracing, not on trace exit.
-#[derive(Debug, Clone)]
-pub enum HandleFailResult {
-    /// `jitexc.DoneWithThisFrameVoid()` — empty payload.
-    DoneWithThisFrameVoid,
-    /// `jitexc.DoneWithThisFrameInt(result)` — `result: lltype.Signed`.
-    DoneWithThisFrameInt(i64),
-    /// `jitexc.DoneWithThisFrameRef(result)` — `result: llmemory.GCREF`.
-    DoneWithThisFrameRef(crate::GcRef),
-    /// `jitexc.DoneWithThisFrameFloat(result)` — `result: longlong.FLOATSTORAGE`.
-    DoneWithThisFrameFloat(f64),
-    /// `jitexc.ExitFrameWithExceptionRef(value)` — `value: llmemory.GCREF`.
-    ExitFrameWithExceptionRef(crate::GcRef),
-}
-
-/// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail` outcome
-/// specialized for CALL_ASSEMBLER slow paths.
-///
-/// Frontends own the `must_compile` / `resume_in_blackhole` branch.
-/// Backends consume this result to either execute the newly-attached
-/// bridge or return the already-decoded blackhole payload.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CallAssemblerHandleFailAction {
-    /// compile.py:706-708 `_trace_and_compile_from_bridge` succeeded.
-    ExecuteAttachedBridge,
-    /// compile.py:710-716 `resume_in_blackhole` already produced the
-    /// raw return bits expected by the caller stub.
-    ReturnToCaller(i64),
-}
-
-// ── compile.py:623-674 _DoneWithThisFrameDescr hierarchy ───────────
-//
-// The subtype structs (DoneWithThisFrameDescrVoid / Int / Ref / Float
-// and ExitFrameWithExceptionDescrRef) live alongside `make_and_attach_
-// done_descrs` in `majit-metainterp/src/compile.rs`, matching upstream
-// `rpython/jit/metainterp/compile.py:623-674`.  Keeping them inside the
-// ir crate would split the family across crates for no structural gain.
-#[allow(dead_code)]
-#[doc(hidden)]
-struct _DoneWithThisFrameHierarchyLivesInMetainterpCompile;
 
 /// resume.py:65-85 AccumInfo — metadata attached to guard descriptors
 /// so deoptimization can reconstruct vector accumulators.
@@ -2441,13 +2236,6 @@ impl FailDescr for SimpleFailDescr {
     fn is_finish(&self) -> bool {
         self.is_finish
     }
-    /// FINISH carries its one result in `fail_arg_types[0]` (or nothing
-    /// for void). This lets `handle_fail` hand the right
-    /// `DoneWithThisFrame*` kind (compile.py:626-656) to the
-    /// dispatcher even without the Step 2 subclass split.
-    fn finish_result_type(&self) -> Type {
-        self.fail_arg_types.first().copied().unwrap_or(Type::Void)
-    }
     fn trace_id(&self) -> u64 {
         self.trace_id
     }
@@ -2456,11 +2244,6 @@ impl FailDescr for SimpleFailDescr {
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
-    }
-    /// finish → compile.py:626-656 `_DoneWithThisFrameDescr.handle_fail`;
-    /// else  → compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-    fn handle_fail(&self, ctx: &mut dyn HandleFailContext) -> HandleFailResult {
-        dispatch_handle_fail(self, ctx)
     }
 }
 
@@ -2844,9 +2627,6 @@ mod tests {
             }
             fn fail_arg_types(&self) -> &[Type] {
                 &self.arg_types
-            }
-            fn handle_fail(&self, ctx: &mut dyn HandleFailContext) -> HandleFailResult {
-                ctx.resume_guard(self)
             }
         }
 

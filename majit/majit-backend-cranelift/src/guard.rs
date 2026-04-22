@@ -520,12 +520,6 @@ impl FailDescr for CraneliftFailDescr {
         self.is_exit_frame_with_exception
     }
 
-    /// FINISH carries its one result in `fail_arg_types[0]` (or
-    /// nothing for void). compile.py:626-656 parity.
-    fn finish_result_type(&self) -> Type {
-        self.fail_arg_types.first().copied().unwrap_or(Type::Void)
-    }
-
     fn is_external_jump(&self) -> bool {
         self.is_external_jump
     }
@@ -564,12 +558,6 @@ impl FailDescr for CraneliftFailDescr {
 
     fn is_compiling(&self) -> bool {
         self.is_compiling()
-    }
-
-    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
-        // finish → compile.py:626-656 `_DoneWithThisFrameDescr.handle_fail`;
-        // else  → compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-        majit_ir::dispatch_handle_fail(self, ctx)
     }
 }
 

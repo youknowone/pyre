@@ -477,7 +477,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     crate::dict_storage_store(
         namespace,
         "MemoryError",
-        make_exc_type("MemoryError", exc_memory_error_new, exception),
+        make_exc_type("MemoryError", exc_exception_new, exception),
     );
     crate::dict_storage_store(
         namespace,
@@ -1106,10 +1106,6 @@ exc_constructor!(
     exc_assertion_error,
     pyre_object::excobject::ExcKind::AssertionError
 );
-exc_constructor!(
-    exc_memory_error,
-    pyre_object::excobject::ExcKind::MemoryError
-);
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
 /// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
@@ -1147,7 +1143,6 @@ exc_new_wrapper!(exc_overflow_error_new, exc_overflow_error);
 exc_new_wrapper!(exc_import_error_new, exc_import_error);
 exc_new_wrapper!(exc_not_implemented_error_new, exc_not_implemented_error);
 exc_new_wrapper!(exc_assertion_error_new, exc_assertion_error);
-exc_new_wrapper!(exc_memory_error_new, exc_memory_error);
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 fn make_exc_type(
@@ -1182,20 +1177,6 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) {
 /// install_default_builtins).
 pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
     EXC_CLASS_REGISTRY.with(|r| r.borrow().get(name).copied())
-}
-
-/// `compile.py:1090` `memory_error = MemoryError()` parity.
-///
-/// The JIT propagate-exception slow path must reuse one preallocated
-/// `MemoryError` instance, not manufacture a fresh base `Exception`
-/// object on each OOM fallback.
-pub fn preallocated_memory_error() -> PyObjectRef {
-    static PREALLOCATED_MEMORY_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *PREALLOCATED_MEMORY_ERROR.get_or_init(|| {
-        let cls = lookup_exc_class("MemoryError")
-            .expect("MemoryError class must be installed before JIT setup");
-        exc_memory_error_new(&[cls]).expect("MemoryError __new__ must succeed") as usize
-    }) as PyObjectRef
 }
 
 thread_local! {
@@ -3214,15 +3195,5 @@ mod tests {
             err.message,
             "pow() 2nd argument cannot be negative when 3rd argument specified"
         );
-    }
-
-    #[test]
-    fn test_preallocated_memory_error_is_singleton_memoryerror_instance() {
-        let _ = new_builtin_dict_storage();
-        let exc0 = preallocated_memory_error();
-        let exc1 = preallocated_memory_error();
-        assert_eq!(exc0, exc1);
-        let cls = lookup_exc_class("MemoryError").expect("MemoryError must be registered");
-        assert_eq!(crate::typedef::r#type(exc0), Some(cls));
     }
 }

@@ -2007,17 +2007,17 @@ impl CodeWriter {
         // emits the same runtime bytes under pyre-only `load_const_*`
         // opnames; the SSARepr now carries the RPython-parity `*_copy`
         // name with a ConstInt/ConstRef/ConstFloat source operand.
-        // `int_eq` is NOT dual-emitted by itself.
-        //
-        // pyre's only emitter of `OpCode::IntEq` via `record_binop_i` is
-        // the `PopJumpIfTrue` branch-folding chain below — which
-        // `rpython/jit/codewriter/jtransform.py:1212` rewrites as
-        // `int_is_zero(x)` and `flatten.py:247` further specialises into
-        // `goto_if_not_int_is_zero`. Emitting a standalone `int_eq` at
-        // the PopJumpIfTrue site would replicate pyre's builder-ABI
-        // sequence into the SSARepr and lock in a pyre-only shape.
-        // Keep the handler on the direct builder path until the
-        // assembler learns the RPython specialisation.
+        // Per-opname integer / float primitives — `int_add`, `int_sub`,
+        // `int_mul`, `int_{floordiv,mod,and,or,xor,lshift,rshift}`,
+        // `int_{eq,ne,lt,le,gt,ge}`, `int_neg`, `int_invert`,
+        // `uint_{rshift,mul_high,lt,le,gt,ge}`, `float_{add,sub,mul,
+        // truediv,neg,abs}` — flow through canonical RPython opnames
+        // and the matching `record_binop_*` / `record_unary_*` arms in
+        // `assembler.rs`. The build-time pyre codewriter currently
+        // emits `BINARY_OP` / `COMPARE_OP` via polymorphic residual
+        // calls because pyre can't prove static operand types from the
+        // bytecode alone; the canonical per-opname handlers handle
+        // emissions that come from #[jit_interp]-lowered macros.
 
         // Call family intentionally has NO dual-emit.
         //
@@ -2221,31 +2221,15 @@ impl CodeWriter {
                 // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
                 // re-raise opname shares the `Block.exits` topology
                 // (`flatten.py` emits the two as alternative codings
-                // of the same exception exit). Upstream
-                // `flowspace/flowcontext.py:1282` wires the real
-                // `(w_type, w_value)` FlowValues from the pending
-                // exception.
+                // of the same exception exit).
                 //
-                // `FrameState.last_exception` (framestate.py:22).
-                // Upstream `rpython/jit/codewriter/flatten.py:161-162`
-                // `make_exception_link` asserts
-                //     assert link.last_exception is not None
-                //     assert link.last_exc_value is not None
-                // before emitting `reraise`, so reaching this macro
-                // with `current_state.last_exception == None` is a
-                // structural bug in the caller rather than a normal
-                // path. Fail loudly instead of quietly constructing
-                // a sentinel-filled exit link.
-                let (etype_var, evalue_var) = current_state.last_exception.clone().expect(
-                    "emit_reraise!: current_state.last_exception must be Some \
-                         (flatten.py:161-162 make_exception_link parity)",
-                );
+                // `reraise` preserves the current handler exception.
                 let link = super::flow::Link::new(
-                    vec![etype_var, evalue_var],
+                    exceptblock_link_args_strict(&current_state),
                     Some(graph.exceptblock.clone()),
                     None,
-                )
-                .into_ref();
+                );
+                let link = link.into_ref();
                 // Step 6A slice S4a: snapshot the EXIT state (same
                 // reasoning as `emit_raise!`).
                 append_exit_with_state(

@@ -5,11 +5,13 @@ pub use majit_translate::jitcode::{
     BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, JitCode as CanonicalJitCode,
 };
 
-pub(crate) const BC_LOAD_CONST_I: u8 = 1;
 pub(crate) const BC_LOOP_HEADER: u8 = 12;
 pub(crate) const BC_ABORT: u8 = 13;
 pub(crate) const BC_ABORT_PERMANENT: u8 = 14;
-pub(crate) const BC_BRANCH_REG_ZERO: u8 = 15;
+/// RPython `blackhole.py:913` aliases `bhimpl_goto_if_not_int_is_true`
+/// to `bhimpl_goto_if_not`, whose body takes the branch iff the int
+/// register is zero/false (`goto_if_not_int_is_true/iL`).
+pub(crate) const BC_GOTO_IF_NOT_INT_IS_TRUE: u8 = 15;
 pub(crate) const BC_JUMP: u8 = 16;
 pub(crate) const BC_INLINE_CALL: u8 = 17;
 pub(crate) const BC_RESIDUAL_CALL_VOID: u8 = 18;
@@ -17,12 +19,10 @@ pub(crate) const BC_MOVE_I: u8 = 21;
 pub(crate) const BC_CALL_INT: u8 = 22;
 pub(crate) const BC_CALL_PURE_INT: u8 = 23;
 // Ref-typed bytecodes
-pub(crate) const BC_LOAD_CONST_R: u8 = 24;
 pub(crate) const BC_MOVE_R: u8 = 27;
 pub(crate) const BC_CALL_REF: u8 = 28;
 pub(crate) const BC_CALL_PURE_REF: u8 = 29;
 // Float-typed bytecodes
-pub(crate) const BC_LOAD_CONST_F: u8 = 30;
 pub(crate) const BC_MOVE_F: u8 = 33;
 pub(crate) const BC_CALL_FLOAT: u8 = 34;
 pub(crate) const BC_CALL_PURE_FLOAT: u8 = 35;
@@ -162,8 +162,55 @@ pub(crate) const BC_UINT_LT: u8 = 144;
 pub(crate) const BC_UINT_LE: u8 = 145;
 pub(crate) const BC_UINT_GT: u8 = 146;
 pub(crate) const BC_UINT_GE: u8 = 147;
+// Ref/nullity primitives — RPython `blackhole.py:584-610`
+// `bhimpl_{ptr_eq,ptr_ne,ptr_iszero,ptr_nonzero,instance_ptr_eq,instance_ptr_ne}`.
+pub(crate) const BC_PTR_EQ: u8 = 151;
+pub(crate) const BC_PTR_NE: u8 = 152;
+pub(crate) const BC_INSTANCE_PTR_EQ: u8 = 153;
+pub(crate) const BC_INSTANCE_PTR_NE: u8 = 154;
+pub(crate) const BC_PTR_ISZERO: u8 = 155;
+pub(crate) const BC_PTR_NONZERO: u8 = 156;
+// Unary ptr nullity exitswitch specialisations — `blackhole.py:937-944`
+// `bhimpl_goto_if_not_ptr_{iszero,nonzero}`.
+pub(crate) const BC_GOTO_IF_NOT_PTR_ISZERO: u8 = 157;
+pub(crate) const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
+// Typed return opcodes — RPython `blackhole.py:841-862`
+// `bhimpl_int_return`, `bhimpl_float_return`, `bhimpl_void_return`.
+// pyre's portal return is REF (see BC_REF_RETURN) but the insns map
+// still needs every upstream return flavour so
+// `pyjitpl.py:2240-2243` `setup_insns` fields do not fall back to
+// `u8::MAX` sentinels.
+pub(crate) const BC_INT_RETURN: u8 = 148;
+pub(crate) const BC_FLOAT_RETURN: u8 = 149;
+pub(crate) const BC_VOID_RETURN: u8 = 150;
 
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
+
+/// Lookup a bytecode opcode by its `opname/argcodes` key.
+///
+/// RPython `assembler.py:220-222`:
+/// ```text
+/// key = opname + '/' + ''.join(argcodes)
+/// num = self.insns.setdefault(key, len(self.insns))
+/// self.code[startposition] = chr(num)
+/// ```
+///
+/// majit currently pre-populates the dict from `wellknown_bh_insns` so
+/// numbers match the hardcoded `BC_*` constants consumed by the
+/// blackhole dispatch. Once dispatch becomes table-driven the
+/// pre-population will drop and numbers will be allocated in emission
+/// order exactly like RPython.
+///
+/// Panics if `key` is not registered — mirrors the `assert 0 <= num <=
+/// 0xFF` behaviour RPython relies on at the assembler layer.
+pub(crate) fn insn_byte(key: &str) -> u8 {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<std::collections::HashMap<&'static str, u8>> = OnceLock::new();
+    let table = TABLE.get_or_init(wellknown_bh_insns);
+    *table
+        .get(key)
+        .unwrap_or_else(|| panic!("insn_byte: unregistered insns key {key:?}"))
+}
 
 /// Fixed majit blackhole opcode-name table.
 ///
@@ -185,15 +232,22 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("live/", BC_LIVE);
     m.insert("catch_exception/L", BC_CATCH_EXCEPTION);
     m.insert("rvmprof_code/ii", BC_RVMPROF_CODE);
+    // pyjitpl.py:2240-2243 typed return accessors:
+    //   op_int_return / op_ref_return / op_float_return / op_void_return
+    // pyre's portal result type is REF so `ref_return/r` is the only
+    // one produced by the current emitter, but the other three must be
+    // registered so `setup_insns` does not fall back to `u8::MAX` for
+    // them.
+    m.insert("int_return/i", BC_INT_RETURN);
     m.insert("ref_return/r", BC_REF_RETURN);
-    // NOTE: majit currently emits only `ref_return` because pyre's portal
-    // result type is REF; `int_return`, `float_return`, `void_return`, and
-    // `goto/L` have no corresponding BC_* constants yet. `setup_insns`
-    // therefore observes `u8::MAX` for those missing RPython opcodes, matching
-    // the `insns.get('...', -1)` fallback but not the full RPython opcode set.
+    m.insert("float_return/f", BC_FLOAT_RETURN);
+    m.insert("void_return/", BC_VOID_RETURN);
 
     // Control flow / structural markers that actually emit.
-    m.insert("jump/L", BC_JUMP);
+    // pyjitpl.py:2237 `op_goto = insns.get('goto/L', -1)` and
+    // blackhole.py:950 `bhimpl_goto(target): return target` — the
+    // canonical key is `goto/L`.
+    m.insert("goto/L", BC_JUMP);
     // loop_header takes a single int constant operand (the jitdriver index).
     // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header emits
     // SpaceOperation('loop_header', [c_index], None); blackhole.py:1063
@@ -201,9 +255,31 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("loop_header/i", BC_LOOP_HEADER);
     m.insert("raise/r", BC_RAISE);
     m.insert("reraise/", BC_RERAISE);
-    m.insert("last_exception/", BC_LAST_EXCEPTION);
-    m.insert("last_exc_value/", BC_LAST_EXC_VALUE);
-    m.insert("jit_merge_point/", BC_JIT_MERGE_POINT);
+    // blackhole.py:987 `@arguments("self", returns="i") bhimpl_last_exception`
+    // yields canonical key `last_exception/>i`.
+    m.insert("last_exception/>i", BC_LAST_EXCEPTION);
+    // flatten.py:347 emits `last_exc_value, '->', reg`, so
+    // assembler.py grows the canonical key `last_exc_value/>r`.
+    m.insert("last_exc_value/>r", BC_LAST_EXC_VALUE);
+    // pyre codewriter emits the portal subset of
+    // `jit_merge_point`: green-int list, green-ref list, red-ref list.
+    // The canonical SSA key is therefore `jit_merge_point/IRR`.
+    m.insert("jit_merge_point/IRR", BC_JIT_MERGE_POINT);
+    // jtransform.py:292-313 / 1672-1688 conditional/known-result family
+    // intentionally omitted. The helper-side `BC_COND_CALL_*` /
+    // `BC_RECORD_KNOWN_RESULT_*` adapters encode argc + per-arg kind tags
+    // in a flat payload, which is not line-by-line compatible with the
+    // canonical `iiIRd` / `riIRd>r` argcode layout. The translator-owned
+    // codewriter pipeline emits the real canonical keys when it actually
+    // assembles those operations.
+    // blackhole.py:1278-1319 inline-call family intentionally omitted.
+    // The helper-side `BC_INLINE_CALL` adapter in majit-metainterp uses a
+    // typed arg/return-slot payload that is not line-by-line compatible
+    // with canonical `inline_call_*` argcodes. The real RPython-shape
+    // `inline_call_*` keys come from the translator/codewriter pipeline
+    // when they are actually emitted; pre-registering them here would make
+    // `wellknown_bh_insns()` claim a bytecode contract this runtime does
+    // not truthfully expose.
 
     // jtransform.py:196 / flatten.py:247 — fused `goto_if_not_<op>_<type>`.
     // Argcodes follow assembler.py:162-196: two registers + label.
@@ -221,6 +297,8 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("goto_if_not_float_ge/ffL", BC_GOTO_IF_NOT_FLOAT_GE);
     m.insert("goto_if_not_ptr_eq/rrL", BC_GOTO_IF_NOT_PTR_EQ);
     m.insert("goto_if_not_ptr_ne/rrL", BC_GOTO_IF_NOT_PTR_NE);
+    m.insert("goto_if_not_ptr_iszero/rL", BC_GOTO_IF_NOT_PTR_ISZERO);
+    m.insert("goto_if_not_ptr_nonzero/rL", BC_GOTO_IF_NOT_PTR_NONZERO);
     m.insert("goto_if_not_int_is_zero/iL", BC_GOTO_IF_NOT_INT_IS_ZERO);
 
     // flatten.py:326-332 `insert_renamings` cycle-break push/pop pairs.
@@ -260,12 +338,48 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("uint_le/ii>i", BC_UINT_LE);
     m.insert("uint_gt/ii>i", BC_UINT_GT);
     m.insert("uint_ge/ii>i", BC_UINT_GE);
+    // Ref/nullity primitives — `blackhole.py:584-610`.
+    m.insert("ptr_eq/rr>i", BC_PTR_EQ);
+    m.insert("ptr_ne/rr>i", BC_PTR_NE);
+    m.insert("instance_ptr_eq/rr>i", BC_INSTANCE_PTR_EQ);
+    m.insert("instance_ptr_ne/rr>i", BC_INSTANCE_PTR_NE);
+    m.insert("ptr_iszero/r>i", BC_PTR_ISZERO);
+    m.insert("ptr_nonzero/r>i", BC_PTR_NONZERO);
+    // Per-opname float primitives — `blackhole.py:696-723`
+    // `bhimpl_float_{add,sub,mul,truediv,neg,abs}`.
     m.insert("float_add/ff>f", BC_FLOAT_ADD);
     m.insert("float_sub/ff>f", BC_FLOAT_SUB);
     m.insert("float_mul/ff>f", BC_FLOAT_MUL);
     m.insert("float_truediv/ff>f", BC_FLOAT_TRUEDIV);
     m.insert("float_neg/f>f", BC_FLOAT_NEG);
     m.insert("float_abs/f>f", BC_FLOAT_ABS);
+
+    // Typed register copy — `blackhole.py:638-646`
+    // `bhimpl_{int,ref,float}_copy`. `@arguments("i"|"r"|"f",
+    // returns="i"|"r"|"f")` yields canonical keys
+    // `{int,ref,float}_copy/X>X`. pyre's `move_{i,r,f}` emitters route
+    // through these bytes; flatten.py:326-332 `insert_renamings` is the
+    // main RPython producer of `int_copy` ops (cycle-break renamings),
+    // which pyre's super-inst expansion also re-uses.
+    m.insert("int_copy/i>i", BC_MOVE_I);
+    m.insert("ref_copy/r>r", BC_MOVE_R);
+    m.insert("float_copy/f>f", BC_MOVE_F);
+
+    // Guard-value promotions — `blackhole.py:648-656`
+    // `bhimpl_{int,ref,float}_guard_value`. Body is a no-op on the
+    // blackhole side; `pyjitpl.py:1512-1515`
+    // `opimpl_{int,ref,float}_guard_value` = `_opimpl_guard_value`
+    // emits GUARD_VALUE during tracing to promote the operand.
+    m.insert("int_guard_value/i", BC_INT_GUARD_VALUE);
+    m.insert("ref_guard_value/r", BC_REF_GUARD_VALUE);
+    m.insert("float_guard_value/f", BC_FLOAT_GUARD_VALUE);
+
+    // Truthy-exitswitch branch — `flatten.py:245` emits the canonical
+    // `goto_if_not/iL`; `blackhole.py:913`
+    // `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not` adds the
+    // specialised alias. Both keys map to the same fixed runtime byte.
+    m.insert("goto_if_not/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
+    m.insert("goto_if_not_int_is_true/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
 
     m
 }
@@ -732,6 +846,40 @@ pub(crate) fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
 mod tests {
     use super::*;
     use majit_translate::jitcode::{JitCode as BuildJitCode, JitCodeBody as BuildJitCodeBody};
+
+    #[test]
+    fn wellknown_bh_insns_stays_canonical_and_avoids_false_call_family_keys() {
+        let insns = wellknown_bh_insns();
+        assert!(
+            !insns.contains_key("jump/L"),
+            "wellknown_bh_insns must keep the canonical goto/L spelling",
+        );
+        assert!(
+            !insns.contains_key("conditional_call_ir_v/iiIRd"),
+            "helper-side BC_COND_CALL_VOID must not masquerade as \
+             canonical conditional_call_ir_v/iiIRd",
+        );
+        assert!(
+            !insns.contains_key("conditional_call_value_ir_r/riIRd>r"),
+            "helper-side BC_COND_CALL_VALUE_REF must not masquerade as \
+             canonical conditional_call_value_ir_r/riIRd>r",
+        );
+        assert!(
+            !insns.contains_key("record_known_result_r_ir_v/riIRd"),
+            "helper-side BC_RECORD_KNOWN_RESULT_REF must not masquerade as \
+             canonical record_known_result_r_ir_v/riIRd",
+        );
+        assert!(
+            !insns.contains_key("inline_call_ir_r/dIR>r"),
+            "helper-side BC_INLINE_CALL adapter must not masquerade as \
+             canonical inline_call_ir_r/dIR>r",
+        );
+        assert!(
+            !insns.contains_key("inline_call_irf_f/dIRF>f"),
+            "helper-side BC_INLINE_CALL adapter must not masquerade as \
+             canonical inline_call_irf_f/dIRF>f",
+        );
+    }
 
     #[test]
     fn canonical_build_jitcode_sizes_blackhole_register_files_without_conversion() {

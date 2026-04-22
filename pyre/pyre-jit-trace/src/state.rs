@@ -103,6 +103,11 @@ struct MetaInterpStaticData {
     /// pyjitpl.py:2255 `finish_setup` is per MetaInterpStaticData instance.
     /// `METAINTERP_SD` is thread-local in pyre, so this guard must live on
     /// the thread-local object rather than in a process-global `Once`.
+    ///
+    /// Unlike RPython, pyre assembles lazily and the writer-side
+    /// `Assembler.insns` table grows over time. The guard therefore marks
+    /// "initial finish_setup done" only; later snapshots still refresh the
+    /// cached opcode ids and liveness bytes in place.
     finish_setup_done: bool,
 
     // pyjitpl.py:2236-2243 opcode number cache filled by `setup_insns`.
@@ -183,7 +188,7 @@ impl MetaInterpStaticData {
     /// pyjitpl.py:2227-2243 `MetaInterpStaticData.setup_insns(self, insns)`:
     /// copy opcode numbers for the well-known bytecodes out of the
     /// assembler's `insns` dict in the same order as upstream.
-    fn setup_insns(&mut self, insns: &HashMap<&'static str, u8>) {
+    fn setup_insns(&mut self, insns: &HashMap<String, u8>) {
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
         self.op_goto = insns.get("goto/L").copied().unwrap_or(u8::MAX);
         self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
@@ -196,10 +201,7 @@ impl MetaInterpStaticData {
 
     /// pyjitpl.py:2255-2264 `finish_setup`: wire the assembler's opcode table
     /// into this staticdata object and snapshot the current `all_liveness`.
-    fn finish_setup_if_needed(&mut self, insns: &HashMap<&'static str, u8>, all_liveness: Vec<u8>) {
-        if self.finish_setup_done {
-            return;
-        }
+    fn finish_setup_if_needed(&mut self, insns: &HashMap<String, u8>, all_liveness: Vec<u8>) {
         self.setup_insns(insns);
         self.liveness_info = all_liveness;
         self.finish_setup_done = true;
@@ -399,6 +401,44 @@ pub fn liveness_info_snapshot() -> Vec<u8> {
 pub fn op_live() -> u8 {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| r.borrow().op_live)
+}
+
+/// blackhole.py:72-74 cached control opcodes consumed by pyre's
+/// blackhole-resume adapters. Returns the same `insns.get(..., -1)`
+/// values RPython would have stored on `BlackholeInterpBuilder`.
+pub fn blackhole_control_opcodes() -> (i32, i32, i32) {
+    use crate::assembler::ASSEMBLER_STATE;
+
+    let needs_refresh = METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let missing_live = sd.op_live == u8::MAX;
+        let missing_catch_exception = sd.op_catch_exception == u8::MAX;
+        let missing_rvmprof_code = sd.op_rvmprof_code == u8::MAX;
+        if !sd.finish_setup_done {
+            return true;
+        }
+        if !(missing_live || missing_catch_exception || missing_rvmprof_code) {
+            return false;
+        }
+        ASSEMBLER_STATE.with(|a| {
+            let asm = a.borrow();
+            (missing_live && asm.insns.contains_key("live/"))
+                || (missing_catch_exception && asm.insns.contains_key("catch_exception/L"))
+                || (missing_rvmprof_code && asm.insns.contains_key("rvmprof_code/ii"))
+        })
+    });
+    if needs_refresh {
+        ensure_finish_setup();
+    }
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let decode = |opcode: u8| -> i32 { if opcode == u8::MAX { -1 } else { opcode as i32 } };
+        (
+            decode(sd.op_live),
+            decode(sd.op_catch_exception),
+            decode(sd.op_rvmprof_code),
+        )
+    })
 }
 
 /// pyjitpl.py:2248-2249 module-level entry point for
@@ -5727,6 +5767,7 @@ mod indirectcalltargets_tests {
         assert_eq!(hit, expected_raw);
     }
 }
+
 #[derive(Clone, Copy)]
 pub struct ResumeFrameState {
     pub sym: *mut PyreSym,
@@ -5737,4 +5778,74 @@ pub struct ResumeFrameState {
     /// snapshotting liveness so the undefined call result does not leak
     /// stale boxes into guard fail_args.
     pub pending_result_stack_idx: Option<usize>,
+}
+
+#[cfg(test)]
+mod finish_setup_tests {
+    use super::{METAINTERP_SD, MetaInterpStaticData, blackhole_control_opcodes};
+    use crate::assembler::publish_state;
+
+    #[test]
+    fn finish_setup_refreshes_opcode_cache_after_initial_empty_snapshot() {
+        let mut sd = MetaInterpStaticData::new();
+        let empty = std::collections::HashMap::new();
+        sd.finish_setup_if_needed(&empty, Vec::new());
+        assert_eq!(sd.op_live, u8::MAX);
+        assert_eq!(sd.op_goto, u8::MAX);
+
+        let mut insns = std::collections::HashMap::new();
+        insns.insert("live/".to_string(), 88u8);
+        insns.insert("goto/L".to_string(), 16u8);
+        insns.insert("catch_exception/L".to_string(), 89u8);
+        insns.insert("rvmprof_code/ii".to_string(), 91u8);
+        insns.insert("int_return/i".to_string(), 148u8);
+        insns.insert("ref_return/r".to_string(), 76u8);
+        insns.insert("float_return/f".to_string(), 149u8);
+        insns.insert("void_return/".to_string(), 150u8);
+
+        sd.finish_setup_if_needed(&insns, vec![1, 2, 3]);
+        assert_eq!(sd.op_live, 88);
+        assert_eq!(sd.op_goto, 16);
+        assert_eq!(sd.op_catch_exception, 89);
+        assert_eq!(sd.op_rvmprof_code, 91);
+        assert_eq!(sd.op_int_return, 148);
+        assert_eq!(sd.op_ref_return, 76);
+        assert_eq!(sd.op_float_return, 149);
+        assert_eq!(sd.op_void_return, 150);
+        assert_eq!(sd.liveness_info, vec![1, 2, 3]);
+        assert!(sd.finish_setup_done);
+    }
+
+    #[test]
+    fn blackhole_control_opcodes_reflect_finish_setup_cache() {
+        let mut sd = MetaInterpStaticData::new();
+        let mut insns = std::collections::HashMap::new();
+        insns.insert("live/".to_string(), 88u8);
+        insns.insert("catch_exception/L".to_string(), 89u8);
+        insns.insert("rvmprof_code/ii".to_string(), 91u8);
+        sd.finish_setup_if_needed(&insns, Vec::new());
+        METAINTERP_SD.with(|slot| {
+            *slot.borrow_mut() = sd;
+        });
+
+        assert_eq!(blackhole_control_opcodes(), (88, 89, 91));
+    }
+
+    #[test]
+    fn blackhole_control_opcodes_refresh_after_initial_empty_snapshot() {
+        let mut sd = MetaInterpStaticData::new();
+        let empty = std::collections::HashMap::new();
+        sd.finish_setup_if_needed(&empty, Vec::new());
+        METAINTERP_SD.with(|slot| {
+            *slot.borrow_mut() = sd;
+        });
+
+        let mut insns = std::collections::HashMap::new();
+        insns.insert("live/".to_string(), 88u8);
+        insns.insert("catch_exception/L".to_string(), 89u8);
+        insns.insert("rvmprof_code/ii".to_string(), 91u8);
+        publish_state(&insns, &[], 0, 0);
+
+        assert_eq!(blackhole_control_opcodes(), (88, 89, 91));
+    }
 }

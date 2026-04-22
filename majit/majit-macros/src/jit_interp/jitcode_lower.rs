@@ -650,8 +650,8 @@ impl<'c> Lowerer<'c> {
     /// RPython jtransform.py:1685 — `rewrite_op_jit_conditional_call`.
     ///
     /// Recognizes `conditional_call!(condition, func, args...)` and emits
-    /// `__builder.conditional_call_void_args` which produces a BC_COND_CALL_VOID
-    /// JitCode bytecode. The meta-interpreter then emits CondCallN resop.
+    /// `__builder.conditional_call_ir_v_typed_args`, matching
+    /// `jtransform.py`'s canonical opname.
     fn lower_conditional_call(&mut self, expr: &Expr) -> Option<()> {
         let mac = match expr {
             Expr::Macro(m) => m,
@@ -697,7 +697,7 @@ impl<'c> Lowerer<'c> {
         let func_path = args[1];
         self.statements.push(quote! {
             let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
-            __builder.conditional_call_void_typed_args(__fn_idx, #cond_reg, &[#(#typed_arg_tokens),*]);
+            __builder.conditional_call_ir_v_typed_args(__fn_idx, #cond_reg, &[#(#typed_arg_tokens),*]);
         });
         Some(())
     }
@@ -705,7 +705,7 @@ impl<'c> Lowerer<'c> {
     /// RPython jtransform.py:1687 — `rewrite_op_jit_conditional_call_value`.
     ///
     /// Recognizes `conditional_call_elidable!(value, func, args...)` and emits
-    /// `__builder.conditional_call_value_int` producing BC_COND_CALL_VALUE_INT.
+    /// the canonical `conditional_call_value_ir_{i,r}` builder entrypoint.
     fn lower_conditional_call_elidable(&mut self, expr: &Expr) -> Option<Binding> {
         let mac = match expr {
             Expr::Macro(m) => m,
@@ -755,10 +755,10 @@ impl<'c> Lowerer<'c> {
         // RPython jtransform.py:1687 — conditional_call_value_ir_{i|r}
         let builder_call = match value_binding.kind {
             BindingKind::Ref => quote! {
-                __builder.conditional_call_value_ref_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
+                __builder.conditional_call_value_ir_r_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
             _ => quote! {
-                __builder.conditional_call_value_int_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
+                __builder.conditional_call_value_ir_i_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
         };
         self.statements.push(quote! {
@@ -775,7 +775,7 @@ impl<'c> Lowerer<'c> {
     /// RPython jtransform.py:292-313 — `rewrite_op_jit_record_known_result`.
     ///
     /// Recognizes `record_known_result!(result, func, args...)` and emits
-    /// `__builder.record_known_result_int` producing BC_RECORD_KNOWN_RESULT_INT.
+    /// the canonical `record_known_result_{i,r}_ir_v` builder entrypoint.
     fn lower_record_known_result(&mut self, expr: &Expr) -> Option<()> {
         let mac = match expr {
             Expr::Macro(m) => m,
@@ -820,10 +820,10 @@ impl<'c> Lowerer<'c> {
         // RPython jtransform.py:302-307 — record_known_result_{i|r}
         let builder_call = match result_binding.kind {
             BindingKind::Ref => quote! {
-                __builder.record_known_result_ref_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
+                __builder.record_known_result_r_ir_v_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
             },
             _ => quote! {
-                __builder.record_known_result_int_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
+                __builder.record_known_result_i_ir_v_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
             },
         };
         self.statements.push(quote! {
@@ -1395,7 +1395,7 @@ impl<'c> Lowerer<'c> {
             let #end_label = __builder.new_label();
         });
         self.statements.push(quote! {
-            __builder.branch_reg_zero(#cond_reg, #else_label);
+            __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
         });
         self.statements.extend(then_stmts);
         self.statements.push(quote! {
@@ -1473,7 +1473,7 @@ impl<'c> Lowerer<'c> {
                     __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
                 });
                 self.statements.push(quote! {
-                    __builder.branch_reg_zero(#eq_reg, #next_label);
+                    __builder.goto_if_not_int_is_true(#eq_reg, #next_label);
                 });
             } else {
                 // Multiple literals (Or pattern): chain with logical OR
@@ -1503,7 +1503,7 @@ impl<'c> Lowerer<'c> {
                     or_reg = new_or_reg;
                 }
                 self.statements.push(quote! {
-                    __builder.branch_reg_zero(#or_reg, #next_label);
+                    __builder.goto_if_not_int_is_true(#or_reg, #next_label);
                 });
             }
 
@@ -1535,7 +1535,7 @@ impl<'c> Lowerer<'c> {
     /// ```text
     /// loop_start:
     ///   eval cond
-    ///   branch_reg_zero(cond, loop_end)
+    ///   goto_if_not_int_is_true(cond, loop_end)
     ///   eval body
     ///   jump(loop_start)
     /// loop_end:
@@ -1558,7 +1558,7 @@ impl<'c> Lowerer<'c> {
         let cond = self.lower_value_expr(&expr_while.cond)?;
         let cond_reg = cond.reg;
         self.statements.push(quote! {
-            __builder.branch_reg_zero(#cond_reg, #loop_end);
+            __builder.goto_if_not_int_is_true(#cond_reg, #loop_end);
         });
 
         // Lower the body, with break targets pointing to loop_end
@@ -1709,7 +1709,7 @@ impl<'c> Lowerer<'c> {
             let #end_label = __builder.new_label();
         });
         self.statements.push(quote! {
-            __builder.branch_reg_zero(#cond_reg, #else_label);
+            __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
         });
 
         // Lower then-branch with loop control
@@ -1790,7 +1790,7 @@ impl<'c> Lowerer<'c> {
                     __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
                 });
                 self.statements.push(quote! {
-                    __builder.branch_reg_zero(#eq_reg, #next_label);
+                    __builder.goto_if_not_int_is_true(#eq_reg, #next_label);
                 });
             } else {
                 let first_val = literals[0];
@@ -1818,7 +1818,7 @@ impl<'c> Lowerer<'c> {
                     or_reg = new_or_reg;
                 }
                 self.statements.push(quote! {
-                    __builder.branch_reg_zero(#or_reg, #next_label);
+                    __builder.goto_if_not_int_is_true(#or_reg, #next_label);
                 });
             }
 
@@ -2361,18 +2361,16 @@ impl<'c> Lowerer<'c> {
                         #call_stmt
                     });
                 }
-                crate::jit_interp::CallPolicyKind::InlineInt => {
+                crate::jit_interp::CallPolicyKind::InlineInt
+                | crate::jit_interp::CallPolicyKind::InlineRef
+                | crate::jit_interp::CallPolicyKind::InlineFloat => {
+                    result_kind = binding_kind_for_inline_policy(kind).unwrap();
                     let builder_path = inline_builder_path(&call.func)?;
-                    let inline_args = typed_inline_arg_tokens(&arg_bindings);
+                    let inline_call = inline_call_tokens(&arg_bindings, reg);
                     self.statements.push(quote! {
                         let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = #builder_path();
                         let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                        __builder.inline_call_with_typed_args(
-                            __sub_idx,
-                            #inline_args,
-                            Some((__sub_return_reg, #reg)),
-                            __sub_return_kind,
-                        );
+                        #inline_call
                     });
                 }
                 _ => return None,
@@ -2380,10 +2378,10 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
-                let inline_args = typed_inline_arg_tokens(&arg_bindings);
+                let inline_call = inline_call_tokens(&arg_bindings, reg);
                 let int_arg_regs = int_arg_regs(&arg_bindings);
                 let unsupported = self.inference_failure_tokens(
-                    "inferred helper policy does not support this value call here",
+                    "inferred helper policy only supports int-return value calls here; use an explicit inline_ref/inline_float or *_ref_wrapped/*_float_wrapped policy",
                 );
                 if let Some(_arg_regs) = int_arg_regs {
                     self.statements.push(quote! {
@@ -2411,12 +2409,7 @@ impl<'c> Lowerer<'c> {
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                                __builder.inline_call_with_typed_args(
-                                    __sub_idx,
-                                    #inline_args,
-                                    Some((__sub_return_reg, #reg)),
-                                    __sub_return_kind,
-                                );
+                                #inline_call
                             }
                             10u8 => {
                                 __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
@@ -2458,12 +2451,7 @@ impl<'c> Lowerer<'c> {
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                                __builder.inline_call_with_typed_args(
-                                    __sub_idx,
-                                    #inline_args,
-                                    Some((__sub_return_reg, #reg)),
-                                    __sub_return_kind,
-                                );
+                                #inline_call
                             }
                             10u8 => {
                                 __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
@@ -2526,7 +2514,7 @@ impl<'c> Lowerer<'c> {
             let #end_label = __builder.new_label();
         });
         self.statements.push(quote! {
-            __builder.branch_reg_zero(#cond_reg, #else_label);
+            __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
         });
         self.statements.extend(then_stmts);
         self.statements.push(quote! {
@@ -2766,23 +2754,141 @@ fn int_arg_regs(bindings: &[Binding]) -> Option<Vec<u16>> {
         .collect()
 }
 
-fn typed_inline_arg_tokens(bindings: &[Binding]) -> TokenStream {
-    let args = bindings.iter().enumerate().map(|(index, binding)| {
-        let reg = binding.reg;
-        let idx = index as u16;
-        match binding.kind {
-            BindingKind::Int => {
-                quote! { (majit_metainterp::JitArgKind::Int, #reg, #idx) }
-            }
-            BindingKind::Ref => {
-                quote! { (majit_metainterp::JitArgKind::Ref, #reg, #idx) }
-            }
-            BindingKind::Float => {
-                quote! { (majit_metainterp::JitArgKind::Float, #reg, #idx) }
-            }
+fn inline_int_arg_tokens(bindings: &[Binding]) -> TokenStream {
+    let mut next_idx = 0u16;
+    let args = bindings.iter().filter_map(|binding| match binding.kind {
+        BindingKind::Int => {
+            let reg = binding.reg;
+            let idx = next_idx;
+            next_idx = next_idx.saturating_add(1);
+            Some(quote! { (#reg, #idx) })
         }
+        BindingKind::Ref | BindingKind::Float => None,
     });
     quote! { &[#(#args),*] }
+}
+
+fn inline_ref_arg_tokens(bindings: &[Binding]) -> TokenStream {
+    let mut next_idx = 0u16;
+    let args = bindings.iter().filter_map(|binding| match binding.kind {
+        BindingKind::Ref => {
+            let reg = binding.reg;
+            let idx = next_idx;
+            next_idx = next_idx.saturating_add(1);
+            Some(quote! { (#reg, #idx) })
+        }
+        BindingKind::Int | BindingKind::Float => None,
+    });
+    quote! { &[#(#args),*] }
+}
+
+fn inline_float_arg_tokens(bindings: &[Binding]) -> TokenStream {
+    let mut next_idx = 0u16;
+    let args = bindings.iter().filter_map(|binding| match binding.kind {
+        BindingKind::Float => {
+            let reg = binding.reg;
+            let idx = next_idx;
+            next_idx = next_idx.saturating_add(1);
+            Some(quote! { (#reg, #idx) })
+        }
+        BindingKind::Int | BindingKind::Ref => None,
+    });
+    quote! { &[#(#args),*] }
+}
+
+fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
+    let args_i = inline_int_arg_tokens(bindings);
+    let args_r = inline_ref_arg_tokens(bindings);
+    let args_f = inline_float_arg_tokens(bindings);
+    let has_int_args = bindings
+        .iter()
+        .any(|binding| matches!(binding.kind, BindingKind::Int));
+    let has_float_args = bindings
+        .iter()
+        .any(|binding| matches!(binding.kind, BindingKind::Float));
+
+    let call_i = if has_float_args {
+        quote! {
+            __builder.inline_call_irf_i(
+                __sub_idx,
+                #args_i,
+                #args_r,
+                #args_f,
+                Some((__sub_return_reg, #result_reg)),
+            );
+        }
+    } else if has_int_args {
+        quote! {
+            __builder.inline_call_ir_i(
+                __sub_idx,
+                #args_i,
+                #args_r,
+                Some((__sub_return_reg, #result_reg)),
+            );
+        }
+    } else {
+        quote! {
+            __builder.inline_call_r_i(
+                __sub_idx,
+                #args_r,
+                Some((__sub_return_reg, #result_reg)),
+            );
+        }
+    };
+    let call_r = if has_float_args {
+        quote! {
+            __builder.inline_call_irf_r(
+                __sub_idx,
+                #args_i,
+                #args_r,
+                #args_f,
+                Some((__sub_return_reg, #result_reg)),
+            );
+        }
+    } else if has_int_args {
+        quote! {
+            __builder.inline_call_ir_r(
+                __sub_idx,
+                #args_i,
+                #args_r,
+                Some((__sub_return_reg, #result_reg)),
+            );
+        }
+    } else {
+        quote! {
+            __builder.inline_call_r_r(
+                __sub_idx,
+                #args_r,
+                Some((__sub_return_reg, #result_reg)),
+            );
+        }
+    };
+    let call_f = quote! {
+        __builder.inline_call_irf_f(
+            __sub_idx,
+            #args_i,
+            #args_r,
+            #args_f,
+            Some((__sub_return_reg, #result_reg)),
+        );
+    };
+
+    quote! {
+        match __sub_return_kind {
+            0u8 => {
+                #call_i
+            }
+            1u8 => {
+                #call_r
+            }
+            2u8 => {
+                #call_f
+            }
+            _ => {
+                panic!("inline helper returned unknown return kind");
+            }
+        }
+    }
 }
 
 fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
@@ -2876,6 +2982,15 @@ fn inline_builder_path(expr: &Expr) -> Option<Path> {
     Some(path)
 }
 
+fn binding_kind_for_inline_policy(kind: crate::jit_interp::CallPolicyKind) -> Option<BindingKind> {
+    match kind {
+        crate::jit_interp::CallPolicyKind::InlineInt => Some(BindingKind::Int),
+        crate::jit_interp::CallPolicyKind::InlineRef => Some(BindingKind::Ref),
+        crate::jit_interp::CallPolicyKind::InlineFloat => Some(BindingKind::Float),
+        _ => None,
+    }
+}
+
 fn helper_policy_path(expr: &Expr) -> Option<Path> {
     let Expr::Path(ExprPath { path, .. }) = expr else {
         return None;
@@ -2958,19 +3073,15 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         .collect();
     let mut lowerer =
         Lowerer::new_with_call_policies(None, call_policies, InferenceFailureMode::Panic);
-    for (index, arg) in func.sig.inputs.iter().enumerate() {
+    let param_layout = inline_helper_param_layout(func)?;
+    let mut max_reg = 0u16;
+    for (arg, (param_kind, reg)) in func.sig.inputs.iter().zip(param_layout.into_iter()) {
         let FnArg::Typed(pat_type) = arg else {
             return Err(syn::Error::new_spanned(
                 arg,
                 "#[jit_inline] does not support methods or self receivers",
             ));
         };
-        let param_kind = classify_param_type(&pat_type.ty).ok_or_else(|| {
-            syn::Error::new_spanned(
-                &pat_type.ty,
-                "#[jit_inline] parameters must use i64/isize (Int), usize/pointer (Ref), or f64 (Float)",
-            )
-        })?;
         let Pat::Ident(pat_ident) = &*pat_type.pat else {
             return Err(syn::Error::new_spanned(
                 &pat_type.pat,
@@ -2982,16 +3093,17 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
             InlineReturnKind::Ref => BindingKind::Ref,
             InlineReturnKind::Float => BindingKind::Float,
         };
+        max_reg = max_reg.max(reg.saturating_add(1));
         lowerer.bindings.insert(
             pat_ident.ident.to_string(),
             Binding {
-                reg: index as u16,
+                reg,
                 kind: binding_kind,
                 depends_on_stack: false,
             },
         );
     }
-    lowerer.next_reg = func.sig.inputs.len() as u16;
+    lowerer.next_reg = max_reg;
 
     let Some(binding) = lowerer.lower_block_value(&func.block) else {
         return Ok(None);
@@ -3005,6 +3117,63 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         return_reg: binding.reg,
         return_kind,
     }))
+}
+
+pub(crate) fn inline_helper_param_layout(
+    func: &ItemFn,
+) -> syn::Result<Vec<(InlineReturnKind, u16)>> {
+    let mut next_i = 0u16;
+    let mut next_r = 0u16;
+    let mut next_f = 0u16;
+    let mut layout = Vec::with_capacity(func.sig.inputs.len());
+    for arg in &func.sig.inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            return Err(syn::Error::new_spanned(
+                arg,
+                "#[jit_inline] does not support methods or self receivers",
+            ));
+        };
+        let param_kind = classify_param_type(&pat_type.ty).ok_or_else(|| {
+            syn::Error::new_spanned(
+                &pat_type.ty,
+                "#[jit_inline] parameters must use i64/isize (Int), usize/pointer (Ref), or f64 (Float)",
+            )
+        })?;
+        let reg = match param_kind {
+            InlineReturnKind::Int => {
+                let reg = next_i;
+                next_i = next_i.saturating_add(1);
+                reg
+            }
+            InlineReturnKind::Ref => {
+                let reg = next_r;
+                next_r = next_r.saturating_add(1);
+                reg
+            }
+            InlineReturnKind::Float => {
+                let reg = next_f;
+                next_f = next_f.saturating_add(1);
+                reg
+            }
+        };
+        layout.push((param_kind, reg));
+    }
+    Ok(layout)
+}
+
+pub(crate) fn inline_helper_param_counts(func: &ItemFn) -> syn::Result<(u16, u16, u16)> {
+    let layout = inline_helper_param_layout(func)?;
+    let mut count_i = 0u16;
+    let mut count_r = 0u16;
+    let mut count_f = 0u16;
+    for (kind, _) in layout {
+        match kind {
+            InlineReturnKind::Int => count_i = count_i.saturating_add(1),
+            InlineReturnKind::Ref => count_r = count_r.saturating_add(1),
+            InlineReturnKind::Float => count_f = count_f.saturating_add(1),
+        }
+    }
+    Ok((count_i, count_r, count_f))
 }
 
 fn try_generate_jitcode_body_inner(
@@ -3056,5 +3225,213 @@ mod tests {
         let pat = parse_pat("_");
         let lits = extract_pat_literals(&pat);
         assert_eq!(lits, None);
+    }
+
+    fn binding(reg: u16, kind: BindingKind) -> Binding {
+        Binding {
+            reg,
+            kind,
+            depends_on_stack: false,
+        }
+    }
+
+    fn parse_fn(code: &str) -> ItemFn {
+        syn::parse_str(code).expect("failed to parse function")
+    }
+
+    fn inline_policy_with_kind(
+        path: &str,
+        kind: crate::jit_interp::CallPolicyKind,
+    ) -> (Path, Option<crate::jit_interp::CallPolicyKind>) {
+        (
+            syn::parse_str(path).expect("failed to parse path"),
+            Some(kind),
+        )
+    }
+
+    fn inline_policy(path: &str) -> (Path, Option<crate::jit_interp::CallPolicyKind>) {
+        inline_policy_with_kind(path, crate::jit_interp::CallPolicyKind::InlineInt)
+    }
+
+    fn parse_call(code: &str) -> ExprCall {
+        syn::parse_str(code).expect("failed to parse call")
+    }
+
+    #[test]
+    fn inline_call_tokens_use_r_family_for_ref_only_args() {
+        let tokens = inline_call_tokens(&[binding(0, BindingKind::Ref)], 7).to_string();
+        assert!(tokens.contains("inline_call_r_i"));
+        assert!(tokens.contains("inline_call_r_r"));
+        assert!(tokens.contains("inline_call_irf_f"));
+        assert!(!tokens.contains("inline_call_ir_i"));
+        assert!(!tokens.contains("inline_call_ir_r"));
+        assert!(!tokens.contains("inline_call_irf_i"));
+        assert!(!tokens.contains("inline_call_irf_r"));
+    }
+
+    #[test]
+    fn inline_call_tokens_use_ir_family_when_any_int_arg_is_present() {
+        let tokens = inline_call_tokens(
+            &[binding(0, BindingKind::Ref), binding(1, BindingKind::Int)],
+            9,
+        )
+        .to_string();
+        assert!(tokens.contains("inline_call_ir_i"));
+        assert!(tokens.contains("inline_call_ir_r"));
+        assert!(tokens.contains("inline_call_irf_f"));
+        assert!(!tokens.contains("inline_call_r_i"));
+        assert!(!tokens.contains("inline_call_r_r"));
+        assert!(!tokens.contains("inline_call_irf_i"));
+        assert!(!tokens.contains("inline_call_irf_r"));
+    }
+
+    #[test]
+    fn inline_call_tokens_use_irf_family_when_any_float_arg_is_present() {
+        let tokens = inline_call_tokens(
+            &[binding(0, BindingKind::Int), binding(1, BindingKind::Float)],
+            11,
+        )
+        .to_string();
+        assert!(tokens.contains("inline_call_irf_i"));
+        assert!(tokens.contains("inline_call_irf_r"));
+        assert!(tokens.contains("inline_call_irf_f"));
+        assert!(!tokens.contains("inline_call_r_i"));
+        assert!(!tokens.contains("inline_call_r_r"));
+        assert!(!tokens.contains("inline_call_ir_i"));
+        assert!(!tokens.contains("inline_call_ir_r"));
+    }
+
+    #[test]
+    fn inline_helper_codegen_uses_canonical_r_surface() {
+        let helper = generate_inline_helper_jitcode_with_calls(
+            &parse_fn(
+                r#"
+                fn outer(arg: usize) -> usize {
+                    callee(arg)
+                }
+                "#,
+            ),
+            &[inline_policy("callee")],
+        )
+        .expect("jit_inline lowering should succeed")
+        .expect("helper should lower");
+        let body = helper.body.to_string();
+        assert!(body.contains("inline_call_r_r"));
+        assert!(!body.contains("inline_call_with_typed_args"));
+    }
+
+    #[test]
+    fn inline_helper_codegen_uses_canonical_ir_surface() {
+        let helper = generate_inline_helper_jitcode_with_calls(
+            &parse_fn(
+                r#"
+                fn outer(lhs: usize, rhs: i64) -> i64 {
+                    callee(lhs, rhs)
+                }
+                "#,
+            ),
+            &[inline_policy("callee")],
+        )
+        .expect("jit_inline lowering should succeed")
+        .expect("helper should lower");
+        let body = helper.body.to_string();
+        assert!(body.contains("inline_call_ir_i"));
+        assert!(!body.contains("inline_call_with_typed_args"));
+    }
+
+    #[test]
+    fn inline_helper_codegen_uses_canonical_irf_surface() {
+        let helper = generate_inline_helper_jitcode_with_calls(
+            &parse_fn(
+                r#"
+                fn outer(arg: f64) -> f64 {
+                    callee(arg)
+                }
+                "#,
+            ),
+            &[inline_policy("callee")],
+        )
+        .expect("jit_inline lowering should succeed")
+        .expect("helper should lower");
+        let body = helper.body.to_string();
+        assert!(body.contains("inline_call_irf_f"));
+        assert!(!body.contains("inline_call_with_typed_args"));
+    }
+
+    #[test]
+    fn inline_helper_param_layout_uses_dense_per_kind_banks() {
+        let func = parse_fn(
+            r#"
+            fn helper(ptr: usize, value: i64, scale: f64, other: usize, more: i64) -> i64 {
+                value + more
+            }
+            "#,
+        );
+        let layout = inline_helper_param_layout(&func).expect("layout should build");
+        assert_eq!(
+            layout,
+            vec![
+                (InlineReturnKind::Ref, 0),
+                (InlineReturnKind::Int, 0),
+                (InlineReturnKind::Float, 0),
+                (InlineReturnKind::Ref, 1),
+                (InlineReturnKind::Int, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_helper_param_counts_match_dense_layout() {
+        let func = parse_fn(
+            r#"
+            fn helper(ptr: usize, value: i64, scale: f64, other: usize, more: i64) -> i64 {
+                value + more
+            }
+            "#,
+        );
+        let counts = inline_helper_param_counts(&func).expect("counts should build");
+        assert_eq!(counts, (2, 2, 1));
+    }
+
+    #[test]
+    fn explicit_inline_ref_policy_sets_ref_binding_kind() {
+        let call = parse_call("callee()");
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["callee".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlineRef),
+            )],
+            InferenceFailureMode::Panic,
+        );
+        let binding = lowerer
+            .lower_call_value(&call)
+            .expect("inline ref call should lower");
+        assert!(matches!(binding.kind, BindingKind::Ref));
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("add_sub_jitcode"));
+        assert!(body.contains("__sub_return_kind"));
+    }
+
+    #[test]
+    fn explicit_inline_float_policy_sets_float_binding_kind() {
+        let call = parse_call("callee()");
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["callee".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlineFloat),
+            )],
+            InferenceFailureMode::Panic,
+        );
+        let binding = lowerer
+            .lower_call_value(&call)
+            .expect("inline float call should lower");
+        assert!(matches!(binding.kind, BindingKind::Float));
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("add_sub_jitcode"));
+        assert!(body.contains("__sub_return_kind"));
     }
 }

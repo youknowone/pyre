@@ -106,19 +106,29 @@ pub struct MIFrame {
 
 impl MIFrame {
     pub fn new(jitcode: Arc<JitCode>, pc: usize) -> Self {
-        let num_regs_i = jitcode.c_num_regs_i as usize;
-        let num_regs_r = jitcode.c_num_regs_r as usize;
-        let num_regs_f = jitcode.c_num_regs_f as usize;
+        // RPython `pyjitpl.py:2247-2253` `MIFrame.setup`:
+        //   self.registers_i = [None] * jitcode.num_regs_and_consts_i()
+        //   self.registers_r = [None] * jitcode.num_regs_and_consts_r()
+        //   self.registers_f = [None] * jitcode.num_regs_and_consts_f()
+        // The register file spans working registers AND the constants
+        // area (`[num_regs_X .. num_regs_and_consts_X)`). `MIFrame.setup`
+        // then fills the constants slots with `Const{Int,Ptr,Float}`
+        // boxes. pyre currently leaves those slots as `None`; callers
+        // that need the constants materialised into the frame (tracer
+        // path) install them via a follow-up populate step.
+        let regs_and_consts_i = jitcode.num_regs_and_consts_i();
+        let regs_and_consts_r = jitcode.num_regs_and_consts_r();
+        let regs_and_consts_f = jitcode.num_regs_and_consts_f();
         Self {
             jitcode,
             pc,
             code_cursor: 0,
-            int_regs: vec![None; num_regs_i],
-            int_values: vec![None; num_regs_i],
-            ref_regs: vec![None; num_regs_r],
-            ref_values: vec![None; num_regs_r],
-            float_regs: vec![None; num_regs_f],
-            float_values: vec![None; num_regs_f],
+            int_regs: vec![None; regs_and_consts_i],
+            int_values: vec![None; regs_and_consts_i],
+            ref_regs: vec![None; regs_and_consts_r],
+            ref_values: vec![None; regs_and_consts_r],
+            float_regs: vec![None; regs_and_consts_f],
+            float_values: vec![None; regs_and_consts_f],
             inline_frame: false,
             return_i: None,
             return_r: None,
@@ -136,6 +146,34 @@ impl MIFrame {
 
     pub fn next_u16(&mut self) -> u16 {
         read_u16(&self.jitcode.code, &mut self.code_cursor)
+    }
+
+    /// RPython `pyjitpl.py:2247-2253` `MIFrame.setup` populates the
+    /// constants window `[num_regs_X .. num_regs_and_consts_X)` with
+    /// `Const{Int,Ptr,Float}` boxes so bytecode operands indexed into
+    /// that window read the constant without an extra opcode.  pyre
+    /// stores an `OpRef` + concrete `i64` pair per slot; call this
+    /// after `MIFrame::new` on any frame that will be driven by
+    /// tracing so the const area is valid.
+    pub fn fill_const_slots(&mut self, ctx: &mut crate::trace_ctx::TraceCtx) {
+        let num_regs_i = self.jitcode.c_num_regs_i as usize;
+        for (i, &value) in self.jitcode.constants_i.iter().enumerate() {
+            let slot = num_regs_i + i;
+            self.int_regs[slot] = Some(ctx.const_int(value));
+            self.int_values[slot] = Some(value);
+        }
+        let num_regs_r = self.jitcode.c_num_regs_r as usize;
+        for (i, &value) in self.jitcode.constants_r.iter().enumerate() {
+            let slot = num_regs_r + i;
+            self.ref_regs[slot] = Some(ctx.const_ref(value));
+            self.ref_values[slot] = Some(value);
+        }
+        let num_regs_f = self.jitcode.c_num_regs_f as usize;
+        for (i, &value) in self.jitcode.constants_f.iter().enumerate() {
+            let slot = num_regs_f + i;
+            self.float_regs[slot] = Some(ctx.const_float(value));
+            self.float_values[slot] = Some(value);
+        }
     }
 
     pub fn finished(&self) -> bool {

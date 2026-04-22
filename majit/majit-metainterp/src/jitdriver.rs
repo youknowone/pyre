@@ -1533,6 +1533,11 @@ impl<S: JitState> JitDriver<S> {
                     .unwrap_or(&fallback_alloc);
 
                 let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
+                bh_builder.setup_cached_control_opcodes(
+                    self.meta_interp().staticdata.op_live,
+                    self.meta_interp().staticdata.op_catch_exception,
+                    self.meta_interp().staticdata.op_rvmprof_code,
+                );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_bytes();
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
@@ -3156,6 +3161,11 @@ impl<S: JitState> JitDriver<S> {
                     .unwrap_or(&fallback_alloc);
 
                 let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
+                bh_builder.setup_cached_control_opcodes(
+                    self.meta_interp().staticdata.op_live,
+                    self.meta_interp().staticdata.op_catch_exception,
+                    self.meta_interp().staticdata.op_rvmprof_code,
+                );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_bytes();
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,

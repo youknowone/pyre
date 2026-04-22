@@ -4610,7 +4610,9 @@ mod tests {
     #[test]
     fn blackhole_from_resumedata_accepts_runtime_jitcode_without_canonical_pair() {
         use crate::blackhole::BlackholeInterpBuilder;
-        use crate::jitcode::{BC_ABORT, BC_LIVE, JitCodeBuilder};
+        use crate::jitcode::{
+            BC_ABORT, BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE, JitCodeBuilder,
+        };
 
         let mut writer = crate::resumecode::Writer::new(6);
         writer.append_int(0); // items_resume_section (patched below)
@@ -4629,6 +4631,11 @@ mod tests {
         let runtime = std::sync::Arc::new(runtime);
 
         let mut builder = BlackholeInterpBuilder::new();
+        builder.setup_cached_control_opcodes(
+            BC_LIVE as i32,
+            BC_CATCH_EXCEPTION as i32,
+            BC_RVMPROF_CODE as i32,
+        );
         let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
             Some(ResolvedJitCode::new(runtime.clone(), 0))
         };

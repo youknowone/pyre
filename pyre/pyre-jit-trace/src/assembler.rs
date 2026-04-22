@@ -32,7 +32,7 @@ use std::collections::HashMap;
 /// - `all_liveness_positions` — dedup dict from bitset key to offset.
 /// - `num_liveness_ops` — running count of liveness writes (diagnostic).
 pub struct AssemblerState {
-    pub insns: HashMap<&'static str, u8>,
+    pub insns: HashMap<String, u8>,
     pub all_liveness: Vec<u8>,
     pub all_liveness_length: usize,
     pub all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>,
@@ -41,11 +41,8 @@ pub struct AssemblerState {
 
 impl AssemblerState {
     fn new() -> Self {
-        // pyre's opcode table is compile-time fixed in majit-metainterp.
-        // This is an adapter input to `setup_insns`, not a full RPython
-        // `asm.insns` table grown in emission order.
         Self {
-            insns: majit_metainterp::jitcode::wellknown_bh_insns(),
+            insns: HashMap::new(),
             all_liveness: Vec::new(),
             all_liveness_length: 0,
             all_liveness_positions: HashMap::new(),
@@ -96,16 +93,22 @@ pub fn num_liveness_ops() -> usize {
     ASSEMBLER_STATE.with(|r| r.borrow().num_liveness_ops)
 }
 
-/// Publish the writer-side `Assembler`'s latest `all_liveness` snapshot
-/// to the blackhole-reader thread-local. `pyre_jit::Assembler` owns
-/// the canonical per-instance state (line-by-line with
+/// Publish the writer-side `Assembler`'s latest snapshot to the
+/// blackhole-reader thread-local. `pyre_jit::Assembler` owns the
+/// canonical per-instance state (line-by-line with
 /// `rpython/jit/codewriter/assembler.py:19-32`); this is only the
 /// pyre-layering bridge so the blackhole in this lower crate can read
 /// without a circular dep on `pyre_jit`. Not a second source of truth
 /// — every publish replaces the mirror entirely.
-pub fn publish_liveness(all_liveness: &[u8], all_liveness_length: usize, num_liveness_ops: usize) {
+pub fn publish_state(
+    insns: &HashMap<String, u8>,
+    all_liveness: &[u8],
+    all_liveness_length: usize,
+    num_liveness_ops: usize,
+) {
     ASSEMBLER_STATE.with(|r| {
         let mut asm = r.borrow_mut();
+        asm.insns = insns.clone();
         asm.all_liveness.clear();
         asm.all_liveness.extend_from_slice(all_liveness);
         asm.all_liveness_length = all_liveness_length;

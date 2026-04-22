@@ -78,7 +78,6 @@ pub enum PyErrorKind {
     ImportError,
     NotImplementedError,
     AssertionError,
-    MemoryError,
     /// Raised by `_weakref` when a proxy is dereferenced after the
     /// referent has been collected.
     /// pypy/module/_weakref/interp__weakref.py:347
@@ -247,7 +246,6 @@ impl PyError {
             PyErrorKind::ImportError => ExcKind::ImportError,
             PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
             PyErrorKind::AssertionError => ExcKind::AssertionError,
-            PyErrorKind::MemoryError => ExcKind::MemoryError,
             PyErrorKind::ReferenceError => ExcKind::ReferenceError,
             PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
             PyErrorKind::RecursionError => ExcKind::RecursionError,
@@ -298,7 +296,6 @@ impl PyError {
             ExcKind::ImportError => PyErrorKind::ImportError,
             ExcKind::NotImplementedError => PyErrorKind::NotImplementedError,
             ExcKind::AssertionError => PyErrorKind::AssertionError,
-            ExcKind::MemoryError => PyErrorKind::MemoryError,
             ExcKind::ReferenceError => PyErrorKind::ReferenceError,
             ExcKind::GeneratorExit => PyErrorKind::GeneratorExit,
             ExcKind::RecursionError => PyErrorKind::RecursionError,

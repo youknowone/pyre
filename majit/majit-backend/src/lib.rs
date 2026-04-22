@@ -749,17 +749,6 @@ impl FailDescr for LoopVersionDescr {
     fn fail_arg_types(&self) -> &[Type] {
         &self.fail_arg_types
     }
-    /// compile.py:895-897 `CompileLoopVersionDescr.handle_fail` —
-    ///     `assert 0, "this guard must never fail"`.
-    /// Loop-version guards exist only as compile-time markers so the
-    /// alternative version can be stitched in; they must not fire at
-    /// runtime.
-    fn handle_fail(
-        &self,
-        _ctx: &mut dyn majit_ir::HandleFailContext,
-    ) -> majit_ir::HandleFailResult {
-        unreachable!("CompileLoopVersionDescr.handle_fail — this guard must never fail");
-    }
 }
 
 /// Tracks alternative loop versions to compile after the main loop.

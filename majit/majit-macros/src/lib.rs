@@ -50,7 +50,7 @@ impl Parse for JitInlineArgs {
                             Some(jit_interp::parse_call_policy_kind(&kind).ok_or_else(|| {
                                 syn::Error::new(
                                     kind.span(),
-                                    "#[jit_inline(calls = { ... })] supports residual/may_force/release_gil/loopinvariant call policies for void/int and wrapped int/ref/float helpers, plus inline_int",
+                                    "#[jit_inline(calls = { ... })] supports residual/may_force/release_gil/loopinvariant call policies for void/int and wrapped int/ref/float helpers, plus inline_int/inline_ref/inline_float",
                                 )
                             })?)
                         } else {
@@ -336,38 +336,23 @@ fn helper_policy_tokens_for_fn(
             _ => unsupported,
         }),
         HelperCallKind::Ref => Ok(match attr_name {
-            "elidable" => quote! {
-                (6u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "dont_look_inside" => quote! {
-                (5u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "jit_may_force" => quote! {
-                (11u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "jit_release_gil" => quote! {
-                (15u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "jit_loop_invariant" => quote! {
-                (19u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            // RPython rewrite_call() bakes the result kind into the opname.
+            // Our infer path cannot recover a static ref-return BindingKind,
+            // so keep the call targets for explicit wrapped policies but do
+            // not advertise a value-call policy code here.
+            "elidable" | "dont_look_inside" | "jit_may_force" | "jit_release_gil"
+            | "jit_loop_invariant" => quote! {
+                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
             },
             _ => unsupported,
         }),
         HelperCallKind::Float => Ok(match attr_name {
-            "elidable" => quote! {
-                (8u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "dont_look_inside" => quote! {
-                (7u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "jit_may_force" => quote! {
-                (12u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "jit_release_gil" => quote! {
-                (16u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
-            },
-            "jit_loop_invariant" => quote! {
-                (20u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+            // Same restriction as ref-return helpers: explicit wrapped float
+            // policies consume these targets directly, but inferred value-call
+            // lowering cannot model the static float result bank.
+            "elidable" | "dont_look_inside" | "jit_may_force" | "jit_release_gil"
+            | "jit_loop_invariant" => quote! {
+                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
             },
             _ => unsupported,
         }),
@@ -1225,7 +1210,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// This is the proc-macro side of RPython's `codewriter.py` helper serialization:
 /// the original function stays callable by the interpreter, and the macro also
 /// emits a hidden `__majit_inline_jitcode_*()` function that `#[jit_interp]`
-/// can use when a call policy maps the helper to `inline_int`.
+/// can use when a call policy maps the helper to `inline_int`/`inline_ref`/`inline_float`.
 ///
 /// Supports Int (i64/isize), Ref (usize/pointer), and Float (f64) return types
 /// and parameter types.
@@ -1266,25 +1251,35 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         InlineReturnKind::Ref => 1,
         InlineReturnKind::Float => 2,
     };
+    // RPython jtransform.py: rewrite_call() bakes the result kind into the
+    // emitted opname. Our inferred helper-policy surface can only model that
+    // parity for int-return inline helpers; ref/float inline helpers must go
+    // through explicit `inline_ref` / `inline_float` policies.
+    let inferred_policy_code: u8 = match helper.return_kind {
+        InlineReturnKind::Int => 4,
+        InlineReturnKind::Ref | InlineReturnKind::Float => 0,
+    };
+    let inferred_inline_builder = match helper.return_kind {
+        InlineReturnKind::Int => quote! { #helper_name as *const () },
+        InlineReturnKind::Ref | InlineReturnKind::Float => quote! { std::ptr::null() },
+    };
 
     // Ensure the right register file for each parameter
     let ensure_param_regs = {
         let mut stmts = Vec::new();
-        for (index, arg) in func.sig.inputs.iter().enumerate() {
-            if let syn::FnArg::Typed(pat_type) = arg {
-                let reg = (index + 1) as u16;
-                if jit_interp::jitcode_lower::classify_param_type(&pat_type.ty)
-                    == Some(InlineReturnKind::Ref)
-                {
-                    stmts.push(quote! { __builder.ensure_r_regs(#reg); });
-                } else if jit_interp::jitcode_lower::classify_param_type(&pat_type.ty)
-                    == Some(InlineReturnKind::Float)
-                {
-                    stmts.push(quote! { __builder.ensure_f_regs(#reg); });
-                } else {
-                    stmts.push(quote! { __builder.ensure_i_regs(#reg); });
-                }
-            }
+        let (count_i, count_r, count_f) =
+            match jit_interp::jitcode_lower::inline_helper_param_counts(&func) {
+                Ok(counts) => counts,
+                Err(err) => return err.to_compile_error().into(),
+            };
+        if count_i != 0 {
+            stmts.push(quote! { __builder.ensure_i_regs(#count_i); });
+        }
+        if count_r != 0 {
+            stmts.push(quote! { __builder.ensure_r_regs(#count_r); });
+        }
+        if count_f != 0 {
+            stmts.push(quote! { __builder.ensure_f_regs(#count_f); });
         }
         stmts
     };
@@ -1305,7 +1300,12 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const ()) {
-            (4u8, #helper_name as *const (), std::ptr::null(), std::ptr::null())
+            (
+                #inferred_policy_code,
+                #inferred_inline_builder,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
         }
     };
 
@@ -1340,6 +1340,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         aheui_io::write_utf8 => jit_write_utf8,
 ///     },
 ///     // optional: infer direct helper calls from sidecar metadata
+///     // non-int result helpers still need explicit `calls = { ... => ... }`
 ///     auto_calls = true,
 ///     calls = {
 ///         helper_compute,

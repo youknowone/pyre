@@ -1478,6 +1478,24 @@ impl BlackholeInterpreter {
         self.registers_i[dst] = eval_binop_i(opcode, lhs, rhs);
     }
 
+    /// Per-opname ref binop helper returning int. Mirrors
+    /// `bhimpl_{ptr_eq,ptr_ne,instance_ptr_eq,instance_ptr_ne}`.
+    fn bh_binop_r_to_i(&mut self, opcode: OpCode) {
+        let dst = self.next_u16() as usize;
+        let lhs_idx = self.next_u16() as usize;
+        let rhs_idx = self.next_u16() as usize;
+        let lhs = self.registers_r[lhs_idx];
+        let rhs = self.registers_r[rhs_idx];
+        self.registers_i[dst] = match opcode {
+            OpCode::PtrEq | OpCode::InstancePtrEq => (lhs == rhs) as i64,
+            OpCode::PtrNe | OpCode::InstancePtrNe => (lhs != rhs) as i64,
+            other => panic!("bh_binop_r_to_i: unsupported opcode {other:?}"),
+        };
+    }
+
+    /// Per-opname float binop helper. See `bh_binop_i` for the pattern.
+    /// RPython equivalents: `bhimpl_float_{add,sub,mul,truediv}`
+    /// (`blackhole.py:663-687`).
     fn bh_binop_f(&mut self, opcode: OpCode) {
         let dst = self.next_u16() as usize;
         let lhs_idx = self.next_u16() as usize;
@@ -1485,6 +1503,18 @@ impl BlackholeInterpreter {
         let lhs = self.registers_f[lhs_idx];
         let rhs = self.registers_f[rhs_idx];
         self.registers_f[dst] = eval_binop_f(opcode, lhs, rhs);
+    }
+
+    /// Unary ptr nullity helpers — `bhimpl_ptr_iszero` / `bhimpl_ptr_nonzero`.
+    fn bh_ptr_nullity(&mut self, nonzero: bool) {
+        let dst = self.next_u16() as usize;
+        let src_idx = self.next_u16() as usize;
+        let value = self.registers_r[src_idx];
+        self.registers_i[dst] = if nonzero {
+            (value != 0) as i64
+        } else {
+            (value == 0) as i64
+        };
     }
 
     /// blackhole.py:1732-1748 _get_list_of_values parity.
@@ -1711,37 +1741,23 @@ impl BlackholeInterpreter {
                 let unique_id = self.registers_i[unique_id_idx];
                 self.bhimpl_rvmprof_code(leaving, unique_id);
             }
-            jitcode::BC_LOAD_CONST_I => {
-                let dst = self.next_u16() as usize;
-                let const_idx = self.next_u16() as usize;
-                let value = self.jitcode.constants_i[const_idx];
-                self.registers_i[dst] = value;
-            }
-            jitcode::BC_LOAD_CONST_R => {
-                let dst = self.next_u16() as usize;
-                let const_idx = self.next_u16() as usize;
-                let value = self.jitcode.constants_r[const_idx];
-                self.registers_r[dst] = value;
-            }
-            jitcode::BC_LOAD_CONST_F => {
-                let dst = self.next_u16() as usize;
-                let const_idx = self.next_u16() as usize;
-                let value = self.jitcode.constants_f[const_idx];
-                self.registers_f[dst] = value;
-            }
+            // RPython `blackhole.py:638-646` `bhimpl_{int,ref,float}_copy`.
+            // Operand order follows the `i>i` / `r>r` / `f>f` argcodes
+            // (`assembler.py:165-174`): source register is encoded
+            // first, destination last.
             jitcode::BC_MOVE_I => {
-                let dst = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
                 self.registers_i[dst] = self.registers_i[src];
             }
             jitcode::BC_MOVE_R => {
-                let dst = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
                 self.registers_r[dst] = self.registers_r[src];
             }
             jitcode::BC_MOVE_F => {
-                let dst = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
+                let dst = self.next_u16() as usize;
                 self.registers_f[dst] = self.registers_f[src];
             }
             jitcode::BC_INT_ADD => self.bh_binop_i(OpCode::IntAdd),
@@ -1778,6 +1794,15 @@ impl BlackholeInterpreter {
                 let value = self.registers_i[src_idx];
                 self.registers_i[dst] = eval_unary_i(OpCode::IntInvert, value);
             }
+            // Ref-valued comparison / nullity primitives — RPython
+            // `blackhole.py` `bhimpl_{ptr_eq,ptr_ne,instance_ptr_eq,
+            // instance_ptr_ne,ptr_iszero,ptr_nonzero}`.
+            jitcode::BC_PTR_EQ => self.bh_binop_r_to_i(OpCode::PtrEq),
+            jitcode::BC_PTR_NE => self.bh_binop_r_to_i(OpCode::PtrNe),
+            jitcode::BC_INSTANCE_PTR_EQ => self.bh_binop_r_to_i(OpCode::InstancePtrEq),
+            jitcode::BC_INSTANCE_PTR_NE => self.bh_binop_r_to_i(OpCode::InstancePtrNe),
+            jitcode::BC_PTR_ISZERO => self.bh_ptr_nullity(false),
+            jitcode::BC_PTR_NONZERO => self.bh_ptr_nullity(true),
             jitcode::BC_FLOAT_ADD => self.bh_binop_f(OpCode::FloatAdd),
             jitcode::BC_FLOAT_SUB => self.bh_binop_f(OpCode::FloatSub),
             jitcode::BC_FLOAT_MUL => self.bh_binop_f(OpCode::FloatMul),
@@ -1794,13 +1819,13 @@ impl BlackholeInterpreter {
                 let value = self.registers_f[src_idx];
                 self.registers_f[dst] = eval_unary_f(OpCode::FloatAbs, value);
             }
-            jitcode::BC_BRANCH_REG_ZERO => {
+            jitcode::BC_GOTO_IF_NOT_INT_IS_TRUE => {
                 let cond_idx = self.next_u16() as usize;
                 let target = self.next_u16() as usize;
                 let cond = self.registers_i[cond_idx];
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[bh-trace] BRANCH_REG_ZERO cond_idx={} cond={} target={} taken={}",
+                        "[bh-trace] GOTO_IF_NOT_INT_IS_TRUE cond_idx={} cond={} target={} taken={}",
                         cond_idx,
                         cond,
                         target,
@@ -1969,6 +1994,22 @@ impl BlackholeInterpreter {
                     self.position = target;
                 }
             }
+            jitcode::BC_GOTO_IF_NOT_PTR_ISZERO => {
+                let a_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_r[a_idx];
+                if a != 0 {
+                    self.position = target;
+                }
+            }
+            jitcode::BC_GOTO_IF_NOT_PTR_NONZERO => {
+                let a_idx = self.next_u16() as usize;
+                let target = self.next_u16() as usize;
+                let a = self.registers_r[a_idx];
+                if a == 0 {
+                    self.position = target;
+                }
+            }
             jitcode::BC_JUMP => {
                 let target = self.next_u16() as usize;
                 self.position = target;
@@ -2043,6 +2084,27 @@ impl BlackholeInterpreter {
                 let src = self.next_u16() as usize;
                 self.tmpreg_r = self.registers_r[src];
                 self.return_type = BhReturnType::Ref;
+                return Err(DispatchError::LeaveFrame);
+            }
+            jitcode::BC_INT_RETURN => {
+                // RPython bhimpl_int_return (blackhole.py:841): stash the
+                // int result in tmpreg_i, tag the frame as int-returning,
+                // and unwind via LeaveFrame.
+                let src = self.next_u16() as usize;
+                self.tmpreg_i = self.registers_i[src];
+                self.return_type = BhReturnType::Int;
+                return Err(DispatchError::LeaveFrame);
+            }
+            jitcode::BC_FLOAT_RETURN => {
+                // RPython bhimpl_float_return (blackhole.py:853).
+                let src = self.next_u16() as usize;
+                self.tmpreg_f = self.registers_f[src];
+                self.return_type = BhReturnType::Float;
+                return Err(DispatchError::LeaveFrame);
+            }
+            jitcode::BC_VOID_RETURN => {
+                // RPython bhimpl_void_return (blackhole.py:859).
+                self.return_type = BhReturnType::Void;
                 return Err(DispatchError::LeaveFrame);
             }
             jitcode::BC_ABORT => {
@@ -2853,7 +2915,7 @@ impl Default for BlackholeInterpBuilder {
 
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
-        let mut builder = Self {
+        Self {
             pool: Vec::new(),
             cpu: None,
             _insns: Vec::new(),
@@ -2862,20 +2924,35 @@ impl BlackholeInterpBuilder {
             op_rvmprof_code: u8::MAX,
             descrs: Vec::new(),
             dispatch_table: Vec::new(),
-        };
-        builder.setup_wellknown_insns();
-        builder
+        }
     }
 
-    /// RPython `blackhole.py:72-73` parity for just the two well-known
-    /// opcodes (`live/`, `catch_exception/L`, `rvmprof_code/ii`). Callers
-    /// that have a full `insns` table should call `setup_insns` instead —
-    /// it covers the dispatch table and the reverse opcode mapping as well.
-    pub fn setup_wellknown_insns(&mut self) {
-        let insns = crate::jitcode::wellknown_bh_insns();
-        self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
-        self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
-        self.op_rvmprof_code = insns.get("rvmprof_code/ii").copied().unwrap_or(u8::MAX);
+    /// PRE-EXISTING-ADAPTATION narrowed for parity:
+    /// some Rust call sites construct a fresh builder away from the
+    /// codewriter, but they already hold the cached opcode ids that
+    /// RPython `setup_insns(insns)` would have stored on the builder.
+    ///
+    /// Copy those three cached control opcodes directly instead of
+    /// consulting a synthetic global `wellknown_bh_insns()` table.
+    /// Callers with a real assembler `insns` dict should still use
+    /// `setup_insns`, which also fills `_insns` and `dispatch_table`
+    /// exactly like `blackhole.py:66-100`.
+    pub fn setup_cached_control_opcodes(
+        &mut self,
+        op_live: i32,
+        op_catch_exception: i32,
+        op_rvmprof_code: i32,
+    ) {
+        let to_u8 = |opcode: i32| -> u8 {
+            if opcode < 0 {
+                u8::MAX
+            } else {
+                u8::try_from(opcode).expect("cached blackhole opcode does not fit in u8")
+            }
+        };
+        self.op_live = to_u8(op_live);
+        self.op_catch_exception = to_u8(op_catch_exception);
+        self.op_rvmprof_code = to_u8(op_rvmprof_code);
     }
 
     /// RPython `blackhole.py:66-100` `setup_insns(insns)`.
@@ -4142,12 +4219,12 @@ mod tests {
         }
 
         #[test]
-        fn test_bh_interp_branch_reg_zero_taken() {
+        fn test_bh_interp_goto_if_not_int_is_true_taken() {
             // Build jitcode: r0 = 0; if r0==0 goto end; r1 = 42; end: r2 = 99
             let mut b = JitCodeBuilder::default();
             b.load_const_i_value(0, 0);
             let lbl = b.new_label();
-            b.branch_reg_zero(0, lbl);
+            b.goto_if_not_int_is_true(0, lbl);
             b.load_const_i_value(1, 42); // should be skipped
             b.mark_label(lbl);
             b.load_const_i_value(2, 99);
@@ -4162,11 +4239,11 @@ mod tests {
         }
 
         #[test]
-        fn test_bh_interp_branch_reg_zero_not_taken() {
+        fn test_bh_interp_goto_if_not_int_is_true_not_taken() {
             let mut b = JitCodeBuilder::default();
             b.load_const_i_value(0, 1); // nonzero
             let lbl = b.new_label();
-            b.branch_reg_zero(0, lbl);
+            b.goto_if_not_int_is_true(0, lbl);
             b.load_const_i_value(1, 42); // NOT skipped
             b.mark_label(lbl);
             b.load_const_i_value(2, 99);
@@ -4227,6 +4304,39 @@ mod tests {
         }
 
         #[test]
+        fn test_bh_interp_ptr_nonzero() {
+            let mut b = JitCodeBuilder::default();
+            b.load_const_r_value(0, 0x1234);
+            b.ptr_nonzero(1, 0);
+            let jitcode = b.finish();
+
+            let mut bh = BlackholeInterpreter::new();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert_eq!(bh.registers_i[1], 1);
+        }
+
+        #[test]
+        fn test_bh_interp_goto_if_not_ptr_nonzero_taken() {
+            let mut b = JitCodeBuilder::default();
+            b.load_const_r_value(0, 0);
+            let lbl = b.new_label();
+            b.goto_if_not_ptr_nonzero(0, lbl);
+            b.load_const_i_value(1, 42); // should be skipped
+            b.mark_label(lbl);
+            b.load_const_i_value(2, 99);
+            let jitcode = b.finish();
+
+            let mut bh = BlackholeInterpreter::new();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert_eq!(bh.registers_i[1], 0);
+            assert_eq!(bh.registers_i[2], 99);
+        }
+
+        #[test]
         fn test_bh_interp_setarg() {
             let mut b = JitCodeBuilder::default();
             // Just record a binop to read r0 + r1
@@ -4256,6 +4366,19 @@ mod tests {
         }
 
         #[test]
+        fn test_builder_new_leaves_control_opcodes_unset_until_explicit_setup() {
+            let mut builder = BlackholeInterpBuilder::new();
+            assert_eq!(builder.op_live, u8::MAX);
+            assert_eq!(builder.op_catch_exception, u8::MAX);
+            assert_eq!(builder.op_rvmprof_code, u8::MAX);
+
+            builder.setup_cached_control_opcodes(88, 89, 91);
+            assert_eq!(builder.op_live, 88);
+            assert_eq!(builder.op_catch_exception, 89);
+            assert_eq!(builder.op_rvmprof_code, 91);
+        }
+
+        #[test]
         fn test_bh_interp_inline_call() {
             // Build sub-jitcode: r0 = arg, result = r0 + r0
             let mut sub = JitCodeBuilder::default();
@@ -4266,7 +4389,7 @@ mod tests {
             let mut b = JitCodeBuilder::default();
             b.load_const_i_value(0, 21);
             let sub_idx = b.add_sub_jitcode(sub_jitcode);
-            b.inline_call_i(sub_idx, &[(0, 0)], Some((1, 1)));
+            b.inline_call_ir_i(sub_idx, &[(0, 0)], &[], Some((1, 1)));
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();

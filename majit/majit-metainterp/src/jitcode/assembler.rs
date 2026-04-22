@@ -29,12 +29,30 @@ pub struct JitCodeBuilder {
     constants_f: Vec<i64>,
     labels: Vec<Option<usize>>,
     patches: Vec<(usize, usize)>,
+    /// RPython `assembler.py:131-138` `emit_const` encodes a constant
+    /// operand as `count_regs[kind] + len(constants) - 1` — i.e. a
+    /// register-space index that points into the constants suffix of
+    /// the register file. pyre's builder cannot resolve that final
+    /// index at emit time (num_regs_X grows as more touch_reg calls
+    /// happen); instead each const-source operand writes a placeholder
+    /// 2-byte slot and records `(offset, kind, pool_idx)` here. The
+    /// `finish()` pass rewrites each placeholder to
+    /// `num_regs_X + pool_idx` once the per-kind register count is final.
+    const_patches: Vec<(usize, ConstKind, u16)>,
     /// Runtime descriptor pool emitted into `JitCodeExecState.descrs`
     /// on `finish()`. Every `BC_INLINE_CALL` / `BC_CALL_*` /
     /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
     has_abort: bool,
+}
+
+/// Register-file kind for const_patches entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstKind {
+    Int,
+    Ref,
+    Float,
 }
 
 impl JitCodeBuilder {
@@ -147,11 +165,21 @@ impl JitCodeBuilder {
         self.load_const_i(dst, const_idx);
     }
 
+    /// Lower to RPython `int_copy/i>i` reading from the constants
+    /// window of the register file (`assembler.py:80-138` `emit_const`
+    /// produces the same byte sequence — a register-space index that
+    /// points into the post-regs constants suffix). The src operand
+    /// is written as a placeholder; `finish()` patches it to
+    /// `num_regs_i + const_idx` once the per-kind register count is
+    /// final.
     pub fn load_const_i(&mut self, dst: u16, const_idx: u16) {
         self.touch_reg(dst);
-        self.push_u8(jitcode::BC_LOAD_CONST_I);
+        self.write_insn("int_copy/i>i");
+        let src_offset = self.code.len();
+        self.push_u16(0);
+        self.const_patches
+            .push((src_offset, ConstKind::Int, const_idx));
         self.push_u16(dst);
-        self.push_u16(const_idx);
     }
 
     // ── State field access (register/tape machines) ──
@@ -327,56 +355,92 @@ impl JitCodeBuilder {
 
     /// RPython `blackhole.py:459-521` `bhimpl_int_*` per-opname handlers:
     /// each primitive has its own insn_id in `BlackholeInterpBuilder.insns`
-    /// (`blackhole.py:52-81 setup_insns`). pyre's runtime dispatch uses a
-    /// hardcoded byte match so each primitive is assigned its own `BC_*`
-    /// byte; this function picks the byte from the IR `OpCode` the tracer
-    /// synthesised and emits the canonical `dst, lhs, rhs` operand triple.
+    /// (`blackhole.py:52-81 setup_insns`). Emits via `write_insn` with
+    /// the canonical `opname/ii>i` key so the opcode byte comes from the
+    /// shared insns table rather than a hand-assigned `BC_*` constant.
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
-        let bc = match opcode {
-            OpCode::IntAdd => jitcode::BC_INT_ADD,
-            OpCode::IntSub => jitcode::BC_INT_SUB,
-            OpCode::IntMul => jitcode::BC_INT_MUL,
-            OpCode::IntFloorDiv => jitcode::BC_INT_FLOORDIV,
-            OpCode::IntMod => jitcode::BC_INT_MOD,
-            OpCode::IntAnd => jitcode::BC_INT_AND,
-            OpCode::IntOr => jitcode::BC_INT_OR,
-            OpCode::IntXor => jitcode::BC_INT_XOR,
-            OpCode::IntLshift => jitcode::BC_INT_LSHIFT,
-            OpCode::IntRshift => jitcode::BC_INT_RSHIFT,
-            OpCode::IntEq => jitcode::BC_INT_EQ,
-            OpCode::IntNe => jitcode::BC_INT_NE,
-            OpCode::IntLt => jitcode::BC_INT_LT,
-            OpCode::IntLe => jitcode::BC_INT_LE,
-            OpCode::IntGt => jitcode::BC_INT_GT,
-            OpCode::IntGe => jitcode::BC_INT_GE,
-            OpCode::UintRshift => jitcode::BC_UINT_RSHIFT,
-            OpCode::UintMulHigh => jitcode::BC_UINT_MUL_HIGH,
-            OpCode::UintLt => jitcode::BC_UINT_LT,
-            OpCode::UintLe => jitcode::BC_UINT_LE,
-            OpCode::UintGt => jitcode::BC_UINT_GT,
-            OpCode::UintGe => jitcode::BC_UINT_GE,
+        let key = match opcode {
+            OpCode::IntAdd => "int_add/ii>i",
+            OpCode::IntSub => "int_sub/ii>i",
+            OpCode::IntMul => "int_mul/ii>i",
+            OpCode::IntFloorDiv => "int_floordiv/ii>i",
+            OpCode::IntMod => "int_mod/ii>i",
+            OpCode::IntAnd => "int_and/ii>i",
+            OpCode::IntOr => "int_or/ii>i",
+            OpCode::IntXor => "int_xor/ii>i",
+            OpCode::IntLshift => "int_lshift/ii>i",
+            OpCode::IntRshift => "int_rshift/ii>i",
+            OpCode::IntEq => "int_eq/ii>i",
+            OpCode::IntNe => "int_ne/ii>i",
+            OpCode::IntLt => "int_lt/ii>i",
+            OpCode::IntLe => "int_le/ii>i",
+            OpCode::IntGt => "int_gt/ii>i",
+            OpCode::IntGe => "int_ge/ii>i",
+            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`.
+            OpCode::UintRshift => "uint_rshift/ii>i",
+            OpCode::UintMulHigh => "uint_mul_high/ii>i",
+            OpCode::UintLt => "uint_lt/ii>i",
+            OpCode::UintLe => "uint_le/ii>i",
+            OpCode::UintGt => "uint_gt/ii>i",
+            OpCode::UintGe => "uint_ge/ii>i",
             other => panic!("record_binop_i: unsupported opcode {other:?}"),
         };
         self.touch_reg(dst);
         self.touch_reg(lhs);
         self.touch_reg(rhs);
-        self.push_u8(bc);
+        self.write_insn(key);
         self.push_u16(dst);
         self.push_u16(lhs);
         self.push_u16(rhs);
     }
 
     /// RPython `blackhole.py:527-533` `bhimpl_int_{neg,invert}` per-opname
-    /// handlers. See `record_binop_i` for the `BC_*` mapping rationale.
+    /// handlers. See `record_binop_i` for the keying rationale.
     pub fn record_unary_i(&mut self, dst: u16, opcode: OpCode, src: u16) {
-        let bc = match opcode {
-            OpCode::IntNeg => jitcode::BC_INT_NEG,
-            OpCode::IntInvert => jitcode::BC_INT_INVERT,
+        let key = match opcode {
+            OpCode::IntNeg => "int_neg/i>i",
+            OpCode::IntInvert => "int_invert/i>i",
             other => panic!("record_unary_i: unsupported opcode {other:?}"),
         };
         self.touch_reg(dst);
         self.touch_reg(src);
-        self.push_u8(bc);
+        self.write_insn(key);
+        self.push_u16(dst);
+        self.push_u16(src);
+    }
+
+    /// RPython `blackhole.py:584-610` ref comparisons returning int:
+    /// `ptr_eq`, `ptr_ne`, `instance_ptr_eq`, `instance_ptr_ne`.
+    pub fn record_binop_r(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
+        let key = match opcode {
+            OpCode::PtrEq => "ptr_eq/rr>i",
+            OpCode::PtrNe => "ptr_ne/rr>i",
+            OpCode::InstancePtrEq => "instance_ptr_eq/rr>i",
+            OpCode::InstancePtrNe => "instance_ptr_ne/rr>i",
+            other => panic!("record_binop_r: unsupported opcode {other:?}"),
+        };
+        self.touch_reg(dst);
+        self.touch_ref_reg(lhs);
+        self.touch_ref_reg(rhs);
+        self.write_insn(key);
+        self.push_u16(dst);
+        self.push_u16(lhs);
+        self.push_u16(rhs);
+    }
+
+    /// RPython `blackhole.py:591-596` unary ptr nullity checks returning int.
+    pub fn ptr_iszero(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_ref_reg(src);
+        self.write_insn("ptr_iszero/r>i");
+        self.push_u16(dst);
+        self.push_u16(src);
+    }
+
+    pub fn ptr_nonzero(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_ref_reg(src);
+        self.write_insn("ptr_nonzero/r>i");
         self.push_u16(dst);
         self.push_u16(src);
     }
@@ -395,9 +459,12 @@ impl JitCodeBuilder {
         *slot = Some(self.code.len());
     }
 
-    pub fn branch_reg_zero(&mut self, reg: u16, label: u16) {
+    /// RPython `blackhole.py:913`
+    /// `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`. Take
+    /// `label` iff `reg == 0`.
+    pub fn goto_if_not_int_is_true(&mut self, reg: u16, label: u16) {
         self.touch_reg(reg);
-        self.push_u8(jitcode::BC_BRANCH_REG_ZERO);
+        self.write_insn("goto_if_not_int_is_true/iL");
         self.push_u16(reg);
         self.push_label_ref(label);
     }
@@ -410,7 +477,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_lt(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
         self.touch_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_LT);
+        self.write_insn("goto_if_not_int_lt/iiL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -419,7 +486,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_le(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
         self.touch_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_LE);
+        self.write_insn("goto_if_not_int_le/iiL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -428,7 +495,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_eq(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
         self.touch_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_EQ);
+        self.write_insn("goto_if_not_int_eq/iiL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -437,7 +504,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_ne(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
         self.touch_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_NE);
+        self.write_insn("goto_if_not_int_ne/iiL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -446,7 +513,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_gt(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
         self.touch_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_GT);
+        self.write_insn("goto_if_not_int_gt/iiL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -455,7 +522,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_int_ge(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
         self.touch_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_GE);
+        self.write_insn("goto_if_not_int_ge/iiL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -465,7 +532,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_float_lt(&mut self, a: u16, b: u16, label: u16) {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_LT);
+        self.write_insn("goto_if_not_float_lt/ffL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -474,7 +541,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_float_le(&mut self, a: u16, b: u16, label: u16) {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_LE);
+        self.write_insn("goto_if_not_float_le/ffL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -483,7 +550,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_float_eq(&mut self, a: u16, b: u16, label: u16) {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_EQ);
+        self.write_insn("goto_if_not_float_eq/ffL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -492,7 +559,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_float_ne(&mut self, a: u16, b: u16, label: u16) {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_NE);
+        self.write_insn("goto_if_not_float_ne/ffL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -501,7 +568,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_float_gt(&mut self, a: u16, b: u16, label: u16) {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_GT);
+        self.write_insn("goto_if_not_float_gt/ffL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -510,7 +577,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_float_ge(&mut self, a: u16, b: u16, label: u16) {
         self.touch_float_reg(a);
         self.touch_float_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_FLOAT_GE);
+        self.write_insn("goto_if_not_float_ge/ffL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -520,7 +587,7 @@ impl JitCodeBuilder {
     pub fn goto_if_not_ptr_eq(&mut self, a: u16, b: u16, label: u16) {
         self.touch_ref_reg(a);
         self.touch_ref_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_PTR_EQ);
+        self.write_insn("goto_if_not_ptr_eq/rrL");
         self.push_u16(a);
         self.push_u16(b);
         self.push_label_ref(label);
@@ -529,9 +596,23 @@ impl JitCodeBuilder {
     pub fn goto_if_not_ptr_ne(&mut self, a: u16, b: u16, label: u16) {
         self.touch_ref_reg(a);
         self.touch_ref_reg(b);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_PTR_NE);
+        self.write_insn("goto_if_not_ptr_ne/rrL");
         self.push_u16(a);
         self.push_u16(b);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_ptr_iszero(&mut self, a: u16, label: u16) {
+        self.touch_ref_reg(a);
+        self.write_insn("goto_if_not_ptr_iszero/rL");
+        self.push_u16(a);
+        self.push_label_ref(label);
+    }
+
+    pub fn goto_if_not_ptr_nonzero(&mut self, a: u16, label: u16) {
+        self.touch_ref_reg(a);
+        self.write_insn("goto_if_not_ptr_nonzero/rL");
+        self.push_u16(a);
         self.push_label_ref(label);
     }
 
@@ -541,13 +622,13 @@ impl JitCodeBuilder {
     // flatten.py:247 specialises the bool exitswitch into this unary form.
     pub fn goto_if_not_int_is_zero(&mut self, a: u16, label: u16) {
         self.touch_reg(a);
-        self.push_u8(jitcode::BC_GOTO_IF_NOT_INT_IS_ZERO);
+        self.write_insn("goto_if_not_int_is_zero/iL");
         self.push_u16(a);
         self.push_label_ref(label);
     }
 
     pub fn jump(&mut self, label: u16) {
-        self.push_u8(jitcode::BC_JUMP);
+        self.write_insn("goto/L");
         self.push_label_ref(label);
     }
 
@@ -556,7 +637,7 @@ impl JitCodeBuilder {
     /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
     /// opimpl_loop_header records the jitdriver index for the trace.
     pub fn loop_header(&mut self, jdindex: u8) {
-        self.push_u8(jitcode::BC_LOOP_HEADER);
+        self.write_insn("loop_header/i");
         self.push_u8(jdindex);
     }
 
@@ -564,7 +645,7 @@ impl JitCodeBuilder {
     /// the shared all_liveness byte string. Returns the operand offset so the
     /// caller can patch it after computing liveness.
     pub fn live_placeholder(&mut self) -> usize {
-        self.push_u8(jitcode::BC_LIVE);
+        self.write_insn("live/");
         let patch_offset = self.code.len();
         self.push_u16(0);
         patch_offset
@@ -578,14 +659,14 @@ impl JitCodeBuilder {
 
     /// RPython blackhole.py:969 `catch_exception/L`.
     pub fn catch_exception(&mut self, label: u16) {
-        self.push_u8(jitcode::BC_CATCH_EXCEPTION);
+        self.write_insn("catch_exception/L");
         self.push_label_ref(label);
     }
 
     /// RPython blackhole.py:993 `last_exc_value/>r`.
     pub fn last_exc_value(&mut self, dst: u16) {
         self.touch_ref_reg(dst);
-        self.push_u8(jitcode::BC_LAST_EXC_VALUE);
+        self.write_insn("last_exc_value/>r");
         self.push_u16(dst);
     }
 
@@ -610,7 +691,7 @@ impl JitCodeBuilder {
     /// `greens_r` = [pycode_reg] (constant slot)
     /// `reds_r`   = [frame_reg, ec_reg] (dedicated portal registers)
     pub fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
-        self.push_u8(jitcode::BC_JIT_MERGE_POINT);
+        self.write_insn("jit_merge_point/IRR");
         self.push_u8(0); // jdindex
         // gi: green int registers (next_instr, is_being_profiled)
         self.push_u8(greens_i.len() as u8);
@@ -643,7 +724,7 @@ impl JitCodeBuilder {
     /// RPython bhimpl_ref_return: emit return-ref opcode.
     /// The return value is in register `src`.
     pub fn ref_return(&mut self, src: u16) {
-        self.push_u8(jitcode::BC_REF_RETURN);
+        self.write_insn("ref_return/r");
         self.push_u16(src);
     }
 
@@ -653,13 +734,13 @@ impl JitCodeBuilder {
 
     /// blackhole.py bhimpl_raise(excvalue): raise exception from register.
     pub fn emit_raise(&mut self, src: u16) {
-        self.push_u8(jitcode::BC_RAISE);
+        self.write_insn("raise/r");
         self.push_u16(src);
     }
 
     /// blackhole.py bhimpl_reraise(): re-raise exception_last_value.
     pub fn emit_reraise(&mut self) {
-        self.push_u8(jitcode::BC_RERAISE);
+        self.write_insn("reraise/");
     }
 
     /// pyjitpl.py opimpl_int_guard_value: promote int register to constant.
@@ -667,86 +748,177 @@ impl JitCodeBuilder {
     /// Blackhole: no-op (value passes through).
     /// Tracing: emits GUARD_VALUE to specialize the trace on this value.
     pub fn int_guard_value(&mut self, src: u16) {
-        self.push_u8(jitcode::BC_INT_GUARD_VALUE);
+        self.write_insn("int_guard_value/i");
         self.push_u16(src);
     }
 
     /// pyjitpl.py opimpl_ref_guard_value: promote ref register to constant.
     pub fn ref_guard_value(&mut self, src: u16) {
-        self.push_u8(jitcode::BC_REF_GUARD_VALUE);
+        self.write_insn("ref_guard_value/r");
         self.push_u16(src);
     }
 
     /// pyjitpl.py opimpl_float_guard_value: promote float register to constant.
     pub fn float_guard_value(&mut self, src: u16) {
-        self.push_u8(jitcode::BC_FLOAT_GUARD_VALUE);
+        self.write_insn("float_guard_value/f");
         self.push_u16(src);
     }
 
     pub fn inline_call(&mut self, sub_jitcode_idx: u16) {
-        self.inline_call_i(sub_jitcode_idx, &[], None);
+        self.inline_call_r_v(sub_jitcode_idx, &[], None);
     }
 
-    pub fn inline_call_i(
+    pub fn inline_call_r_i(
         &mut self,
         sub_jitcode_idx: u16,
-        args: &[(u16, u16)],
+        args_r: &[(u16, u16)],
         return_i: Option<(u16, u16)>,
     ) {
-        self.inline_call_full(sub_jitcode_idx, args, return_i, None, None);
+        self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], return_i, None, None);
     }
 
-    pub fn inline_call_r(
+    pub fn inline_call_r_r(
         &mut self,
         sub_jitcode_idx: u16,
-        args: &[(u16, u16)],
+        args_r: &[(u16, u16)],
         return_r: Option<(u16, u16)>,
     ) {
-        self.inline_call_full(sub_jitcode_idx, args, None, return_r, None);
+        self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], None, return_r, None);
     }
 
-    pub fn inline_call_f(
+    pub fn inline_call_r_v(
         &mut self,
         sub_jitcode_idx: u16,
-        args: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        _return_v: Option<(u16, u16)>,
+    ) {
+        self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], None, None, None);
+    }
+
+    pub fn inline_call_ir_i(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        return_i: Option<(u16, u16)>,
+    ) {
+        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], return_i, None, None);
+    }
+
+    pub fn inline_call_ir_r(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        return_r: Option<(u16, u16)>,
+    ) {
+        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], None, return_r, None);
+    }
+
+    pub fn inline_call_ir_v(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        _return_v: Option<(u16, u16)>,
+    ) {
+        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], None, None, None);
+    }
+
+    pub fn inline_call_irf_i(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        args_f: &[(u16, u16)],
+        return_i: Option<(u16, u16)>,
+    ) {
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            args_i,
+            args_r,
+            args_f,
+            return_i,
+            None,
+            None,
+        );
+    }
+
+    pub fn inline_call_irf_r(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        args_f: &[(u16, u16)],
+        return_r: Option<(u16, u16)>,
+    ) {
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            args_i,
+            args_r,
+            args_f,
+            None,
+            return_r,
+            None,
+        );
+    }
+
+    pub fn inline_call_irf_f(
+        &mut self,
+        sub_jitcode_idx: u16,
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        args_f: &[(u16, u16)],
         return_f: Option<(u16, u16)>,
     ) {
-        self.inline_call_full(sub_jitcode_idx, args, None, None, return_f);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            args_i,
+            args_r,
+            args_f,
+            None,
+            None,
+            return_f,
+        );
     }
 
-    /// Inline call with typed arguments and a typed return slot.
-    ///
-    /// `args` maps each typed caller register to a callee register,
-    /// `return_kind` selects which register file the return is routed through:
-    /// 0 = Int, 1 = Ref, 2 = Float.
-    pub fn inline_call_with_typed_args(
+    pub fn inline_call_irf_v(
         &mut self,
         sub_jitcode_idx: u16,
-        args: &[(JitArgKind, u16, u16)],
-        return_slot: Option<(u16, u16)>,
-        return_kind: u8,
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        args_f: &[(u16, u16)],
+        _return_v: Option<(u16, u16)>,
     ) {
-        let (return_i, return_r, return_f) = match return_kind {
-            1 => (None, return_slot, None),
-            2 => (None, None, return_slot),
-            _ => (return_slot, None, None),
-        };
-        self.inline_call_typed(sub_jitcode_idx, args, return_i, return_r, return_f);
+        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, args_f, None, None, None);
     }
 
-    fn inline_call_full(
+    fn inline_call_grouped(
         &mut self,
         sub_jitcode_idx: u16,
-        args: &[(u16, u16)],
+        args_i: &[(u16, u16)],
+        args_r: &[(u16, u16)],
+        args_f: &[(u16, u16)],
         return_i: Option<(u16, u16)>,
         return_r: Option<(u16, u16)>,
         return_f: Option<(u16, u16)>,
     ) {
-        // Default: all args are int-typed when using (u16, u16) pairs
-        let typed_args: Vec<_> = args
-            .iter()
-            .map(|&(src, dst)| (JitArgKind::Int, src, dst))
-            .collect();
+        let mut typed_args = Vec::with_capacity(args_i.len() + args_r.len() + args_f.len());
+        typed_args.extend(
+            args_i
+                .iter()
+                .map(|&(caller_src, callee_dst)| (JitArgKind::Int, caller_src, callee_dst)),
+        );
+        typed_args.extend(
+            args_r
+                .iter()
+                .map(|&(caller_src, callee_dst)| (JitArgKind::Ref, caller_src, callee_dst)),
+        );
+        typed_args.extend(
+            args_f
+                .iter()
+                .map(|&(caller_src, callee_dst)| (JitArgKind::Float, caller_src, callee_dst)),
+        );
         self.inline_call_typed(sub_jitcode_idx, &typed_args, return_i, return_r, return_f);
     }
 
@@ -923,7 +1095,7 @@ impl JitCodeBuilder {
     /// RPython: `conditional_call_ir_v(condition, funcptr, calldescr, [i], [r])`
     /// Condition in cond_reg; if nonzero, call func with args. Result void.
     /// `typed_args` carries per-argument kind (int/ref) — RPython make_three_lists parity.
-    pub fn conditional_call_void_typed_args(
+    pub fn conditional_call_ir_v_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         cond_reg: u16,
@@ -934,7 +1106,7 @@ impl JitCodeBuilder {
     }
 
     /// RPython: `conditional_call_value_ir_i(value, funcptr, calldescr, [i], [r])`
-    pub fn conditional_call_value_int_typed_args(
+    pub fn conditional_call_value_ir_i_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         value_reg: u16,
@@ -953,15 +1125,15 @@ impl JitCodeBuilder {
     }
 
     /// RPython: `conditional_call_value_ir_r`
-    pub fn conditional_call_value_ref_typed_args(
+    pub fn conditional_call_value_ir_r_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         value_reg: u16,
         typed_args: &[JitCallArg],
         dst: u16,
     ) {
-        self.touch_reg(value_reg);
-        self.touch_reg(dst);
+        self.touch_ref_reg(value_reg);
+        self.touch_ref_reg(dst);
         self.call_cond_value_like(
             jitcode::BC_COND_CALL_VALUE_REF,
             fn_ptr_idx,
@@ -972,7 +1144,7 @@ impl JitCodeBuilder {
     }
 
     /// RPython: `record_known_result_i_ir_v(result, funcptr, calldescr, [i], [r])`
-    pub fn record_known_result_int_typed_args(
+    pub fn record_known_result_i_ir_v_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         result_reg: u16,
@@ -988,13 +1160,13 @@ impl JitCodeBuilder {
     }
 
     /// RPython: `record_known_result_r_ir_v`
-    pub fn record_known_result_ref_typed_args(
+    pub fn record_known_result_r_ir_v_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         result_reg: u16,
         typed_args: &[JitCallArg],
     ) {
-        self.touch_reg(result_reg);
+        self.touch_ref_reg(result_reg);
         self.call_cond_like(
             jitcode::BC_RECORD_KNOWN_RESULT_REF,
             fn_ptr_idx,
@@ -1037,19 +1209,23 @@ impl JitCodeBuilder {
         self.push_u16(dst);
     }
 
+    /// RPython `blackhole.py:638-640` `bhimpl_int_copy(a) returns=i`.
+    /// Byte layout follows `assembler.py:165-174`: each `Register` is
+    /// emitted in argcode order, so `int_copy/i>i` stores `[src][dst]`
+    /// and the `>i` result byte is the last operand.
     pub fn move_i(&mut self, dst: u16, src: u16) {
         self.touch_reg(dst);
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_MOVE_I);
-        self.push_u16(dst);
+        self.write_insn("int_copy/i>i");
         self.push_u16(src);
+        self.push_u16(dst);
     }
 
     /// `flatten.py:329` `self.emitline('int_push', v)` / `blackhole.py:662-663`
     /// `bhimpl_int_push(a)` — save `src` into the int-kind scratch slot.
     pub fn push_i(&mut self, src: u16) {
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_INT_PUSH);
+        self.write_insn("int_push/i");
         self.push_u16(src);
     }
 
@@ -1057,7 +1233,7 @@ impl JitCodeBuilder {
     /// `bhimpl_int_pop()` — load `dst` from the int-kind scratch slot.
     pub fn pop_i(&mut self, dst: u16) {
         self.touch_reg(dst);
-        self.push_u8(jitcode::BC_INT_POP);
+        self.write_insn("int_pop/>i");
         self.push_u16(dst);
     }
 
@@ -1080,26 +1256,34 @@ impl JitCodeBuilder {
         self.load_const_r(dst, const_idx);
     }
 
+    /// Lower to RPython `ref_copy/r>r` reading from the constants
+    /// window of the ref register file. See `load_const_i` for the
+    /// const-patch mechanism.
     pub fn load_const_r(&mut self, dst: u16, const_idx: u16) {
         self.touch_ref_reg(dst);
-        self.push_u8(jitcode::BC_LOAD_CONST_R);
+        self.write_insn("ref_copy/r>r");
+        let src_offset = self.code.len();
+        self.push_u16(0);
+        self.const_patches
+            .push((src_offset, ConstKind::Ref, const_idx));
         self.push_u16(dst);
-        self.push_u16(const_idx);
     }
 
+    /// RPython `blackhole.py:641-643` `bhimpl_ref_copy(a) returns=r`.
+    /// See `move_i` for the `[src][dst]` argcode-order layout.
     pub fn move_r(&mut self, dst: u16, src: u16) {
         self.touch_ref_reg(dst);
         self.touch_ref_reg(src);
-        self.push_u8(jitcode::BC_MOVE_R);
-        self.push_u16(dst);
+        self.write_insn("ref_copy/r>r");
         self.push_u16(src);
+        self.push_u16(dst);
     }
 
     /// `flatten.py:329` `self.emitline('ref_push', v)` / `blackhole.py:665-666`
     /// `bhimpl_ref_push(a)` — save `src` into the ref-kind scratch slot.
     pub fn push_r(&mut self, src: u16) {
         self.touch_ref_reg(src);
-        self.push_u8(jitcode::BC_REF_PUSH);
+        self.write_insn("ref_push/r");
         self.push_u16(src);
     }
 
@@ -1107,7 +1291,7 @@ impl JitCodeBuilder {
     /// `bhimpl_ref_pop()` — load `dst` from the ref-kind scratch slot.
     pub fn pop_r(&mut self, dst: u16) {
         self.touch_ref_reg(dst);
-        self.push_u8(jitcode::BC_REF_POP);
+        self.write_insn("ref_pop/>r");
         self.push_u16(dst);
     }
 
@@ -1187,26 +1371,34 @@ impl JitCodeBuilder {
         self.load_const_f(dst, const_idx);
     }
 
+    /// Lower to RPython `float_copy/f>f` reading from the constants
+    /// window of the float register file. See `load_const_i` for the
+    /// const-patch mechanism.
     pub fn load_const_f(&mut self, dst: u16, const_idx: u16) {
         self.touch_float_reg(dst);
-        self.push_u8(jitcode::BC_LOAD_CONST_F);
+        self.write_insn("float_copy/f>f");
+        let src_offset = self.code.len();
+        self.push_u16(0);
+        self.const_patches
+            .push((src_offset, ConstKind::Float, const_idx));
         self.push_u16(dst);
-        self.push_u16(const_idx);
     }
 
+    /// RPython `blackhole.py:644-646` `bhimpl_float_copy(a) returns=f`.
+    /// See `move_i` for the `[src][dst]` argcode-order layout.
     pub fn move_f(&mut self, dst: u16, src: u16) {
         self.touch_float_reg(dst);
         self.touch_float_reg(src);
-        self.push_u8(jitcode::BC_MOVE_F);
-        self.push_u16(dst);
+        self.write_insn("float_copy/f>f");
         self.push_u16(src);
+        self.push_u16(dst);
     }
 
     /// `flatten.py:329` `self.emitline('float_push', v)` / `blackhole.py:668-669`
     /// `bhimpl_float_push(a)` — save `src` into the float-kind scratch slot.
     pub fn push_f(&mut self, src: u16) {
         self.touch_float_reg(src);
-        self.push_u8(jitcode::BC_FLOAT_PUSH);
+        self.write_insn("float_push/f");
         self.push_u16(src);
     }
 
@@ -1214,7 +1406,7 @@ impl JitCodeBuilder {
     /// `bhimpl_float_pop()` — load `dst` from the float-kind scratch slot.
     pub fn pop_f(&mut self, dst: u16) {
         self.touch_float_reg(dst);
-        self.push_u8(jitcode::BC_FLOAT_POP);
+        self.write_insn("float_pop/>f");
         self.push_u16(dst);
     }
 
@@ -1307,17 +1499,17 @@ impl JitCodeBuilder {
     /// RPython `bhimpl_*` — those lower to a residual call at the
     /// codewriter layer, never reaching a jitcode bytecode.
     pub fn record_binop_f(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
-        let bc = match opcode {
-            OpCode::FloatAdd => jitcode::BC_FLOAT_ADD,
-            OpCode::FloatSub => jitcode::BC_FLOAT_SUB,
-            OpCode::FloatMul => jitcode::BC_FLOAT_MUL,
-            OpCode::FloatTrueDiv => jitcode::BC_FLOAT_TRUEDIV,
+        let key = match opcode {
+            OpCode::FloatAdd => "float_add/ff>f",
+            OpCode::FloatSub => "float_sub/ff>f",
+            OpCode::FloatMul => "float_mul/ff>f",
+            OpCode::FloatTrueDiv => "float_truediv/ff>f",
             other => panic!("record_binop_f: unsupported opcode {other:?}"),
         };
         self.touch_float_reg(dst);
         self.touch_float_reg(lhs);
         self.touch_float_reg(rhs);
-        self.push_u8(bc);
+        self.write_insn(key);
         self.push_u16(dst);
         self.push_u16(lhs);
         self.push_u16(rhs);
@@ -1325,14 +1517,14 @@ impl JitCodeBuilder {
 
     /// RPython `blackhole.py:689-695` `bhimpl_float_{neg,abs}` per-opname handlers.
     pub fn record_unary_f(&mut self, dst: u16, opcode: OpCode, src: u16) {
-        let bc = match opcode {
-            OpCode::FloatNeg => jitcode::BC_FLOAT_NEG,
-            OpCode::FloatAbs => jitcode::BC_FLOAT_ABS,
+        let key = match opcode {
+            OpCode::FloatNeg => "float_neg/f>f",
+            OpCode::FloatAbs => "float_abs/f>f",
             other => panic!("record_unary_f: unsupported opcode {other:?}"),
         };
         self.touch_float_reg(dst);
         self.touch_float_reg(src);
-        self.push_u8(bc);
+        self.write_insn(key);
         self.push_u16(dst);
         self.push_u16(src);
     }
@@ -1408,6 +1600,7 @@ impl JitCodeBuilder {
 
     pub fn finish(mut self) -> JitCode {
         self.patch_labels();
+        self.patch_const_refs();
         JitCode {
             name: self.name,
             code: self.code,
@@ -1437,6 +1630,16 @@ impl JitCodeBuilder {
 
     fn push_u16(&mut self, value: u16) {
         self.code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// RPython `assembler.py:216-222` `write_insn` opcode-byte lane:
+    /// looks up `opname/argcodes` in the shared insns table and emits
+    /// the assigned byte. Operand emission is still done by the
+    /// surrounding method because pyre's 2-byte register operands and
+    /// per-BC operand layouts do not yet match the 1-byte `emit_reg` /
+    /// `emit_const` encoding on the RPython side.
+    fn write_insn(&mut self, key: &'static str) {
+        self.push_u8(jitcode::insn_byte(key));
     }
 
     fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
@@ -1605,6 +1808,25 @@ impl JitCodeBuilder {
             let bytes = target.to_le_bytes();
             self.code[patch_offset] = bytes[0];
             self.code[patch_offset + 1] = bytes[1];
+        }
+    }
+
+    /// RPython `assembler.py:131-138` resolves a const-source operand
+    /// to `count_regs[kind] + len(constants) - 1`. pyre performs the
+    /// same resolution as a post-emission pass once per-kind
+    /// `num_regs_X` is final: `num_regs_X + pool_idx` is the slot the
+    /// register file-backed `{int,ref,float}_copy` reads from.
+    fn patch_const_refs(&mut self) {
+        for &(offset, kind, pool_idx) in &self.const_patches {
+            let base = match kind {
+                ConstKind::Int => self.num_regs_i,
+                ConstKind::Ref => self.num_regs_r,
+                ConstKind::Float => self.num_regs_f,
+            };
+            let slot = base + pool_idx;
+            let bytes = slot.to_le_bytes();
+            self.code[offset] = bytes[0];
+            self.code[offset + 1] = bytes[1];
         }
     }
 }

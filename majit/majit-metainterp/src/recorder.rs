@@ -388,12 +388,6 @@ mod tests {
         fn fail_arg_types(&self) -> &[Type] {
             &[]
         }
-        fn handle_fail(
-            &self,
-            ctx: &mut dyn majit_ir::HandleFailContext,
-        ) -> majit_ir::HandleFailResult {
-            ctx.resume_guard(self)
-        }
     }
 
     fn make_fail_descr(index: u32) -> DescrRef {

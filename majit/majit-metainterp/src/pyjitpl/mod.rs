@@ -8831,8 +8831,17 @@ impl<M: Clone> MetaInterp<M> {
         R: crate::pyjitpl::JitCodeRuntime,
     {
         // pyjitpl.py:2451: self.framestack.append(f) — push the root.
-        self.framestack
-            .push(crate::pyjitpl::MIFrame::new(jitcode, pc));
+        let mut root_frame = crate::pyjitpl::MIFrame::new(jitcode, pc);
+        {
+            // RPython `pyjitpl.py:2247-2253` `MIFrame.setup` populates
+            // the constants window with Const{Int,Ptr,Float} boxes.
+            let ctx = self
+                .tracing
+                .as_mut()
+                .expect("trace_jitcode_with_framestack requires an active trace");
+            root_frame.fill_const_slots(ctx);
+        }
+        self.framestack.push(root_frame);
         let action = {
             // Split the &mut borrow so the trace context and framestack
             // can be passed to the machine simultaneously.  `tracing`

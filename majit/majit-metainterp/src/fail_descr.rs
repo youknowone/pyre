@@ -88,9 +88,6 @@ impl FailDescr for MetaFailDescr {
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
     }
-    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
-        ctx.resume_guard(self)
-    }
 }
 
 /// Per-guard FailDescr that also carries resume data for deoptimization.
@@ -141,9 +138,6 @@ impl FailDescr for ResumeGuardDescr {
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
-    }
-    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
-        ctx.resume_guard(self)
     }
 }
 
@@ -242,9 +236,6 @@ impl FailDescr for ResumeAtPositionDescr {
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
     }
-    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
-        ctx.resume_guard(self)
-    }
 }
 
 /// Create a ResumeAtPositionDescr with auto-assigned fail_index and
@@ -336,14 +327,6 @@ impl FailDescr for CompileLoopVersionDescr {
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
-    }
-    /// compile.py:895-897 `CompileLoopVersionDescr.handle_fail` —
-    ///     `assert 0, "this guard must never fail"`.
-    fn handle_fail(
-        &self,
-        _ctx: &mut dyn majit_ir::HandleFailContext,
-    ) -> majit_ir::HandleFailResult {
-        unreachable!("CompileLoopVersionDescr.handle_fail — this guard must never fail");
     }
 }
 

@@ -846,9 +846,7 @@ impl Backend for DynasmBackend {
                 Value::Float(f) => f.to_bits() as i64,
                 Value::Void => 0,
             };
-            unsafe {
-                crate::llmodel::set_int_value_direct(jf_ptr, Self::input_slot(i), raw as isize)
-            };
+            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
         }
 
         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -989,9 +987,7 @@ impl Backend for DynasmBackend {
         unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
 
         for (i, &val) in args.iter().enumerate() {
-            unsafe {
-                crate::llmodel::set_int_value_direct(jf_ptr, Self::input_slot(i), val as isize)
-            };
+            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
         }
 
         let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
