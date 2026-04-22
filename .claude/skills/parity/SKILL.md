@@ -34,7 +34,7 @@ Separate the invocation into:
 - The `/parity` flag itself (already consumed).
 - The **follow-up task** — everything the user wrote after `/parity`. This is the actual work to be done.
 
-If there is no follow-up task (just bare `/parity`), default to "run a full parity audit of the current diff and report findings without writing code".
+If there is no follow-up task (just bare `/parity`), default to "run a full parity audit of the current diff, fix trivial deviations in-session, and report findings". A deviation is **trivial** when it fits in one session and does not change observable semantics — typical examples: adding an inline comment that cites the RPython file:line behind a PRE-EXISTING-ADAPTATION, renaming a local to match upstream identifier, re-ordering a match arm to mirror upstream's if/elif chain. Anything that touches cross-crate API shape, regenerates lockfiles, moves files between modules, or requires porting a missing dependency is **not** trivial — surface it as a finding and wait for user direction.
 
 ### Step 2: Parity audit
 
