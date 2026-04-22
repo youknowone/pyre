@@ -476,7 +476,7 @@ impl<'a> TraceIterator<'a> {
 /// compilation path produces one per guard failure that triggers a
 /// sub-trace retrace.
 pub struct CutTrace<'a> {
-    pub trace: &'a TraceRecordBuffer,
+    pub trace: *mut TraceRecordBuffer,
     pub start: usize,
     pub count: u32,
     pub index: u32,
@@ -485,18 +485,28 @@ pub struct CutTrace<'a> {
     /// OpRef so downstream TAGBOX(p) decodes resolve to the new
     /// iterator-local inputarg.
     pub inputargs: Vec<Box>,
+    _marker: std::marker::PhantomData<&'a TraceRecordBuffer>,
 }
 
 impl<'a> CutTrace<'a> {
+    /// opencoder.py:416-418 `CutTrace.cut_at(cut)` — delegate to the
+    /// parent trace after asserting the cut lies beyond this cut-trace's
+    /// starting count.
+    pub fn cut_at(&self, cut: crate::recorder::TracePosition) {
+        assert!(cut._count > self.count, "cut must lie after CutTrace start");
+        unsafe { (&mut *self.trace).cut_at(cut) };
+    }
+
     /// opencoder.py:420-427 `CutTrace.get_iter` — build a
     /// `ByteTraceIter` that walks the parent trace from `start` to
     /// `trace._pos`, with `_cache` / `inputargs` seeded from the cut's
     /// inputarg templates.
     pub fn get_iter(&self) -> ByteTraceIter<'a> {
+        let trace = unsafe { &*self.trace };
         ByteTraceIter::new_for_cut(
-            self.trace,
+            trace,
             self.start,
-            self.trace._pos,
+            trace._pos,
             self.count,
             self.index,
             &self.inputargs,
@@ -510,10 +520,11 @@ impl<'a> CutTrace<'a> {
         &self,
         const_pool: &'a mut crate::constant_pool::ConstantPool,
     ) -> ByteTraceIter<'a> {
+        let trace = unsafe { &*self.trace };
         ByteTraceIter::new_for_cut(
-            self.trace,
+            trace,
             self.start,
-            self.trace._pos,
+            trace._pos,
             self.count,
             self.index,
             &self.inputargs,
@@ -1678,11 +1689,12 @@ impl TraceRecordBuffer {
         inputargs: Vec<Box>,
     ) -> CutTrace<'_> {
         CutTrace {
-            trace: self,
+            trace: self as *const _ as *mut _,
             start: cut._pos,
             count: cut._count,
             index: cut._index,
             inputargs,
+            _marker: std::marker::PhantomData,
         }
     }
 

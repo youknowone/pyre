@@ -3676,8 +3676,8 @@ impl CodeWriter {
         self.finalize_jitcode(
             assembler,
             ssarepr,
-            w_code,
             code,
+            w_code,
             pc_map,
             depth_at_pc,
             portal_frame_reg,
@@ -3712,8 +3712,8 @@ impl CodeWriter {
         &self,
         assembler: SSAReprEmitter,
         ssarepr: SSARepr,
-        w_code: *const (),
         code: &CodeObject,
+        w_code: *const (),
         pc_map: Vec<usize>,
         depth_at_pc: Vec<u16>,
         portal_frame_reg: u16,
@@ -3773,6 +3773,7 @@ impl CodeWriter {
         PyJitCode {
             jitcode: std::sync::Arc::new(jitcode),
             metadata,
+            code_ptr: code as *const CodeObject,
             w_code,
             has_abort,
             merge_point_pc,

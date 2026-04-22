@@ -10,8 +10,8 @@ use pyre_interpreter::CodeObject;
 use pyre_interpreter::bytecode::Instruction;
 
 use super::state::{
-    ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, materialize_pending_inline_result,
-    pending_inline_result_from_concrete,
+    ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, ResumeFrameState,
+    materialize_pending_inline_result, pending_inline_result_from_concrete,
 };
 
 /// RPython MIFrame (pyjitpl.py:65) — per-frame tracing state.
@@ -33,8 +33,7 @@ pub struct MetaInterpFrame {
     /// Box for heap stability across Vec reallocs.
     pub owned_concrete_frame: Option<Box<pyre_interpreter::pyframe::PyFrame>>,
     /// opencoder.py:819-834: accumulated parent frame chain.
-    /// Each: (fail_args, types, resumepc, jitcode_index).
-    pub parent_frames: Vec<(Vec<OpRef>, Vec<Type>, usize, i32)>,
+    pub parent_frames: Vec<ResumeFrameState>,
     pub drop_frame_opref: Option<OpRef>,
     pub caller_result_stack_idx: Option<usize>,
     pub arg_state: pyre_interpreter::bytecode::OpArgState,
@@ -367,12 +366,16 @@ impl PyreMetaInterp {
     fn push_inline_frame(
         &mut self,
         ctx: &mut TraceCtx,
-        pending: PendingInlineFrame,
+        mut pending: PendingInlineFrame,
         caller_result_idx: Option<usize>,
     ) {
         let (driver, _) = crate::driver::driver_pair();
         driver.enter_inline_frame(pending.green_key_raw);
         ctx.push_inline_trace_position(pending.green_key);
+
+        if let Some(parent) = pending.parent_frames.first_mut() {
+            parent.pending_result_stack_idx = caller_result_idx;
+        }
 
         let callee_code = pending.concrete_frame.pycode;
         let mut owned_sym = Box::new(pending.sym);

@@ -60,10 +60,14 @@ pub struct PyJitCodeMetadata {
 pub struct PyJitCode {
     pub jitcode: std::sync::Arc<RuntimeJitCode>,
     pub metadata: PyJitCodeMetadata,
-    /// pyre-only: the `W_CodeObject` wrapper this jitcode was compiled
-    /// for. Stored on the shared payload so `CallControl` can recover
-    /// the runtime code identity during its `unfinished_graphs` drain
-    /// without carrying a parallel `(graph, w_code, ...)` queue.
+    /// pyre's graph identity for the cached jitcode slot.
+    ///
+    /// RPython indexes `CallControl.jitcodes` and `unfinished_graphs`
+    /// directly by graph object. pyre still keys the public cache by
+    /// `w_code` when available, but the cached object carries the raw
+    /// CodeObject pointer so the queue can stay a bare graph list.
+    pub code_ptr: *const pyre_interpreter::CodeObject,
+    /// pyre-only wrapper identity for trace-side jitcode lookup.
     pub w_code: *const (),
     /// True if the jitcode contains BC_ABORT opcodes (unsupported bytecodes).
     /// Precomputed at compile time to avoid repeated bytecode scanning.
@@ -100,9 +104,14 @@ impl PyJitCode {
     /// `get_jitcode` calls (or pyre's `merge_point_pc` refinement
     /// shortcut) can find an existing key without recompiling.
     ///
-    /// Until the drain replaces the slot, the only fields with
-    /// meaningful content are `w_code` and `merge_point_pc`.
-    pub fn skeleton(w_code: *const (), merge_point_pc: Option<usize>) -> Self {
+    /// Until the drain replaces the slot, the only field with meaningful
+    /// content is `merge_point_pc` (the refinement hint passed in by
+    /// `get_jitcode`).
+    pub fn skeleton(
+        code_ptr: *const pyre_interpreter::CodeObject,
+        w_code: *const (),
+        merge_point_pc: Option<usize>,
+    ) -> Self {
         Self {
             jitcode: std::sync::Arc::new(RuntimeJitCode::default()),
             metadata: PyJitCodeMetadata {
@@ -112,6 +121,7 @@ impl PyJitCode {
                 portal_ec_reg: 0,
                 stack_base: 0,
             },
+            code_ptr,
             w_code,
             has_abort: false,
             merge_point_pc,

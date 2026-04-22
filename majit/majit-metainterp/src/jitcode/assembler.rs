@@ -349,7 +349,6 @@ impl JitCodeBuilder {
             OpCode::IntLe => jitcode::BC_INT_LE,
             OpCode::IntGt => jitcode::BC_INT_GT,
             OpCode::IntGe => jitcode::BC_INT_GE,
-            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`.
             OpCode::UintRshift => jitcode::BC_UINT_RSHIFT,
             OpCode::UintMulHigh => jitcode::BC_UINT_MUL_HIGH,
             OpCode::UintLt => jitcode::BC_UINT_LT,

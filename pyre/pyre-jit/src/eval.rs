@@ -4561,8 +4561,6 @@ mod tests {
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
         }
     }
 
@@ -4716,8 +4714,6 @@ mod tests {
             vable_debugdata: ctx.const_ref(0xbeef),
             vable_lastblock: ctx.const_ref(0xcafe),
             vable_w_globals: ctx.const_ref(0xfeed),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -4785,8 +4781,6 @@ mod tests {
             vable_debugdata: ctx.const_ref(0),
             vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -4858,8 +4852,6 @@ mod tests {
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
                 vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
-                pre_opcode_vsd: None,
-                pre_opcode_registers_r: None,
             });
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -4935,8 +4927,6 @@ mod tests {
             vable_debugdata: ctx.const_ref(0),
             vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -4999,8 +4989,6 @@ mod tests {
             vable_debugdata: ctx.const_ref(0),
             vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -5086,8 +5074,6 @@ mod tests {
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
                 vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
-                pre_opcode_vsd: None,
-                pre_opcode_registers_r: None,
             });
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
             if record_branch_guard {
@@ -5174,8 +5160,6 @@ mod tests {
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -5250,8 +5234,6 @@ mod tests {
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
 

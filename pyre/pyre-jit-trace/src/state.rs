@@ -264,8 +264,13 @@ impl MetaInterpStaticData {
             }
             return &*self.jitcodes[idx] as *const JitCode;
         }
-        let payload =
-            supplied.unwrap_or_else(|| std::sync::Arc::new(crate::PyJitCode::skeleton(code, None)));
+        let payload = supplied.unwrap_or_else(|| {
+            let raw_code = unsafe {
+                pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
+                    as *const CodeObject
+            };
+            std::sync::Arc::new(crate::PyJitCode::skeleton(raw_code, code, None))
+        });
         let index = self.jitcodes.len() as i32;
         if std::env::var_os("MAJIT_LOG").is_some() && index > 30 {
             eprintln!("[jitcode-for] new idx={} code={:#x}", index, key);
@@ -801,7 +806,11 @@ fn null_jitcode() -> &'static JitCode {
         let r = cell.get_or_init(|| JitCode {
             code: std::ptr::null(),
             index: -1,
-            payload: std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null(), None)),
+            payload: std::sync::Arc::new(crate::PyJitCode::skeleton(
+                std::ptr::null(),
+                std::ptr::null(),
+                None,
+            )),
         });
         // SAFETY: per-thread `OnceCell` initialises once; the
         // resulting reference lives for the thread's lifetime.
@@ -1075,31 +1084,6 @@ pub struct PyreSym {
     pub(crate) concrete_vable_ptr: *mut u8,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
-    /// RPython `capture_resumedata(resumepc=orgpc)`
-    /// (`pyjitpl.py:2586-2602`) swaps `frame.pc` to `orgpc` while
-    /// snapshotting resume data, because a guard firing mid-opcode
-    /// must resume at the opcode's start on failure. In RPython that
-    /// one pc swap is enough: each jitcode instruction writes its
-    /// result AFTER the guard it might fire, so `registers_{i,r,f}`
-    /// still carry the pre-opcode values at guard time.
-    ///
-    /// Pyre dispatches a single Python bytecode into multiple SSA ops,
-    /// some of which may write `registers_r` BEFORE a mid-opcode
-    /// guard fires. That makes register state at guard time diverge
-    /// from orgpc state, so pyre additionally snapshots
-    /// `valuestackdepth` (`pre_opcode_vsd`) and the full `registers_r`
-    /// (`pre_opcode_registers_r` below) at opcode start. Encoder
-    /// consumers read through these snapshots. PRE-EXISTING-
-    /// ADAPTATION for the stack-machine → register-machine dispatch
-    /// difference.
-    pub(crate) pre_opcode_vsd: Option<usize>,
-    /// Stage 3.4 Phase B: full snapshot of `registers_r` at opcode
-    /// start. Encoder consumers (`get_list_of_active_boxes`,
-    /// `build_virtualizable_boxes`) read the unified abstract register
-    /// file through this snapshot so that locals (idx < nlocals) and
-    /// stack tail (idx >= nlocals) share a single indexing rule. When
-    /// `None` the consumer falls back to the live `registers_r`.
-    pub(crate) pre_opcode_registers_r: Option<Vec<OpRef>>,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py:2745): concrete
     /// exception object pending during tracing. Set by execute_ll_raised
     /// (raise_varargs), consumed by handle_possible_exception.
@@ -1161,8 +1145,6 @@ pub struct TestSymState {
     pub vable_debugdata: OpRef,
     pub vable_lastblock: OpRef,
     pub vable_w_globals: OpRef,
-    pub pre_opcode_vsd: Option<usize>,
-    pub pre_opcode_registers_r: Option<Vec<OpRef>>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1182,10 +1164,25 @@ pub struct MIFrame {
     /// opcode. All guards within one opcode capture this as their resume PC
     /// so that guard failure re-executes the opcode from the beginning.
     pub(crate) orgpc: usize,
+    /// RPython `capture_resumedata(resumepc=orgpc)`
+    /// Opcode-start snapshot of the unified `registers_r` file used by
+    /// guard/resumedata capture for this one opcode. When `None`, guard
+    /// capture reads the live register file directly. The snapshot stores
+    /// exactly `registers_r[..valuestackdepth]`, so its length is the
+    /// pre-opcode valuestack depth and no separate `pre_opcode_vsd` slot is
+    /// needed.
+    pub(crate) pre_opcode_registers_r: Option<Vec<OpRef>>,
     /// PyPy capture_resumedata: parent frame chain for multi-frame guards.
-    /// Each element is (fail_args, fail_arg_types, resumepc, jitcode_index).
-    /// opencoder.py:819-834: walks framestack to build parent snapshot chain.
-    pub parent_frames: Vec<(Vec<OpRef>, Vec<Type>, usize, i32)>,
+    /// Each entry points at one parent frame plus the resumepc that
+    /// should be used when that parent is snapshotted. This stays much
+    /// closer to RPython's `self.framestack` than the old flattened
+    /// `(fail_args, fail_arg_types, resumepc, jitcode_index)` tuples.
+    pub parent_frames: Vec<ResumeFrameState>,
+    /// `pyjitpl.py:181-193` `_result_argcode` analogue for non-top-frame
+    /// snapshotting. When present, `get_list_of_active_boxes(in_a_call=True)`
+    /// overwrites this caller stack slot with a null placeholder before
+    /// liveness encoding.
+    pub pending_result_stack_idx: Option<usize>,
     pub pending_inline_frame: Option<PendingInlineFrame>,
 }
 
@@ -1223,6 +1220,27 @@ pub(crate) fn instruction_is_trivia_between_compare_and_branch(instruction: Inst
     )
 }
 
+pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) -> bool {
+    // Only keep the opcode-start snapshot for bytecodes that can emit a
+    // guard after mutating the logical stack/register state. A larger
+    // "may raise" set still needs GUARD_{NO_,}EXCEPTION handling, but
+    // opcodes like GET_ITER / FOR_ITER / GET_LEN / IMPORT_FROM inspect
+    // the current stack via peek-at-TOS and do not need a pre-pop
+    // resumestate. Unsupported tracer opcodes also stay out of this set
+    // until they gain a real guard-producing lowering.
+    matches!(
+        instruction,
+        Instruction::Call { .. }
+            | Instruction::StoreSubscr
+            | Instruction::BinaryOp { .. }
+            | Instruction::CompareOp { .. }
+            | Instruction::UnaryNegative
+            | Instruction::UnaryNot
+            | Instruction::UnaryInvert
+            | Instruction::RaiseVarargs { .. }
+    )
+}
+
 /// RPython exc=True parity: instructions that correspond to JitCode ops
 /// with exc=True. Only external calls and operations that invoke arbitrary
 /// Python code need GUARD_NO_EXCEPTION. Arithmetic, comparisons, and
@@ -1233,14 +1251,12 @@ pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
         instruction,
         // RPython exc=True: external calls and attribute access that
         // may invoke arbitrary Python code (__getattr__, descriptors).
+        // Unsupported tracer opcodes stay out of this set until they gain a
+        // real lowering; otherwise the default "not implemented" error is
+        // mis-recorded as a traced GUARD_EXCEPTION.
         Instruction::Call { .. }
-            | Instruction::CallKw { .. }
-            | Instruction::CallFunctionEx { .. }
             | Instruction::StoreAttr { .. }
-            | Instruction::DeleteAttr { .. }
             | Instruction::StoreSubscr
-            | Instruction::DeleteSubscr
-            | Instruction::ImportName { .. }
             | Instruction::ImportFrom { .. }
             // RPython opimpl_raise/opimpl_reraise: always Err, needs
             // GUARD_EXCEPTION + finishframe_exception for exception-path tracing.
@@ -1930,8 +1946,6 @@ impl PyreSym {
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
-            pre_opcode_vsd: None,
-            pre_opcode_registers_r: None,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
@@ -1963,8 +1977,6 @@ impl PyreSym {
         sym.vable_debugdata = state.vable_debugdata;
         sym.vable_lastblock = state.vable_lastblock;
         sym.vable_w_globals = state.vable_w_globals;
-        sym.pre_opcode_vsd = state.pre_opcode_vsd;
-        sym.pre_opcode_registers_r = state.pre_opcode_registers_r;
         sym
     }
 
@@ -4493,10 +4505,12 @@ mod tests {
     use crate::helpers::TraceHelperAccess;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
-    use pyre_interpreter::bytecode::BinaryOperator;
+    use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ConstantData, Instruction};
     use pyre_interpreter::eval::eval_frame_plain;
+    use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{
-        IterOpcodeHandler, OpcodeStepExecutor, SharedOpcodeHandler, compile_exec,
+        BranchOpcodeHandler, IterOpcodeHandler, LocalOpcodeHandler, Mode, OpcodeStepExecutor,
+        SharedOpcodeHandler, compile_exec, compile_source,
     };
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
@@ -4562,6 +4576,238 @@ mod tests {
         }
     }
 
+    fn compile_function_body(src: &str) -> CodeObject {
+        let module = compile_source(src, Mode::Exec).expect("compile should succeed");
+        module
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("source should contain a function body")
+    }
+
+    fn contains_instruction(code: &CodeObject, predicate: impl Fn(Instruction) -> bool) -> bool {
+        (0..code.instructions.len()).any(|pc| {
+            decode_instruction_at(code, pc)
+                .map(|(instruction, _)| predicate(instruction))
+                .unwrap_or(false)
+        })
+    }
+
+    #[test]
+    fn test_pre_opcode_snapshot_gate_skips_peek_only_and_no_guard_opcodes() {
+        let iter_code =
+            compile_function_body("def f(xs):\n    for x in xs:\n        return len(xs)\n");
+        assert!(contains_instruction(&iter_code, |instruction| {
+            matches!(instruction, Instruction::GetIter)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+        assert!(contains_instruction(&iter_code, |instruction| {
+            matches!(instruction, Instruction::ForIter { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let match_code = compile_function_body(
+            "def f(xs):\n    match xs:\n        case [a, b]:\n            return 1\n    return 0\n",
+        );
+        assert!(contains_instruction(&match_code, |instruction| {
+            matches!(instruction, Instruction::GetLen)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let import_code =
+            compile_function_body("def f(pkg):\n    from pkg import name\n    return name\n");
+        assert!(contains_instruction(&import_code, |instruction| {
+            matches!(instruction, Instruction::ImportFrom { .. })
+                && instruction_may_raise(instruction)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let except_code = compile_function_body(
+            "def f():\n    try:\n        raise ValueError('x')\n    except ValueError:\n        return 0\n",
+        );
+        assert!(contains_instruction(&except_code, |instruction| {
+            matches!(instruction, Instruction::CheckExcMatch)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let none_branch_code = compile_function_body(
+            "def f(x):\n    if x is not None:\n        return 1\n    return 0\n",
+        );
+        assert!(contains_instruction(&none_branch_code, |instruction| {
+            matches!(instruction, Instruction::PopJumpIfNone { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let not_none_branch_code =
+            compile_function_body("def f(x):\n    if x is None:\n        return 1\n    return 0\n");
+        assert!(contains_instruction(&not_none_branch_code, |instruction| {
+            matches!(instruction, Instruction::PopJumpIfNotNone { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let truth_branch_code =
+            compile_function_body("def f(x):\n    if x:\n        return 1\n    return 0\n");
+        assert!(contains_instruction(&truth_branch_code, |instruction| {
+            matches!(instruction, Instruction::PopJumpIfFalse { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let not_truth_branch_code =
+            compile_function_body("def f(x):\n    if not x:\n        return 1\n    return 0\n");
+        assert!(contains_instruction(
+            &not_truth_branch_code,
+            |instruction| {
+                matches!(instruction, Instruction::PopJumpIfTrue { .. })
+                    && !instruction_needs_pre_opcode_snapshot(instruction)
+            }
+        ));
+
+        let contains_code = compile_function_body("def f(a, b):\n    return a in b\n");
+        assert!(contains_instruction(&contains_code, |instruction| {
+            matches!(instruction, Instruction::ContainsOp { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let with_except_code = compile_function_body(
+            "def f(cm):\n    try:\n        with cm:\n            return 1\n    except Exception:\n        return 0\n",
+        );
+        assert!(contains_instruction(&with_except_code, |instruction| {
+            matches!(instruction, Instruction::WithExceptStart)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let import_name_code =
+            compile_function_body("def f():\n    import math\n    return math\n");
+        assert!(contains_instruction(&import_name_code, |instruction| {
+            matches!(instruction, Instruction::ImportName { .. })
+                && !instruction_may_raise(instruction)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let call_code = compile_function_body("def f(g, x):\n    return g(x)\n");
+        let call_kw_instruction = (0..call_code.instructions.len())
+            .find_map(|pc| match decode_instruction_at(&call_code, pc) {
+                Some((Instruction::Call { argc }, _)) => Some(Instruction::CallKw { argc }),
+                _ => None,
+            })
+            .expect("source should contain a Call instruction to reuse argc shape");
+        assert!(!instruction_may_raise(call_kw_instruction));
+        assert!(!instruction_needs_pre_opcode_snapshot(call_kw_instruction));
+
+        assert!(!instruction_may_raise(Instruction::CallFunctionEx));
+        assert!(!instruction_needs_pre_opcode_snapshot(
+            Instruction::CallFunctionEx
+        ));
+
+        let delete_attr_code = compile_function_body("def f(obj):\n    del obj.x\n");
+        assert!(contains_instruction(&delete_attr_code, |instruction| {
+            matches!(instruction, Instruction::DeleteAttr { .. })
+                && !instruction_may_raise(instruction)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let delete_subscr_code = compile_function_body("def f(a, i):\n    del a[i]\n");
+        assert!(contains_instruction(&delete_subscr_code, |instruction| {
+            matches!(instruction, Instruction::DeleteSubscr)
+                && !instruction_may_raise(instruction)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let store_attr_code = compile_function_body("def f(obj, v):\n    obj.x = v\n");
+        assert!(contains_instruction(&store_attr_code, |instruction| {
+            matches!(instruction, Instruction::StoreAttr { .. })
+                && instruction_may_raise(instruction)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let dict_update_code = compile_function_body("def f(a, b):\n    return {**a, **b}\n");
+        assert!(contains_instruction(&dict_update_code, |instruction| {
+            matches!(instruction, Instruction::DictUpdate { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let binary_slice_code = compile_function_body("def f(a, b, c):\n    return a[b:c]\n");
+        assert!(contains_instruction(&binary_slice_code, |instruction| {
+            matches!(instruction, Instruction::BinarySlice)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let store_slice_code =
+            compile_function_body("def f(a, b, c, v):\n    a[b:c] = v\n    return a\n");
+        assert!(contains_instruction(&store_slice_code, |instruction| {
+            matches!(instruction, Instruction::StoreSlice)
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let list_extend_code = compile_function_body("def f(a, b):\n    return [*a, *b]\n");
+        assert!(contains_instruction(&list_extend_code, |instruction| {
+            matches!(instruction, Instruction::ListExtend { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let set_update_code = compile_function_body("def f(a, b):\n    return {*a, *b}\n");
+        assert!(contains_instruction(&set_update_code, |instruction| {
+            matches!(instruction, Instruction::SetUpdate { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let map_add_code = compile_function_body("def f(xs):\n    return {x: x for x in xs}\n");
+        assert!(contains_instruction(&map_add_code, |instruction| {
+            matches!(instruction, Instruction::MapAdd { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let set_add_code = compile_function_body("def f(xs):\n    return {x for x in xs}\n");
+        assert!(contains_instruction(&set_add_code, |instruction| {
+            matches!(instruction, Instruction::SetAdd { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let reraise_code = compile_function_body(
+            "def f():\n    try:\n        raise ValueError(1)\n    except Exception:\n        raise\n",
+        );
+        assert!(contains_instruction(&reraise_code, |instruction| {
+            matches!(instruction, Instruction::Reraise { .. })
+                && !instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+    }
+
+    #[test]
+    fn test_pre_opcode_snapshot_gate_keeps_pop_before_guard_opcodes() {
+        let call_code = compile_function_body("def f(g, x):\n    return g(x)\n");
+        assert!(contains_instruction(&call_code, |instruction| {
+            matches!(instruction, Instruction::Call { .. })
+                && instruction_may_raise(instruction)
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let unary_code = compile_function_body("def f(x):\n    return -x\n");
+        assert!(contains_instruction(&unary_code, |instruction| {
+            matches!(instruction, Instruction::UnaryNegative)
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let store_subscr_code =
+            compile_function_body("def f(a, i, v):\n    a[i] = v\n    return a\n");
+        assert!(contains_instruction(&store_subscr_code, |instruction| {
+            matches!(instruction, Instruction::StoreSubscr)
+                && instruction_may_raise(instruction)
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+
+        let raise_code = compile_function_body(
+            "def f():\n    try:\n        raise ValueError(1)\n    except Exception:\n        raise\n",
+        );
+        assert!(contains_instruction(&raise_code, |instruction| {
+            matches!(instruction, Instruction::RaiseVarargs { .. })
+                && instruction_may_raise(instruction)
+                && instruction_needs_pre_opcode_snapshot(instruction)
+        }));
+    }
+
     #[test]
     fn test_trace_ob_type_descr_uses_immutable_header_field_descr() {
         let descr = crate::descr::ob_type_descr();
@@ -4598,9 +4844,11 @@ mod tests {
             sym: &mut sym,
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
+            pre_opcode_registers_r: None,
         };
 
         let instance_ref = ctx.const_ref(instance as i64);
@@ -4836,9 +5084,11 @@ mod tests {
             sym: &mut sym,
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
         };
 
         state
@@ -4867,9 +5117,11 @@ mod tests {
             sym: &mut sym,
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
         };
 
         let _ = <MIFrame as TraceHelperAccess>::trace_binary_value(
@@ -4905,9 +5157,11 @@ mod tests {
             sym: &mut sym,
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
         };
 
         let _ = state
@@ -4963,9 +5217,11 @@ mod tests {
             sym: &mut sym,
             fallthrough_pc: branch_pc,
             parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -5041,9 +5297,11 @@ mod tests {
             sym: &mut sym,
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -5131,9 +5389,11 @@ mod tests {
             sym: &mut sym,
             fallthrough_pc: compare_pc + 1,
             parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
         };
 
         assert!(
@@ -5204,8 +5464,7 @@ pub struct PendingInlineFrame {
     /// without the hash-collision risk a u64-only comparison carries.
     pub green_key_raw: (usize, usize),
     /// opencoder.py:819-834: accumulated parent frame chain.
-    /// Each: (fail_args, types, resumepc, jitcode_index).
-    pub parent_frames: Vec<(Vec<OpRef>, Vec<Type>, usize, i32)>,
+    pub parent_frames: Vec<ResumeFrameState>,
     pub nargs: usize,
     pub caller_result_stack_idx: Option<usize>,
 }
@@ -5330,7 +5589,10 @@ mod indirectcalltargets_tests {
         let raw_code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
             as *const ();
-        let skeleton = Arc::new(crate::PyJitCode::skeleton(code, None));
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject
+        };
+        let skeleton = Arc::new(crate::PyJitCode::skeleton(raw_code, code, None));
         let inserted = sd.jitcode_for(code, Some(skeleton));
         assert!(std::ptr::eq(inserted, sd.jitcodes[0].as_ref()));
         assert!(sd.compiled_jitcode_lookup(code).is_none());
@@ -5342,7 +5604,10 @@ mod indirectcalltargets_tests {
         let raw_code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
             as *const ();
-        let mut pyjit = crate::PyJitCode::skeleton(code, None);
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code, None);
         pyjit.metadata.pc_map.push(0);
         let inserted = sd.jitcode_for(code, Some(Arc::new(pyjit)));
         let hit = sd
@@ -5367,21 +5632,25 @@ mod indirectcalltargets_tests {
         // lands at wrapper.index == 1.  This makes the regression test
         // sensitive to whether the hit-path re-stamp uses the actual
         // SD slot (1) rather than the inner JitCode's default (0).
-        //
-        // `canonical_code_key` dereferences the W_CodeObject wrapper via
-        // `w_code_get_ptr`, so the test must use real wrappers rather
-        // than synthetic pointer values.
         let raw_a = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let code_a =
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_a)) as *const ()) as *const ();
         let raw_b = pyre_interpreter::compile_exec("x = 2\n").expect("source must compile");
         let code_b =
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_b)) as *const ()) as *const ();
+        let raw_a = unsafe {
+            pyre_interpreter::w_code_get_ptr(code_a as pyre_object::PyObjectRef)
+                as *const CodeObject
+        };
+        let raw_b = unsafe {
+            pyre_interpreter::w_code_get_ptr(code_b as pyre_object::PyObjectRef)
+                as *const CodeObject
+        };
         let _ = sd.jitcode_for(
             code_a,
-            Some(Arc::new(crate::PyJitCode::skeleton(code_a, None))),
+            Some(Arc::new(crate::PyJitCode::skeleton(raw_a, code_a, None))),
         );
-        let first = Arc::new(crate::PyJitCode::skeleton(code_b, None));
+        let first = Arc::new(crate::PyJitCode::skeleton(raw_b, code_b, None));
         let _ = sd.jitcode_for(code_b, Some(first.clone()));
         assert_eq!(first.jitcode.index.load(Ordering::Relaxed), 1);
 
@@ -5389,7 +5658,7 @@ mod indirectcalltargets_tests {
         // The replacement's inner JitCode starts with index=0 (the
         // default from JitCodeBuilder::finish); after jitcode_for, it
         // must carry index=1 — matching the SD slot it fills.
-        let second = Arc::new(crate::PyJitCode::skeleton(code_b, None));
+        let second = Arc::new(crate::PyJitCode::skeleton(raw_b, code_b, None));
         assert_eq!(
             second.jitcode.index.load(Ordering::Relaxed),
             0,
@@ -5415,7 +5684,18 @@ mod indirectcalltargets_tests {
         let raw_key =
             unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as usize };
 
-        let _ = sd.jitcode_for(code, Some(Arc::new(crate::PyJitCode::skeleton(code, None))));
+        let expected_raw = unsafe {
+            pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject
+        };
+
+        let _ = sd.jitcode_for(
+            code,
+            Some(Arc::new(crate::PyJitCode::skeleton(
+                expected_raw,
+                code,
+                None,
+            ))),
+        );
 
         assert!(sd.by_code.contains_key(&raw_key));
         assert!(!sd.by_code.contains_key(&(code as usize)));
@@ -5431,7 +5711,14 @@ mod indirectcalltargets_tests {
             pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject
         };
 
-        let _ = sd.jitcode_for(code, Some(Arc::new(crate::PyJitCode::skeleton(code, None))));
+        let _ = sd.jitcode_for(
+            code,
+            Some(Arc::new(crate::PyJitCode::skeleton(
+                expected_raw,
+                code,
+                None,
+            ))),
+        );
         METAINTERP_SD.with(|slot| {
             *slot.borrow_mut() = sd;
         });
@@ -5439,4 +5726,15 @@ mod indirectcalltargets_tests {
         let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
         assert_eq!(hit, expected_raw);
     }
+}
+#[derive(Clone, Copy)]
+pub struct ResumeFrameState {
+    pub sym: *mut PyreSym,
+    pub concrete_frame_addr: usize,
+    pub resume_pc: usize,
+    /// pyjitpl.py:181-193 `get_list_of_active_boxes(in_a_call=True)`.
+    /// Non-top frames clear the caller's pending result slot before
+    /// snapshotting liveness so the undefined call result does not leak
+    /// stale boxes into guard fail_args.
+    pub pending_result_stack_idx: Option<usize>,
 }

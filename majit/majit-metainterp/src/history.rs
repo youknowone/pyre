@@ -14,6 +14,23 @@ use majit_ir::{InputArg, Op, OpCode, OpRef};
 /// `History` is retained for direct RPython call-site parity.
 pub type History = TreeLoop;
 
+/// Cut position for a materialized `TreeLoop`.
+///
+/// RPython's byte-stream opencoder uses the full 5-tuple cut point, but the
+/// already-materialized `TreeLoop` only needs the op index into `ops`.
+/// Keeping this separate avoids reusing byte-cursor `_pos` as if it were
+/// always a `Vec<Op>` index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeLoopCutPosition {
+    pub op_index: usize,
+}
+
+impl TreeLoopCutPosition {
+    pub fn new(op_index: usize) -> Self {
+        Self { op_index }
+    }
+}
+
 /// A completed trace ready for optimization and compilation.
 #[derive(Clone, Debug)]
 pub struct TreeLoop {
@@ -205,7 +222,7 @@ impl TreeLoop {
     /// closure of dependencies).
     pub fn cut_trace_from(
         &self,
-        start: crate::recorder::TracePosition,
+        start: TreeLoopCutPosition,
         original_boxes: &[OpRef],
         original_box_types: &[majit_ir::Type],
     ) -> TreeLoop {
@@ -218,7 +235,7 @@ impl TreeLoop {
     /// pointers and entry-contract mismatches at compiled-code entry.
     pub fn cut_trace_from_with_consts(
         &self,
-        start: crate::recorder::TracePosition,
+        start: TreeLoopCutPosition,
         original_boxes: &[OpRef],
         original_box_types: &[majit_ir::Type],
         inputarg_consts: &[OpRef],
@@ -226,7 +243,7 @@ impl TreeLoop {
         use std::collections::{HashMap, HashSet, VecDeque};
 
         let num_original_inputargs = self.inputargs.len() as u32;
-        let cut_ops = &self.ops[start._pos..];
+        let cut_ops = &self.ops[start.op_index..];
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
         let mut remap: HashMap<OpRef, OpRef> = HashMap::new();
@@ -1068,13 +1085,7 @@ mod tests {
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
-        let start = crate::recorder::TracePosition {
-            _pos: 1, // cut after op0
-            _count: 3,
-            _index: 3,
-            snapshot_data_len: 0,
-            snapshot_array_data_len: 0,
-        };
+        let start = TreeLoopCutPosition::new(1); // cut after op0
         let original_boxes = vec![OpRef(0), OpRef(1)];
         let original_box_types = vec![Type::Int, Type::Int];
 
@@ -1107,13 +1118,7 @@ mod tests {
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
-        let start = crate::recorder::TracePosition {
-            _pos: 1, // cut after op0
-            _count: 3,
-            _index: 3,
-            snapshot_data_len: 0,
-            snapshot_array_data_len: 0,
-        };
+        let start = TreeLoopCutPosition::new(1); // cut after op0
         // original_boxes only has v0 — v2 is escaped
         let original_boxes = vec![OpRef(0)];
         let original_box_types = vec![Type::Int];
@@ -1145,13 +1150,7 @@ mod tests {
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
-        let start = crate::recorder::TracePosition {
-            _pos: 1,
-            _count: 2,
-            _index: 2,
-            snapshot_data_len: 0,
-            snapshot_array_data_len: 0,
-        };
+        let start = TreeLoopCutPosition::new(1);
         let original_boxes = vec![OpRef(0)];
         let original_box_types = vec![Type::Int];
 
@@ -1183,13 +1182,7 @@ mod tests {
         ops.push(op3);
         let trace = TreeLoop::new(inputargs, ops);
 
-        let start = crate::recorder::TracePosition {
-            _pos: 2, // cut after op0 and op1
-            _count: 3,
-            _index: 3,
-            snapshot_data_len: 0,
-            snapshot_array_data_len: 0,
-        };
+        let start = TreeLoopCutPosition::new(2); // cut after op0 and op1
         let original_boxes = vec![OpRef(0)];
         let original_box_types = vec![Type::Int];
 

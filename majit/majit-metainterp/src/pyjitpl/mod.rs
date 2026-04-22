@@ -2447,7 +2447,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
     ) -> Option<(TreeLoop, HashMap<u32, i64>)> {
         self.force_finish_trace = false;
-        let ctx = self.tracing.take()?;
+        let mut ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
         let mut recorder = ctx.recorder;
         recorder.finish(finish_args, crate::make_fail_descr(finish_args.len()));
@@ -2741,7 +2741,7 @@ impl<M: Clone> MetaInterp<M> {
                     (
                         mp.original_boxes.clone(),
                         mp.original_box_types.clone(),
-                        mp.position,
+                        crate::history::TreeLoopCutPosition::new(mp.position._pos),
                     )
                 })
         } else {
@@ -2796,8 +2796,8 @@ impl<M: Clone> MetaInterp<M> {
         {
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] cut_trace_from: start._pos={} original_boxes={} trace_ops={} header_pc={}",
-                    start._pos,
+                    "[jit] cut_trace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
+                    start.op_index,
                     original_boxes.len(),
                     trace.ops.len(),
                     ctx.header_pc,

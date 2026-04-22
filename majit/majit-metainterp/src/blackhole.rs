@@ -1469,11 +1469,6 @@ impl BlackholeInterpreter {
         jitcode::read_u16(&self.jitcode.code, &mut self.position)
     }
 
-    /// Per-opname integer binop helper. Decodes `dst, lhs, rhs` from the
-    /// bytecode stream and applies `opcode` through `eval_binop_i`; the
-    /// `OpCode` argument is a constant at each call site so the inner
-    /// match folds to a single primitive call. RPython's equivalent is
-    /// one `bhimpl_int_<op>` per primitive (`blackhole.py:459-521`).
     fn bh_binop_i(&mut self, opcode: OpCode) {
         let dst = self.next_u16() as usize;
         let lhs_idx = self.next_u16() as usize;
@@ -1483,9 +1478,6 @@ impl BlackholeInterpreter {
         self.registers_i[dst] = eval_binop_i(opcode, lhs, rhs);
     }
 
-    /// Per-opname float binop helper. See `bh_binop_i` for the pattern.
-    /// RPython equivalents: `bhimpl_float_{add,sub,mul,truediv}`
-    /// (`blackhole.py:663-687`).
     fn bh_binop_f(&mut self, opcode: OpCode) {
         let dst = self.next_u16() as usize;
         let lhs_idx = self.next_u16() as usize;
@@ -1752,14 +1744,6 @@ impl BlackholeInterpreter {
                 let src = self.next_u16() as usize;
                 self.registers_f[dst] = self.registers_f[src];
             }
-            // Per-opname integer arithmetic handlers — RPython
-            // `blackhole.py:459-521` `bhimpl_int_{add,sub,mul,...}`. Each
-            // primitive has its own insn_id in
-            // `BlackholeInterpBuilder.insns` (`blackhole.py:52-81
-            // setup_insns`); pyre's hardcoded dispatch uses one `BC_*`
-            // byte per opname instead. The `eval_binop_i` branch folds
-            // to a direct primitive call at compile time because the
-            // `OpCode` argument is a constant at each match arm.
             jitcode::BC_INT_ADD => self.bh_binop_i(OpCode::IntAdd),
             jitcode::BC_INT_SUB => self.bh_binop_i(OpCode::IntSub),
             jitcode::BC_INT_MUL => self.bh_binop_i(OpCode::IntMul),
@@ -1776,6 +1760,12 @@ impl BlackholeInterpreter {
             jitcode::BC_INT_LE => self.bh_binop_i(OpCode::IntLe),
             jitcode::BC_INT_GT => self.bh_binop_i(OpCode::IntGt),
             jitcode::BC_INT_GE => self.bh_binop_i(OpCode::IntGe),
+            jitcode::BC_UINT_RSHIFT => self.bh_binop_i(OpCode::UintRshift),
+            jitcode::BC_UINT_MUL_HIGH => self.bh_binop_i(OpCode::UintMulHigh),
+            jitcode::BC_UINT_LT => self.bh_binop_i(OpCode::UintLt),
+            jitcode::BC_UINT_LE => self.bh_binop_i(OpCode::UintLe),
+            jitcode::BC_UINT_GT => self.bh_binop_i(OpCode::UintGt),
+            jitcode::BC_UINT_GE => self.bh_binop_i(OpCode::UintGe),
             jitcode::BC_INT_NEG => {
                 let dst = self.next_u16() as usize;
                 let src_idx = self.next_u16() as usize;
@@ -1788,15 +1778,6 @@ impl BlackholeInterpreter {
                 let value = self.registers_i[src_idx];
                 self.registers_i[dst] = eval_unary_i(OpCode::IntInvert, value);
             }
-            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`.
-            jitcode::BC_UINT_RSHIFT => self.bh_binop_i(OpCode::UintRshift),
-            jitcode::BC_UINT_MUL_HIGH => self.bh_binop_i(OpCode::UintMulHigh),
-            jitcode::BC_UINT_LT => self.bh_binop_i(OpCode::UintLt),
-            jitcode::BC_UINT_LE => self.bh_binop_i(OpCode::UintLe),
-            jitcode::BC_UINT_GT => self.bh_binop_i(OpCode::UintGt),
-            jitcode::BC_UINT_GE => self.bh_binop_i(OpCode::UintGe),
-            // Per-opname float primitives — RPython `blackhole.py:696-723`
-            // `bhimpl_float_{add,sub,mul,truediv,neg,abs}`.
             jitcode::BC_FLOAT_ADD => self.bh_binop_f(OpCode::FloatAdd),
             jitcode::BC_FLOAT_SUB => self.bh_binop_f(OpCode::FloatSub),
             jitcode::BC_FLOAT_MUL => self.bh_binop_f(OpCode::FloatMul),

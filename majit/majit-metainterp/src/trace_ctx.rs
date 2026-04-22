@@ -790,6 +790,11 @@ impl TraceCtx {
         self.recorder.capture_resumedata(snapshot)
     }
 
+    /// Look up a captured snapshot by id.
+    pub fn get_snapshot(&self, id: i32) -> Option<&crate::recorder::Snapshot> {
+        self.recorder.get_snapshot(id)
+    }
+
     /// Set rd_resume_position on the last recorded guard.
     pub fn set_last_guard_resume_position(&mut self, snapshot_id: i32) {
         self.recorder.set_last_op_resume_position(snapshot_id);
@@ -956,9 +961,7 @@ impl TraceCtx {
     }
 
     /// Snapshot slice accessor — Pyre-level parity with
-    /// `MetaInterp.history.trace.snapshots()`. The storage is a
-    /// `Vec<Snapshot>` side-table today; Step 2e.2b migrates this to
-    /// the byte-stream `_snapshot_data` / `_snapshot_array_data`.
+    /// `MetaInterp.history.trace.snapshots()`.
     pub fn snapshots(&self) -> &[crate::recorder::Snapshot] {
         self.recorder.snapshots()
     }

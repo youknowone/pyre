@@ -15,12 +15,12 @@ use crate::history::TreeLoop;
 /// The byte-stream recorder (`TraceRecordBuffer`) fills in every field
 /// from its byte cursor / counter state.  The legacy `Vec<Op>` recorder
 /// (`recorder::Trace`, being migrated away in Step 2e.2b) maps `_pos` to
-/// the ops-Vec cursor (number of ops currently stored) and stores the
-/// running op count in `_count == _index` (recorder::Trace does not
-/// distinguish void-yielding ops from box-yielding ops).  Snapshot lens
-/// are 0 because `recorder::Trace` keeps snapshots as a separate
-/// `Vec<Snapshot>` side-table; the byte-stream migration retires that
-/// side-table.
+/// the ops-Vec cursor (number of ops currently stored). `_count` mirrors
+/// the total number of recorded ops, while `_index` mirrors the number of
+/// box-yielding positions (inputargs + non-void ops), matching
+/// opencoder.py's split counters even though the legacy `Vec<Op>` recorder
+/// still assigns `OpRef` positions in total-op order. Snapshot lens come
+/// from the recorder-owned `snapshots` side table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TracePosition {
     /// opencoder.py:475 `self._pos` — byte cursor for TRB, ops-Vec cursor
@@ -37,13 +37,15 @@ pub struct TracePosition {
     pub snapshot_array_data_len: usize,
 }
 
-/// The trace recorder: accumulates operations during tracing.
 /// opencoder.py Snapshot parity: per-guard snapshot of the interpreter
 /// frame state, encoded as tagged references to boxes.
 ///
-/// RPython stores snapshots inline in the trace byte stream. majit stores
-/// them in a side table indexed by snapshot_id. Each snapshot captures
-/// the live variables of each frame in the call stack at the guard point.
+/// RPython stores snapshots inline in the trace byte stream
+/// (`_snapshot_data` / `_snapshot_array_data`).  Pyre owns them on
+/// `TraceCtx` as a `Vec<Snapshot>` side-table (Step 2e.2b will migrate
+/// this to the byte-stream form already carried by `TraceRecordBuffer`).
+/// Each snapshot captures the live variables of each frame in the call
+/// stack at the guard point.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     /// Frames in the snapshot, outermost first.
@@ -93,8 +95,11 @@ pub struct Trace {
     inputargs: Vec<InputArg>,
     /// Next OpRef index to assign.
     op_count: u32,
+    /// opencoder.py parity: count of box-yielding positions
+    /// (inputargs + non-void ops).
+    box_count: u32,
     /// opencoder.py parity: per-guard snapshots of interpreter frame state.
-    /// Indexed by snapshot_id (set on guard ops as rd_resume_position).
+    /// Indexed by snapshot_id (stored on guard ops as rd_resume_position).
     snapshots: Vec<Snapshot>,
 }
 
@@ -109,6 +114,7 @@ impl Trace {
             ops: Vec::with_capacity(256),
             inputargs: Vec::new(),
             op_count: 0,
+            box_count: 0,
             snapshots: Vec::new(),
         }
     }
@@ -144,6 +150,7 @@ impl Trace {
         self.inputargs.push(InputArg::from_type(tp, index));
         let opref = OpRef(self.op_count);
         self.op_count += 1;
+        self.box_count += 1;
         opref
     }
 
@@ -156,6 +163,9 @@ impl Trace {
         op.pos = opref;
         self.ops.push(op);
         self.op_count += 1;
+        if opcode.result_type() != Type::Void {
+            self.box_count += 1;
+        }
         opref
     }
 
@@ -173,6 +183,9 @@ impl Trace {
         op.pos = opref;
         self.ops.push(op);
         self.op_count += 1;
+        if opcode.result_type() != Type::Void {
+            self.box_count += 1;
+        }
         opref
     }
 
@@ -216,6 +229,29 @@ impl Trace {
         }
     }
 
+    /// opencoder.py:819 parity: capture a snapshot of the current
+    /// interpreter frame state. Returns a snapshot_id that should be
+    /// stored in the guard op's `rd_resume_position`.
+    pub fn capture_resumedata(&mut self, snapshot: Snapshot) -> i32 {
+        let id = self.snapshots.len() as i32;
+        self.snapshots.push(snapshot);
+        id
+    }
+
+    /// Get a snapshot by id.
+    pub fn get_snapshot(&self, id: i32) -> Option<&Snapshot> {
+        if id >= 0 {
+            self.snapshots.get(id as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Access all snapshots.
+    pub fn snapshots(&self) -> &[Snapshot] {
+        &self.snapshots
+    }
+
     /// Close the loop: add a JUMP operation back to the start.
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {
@@ -253,43 +289,17 @@ impl Trace {
 
     /// Return the completed trace.
     /// The recorder is consumed; no further operations can be recorded.
+    ///
     pub fn get_trace(self) -> TreeLoop {
         TreeLoop::with_snapshots(self.inputargs, self.ops, self.snapshots)
-    }
-
-    /// opencoder.py: cut_point() — snapshot the current recorder position.
-    ///
-    /// Used by compile_trace to save position before recording a JUMP,
-    /// and by reached_loop_header to record merge points.
-    /// opencoder.py:819 parity: capture a snapshot of the current
-    /// interpreter frame state. Returns a snapshot_id that should be
-    /// stored in the guard op's `rd_resume_position`.
-    pub fn capture_resumedata(&mut self, snapshot: Snapshot) -> i32 {
-        let id = self.snapshots.len() as i32;
-        self.snapshots.push(snapshot);
-        id
-    }
-
-    /// Get a snapshot by id.
-    pub fn get_snapshot(&self, id: i32) -> Option<&Snapshot> {
-        if id >= 0 {
-            self.snapshots.get(id as usize)
-        } else {
-            None
-        }
-    }
-
-    /// Access all snapshots.
-    pub fn snapshots(&self) -> &[Snapshot] {
-        &self.snapshots
     }
 
     pub fn get_position(&self) -> TracePosition {
         TracePosition {
             _pos: self.ops.len(),
             _count: self.op_count,
-            _index: self.op_count,
-            snapshot_data_len: 0,
+            _index: self.box_count,
+            snapshot_data_len: self.snapshots.len(),
             snapshot_array_data_len: 0,
         }
     }
@@ -303,6 +313,7 @@ impl Trace {
     pub fn cut(&mut self, pos: TracePosition) {
         self.ops.truncate(pos._pos);
         self.op_count = pos._count;
+        self.box_count = pos._index;
     }
 
     /// history.py:725 `length`: number of non-inputarg ops recorded so far.
@@ -739,6 +750,25 @@ mod tests {
         rec.close_loop(&[OpRef(2)]);
         // After close_loop, Jump is added.
         assert_eq!(rec.num_ops(), 4);
+    }
+
+    #[test]
+    fn test_trace_position_splits_count_and_index_for_void_ops() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let before_guard = rec.get_position();
+        assert_eq!(before_guard._count, 2);
+        assert_eq!(before_guard._index, 2);
+
+        let descr = make_fail_descr(0);
+        rec.record_guard(OpCode::GuardTrue, &[i1], descr);
+        rec.close_loop(&[i1]);
+        rec.finish(&[i1], make_fail_descr(1));
+
+        let pos = rec.get_position();
+        assert_eq!(pos._count, 5);
+        assert_eq!(pos._index, 2);
     }
 
     #[test]

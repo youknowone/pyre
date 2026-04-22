@@ -702,11 +702,9 @@ fn dispatch_op(
         }
         "hint_force_virtualizable" => state.builder.vable_force(),
         // `rpython/jit/metainterp/resoperation.py` / `jtransform.py`
-        // emit per-OpCode opnames for integer comparisons and
-        // arithmetic. pyre currently only emits `int_eq` at the
-        // SSARepr layer (via the `PopJumpIfTrue` branch-folding chain
-        // in `codewriter.rs`); additional per-opname entries land here
-        // when their emitter appears.
+        // emit per-opname integer comparisons and arithmetic; the
+        // assembler lowers those names directly to the matching
+        // JitCodeBuilder entrypoints.
         "int_eq" => {
             let dst = expect_result_reg(result, Kind::Int, "int_eq needs result");
             state.builder.record_binop_i(

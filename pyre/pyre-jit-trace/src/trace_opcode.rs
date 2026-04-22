@@ -134,8 +134,10 @@ impl MIFrame {
             fallthrough_pc,
             concrete_frame_addr: concrete_frame,
             orgpc,
+            pre_opcode_registers_r: None,
             parent_frames: Vec::new(),
             pending_inline_frame: None,
+            pending_result_stack_idx: None,
         }
     }
 
@@ -293,6 +295,18 @@ impl MIFrame {
         self.sym().frame
     }
 
+    #[inline]
+    fn capture_pre_opcode_state(&mut self) {
+        let s = self.sym();
+        let prefix_len = s.valuestackdepth.min(s.registers_r.len());
+        self.pre_opcode_registers_r = Some(s.registers_r[..prefix_len].to_vec());
+    }
+
+    #[inline]
+    fn clear_pre_opcode_state(&mut self) {
+        self.pre_opcode_registers_r = None;
+    }
+
     fn materialize_fail_arg_slot(
         &mut self,
         ctx: &mut TraceCtx,
@@ -417,21 +431,28 @@ impl MIFrame {
             // surface as active OpRefs. This matches the OLD
             // `stack_values.len()` bound on the
             // `stack_values[idx - nlocals]` read path.
-            let (valid_stack_only, source_len) = if let Some(ref pre_r) = s.pre_opcode_registers_r {
-                let pre_stack_only = s
-                    .pre_opcode_vsd
-                    .unwrap_or(s.valuestackdepth)
-                    .saturating_sub(s.nlocals);
-                (pre_stack_only, pre_r.len())
-            } else {
-                (s.stack_only_depth(), s.registers_r.len())
-            };
+            let (valid_stack_only, source_len) =
+                if let Some(ref pre_r) = self.pre_opcode_registers_r {
+                    let pre_stack_only = pre_r.len().saturating_sub(s.nlocals);
+                    (pre_stack_only, pre_r.len())
+                } else {
+                    (s.stack_only_depth(), s.registers_r.len())
+                };
             let valid_len = (s.nlocals + valid_stack_only).min(source_len);
-            let registers_r_view: Vec<OpRef> = if let Some(ref pre_r) = s.pre_opcode_registers_r {
-                pre_r[..valid_len.min(pre_r.len())].to_vec()
-            } else {
-                s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
-            };
+            let mut registers_r_view: Vec<OpRef> =
+                if let Some(ref pre_r) = self.pre_opcode_registers_r {
+                    pre_r[..valid_len.min(pre_r.len())].to_vec()
+                } else {
+                    s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
+                };
+            if in_a_call {
+                if let Some(result_idx) = self.pending_result_stack_idx {
+                    let abs_idx = s.nlocals + result_idx;
+                    if abs_idx < registers_r_view.len() {
+                        registers_r_view[abs_idx] = ctx.const_ref(pyre_object::PY_NULL as i64);
+                    }
+                }
+            }
             // Skeleton path's `is_stack_live` query still needs a stack
             // slice in per-slot kind shape; slice the tail of the
             // register-file view.
@@ -967,8 +988,8 @@ impl MIFrame {
 
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
     ///
-    /// When pre_opcode_vsd is set, sets vable_last_instr = orgpc - 1 and
-    /// vable_valuestackdepth = pre-opcode depth. The guard's fail_args
+    /// When a pre-opcode snapshot is present, sets vable_last_instr = orgpc - 1
+    /// and vable_valuestackdepth = the snapshot depth. The guard's fail_args
     /// then carry the pre-opcode stack state so the blackhole interpreter
     /// can re-execute the opcode from orgpc.
     ///
@@ -994,7 +1015,10 @@ impl MIFrame {
         let ns_ptr = self.sym().concrete_namespace as i64;
         let vsd = {
             let s = self.sym();
-            s.pre_opcode_vsd.unwrap_or(s.valuestackdepth) as i64
+            self.pre_opcode_registers_r
+                .as_ref()
+                .map(|pre_r| pre_r.len())
+                .unwrap_or(s.valuestackdepth) as i64
         };
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let s = self.sym_mut();
@@ -1645,6 +1669,13 @@ impl MIFrame {
                 | OpCode::GuardNotForced
                 | OpCode::GuardAlwaysFails
         );
+        if after_residual_call {
+            // pyjitpl.py:2586-2602: residual-call guards snapshot the state
+            // AFTER the call, using the auto-advanced pc and post-call
+            // register file. The opcode-start snapshot is only for
+            // re-executing the current opcode from orgpc.
+            self.clear_pre_opcode_state();
+        }
         // opencoder.py:819 capture_resumedata(framestack) parity:
         // Encode the full framestack [callee (top), caller (parent)] into
         // a multi-frame snapshot. The callee's pc is set to resumepc
@@ -1670,19 +1701,12 @@ impl MIFrame {
                 self.orgpc
             };
             // opencoder.py:819-834: snapshot uses active boxes (not fail_args).
-            // callee_snapshot_types_full includes header [Ref, Int, Ref, Int, Ref];
-            // snapshot needs only the active_boxes portion.
-            let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            let callee_snapshot_types = &callee_snapshot_types_full[__n..];
-            let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
-                jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
-                pc: callee_live_pc as u32,
-                boxes: Self::fail_args_to_snapshot_boxes_typed(
-                    &callee_active_boxes,
-                    callee_snapshot_types,
-                    ctx,
-                ),
-            }];
+            let snapshot = self.build_framestack_snapshot(
+                ctx,
+                callee_live_pc,
+                &callee_active_boxes,
+                &callee_snapshot_types_full,
+            );
             // pyjitpl.py:2558-2585 generate_guard parity: record guard with
             // a raw fail_args "hint" (header + active_boxes). The optimizer's
             // store_final_boxes_in_guard (mod.rs:finalize_guard_resume_data)
@@ -1690,9 +1714,9 @@ impl MIFrame {
             // from the snapshot via _number_boxes — Consts are dropped from
             // liveboxes during numbering (resume.py:202-207 getconst path),
             // so the post-optimizer fail_args naturally satisfy regalloc.py:1203.
-            let mut fail_args: Vec<OpRef> = {
+            let callee_fail_args: Vec<OpRef> = {
                 let s = self.sym();
-                vec![
+                let mut fa = vec![
                     s.frame,
                     s.vable_last_instr,
                     s.vable_pycode,
@@ -1700,50 +1724,15 @@ impl MIFrame {
                     s.vable_debugdata,
                     s.vable_lastblock,
                     s.vable_w_globals,
-                ]
+                ];
+                fa.extend_from_slice(&callee_active_boxes);
+                fa
             };
-            fail_args.extend_from_slice(&callee_active_boxes);
-            let mut types = callee_snapshot_types_full;
-            // opencoder.py:806: parent frames keep their original pc.
-            // Snapshot boxes = active boxes only (skip scalar inputarg header).
-            for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
-                // pyjitpl.py:2586-2602 capture_resumedata: parent frames'
-                // snapshot stores ONLY their active boxes (the registers
-                // live at the call site), NOT the header.
-                // When pfa.len() <= __n there are zero active boxes — the
-                // snapshot body must be empty, NOT the header itself.
-                let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-                let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
-                let parent_types: &[Type] = if pfa_types.len() > __n {
-                    &pfa_types[__n..]
-                } else {
-                    &[]
-                };
-                frames.push(majit_metainterp::recorder::SnapshotFrame {
-                    jitcode_index: *pfa_jitcode_index as u32,
-                    pc: *pfa_resumepc as u32,
-                    boxes: Self::fail_args_to_snapshot_boxes_typed(
-                        parent_active,
-                        parent_types,
-                        ctx,
-                    ),
-                });
-                fail_args.extend_from_slice(pfa);
-                if !pfa_types.is_empty() {
-                    types.extend_from_slice(pfa_types);
-                } else {
-                    let pt = fail_arg_types_for_virtualizable_state(pfa.len());
-                    types.extend_from_slice(&pt);
-                }
-            }
-            let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
-            // pyjitpl.py:2597: self.virtualref_boxes
-            let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
-            let snapshot = majit_metainterp::recorder::Snapshot {
-                frames,
-                vable_boxes,
-                vref_boxes,
-            };
+            let (fail_args, types) = self.extend_fail_args_and_types_with_parents(
+                ctx,
+                callee_fail_args,
+                callee_snapshot_types_full,
+            );
             let snapshot_id = ctx.capture_resumedata(snapshot);
 
             ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
@@ -1813,8 +1802,12 @@ impl MIFrame {
     /// pyjitpl.py:2586-2602 capture_resumedata parity.
     ///
     /// Temporarily sets frame.pc = resumepc, captures the full framestack
-    /// + virtualizable_boxes + virtualref_boxes into a snapshot, then
-    /// restores frame.pc.
+    /// ([self as top/callee] + self.parent_frames as parents) plus
+    /// virtualizable_boxes + virtualref_boxes into a snapshot, then
+    /// restores frame.pc.  Matches opencoder.py:819-832
+    /// `capture_resumedata(framestack, virtualizable_boxes,
+    /// virtualref_boxes, after_residual_call=False)` which walks the full
+    /// `self.framestack` to build one SnapshotFrame per live frame.
     fn capture_resumedata(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1837,26 +1830,15 @@ impl MIFrame {
             self.orgpc
         };
 
-        // opencoder.py:767-770: snapshot uses active boxes (not fail_args).
-        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let snapshot_types = &snapshot_full_types[n..];
-        let snapshot_boxes =
-            Self::fail_args_to_snapshot_boxes_typed(active_boxes, snapshot_types, ctx);
-        let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
-        let jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
-
         // pyjitpl.py:2597-2600: history.trace.capture_resumedata(
         //     self.framestack, virtualizable_boxes, self.virtualref_boxes,
         //     after_residual_call)
-        let snapshot = majit_metainterp::recorder::Snapshot {
-            frames: vec![majit_metainterp::recorder::SnapshotFrame {
-                jitcode_index,
-                pc: snapshot_live_pc as u32,
-                boxes: snapshot_boxes,
-            }],
-            vable_boxes,
-            vref_boxes: Self::build_virtualref_boxes(self.sym(), ctx),
-        };
+        let snapshot = self.build_framestack_snapshot(
+            ctx,
+            snapshot_live_pc,
+            active_boxes,
+            snapshot_full_types,
+        );
         let snapshot_id = ctx.capture_resumedata(snapshot);
         ctx.set_last_guard_resume_position(snapshot_id);
 
@@ -1865,6 +1847,128 @@ impl MIFrame {
         let s = self.sym_mut();
         s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
+    }
+
+    /// Extend a single-frame callee's `(fail_args, fail_arg_types)` with
+    /// the contribution of every active parent frame.  Mirrors the
+    /// `pyjitpl.py:2597` generate_guard fail_args collection — parent
+    /// frames contribute their full header + active boxes because the
+    /// resume path must rehydrate virtualizable fields and registers
+    /// across the entire framestack on guard failure.
+    fn extend_fail_args_and_types_with_parents(
+        &mut self,
+        ctx: &mut TraceCtx,
+        mut fail_args: Vec<OpRef>,
+        mut types: Vec<Type>,
+    ) -> (Vec<OpRef>, Vec<Type>) {
+        for parent in self.parent_frames.clone() {
+            let (parent_fail_args, parent_types, _jitcode_index) =
+                self.materialize_parent_frame_state(ctx, parent);
+            fail_args.extend_from_slice(&parent_fail_args);
+            types.extend_from_slice(&parent_types);
+        }
+        (fail_args, types)
+    }
+
+    /// Build the full framestack `Snapshot` — top (callee) frame
+    /// followed by every parent frame in `self.parent_frames` — plus
+    /// virtualizable and virtualref boxes.  Mirrors opencoder.py:819-832
+    /// `capture_resumedata(framestack, virtualizable_boxes,
+    /// virtualref_boxes, ...)`.
+    ///
+    /// The caller is responsible for swapping `self.orgpc` if the
+    /// snapshot pc differs from the current orgpc (RPython
+    /// pyjitpl.py:2594-2602 MIFrame.capture_resumedata does the same
+    /// before calling `history.trace.capture_resumedata`), and for
+    /// computing `top_active_boxes` / `top_snapshot_types_full` under
+    /// the liveness that applies to the swapped pc.
+    fn build_framestack_snapshot(
+        &mut self,
+        ctx: &mut TraceCtx,
+        top_pc: usize,
+        top_active_boxes: &[OpRef],
+        top_snapshot_types_full: &[Type],
+    ) -> majit_metainterp::recorder::Snapshot {
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let top_snapshot_types = &top_snapshot_types_full[n..];
+        let top_jitcode_index = unsafe { (*self.sym().jitcode).index } as u32;
+        let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
+            jitcode_index: top_jitcode_index,
+            pc: top_pc as u32,
+            boxes: Self::fail_args_to_snapshot_boxes_typed(
+                top_active_boxes,
+                top_snapshot_types,
+                ctx,
+            ),
+        }];
+        // opencoder.py:806: parent frames keep their original pc.
+        // Snapshot boxes = active boxes only (skip scalar inputarg header).
+        for parent in self.parent_frames.clone() {
+            let (_parent_fail_args, parent_types_full, parent_jitcode_index, parent_active) =
+                self.materialize_parent_snapshot_state(ctx, parent);
+            let parent_types: &[Type] = if parent_types_full.len() > n {
+                &parent_types_full[n..]
+            } else {
+                &[]
+            };
+            frames.push(majit_metainterp::recorder::SnapshotFrame {
+                jitcode_index: parent_jitcode_index,
+                pc: parent.resume_pc as u32,
+                boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
+            });
+        }
+        let vable_boxes = self.build_virtualizable_boxes(ctx);
+        let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
+        majit_metainterp::recorder::Snapshot {
+            frames,
+            vable_boxes,
+            vref_boxes,
+        }
+    }
+
+    fn materialize_parent_frame_state(
+        &mut self,
+        ctx: &mut TraceCtx,
+        parent: ResumeFrameState,
+    ) -> (Vec<OpRef>, Vec<Type>, u32) {
+        let (fail_args, full_types, jitcode_index, _active_boxes) =
+            self.materialize_parent_snapshot_state(ctx, parent);
+        (fail_args, full_types, jitcode_index)
+    }
+
+    fn materialize_parent_snapshot_state(
+        &mut self,
+        ctx: &mut TraceCtx,
+        parent: ResumeFrameState,
+    ) -> (Vec<OpRef>, Vec<Type>, u32, Vec<OpRef>) {
+        let parent_sym = unsafe { &mut *parent.sym };
+        let mut parent_frame = MIFrame::from_sym(
+            ctx,
+            parent_sym,
+            parent.concrete_frame_addr,
+            parent.resume_pc,
+            parent.resume_pc,
+        );
+        parent_frame.pending_result_stack_idx = parent.pending_result_stack_idx;
+        parent_frame.flush_to_frame_for_guard(ctx);
+        let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false);
+        let full_types = parent_frame.build_fail_arg_types_for_active_boxes(&active_boxes);
+        let jitcode_index = unsafe { (*parent_frame.sym().jitcode).index } as u32;
+        let fail_args = {
+            let s = parent_frame.sym();
+            let mut fa = vec![
+                s.frame,
+                s.vable_last_instr,
+                s.vable_pycode,
+                s.vable_valuestackdepth,
+                s.vable_debugdata,
+                s.vable_lastblock,
+                s.vable_w_globals,
+            ];
+            fa.extend_from_slice(&active_boxes);
+            fa
+        };
+        (fail_args, full_types, jitcode_index, active_boxes)
     }
 
     /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
@@ -1943,9 +2047,10 @@ impl MIFrame {
     /// Fix requires backend exit block recompilation after numbering,
     /// or trace-time SameAs emission for fresh vable OpRefs.
     fn build_virtualizable_boxes(
-        sym: &PyreSym,
+        &self,
         ctx: &majit_metainterp::TraceCtx,
     ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
+        let sym = self.sym();
         // opencoder.py:718-726 _list_of_boxes_virtualizable parity:
         // RPython format: [virtualizable_ptr, static_fields..., array_items...]
         // (virtualizable_ptr moved from end to front).
@@ -1981,17 +2086,14 @@ impl MIFrame {
         // `stack_values` is kept for the `physical_array_len` fallback
         // below (frame height calculation), where the symbolic stack
         // depth still drives the target array length.
-        let (valid_stack_only, source_len) = if let Some(ref pre_r) = sym.pre_opcode_registers_r {
-            let pre_stack_only = sym
-                .pre_opcode_vsd
-                .unwrap_or(sym.valuestackdepth)
-                .saturating_sub(sym.nlocals);
+        let (valid_stack_only, source_len) = if let Some(ref pre_r) = self.pre_opcode_registers_r {
+            let pre_stack_only = pre_r.len().saturating_sub(sym.nlocals);
             (pre_stack_only, pre_r.len())
         } else {
             (stack_only, sym.registers_r.len())
         };
         let valid_len = (sym.nlocals + valid_stack_only).min(source_len);
-        let registers_r_view: Vec<OpRef> = if let Some(ref pre_r) = sym.pre_opcode_registers_r {
+        let registers_r_view: Vec<OpRef> = if let Some(ref pre_r) = self.pre_opcode_registers_r {
             pre_r[..valid_len.min(pre_r.len())].to_vec()
         } else {
             sym.registers_r[..valid_len.min(sym.registers_r.len())].to_vec()
@@ -2020,7 +2122,11 @@ impl MIFrame {
         let physical_array_len = concrete_frame
             .map(|f| f.locals_w().len())
             .unwrap_or_else(|| {
-                let current_vsd = sym.pre_opcode_vsd.unwrap_or(sym.valuestackdepth);
+                let current_vsd = self
+                    .pre_opcode_registers_r
+                    .as_ref()
+                    .map(|pre_r| pre_r.len())
+                    .unwrap_or(sym.valuestackdepth);
                 let stack_depth = current_vsd
                     .saturating_sub(sym.nlocals)
                     .min(stack_values.len());
@@ -2269,22 +2375,25 @@ impl MIFrame {
         // Branch guards resume at `other_target` (the runtime jump destination,
         // not the POP_JUMP_IF_* opcode's orgpc). At `other_target` the Python
         // interpreter has already popped the comparison truth, so the snapshot
-        // must reflect the POST-POP stack state. `pre_opcode_stack` /
-        // `pre_opcode_vsd` were captured at the START of POP_JUMP_IF (PRE-POP)
-        // and still carry the Int truth — using them here would emit a
-        // `Box(truth_opref, Int)` at a Ref-declared `locals_cells_stack_w`
-        // slot and corrupt the PyFrame when the guard resumes (the decoder
-        // writes a raw i64 where a PyObjectRef is expected).
+        // must reflect the POST-POP register file. `pre_opcode_registers_r`
+        // was captured at the START of POP_JUMP_IF
+        // (PRE-POP) and still carry the Int truth — using them here would
+        // emit a `Box(truth_opref, Int)` at a Ref-declared
+        // `locals_cells_stack_w` slot and corrupt the PyFrame when the
+        // guard resumes (the decoder writes a raw i64 where a PyObjectRef
+        // is expected).
         //
-        // Temporarily suppress the pre-opcode snapshot for the duration of
-        // the branch guard capture so `flush_to_frame_for_guard`,
-        // `get_list_of_active_boxes`, and `build_virtualizable_boxes` all
-        // read the current (post-pop) registers_r / valuestackdepth. The
-        // pre-opcode snapshot was renamed from `pre_opcode_stack` +
-        // `pre_opcode_stack_types` to a single `pre_opcode_registers_r`
-        // (see `state.rs:1073`) when the register-machine port landed.
-        let saved_pre_opcode_vsd = self.sym_mut().pre_opcode_vsd.take();
-        let saved_pre_opcode_registers_r = self.sym_mut().pre_opcode_registers_r.take();
+        // pyjitpl.py:2586-2602 capture_resumedata mutates `frame.pc` to
+        // `resumepc` for the duration of the capture and restores it on
+        // exit; RPython has no pre-opcode snapshot because its jitcode is
+        // register-machine and liveness is per-PC. Pyre's pre_opcode_*
+        // fields are a NEW-DEVIATION that will be removed once per-PC
+        // liveness is ported (codewriter/liveness.py). Until then, clear
+        // them here so flush_to_frame_for_guard, get_list_of_active_boxes,
+        // and build_virtualizable_boxes all read the current (post-pop)
+        // `registers_r` / valuestackdepth. The next trace_code_step
+        // re-captures the snapshot, so no restore is needed.
+        self.clear_pre_opcode_state();
 
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
@@ -2295,7 +2404,7 @@ impl MIFrame {
         let callee_snapshot_types_full =
             self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
 
-        let mut fail_args: Vec<OpRef> = {
+        let callee_fail_args: Vec<OpRef> = {
             let s = self.sym();
             // interp_jit.py:25-31 scalar field order.
             // NUM_SCALAR_INPUTARGS = 7: frame + 6 static fields.
@@ -2311,7 +2420,6 @@ impl MIFrame {
             fa.extend_from_slice(&callee_active_boxes);
             fa
         };
-        let mut types = callee_snapshot_types_full.clone();
 
         // opencoder.py:819 capture_resumedata(framestack) parity:
         // Encode the full framestack [callee (top) with resume_pc=other_target,
@@ -2319,47 +2427,17 @@ impl MIFrame {
         // use the same other_target adaptation — the callee frame's resume
         // pc points past POP_JUMP_IF_* (not at it), while parent frames
         // keep their original return_point pc.
-        let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let callee_snapshot_types = &callee_snapshot_types_full[__n..];
-        let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
-            jitcode_index: unsafe { (*self.sym().jitcode).index } as u32,
-            pc: resume_pc as u32,
-            boxes: Self::fail_args_to_snapshot_boxes_typed(
-                &callee_active_boxes,
-                callee_snapshot_types,
-                ctx,
-            ),
-        }];
-        // opencoder.py:806: parent frames keep their original pc.
-        // Snapshot boxes = active boxes only (skip scalar inputarg header).
-        for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &self.parent_frames {
-            let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
-            let parent_types: &[Type] = if pfa_types.len() > __n {
-                &pfa_types[__n..]
-            } else {
-                &[]
-            };
-            frames.push(majit_metainterp::recorder::SnapshotFrame {
-                jitcode_index: *pfa_jitcode_index as u32,
-                pc: *pfa_resumepc as u32,
-                boxes: Self::fail_args_to_snapshot_boxes_typed(parent_active, parent_types, ctx),
-            });
-            fail_args.extend_from_slice(pfa);
-            if !pfa_types.is_empty() {
-                types.extend_from_slice(pfa_types);
-            } else {
-                let pt = fail_arg_types_for_virtualizable_state(pfa.len());
-                types.extend_from_slice(&pt);
-            }
-        }
-
-        let vable_boxes = Self::build_virtualizable_boxes(self.sym(), ctx);
-        let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
-        let snapshot = majit_metainterp::recorder::Snapshot {
-            frames,
-            vable_boxes,
-            vref_boxes,
-        };
+        let snapshot = self.build_framestack_snapshot(
+            ctx,
+            resume_pc,
+            &callee_active_boxes,
+            &callee_snapshot_types_full,
+        );
+        let (fail_args, types) = self.extend_fail_args_and_types_with_parents(
+            ctx,
+            callee_fail_args,
+            callee_snapshot_types_full,
+        );
         let snapshot_id = ctx.capture_resumedata(snapshot);
 
         ctx.record_guard_typed_with_fail_args(opcode, &[truth], types, &fail_args);
@@ -2370,8 +2448,6 @@ impl MIFrame {
         let s = self.sym_mut();
         s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
-        s.pre_opcode_vsd = saved_pre_opcode_vsd;
-        s.pre_opcode_registers_r = saved_pre_opcode_registers_r;
     }
 
     /// pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity.
@@ -3806,36 +3882,14 @@ impl MIFrame {
             s.vable_last_instr = ni;
             s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
         });
-        // pyjitpl.py:177: active boxes for parent frame.
-        // pyjitpl.py:177: parent frame is in_a_call=True (opencoder.py:806).
-        let my_active_boxes =
-            self.with_ctx(|this, ctx| this.get_list_of_active_boxes(ctx, true, false));
-        // fail_args = header + active_boxes (for Cranelift deadframe).
-        let my_fail_args = self.with_ctx(|this, _ctx| {
-            let s = this.sym();
-            let mut fa = vec![
-                s.frame,
-                s.vable_last_instr,
-                s.vable_pycode,
-                s.vable_valuestackdepth,
-                s.vable_debugdata,
-                s.vable_lastblock,
-                s.vable_w_globals,
-            ];
-            fa.extend_from_slice(&my_active_boxes);
-            fa
-        });
-        let my_fail_arg_types = self.build_fail_arg_types_for_active_boxes(&my_active_boxes);
-        // opencoder.py:810: parent frame's jitcode.index.
-        let my_jitcode_index = unsafe { (*self.sym().jitcode).index };
         // opencoder.py:819-834 parity: accumulate full parent chain.
         // Current frame becomes the newest parent; existing parents follow.
-        let mut parent_frames = vec![(
-            my_fail_args,
-            my_fail_arg_types,
-            return_point_pc,
-            my_jitcode_index,
-        )];
+        let mut parent_frames = vec![ResumeFrameState {
+            sym: self.sym,
+            concrete_frame_addr: self.concrete_frame_addr,
+            resume_pc: return_point_pc,
+            pending_result_stack_idx: None,
+        }];
         parent_frames.extend(self.parent_frames.iter().cloned());
         Ok(PendingInlineFrame {
             sym: callee_sym,
@@ -4222,20 +4276,15 @@ impl MIFrame {
 
         self.set_orgpc(pc);
         self.prepare_fallthrough();
-        // RPython capture_resumedata(resumepc=orgpc): save pre-opcode
-        // stack state so guard fail_args reflect the state BEFORE the
-        // opcode executes. On guard failure the interpreter re-executes
-        // the opcode from orgpc.
-        {
-            let s = self.sym_mut();
-            s.pre_opcode_vsd = Some(s.valuestackdepth);
-            // Stage 3.4 Phase C: the unified register file snapshot is
-            // the single source for guard fail_arg encoding. Locals
-            // live in `[..nlocals]` and stack slots in
-            // `[nlocals..nlocals+stack_only]`; encoders read them via
-            // `pre_opcode_registers_r` with `pre_opcode_vsd` bounding
-            // the valid live window.
-            s.pre_opcode_registers_r = Some(s.registers_r.clone());
+        // RPython pyjitpl.py captures resumedata at each guard site, not at
+        // every opcode boundary. Pyre still needs an opcode-start snapshot
+        // for stack-machine opcodes that can mutate stack/register state
+        // before emitting a guard; keep it off for instructions that cannot
+        // reach a guard at all.
+        let needs_pre_opcode_snapshot =
+            crate::state::instruction_needs_pre_opcode_snapshot(instruction);
+        if needs_pre_opcode_snapshot {
+            self.capture_pre_opcode_state();
         }
         // pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity: when
         // the CompareOp is followed by PopJumpIf* and operands form a
@@ -4257,9 +4306,9 @@ impl MIFrame {
                 // and return the action immediately (matches the
                 // post-dispatch clear that normally follows
                 // execute_opcode_step below).
-                let s = self.sym_mut();
-                s.pre_opcode_vsd = None;
-                s.pre_opcode_registers_r = None;
+                if needs_pre_opcode_snapshot {
+                    self.clear_pre_opcode_state();
+                }
                 return action;
             }
             Some(Err(e)) => Err(e),
@@ -4269,10 +4318,8 @@ impl MIFrame {
         // RPython: capture_resumedata is called at each guard; there is
         // no per-opcode snapshot lifecycle. Clearing here ensures the
         // snapshot doesn't leak into subsequent opcodes.
-        {
-            let s = self.sym_mut();
-            s.pre_opcode_vsd = None;
-            s.pre_opcode_registers_r = None;
+        if needs_pre_opcode_snapshot {
+            self.clear_pre_opcode_state();
         }
         // RPython execute_ll_raised parity: store exception in
         // last_exc_value before calling handle_possible_exception.
@@ -4341,11 +4388,12 @@ impl MIFrame {
                 let resume_pc = this.fallthrough_pc;
                 let saved_orgpc = this.orgpc;
                 this.orgpc = resume_pc;
+                this.clear_pre_opcode_state();
 
                 this.flush_to_frame_for_guard(ctx);
                 let active_boxes = this.get_list_of_active_boxes(ctx, false, after_residual_call);
                 let fail_arg_types = this.build_fail_arg_types_for_active_boxes(&active_boxes);
-                let fail_args = {
+                let callee_fail_args = {
                     let s = this.sym();
                     let mut fa = vec![
                         s.frame,
@@ -4362,57 +4410,13 @@ impl MIFrame {
 
                 // capture_resumedata parity: full framestack snapshot.
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
-                let __n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-                let jitcode_index = unsafe { (*this.sym().jitcode).index } as u32;
-                // fail_arg_types includes header; snapshot
-                // needs only the active_boxes portion.
-                let snapshot_types = &fail_arg_types[__n..];
-                let mut frames = vec![majit_metainterp::recorder::SnapshotFrame {
-                    jitcode_index,
-                    pc: resume_pc as u32,
-                    boxes: Self::fail_args_to_snapshot_boxes_typed(
-                        &active_boxes,
-                        snapshot_types,
-                        ctx,
-                    ),
-                }];
-                let mut all_fail_args = fail_args.clone();
-                let mut all_types = fail_arg_types.clone();
-                // Include parent frames (RPython: full self.framestack).
-                for (pfa, pfa_types, pfa_resumepc, pfa_jitcode_index) in &this.parent_frames {
-                    // pyjitpl.py:2586-2602 capture_resumedata: parent
-                    // frames' snapshot stores ONLY their active boxes (not
-                    // the header). When pfa.len() <= __n,
-                    // there are zero active boxes — body must be empty.
-                    let parent_active: &[OpRef] = if pfa.len() > __n { &pfa[__n..] } else { &[] };
-                    let parent_types: &[Type] = if pfa_types.len() > __n {
-                        &pfa_types[__n..]
-                    } else {
-                        &[]
-                    };
-                    frames.push(majit_metainterp::recorder::SnapshotFrame {
-                        jitcode_index: *pfa_jitcode_index as u32,
-                        pc: *pfa_resumepc as u32,
-                        boxes: Self::fail_args_to_snapshot_boxes_typed(
-                            parent_active,
-                            parent_types,
-                            ctx,
-                        ),
-                    });
-                    all_fail_args.extend_from_slice(pfa);
-                    let pt = if pfa_types.is_empty() {
-                        fail_arg_types_for_virtualizable_state(pfa.len())
-                    } else {
-                        pfa_types.clone()
-                    };
-                    all_types.extend_from_slice(&pt);
-                }
-                let vable_boxes = Self::build_virtualizable_boxes(this.sym(), ctx);
-                let snapshot = majit_metainterp::recorder::Snapshot {
-                    frames,
-                    vable_boxes,
-                    vref_boxes: Self::build_virtualref_boxes(this.sym(), ctx),
-                };
+                let snapshot =
+                    this.build_framestack_snapshot(ctx, resume_pc, &active_boxes, &fail_arg_types);
+                let (all_fail_args, all_types) = this.extend_fail_args_and_types_with_parents(
+                    ctx,
+                    callee_fail_args,
+                    fail_arg_types,
+                );
                 let snapshot_id = ctx.capture_resumedata(snapshot);
 
                 let exc_type_const = ctx.const_int(exc_type_ptr);
@@ -4558,7 +4562,16 @@ impl MIFrame {
             return InlineTraceStepAction::Trace(TraceAction::Abort);
         };
 
+        self.set_orgpc(pc);
         self.prepare_fallthrough();
+        // Keep inline-frame guard capture aligned with the root-frame path:
+        // only opcodes that can actually reach a guard carry an opcode-start
+        // snapshot, and specific guard paths may still suppress it.
+        let needs_pre_opcode_snapshot =
+            crate::state::instruction_needs_pre_opcode_snapshot(instruction);
+        if needs_pre_opcode_snapshot {
+            self.capture_pre_opcode_state();
+        }
         // pyjitpl.py:541-556 fused COMPARE_OP + PopJumpIf* parity (see
         // trace_code_step's counterpart for the full rationale).
         let fused_result = if let Instruction::CompareOp { opname } = instruction {
@@ -4578,14 +4591,17 @@ impl MIFrame {
                 // work may add it), clear them on the fused-return path the
                 // same way the non-inline path does at the post-dispatch
                 // clear below.
-                let s = self.sym_mut();
-                s.pre_opcode_vsd = None;
-                s.pre_opcode_registers_r = None;
+                if needs_pre_opcode_snapshot {
+                    self.clear_pre_opcode_state();
+                }
                 return InlineTraceStepAction::Trace(action);
             }
             Some(Err(e)) => Err(e),
             None => execute_opcode_step(self, code, instruction, op_arg, pc + 1),
         };
+        if needs_pre_opcode_snapshot {
+            self.clear_pre_opcode_state();
+        }
         // RPython execute_ll_raised parity: store exception in last_exc_value.
         if let Err(ref err) = step_result {
             let exc_obj = err.to_exc_object();
@@ -4922,6 +4938,78 @@ impl TraceHelperAccess for MIFrame {
 
 impl OpcodeStepExecutor for MIFrame {
     type Error = PyError;
+
+    fn pop_jump_if_none(&mut self, target: usize) -> Result<(), Self::Error> {
+        let value = SharedOpcodeHandler::pop_value(self)?;
+        if self.value_type(value.opref) != Type::Ref {
+            return Err(PyError::type_error("pop_jump_if_none expects a ref value"));
+        }
+        let concrete_obj = value.concrete.to_pyobj();
+        if concrete_obj.is_null() {
+            return Err(PyError::type_error(
+                "missing concrete value for pop_jump_if_none during trace",
+            ));
+        }
+        let truth = self.with_ctx(|_this, ctx| {
+            let expected = ctx.const_ref(pyre_object::w_none() as i64);
+            ctx.record_op(OpCode::PtrEq, &[value.opref, expected])
+        });
+        let should_jump = unsafe { pyre_object::is_none(concrete_obj) };
+        let fallthrough = self.fallthrough_pc();
+        if !should_jump {
+            self.with_ctx(|this, ctx| {
+                MIFrame::set_next_instr(this, ctx, target);
+                Ok::<(), PyError>(())
+            })?;
+        }
+        let other_target = if should_jump { fallthrough } else { target };
+        self.with_ctx(|this, ctx| {
+            MIFrame::record_branch_guard(this, ctx, value.opref, truth, should_jump, other_target);
+            Ok::<(), PyError>(())
+        })?;
+        let next_target = if should_jump { target } else { fallthrough };
+        self.with_ctx(|this, ctx| {
+            MIFrame::set_next_instr(this, ctx, next_target);
+            Ok::<(), PyError>(())
+        })
+    }
+
+    fn pop_jump_if_not_none(&mut self, target: usize) -> Result<(), Self::Error> {
+        let value = SharedOpcodeHandler::pop_value(self)?;
+        if self.value_type(value.opref) != Type::Ref {
+            return Err(PyError::type_error(
+                "pop_jump_if_not_none expects a ref value",
+            ));
+        }
+        let concrete_obj = value.concrete.to_pyobj();
+        if concrete_obj.is_null() {
+            return Err(PyError::type_error(
+                "missing concrete value for pop_jump_if_not_none during trace",
+            ));
+        }
+        let truth = self.with_ctx(|_this, ctx| {
+            let expected = ctx.const_ref(pyre_object::w_none() as i64);
+            ctx.record_op(OpCode::PtrNe, &[value.opref, expected])
+        });
+        let should_jump = !unsafe { pyre_object::is_none(concrete_obj) };
+        let fallthrough = self.fallthrough_pc();
+        if !should_jump {
+            self.with_ctx(|this, ctx| {
+                MIFrame::set_next_instr(this, ctx, target);
+                Ok::<(), PyError>(())
+            })?;
+        }
+        let other_target = if should_jump { fallthrough } else { target };
+        self.with_ctx(|this, ctx| {
+            MIFrame::record_branch_guard(this, ctx, value.opref, truth, should_jump, other_target);
+            Ok::<(), PyError>(())
+        })?;
+        let next_target = if should_jump { target } else { fallthrough };
+        self.with_ctx(|this, ctx| {
+            MIFrame::set_next_instr(this, ctx, next_target);
+            Ok::<(), PyError>(())
+        })
+    }
 
     /// Fix fusion opcode: load two locals with correct concrete tracking.
     /// FrontendOp carries concrete directly — no pending_concrete_push needed.

@@ -799,11 +799,6 @@ where
                 );
             }
 
-            // Per-opname integer arithmetic tracer handlers. RPython
-            // `pyjitpl.py` emits one `opimpl_int_<op>` per primitive
-            // (`pyjitpl.py:1460-1513`); pyre's hardcoded tracer match
-            // collapses the shape through `trace_binop_i`, which records
-            // the constant `OpCode` and updates the shadow register.
             jitcode::BC_INT_ADD => self.trace_binop_i(ctx, OpCode::IntAdd),
             jitcode::BC_INT_SUB => self.trace_binop_i(ctx, OpCode::IntSub),
             jitcode::BC_INT_MUL => self.trace_binop_i(ctx, OpCode::IntMul),
@@ -820,16 +815,14 @@ where
             jitcode::BC_INT_LE => self.trace_binop_i(ctx, OpCode::IntLe),
             jitcode::BC_INT_GT => self.trace_binop_i(ctx, OpCode::IntGt),
             jitcode::BC_INT_GE => self.trace_binop_i(ctx, OpCode::IntGe),
-            jitcode::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
-            jitcode::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
-            // Unsigned integer primitives — RPython `blackhole.py:471,521,571-582`
-            // + `pyjitpl.py:281-283` opimpl rolls.
             jitcode::BC_UINT_RSHIFT => self.trace_binop_i(ctx, OpCode::UintRshift),
             jitcode::BC_UINT_MUL_HIGH => self.trace_binop_i(ctx, OpCode::UintMulHigh),
             jitcode::BC_UINT_LT => self.trace_binop_i(ctx, OpCode::UintLt),
             jitcode::BC_UINT_LE => self.trace_binop_i(ctx, OpCode::UintLe),
             jitcode::BC_UINT_GT => self.trace_binop_i(ctx, OpCode::UintGt),
             jitcode::BC_UINT_GE => self.trace_binop_i(ctx, OpCode::UintGe),
+            jitcode::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
+            jitcode::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
             jitcode::BC_BRANCH_REG_ZERO => {
                 let (cond_idx, target) = {
                     let frame = self.frames.current_mut();
@@ -1652,8 +1645,6 @@ where
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 }
             }
-            // Per-opname float tracer arms — RPython
-            // `pyjitpl.py:1561-1573` `opimpl_float_{add,sub,mul,...}`.
             jitcode::BC_FLOAT_ADD => self.trace_binop_f(ctx, OpCode::FloatAdd),
             jitcode::BC_FLOAT_SUB => self.trace_binop_f(ctx, OpCode::FloatSub),
             jitcode::BC_FLOAT_MUL => self.trace_binop_f(ctx, OpCode::FloatMul),
@@ -1767,10 +1758,6 @@ where
         }
     }
 
-    /// Per-opname integer binop tracer helper. Decodes `dst, lhs, rhs`
-    /// from the current frame's bytecode stream, records the op with
-    /// the constant `opcode`, and updates the shadow register. Mirrors
-    /// the `opimpl_int_<op>` shape (`pyjitpl.py:1460-1513`).
     fn trace_binop_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         let (dst, lhs_idx, rhs_idx) = {
             let frame = self.frames.current_mut();
@@ -1781,10 +1768,6 @@ where
         };
         let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
-        // `b1 is b2` crude fastpath for comparisons — `pyjitpl.py:326-336`
-        // `FASTPATHS_SAME_BOXES`. Same OpRef means the reads came from
-        // the same shadow register slot without re-assignment, matching
-        // RPython's Python-level `is` check on IntFrontendOp boxes.
         if lhs == rhs {
             if let Some(fast) = fastpath_same_boxes(opcode) {
                 self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
@@ -1795,7 +1778,6 @@ where
         self.set_int_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
     }
 
-    /// Per-opname integer unary tracer helper.
     fn trace_unary_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         let (dst, src_idx) = {
             let frame = self.frames.current_mut();
@@ -1808,7 +1790,6 @@ where
         self.set_int_reg(dst, Some(ctx.record_op(opcode, &[src])), Some(value));
     }
 
-    /// Per-opname float binop tracer helper.
     fn trace_binop_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         let (dst, lhs_idx, rhs_idx) = {
             let frame = self.frames.current_mut();
@@ -1823,7 +1804,6 @@ where
         self.set_float_reg(dst, Some(ctx.record_op(opcode, &[lhs, rhs])), Some(value));
     }
 
-    /// Per-opname float unary tracer helper.
     fn trace_unary_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
         let (dst, src_idx) = {
             let frame = self.frames.current_mut();
@@ -1903,12 +1883,8 @@ pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
         OpCode::IntLe => i64::from(lhs <= rhs),
         OpCode::IntGt => i64::from(lhs > rhs),
         OpCode::IntGe => i64::from(lhs >= rhs),
-        // `bhimpl_uint_rshift` (`blackhole.py:521`) — unsigned shift-right.
         OpCode::UintRshift => (lhs as u64).wrapping_shr(rhs as u32) as i64,
-        // `bhimpl_uint_mul_high` (`blackhole.py:471`) — high 64 bits of
-        // `r_uint(a) * r_uint(b)` via widening u128 multiplication.
         OpCode::UintMulHigh => (((lhs as u64) as u128 * (rhs as u64) as u128) >> 64) as i64,
-        // `bhimpl_uint_{lt,le,gt,ge}` (`blackhole.py:571-582`).
         OpCode::UintLt => i64::from((lhs as u64) < (rhs as u64)),
         OpCode::UintLe => i64::from((lhs as u64) <= (rhs as u64)),
         OpCode::UintGt => i64::from((lhs as u64) > (rhs as u64)),
@@ -1920,7 +1896,6 @@ pub(crate) fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
 pub(crate) fn eval_unary_i(opcode: OpCode, value: i64) -> i64 {
     match opcode {
         OpCode::IntNeg => value.wrapping_neg(),
-        // `bhimpl_int_invert` (`blackhole.py:531`) — bitwise NOT.
         OpCode::IntInvert => !value,
         other => panic!("unsupported jitcode integer unary op {other:?}"),
     }

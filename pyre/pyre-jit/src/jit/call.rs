@@ -166,10 +166,10 @@ pub struct CallControl {
     /// new graph and drained by `enum_pending_graphs()` inside
     /// `make_jitcodes()` (codewriter.py:79).
     ///
-    /// pyre now mirrors the upstream queue shape and stores bare graph
-    /// pointers again. The pyre-only `w_code` and `merge_point_pc`
-    /// refinements live on the cached `PyJitCode` skeleton instead and
-    /// are recovered from there by the drain loop.
+    /// pyre now mirrors RPython's bare-graph queue directly. The
+    /// pyre-only `w_code` / `merge_point_pc` adapter state lives on the
+    /// cached `PyJitCode` shell instead of in the queue tuple so
+    /// `enum_pending_graphs()` can match `call.py:150-153` again.
     pub unfinished_graphs: Vec<*const CodeObject>,
 
     /// call.py:31 `self.callinfocollection = CallInfoCollection()`.
@@ -311,9 +311,6 @@ impl CallControl {
     ///     yield graph, self.jitcodes[graph]
     /// ```
     ///
-    /// pyre now mirrors the upstream return shape and yields the bare
-    /// graph pointer. The drain recovers pyre-only runtime inputs from
-    /// the cached skeleton stored in `self.jitcodes[graph]`.
     pub fn enum_pending_graphs(&mut self) -> Option<*const CodeObject> {
         self.unfinished_graphs.pop()
     }
@@ -423,7 +420,7 @@ impl CallControl {
             // `CodeWriter::make_jitcodes`'s drain loop at
             // codewriter.py:80 `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
-            self.reset_jitcode_skeleton(key, w_code, merge_point_pc);
+            self.reset_jitcode_skeleton(key, code_ptr, w_code, merge_point_pc);
             // call.py:171 `self.unfinished_graphs.append(graph)`. pyre
             // also re-pushes on a merge_point_pc refinement so the
             // drain picks the refined entry up again for the recompile
@@ -460,18 +457,19 @@ impl CallControl {
     pub fn reset_jitcode_skeleton(
         &mut self,
         key: usize,
+        code_ptr: *const CodeObject,
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
             if let Some(existing) = std::sync::Arc::get_mut(slot) {
-                *existing = PyJitCode::skeleton(w_code, merge_point_pc);
+                *existing = PyJitCode::skeleton(code_ptr, w_code, merge_point_pc);
                 return;
             }
         }
         self.jitcodes.insert(
             key,
-            std::sync::Arc::new(PyJitCode::skeleton(w_code, merge_point_pc)),
+            std::sync::Arc::new(PyJitCode::skeleton(code_ptr, w_code, merge_point_pc)),
         );
     }
 

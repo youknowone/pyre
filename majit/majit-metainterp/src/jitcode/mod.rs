@@ -132,12 +132,6 @@ pub(crate) const BC_INT_POP: u8 = 110;
 pub(crate) const BC_REF_POP: u8 = 111;
 pub(crate) const BC_FLOAT_POP: u8 = 112;
 
-// Per-opname integer arithmetic. RPython `blackhole.py:459-521` defines
-// one `bhimpl_int_<op>` per opname under `@arguments("i", "i", returns="i")`,
-// each registered in `BlackholeInterpBuilder.insns` with its own insn_id
-// via `setup_insns` (`blackhole.py:52-81`). pyre's runtime dispatch still
-// uses a hardcoded byte-match so each opname needs its own `BC_*` byte
-// — the BC_* value is this path's analogue of RPython's insn_id.
 pub(crate) const BC_INT_ADD: u8 = 113;
 pub(crate) const BC_INT_SUB: u8 = 114;
 pub(crate) const BC_INT_MUL: u8 = 115;
@@ -148,29 +142,20 @@ pub(crate) const BC_INT_OR: u8 = 119;
 pub(crate) const BC_INT_XOR: u8 = 120;
 pub(crate) const BC_INT_LSHIFT: u8 = 121;
 pub(crate) const BC_INT_RSHIFT: u8 = 122;
-// Integer comparisons — RPython `blackhole.py:535-551` `bhimpl_int_{eq,ne,lt,le,gt,ge}`.
 pub(crate) const BC_INT_EQ: u8 = 123;
 pub(crate) const BC_INT_NE: u8 = 124;
 pub(crate) const BC_INT_LT: u8 = 125;
 pub(crate) const BC_INT_LE: u8 = 126;
 pub(crate) const BC_INT_GT: u8 = 127;
 pub(crate) const BC_INT_GE: u8 = 128;
-// Integer unary — RPython `blackhole.py:527-533` `bhimpl_int_{neg,invert}`.
 pub(crate) const BC_INT_NEG: u8 = 132;
-// Float binary — RPython `blackhole.py:696-719` `bhimpl_float_{add,sub,mul,truediv}`.
-// RPython has no `bhimpl_float_floordiv` / `bhimpl_float_mod` — those lower to
-// a residual call at the codewriter layer.
 pub(crate) const BC_FLOAT_ADD: u8 = 133;
 pub(crate) const BC_FLOAT_SUB: u8 = 134;
 pub(crate) const BC_FLOAT_MUL: u8 = 135;
 pub(crate) const BC_FLOAT_TRUEDIV: u8 = 136;
-// Float unary — RPython `blackhole.py:689-695` `bhimpl_float_{neg,abs}`.
 pub(crate) const BC_FLOAT_NEG: u8 = 139;
 pub(crate) const BC_FLOAT_ABS: u8 = 140;
-// Integer bitwise-not — RPython `blackhole.py:531` `bhimpl_int_invert`.
 pub(crate) const BC_INT_INVERT: u8 = 141;
-// Unsigned integer primitives — RPython `blackhole.py:471` `bhimpl_uint_mul_high`,
-// `blackhole.py:521` `bhimpl_uint_rshift`, `blackhole.py:571-582` `bhimpl_uint_{lt,le,gt,ge}`.
 pub(crate) const BC_UINT_RSHIFT: u8 = 142;
 pub(crate) const BC_UINT_MUL_HIGH: u8 = 143;
 pub(crate) const BC_UINT_LT: u8 = 144;
@@ -249,10 +234,6 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("ref_pop/>r", BC_REF_POP);
     m.insert("float_pop/>f", BC_FLOAT_POP);
 
-    // Per-opname integer arithmetic — RPython `blackhole.py:459-521`
-    // `bhimpl_int_{add,sub,mul,...}`. Each primitive carries
-    // `@arguments("i","i", returns="i")` so the insns key grown by
-    // `Assembler.write_insn` (`assembler.py:222-244`) is `<opname>/ii>i`.
     m.insert("int_add/ii>i", BC_INT_ADD);
     m.insert("int_sub/ii>i", BC_INT_SUB);
     m.insert("int_mul/ii>i", BC_INT_MUL);
@@ -263,25 +244,22 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("int_xor/ii>i", BC_INT_XOR);
     m.insert("int_lshift/ii>i", BC_INT_LSHIFT);
     m.insert("int_rshift/ii>i", BC_INT_RSHIFT);
-    // Integer comparisons — `blackhole.py:535-551`.
     m.insert("int_eq/ii>i", BC_INT_EQ);
     m.insert("int_ne/ii>i", BC_INT_NE);
     m.insert("int_lt/ii>i", BC_INT_LT);
     m.insert("int_le/ii>i", BC_INT_LE);
     m.insert("int_gt/ii>i", BC_INT_GT);
     m.insert("int_ge/ii>i", BC_INT_GE);
-    // Integer unary — `blackhole.py:527-533`.
     m.insert("int_neg/i>i", BC_INT_NEG);
     m.insert("int_invert/i>i", BC_INT_INVERT);
-    // Unsigned integer primitives — `blackhole.py:471`, `:521`, `:571-582`.
+    m.insert("int_neg/i>i", BC_INT_NEG);
+    m.insert("int_invert/i>i", BC_INT_INVERT);
     m.insert("uint_rshift/ii>i", BC_UINT_RSHIFT);
     m.insert("uint_mul_high/ii>i", BC_UINT_MUL_HIGH);
     m.insert("uint_lt/ii>i", BC_UINT_LT);
     m.insert("uint_le/ii>i", BC_UINT_LE);
     m.insert("uint_gt/ii>i", BC_UINT_GT);
     m.insert("uint_ge/ii>i", BC_UINT_GE);
-    // Per-opname float primitives — `blackhole.py:696-723`
-    // `bhimpl_float_{add,sub,mul,truediv,neg,abs}`.
     m.insert("float_add/ff>f", BC_FLOAT_ADD);
     m.insert("float_sub/ff>f", BC_FLOAT_SUB);
     m.insert("float_mul/ff>f", BC_FLOAT_MUL);
@@ -403,10 +381,9 @@ impl RuntimeBhDescr {
 /// `RuntimeBhDescr::AssemblerToken`) into the unified `descrs` list.
 /// Slice 3c dissolved the remaining `opcodes` pool by splitting
 /// `BC_RECORD_BINOP_*` / `BC_RECORD_UNARY_*` into per-opname `BC_*`
-/// bytes (`BC_INT_ADD`, `BC_FLOAT_MUL`, …), matching the per-opname
-/// handler shape of `bhimpl_int_add` / `bhimpl_float_mul` etc.
-/// (`blackhole.py:459-695`). The struct now holds only `descrs`,
-/// mirroring `BlackholeInterpBuilder.descrs` / `BlackholeInterpreter.descrs`
+/// bytes (`BC_INT_ADD`, `BC_FLOAT_MUL`, …), so the struct now holds
+/// only `descrs`, mirroring `BlackholeInterpBuilder.descrs` /
+/// `BlackholeInterpreter.descrs`
 /// (`blackhole.py:103, 288`).
 #[derive(Clone, Debug, Default)]
 pub struct JitCodeExecState {
