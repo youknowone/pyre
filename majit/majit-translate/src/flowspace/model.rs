@@ -1860,8 +1860,13 @@ impl Default for Variable {
 /// RPython `flowspace/model.py:354-382` — `class Constant(Hashable)`.
 ///
 /// `__slots__ = ["concretetype"]`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct Constant {
+    /// Stable identity for this `Constant` instance. Upstream caches
+    /// mutable constants by the `Constant(x)` object itself; Rust keeps
+    /// value-based `PartialEq` / `Hash` for legacy comparisons and
+    /// exposes this separate id for identity-keyed caches.
+    pub id: u64,
     /// RPython `Hashable.value`.
     pub value: ConstValue,
     /// RPython `Constant.concretetype`.
@@ -1872,6 +1877,7 @@ impl Constant {
     /// RPython `Constant.__init__(value, concretetype=None)`.
     pub fn new(value: ConstValue) -> Self {
         Constant {
+            id: NEXT_CONSTANT_ID.fetch_add(1, Ordering::Relaxed),
             value,
             concretetype: None,
         }
@@ -1880,6 +1886,7 @@ impl Constant {
     /// RPython `Constant.__init__(value, concretetype)`.
     pub fn with_concretetype(value: ConstValue, concretetype: ConcretetypePlaceholder) -> Self {
         Constant {
+            id: NEXT_CONSTANT_ID.fetch_add(1, Ordering::Relaxed),
             value,
             concretetype: Some(concretetype),
         }
@@ -1959,6 +1966,23 @@ impl Constant {
     /// RPython `Constant.replace(mapping)` — Constants never rename.
     pub fn replace<'a>(&'a self, _mapping: &'a HashMap<Variable, Variable>) -> &'a Constant {
         self
+    }
+}
+
+static NEXT_CONSTANT_ID: AtomicU64 = AtomicU64::new(1);
+
+impl PartialEq for Constant {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value && self.concretetype == other.concretetype
+    }
+}
+
+impl Eq for Constant {}
+
+impl Hash for Constant {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+        self.concretetype.hash(state);
     }
 }
 

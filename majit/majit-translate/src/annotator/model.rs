@@ -849,10 +849,31 @@ pub struct SomeTuple {
 
 impl SomeTuple {
     pub fn new(items: Vec<SomeValue>) -> Self {
-        SomeTuple {
-            base: SomeObjectBase::new(KnownType::Other, true),
-            items,
+        fn tuple_const_value(items: &[SomeValue]) -> Option<crate::flowspace::model::ConstValue> {
+            use crate::flowspace::model::ConstValue;
+
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let value = if let Some(value) = item.const_() {
+                    value.clone()
+                } else if let SomeValue::Tuple(t) = item {
+                    match t.base.const_box.as_ref().map(|c| c.value.clone()) {
+                        Some(value) => value,
+                        None => return None,
+                    }
+                } else {
+                    return None;
+                };
+                out.push(value);
+            }
+            Some(ConstValue::Tuple(out))
         }
+
+        let mut base = SomeObjectBase::new(KnownType::Other, true);
+        if let Some(value) = tuple_const_value(&items) {
+            base.const_box = Some(Constant::new(value));
+        }
+        SomeTuple { base, items }
     }
 }
 
@@ -917,14 +938,29 @@ pub struct SomeIterator {
     pub base: SomeObjectBase,
     pub s_container: Box<SomeValue>,
     pub variant: Vec<String>,
+    /// Upstream `SomeIterator(self, "enumerate", const)` carries the
+    /// optional enumerate start constant as the second entry in the
+    /// `variant` tuple. Rust keeps the marker list plus the explicit
+    /// payload so callers can preserve the original constant without
+    /// stringifying it away.
+    pub enumerate_start: Option<crate::flowspace::model::ConstValue>,
 }
 
 impl SomeIterator {
     pub fn new(s_container: SomeValue, variant: Vec<String>) -> Self {
+        Self::new_with_enumerate_start(s_container, variant, None)
+    }
+
+    pub fn new_with_enumerate_start(
+        s_container: SomeValue,
+        variant: Vec<String>,
+        enumerate_start: Option<crate::flowspace::model::ConstValue>,
+    ) -> Self {
         SomeIterator {
             base: SomeObjectBase::new(KnownType::Other, false),
             s_container: Box::new(s_container),
             variant,
+            enumerate_start,
         }
     }
 }
@@ -2637,7 +2673,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // `pair(SomeIterator, SomeIterator).union()` in binaryop.py:
         // container union plus exact variant match.
         (SomeValue::Iterator(a), SomeValue::Iterator(b)) => {
-            if a.variant != b.variant {
+            if a.variant != b.variant || a.enumerate_start != b.enumerate_start {
                 return Err(UnionError {
                     lhs: s1.clone(),
                     rhs: s2.clone(),
@@ -2645,9 +2681,10 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                 });
             }
             let s_container = union(&a.s_container, &b.s_container)?;
-            Ok(SomeValue::Iterator(SomeIterator::new(
+            Ok(SomeValue::Iterator(SomeIterator::new_with_enumerate_start(
                 s_container,
                 a.variant.clone(),
+                a.enumerate_start.clone(),
             )))
         }
 
@@ -3370,16 +3407,29 @@ mod tests {
         let tuple_all_const =
             SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(item.clone())]));
         assert!(tuple_all_const.is_constant());
+        assert_eq!(
+            tuple_all_const.const_(),
+            Some(&super::super::super::flowspace::model::ConstValue::Tuple(
+                vec![super::super::super::flowspace::model::ConstValue::Int(7),]
+            ))
+        );
         // An empty tuple is trivially "all constant" and so counts as
         // a constant tuple too (matches upstream's empty-loop for-else).
         let tuple_empty = SomeValue::Tuple(SomeTuple::new(Vec::new()));
         assert!(tuple_empty.is_constant());
+        assert_eq!(
+            tuple_empty.const_(),
+            Some(&super::super::super::flowspace::model::ConstValue::Tuple(
+                vec![]
+            ))
+        );
         // One non-constant item breaks the invariant.
         let tuple_mixed = SomeValue::Tuple(SomeTuple::new(vec![
             SomeValue::Integer(item),
             SomeValue::Integer(SomeInteger::default()),
         ]));
         assert!(!tuple_mixed.is_constant());
+        assert_eq!(tuple_mixed.const_(), None);
     }
 
     #[test]
@@ -3449,6 +3499,25 @@ mod tests {
             vec!["keys".to_string()],
         ));
         assert!(union(&a, &keys).is_err());
+    }
+
+    #[test]
+    fn union_iterators_require_matching_enumerate_start_payload() {
+        let a = SomeValue::Iterator(SomeIterator::new_with_enumerate_start(
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::default(),
+            )))),
+            vec!["enumerate".to_string()],
+            Some(crate::flowspace::model::ConstValue::Int(1)),
+        ));
+        let b = SomeValue::Iterator(SomeIterator::new_with_enumerate_start(
+            SomeValue::List(SomeList::new(ld_mutable(SomeValue::Integer(
+                SomeInteger::default(),
+            )))),
+            vec!["enumerate".to_string()],
+            Some(crate::flowspace::model::ConstValue::Int(2)),
+        ));
+        assert!(union(&a, &b).is_err());
     }
 
     #[test]

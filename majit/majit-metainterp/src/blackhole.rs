@@ -5529,6 +5529,23 @@ fn handler_setfield_gc_v_iid_pyre(
     Ok(pos)
 }
 
+// pyre: `setfield_gc_v/ird` — same tagged-int base path, but the stored
+// value lives in a Ref register. The blackhole side effect is still the
+// canonical `bh_setfield_gc_r`; only the base register file differs from
+// RPython's `setfield_gc_r/rrd`.
+fn handler_setfield_gc_v_ird_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let value = bh.registers_r[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
+    Ok(pos)
+}
+
 // pyre: `setarrayitem_gc_v/iiid` — array base colored into Int register
 // (tagged-int path), index int, value int, descr. Same primitive as the
 // canonical `setarrayitem_gc_i/riid`.
@@ -6221,6 +6238,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // register (same tagged-int deviation documented on `bhhandler_ri_i`).
     // Distinct handlers read the base from `registers_i`.
     builder.wire_handler("setfield_gc_v/iid", handler_setfield_gc_v_iid_pyre);
+    builder.wire_handler("setfield_gc_v/ird", handler_setfield_gc_v_ird_pyre);
     builder.wire_handler(
         "setarrayitem_gc_v/iiid",
         handler_setarrayitem_gc_v_iiid_pyre,

@@ -764,21 +764,9 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                         all_constant = false;
                         break;
                     }
-                    if !can_generalize_contains_key(&s, &needle_binding) {
-                        all_constant = false;
-                        break;
-                    }
                     let Some(key) = const_value_from(&s) else {
-                        // Upstream `s.is_immutable_constant()` implies
-                        // `s.const` is readable because Python's
-                        // SomeTuple/SomeList synthesise the const on
-                        // demand. The Rust port only pins `const_box`
-                        // for scalar carriers, so composite
-                        // `SomeTuple(const,const,...)` without an
-                        // explicit const_box returns None here even
-                        // though `is_immutable_constant()` was True.
-                        // Bail out conservatively instead of panicking;
-                        // the original `contains` op stays intact.
+                        // Unsupported immutable-constant carrier:
+                        // leave the original `contains` op intact.
                         all_constant = false;
                         break;
                     };
@@ -906,65 +894,8 @@ fn is_supported_contains_key(cv: &ConstValue) -> bool {
     }
 }
 
-/// Recover a plain [`ConstValue`] from a [`SomeValue`] that passed
-/// `is_immutable_constant()`.
-///
-/// Upstream Python's `SomeTuple.const` / `SomeList.const` properties
-/// synthesise the container from `self.items` at access time. The Rust
-/// port only pins `const_box` for scalar carriers, so composite
-/// annotations with all-constant elements need explicit
-/// reconstruction.
-///
-/// Returns `None` when `s` is not an immutable-constant carrier or a
-/// transitively constant composite.
 fn const_value_from(s: &super::super::annotator::model::SomeValue) -> Option<ConstValue> {
-    use super::super::annotator::model::SomeValue;
-    // Fast path: the carrier pinned `const_box`.
-    if let Some(cv) = s.const_() {
-        return Some(cv.clone());
-    }
-    match s {
-        SomeValue::Tuple(t) => {
-            let mut items = Vec::with_capacity(t.items.len());
-            for item in &t.items {
-                items.push(const_value_from(item)?);
-            }
-            Some(ConstValue::Tuple(items))
-        }
-        _ => None,
-    }
-}
-
-/// Preflight the downstream `s_dict.dictdef.generalize_key(...)`
-/// call for PBC-backed list constants.
-///
-/// Upstream `transform_list_contains()` always rewrites first and lets
-/// `generalize_key()` / `union()` decide whether the key lattice can
-/// absorb the needle. In the Rust port we need a non-panicking fast
-/// reject so the optimisation stays observationally optional.
-///
-/// Restrict the preflight to the cases where upstream's current
-/// `union()` subset is known to succeed:
-///
-/// * non-PBC keys: defer to the existing lattice
-/// * PBC key + `Impossible` / `None`
-/// * PBC key + PBC needle of the same `DescKind`
-fn can_generalize_contains_key(
-    key_s: &super::super::annotator::model::SomeValue,
-    needle_s: &super::super::annotator::model::SomeValue,
-) -> bool {
-    use super::super::annotator::model::SomeValue;
-
-    let SomeValue::PBC(key_pbc) = key_s else {
-        return true;
-    };
-    match needle_s {
-        SomeValue::Impossible | SomeValue::None_(_) => true,
-        SomeValue::PBC(needle_pbc) => {
-            matches!((key_pbc.get_kind(), needle_pbc.get_kind()), (Ok(a), Ok(b)) if a == b)
-        }
-        _ => false,
-    }
+    s.const_().cloned()
 }
 
 // References to unused imports during deferred-port phase would trip
@@ -1543,12 +1474,12 @@ mod tests {
     }
 
     #[test]
-    fn transform_list_contains_tolerates_function_constant_key() {
-        // `ConstValue::Function` now supports `immutablevalue`, but
-        // the dict-key generalization step still cannot union a
-        // function SomePBC key with an arbitrary non-PBC needle. The
-        // optimisation must therefore bail out cleanly instead of
-        // panicking.
+    #[should_panic(expected = "transform_list_contains: generalize_key failed")]
+    fn transform_list_contains_raises_for_function_constant_key_with_non_pbc_needle() {
+        // Upstream does not preflight `generalize_key()`: once the
+        // list constant rewrites to `Constant(dict)`, widening the dict
+        // key cell with an incompatible non-PBC needle raises from the
+        // union lattice.
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::flowspace::model::{ConstValue as CV, Constant as C, GraphFunc, SpaceOperation};
 
@@ -1579,11 +1510,6 @@ mod tests {
         ));
 
         transform_list_contains(&ann, &[block.clone()]);
-
-        assert!(
-            matches!(block.borrow().operations[1].args[0], Hlvalue::Variable(_)),
-            "function-constant list should currently stay unreduced"
-        );
     }
 
     #[test]
@@ -1638,7 +1564,8 @@ mod tests {
     }
 
     #[test]
-    fn transform_list_contains_tolerates_class_constant_key() {
+    #[should_panic(expected = "transform_list_contains: generalize_key failed")]
+    fn transform_list_contains_raises_for_class_constant_key_with_non_pbc_needle() {
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::flowspace::model::{
             ConstValue as CV, Constant as C, HostObject, SpaceOperation,
@@ -1670,11 +1597,6 @@ mod tests {
         ));
 
         transform_list_contains(&ann, &[block.clone()]);
-
-        assert!(
-            matches!(block.borrow().operations[1].args[0], Hlvalue::Variable(_)),
-            "class-constant list should stay unreduced for a non-PBC needle"
-        );
     }
 
     #[test]

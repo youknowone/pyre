@@ -358,7 +358,7 @@ impl RPythonAnnotator {
     pub fn annotation(&self, arg: &Hlvalue) -> Option<SomeValue> {
         match arg {
             Hlvalue::Variable(v) => v.annotation.as_ref().map(|rc| (**rc).clone()),
-            Hlvalue::Constant(c) => match self.bookkeeper.immutablevalue(&c.value) {
+            Hlvalue::Constant(c) => match self.bookkeeper.immutableconstant(c) {
                 Ok(sv) => Some(sv),
                 Err(e) => panic!(
                     "AnnotatorError: immutablevalue({:?}) failed — {}",
@@ -613,7 +613,7 @@ impl RPythonAnnotator {
             },
             Hlvalue::Constant(c) => self
                 .bookkeeper
-                .immutablevalue(&c.value)
+                .immutableconstant(c)
                 .map(|sv| sv.knowntype())
                 .unwrap_or(KnownType::Object),
         }
@@ -1544,7 +1544,7 @@ impl RPythonAnnotator {
                     .expect("mergeinputargs: inputarg lacks annotation"),
                 Hlvalue::Constant(c) => self
                     .bookkeeper
-                    .immutablevalue(&c.value)
+                    .immutableconstant(c)
                     .expect("mergeinputargs: constant immutablevalue failed"),
             })
             .collect();

@@ -219,11 +219,11 @@ pub struct Bookkeeper {
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
     pub emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
     /// RPython `self.immutable_cache = {}` (bookkeeper.py:61), keyed by
-    /// `Constant(x)` for the List / Dict / OrderedDict / r_dict branches
-    /// of `immutablevalue` (bookkeeper.py:255-298). Upstream's cache
-    /// memoises the returned `SomeList` / `SomeDict` so downstream
-    /// `generalize_key` / `generalize` mutations on the cached
-    /// `DictDef` / `ListDef` persist across calls.
+    /// the identity of `Constant(x)` for the List / Dict / OrderedDict /
+    /// r_dict branches of `immutablevalue` (bookkeeper.py:255-298).
+    /// Upstream's cache memoises the returned `SomeList` / `SomeDict` so
+    /// downstream `generalize_key` / `generalize` mutations on the
+    /// cached `DictDef` / `ListDef` persist across calls.
     ///
     /// `transform_list_contains` (translator/transform.py:115-134)
     /// relies on this: it calls `self.annotation(Constant(dict))` after
@@ -231,25 +231,7 @@ pub struct Bookkeeper {
     /// dictdef via `generalize_key`. Without the cache the second
     /// `annotation()` call builds a fresh DictDef and the mutation
     /// dissolves.
-    ///
-    /// **Precision deviation from upstream.** Upstream uses
-    /// `Hashable(Constant(x))` which for hashable values hashes on
-    /// `(type(x), x)` and falls back to `id(x)` for mutable
-    /// list/dict/set values (see `rpython/tool/uid.py:27-38`). The Rust
-    /// port keys this cache on the value-equal `ConstValue` enum, so two
-    /// distinct prebuilt `[]` / `{}` literals with identical contents
-    /// share a cache entry. Any `generalize` / `generalize_key` call on
-    /// the cached `ListDef` / `DictDef` then widens both literals'
-    /// annotations together — soundness is preserved (widening stays
-    /// monotonic in the lattice) but precision is lost across
-    /// structurally-equal distinct constants.
-    ///
-    /// The identity-based port needs `Hlvalue::Constant` to carry an
-    /// identity-bearing wrapper (`Rc<Constant>` or an atomic id field)
-    /// so the cache can key on the Rc pointer like upstream's `id(x)`
-    /// fallback. That refactor is deferred until the rtyper port (Phase
-    /// 6) exposes a site where the precision loss is user-visible.
-    pub immutable_cache: RefCell<HashMap<ConstValue, SomeValue>>,
+    pub immutable_cache: RefCell<HashMap<u64, SomeValue>>,
     /// RPython `self.pending_specializations = []` (bookkeeper.py:69).
     ///
     /// List of callbacks drained by
@@ -1542,13 +1524,91 @@ impl Bookkeeper {
     /// "The most precise SomeValue instance that contains the
     /// immutable value x."
     ///
-    /// Input is a flowspace [`ConstValue`] — the Rust-side
-    /// counterpart to upstream's Python constant. Primitive branches
-    /// (bool / int / float / str / char / unicode / bytearray / tuple
-    /// / None) are ported line-by-line; `list` / `dict` build
-    /// [`SomeList`] / [`SomeDict`] via `getlistdef` / `getdictdef`
-    /// without the upstream `immutable_cache` memoisation (perf-only
-    /// deviation, correctness unchanged).
+    fn immutable_list_with_key(
+        self: &Rc<Self>,
+        key: Option<&Constant>,
+        x: &ConstValue,
+        items: &[ConstValue],
+    ) -> Result<SomeValue, AnnotatorError> {
+        if let Some(key) = key
+            && let Some(hit) = self.immutable_cache.borrow().get(&key.id).cloned()
+        {
+            return Ok(hit);
+        }
+        let listdef = ListDef::new(Some(self.clone()), SomeValue::Impossible, false, false);
+        let mut result = SomeList::new(listdef.clone());
+        result.base.const_box = Some(key.cloned().unwrap_or_else(|| Constant::new(x.clone())));
+        if let Some(key) = key {
+            self.immutable_cache
+                .borrow_mut()
+                .insert(key.id, SomeValue::List(result.clone()));
+        }
+        for e in items {
+            let s_e = self.immutablevalue(e)?;
+            listdef
+                .generalize(&s_e)
+                .map_err(|e| AnnotatorError::new(e.msg))?;
+        }
+        Ok(SomeValue::List(result))
+    }
+
+    fn immutable_dict_with_key(
+        self: &Rc<Self>,
+        key: Option<&Constant>,
+        x: &ConstValue,
+        items: &HashMap<ConstValue, ConstValue>,
+    ) -> Result<SomeValue, AnnotatorError> {
+        if let Some(key) = key
+            && let Some(hit) = self.immutable_cache.borrow().get(&key.id).cloned()
+        {
+            return Ok(hit);
+        }
+        let dictdef = DictDef::new(
+            Some(self.clone()),
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            false,
+            false,
+            false,
+        );
+        let mut result = SomeDict::new(dictdef.clone());
+        result.base.const_box = Some(key.cloned().unwrap_or_else(|| Constant::new(x.clone())));
+        if let Some(key) = key {
+            self.immutable_cache
+                .borrow_mut()
+                .insert(key.id, SomeValue::Dict(result.clone()));
+        }
+        for (k, v) in items {
+            let s_k = self.immutablevalue(k)?;
+            let s_v = self.immutablevalue(v)?;
+            dictdef
+                .generalize_key(&s_k)
+                .map_err(|e| AnnotatorError::new(e.msg))?;
+            dictdef
+                .generalize_value(&s_v)
+                .map_err(|e| AnnotatorError::new(e.msg))?;
+        }
+        Ok(SomeValue::Dict(result))
+    }
+
+    /// RPython `Bookkeeper.immutablevalue(Constant(x))` for callers that
+    /// still have the original `Constant` object and therefore its
+    /// identity. List/dict branches must preserve that identity so
+    /// `self.immutable_cache[key]` matches upstream.
+    pub fn immutableconstant(self: &Rc<Self>, c: &Constant) -> Result<SomeValue, AnnotatorError> {
+        match &c.value {
+            ConstValue::List(items) => self.immutable_list_with_key(Some(c), &c.value, items),
+            ConstValue::Dict(items) => self.immutable_dict_with_key(Some(c), &c.value, items),
+            _ => self.immutablevalue(&c.value),
+        }
+    }
+
+    /// Input is a flowspace [`ConstValue`] — the Rust-side counterpart
+    /// to upstream's Python constant. Primitive branches (bool / int /
+    /// float / str / char / unicode / bytearray / tuple / None) are
+    /// ported line-by-line. Callers that still have the original
+    /// [`Constant`] object should use [`Self::immutableconstant`] so
+    /// list/dict branches can preserve `Constant(x)` identity.
     ///
     /// The function / class / bound-method / weakref / frozen-PBC /
     /// property / instance branches (bookkeeper.py:218-348) route
@@ -1596,80 +1656,8 @@ impl Bookkeeper {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(SomeValue::Tuple(SomeTuple::new(items_s)))
             }
-            ConstValue::List(items) => {
-                // upstream bookkeeper.py:255-265:
-                //
-                //     key = Constant(x)
-                //     try: return self.immutable_cache[key]
-                //     except KeyError:
-                //         result = SomeList(ListDef(self, s_ImpossibleValue))
-                //         self.immutable_cache[key] = result
-                //         for e in x:
-                //             result.listdef.generalize(self.immutablevalue(e))
-                //         result.const_box = key
-                //         return result
-                if let Some(hit) = self.immutable_cache.borrow().get(x).cloned() {
-                    return Ok(hit);
-                }
-                let listdef = ListDef::new(Some(self.clone()), SomeValue::Impossible, false, false);
-                let mut result = SomeList::new(listdef.clone());
-                result.base.const_box = Some(Constant::new(x.clone()));
-                // Upstream stores the cache entry BEFORE populating the
-                // listdef so recursive immutablevalue() hits on nested
-                // lists re-use the in-flight cell. Matches
-                // bookkeeper.py:261.
-                self.immutable_cache
-                    .borrow_mut()
-                    .insert(x.clone(), SomeValue::List(result.clone()));
-                for e in items {
-                    let s_e = self.immutablevalue(e)?;
-                    listdef
-                        .generalize(&s_e)
-                        .map_err(|e| AnnotatorError::new(e.msg))?;
-                }
-                Ok(SomeValue::List(result))
-            }
-            ConstValue::Dict(items) => {
-                // upstream bookkeeper.py:266-298:
-                //
-                //     key = Constant(x)
-                //     try: return self.immutable_cache[key]
-                //     except KeyError:
-                //         result = SomeDict(DictDef(self, ...))
-                //         self.immutable_cache[key] = result
-                //         for ek, ev in x.iteritems():
-                //             result.dictdef.generalize_key(self.immutablevalue(ek))
-                //             result.dictdef.generalize_value(self.immutablevalue(ev))
-                //         result.const_box = key
-                //         return result
-                if let Some(hit) = self.immutable_cache.borrow().get(x).cloned() {
-                    return Ok(hit);
-                }
-                let dictdef = DictDef::new(
-                    Some(self.clone()),
-                    SomeValue::Impossible,
-                    SomeValue::Impossible,
-                    false,
-                    false,
-                    false,
-                );
-                let mut result = SomeDict::new(dictdef.clone());
-                result.base.const_box = Some(Constant::new(x.clone()));
-                self.immutable_cache
-                    .borrow_mut()
-                    .insert(x.clone(), SomeValue::Dict(result.clone()));
-                for (k, v) in items {
-                    let s_k = self.immutablevalue(k)?;
-                    let s_v = self.immutablevalue(v)?;
-                    dictdef
-                        .generalize_key(&s_k)
-                        .map_err(|e| AnnotatorError::new(e.msg))?;
-                    dictdef
-                        .generalize_value(&s_v)
-                        .map_err(|e| AnnotatorError::new(e.msg))?;
-                }
-                Ok(SomeValue::Dict(result))
-            }
+            ConstValue::List(items) => self.immutable_list_with_key(None, x, items),
+            ConstValue::Dict(items) => self.immutable_dict_with_key(None, x, items),
             ConstValue::HostObject(obj) => self.immutablevalue_hostobject(obj, x),
             ConstValue::Function(func) => {
                 let host = HostObject::new_user_function((**func).clone());
@@ -2336,6 +2324,54 @@ mod tests {
             }
             other => panic!("expected SomeList, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn immutableconstant_list_reuses_same_constant_identity() {
+        let bk = bk();
+        let key = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let a = bk.immutableconstant(&key).unwrap();
+        let b = bk.immutableconstant(&key).unwrap();
+        let (SomeValue::List(a), SomeValue::List(b)) = (a, b) else {
+            panic!("expected SomeList");
+        };
+        assert!(a.listdef.same_as(&b.listdef));
+        assert_eq!(a.base.const_box.as_ref().map(|c| c.id), Some(key.id));
+        assert_eq!(b.base.const_box.as_ref().map(|c| c.id), Some(key.id));
+    }
+
+    #[test]
+    fn immutableconstant_list_distinguishes_equal_but_distinct_constants() {
+        let bk = bk();
+        let a_key = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let b_key = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let a = bk.immutableconstant(&a_key).unwrap();
+        let b = bk.immutableconstant(&b_key).unwrap();
+        let (SomeValue::List(a), SomeValue::List(b)) = (a, b) else {
+            panic!("expected SomeList");
+        };
+        assert!(!a.listdef.same_as(&b.listdef));
+        assert_eq!(a.base.const_box.as_ref().map(|c| c.id), Some(a_key.id));
+        assert_eq!(b.base.const_box.as_ref().map(|c| c.id), Some(b_key.id));
+    }
+
+    #[test]
+    fn immutableconstant_dict_distinguishes_equal_but_distinct_constants() {
+        let bk = bk();
+        let mut a_items = HashMap::new();
+        a_items.insert(ConstValue::Int(1), ConstValue::None);
+        let mut b_items = HashMap::new();
+        b_items.insert(ConstValue::Int(1), ConstValue::None);
+        let a_key = Constant::new(ConstValue::Dict(a_items));
+        let b_key = Constant::new(ConstValue::Dict(b_items));
+        let a = bk.immutableconstant(&a_key).unwrap();
+        let b = bk.immutableconstant(&b_key).unwrap();
+        let (SomeValue::Dict(a), SomeValue::Dict(b)) = (a, b) else {
+            panic!("expected SomeDict");
+        };
+        assert_ne!(a.dictdef, b.dictdef);
+        assert_eq!(a.base.const_box.as_ref().map(|c| c.id), Some(a_key.id));
+        assert_eq!(b.base.const_box.as_ref().map(|c| c.id), Some(b_key.id));
     }
 
     #[test]

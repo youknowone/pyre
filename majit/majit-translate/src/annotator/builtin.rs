@@ -501,12 +501,11 @@ pub fn builtin_enumerate(
             "second argument to enumerate must be constant",
         ));
     }
-    // upstream stores the start const on the variant — the Rust
-    // SomeIterator drops trailing positional variants (see
-    // `unaryop.rs:3023` comment chain). We keep the marker only.
-    Ok(SomeValue::Iterator(SomeIterator::new(
+    let const_start = s_start.and_then(|s| s.const_().cloned());
+    Ok(SomeValue::Iterator(SomeIterator::new_with_enumerate_start(
         s_obj,
         vec!["enumerate".to_string()],
+        const_start,
     )))
 }
 
@@ -1954,6 +1953,34 @@ mod tests {
             "err was {:?}",
             err.msg
         );
+    }
+
+    #[test]
+    fn builtin_enumerate_preserves_constant_start_payload() {
+        let bk = bk();
+        let s_xs = SomeValue::object();
+        let s_start = bk.immutablevalue(&ConstValue::Int(3)).unwrap();
+        let result = builtin_enumerate(&bk, &[s_xs, s_start], &no_kwds()).unwrap();
+        let SomeValue::Iterator(it) = result else {
+            panic!("expected SomeIterator");
+        };
+        assert_eq!(it.variant, vec!["enumerate".to_string()]);
+        assert_eq!(it.enumerate_start, Some(ConstValue::Int(3)));
+    }
+
+    #[test]
+    fn builtin_enumerate_keyword_preserves_constant_start_payload() {
+        let bk = bk();
+        let s_xs = SomeValue::object();
+        let s_start = bk.immutablevalue(&ConstValue::Int(5)).unwrap();
+        let mut kwds: HashMap<String, SomeValue> = HashMap::new();
+        kwds.insert("s_start".into(), s_start);
+        let result = builtin_enumerate(&bk, &[s_xs], &kwds).unwrap();
+        let SomeValue::Iterator(it) = result else {
+            panic!("expected SomeIterator");
+        };
+        assert_eq!(it.variant, vec!["enumerate".to_string()]);
+        assert_eq!(it.enumerate_start, Some(ConstValue::Int(5)));
     }
 
     #[test]

@@ -4574,6 +4574,30 @@ mod tests {
     }
 
     #[test]
+    fn test_phase_seeded_value_types_skip_void_entries() {
+        let mut opt = Optimizer::new();
+        opt.original_trace_op_types.insert(40, Type::Void);
+        opt.original_trace_op_types.insert(41, Type::Int);
+        opt.prev_phase_value_types.insert(50, Type::Void);
+        opt.prev_phase_value_types.insert(51, Type::Ref);
+
+        let mut constants = std::collections::HashMap::new();
+        let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 0, 0, 0);
+
+        assert!(result.is_empty());
+        assert_eq!(opt.prev_phase_value_types.get(&41), Some(&Type::Int));
+        assert_eq!(opt.prev_phase_value_types.get(&51), Some(&Type::Ref));
+        assert!(!opt.prev_phase_value_types.contains_key(&40));
+        assert!(!opt.prev_phase_value_types.contains_key(&50));
+        assert!(
+            !opt.prev_phase_value_types
+                .values()
+                .any(|&tp| tp == Type::Void),
+            "value_types must only carry Box-producing i/r/f entries"
+        );
+    }
+
+    #[test]
     fn test_is_call_pure_pure_canraise_ignores_memoryerror_only() {
         let mut op = Op::new(OpCode::CallPureI, &[OpRef(0), OpRef(1)]);
         op.descr = Some(Arc::new(TestCallDescr {
