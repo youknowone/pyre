@@ -2449,10 +2449,9 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
-        let mut recorder = ctx.recorder;
-        recorder.finish(finish_args, crate::make_fail_descr(finish_args.len()));
-        let trace = recorder.get_trace();
-        let constants = ctx.constants.into_inner();
+        ctx.finish(finish_args, crate::make_fail_descr(finish_args.len()));
+        let constants = std::mem::take(&mut ctx.constants).into_inner();
+        let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
         Some((trace, constants))
     }
@@ -3695,12 +3694,11 @@ impl<M: Clone> MetaInterp<M> {
             None => return false,
         };
 
-        let mut recorder = ctx.recorder;
-        recorder.close_loop(jump_args);
-        let trace = recorder.get_trace();
-
+        ctx.close_loop(jump_args);
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
-        let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
+        let (mut constants, mut constant_types) =
+            std::mem::take(&mut ctx.constants).into_inner_with_types();
+        let trace = ctx.into_tree_loop();
 
         let trace_ops = trace.ops.clone();
 
@@ -13807,6 +13805,34 @@ mod tests {
             .into_iter()
             .filter(|op| op.opcode != OpCode::Jump)
             .collect()
+    }
+
+    #[test]
+    fn finish_trace_for_parity_preserves_captured_snapshots() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let action = meta.force_start_tracing(777, (0, 0), None, &[Value::Int(17)]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let snapshot_id = {
+            let ctx = meta.trace_ctx().expect("active trace context");
+            ctx.capture_resumedata(crate::recorder::Snapshot {
+                frames: vec![crate::recorder::SnapshotFrame {
+                    jitcode_index: 0,
+                    pc: 123,
+                    boxes: vec![crate::recorder::SnapshotTagged::Box(0, Type::Int)],
+                }],
+                vable_boxes: Vec::new(),
+                vref_boxes: Vec::new(),
+            })
+        };
+        assert_eq!(snapshot_id, 0);
+
+        let (trace, _) = meta
+            .finish_trace_for_parity(&[OpRef(0)])
+            .expect("trace should finish");
+        assert_eq!(trace.snapshots.len(), 1);
+        assert_eq!(trace.snapshots[0].frames.len(), 1);
+        assert_eq!(trace.snapshots[0].frames[0].pc, 123);
     }
 
     #[test]

@@ -74,29 +74,47 @@ pub fn set_current_exception(exc: PyObjectRef) {
     CURRENT_EXCEPTION.with(|current| current.set(exc));
 }
 
-fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
+fn builtin_base_exception_type(
+    execution_context: *const crate::PyExecutionContext,
+) -> Option<PyObjectRef> {
+    if execution_context.is_null() {
+        return None;
+    }
+    let builtins = unsafe { (*execution_context).fresh_dict_storage() };
+    crate::dict_storage_get(&builtins, "BaseException")
+}
+
+pub fn exception_is_valid_obj_as_class_w(
+    obj: PyObjectRef,
+    execution_context: *const crate::PyExecutionContext,
+) -> bool {
+    if obj.is_null() || !unsafe { pyre_object::is_type(obj) } {
+        return false;
+    }
+    let Some(w_base_exception) = builtin_base_exception_type(execution_context) else {
+        return false;
+    };
+    unsafe { crate::baseobjspace::issubtype_w(obj, w_base_exception) }
+}
+
+pub fn normalize_raise_value(
+    value: PyObjectRef,
+    execution_context: *const crate::PyExecutionContext,
+) -> PyObjectRef {
+    if exception_is_valid_obj_as_class_w(value, execution_context) {
+        return crate::call_function(value, &[]);
+    }
+    value
+}
+
+pub fn normalize_raise_cause(
+    cause: PyObjectRef,
+    execution_context: *const crate::PyExecutionContext,
+) -> Result<PyObjectRef, PyError> {
+    let cause = normalize_raise_value(cause, execution_context);
     unsafe {
         if cause.is_null() || pyre_object::is_none(cause) || pyre_object::is_exception(cause) {
             return Ok(cause);
-        }
-        if crate::is_function(cause)
-            && crate::is_builtin_code(crate::getcode(cause) as pyre_object::PyObjectRef)
-        {
-            let code = crate::getcode(cause);
-            let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-            return match func(&[]) {
-                Ok(cause_obj) if pyre_object::is_exception(cause_obj) => Ok(cause_obj),
-                Ok(_) => Err(PyError::type_error(
-                    "exception cause must be None or derive from BaseException",
-                )),
-                Err(e) => Err(e),
-            };
-        }
-        if pyre_object::is_type(cause) {
-            let result = crate::call_function(cause, &[]);
-            if pyre_object::is_exception(result) {
-                return Ok(result);
-            }
         }
     }
     Err(PyError::type_error(
@@ -104,7 +122,7 @@ fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
     ))
 }
 
-fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
+pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
     if let Some(cause_obj) = cause {
         if !cause_obj.is_null() {
             crate::baseobjspace::ATTR_TABLE.with(|table| {
@@ -1047,40 +1065,12 @@ impl OpcodeStepExecutor for PyFrame {
                 }
             }
             1 => {
-                let exc = self.pop();
+                let exc = normalize_raise_value(self.pop(), self.execution_context);
                 let cause = None;
                 unsafe {
                     if pyre_object::is_exception(exc) {
                         attach_raise_cause(exc, cause)?;
                         Err(PyError::from_exc_object(exc))
-                    } else if crate::is_function(exc)
-                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
-                    {
-                        // raise TypeError → call TypeError() to create instance
-                        let code = crate::getcode(exc);
-                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-                        match func(&[]) {
-                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
-                                attach_raise_cause(exc_obj, cause)?;
-                                Err(PyError::from_exc_object(exc_obj))
-                            }
-                            Ok(exc_obj) => {
-                                // Treat non-exception return as RuntimeError
-                                Err(PyError::runtime_error(&crate::py_str(exc_obj)))
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else if pyre_object::is_type(exc) {
-                        // raise SomeType → call type() to create instance
-                        let result = crate::call_function(exc, &[]);
-                        if pyre_object::is_exception(result) {
-                            attach_raise_cause(result, cause)?;
-                            Err(PyError::from_exc_object(result))
-                        } else {
-                            Err(PyError::type_error(
-                                "exceptions must derive from BaseException",
-                            ))
-                        }
                     } else {
                         Err(PyError::type_error(
                             "exceptions must derive from BaseException",
@@ -1090,35 +1080,12 @@ impl OpcodeStepExecutor for PyFrame {
             }
             2 => {
                 let raw_cause = self.pop();
-                let exc = self.pop();
-                let cause = Some(normalize_raise_cause(raw_cause)?);
+                let exc = normalize_raise_value(self.pop(), self.execution_context);
+                let cause = Some(normalize_raise_cause(raw_cause, self.execution_context)?);
                 unsafe {
                     if pyre_object::is_exception(exc) {
                         attach_raise_cause(exc, cause)?;
                         Err(PyError::from_exc_object(exc))
-                    } else if crate::is_function(exc)
-                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
-                    {
-                        let code = crate::getcode(exc);
-                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-                        match func(&[]) {
-                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
-                                attach_raise_cause(exc_obj, cause)?;
-                                Err(PyError::from_exc_object(exc_obj))
-                            }
-                            Ok(exc_obj) => Err(PyError::runtime_error(&crate::py_str(exc_obj))),
-                            Err(e) => Err(e),
-                        }
-                    } else if pyre_object::is_type(exc) {
-                        let result = crate::call_function(exc, &[]);
-                        if pyre_object::is_exception(result) {
-                            attach_raise_cause(result, cause)?;
-                            Err(PyError::from_exc_object(result))
-                        } else {
-                            Err(PyError::type_error(
-                                "exceptions must derive from BaseException",
-                            ))
-                        }
                     } else {
                         Err(PyError::type_error(
                             "exceptions must derive from BaseException",
@@ -2279,6 +2246,62 @@ mod tests {
         let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
         let result = eval_frame_plain(&mut frame);
         (result, frame)
+    }
+
+    #[test]
+    fn test_exception_is_valid_obj_as_class_w_matches_baseexception_subclass_rule() {
+        let (_result, frame) = run_exec_frame("good = ValueError\nbad = int");
+        let w_globals = unsafe { &*frame.fget_w_globals() };
+        let good = *w_globals.get("good").expect("missing good");
+        let bad = *w_globals.get("bad").expect("missing bad");
+
+        assert!(exception_is_valid_obj_as_class_w(
+            good,
+            frame.execution_context
+        ));
+        assert!(!exception_is_valid_obj_as_class_w(
+            bad,
+            frame.execution_context
+        ));
+    }
+
+    #[test]
+    fn test_raise_non_exception_type_raises_typeerror() {
+        let (result, _frame) = run_exec_frame("raise int");
+        let err = result.expect_err("raise int should fail");
+        assert_eq!(err.kind, PyErrorKind::TypeError);
+        assert_eq!(err.message, "exceptions must derive from BaseException");
+    }
+
+    #[test]
+    fn test_raise_invalid_cause_raises_typeerror() {
+        let (result, _frame) = run_exec_frame("raise ValueError() from 1");
+        let err = result.expect_err("invalid cause should fail");
+        assert_eq!(err.kind, PyErrorKind::TypeError);
+        assert_eq!(
+            err.message,
+            "exception cause must be None or derive from BaseException"
+        );
+    }
+
+    #[test]
+    fn test_raise_from_sets_cause_attribute() {
+        let (_result, frame) = run_exec_frame("exc = ValueError()\ncause = KeyError()");
+        let w_globals = unsafe { &*frame.fget_w_globals() };
+        let exc = *w_globals.get("exc").expect("missing exc");
+        let cause = *w_globals.get("cause").expect("missing cause");
+
+        let code = compile_exec("raise exc from cause").expect("compile failed");
+        let mut raise_frame =
+            PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        unsafe {
+            (*raise_frame.fget_w_globals()).insert("exc".to_string(), exc);
+            (*raise_frame.fget_w_globals()).insert("cause".to_string(), cause);
+        }
+
+        let err = eval_frame_plain(&mut raise_frame).expect_err("raise from should fail");
+        assert_eq!(err.to_exc_object(), exc);
+        assert_eq!(crate::getattr(exc, "__cause__").expect("read cause"), cause);
     }
 
     #[test]

@@ -10,7 +10,6 @@ use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
     JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx,
 };
-use pyre_interpreter::PyError;
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 use pyre_interpreter::pyframe::{PendingInlineResult, PyFrame};
@@ -1136,6 +1135,10 @@ pub struct PyreSym {
     /// by handle_possible_exception after GUARD_EXCEPTION, then consumed
     /// by finishframe_exception for stack push.
     pub(crate) last_exc_box: OpRef,
+    /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
+    /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
+    pub(crate) current_exc_value: pyre_object::PyObjectRef,
+    pub(crate) current_exc_box: OpRef,
     /// pyjitpl.py:2597 virtualref_boxes: pairs of (jit_virtual, real_vref).
     /// Each pair: (symbolic OpRef, concrete pointer).
     /// resume.py:1093 restores virtual references on guard failure.
@@ -1988,6 +1991,8 @@ impl PyreSym {
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
+            current_exc_value: pyre_interpreter::eval::get_current_exception(),
+            current_exc_box: OpRef::NONE,
             virtualref_boxes: Vec::new(),
             // RPython pyjitpl.py:74-78 init: registers_X[i] = CONST_NULL for
             // i in num_regs. Sized lazily here — Stage 3.2 will resize each
@@ -5092,6 +5097,201 @@ mod tests {
         );
         assert_eq!(state.sym().last_exc_value, PY_NULL);
         assert_eq!(state.sym().last_exc_box, OpRef::NONE);
+    }
+
+    #[test]
+    fn test_trace_code_step_routes_malformed_raise_through_generic_exception_path() {
+        let lookup_code = compile_exec("x = int\n").expect("lookup code should compile");
+        let mut lookup_frame = pyre_interpreter::PyFrame::new_with_context(
+            lookup_code,
+            Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        );
+        eval_frame_plain(&mut lookup_frame).expect("lookup module should execute");
+        let int_type = unsafe {
+            (*lookup_frame.fget_w_globals())
+                .get("x")
+                .copied()
+                .expect("globals should contain int")
+        };
+
+        let code = compile_exec("try:\n    raise int\nexcept TypeError:\n    pass\n")
+            .expect("trace code should compile");
+        let raise_pc = (0..code.instructions.len())
+            .find(|&pc| {
+                matches!(
+                    decode_instruction_at(&code, pc),
+                    Some((Instruction::RaiseVarargs { .. }, _))
+                )
+            })
+            .expect("test bytecode should contain RAISE_VARARGS");
+        let handler_pc = pyre_interpreter::bytecode::find_exception_handler(
+            &code.exceptiontable,
+            raise_pc as u32,
+        )
+        .expect("raise should be covered by exception table")
+        .target as usize;
+        let code_ref =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
+                as *const ();
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(code_ref as pyre_object::PyObjectRef)
+                as *const CodeObject
+        };
+        let mut builder = majit_metainterp::JitCodeBuilder::default();
+        let live_patch = builder.live_placeholder();
+        builder.patch_live_offset(live_patch, 0);
+        let mut insns = std::collections::HashMap::new();
+        insns.insert("live/".to_string(), majit_metainterp::jitcode::BC_LIVE);
+        crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref, None);
+        pyjit.jitcode = std::sync::Arc::new(builder.finish());
+        pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
+        METAINTERP_SD.with(|r| {
+            let _ = r
+                .borrow_mut()
+                .jitcode_for(code_ref, Some(std::sync::Arc::new(pyjit)));
+        });
+
+        let mut frame = Box::new(pyre_interpreter::PyFrame::new_with_context(
+            code.clone(),
+            Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        ));
+        frame.fix_array_ptrs();
+        frame.push(int_type);
+
+        let mut ctx = TraceCtx::for_test(1);
+        let int_ref = ctx.const_ref(int_type as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = jitcode_for(code_ref);
+        sym.nlocals = frame.nlocals();
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
+            pre_opcode_registers_r: None,
+        };
+
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(int_ref, ConcreteValue::Ref(int_type)),
+        )
+        .expect("push malformed raise value");
+
+        let action = state.trace_code_step(&code, raise_pc);
+        assert!(
+            matches!(action, TraceAction::Continue),
+            "malformed raise inside a handler should follow the generic exception path"
+        );
+        assert_eq!(state.sym().pending_next_instr, Some(handler_pc));
+        assert_ne!(state.sym().last_exc_value, PY_NULL);
+    }
+
+    #[test]
+    fn test_raise_varargs_exception_class_seeds_const_exception_box() {
+        let code = compile_exec("x = ValueError\n").expect("compile failed");
+        let mut frame = pyre_interpreter::PyFrame::new_with_context(
+            code,
+            Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        );
+        eval_frame_plain(&mut frame).expect("module body should execute");
+        let exc_type = unsafe {
+            (*frame.fget_w_globals())
+                .get("x")
+                .copied()
+                .expect("globals should contain ValueError")
+        };
+
+        let mut ctx = TraceCtx::for_test(1);
+        let exc_type_ref = ctx.const_ref(exc_type as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
+            pre_opcode_registers_r: None,
+        };
+
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(exc_type_ref, ConcreteValue::Ref(exc_type)),
+        )
+        .expect("push exception class");
+
+        let err = OpcodeStepExecutor::raise_varargs(&mut state, 1)
+            .expect_err("raising exception class should raise");
+        assert_eq!(err.kind, PyErrorKind::ValueError);
+        assert_ne!(state.sym().last_exc_box, OpRef::NONE);
+        assert_eq!(state.sym().last_exc_value, err.to_exc_object());
+    }
+
+    #[test]
+    fn test_push_exc_info_and_pop_except_preserve_symbolic_previous_exception() {
+        let code = compile_exec("try:\n    raise ValueError\nexcept Exception:\n    pass\n")
+            .expect("compile failed");
+        let mut frame = pyre_interpreter::PyFrame::new_with_context(
+            code,
+            Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        );
+        let prev_exc = pyre_interpreter::PyError::value_error("prev").to_exc_object();
+        let caught_exc = pyre_interpreter::PyError::runtime_error("caught").to_exc_object();
+
+        let mut ctx = TraceCtx::for_test(1);
+        let prev_exc_ref = ctx.const_ref(prev_exc as i64);
+        let caught_exc_ref = ctx.const_ref(caught_exc as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.current_exc_value = prev_exc;
+        sym.current_exc_box = prev_exc_ref;
+        pyre_interpreter::eval::set_current_exception(prev_exc);
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
+            pre_opcode_registers_r: None,
+        };
+
+        frame.push(caught_exc);
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(caught_exc_ref, ConcreteValue::Ref(caught_exc)),
+        )
+        .expect("push caught exception");
+
+        OpcodeStepExecutor::push_exc_info(&mut state).expect("push_exc_info should succeed");
+        assert_eq!(state.sym().current_exc_value, caught_exc);
+        assert_eq!(state.sym().current_exc_box, caught_exc_ref);
+
+        let pushed_exc = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
+            .expect("caught exception should remain on stack");
+        assert_eq!(pushed_exc.opref, caught_exc_ref);
+        let restored_prev = <MIFrame as SharedOpcodeHandler>::pop_value(&mut state)
+            .expect("previous exception should be underneath the caught exception");
+        assert_eq!(restored_prev.opref, prev_exc_ref);
+        assert_eq!(restored_prev.concrete.to_pyobj(), prev_exc);
+
+        <MIFrame as SharedOpcodeHandler>::push_value(&mut state, restored_prev)
+            .expect("restore previous exception for POP_EXCEPT");
+        OpcodeStepExecutor::pop_except(&mut state).expect("pop_except should succeed");
+        assert_eq!(state.sym().current_exc_value, prev_exc);
+        assert_eq!(state.sym().current_exc_box, prev_exc_ref);
+        assert_eq!(pyre_interpreter::eval::get_current_exception(), prev_exc);
+        pyre_interpreter::eval::set_current_exception(PY_NULL);
     }
 
     #[test]
