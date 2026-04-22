@@ -2763,7 +2763,12 @@ impl<M: Clone> MetaInterp<M> {
         // GUARD_NOT_INVALIDATED are both emitted during tracing in
         // close_loop_args_at (state.rs) via record_guard → capture_resumedata.
         recorder.close_loop(jump_args);
-        let trace = recorder.get_trace();
+        // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
+        // them so downstream consumers (`trace.snapshots`) still observe
+        // the captured resumedata. `recorder.get_trace()` on its own
+        // returns a snapshot-less TreeLoop post-Task #70.
+        let mut trace = recorder.get_trace();
+        trace.snapshots = std::mem::take(&mut ctx.snapshots);
 
         // RPython Box type parity: build type index from the FULL uncut
         // trace. snapshot_boxes reference positions from the original trace;
@@ -4137,7 +4142,12 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap_or_else(|| crate::make_fail_descr_typed(finish_arg_types.clone()))
         };
         recorder.finish(finish_args, finish_descr);
-        let trace = recorder.get_trace();
+        // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
+        // them so downstream consumers (`trace.snapshots`) still observe
+        // the captured resumedata. `recorder.get_trace()` on its own
+        // returns a snapshot-less TreeLoop post-Task #70.
+        let mut trace = recorder.get_trace();
+        trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let trace_snapshots = trace.snapshots.clone();
 
         // RPython Box type parity: build type index from the trace ops.
@@ -4508,7 +4518,12 @@ impl<M: Clone> MetaInterp<M> {
         let green_key = ctx.green_key;
 
         let recorder = ctx.recorder;
-        let trace = recorder.get_trace();
+        // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
+        // them so downstream consumers (`trace.snapshots`) still observe
+        // the captured resumedata. `recorder.get_trace()` on its own
+        // returns a snapshot-less TreeLoop post-Task #70.
+        let mut trace = recorder.get_trace();
+        trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let trace_snapshots = trace.snapshots.clone();
 
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();

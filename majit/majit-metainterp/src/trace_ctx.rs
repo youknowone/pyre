@@ -175,6 +175,15 @@ pub struct TraceCtx {
     /// call; pyre snapshots it at `setup_tracing` time (warmstate owns the
     /// live value). Default mirrors rlib/jit.py:592 (trace_limit = 6000).
     trace_limit: usize,
+    /// Pyre-only snapshot side table (opencoder.py stores snapshots inline
+    /// in `_snapshot_data` / `_snapshot_array_data` byte streams).
+    /// `capture_resumedata` pushes one entry per guard; the returned id
+    /// is stored on the guard op's `rd_resume_position`.  Grows
+    /// monotonically across `cut_trace` (matches the pre-Task #70
+    /// behavior — see `cut_trace` for rationale).  Will migrate to the
+    /// byte-stream form carried by `TraceRecordBuffer` alongside the
+    /// eventual field swap (Task #59 / #70).
+    pub(crate) snapshots: Vec<crate::recorder::Snapshot>,
 }
 
 /// rlib/jit.py:592 default `trace_limit` — mirrored here so standalone
@@ -226,7 +235,12 @@ impl TraceCtx {
         live_arg_types: Vec<Type>,
         header_pc: usize,
     ) {
-        let position = self.recorder.get_position();
+        // Use the TraceCtx-level position so `snapshot_data_len` reflects
+        // the current Vec<Snapshot> side table length (Task #70 moved
+        // snapshots off `recorder::Trace`; a bare `recorder.get_position()`
+        // would report `snapshot_data_len: 0`, causing `cut_trace` to
+        // truncate valid snapshots when this merge point is restored).
+        let position = self.get_trace_position();
         self.current_merge_points.push(MergePoint {
             green_key: key,
             position,
@@ -277,11 +291,23 @@ impl TraceCtx {
     }
 
     /// history.py: get_trace_position — current recorder position.
+    ///
+    /// Combines the recorder's 3-tuple (`_pos` / `_count` / `_index`) with
+    /// the TraceCtx-owned snapshot side table length so callers see the
+    /// full opencoder.py:567-568 5-tuple.
     pub fn get_trace_position(&self) -> TracePosition {
-        self.recorder.get_position()
+        let mut pos = self.recorder.get_position();
+        pos.snapshot_data_len = self.snapshots.len();
+        pos
     }
 
     /// history.py: cut — restore recorder to a saved position.
+    ///
+    /// Does NOT truncate `self.snapshots` — matches the pre-Task #70
+    /// `recorder::Trace::cut` behavior where snapshots grew monotonically
+    /// even across rewinds. Downstream code only indexes new snapshot ids
+    /// minted after each cut, so stale entries are harmless; truncating
+    /// regresses bench (tested under Task #70).
     pub fn cut_trace(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
     }
@@ -425,6 +451,7 @@ impl TraceCtx {
             callinfocollection: None,
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
+            snapshots: Vec::new(),
         }
     }
 
@@ -478,6 +505,7 @@ impl TraceCtx {
             callinfocollection: None,
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
+            snapshots: Vec::new(),
         }
     }
 
@@ -787,12 +815,18 @@ impl TraceCtx {
     /// opencoder.py:819 parity: capture a snapshot of the interpreter
     /// frame state. Returns a snapshot_id for use as rd_resume_position.
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
-        self.recorder.capture_resumedata(snapshot)
+        let id = self.snapshots.len() as i32;
+        self.snapshots.push(snapshot);
+        id
     }
 
     /// Look up a captured snapshot by id.
     pub fn get_snapshot(&self, id: i32) -> Option<&crate::recorder::Snapshot> {
-        self.recorder.get_snapshot(id)
+        if id >= 0 {
+            self.snapshots.get(id as usize)
+        } else {
+            None
+        }
     }
 
     /// Set rd_resume_position on the last recorded guard.
@@ -979,15 +1013,22 @@ impl TraceCtx {
     ///
     /// Pyre analog of RPython's `MetaInterp.history.trace` access — after
     /// tracing ends, downstream callers (optimizer, bridge export) see
-    /// the loop as `TreeLoop { inputargs, ops, snapshots }`.
+    /// the loop as `TreeLoop { inputargs, ops, snapshots }`. Snapshots
+    /// come from the TraceCtx-owned side table (Task #70 moved them off
+    /// `recorder::Trace`); the recorder contributes only inputargs + ops.
     pub fn into_tree_loop(self) -> crate::history::TreeLoop {
-        self.recorder.get_trace()
+        let recorder_trace = self.recorder.get_trace();
+        crate::history::TreeLoop::with_snapshots(
+            recorder_trace.inputargs,
+            recorder_trace.ops,
+            self.snapshots,
+        )
     }
 
     /// Snapshot slice accessor — Pyre-level parity with
     /// `MetaInterp.history.trace.snapshots()`.
     pub fn snapshots(&self) -> &[crate::recorder::Snapshot] {
-        self.recorder.snapshots()
+        &self.snapshots
     }
 
     /// Op slice accessor — returns the raw recorded operations. After

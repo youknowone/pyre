@@ -98,9 +98,6 @@ pub struct Trace {
     /// opencoder.py parity: count of box-yielding positions
     /// (inputargs + non-void ops).
     box_count: u32,
-    /// opencoder.py parity: per-guard snapshots of interpreter frame state.
-    /// Indexed by snapshot_id (stored on guard ops as rd_resume_position).
-    snapshots: Vec<Snapshot>,
 }
 
 impl Trace {
@@ -115,7 +112,6 @@ impl Trace {
             inputargs: Vec::new(),
             op_count: 0,
             box_count: 0,
-            snapshots: Vec::new(),
         }
     }
 
@@ -229,29 +225,6 @@ impl Trace {
         }
     }
 
-    /// opencoder.py:819 parity: capture a snapshot of the current
-    /// interpreter frame state. Returns a snapshot_id that should be
-    /// stored in the guard op's `rd_resume_position`.
-    pub fn capture_resumedata(&mut self, snapshot: Snapshot) -> i32 {
-        let id = self.snapshots.len() as i32;
-        self.snapshots.push(snapshot);
-        id
-    }
-
-    /// Get a snapshot by id.
-    pub fn get_snapshot(&self, id: i32) -> Option<&Snapshot> {
-        if id >= 0 {
-            self.snapshots.get(id as usize)
-        } else {
-            None
-        }
-    }
-
-    /// Access all snapshots.
-    pub fn snapshots(&self) -> &[Snapshot] {
-        &self.snapshots
-    }
-
     /// Close the loop: add a JUMP operation back to the start.
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {
@@ -290,16 +263,24 @@ impl Trace {
     /// Return the completed trace.
     /// The recorder is consumed; no further operations can be recorded.
     ///
+    /// Snapshots (pyre-only Vec<Snapshot> side table) live on `TraceCtx`;
+    /// callers that need them assemble via `TreeLoop::with_snapshots`
+    /// directly — see `TraceCtx::into_tree_loop`.
     pub fn get_trace(self) -> TreeLoop {
-        TreeLoop::with_snapshots(self.inputargs, self.ops, self.snapshots)
+        TreeLoop::new(self.inputargs, self.ops)
     }
 
+    /// opencoder.py:567-568 `cut_point()` — the recorder's local slice of
+    /// the 5-tuple. `snapshot_data_len` / `snapshot_array_data_len` come
+    /// from `TraceCtx` (which owns the pyre-only Vec<Snapshot> side
+    /// table); callers should use `TraceCtx::get_trace_position` for a
+    /// fully-populated position.
     pub fn get_position(&self) -> TracePosition {
         TracePosition {
             _pos: self.ops.len(),
             _count: self.op_count,
             _index: self.box_count,
-            snapshot_data_len: self.snapshots.len(),
+            snapshot_data_len: 0,
             snapshot_array_data_len: 0,
         }
     }
