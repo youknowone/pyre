@@ -137,6 +137,72 @@ fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::
     ]
 }
 
+fn residual_call_graph_shape(
+    flavor: CallFlavor,
+    fn_idx: u16,
+    call_values: &[super::flow::FlowValue],
+    reskind: ResKind,
+) -> (String, Vec<super::flow::SpaceOperationArg>) {
+    let mut ints = Vec::new();
+    let mut refs = Vec::new();
+    let mut floats = Vec::new();
+    let mut arg_kinds = Vec::with_capacity(call_values.len());
+    for value in call_values {
+        let kind = flow_value_kind(value);
+        arg_kinds.push(kind);
+        match kind {
+            Kind::Int => ints.push(value.clone()),
+            Kind::Ref => refs.push(value.clone()),
+            Kind::Float => floats.push(value.clone()),
+        }
+    }
+
+    let kinds: &str = if !floats.is_empty() || reskind == ResKind::Float {
+        "irf"
+    } else if !ints.is_empty() {
+        "ir"
+    } else {
+        "r"
+    };
+    let opname = format!("residual_call_{kinds}_{}", reskind.as_char());
+    let mut args = Vec::with_capacity(5);
+    args.push(super::flow::Constant::signed(fn_idx as i64).into());
+    if kinds.contains('i') {
+        args.push(super::flow::FlowListOfKind::new(Kind::Int, ints).into());
+    }
+    if kinds.contains('r') {
+        args.push(super::flow::FlowListOfKind::new(Kind::Ref, refs).into());
+    }
+    if kinds.contains('f') {
+        args.push(super::flow::FlowListOfKind::new(Kind::Float, floats).into());
+    }
+    args.push(
+        DescrOperand::CallDescrStub(super::flatten::CallDescrStub { flavor, arg_kinds }).into(),
+    );
+    (opname, args)
+}
+
+fn record_graph_residual_call(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    flavor: CallFlavor,
+    fn_idx: u16,
+    call_values: &[super::flow::FlowValue],
+    reskind: ResKind,
+    offset: i64,
+) -> Option<super::flow::FlowValue> {
+    let (opname, args) = residual_call_graph_shape(flavor, fn_idx, call_values, reskind);
+    match reskind.to_kind() {
+        Some(result_kind) => {
+            Some(emit_graph_op_with_result(graph, block, opname, args, result_kind, offset).into())
+        }
+        None => {
+            emit_graph_op_void(block, opname, args, offset);
+            None
+        }
+    }
+}
+
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
     next_instr: usize,
@@ -772,12 +838,12 @@ fn explicit_raise_exception_pair(
     raised_value: super::flow::FlowValue,
     offset: i64,
 ) -> (super::flow::FlowValue, super::flow::FlowValue) {
-    let exc_type = graph.fresh_variable(Kind::Ref);
-    record_graph_op(
+    let exc_type = emit_graph_op_with_result(
+        graph,
         block,
         "type",
         vec![raised_value.clone().into()],
-        Some(exc_type.into()),
+        Kind::Ref,
         offset,
     );
     (exc_type.into(), raised_value)
@@ -1046,6 +1112,32 @@ fn fresh_ref_value(graph: &mut super::flow::FunctionGraph) -> super::flow::FlowV
     graph.fresh_variable(Kind::Ref).into()
 }
 
+fn null_stack_sentinel() -> super::flow::FlowValue {
+    // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker is a
+    // frontend-only calling-convention sentinel, not a user-visible
+    // Python object and not an RPython flow-graph value.  Keep it out of
+    // graph operations and use it only to preserve the shadow stack's
+    // arity until CALL discards the slot.
+    super::flow::Constant::opaque("push_null", Some(Kind::Ref)).into()
+}
+
+fn duplicate_shadow_tos(
+    graph: &mut super::flow::FunctionGraph,
+    state: &mut FrameState,
+) -> super::flow::FlowValue {
+    // CPython/PyPy stack DUP/COPY semantics preserve the exact top-of-stack
+    // value identity.  When the walker's shadow stack is temporarily out of
+    // sync, fall back to a fresh Ref variable instead of panicking so the
+    // compile can continue, but keep the normal path as a clone of TOS.
+    let duplicated = state
+        .stack
+        .last()
+        .cloned()
+        .unwrap_or_else(|| fresh_ref_value(graph));
+    state.stack.push(duplicated.clone());
+    duplicated
+}
+
 /// Step 6 transitional dual-write.  `rpython/jit/codewriter/codewriter.py:44-67`
 /// runs `perform_register_allocation(graph) → flatten_graph(graph) →
 /// compute_liveness(ssarepr) → assemble(ssarepr)`.  Upstream has **one**
@@ -1072,6 +1164,323 @@ fn record_graph_op(
     let op = super::flow::SpaceOperation::new(opname, args, result, offset);
     super::flow::push_op(block, op.clone());
     op
+}
+
+/// Emit a void-result `SpaceOperation` into `block` and return it.
+/// Matches the call-marker / control-flow emission path in
+/// `rpython/jit/codewriter/jtransform.py:1690-1723` where markers like
+/// `jit_merge_point` and `loop_header` are produced with no `result`
+/// and immediately fed into `GraphFlattener.emit_space_operation`.
+///
+/// Phase 1 walker-rewrite entrypoint (Task #224): the void counterpart
+/// of `emit_graph_op_with_result`.  Callers that need the recorded
+/// `SpaceOperation` (e.g. to immediately flatten it into the SSARepr via
+/// `GraphFlattener::emit_space_operation`) use the returned value; callers
+/// that only need the side-effect can ignore it.
+fn emit_graph_op_void(
+    block: &super::flow::BlockRef,
+    opname: impl Into<String>,
+    args: Vec<super::flow::SpaceOperationArg>,
+    offset: i64,
+) -> super::flow::SpaceOperation {
+    record_graph_op(block, opname, args, None, offset)
+}
+
+/// Emit a value-producing `SpaceOperation` into `block`, allocating a
+/// fresh `Variable` of `result_kind` to hold the result.  Mirrors the
+/// upstream pattern in `rpython/flowspace/flowcontext.py:135-139`:
+///
+/// ```python
+/// w_result = Variable()
+/// spaceop = SpaceOperation(name, args_w, w_result)
+/// self.recorder.append(spaceop)
+/// ```
+///
+/// Phase 1 walker-rewrite entrypoint (Task #224): a single place that
+/// packages the fresh-Variable → `record_graph_op` → return-Variable
+/// pattern so the walker's per-opcode handlers can record
+/// value-producing graph operations without inlining `graph.fresh_variable`
+/// + `record_graph_op` at every call site.  Future sessions migrate
+/// individual emit sites to call this helper instead of emitting directly
+/// to `SSARepr`; when every value-producing op records through this path
+/// the production pipeline can flip to `flatten_graph(graph, ...)` per
+/// `codewriter.py:44-67`.
+fn emit_graph_op_with_result(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    opname: impl Into<String>,
+    args: Vec<super::flow::SpaceOperationArg>,
+    result_kind: Kind,
+    offset: i64,
+) -> super::flow::Variable {
+    let result = graph.fresh_variable(result_kind);
+    record_graph_op(block, opname, args, Some(result.into()), offset);
+    result
+}
+
+fn emit_frontend_neg(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    operand: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py:192 + unaryoperation(): UNARY_NEGATIVE records
+    // `op.neg(w_1).eval(self)` at the frontend graph level.  Keep the
+    // graph semantic here and leave the current helper-call lowering in
+    // SSARepr as a backend adaptation until frontend-lowering lands.
+    emit_graph_op_with_result(graph, block, "neg", vec![operand.into()], Kind::Ref, offset)
+}
+
+fn emit_frontend_newlist(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    items: Vec<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py:1168-1171 BUILD_LIST -> `op.newlist(*items).eval(self)`.
+    // Preserve the frontend semantic op in the graph; the current
+    // build_list helper call remains a pyre backend adaptation only.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "newlist",
+        items.into_iter().map(Into::into).collect(),
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_setitem(
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    key: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::SpaceOperation {
+    // flowcontext.py:1146-1149 STORE_SUBSCR ->
+    // `op.setitem(w_obj, w_subscr, w_newvalue).eval(self)`.
+    emit_graph_op_void(
+        block,
+        "setitem",
+        vec![obj.into(), key.into(), value.into()],
+        offset,
+    )
+}
+
+fn emit_frontend_setattr(
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    attr_name: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::SpaceOperation {
+    // flowcontext.py:1031-1036 STORE_ATTR ->
+    // `op.setattr(w_obj, w_attributename, w_newvalue).eval(self)`.
+    emit_graph_op_void(
+        block,
+        "setattr",
+        vec![obj.into(), attr_name.into(), value.into()],
+        offset,
+    )
+}
+
+fn emit_frontend_getattr(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    attr_name: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py:862-867 LOAD_ATTR ->
+    // `op.getattr(w_obj, w_attributename).eval(self)`.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "getattr",
+        vec![obj.into(), attr_name.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_simple_call(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    callable: super::flow::FlowValue,
+    args: Vec<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::Variable {
+    let mut op_args = Vec::with_capacity(args.len() + 1);
+    op_args.push(callable.into());
+    op_args.extend(args.into_iter().map(Into::into));
+    emit_graph_op_with_result(graph, block, "simple_call", op_args, Kind::Ref, offset)
+}
+
+fn emit_frontend_bool(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    operand: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py:756-763 POP_JUMP_IF_* branches on
+    // `guessbool(op.bool(w_value).eval(self))`. Keep the frontend
+    // `bool` operation in the graph and leave the current `truth_fn`
+    // SSA helper call as a backend adaptation.  pyre represents
+    // `lltype.Bool` in control-flow positions as `Kind::Int`, matching
+    // the existing `goto_if_not` / `goto_if_not_int_is_zero` SSA ops.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "bool",
+        vec![operand.into()],
+        Kind::Int,
+        offset,
+    )
+}
+
+fn binary_opname(op: pyre_interpreter::bytecode::BinaryOperator) -> &'static str {
+    use pyre_interpreter::bytecode::BinaryOperator as B;
+
+    match op {
+        B::Add => "add",
+        B::Subtract => "sub",
+        B::Multiply => "mul",
+        B::FloorDivide => "floordiv",
+        B::Remainder => "mod",
+        B::TrueDivide => "truediv",
+        B::Subscr => "getitem",
+        B::Power => "pow",
+        B::Lshift => "lshift",
+        B::Rshift => "rshift",
+        B::And => "and_",
+        B::Or => "or_",
+        B::Xor => "xor",
+        B::InplaceAdd => "inplace_add",
+        B::InplaceSubtract => "inplace_sub",
+        B::InplaceMultiply => "inplace_mul",
+        B::InplaceFloorDivide => "inplace_floordiv",
+        B::InplaceRemainder => "inplace_mod",
+        B::InplaceTrueDivide => "inplace_truediv",
+        B::InplacePower => "inplace_pow",
+        B::InplaceLshift => "inplace_lshift",
+        B::InplaceRshift => "inplace_rshift",
+        B::InplaceAnd => "inplace_and",
+        B::InplaceOr => "inplace_or",
+        B::InplaceXor => "inplace_xor",
+        other => panic!("unsupported BinaryOperator in frontend graph: {other:?}"),
+    }
+}
+
+fn emit_frontend_binary(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    op: pyre_interpreter::bytecode::BinaryOperator,
+    lhs: super::flow::FlowValue,
+    rhs: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        binary_opname(op),
+        vec![lhs.into(), rhs.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn compare_opname(op: pyre_interpreter::bytecode::ComparisonOperator) -> &'static str {
+    use pyre_interpreter::bytecode::ComparisonOperator as C;
+
+    match op {
+        C::Less => "lt",
+        C::LessOrEqual => "le",
+        C::Equal => "eq",
+        C::NotEqual => "ne",
+        C::Greater => "gt",
+        C::GreaterOrEqual => "ge",
+    }
+}
+
+fn emit_frontend_compare(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    op: pyre_interpreter::bytecode::ComparisonOperator,
+    lhs: super::flow::FlowValue,
+    rhs: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        compare_opname(op),
+        vec![lhs.into(), rhs.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn emit_frontend_cmp_exc_match(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    exception_value: super::flow::FlowValue,
+    match_type: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py:591-598 `cmp_exc_match(w_1, w_2)`.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "cmp_exc_match",
+        vec![exception_value.into(), match_type.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
+fn frontend_constant_flow_value(
+    constant: &pyre_interpreter::bytecode::ConstantData,
+) -> Option<super::flow::FlowValue> {
+    // flowcontext.py:838-843 LOAD_CONST -> `getconstant_w()` and
+    // `pushvalue()` of the actual Constant object. Keep every
+    // representable frontend constant in the shadow graph instead of
+    // degrading immediately to a fresh Variable.
+    match constant {
+        pyre_interpreter::bytecode::ConstantData::None => {
+            Some(super::flow::Constant::none().into())
+        }
+        pyre_interpreter::bytecode::ConstantData::Boolean { value } => {
+            Some(super::flow::Constant::bool(*value).into())
+        }
+        pyre_interpreter::bytecode::ConstantData::Integer { value } => {
+            use num_traits::ToPrimitive;
+            value
+                .to_i64()
+                .map(|value| super::flow::Constant::signed(value).into())
+        }
+        pyre_interpreter::bytecode::ConstantData::Str { value } => Some(
+            super::flow::Constant::string(value.as_str().expect("non-UTF-8 string constant"))
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+fn set_block_bool_exitswitch(block: &super::flow::BlockRef, condition: super::flow::FlowValue) {
+    block.borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(condition));
+}
+
+fn set_last_bool_exitcase(block: &super::flow::BlockRef, branch_taken: bool) {
+    let link = block
+        .borrow()
+        .exits
+        .last()
+        .cloned()
+        .expect("boolean branch must append a Link before setting exitcase");
+    let case: super::flow::FlowValue = super::flow::Constant::bool(branch_taken).into();
+    let mut link_borrow = link.borrow_mut();
+    link_borrow.exitcase = Some(case.clone());
+    link_borrow.llexitcase = Some(case);
 }
 
 fn sync_stack_state(graph: &mut super::flow::FunctionGraph, state: &mut FrameState, depth: u16) {
@@ -2238,6 +2647,7 @@ impl CodeWriter {
         // always coexists with the straight-line successor on
         // `Block.exits`.
         let mut needs_fallthrough: bool = true;
+        let mut pending_bool_fallthrough_case: Option<bool> = None;
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -2698,6 +3108,9 @@ impl CodeWriter {
                         py_pc,
                     )
                 };
+                if let Some(fallthrough_case) = pending_bool_fallthrough_case.take() {
+                    set_last_bool_exitcase(&current_block.block(), fallthrough_case);
+                }
                 current_block = new_block;
                 current_state = current_block
                     .framestate()
@@ -3101,11 +3514,10 @@ impl CodeWriter {
                     let (frame_var, ec_var) = portal_graph_inputvars(code);
                     let graph_args =
                         portal_jit_merge_point_graph_args(&graph, py_pc, w_code as *const ());
-                    let graph_op = record_graph_op(
+                    let graph_op = emit_graph_op_void(
                         &current_block.block(),
                         "jit_merge_point",
                         graph_args,
-                        None,
                         py_pc as i64,
                     );
                     GraphFlattener::new_with_constant_lowering(
@@ -3142,11 +3554,10 @@ impl CodeWriter {
                     .emit_space_operation(&graph_op);
                 } else {
                     // pyre has a single jitdriver (PyPyJitDriver), index 0.
-                    let loop_header_op = record_graph_op(
+                    let loop_header_op = emit_graph_op_void(
                         &current_block.block(),
                         "loop_header",
                         vec![super::flow::Constant::signed(0).into()],
-                        None,
                         py_pc as i64,
                     );
                     GraphFlattener::new(&mut ssarepr, |_variable| {
@@ -3256,9 +3667,22 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    current_state
-                        .stack
-                        .push(super::flow::Constant::signed(val).into());
+                    // Phase 1 walker-rewrite pilot (Task #224): record
+                    // the graph-level residual_call for `box_int(val)`.
+                    // jtransform.py:414-435 rewrite_call treats literal
+                    // operands as `Constant` without routing them through
+                    // a separate SSA slot.
+                    let boxed_int = record_graph_residual_call(
+                        &mut graph,
+                        &current_block.block(),
+                        CallFlavor::Plain,
+                        box_int_fn_idx,
+                        &[super::flow::Constant::signed(val).into()],
+                        ResKind::Ref,
+                        py_pc as i64,
+                    )
+                    .expect("box_int residual_call produces a Ref result");
+                    current_state.stack.push(boxed_int);
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
@@ -3280,22 +3704,11 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    let value = match code.constants.get(idx) {
-                        Some(pyre_interpreter::bytecode::ConstantData::None) => {
-                            super::flow::Constant::none().into()
-                        }
-                        Some(pyre_interpreter::bytecode::ConstantData::Boolean { value }) => {
-                            super::flow::Constant::bool(*value).into()
-                        }
-                        Some(pyre_interpreter::bytecode::ConstantData::Integer { value }) => {
-                            use num_traits::ToPrimitive;
-                            value
-                                .to_i64()
-                                .map(|value| super::flow::Constant::signed(value).into())
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph))
-                        }
-                        _ => fresh_ref_value(&mut graph),
-                    };
+                    let value = code
+                        .constants
+                        .get(idx)
+                        .and_then(frontend_constant_flow_value)
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(value);
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
@@ -3421,10 +3834,29 @@ impl CodeWriter {
                 Instruction::StoreSubscr => {
                     let key_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     emit_ref_copy!(ssarepr, obj_tmp1, key_reg);
+                    let key_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     let obj_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     emit_ref_copy!(ssarepr, obj_tmp0, obj_reg);
+                    let obj_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     emit_ref_copy!(ssarepr, arg_regs_start, value_reg);
+                    let stored_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let _ = emit_frontend_setitem(
+                        &current_block.block(),
+                        obj_value,
+                        key_value,
+                        stored_value,
+                        py_pc as i64,
+                    );
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3443,10 +3875,13 @@ impl CodeWriter {
 
                 Instruction::PopTop => {
                     let _ = emit_popvalue_ref!(ssarepr, current_depth);
-                    // regalloc.py: discard = just decrement depth, no bytecode
+                    let _ = current_state.stack.pop();
+                    // flowcontext.py:891 `self.popvalue()`; regalloc.py:
+                    // discard = just decrement depth, no bytecode.
                 }
 
                 Instruction::PushNull => {
+                    current_state.stack.push(null_stack_sentinel());
                     emit_pushvalue_ref!(ssarepr, current_depth, null_ref_reg);
                 }
 
@@ -3460,14 +3895,31 @@ impl CodeWriter {
                 // lhs/rhs values in fail_args. See
                 // `memory/pyre_trace_temp_reg_tracking_gap_2026_04_19.md`.
                 Instruction::BinaryOp { op } => {
-                    let op_val = binary_op_tag(op.get(op_arg))
+                    let op_kind = op.get(op_arg);
+                    let op_val = binary_op_tag(op_kind)
                         .expect("unsupported binary op tag in jitcode lowering")
                         as u32;
                     // Pop rhs (blackhole will see vsd reflect this pop).
                     let rhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                    let rhs_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     // Pop lhs.
                     let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                    let lhs_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     emit_load_const_i!(ssarepr, op_code_reg, op_val as i64);
+                    let result_value = emit_frontend_binary(
+                        &mut graph,
+                        &current_block.block(),
+                        op_kind,
+                        lhs_value,
+                        rhs_value,
+                        py_pc as i64,
+                    );
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3482,16 +3934,34 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
+                    current_state.stack.push(result_value.into());
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
                 // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
                 Instruction::CompareOp { opname } => {
                     // Same stack-direct pattern as BinaryOp — see its comment.
-                    let op_val = compare_op_tag(opname.get(op_arg)) as u32;
+                    let op_kind = opname.get(op_arg);
+                    let op_val = compare_op_tag(op_kind) as u32;
                     let rhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                    let rhs_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                    let lhs_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     emit_load_const_i!(ssarepr, op_code_reg, op_val as i64);
+                    let result_value = emit_frontend_compare(
+                        &mut graph,
+                        &current_block.block(),
+                        op_kind,
+                        lhs_value,
+                        rhs_value,
+                        py_pc as i64,
+                    );
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3506,6 +3976,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
+                    current_state.stack.push(result_value.into());
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
@@ -3523,6 +3994,17 @@ impl CodeWriter {
                     );
                     let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     emit_ref_copy!(ssarepr, obj_tmp0, value_reg);
+                    let cond_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let bool_value = emit_frontend_bool(
+                        &mut graph,
+                        &current_block.block(),
+                        cond_value,
+                        py_pc as i64,
+                    );
+                    set_block_bool_exitswitch(&current_block.block(), bool_value.into());
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3535,6 +4017,8 @@ impl CodeWriter {
                     );
                     if target_py_pc < num_instrs {
                         emit_goto_if_not!(ssarepr, int_tmp0, target_py_pc);
+                        set_last_bool_exitcase(&current_block.block(), false);
+                        pending_bool_fallthrough_case = Some(true);
                     }
                 }
 
@@ -3553,6 +4037,17 @@ impl CodeWriter {
                     );
                     let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     emit_ref_copy!(ssarepr, obj_tmp0, value_reg);
+                    let cond_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let bool_value = emit_frontend_bool(
+                        &mut graph,
+                        &current_block.block(),
+                        cond_value,
+                        py_pc as i64,
+                    );
+                    set_block_bool_exitswitch(&current_block.block(), bool_value.into());
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3565,6 +4060,8 @@ impl CodeWriter {
                     );
                     if target_py_pc < num_instrs {
                         emit_goto_if_not_int_is_zero!(ssarepr, int_tmp0, target_py_pc);
+                        set_last_bool_exitcase(&current_block.block(), true);
+                        pending_bool_fallthrough_case = Some(false);
                     }
                 }
 
@@ -3603,6 +4100,22 @@ impl CodeWriter {
                 // RPython jtransform.py: rewrite_op_direct_call (residual)
                 Instruction::LoadGlobal { namei } => {
                     let raw_namei = namei.get(op_arg) as usize as i64;
+                    // `flowcontext.py:856-859` resolves globals during
+                    // analysis, so there is no direct codewriter-space
+                    // `SpaceOperation('load_global', ...)` upstream.
+                    // Pyre cannot fold runtime globals at compile time,
+                    // so the frontend keeps this as a pyre-local semantic
+                    // op and the eventual frontend-lowering step will
+                    // rewrite it into the helper/vable sequence the
+                    // backend consumes today.
+                    let result_value = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "load_global",
+                        vec![super::flow::Constant::signed(raw_namei).into()],
+                        Kind::Ref,
+                        py_pc as i64,
+                    );
                     // jtransform.py: getfield_vable_r for w_globals (field 3)
                     // and pycode (field 1) — namespace for lookup, code for names.
                     emit_vable_getfield_ref!(ssarepr, obj_tmp0, VABLE_NAMESPACE_FIELD_IDX);
@@ -3624,8 +4137,10 @@ impl CodeWriter {
                     );
                     // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
                     if raw_namei & 1 != 0 {
+                        current_state.stack.push(null_stack_sentinel());
                         emit_pushvalue_ref!(ssarepr, current_depth, null_ref_reg);
                     }
+                    current_state.stack.push(result_value.into());
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
@@ -3643,13 +4158,28 @@ impl CodeWriter {
                 // Pop in reverse: args, null_or_self, callable.
                 Instruction::Call { argc } => {
                     let nargs = argc.get(op_arg) as usize;
+                    let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                     for i in (0..nargs).rev() {
                         let arg_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         emit_ref_copy!(ssarepr, arg_regs_start + i as u16, arg_reg);
+                        graph_arg_values_rev.push(
+                            current_state
+                                .stack
+                                .pop()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph)),
+                        );
                     }
                     let callable_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     emit_ref_copy!(ssarepr, obj_tmp1, callable_reg);
+                    let callable_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     let _ = emit_popvalue_ref!(ssarepr, current_depth); // NULL (discard)
+                    let _null_or_self = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
 
                     // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
                     // call_fn(callable, arg0, ...) → result
@@ -3666,6 +4196,20 @@ impl CodeWriter {
                     // to the correct arity. Each nargs needs a matching
                     // extern "C" fn with that many i64 parameters.
                     // nargs > 8 → abort_permanent (no matching helper).
+                    let call_result_value = if nargs > 8 {
+                        fresh_ref_value(&mut graph)
+                    } else {
+                        let graph_call_args: Vec<_> =
+                            graph_arg_values_rev.into_iter().rev().collect();
+                        emit_frontend_simple_call(
+                            &mut graph,
+                            &current_block.block(),
+                            callable_value,
+                            graph_call_args,
+                            py_pc as i64,
+                        )
+                        .into()
+                    };
                     if nargs > 8 {
                         emit_abort_permanent!(ssarepr);
                     } else {
@@ -3691,6 +4235,7 @@ impl CodeWriter {
                             Some(obj_tmp0),
                         );
                     }
+                    current_state.stack.push(call_result_value);
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
@@ -3703,7 +4248,20 @@ impl CodeWriter {
                 Instruction::UnaryNegative => {
                     let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     emit_ref_copy!(ssarepr, obj_tmp0, value_reg);
+                    let operand_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let negated = emit_frontend_neg(
+                        &mut graph,
+                        &current_block.block(),
+                        operand_value,
+                        py_pc as i64,
+                    );
                     emit_load_const_i!(ssarepr, int_tmp0, 0);
+                    let subtract_tag =
+                        binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
+                            .expect("subtract must have a jit binary-op tag");
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3714,12 +4272,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp1),
                     );
-                    emit_load_const_i!(
-                        ssarepr,
-                        int_tmp0,
-                        binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
-                            .expect("subtract must have a jit binary-op tag"),
-                    );
+                    emit_load_const_i!(ssarepr, int_tmp0, subtract_tag);
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3734,6 +4287,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
+                    current_state.stack.push(negated.into());
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
@@ -3753,16 +4307,35 @@ impl CodeWriter {
                 // RPython bhimpl_newlist: build list from N items on stack.
                 Instruction::BuildList { count } => {
                     let argc = count.get(op_arg) as usize;
+                    let mut item_values_rev = Vec::with_capacity(argc);
                     for i in (0..argc.min(2)).rev() {
                         let item_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         emit_ref_copy!(ssarepr, arg_regs_start + i as u16, item_reg);
+                        item_values_rev.push(
+                            current_state
+                                .stack
+                                .pop()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph)),
+                        );
                     }
                     // Discard extra items beyond 2 (helper supports 0-2).
                     for _ in 2..argc {
                         let _ = emit_popvalue_ref!(ssarepr, current_depth);
+                        item_values_rev.push(
+                            current_state
+                                .stack
+                                .pop()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph)),
+                        );
                     }
                     // build_list_fn(argc, item0, item1) → list
                     emit_load_const_i!(ssarepr, int_tmp0, argc as i64);
+                    let result_value = emit_frontend_newlist(
+                        &mut graph,
+                        &current_block.block(),
+                        item_values_rev.into_iter().rev().collect(),
+                        py_pc as i64,
+                    );
                     let item0 = if argc >= 1 {
                         majit_metainterp::jitcode::JitCallArg::reference(arg_regs_start)
                     } else {
@@ -3787,6 +4360,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
+                    current_state.stack.push(result_value.into());
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
@@ -3902,12 +4476,29 @@ impl CodeWriter {
                 }
 
                 Instruction::CheckExcMatch => {
+                    // CPython 3.14 CHECK_EXC_MATCH: pop match_type (TOS),
+                    // peek exception (TOS-1), push bool result.
                     let match_type_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                    let _ = current_state.stack.pop();
+                    let match_type = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     emit_ref_copy!(ssarepr, obj_tmp1, match_type_reg); // match type
+                    let exception_value = current_state
+                        .stack
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth - 1); // exception
                     // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
                     emit_load_const_i!(ssarepr, int_tmp0, 10); // isinstance op
+                    let result_value = emit_frontend_cmp_exc_match(
+                        &mut graph,
+                        &current_block.block(),
+                        exception_value,
+                        match_type,
+                        py_pc as i64,
+                    );
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3922,7 +4513,7 @@ impl CodeWriter {
                         ResKind::Ref,
                         Some(obj_tmp0),
                     );
-                    current_state.stack.push(fresh_ref_value(&mut graph));
+                    current_state.stack.push(result_value.into());
                     emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
                 }
 
@@ -3960,13 +4551,7 @@ impl CodeWriter {
                 Instruction::Copy { i } => {
                     let d = i.get(op_arg) as usize;
                     if d == 1 {
-                        current_state.stack.push(
-                            current_state
-                                .stack
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph)),
-                        );
+                        let _ = duplicate_shadow_tos(&mut graph, &mut current_state);
                         emit_pushvalue_ref!(ssarepr, current_depth, stack_base + current_depth - 1);
                     } else {
                         // COPY(d>1): exception handler pattern only.
@@ -3979,18 +4564,61 @@ impl CodeWriter {
                 // Stack-effect-aware abort_permanent for unsupported ops.
                 // current_depth must track interpreter parity so that
                 // subsequent CALL handlers don't underflow.
-                Instruction::LoadName { .. } => {
-                    // PyPy assemble.py: LOAD_NAME has stack effect +1.
+                Instruction::LoadName { namei } => {
+                    // flowcontext.py:859 LOAD_NAME = LOAD_GLOBAL.
+                    // As with LOAD_GLOBAL above, pyre cannot fold the
+                    // module namespace lookup at compile time, so keep a
+                    // pyre-local semantic op in the shadow graph and leave
+                    // backend lowering on the existing abort/helper path.
+                    let name_idx = namei.get(op_arg) as usize as i64;
+                    let result_value = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "load_global",
+                        vec![super::flow::Constant::signed(name_idx).into()],
+                        Kind::Ref,
+                        py_pc as i64,
+                    );
                     emit_abort_permanent!(ssarepr);
+                    current_state.stack.push(result_value.into());
                     current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
-                Instruction::StoreName { .. } => {
-                    // PyPy assemble.py: STORE_NAME has stack effect -1.
+                Instruction::StoreName { .. } | Instruction::StoreGlobal { .. } => {
+                    // flowcontext.py marks STORE_NAME unsupported, but the
+                    // stack effect still consumes one value. STORE_GLOBAL
+                    // follows the same shape in flowcontext.py:884-890.
                     emit_abort_permanent!(ssarepr);
+                    let _ = current_state.stack.pop();
                     current_depth = current_depth.saturating_sub(1);
+                    emit_vsd!(current_depth);
                 }
                 Instruction::MakeFunction { .. } => {
                     // Module-level only: abort_permanent (won't block blackhole).
+                    emit_abort_permanent!(ssarepr);
+                }
+                Instruction::StoreAttr { namei } => {
+                    let name_idx = namei.get(op_arg) as usize;
+                    let attr_name = super::flow::Constant::string(code.names[name_idx].as_str());
+                    current_depth = current_depth.saturating_sub(1);
+                    emit_vsd!(current_depth);
+                    let obj_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    current_depth = current_depth.saturating_sub(1);
+                    emit_vsd!(current_depth);
+                    let stored_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let _ = emit_frontend_setattr(
+                        &current_block.block(),
+                        obj_value,
+                        attr_name.into(),
+                        stored_value,
+                        py_pc as i64,
+                    );
                     emit_abort_permanent!(ssarepr);
                 }
                 Instruction::LoadAttr { namei } => {
@@ -3998,9 +4626,25 @@ impl CodeWriter {
                     // pyre's CPython-3.13 method form pushes an extra
                     // null/self sentinel, so keep current_depth in sync.
                     let attr = namei.get(op_arg);
+                    let name_idx = attr.name_idx() as usize;
+                    let attr_name = super::flow::Constant::string(code.names[name_idx].as_str());
+                    let obj_value = current_state
+                        .stack
+                        .pop()
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let result_value = emit_frontend_getattr(
+                        &mut graph,
+                        &current_block.block(),
+                        obj_value,
+                        attr_name.into(),
+                        py_pc as i64,
+                    );
                     emit_abort_permanent!(ssarepr);
+                    current_state.stack.push(result_value.into());
                     if attr.is_method() {
+                        current_state.stack.push(null_stack_sentinel());
                         current_depth += 1;
+                        emit_vsd!(current_depth);
                     }
                 }
 
@@ -4272,6 +4916,60 @@ impl CodeWriter {
             inputs,
             &cfg_coalesce_pairs,
         );
+        // Phase 1 pilot (Task #224): run graph-based
+        // `perform_graph_register_allocation_all_kinds` in parallel
+        // for instrumentation.  Upstream `codewriter.py:44-46` runs
+        // regalloc on the CFG before flatten emits the SSARepr; pyre
+        // still drives regalloc off the SSARepr, but we expect the
+        // graph-based allocator to produce a strict lower bound on
+        // the per-kind color count because the graph does not track
+        // intra-block `*_copy` temporaries (see
+        // `perform_graph_register_allocation` docstring).  A breach of
+        // `graph_num_colors <= ssa num_regs` would mean the walker
+        // emitted graph Variables that have no SSARepr backing — a
+        // Phase 1 invariant violation worth catching early.
+        // Phase 1 pilot probe: `cfg(debug_assertions)` always runs the
+        // graph allocator and asserts the lower-bound invariant; release
+        // builds skip it unless `PYRE_PHASE1_REGALLOC_LOG` is set, which
+        // also enables a one-line per-JitCode log:
+        //   `[phase1-regalloc] <obj_name> int=<g>/<s> ref=<g>/<s> float=<g>/<s>`
+        // (`<graph>/<ssa>`).  Quantifies how close the shadow graph is
+        // to the SSArepr population before flipping the pipeline
+        // (Task #227).  When the env var is unset and assertions are
+        // off the graph allocator is not invoked at all (zero cost).
+        let log_enabled = std::env::var_os("PYRE_PHASE1_REGALLOC_LOG").is_some();
+        if cfg!(debug_assertions) || log_enabled {
+            let graph_regallocs =
+                super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+            let mut log_line = String::new();
+            for &kind in super::flatten::Kind::ALL.iter() {
+                let graph_num = graph_regallocs
+                    .get(&kind)
+                    .map(|r| r.num_colors)
+                    .unwrap_or(0);
+                let ssa_num = alloc_result.num_regs.get(&kind).copied().unwrap_or(0);
+                debug_assert!(
+                    graph_num <= ssa_num,
+                    "Phase 1 parallel regalloc: graph num_colors ({}) \
+                     exceeds ssarepr num_regs ({}) for {:?}",
+                    graph_num,
+                    ssa_num,
+                    kind,
+                );
+                if log_enabled {
+                    let kind_tag = match kind {
+                        super::flatten::Kind::Int => "int",
+                        super::flatten::Kind::Ref => "ref",
+                        super::flatten::Kind::Float => "float",
+                    };
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut log_line, " {kind_tag}={graph_num}/{ssa_num}");
+                }
+            }
+            if log_enabled {
+                eprintln!("[phase1-regalloc] {}{}", code.obj_name, log_line);
+            }
+        }
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
@@ -4872,6 +5570,373 @@ mod tests {
         assert_eq!(op.offset, 123);
         assert_eq!(op.args, vec![SpaceOperationArg::from(raised_value)]);
         assert_eq!(op.result, Some(new_type.into()));
+    }
+
+    #[test]
+    fn record_graph_residual_call_uses_upstream_call_shape() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("graph_call", start.clone(), None);
+        let arg_ref = graph.fresh_variable(Kind::Ref);
+        let arg_int = graph.fresh_variable(Kind::Int);
+
+        let result = record_graph_residual_call(
+            &mut graph,
+            &start,
+            CallFlavor::MayForce,
+            17,
+            &[arg_ref.into(), arg_int.into()],
+            ResKind::Ref,
+            42,
+        )
+        .expect("ref residual_call should return graph result");
+
+        let FlowValue::Variable(result_var) = result else {
+            panic!("graph residual_call result must be a Variable");
+        };
+        assert_eq!(result_var.kind, Some(Kind::Ref));
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("graph residual_call should record one SpaceOperation");
+        assert_eq!(op.opname, "residual_call_ir_r");
+        assert_eq!(op.offset, 42);
+        assert_eq!(op.result, Some(result_var.into()));
+        assert!(matches!(
+            op.args.as_slice(),
+            [
+                SpaceOperationArg::Value(FlowValue::Constant(Constant {
+                    value: crate::jit::flow::ConstantValue::Signed(17),
+                    ..
+                })),
+                SpaceOperationArg::ListOfKind(ints),
+                SpaceOperationArg::ListOfKind(refs),
+                SpaceOperationArg::Descr(_),
+            ] if ints.kind == Kind::Int
+                && ints.content == vec![arg_int.into()]
+                && refs.kind == Kind::Ref
+                && refs.content == vec![arg_ref.into()]
+        ));
+    }
+
+    #[test]
+    fn null_stack_sentinel_is_opaque_ref_constant() {
+        let value = null_stack_sentinel();
+        let FlowValue::Constant(constant) = value else {
+            panic!("null stack sentinel must be a Constant");
+        };
+        assert_eq!(constant.kind, Some(Kind::Ref));
+        assert!(matches!(
+            constant.value,
+            crate::jit::flow::ConstantValue::Opaque(_)
+        ));
+    }
+
+    #[test]
+    fn duplicate_shadow_tos_clones_existing_top_value() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("dup_shadow_tos", start, None);
+        let top = Variable::new(VariableId(9), Kind::Ref);
+        let mut state = FrameState::new(Vec::new(), vec![top.into()], None, Vec::new(), 0);
+
+        let duplicated = duplicate_shadow_tos(&mut graph, &mut state);
+
+        assert_eq!(duplicated, top.into());
+        assert_eq!(state.stack, vec![top.into(), top.into()]);
+    }
+
+    #[test]
+    fn duplicate_shadow_tos_falls_back_to_fresh_ref_when_stack_is_empty() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("dup_shadow_tos_empty", start, None);
+        let mut state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
+
+        let duplicated = duplicate_shadow_tos(&mut graph, &mut state);
+
+        let FlowValue::Variable(variable) = duplicated else {
+            panic!("empty-stack duplication fallback must synthesize a Variable");
+        };
+        assert_eq!(variable.kind, Some(Kind::Ref));
+        assert_eq!(state.stack, vec![duplicated]);
+    }
+
+    #[test]
+    fn emit_frontend_neg_records_flowspace_style_unary_op() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("neg", start.clone(), None);
+        let operand = Variable::new(VariableId(12), Kind::Ref);
+
+        let result = emit_frontend_neg(&mut graph, &start, operand.into(), 33);
+
+        let block = start.borrow();
+        let op = block.operations.last().expect("neg op should be recorded");
+        assert_eq!(op.opname, "neg");
+        assert_eq!(op.offset, 33);
+        assert_eq!(op.args, vec![operand.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_newlist_records_all_items() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("newlist", start.clone(), None);
+        let item0 = Variable::new(VariableId(20), Kind::Ref);
+        let item1 = Constant::signed(7);
+        let item2 = Variable::new(VariableId(21), Kind::Ref);
+
+        let result = emit_frontend_newlist(
+            &mut graph,
+            &start,
+            vec![item0.into(), item1.clone().into(), item2.into()],
+            44,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("newlist op should be recorded");
+        assert_eq!(op.opname, "newlist");
+        assert_eq!(op.offset, 44);
+        assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_setitem_records_flowspace_style_store_subscr() {
+        let start = Block::shared(Vec::new());
+        let obj = Variable::new(VariableId(30), Kind::Ref);
+        let key = Constant::signed(2);
+        let value = Variable::new(VariableId(31), Kind::Ref);
+
+        let op = emit_frontend_setitem(&start, obj.into(), key.clone().into(), value.into(), 55);
+
+        assert_eq!(op.opname, "setitem");
+        assert_eq!(op.offset, 55);
+        assert_eq!(op.args, vec![obj.into(), key.into(), value.into()]);
+        assert_eq!(op.result, None);
+    }
+
+    #[test]
+    fn emit_frontend_setattr_records_flowspace_style_store_attr() {
+        let start = Block::shared(Vec::new());
+        let obj = Variable::new(VariableId(32), Kind::Ref);
+        let name = Constant::string("field");
+        let value = Variable::new(VariableId(33), Kind::Ref);
+
+        let op = emit_frontend_setattr(&start, obj.into(), name.clone().into(), value.into(), 56);
+
+        assert_eq!(op.opname, "setattr");
+        assert_eq!(op.offset, 56);
+        assert_eq!(op.args, vec![obj.into(), name.into(), value.into()]);
+        assert_eq!(op.result, None);
+    }
+
+    #[test]
+    fn emit_frontend_getattr_records_flowspace_style_load_attr() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("getattr", start.clone(), None);
+        let obj = Variable::new(VariableId(34), Kind::Ref);
+        let name = Constant::string("field");
+
+        let result = emit_frontend_getattr(&mut graph, &start, obj.into(), name.clone().into(), 57);
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("getattr op should be recorded");
+        assert_eq!(op.opname, "getattr");
+        assert_eq!(op.offset, 57);
+        assert_eq!(op.args, vec![obj.into(), name.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_binary_uses_flowspace_operator_name() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("binary", start.clone(), None);
+        let lhs = Variable::new(VariableId(40), Kind::Ref);
+        let rhs = Variable::new(VariableId(41), Kind::Ref);
+
+        let result = emit_frontend_binary(
+            &mut graph,
+            &start,
+            pyre_interpreter::bytecode::BinaryOperator::InplaceAdd,
+            lhs.into(),
+            rhs.into(),
+            66,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("binary op should be recorded");
+        assert_eq!(op.opname, "inplace_add");
+        assert_eq!(op.offset, 66);
+        assert_eq!(op.args, vec![lhs.into(), rhs.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_compare_uses_flowspace_compare_name() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("compare", start.clone(), None);
+        let lhs = Variable::new(VariableId(50), Kind::Ref);
+        let rhs = Variable::new(VariableId(51), Kind::Ref);
+
+        let result = emit_frontend_compare(
+            &mut graph,
+            &start,
+            pyre_interpreter::bytecode::ComparisonOperator::LessOrEqual,
+            lhs.into(),
+            rhs.into(),
+            77,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("compare op should be recorded");
+        assert_eq!(op.opname, "le");
+        assert_eq!(op.offset, 77);
+        assert_eq!(op.args, vec![lhs.into(), rhs.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_bool_records_flowspace_truth_op() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("bool", start.clone(), None);
+        let operand = Variable::new(VariableId(52), Kind::Ref);
+
+        let result = emit_frontend_bool(&mut graph, &start, operand.into(), 78);
+
+        assert_eq!(result.kind, Some(Kind::Int));
+        let block = start.borrow();
+        let op = block.operations.last().expect("bool op should be recorded");
+        assert_eq!(op.opname, "bool");
+        assert_eq!(op.offset, 78);
+        assert_eq!(op.args, vec![operand.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn set_block_bool_exitswitch_records_condition_value() {
+        let start = Block::shared(Vec::new());
+        let cond = Variable::new(VariableId(53), Kind::Int);
+
+        set_block_bool_exitswitch(&start, cond.into());
+
+        assert_eq!(
+            start.borrow().exitswitch,
+            Some(ExitSwitch::Value(cond.into()))
+        );
+    }
+
+    #[test]
+    fn set_last_bool_exitcase_updates_latest_link() {
+        let start = Block::shared(Vec::new());
+        let target = Block::shared(Vec::new());
+        let link = Link::new(Vec::new(), Some(target), None).into_ref();
+        start.closeblock(vec![link.clone()]);
+
+        set_last_bool_exitcase(&start, true);
+
+        let link_borrow = link.borrow();
+        assert_eq!(link_borrow.exitcase, Some(Constant::bool(true).into()));
+        assert_eq!(link_borrow.llexitcase, Some(Constant::bool(true).into()));
+    }
+
+    #[test]
+    fn frontend_constant_flow_value_preserves_string_constants() {
+        let constant = ConstantData::Str {
+            value: "hello".to_owned().into(),
+        };
+
+        let value = frontend_constant_flow_value(&constant);
+
+        assert_eq!(value, Some(Constant::string("hello").into()));
+    }
+
+    #[test]
+    fn emit_frontend_simple_call_records_callable_then_args() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("simple_call", start.clone(), None);
+        let callable = Variable::new(VariableId(60), Kind::Ref);
+        let arg0 = Variable::new(VariableId(61), Kind::Ref);
+        let arg1 = Constant::signed(9);
+
+        let result = emit_frontend_simple_call(
+            &mut graph,
+            &start,
+            callable.into(),
+            vec![arg0.into(), arg1.clone().into()],
+            88,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("simple_call op should be recorded");
+        assert_eq!(op.opname, "simple_call");
+        assert_eq!(op.offset, 88);
+        assert_eq!(op.args, vec![callable.into(), arg0.into(), arg1.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_cmp_exc_match_uses_flowspace_name() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("cmp_exc_match", start.clone(), None);
+        let exception_value = Variable::new(VariableId(70), Kind::Ref);
+        let match_type = Variable::new(VariableId(71), Kind::Ref);
+
+        let result = emit_frontend_cmp_exc_match(
+            &mut graph,
+            &start,
+            exception_value.into(),
+            match_type.into(),
+            99,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("cmp_exc_match op should be recorded");
+        assert_eq!(op.opname, "cmp_exc_match");
+        assert_eq!(op.offset, 99);
+        assert_eq!(op.args, vec![exception_value.into(), match_type.into()]);
+        assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_graph_op_with_result_records_load_global_frontend_op() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("load_global", start.clone(), None);
+        let result = emit_graph_op_with_result(
+            &mut graph,
+            &start,
+            "load_global",
+            vec![Constant::signed(5).into()],
+            Kind::Ref,
+            77,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("load_global op should be recorded");
+        assert_eq!(op.opname, "load_global");
+        assert_eq!(op.offset, 77);
+        assert_eq!(op.args, vec![Constant::signed(5).into()]);
+        assert_eq!(op.result, Some(result.into()));
     }
 
     fn identity_arg_positions(count: usize) -> Vec<LinkArgPosition> {

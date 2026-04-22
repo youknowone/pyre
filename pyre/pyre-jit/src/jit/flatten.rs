@@ -802,6 +802,31 @@ where
             }
             return;
         }
+        if exits.len() == 2 {
+            let Some(exitswitch) = block.borrow().exitswitch.clone() else {
+                panic!("flatten_graph: 2-exit block missing exitswitch");
+            };
+            let mut linkfalse = exits[0].clone();
+            let mut linktrue = exits[1].clone();
+            if linkfalse.borrow().llexitcase == Some(Constant::bool(true).into()) {
+                std::mem::swap(&mut linkfalse, &mut linktrue);
+            }
+            let opargs = match exitswitch {
+                super::flow::ExitSwitch::Value(value) => {
+                    vec![self.flatten_value(&value), self.tlabel_for_link(&linkfalse)]
+                }
+                super::flow::ExitSwitch::Tuple(_) => {
+                    panic!("flatten_graph: tuple exitswitch not wired yet")
+                }
+            };
+            self.emitline(Insn::live(Vec::new()));
+            self.emitline(Insn::op("goto_if_not", opargs));
+            self.make_link(&linktrue, handling_ovf);
+            let false_label = self.label_for_link(&linkfalse);
+            self.emitline(false_label);
+            self.make_link(&linkfalse, handling_ovf);
+            return;
+        }
         panic!(
             "flatten_graph: unsupported exits shape for block with {} exits",
             exits.len()
@@ -958,17 +983,10 @@ where
                     .collect(),
             )),
             // `flatten.py:365-367` passes AbstractDescr through
-            // unchanged.  pyre's `DescrOperand` is a closed enum over
-            // specific descr flavors (Bh/SwitchDict/ResidualCall/…)
-            // rather than a transparent wrapper; picking the correct
-            // variant requires per-opname semantic context that the
-            // generic flatten path does not carry.  No graph-emitted
-            // op currently ships a Descr arg — add the per-opname
-            // mapping here alongside the first such producer.
-            SpaceOperationArg::Descr(_) => panic!(
-                "GraphFlattener: lowering SpaceOperationArg::Descr requires \
-                 per-opname DescrOperand mapping; no production consumer yet"
-            ),
+            // unchanged. `flow::SpaceOperationArg::Descr` already carries
+            // the closed-world SSA-side `DescrOperand`, so flattening is
+            // the direct identity-preserving `Operand::Descr` wrap.
+            SpaceOperationArg::Descr(descr) => Operand::descr_rc(Rc::clone(&descr.0)),
             // `flatten.py:365-367` also passes IndirectCallTargets
             // through unchanged.  `Operand::IndirectCallTargets` takes a
             // value, so clone the inner (the `Vec<Arc<JitCode>>` clone
@@ -1397,6 +1415,58 @@ mod tests {
     }
 
     #[test]
+    fn flatten_graph_emits_boolean_branch_exits() {
+        use crate::jit::flow::{Block, Constant, ExitSwitch, FunctionGraph, Link};
+
+        let cond = Variable::new(VariableId(0), Kind::Int);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![cond.into()]);
+        let mut graph = FunctionGraph::new("bool_branch", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(cond.into()));
+        let false_link = Link::new(
+            vec![Constant::signed(0).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::bool(false).into()),
+        )
+        .with_llexitcase(Constant::bool(false).into())
+        .into_ref();
+        let true_link = Link::new(
+            vec![Constant::signed(1).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::bool(true).into()),
+        )
+        .with_llexitcase(Constant::bool(true).into())
+        .into_ref();
+        start.closeblock(vec![false_link, true_link]);
+
+        let mut ssarepr = SSARepr::new("bool_branch");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        assert!(ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "goto_if_not"
+                        && matches!(
+                            args.as_slice(),
+                            [Operand::Register(Register { kind: Kind::Int, index: 0 }), Operand::TLabel(_)]
+                        )
+            )
+        }));
+        assert!(ssarepr.insns.iter().any(|insn| {
+            matches!(insn, Insn::Op { opname, args, .. }
+                if opname == "int_return"
+                    && matches!(args.as_slice(), [Operand::ConstInt(0)] | [Operand::ConstInt(1)]))
+        }));
+    }
+
+    #[test]
     fn graph_flattener_emits_generic_result_op() {
         let src = Variable::new(VariableId(0), Kind::Ref);
         let dst = Variable::new(VariableId(1), Kind::Ref);
@@ -1428,6 +1498,47 @@ mod tests {
                     })]
                 ));
                 assert_eq!(*result, Register::new(Kind::Ref, 1));
+            }
+            other => panic!("unexpected insns: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_flattener_passes_descr_args_through_by_identity() {
+        let int_arg = Variable::new(VariableId(0), Kind::Int);
+        let ref_arg = Variable::new(VariableId(1), Kind::Ref);
+        let dst = Variable::new(VariableId(2), Kind::Ref);
+        let descr = Rc::new(DescrOperand::CallDescrStub(CallDescrStub {
+            flavor: CallFlavor::MayForce,
+            arg_kinds: vec![Kind::Ref, Kind::Int],
+        }));
+        let op = SpaceOperation::new(
+            "residual_call_ir_r",
+            vec![
+                Constant::signed(17).into(),
+                crate::jit::flow::FlowListOfKind::new(Kind::Int, vec![int_arg.into()]).into(),
+                crate::jit::flow::FlowListOfKind::new(Kind::Ref, vec![ref_arg.into()]).into(),
+                descr.clone().into(),
+            ],
+            Some(dst.into()),
+            29,
+        );
+        let mut ssarepr = SSARepr::new("descr_passthrough");
+        let mut flattener = GraphFlattener::new(&mut ssarepr, |variable| {
+            Register::new(
+                variable.kind.expect("test variable kind"),
+                variable.id.0 as u16,
+            )
+        });
+
+        flattener.emit_space_operation(&op);
+
+        match &ssarepr.insns[..] {
+            [Insn::Op { args, .. }] => {
+                let Operand::Descr(emitted) = &args[3] else {
+                    panic!("expected descr operand, got {:?}", args[3]);
+                };
+                assert!(Rc::ptr_eq(emitted, &descr));
             }
             other => panic!("unexpected insns: {other:?}"),
         }
