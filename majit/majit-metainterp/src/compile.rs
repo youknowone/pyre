@@ -2122,11 +2122,18 @@ pub fn compile_tmp_callback(
     backend: &mut dyn Backend,
     jitdriver_sd: &crate::jitdriver::JitDriverStaticData,
     token_number: u64,
+    green_key: u64,
     greenboxes: &[Value],
     red_arg_types: &[Type],
 ) -> Result<Arc<JitCellToken>, BackendError> {
     // `compile.py:1107` `jitcell_token = make_jitcell_token(jitdriver_sd)`.
+    // Pyre adaptation: the token carries `green_key` (enabling cell lookup
+    // on later CALL_ASSEMBLER) and `virtualizable_arg_index` (cached from
+    // `jitdriver_sd.index_of_virtualizable`, matching the fields populated
+    // on real-loop tokens at `compile_loop`).
     let mut jitcell_token = JitCellToken::new(token_number);
+    jitcell_token.green_key = green_key;
+    jitcell_token.virtualizable_arg_index = jitdriver_sd.virtualizable_arg_index();
     //
     // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
     // marker.  PRE-EXISTING-ADAPTATION: `rpython/rlib/jit.py`'s `jl`

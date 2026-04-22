@@ -712,6 +712,34 @@ impl WarmEnterState {
         self.cells.get(&green_key_hash)
     }
 
+    /// `rpython/jit/metainterp/warmstate.py:714-723` `get_assembler_token`.
+    ///
+    /// Returns the cell's existing procedure token, or — if none exists —
+    /// builds a temporary one via `make_token` (caller wires
+    /// `compile_tmp_callback`) and installs it on the cell with
+    /// `tmp=true`.  The closure-based signature is a Rust adaptation so
+    /// the caller can provide the `&mut Backend` / `&JitDriverStaticData`
+    /// / `greenboxes` bundle without threading them through WarmEnterState.
+    pub fn get_assembler_token<E, F>(
+        &mut self,
+        green_key_hash: u64,
+        make_token: F,
+    ) -> Result<Arc<JitCellToken>, E>
+    where
+        F: FnOnce() -> Result<Arc<JitCellToken>, E>,
+    {
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(BaseJitCell::new);
+        if let Some(token) = cell.get_procedure_token() {
+            return Ok(token.clone());
+        }
+        let token = make_token()?;
+        cell.set_procedure_token(token.clone(), true);
+        Ok(token)
+    }
+
     /// Log a successful trace compilation. No-op if Logger is disabled.
     pub fn log_compile(
         &mut self,

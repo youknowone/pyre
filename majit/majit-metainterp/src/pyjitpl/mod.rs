@@ -9786,7 +9786,12 @@ impl<M: Clone> MetaInterp<M> {
         targetjitdriver_sd: usize,
     ) -> (Option<OpRef>, Option<OpRef>) {
         // pyjitpl.py:3593 num_green_args = targetjitdriver_sd.num_green_args
-        let target_sd = match self.staticdata.jitdrivers_sd.get(targetjitdriver_sd) {
+        let target_sd = match self
+            .staticdata
+            .jitdrivers_sd
+            .get(targetjitdriver_sd)
+            .cloned()
+        {
             Some(sd) => sd,
             None => return (None, None),
         };
@@ -9804,25 +9809,60 @@ impl<M: Clone> MetaInterp<M> {
             "pyjitpl.py:3596 — direct_assembler_call args.len() must match num_red_args",
         );
         // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs)
+        let arg_types: Vec<Type> = args
+            .iter()
+            .map(|(kind, _, _)| match kind {
+                crate::jitcode::JitArgKind::Int => Type::Int,
+                crate::jitcode::JitArgKind::Ref => Type::Ref,
+                crate::jitcode::JitArgKind::Float => Type::Float,
+            })
+            .collect();
         let green_values: Vec<i64> = greenargs.iter().map(|(_, _, value)| *value).collect();
         let green_key = crate::green_key_hash(&green_values);
-        // pyjitpl.py:3605-3608 — `jd.index_of_virtualizable >= 0` decides
-        // whether a vablebox is returned.  The token-derived path keeps
-        // its embedded index for backwards compatibility with tokens
-        // whose driver_sd `index_of_virtualizable` slot wasn't populated
-        // at codewriter setup; the pending-token branch reads the field
-        // directly per upstream parity.
         let (target_token, vable_index) = if let Some(token) = self.get_loop_token(green_key) {
             (token.number, token.virtualizable_arg_index)
-        } else if let Some(token_number) = self.get_pending_token_number(green_key) {
-            let idx = if target_sd.index_of_virtualizable >= 0 {
-                Some(target_sd.index_of_virtualizable as usize)
-            } else {
-                None
-            };
-            (token_number, idx)
         } else {
-            return (None, None);
+            // warmstate.py:714-723 — cell has no procedure_token yet, so
+            // synthesise one via `compile_tmp_callback`.  Reuses the
+            // already-allocated pending token number when available so
+            // the backend's pending-target registry stays consistent.
+            let greenboxes: Vec<Value> = greenargs
+                .iter()
+                .map(|(kind, _, value)| match kind {
+                    crate::jitcode::JitArgKind::Int => Value::Int(*value),
+                    crate::jitcode::JitArgKind::Ref => Value::Ref(GcRef(*value as usize)),
+                    crate::jitcode::JitArgKind::Float => {
+                        Value::Float(f64::from_bits(*value as u64))
+                    }
+                })
+                .collect();
+            let token_number = self
+                .get_pending_token_number(green_key)
+                .unwrap_or_else(|| self.warm_state.alloc_token_number());
+            let token = {
+                let backend = &mut self.backend;
+                match self.warm_state.get_assembler_token(green_key, || {
+                    compile::compile_tmp_callback(
+                        backend,
+                        &target_sd,
+                        token_number,
+                        green_key,
+                        &greenboxes,
+                        &arg_types,
+                    )
+                }) {
+                    Ok(token) => token,
+                    Err(err) => {
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][call_assembler] compile_tmp_callback failed for key={green_key}: {err:?}"
+                            );
+                        }
+                        return (None, None);
+                    }
+                }
+            };
+            (token.number, token.virtualizable_arg_index)
         };
         // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
         let opnum = match descr_view.result_type() {
@@ -9833,14 +9873,6 @@ impl<M: Clone> MetaInterp<M> {
         };
         // pyjitpl.py:3602 op = self.history.record_nospec(opnum, args, valueconst, descr=token)
         let opref_args: Vec<OpRef> = args.iter().map(|(_, opref, _)| *opref).collect();
-        let arg_types: Vec<Type> = args
-            .iter()
-            .map(|(kind, _, _)| match kind {
-                crate::jitcode::JitArgKind::Int => Type::Int,
-                crate::jitcode::JitArgKind::Ref => Type::Ref,
-                crate::jitcode::JitArgKind::Float => Type::Float,
-            })
-            .collect();
         let op_ref = {
             let ctx = match self.tracing.as_mut() {
                 Some(ctx) => ctx,
@@ -14119,6 +14151,87 @@ mod tests {
             .and_then(|descr| descr.as_call_descr())
             .expect("call descr");
         assert_eq!(call_descr.call_target_token(), Some(4242));
+    }
+
+    #[test]
+    fn direct_assembler_call_installs_temp_callback_token_on_cell() {
+        // warmstate.py:714-723 `get_assembler_token` parity: when the
+        // target green key has no existing procedure_token,
+        // `direct_assembler_call` must synthesise one via
+        // `compile_tmp_callback` and install it on the cell with
+        // `tmp=true`.
+        extern "C" fn dummy_portal_runner() -> i64 {
+            0
+        }
+
+        let mut meta = MetaInterp::<()>::new(10);
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
+            let mut jd =
+                JitDriverStaticData::new(vec![("code", Type::Int)], vec![("frame", Type::Int)]);
+            jd.result_type = Type::Int;
+            jd.portal_runner_adr = dummy_portal_runner as *const () as usize as i64;
+            staticdata.jitdrivers_sd.push(jd);
+            staticdata.finish_setup_descrs_for_jitdrivers(&mut meta.backend);
+        }
+
+        let action = meta.force_start_tracing(888, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let frame_box = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(1234)
+        };
+        let green_box = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(55)
+        };
+        let func_box = {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.const_int(9999)
+        };
+        let descr = make_call_descr(vec![Type::Int, Type::Int], Type::Int);
+
+        let green_key = crate::green_key_hash(&[55]);
+        let (_vablebox, resbox) = meta.direct_assembler_call(
+            &[
+                (JitArgKind::Int, func_box, 9999),
+                (JitArgKind::Int, green_box, 55),
+                (JitArgKind::Int, frame_box, 1234),
+            ],
+            descr.as_ref().as_call_descr().expect("call descr"),
+            0,
+        );
+        assert!(
+            resbox.is_some(),
+            "temp callback path should record CALL_ASSEMBLER"
+        );
+
+        let cell = meta
+            .warm_state
+            .get_cell(green_key)
+            .expect("temp callback should install a jit cell");
+        assert_ne!(
+            cell.flags & crate::warmstate::jc_flags::TEMPORARY,
+            0,
+            "temp callback token should mark the cell as TEMPORARY"
+        );
+        let token = cell
+            .get_procedure_token()
+            .expect("temp callback should install a procedure token");
+        let token_number = token.number;
+
+        let ops = take_recorded_ops(&mut meta);
+        let call = ops
+            .into_iter()
+            .find(|op| op.opcode == OpCode::CallAssemblerI)
+            .expect("CALL_ASSEMBLER_I recorded");
+        let call_descr = call
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("call descr");
+        assert_eq!(call_descr.call_target_token(), Some(token_number));
     }
 
     #[test]
