@@ -206,255 +206,249 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
-    if TYPEOBJECT_CACHE.get().is_some() {
-        return;
-    }
+    TYPEOBJECT_CACHE.get_or_init(|| {
+        let mut reg: HashMap<usize, usize> = HashMap::new();
 
-    let mut reg: HashMap<usize, usize> = HashMap::new();
+        // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
+        // MRO = [object]. All other types inherit from object.
+        let object_type = new_root_typeobject("object", init_object_type);
+        reg.insert(
+            &INSTANCE_TYPE as *const PyType as usize,
+            object_type as usize,
+        );
+        let _ = W_OBJECT_TYPEOBJECT.set(object_type as usize);
 
-    // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
-    // MRO = [object]. All other types inherit from object.
-    let object_type = new_root_typeobject("object", init_object_type);
-    reg.insert(
-        &INSTANCE_TYPE as *const PyType as usize,
-        object_type as usize,
-    );
-    let _ = W_OBJECT_TYPEOBJECT.set(object_type as usize);
+        // type — PyPy: typeobject.py, bases=(object,)
+        // type.__new__(metatype, name, bases, dict) creates new types
+        let type_type = new_typeobject_with_base("type", init_type_type, object_type);
+        // hasdict/weakrefable/acceptable now set by typedef.py:34,37,43 logic
+        // in new_typeobject_with_base_and_layout from init_type_type's dict contents.
+        reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
+        let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
 
-    // type — PyPy: typeobject.py, bases=(object,)
-    // type.__new__(metatype, name, bases, dict) creates new types
-    let type_type = new_typeobject_with_base("type", init_type_type, object_type);
-    // hasdict/weakrefable/acceptable now set by typedef.py:34,37,43 logic
-    // in new_typeobject_with_base_and_layout from init_type_type's dict contents.
-    reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
-    let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
-
-    // int — intobject.py W_IntObject.typedef, bases=(object,)
-    // Layout = INT_TYPE because instances are W_IntObject.
-    let int_type = new_typeobject_with_base_and_layout(
-        "int",
-        init_int_type,
-        object_type,
-        &INT_TYPE as *const PyType,
-    );
-    reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
-
-    // float — floatobject.py, bases=(object,)
-    reg.insert(
-        &FLOAT_TYPE as *const PyType as usize,
-        new_typeobject_with_base_and_layout(
-            "float",
-            init_float_type,
+        // int — intobject.py W_IntObject.typedef, bases=(object,)
+        // Layout = INT_TYPE because instances are W_IntObject.
+        let int_type = new_typeobject_with_base_and_layout(
+            "int",
+            init_int_type,
             object_type,
-            &FLOAT_TYPE as *const PyType,
-        ) as usize,
-    );
+            &INT_TYPE as *const PyType,
+        );
+        reg.insert(&INT_TYPE as *const PyType as usize, int_type as usize);
 
-    // bool — boolobject.py, bases=(int,)
-    // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
-    // boolobject.py:110 W_BoolObject.typedef.acceptable_as_base_class = False
-    let bool_type = new_typeobject_with_base_and_layout(
-        "bool",
-        init_bool_type,
-        int_type,
-        &BOOL_TYPE as *const PyType,
-    );
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(bool_type, false) };
-    reg.insert(&BOOL_TYPE as *const PyType as usize, bool_type as usize);
+        // float — floatobject.py, bases=(object,)
+        reg.insert(
+            &FLOAT_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "float",
+                init_float_type,
+                object_type,
+                &FLOAT_TYPE as *const PyType,
+            ) as usize,
+        );
 
-    // str — PyPy: unicodeobject.py, bases=(object,)
-    reg.insert(
-        &STR_TYPE as *const PyType as usize,
-        new_typeobject_with_base("str", init_str_type, object_type) as usize,
-    );
+        // bool — boolobject.py, bases=(int,)
+        // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
+        // boolobject.py:110 W_BoolObject.typedef.acceptable_as_base_class = False
+        let bool_type = new_typeobject_with_base_and_layout(
+            "bool",
+            init_bool_type,
+            int_type,
+            &BOOL_TYPE as *const PyType,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(bool_type, false) };
+        reg.insert(&BOOL_TYPE as *const PyType as usize, bool_type as usize);
 
-    // list — PyPy: listobject.py, bases=(object,)
-    reg.insert(
-        &LIST_TYPE as *const PyType as usize,
-        new_typeobject_with_base("list", init_list_type, object_type) as usize,
-    );
+        // str — PyPy: unicodeobject.py, bases=(object,)
+        reg.insert(
+            &STR_TYPE as *const PyType as usize,
+            new_typeobject_with_base("str", init_str_type, object_type) as usize,
+        );
 
-    // tuple — PyPy: tupleobject.py, bases=(object,)
-    reg.insert(
-        &TUPLE_TYPE as *const PyType as usize,
-        new_typeobject_with_base("tuple", init_tuple_type, object_type) as usize,
-    );
+        // list — PyPy: listobject.py, bases=(object,)
+        reg.insert(
+            &LIST_TYPE as *const PyType as usize,
+            new_typeobject_with_base("list", init_list_type, object_type) as usize,
+        );
 
-    // dict — PyPy: dictobject.py, bases=(object,)
-    reg.insert(
-        &DICT_TYPE as *const PyType as usize,
-        new_typeobject_with_base("dict", init_dict_type, object_type) as usize,
-    );
+        // tuple — PyPy: tupleobject.py, bases=(object,)
+        reg.insert(
+            &TUPLE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("tuple", init_tuple_type, object_type) as usize,
+        );
 
-    // function — PyPy: funcobject.py
-    // Functions are descriptors: function.__get__ returns a bound method.
-    let function_type = new_typeobject_with_base("function", init_function_type, object_type);
-    // typedef.py:742 Function.typedef.acceptable_as_base_class = False
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(function_type, false) };
-    // typedef.py:735/740 — Function exposes __dict__ and __weakref__.
-    unsafe {
-        pyre_object::w_type_set_hasdict(function_type, true);
-        pyre_object::w_type_set_weakrefable(function_type, true);
-    }
-    reg.insert(
-        &crate::FUNCTION_TYPE as *const PyType as usize,
-        function_type as usize,
-    );
+        // dict — PyPy: dictobject.py, bases=(object,)
+        reg.insert(
+            &DICT_TYPE as *const PyType as usize,
+            new_typeobject_with_base("dict", init_dict_type, object_type) as usize,
+        );
 
-    // builtin_function — PyPy: typedef.py BuiltinFunction.typedef
-    // Mirrors Function.typedef except `__get__` is intentionally absent.
-    let builtin_function_type =
-        new_typeobject_with_base("builtin_function", init_builtin_function_type, object_type);
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(builtin_function_type, false) };
-    unsafe {
-        pyre_object::w_type_set_hasdict(builtin_function_type, true);
-        pyre_object::w_type_set_weakrefable(builtin_function_type, true);
-    }
-    reg.insert(
-        &crate::BUILTIN_FUNCTION_TYPE as *const PyType as usize,
-        builtin_function_type as usize,
-    );
+        // function — PyPy: funcobject.py
+        // Functions are descriptors: function.__get__ returns a bound method.
+        let function_type = new_typeobject_with_base("function", init_function_type, object_type);
+        // typedef.py:742 Function.typedef.acceptable_as_base_class = False
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(function_type, false) };
+        // typedef.py:735/740 — Function exposes __dict__ and __weakref__.
+        unsafe {
+            pyre_object::w_type_set_hasdict(function_type, true);
+            pyre_object::w_type_set_weakrefable(function_type, true);
+        }
+        reg.insert(
+            &crate::FUNCTION_TYPE as *const PyType as usize,
+            function_type as usize,
+        );
 
-    // builtin-code — PyPy: BuiltinCode.typedef = TypeDef('builtin-code', ...)
-    reg.insert(
-        &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
-        new_typeobject_with_base("builtin-code", init_builtin_code_type, object_type) as usize,
-    );
+        // builtin_function — PyPy: typedef.py BuiltinFunction.typedef
+        // Mirrors Function.typedef except `__get__` is intentionally absent.
+        let builtin_function_type =
+            new_typeobject_with_base("builtin_function", init_builtin_function_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(builtin_function_type, false) };
+        unsafe {
+            pyre_object::w_type_set_hasdict(builtin_function_type, true);
+            pyre_object::w_type_set_weakrefable(builtin_function_type, true);
+        }
+        reg.insert(
+            &crate::BUILTIN_FUNCTION_TYPE as *const PyType as usize,
+            builtin_function_type as usize,
+        );
 
-    // typedef.py:765 Method.typedef.acceptable_as_base_class = False
-    let method_type = new_typeobject_with_base("method", init_method_type, object_type);
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(method_type, false) };
-    // typedef.py:763 — Method exposes __weakref__.
-    unsafe { pyre_object::w_type_set_weakrefable(method_type, true) };
-    reg.insert(
-        &pyre_object::methodobject::METHOD_TYPE as *const PyType as usize,
-        method_type as usize,
-    );
+        // builtin-code — PyPy: BuiltinCode.typedef = TypeDef('builtin-code', ...)
+        reg.insert(
+            &crate::BUILTIN_CODE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("builtin-code", init_builtin_code_type, object_type) as usize,
+        );
 
-    // typedef.py:664 PyCode.typedef.acceptable_as_base_class = False
-    let code_type = new_typeobject_with_base("code", init_code_type, object_type);
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(code_type, false) };
-    reg.insert(
-        &crate::pycode::CODE_TYPE as *const PyType as usize,
-        code_type as usize,
-    );
+        // typedef.py:765 Method.typedef.acceptable_as_base_class = False
+        let method_type = new_typeobject_with_base("method", init_method_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(method_type, false) };
+        // typedef.py:763 — Method exposes __weakref__.
+        unsafe { pyre_object::w_type_set_weakrefable(method_type, true) };
+        reg.insert(
+            &pyre_object::methodobject::METHOD_TYPE as *const PyType as usize,
+            method_type as usize,
+        );
 
-    // typedef.py:500 Member.typedef.acceptable_as_base_class = False
-    let member_desc_type = new_typeobject_with_base(
-        "member_descriptor",
-        init_member_descriptor_type,
-        object_type,
-    );
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(member_desc_type, false) };
-    reg.insert(
-        &pyre_object::memberobject::MEMBER_TYPE as *const PyType as usize,
-        member_desc_type as usize,
-    );
+        // typedef.py:664 PyCode.typedef.acceptable_as_base_class = False
+        let code_type = new_typeobject_with_base("code", init_code_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(code_type, false) };
+        reg.insert(
+            &crate::pycode::CODE_TYPE as *const PyType as usize,
+            code_type as usize,
+        );
 
-    // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
-    reg.insert(
-        &pyre_object::propertyobject::STATICMETHOD_TYPE as *const PyType as usize,
-        new_typeobject_with_base("staticmethod", init_staticmethod_type, object_type) as usize,
-    );
-
-    // classmethod — PyPy: function.py ClassMethod, bases=(object,)
-    reg.insert(
-        &pyre_object::propertyobject::CLASSMETHOD_TYPE as *const PyType as usize,
-        new_typeobject_with_base("classmethod", init_classmethod_type, object_type) as usize,
-    );
-
-    // property — PyPy: descriptor.py W_Property, bases=(object,)
-    reg.insert(
-        &pyre_object::propertyobject::PROPERTY_TYPE as *const PyType as usize,
-        new_typeobject_with_base("property", init_property_type, object_type) as usize,
-    );
-
-    // exception — pyre uses one shared W_TypeObject for all builtin
-    // exception instances; the per-class hierarchy lives in the namespace
-    // (see make_exc_type in builtins.rs).  Registering it here lets
-    // typedef::r#type return a non-null type for raised exception objects.
-    reg.insert(
-        &pyre_object::excobject::EXCEPTION_TYPE as *const PyType as usize,
-        new_typeobject_with_base("exception", |_| {}, object_type) as usize,
-    );
-
-    // NoneType — bases=(object,)
-    reg.insert(
-        &NONE_TYPE as *const PyType as usize,
-        new_typeobject_with_base("NoneType", |_| {}, object_type) as usize,
-    );
-
-    // typedef.py:941-946 Ellipsis.typedef.
-    let ellipsis_type = new_typeobject_with_base("ellipsis", init_ellipsis_type, object_type);
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(ellipsis_type, false) };
-    reg.insert(
-        &ELLIPSIS_TYPE as *const PyType as usize,
-        ellipsis_type as usize,
-    );
-
-    // typedef.py:948-954 NotImplemented.typedef.
-    let notimplemented_type =
-        new_typeobject_with_base("NotImplementedType", init_notimplemented_type, object_type);
-    unsafe { pyre_object::w_type_set_acceptable_as_base_class(notimplemented_type, false) };
-    reg.insert(
-        &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType as usize,
-        notimplemented_type as usize,
-    );
-
-    // types.UnionType — PyPy: _pypy_generic_alias.py UnionType, bases=(object,)
-    reg.insert(
-        &pyre_object::UNION_TYPE as *const PyType as usize,
-        new_typeobject_with_base("types.UnionType", init_union_type, object_type) as usize,
-    );
-
-    // slice — PyPy: sliceobject.py, bases=(object,)
-    reg.insert(
-        &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
-        new_typeobject_with_base("slice", |_| {}, object_type) as usize,
-    );
-
-    // bytearray — PyPy: bytearrayobject.py, bases=(object,)
-    reg.insert(
-        &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType as usize,
-        new_typeobject_with_base("bytearray", init_bytearray_type, object_type) as usize,
-    );
-
-    // bytes — PyPy: bytesobject.py W_BytesObject, bases=(object,)
-    reg.insert(
-        &pyre_object::bytesobject::BYTES_TYPE as *const PyType as usize,
-        new_typeobject_with_base("bytes", init_bytes_type, object_type) as usize,
-    );
-
-    // set / frozenset — PyPy: setobject.py, bases=(object,).
-    // Both carry their own layout typedef so check_user_subclass's layout
-    // safety check (typeobject.py:520-523) can reject foreign-layout
-    // subclasses (e.g. subclass adds __slots__).
-    reg.insert(
-        &pyre_object::setobject::SET_TYPE as *const PyType as usize,
-        new_typeobject_with_base_and_layout(
-            "set",
-            init_set_type,
+        // typedef.py:500 Member.typedef.acceptable_as_base_class = False
+        let member_desc_type = new_typeobject_with_base(
+            "member_descriptor",
+            init_member_descriptor_type,
             object_type,
-            &pyre_object::setobject::SET_TYPE as *const PyType,
-        ) as usize,
-    );
-    reg.insert(
-        &pyre_object::setobject::FROZENSET_TYPE as *const PyType as usize,
-        new_typeobject_with_base_and_layout(
-            "frozenset",
-            init_frozenset_type,
-            object_type,
-            &pyre_object::setobject::FROZENSET_TYPE as *const PyType,
-        ) as usize,
-    );
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(member_desc_type, false) };
+        reg.insert(
+            &pyre_object::memberobject::MEMBER_TYPE as *const PyType as usize,
+            member_desc_type as usize,
+        );
 
-    let _ = TYPEOBJECT_CACHE.set(reg);
+        // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
+        reg.insert(
+            &pyre_object::propertyobject::STATICMETHOD_TYPE as *const PyType as usize,
+            new_typeobject_with_base("staticmethod", init_staticmethod_type, object_type) as usize,
+        );
 
-    // rclass.py:739-743 parity — cache W_TypeObject on each PyType
-    // so allocators can set w_class at allocation time (like RPython's
-    // `self.setfield(vptr, '__class__', ctypeptr, llops)` in new_instance).
-    if let Some(cache) = TYPEOBJECT_CACHE.get() {
-        for (&pytype_addr, &w_typeobject_addr) in cache {
+        // classmethod — PyPy: function.py ClassMethod, bases=(object,)
+        reg.insert(
+            &pyre_object::propertyobject::CLASSMETHOD_TYPE as *const PyType as usize,
+            new_typeobject_with_base("classmethod", init_classmethod_type, object_type) as usize,
+        );
+
+        // property — PyPy: descriptor.py W_Property, bases=(object,)
+        reg.insert(
+            &pyre_object::propertyobject::PROPERTY_TYPE as *const PyType as usize,
+            new_typeobject_with_base("property", init_property_type, object_type) as usize,
+        );
+
+        // exception — pyre uses one shared W_TypeObject for all builtin
+        // exception instances; the per-class hierarchy lives in the namespace
+        // (see make_exc_type in builtins.rs).  Registering it here lets
+        // typedef::r#type return a non-null type for raised exception objects.
+        reg.insert(
+            &pyre_object::excobject::EXCEPTION_TYPE as *const PyType as usize,
+            new_typeobject_with_base("exception", |_| {}, object_type) as usize,
+        );
+
+        // NoneType — bases=(object,)
+        reg.insert(
+            &NONE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("NoneType", |_| {}, object_type) as usize,
+        );
+
+        // typedef.py:941-946 Ellipsis.typedef.
+        let ellipsis_type = new_typeobject_with_base("ellipsis", init_ellipsis_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(ellipsis_type, false) };
+        reg.insert(
+            &ELLIPSIS_TYPE as *const PyType as usize,
+            ellipsis_type as usize,
+        );
+
+        // typedef.py:948-954 NotImplemented.typedef.
+        let notimplemented_type =
+            new_typeobject_with_base("NotImplementedType", init_notimplemented_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(notimplemented_type, false) };
+        reg.insert(
+            &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType as usize,
+            notimplemented_type as usize,
+        );
+
+        // types.UnionType — PyPy: _pypy_generic_alias.py UnionType, bases=(object,)
+        reg.insert(
+            &pyre_object::UNION_TYPE as *const PyType as usize,
+            new_typeobject_with_base("types.UnionType", init_union_type, object_type) as usize,
+        );
+
+        // slice — PyPy: sliceobject.py, bases=(object,)
+        reg.insert(
+            &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
+            new_typeobject_with_base("slice", |_| {}, object_type) as usize,
+        );
+
+        // bytearray — PyPy: bytearrayobject.py, bases=(object,)
+        reg.insert(
+            &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType as usize,
+            new_typeobject_with_base("bytearray", init_bytearray_type, object_type) as usize,
+        );
+
+        // bytes — PyPy: bytesobject.py W_BytesObject, bases=(object,)
+        reg.insert(
+            &pyre_object::bytesobject::BYTES_TYPE as *const PyType as usize,
+            new_typeobject_with_base("bytes", init_bytes_type, object_type) as usize,
+        );
+
+        // set / frozenset — PyPy: setobject.py, bases=(object,).
+        // Both carry their own layout typedef so check_user_subclass's layout
+        // safety check (typeobject.py:520-523) can reject foreign-layout
+        // subclasses (e.g. subclass adds __slots__).
+        reg.insert(
+            &pyre_object::setobject::SET_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "set",
+                init_set_type,
+                object_type,
+                &pyre_object::setobject::SET_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
+            &pyre_object::setobject::FROZENSET_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "frozenset",
+                init_frozenset_type,
+                object_type,
+                &pyre_object::setobject::FROZENSET_TYPE as *const PyType,
+            ) as usize,
+        );
+
+        // rclass.py:739-743 parity — cache W_TypeObject on each PyType
+        // so allocators can set w_class at allocation time (like RPython's
+        // `self.setfield(vptr, '__class__', ctypeptr, llops)` in new_instance).
+        for (&pytype_addr, &w_typeobject_addr) in &reg {
             let tp = unsafe { &*(pytype_addr as *const PyType) };
             let w_typeobject = w_typeobject_addr as PyObjectRef;
             pyre_object::pyobject::set_instantiate(tp, w_typeobject);
@@ -462,8 +456,11 @@ pub fn init_typeobjects() {
         // Set w_class on all built-in type objects to `type`.
         // baseobjspace.py:76 getclass() — for type objects, the class
         // is the metatype (default: `type`).
-        let w_type_type = w_type();
-        for &w_typeobject_addr in cache.values() {
+        let w_type_type = W_TYPE_TYPEOBJECT
+            .get()
+            .map(|v| *v as PyObjectRef)
+            .unwrap_or(PY_NULL);
+        for &w_typeobject_addr in reg.values() {
             let w_typeobj = w_typeobject_addr as PyObjectRef;
             unsafe {
                 if (*w_typeobj).w_class.is_null() {
@@ -471,7 +468,9 @@ pub fn init_typeobjects() {
                 }
             }
         }
-    }
+
+        reg
+    });
 
     patch_builtin_function_descriptors();
 }
