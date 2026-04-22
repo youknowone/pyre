@@ -721,11 +721,28 @@ impl JitCodeBuilder {
         self.has_abort = true;
     }
 
-    /// RPython bhimpl_ref_return: emit return-ref opcode.
-    /// The return value is in register `src`.
+    /// RPython `blackhole.py:841-862` typed return opcodes.
+    /// The return value is in register `src`; `void_return` has no operand.
+    pub fn int_return(&mut self, src: u16) {
+        self.touch_reg(src);
+        self.write_insn("int_return/i");
+        self.push_u16(src);
+    }
+
     pub fn ref_return(&mut self, src: u16) {
+        self.touch_ref_reg(src);
         self.write_insn("ref_return/r");
         self.push_u16(src);
+    }
+
+    pub fn float_return(&mut self, src: u16) {
+        self.touch_float_reg(src);
+        self.write_insn("float_return/f");
+        self.push_u16(src);
+    }
+
+    pub fn void_return(&mut self) {
+        self.write_insn("void_return/");
     }
 
     pub fn abort_permanent(&mut self) {

@@ -1,5 +1,17 @@
 use majit_macros::{dont_look_inside, jit_inline};
 
+fn assert_single_return_opcode(jitcode: &majit_metainterp::JitCode, key: &str) {
+    let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+        .get(key)
+        .unwrap_or_else(|| panic!("missing wellknown opcode for {key}"));
+    assert_eq!(
+        jitcode.code.len(),
+        3,
+        "helper should emit one return opcode"
+    );
+    assert_eq!(jitcode.code[0], opcode, "helper should end with {key}");
+}
+
 // ── Ref-returning inline helpers ────────────────────────────────────
 
 #[jit_inline]
@@ -49,11 +61,7 @@ fn jit_inline_ref_identity_generates_valid_jitcode() {
     assert_eq!(jitcode.c_num_regs_i, 0, "no int registers needed");
     assert!(jitcode.c_num_regs_r >= 1, "at least 1 ref register needed");
     assert_eq!(jitcode.c_num_regs_f, 0, "no float registers needed");
-    // Body is empty (identity returns parameter directly)
-    assert!(
-        jitcode.code.is_empty(),
-        "identity helper should have empty bytecode"
-    );
+    assert_single_return_opcode(&jitcode, "ref_return/r");
 }
 
 #[test]
@@ -71,10 +79,7 @@ fn jit_inline_float_identity_generates_valid_jitcode() {
         jitcode.c_num_regs_f >= 1,
         "at least 1 float register needed"
     );
-    assert!(
-        jitcode.code.is_empty(),
-        "identity helper should have empty bytecode"
-    );
+    assert_single_return_opcode(&jitcode, "float_return/f");
 }
 
 #[test]
@@ -103,6 +108,7 @@ fn jit_inline_mixed_identity_generates_dense_per_kind_jitcode() {
     assert_eq!(jitcode.c_num_regs_i, 1, "one int register needed");
     assert_eq!(jitcode.c_num_regs_r, 1, "one ref register needed");
     assert_eq!(jitcode.c_num_regs_f, 1, "one float register needed");
+    assert_single_return_opcode(&jitcode, "int_return/i");
 }
 
 #[test]

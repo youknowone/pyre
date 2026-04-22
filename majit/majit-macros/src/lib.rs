@@ -1244,6 +1244,11 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
     let helper_body = helper.body;
     let return_reg = helper.return_reg;
+    let helper_return = match helper.return_kind {
+        InlineReturnKind::Int => quote! { __builder.int_return(#return_reg); },
+        InlineReturnKind::Ref => quote! { __builder.ref_return(#return_reg); },
+        InlineReturnKind::Float => quote! { __builder.float_return(#return_reg); },
+    };
 
     // Return kind code: 0 = Int, 1 = Ref, 2 = Float
     let return_kind_code: u8 = match helper.return_kind {
@@ -1295,6 +1300,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
             #(#ensure_param_regs)*
             #helper_body
+            #helper_return
             (__builder.finish(), #return_reg, #return_kind_code)
         }
 
