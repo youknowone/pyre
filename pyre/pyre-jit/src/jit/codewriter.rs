@@ -1147,14 +1147,12 @@ fn register_helper_fn_pointers(
 /// backward dataflow over the populated `SSARepr` that fills each
 /// `-live-` marker with the set of registers alive across it.
 ///
-/// The dataflow runs on the walker's SSARepr via
-/// `liveness::compute_liveness_preserve_positions`, which skips
-/// `remove_repeated_live` so `live_patches` insn indices stay valid
-/// offsets into `ssarepr.insns`. (The full `compute_liveness` would
-/// call `remove_repeated_live`'s `res.extend(labels); res.push(live)`
-/// reorder loop, which swaps `-live-, Label` into `Label, -live-` even
-/// when nothing is merged — `live_patches[i].1` then points at the
-/// moved `Label` instead of the `-live-` marker.)
+/// The dataflow runs on the post-regalloc `SSARepr` via the upstream
+/// `liveness::compute_liveness`, including `remove_repeated_live`.
+/// pyre's `PcAnchor(py_pc)` markers survive that rewrite unchanged, so
+/// the follow-up filter rescans anchor-delimited ranges in the FINAL
+/// `SSARepr` to find each Python PC's `-live-` marker instead of caching
+/// pre-rewrite insn indices.
 ///
 /// After the dataflow, pyre applies an in-place post-filter to each
 /// `-live-` marker so the args carry only the subset of registers
@@ -1186,29 +1184,94 @@ fn register_helper_fn_pointers(
 ///     didn't mark it alive, because pyre's runtime invariant at
 ///     every `-live-` marker is "all stack slots up to the current
 ///     depth hold a live box".
-///   - Intersect with LiveVars: RPython's SSA liveness is the
-///     authoritative live set, but pyre's tracer + blackhole are
-///     still wired to Python's per-bytecode LiveVars answer (which
-///     omits function parameters at pc=0). Narrowing SSA back to
-///     LV∩SSA restores that contract; see
-///     `phase4_ssa_liveness_blocker_2026_04_18.md` for the rework
-///     required to drop this intersection.
 ///
-/// Unreachable PCs (the `LiveVars` dataflow leaves `usize::MAX`
-/// sentinels from `liveness.rs:150`) get emptied so the downstream
-/// `live_patches.iter()` alignment stays one-to-one.
+/// Unreachable PCs still get emptied in place via the bytecode
+/// `LiveVars` analysis. The direct-dispatch walker emits one
+/// `PcAnchor`/`-live-` pair per Python PC, including dead bytecodes
+/// that never execute, whereas upstream RPython only flattens
+/// reachable flow-graph blocks.
+fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
+    let mut positions = vec![usize::MAX; num_pcs];
+    for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
+        if let Insn::PcAnchor(py_pc) = insn {
+            assert!(
+                *py_pc < num_pcs,
+                "pc_anchor_positions: py_pc {py_pc} out of range {num_pcs}"
+            );
+            assert_eq!(
+                positions[*py_pc],
+                usize::MAX,
+                "pc_anchor_positions: duplicate PcAnchor for py_pc {py_pc}"
+            );
+            positions[*py_pc] = insn_idx;
+        }
+    }
+    for (py_pc, &insn_idx) in positions.iter().enumerate() {
+        assert_ne!(
+            insn_idx,
+            usize::MAX,
+            "pc_anchor_positions: missing PcAnchor for py_pc {py_pc}"
+        );
+    }
+    positions
+}
+
+fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
+    let mut anchors: Vec<(usize, usize)> = Vec::with_capacity(num_pcs);
+    for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
+        if let Insn::PcAnchor(py_pc) = insn {
+            anchors.push((insn_idx, *py_pc));
+        }
+    }
+    assert_eq!(
+        anchors.len(),
+        num_pcs,
+        "live_marker_indices_by_pc: expected {num_pcs} PcAnchors, found {}",
+        anchors.len()
+    );
+    let mut live_indices = vec![usize::MAX; num_pcs];
+    for (anchor_pos, (anchor_idx, py_pc)) in anchors.iter().enumerate() {
+        let end = anchors
+            .get(anchor_pos + 1)
+            .map(|(next_idx, _)| *next_idx)
+            .unwrap_or(ssarepr.insns.len());
+        let mut live_idx: Option<usize> = None;
+        for insn_idx in (anchor_idx + 1)..end {
+            if ssarepr.insns[insn_idx].is_live() {
+                assert!(
+                    live_idx.is_none(),
+                    "live_marker_indices_by_pc: multiple -live- markers for py_pc {} in range {}..{}",
+                    py_pc,
+                    anchor_idx + 1,
+                    end
+                );
+                live_idx = Some(insn_idx);
+            }
+        }
+        live_indices[*py_pc] = live_idx.unwrap_or_else(|| {
+            panic!(
+                "live_marker_indices_by_pc: missing -live- marker for py_pc {} in range {}..{}",
+                py_pc,
+                anchor_idx + 1,
+                end
+            )
+        });
+    }
+    live_indices
+}
+
 fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
-    live_patches: &[(usize, usize)],
     code: &CodeObject,
     nlocals: usize,
     stack_base: u16,
     depth_at_pc: &[u16],
 ) {
     use super::flatten::{Insn, Kind as SsaKind, Operand as SsaOperand};
-    super::liveness::compute_liveness_preserve_positions(ssarepr);
+    super::liveness::compute_liveness(ssarepr);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
-    for &(py_pc, insn_idx) in live_patches.iter() {
+    let live_markers = live_marker_indices_by_pc(ssarepr, code.instructions.len());
+    for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
             Some(insn) if insn.is_live() => insn.live_args_mut().unwrap(),
             Some(other) => panic!(
@@ -1825,9 +1888,6 @@ impl CodeWriter {
         // becomes a `loop_header` site.
         let loop_header_pcs = find_loop_header_pcs(code);
 
-        // pc_map: Python PC → JitCode byte offset
-        let mut pc_map = vec![0usize; num_instrs];
-
         // RPython: flatten_graph() walks blocks and emits instruction tuples.
         // RPython: assembler.assemble(ssarepr, jitcode, num_regs) emits bytecodes.
         // For pyre, we combine both steps: walk Python bytecodes and emit
@@ -1837,8 +1897,6 @@ impl CodeWriter {
         // precise liveness generation. Stack registers stack_base..stack_base+depth
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
-        let mut live_patches: Vec<(usize, usize)> = Vec::with_capacity(num_instrs);
-
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
         // — RPython looks up portal-ness in the registry that
         // `setup_jitdriver` populates. pyre matches that: a code is a
@@ -2300,14 +2358,11 @@ impl CodeWriter {
         // `flatten.py` inserts `self.emitline('-live-')` at every block
         // entry and at every point with a live resume set; `assembler.py:146-158`
         // allocates an `all_liveness` slot and encodes the live-register
-        // triple. pyre patches the live-offset after the assembler
-        // computes liveness for the Python PC, so the SSARepr `-live-`
-        // marker is empty until `filter_liveness_in_place` fills it.
+        // triple. pyre emits the same placeholder here, then fills it
+        // after regalloc by rescanning the final SSARepr's PcAnchor ranges.
         macro_rules! emit_live_placeholder {
             ($ssarepr:expr) => {{
-                let idx = $ssarepr.insns.len();
                 $ssarepr.insns.push(Insn::live(Vec::new()));
-                idx
             }};
         }
 
@@ -2520,17 +2575,11 @@ impl CodeWriter {
             emit_mark_label_pc!(ssarepr, py_pc);
             // pyre PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor`
             // docstring in `flatten.rs`): emit a stable anchor at every
-            // Python PC start so the post-compute_liveness / post-
-            // regalloc SSARepr position is recoverable.
+            // Python PC start so the post-compute_liveness /
+            // post-remove_repeated_live SSARepr position is recoverable.
             ssarepr.insns.push(Insn::PcAnchor(py_pc));
-            // Phase 3c Step 2: pc_map records walker-local SSARepr insn
-            // indices. `insn_pos_to_byte_offset` translates them to byte
-            // offsets after `Assembler::assemble` populates
-            // `ssarepr.insns_pos`.
-            pc_map[py_pc] = ssarepr.insns.len();
-            let live_patch = emit_live_placeholder!(ssarepr);
-            live_patches.push((py_pc, live_patch));
             depth_at_pc[py_pc] = current_depth;
+            emit_live_placeholder!(ssarepr);
 
             if loop_header_pcs.contains(&py_pc) {
                 if merge_point_pc == Some(py_pc) {
@@ -2582,24 +2631,17 @@ impl CodeWriter {
 
             // RPython jtransform.py: rewrite_operation() dispatches per opname.
             // Each match arm is the pyre equivalent of rewrite_op_*.
-            match instruction {
-                Instruction::Resume { .. }
-                | Instruction::Nop
-                | Instruction::Cache
-                | Instruction::NotTaken
-                | Instruction::ExtendedArg => {
-                    // RPython: no-op operations produce no jitcode output
-                }
-
-                // jtransform.py:1877 do_fixed_list_getitem vable case:
-                // portal locals are virtualizable array items — emit
-                // vable_getarrayitem_ref so the optimizer folds the read
-                // against virtualizable_boxes and the blackhole pulls the
-                // live frame value into stack_base+current_depth on
-                // resume. Non-portal frames keep ref_copy (no virtualizable
-                // in scope).
-                Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
-                    let reg = var_num.get(op_arg).as_usize() as u16;
+            //
+            // jtransform.py:1877 do_fixed_list_getitem / :1898
+            // do_fixed_list_setitem parity: portal local accesses lower to
+            // getarrayitem_vable_r / setarrayitem_vable_r against the
+            // virtualizable array. CPython 3.13 fast-local
+            // superinstructions decompose to repeated plain LOAD_FAST /
+            // STORE_FAST effects, so reuse the same lowering helper in all
+            // three arms to keep the portal/non-portal behavior aligned.
+            macro_rules! emit_fast_load_ref {
+                ($reg:expr) => {{
+                    let reg = $reg;
                     if is_portal {
                         emit_load_const_i!(
                             ssarepr,
@@ -2623,16 +2665,11 @@ impl CodeWriter {
                     current_state.stack.push(loaded);
                     current_depth += 1;
                     emit_vsd!(current_depth);
-                }
-
-                // jtransform.py:1898 do_fixed_list_setitem vable case:
-                // Portal frames treat `locals_cells_stack_w` as the sole
-                // storage for locals — setarrayitem_vable_r writes from
-                // the value-stack slot directly, so no register-per-local
-                // shadow exists. Non-portal frames keep ref_copy (no vable
-                // in scope).
-                Instruction::StoreFast { var_num } => {
-                    let reg = var_num.get(op_arg).as_usize() as u16;
+                }};
+            }
+            macro_rules! emit_fast_store_ref {
+                ($reg:expr) => {{
+                    let reg = $reg;
                     current_depth -= 1;
                     emit_vsd!(current_depth);
                     let stored = current_state
@@ -2657,6 +2694,38 @@ impl CodeWriter {
                     if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                         *slot = Some(stored);
                     }
+                }};
+            }
+            match instruction {
+                Instruction::Resume { .. }
+                | Instruction::Nop
+                | Instruction::Cache
+                | Instruction::NotTaken
+                | Instruction::ExtendedArg => {
+                    // RPython: no-op operations produce no jitcode output
+                }
+
+                // jtransform.py:1877 do_fixed_list_getitem vable case:
+                // portal locals are virtualizable array items — emit
+                // vable_getarrayitem_ref so the optimizer folds the read
+                // against virtualizable_boxes and the blackhole pulls the
+                // live frame value into stack_base+current_depth on
+                // resume. Non-portal frames keep ref_copy (no virtualizable
+                // in scope).
+                Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
+                    let reg = var_num.get(op_arg).as_usize() as u16;
+                    emit_fast_load_ref!(reg);
+                }
+
+                // jtransform.py:1898 do_fixed_list_setitem vable case:
+                // Portal frames treat `locals_cells_stack_w` as the sole
+                // storage for locals — setarrayitem_vable_r writes from
+                // the value-stack slot directly, so no register-per-local
+                // shadow exists. Non-portal frames keep ref_copy (no vable
+                // in scope).
+                Instruction::StoreFast { var_num } => {
+                    let reg = var_num.get(op_arg).as_usize() as u16;
+                    emit_fast_store_ref!(reg);
                 }
 
                 Instruction::LoadSmallInt { i } => {
@@ -3515,9 +3584,9 @@ impl CodeWriter {
         // `block.operations` + `link.args` for interference; `-live-`
         // markers don't exist yet. pyre dispatches directly to the
         // SSARepr — at regalloc time the `-live-` markers are present
-        // but hold empty args (`filter_liveness_in_place` runs post-
-        // rename), so the allocator's generic `Insn::Op` walk is a
-        // no-op on them, matching the upstream pre-liveness ordering.
+        // but still hold empty args (`filter_liveness_in_place` runs
+        // post-rename), so the allocator's generic `Insn::Op` walk is
+        // a no-op on them, matching the upstream pre-liveness ordering.
         let max_stack_depth_observed = depth_at_pc.iter().copied().max().unwrap_or(0);
         let inputs = super::regalloc::ExternalInputs {
             portal_frame_reg,
@@ -3569,17 +3638,15 @@ impl CodeWriter {
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the
-        // post-rename colors. pyre's `filter_liveness_in_place` is the
-        // same pass plus the pyre-only runtime-contract filter
-        // (Ref-only, in-range, stack-complete, LiveVars-intersected).
-        filter_liveness_in_place(
-            &mut ssarepr,
-            &live_patches,
-            code,
-            nlocals,
-            stack_base,
-            &depth_at_pc,
-        );
+        // post-rename colors. pyre's `filter_liveness_in_place` keeps
+        // that ordering and then applies the pyre-only runtime-contract
+        // filter (Ref-only, in-range, stack-complete, LiveVars-intersected).
+        filter_liveness_in_place(&mut ssarepr, code, nlocals, stack_base, &depth_at_pc);
+        // pc_map: Python PC → final SSARepr anchor position. Recomputed
+        // from the surviving PcAnchors AFTER liveness so any
+        // remove_repeated_live reordering is reflected here before the
+        // later insn-index → byte-offset translation.
+        let pc_map = pc_anchor_positions(&ssarepr, num_instrs);
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
         // (or 0 if coloring is empty). Pass through to the Assembler
@@ -4052,7 +4119,7 @@ mod tests {
         new_shadow_graph,
     };
     use crate::jit::assembler::ArcByPtr;
-    use crate::jit::flatten::Kind;
+    use crate::jit::flatten::{Insn, Kind, Label as FlatLabel, Operand, Register, SSARepr};
     use crate::jit::flow::{
         Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkArgPosition, LinkRef,
         Variable, VariableId, c_last_exception,
@@ -4654,6 +4721,34 @@ mod tests {
         let link_exit_states = link_exit_states_from(vec![(link, start_state)]);
         let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
         assert_eq!(pairs, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn pc_anchor_and_live_marker_rescan_follow_final_ssarepr_order() {
+        let mut ssarepr = SSARepr::new("t");
+        ssarepr.insns.push(Insn::PcAnchor(0));
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                0,
+            ))]));
+        // `remove_repeated_live` rewrites `-live-, Label` into
+        // `Label, -live-`; the anchor scan must use the final insn order,
+        // not the pre-rewrite placeholder index.
+        ssarepr.insns.push(Insn::Label(FlatLabel::new("pc1")));
+        ssarepr.insns.push(Insn::PcAnchor(1));
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                1,
+            ))]));
+
+        crate::jit::liveness::remove_repeated_live(&mut ssarepr);
+
+        assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 3]);
+        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![2, 4]);
     }
 
     #[test]

@@ -689,16 +689,12 @@ fn make_exception_link(
     debug_assert!(link.last_exception.is_some());
     debug_assert!(link.last_exc_value.is_some());
     let target = graph.block(link.target);
-    // Bare-reraise special case: upstream `flatten.py:160-168` collapses
-    // `Link([last_exception, last_exc_value], graph.exceptblock)` into a
-    // single `reraise` + `---` pair so the common propagate-unhandled
-    // shape doesn't need a renaming.  Require the target to be the
-    // graph's canonical `exceptblock` in addition to the args pattern,
-    // otherwise a typed-exception link whose args happen to match
-    // (e.g. a catch handler that receives both exception variables) is
-    // mis-classified as a reraise.
-    if link.target == graph.exceptblock
-        && target.operations.is_empty()
+    // `flatten.py:160-168` keys this collapse only on the empty-target
+    // shape plus the exact `[last_exception, last_exc_value]` args.
+    // Preserve that structure literally here; any typed handler that
+    // would otherwise match must be fixed at graph-construction time to
+    // carry a non-empty body, as upstream flow graphs do.
+    if target.operations.is_empty()
         && link.args
             == vec![
                 link.last_exception.clone().unwrap(),
@@ -1250,6 +1246,10 @@ mod tests {
         let handler_exc_value = graph.alloc_value();
         graph.block_mut(handler).inputargs.push(handler_exc_type);
         graph.block_mut(handler).inputargs.push(handler_exc_value);
+        // Upstream invariant: typed catch handlers are not empty blocks.
+        // Keep one op in the handler so the bare-reraise collapse remains
+        // reserved for the empty exception block shape from flatten.py.
+        graph.push_op(handler, OpKind::Live, false);
         graph.set_goto(handler, graph.returnblock, vec![handler_exc_value]);
 
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();

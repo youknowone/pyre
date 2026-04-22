@@ -4462,6 +4462,1181 @@ mod tests {
         }
     }
 
+    fn function_code_from_module(
+        module: &pyre_interpreter::CodeObject,
+        name: &str,
+    ) -> pyre_interpreter::CodeObject {
+        use pyre_interpreter::ConstantData;
+
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } if code.obj_name.as_str() == name => {
+                    Some((**code).clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("test source should contain function code {name}"))
+    }
+
+    fn live_pc_containing_all(
+        jitcode_index: i32,
+        code: &pyre_interpreter::CodeObject,
+        regs: &[u32],
+    ) -> (usize, Vec<u32>) {
+        let live_by_pc: Vec<(usize, Vec<u32>)> = (0..code.instructions.len())
+            .map(|pc| {
+                let live =
+                    pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32);
+                (pc, live)
+            })
+            .collect();
+        live_by_pc
+            .iter()
+            .find_map(|(pc, live)| {
+                regs.iter()
+                    .all(|reg| live.contains(reg))
+                    .then_some((*pc, live.clone()))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "compiled liveness should expose regs {regs:?}; got {:?}",
+                    live_by_pc
+                )
+            })
+    }
+
+    fn compiled_trace_fixture(
+        source: &str,
+        function_name: &str,
+        live_regs: &[u32],
+        init: impl FnOnce(&mut PyFrame),
+    ) -> (Box<PyFrame>, *const (), usize) {
+        use pyre_interpreter::compile_exec;
+        use pyre_jit_trace::state as trace_state;
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec(source).expect("test code should compile");
+        let code = function_code_from_module(&module, function_name);
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        init(&mut frame);
+        frame.fix_array_ptrs();
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, live_regs);
+        (frame, jitcode_ptr, resume_pc)
+    }
+
+    fn single_local_test_state(
+        ctx: &mut majit_metainterp::TraceCtx,
+        frame: &PyFrame,
+        frame_ptr: usize,
+        jitcode_ptr: *const (),
+        resume_pc: usize,
+        local_type: majit_ir::Type,
+        local: majit_ir::OpRef,
+    ) -> pyre_jit_trace::state::TestSymState {
+        use pyre_jit_trace::state as trace_state;
+
+        let frame_ref = ctx.const_ref(frame_ptr as i64);
+        let locals_array = trace_state::frame_locals_cells_stack_array_ref(ctx, frame_ref);
+        pyre_jit_trace::state::TestSymState {
+            frame: frame_ref,
+            jitcode: jitcode_ptr,
+            nlocals: 1,
+            valuestackdepth: 1,
+            locals_cells_stack_array_ref: locals_array,
+            symbolic_local_types: vec![local_type],
+            symbolic_stack_types: vec![],
+            registers_r: vec![local],
+            concrete_stack: vec![],
+            concrete_namespace: frame.w_globals,
+            vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
+            vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
+            vable_valuestackdepth: ctx.const_int(1),
+            vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
+            vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            pre_opcode_vsd: None,
+            pre_opcode_registers_r: None,
+        }
+    }
+
+    #[test]
+    fn test_restore_guard_failure_uses_runtime_value_kinds_with_compiled_trace_jitcode() {
+        use majit_ir::{GcRef, Type, Value};
+        use majit_metainterp::JitState;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_interpreter::{ConstantData, compile_exec};
+        use pyre_jit_trace::state::{self as trace_state, PyreJitState, PyreMeta};
+        use pyre_object::pyobject::is_int;
+        use pyre_object::{w_int_get_value, w_int_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
+            .expect("test code should compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                    Some((**code).clone())
+                }
+                _ => None,
+            })
+            .expect("test source should contain function code");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let resume_pc = (0..code.instructions.len())
+            .find(|&pc| {
+                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32).contains(&3)
+            })
+            .expect("compiled liveness should expose local i at some Python PC");
+        let live_regs = trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32);
+        assert!(
+            live_regs.contains(&3),
+            "selected resume pc must decode the raw-int local slot"
+        );
+        assert_eq!(
+            trace_state::frame_value_count_at(jitcode_index, resume_pc as i32),
+            live_regs.len(),
+            "frame-value count must come from the same compiled jitcode liveness block"
+        );
+
+        let mut state = PyreJitState {
+            frame: frame_ptr,
+            resume_pc: Some(resume_pc),
+        };
+        state.set_next_instr(0);
+        state.set_valuestackdepth(4);
+        let meta = PyreMeta {
+            num_locals: 4,
+            ns_len: 0,
+            valuestackdepth: 4,
+            has_virtualizable: true,
+            // Trace-entry slot types can be stale; guard failure must still
+            // respect the runtime Value tags recovered from resume data.
+            slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+        };
+
+        let mut values = vec![
+            Value::Ref(GcRef(frame_ptr)),                // frame
+            Value::Int(8),                               // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)),    // pycode
+            Value::Int(4),                               // valuestackdepth
+            Value::Ref(GcRef(0)),                        // debugdata
+            Value::Ref(GcRef(0)),                        // lastblock
+            Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
+        ];
+        for reg in live_regs {
+            match reg {
+                0 => values.push(Value::Ref(GcRef(w_int_new(1) as usize))), // local a
+                1 => values.push(Value::Ref(GcRef(w_int_new(2) as usize))), // local b
+                2 => values.push(Value::Ref(GcRef(w_int_new(3) as usize))), // local c
+                3 => values.push(Value::Int(7)),                            // local i
+                other => panic!("unexpected live reg {other} at resume pc {resume_pc}"),
+            }
+        }
+
+        assert!(<PyreJitState as JitState>::restore_guard_failure_values(
+            &mut state,
+            &meta,
+            &values,
+            &majit_metainterp::blackhole::ExceptionState::default(),
+        ));
+
+        assert_eq!(state.next_instr(), 9);
+        assert_eq!(state.valuestackdepth(), 4);
+        let restored_i = state.local_at(3).expect("local i should be restored");
+        assert!(unsafe { is_int(restored_i) });
+        assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
+    }
+
+    #[test]
+    fn test_current_fail_args_flushes_header_with_compiled_trace_jitcode() {
+        use majit_ir::{OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::compile_exec;
+        use pyre_interpreter::pyframe::{FrameBlock, PyFrame};
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::{w_int_new, w_list_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[1] = w_int_new(7);
+        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        frame.locals_w_mut()[3] = w_int_new(5);
+        frame.valuestackdepth = 4;
+        let _ = frame.getorcreatedebug(123);
+        frame.append_block(FrameBlock {
+            valuestackdepth: 0,
+            handlerposition: 55,
+            previous: std::ptr::null_mut(),
+        });
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+
+        let mut ctx = TraceCtx::for_test(2);
+        let frame_ref = ctx.const_ref(frame_ptr as i64);
+        let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+        let mut sym = PyreSym::from_test_state(TestSymState {
+            frame: frame_ref,
+            jitcode: jitcode_ptr,
+            nlocals: 2,
+            valuestackdepth: 4,
+            locals_cells_stack_array_ref: locals_array,
+            symbolic_local_types: vec![Type::Ref, Type::Int],
+            symbolic_stack_types: vec![Type::Ref, Type::Int],
+            registers_r: vec![OpRef::NONE; 4],
+            concrete_stack: vec![],
+            concrete_namespace: frame.w_globals,
+            vable_last_instr: ctx.const_int(999),
+            vable_pycode: ctx.const_ref(0xdead),
+            vable_valuestackdepth: ctx.const_int(111),
+            vable_debugdata: ctx.const_ref(0xbeef),
+            vable_lastblock: ctx.const_ref(0xcafe),
+            vable_w_globals: ctx.const_ref(0xfeed),
+            pre_opcode_vsd: None,
+            pre_opcode_registers_r: None,
+        });
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        let fail_args = state.capture_current_fail_args();
+
+        assert_eq!(
+            fail_args.len(),
+            pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + live_regs.len(),
+        );
+        assert_eq!(fail_args[0], frame_ref);
+        assert_eq!(fail_args[1], ctx.const_int(resume_pc as i64 - 1));
+        assert_eq!(fail_args[2], ctx.const_ref(frame.pycode as usize as i64));
+        assert_eq!(fail_args[3], ctx.const_int(4));
+        assert_eq!(fail_args[4], ctx.const_ref(frame.debugdata as usize as i64));
+        assert_eq!(fail_args[5], ctx.const_ref(frame.lastblock as usize as i64));
+        assert_eq!(fail_args[6], ctx.const_ref(frame.w_globals as usize as i64));
+    }
+
+    #[test]
+    fn test_current_fail_args_materializes_symbolic_holes_with_compiled_trace_jitcode() {
+        use majit_ir::{OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::compile_exec;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::{w_int_new, w_list_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[1] = w_int_new(7);
+        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        frame.locals_w_mut()[3] = w_int_new(5);
+        frame.valuestackdepth = 4;
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+
+        let mut ctx = TraceCtx::for_test(2);
+        let frame_ref = ctx.const_ref(frame_ptr as i64);
+        let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+        let mut sym = PyreSym::from_test_state(TestSymState {
+            frame: frame_ref,
+            jitcode: jitcode_ptr,
+            nlocals: 2,
+            valuestackdepth: 4,
+            locals_cells_stack_array_ref: locals_array,
+            symbolic_local_types: vec![Type::Ref, Type::Int],
+            symbolic_stack_types: vec![Type::Ref, Type::Int],
+            registers_r: vec![OpRef::NONE; 4],
+            concrete_stack: vec![],
+            concrete_namespace: frame.w_globals,
+            vable_last_instr: ctx.const_int(0),
+            vable_pycode: ctx.const_ref(0),
+            vable_valuestackdepth: ctx.const_int(0),
+            vable_debugdata: ctx.const_ref(0),
+            vable_lastblock: ctx.const_ref(0),
+            vable_w_globals: ctx.const_ref(0),
+            pre_opcode_vsd: None,
+            pre_opcode_registers_r: None,
+        });
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        let fail_args = state.capture_current_fail_args();
+
+        assert!(live_regs.contains(&2));
+        assert!(live_regs.contains(&3));
+        assert_eq!(
+            fail_args.len(),
+            pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + live_regs.len(),
+        );
+        assert_eq!(fail_args[0], frame_ref);
+        assert!(
+            fail_args.iter().all(|arg| !arg.is_none()),
+            "materialized fail args should not contain OpRef::NONE holes"
+        );
+        assert!(
+            state.symbolic_registers_r()[2..4]
+                .iter()
+                .all(|opref| !opref.is_none()),
+            "live stack slots should be materialized into the symbolic register file"
+        );
+    }
+
+    #[test]
+    fn test_load_local_checked_value_respects_symbolic_local_type_with_compiled_trace_jitcode() {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_interpreter::{LocalOpcodeHandler, compile_exec};
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::{w_int_new, w_list_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module =
+            compile_exec("def f(b):\n    return b\nf(1)\n").expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[0]);
+
+        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
+            let mut ctx = TraceCtx::for_test_types(&[symbolic_type]);
+            let local = OpRef(0);
+            let frame_ref = ctx.const_ref(frame_ptr as i64);
+            let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+            let mut sym = PyreSym::from_test_state(TestSymState {
+                frame: frame_ref,
+                jitcode: jitcode_ptr,
+                nlocals: 1,
+                valuestackdepth: 1,
+                locals_cells_stack_array_ref: locals_array,
+                symbolic_local_types: vec![symbolic_type],
+                symbolic_stack_types: vec![],
+                registers_r: vec![local],
+                concrete_stack: vec![],
+                concrete_namespace: frame.w_globals,
+                vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
+                vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
+                vable_valuestackdepth: ctx.const_int(1),
+                vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
+                vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
+                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+                pre_opcode_vsd: None,
+                pre_opcode_registers_r: None,
+            });
+            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+            let loaded =
+                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
+                    .expect("local should load");
+            assert_eq!(loaded.opref, local);
+
+            let recorder = ctx.into_recorder();
+            match expected_guard {
+                Some(opcode) => {
+                    assert!(
+                        recorder.ops().iter().any(|op| op.opcode == opcode),
+                        "expected guard opcode {opcode:?} in {:?}",
+                        recorder.ops()
+                    );
+                }
+                None => assert_eq!(recorder.num_guards(), 0),
+            }
+        };
+
+        run_case(Type::Int, "j", None);
+        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
+    }
+
+    #[test]
+    fn test_guard_class_uses_guard_nonnull_class_with_compiled_trace_jitcode() {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::compile_exec;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::{INT_TYPE, w_int_new, w_list_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[1] = w_int_new(7);
+        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        frame.locals_w_mut()[3] = w_int_new(5);
+        frame.valuestackdepth = 4;
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let obj = OpRef(0);
+        let frame_ref = ctx.const_ref(frame_ptr as i64);
+        let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+        let mut sym = PyreSym::from_test_state(TestSymState {
+            frame: frame_ref,
+            jitcode: jitcode_ptr,
+            nlocals: 2,
+            valuestackdepth: 4,
+            locals_cells_stack_array_ref: locals_array,
+            symbolic_local_types: vec![Type::Ref, Type::Int],
+            symbolic_stack_types: vec![Type::Ref, Type::Int],
+            registers_r: vec![OpRef::NONE; 4],
+            concrete_stack: vec![],
+            concrete_namespace: frame.w_globals,
+            vable_last_instr: ctx.const_int(0),
+            vable_pycode: ctx.const_ref(0),
+            vable_valuestackdepth: ctx.const_int(0),
+            vable_debugdata: ctx.const_ref(0),
+            vable_lastblock: ctx.const_ref(0),
+            vable_w_globals: ctx.const_ref(0),
+            pre_opcode_vsd: None,
+            pre_opcode_registers_r: None,
+        });
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        state.capture_guard_class(obj, &INT_TYPE as *const _);
+
+        let recorder = ctx.into_recorder();
+        let op = recorder.ops().last().expect("guard op should be present");
+        assert_eq!(op.opcode, OpCode::GuardNonnullClass);
+        assert_eq!(op.args[0], obj);
+    }
+
+    #[test]
+    fn test_trace_guarded_int_payload_uses_guard_nonnull_class_and_pure_payload_with_compiled_trace_jitcode()
+     {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::compile_exec;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::{w_int_new, w_list_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[1] = w_int_new(7);
+        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        frame.locals_w_mut()[3] = w_int_new(5);
+        frame.valuestackdepth = 4;
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let int_obj = OpRef(0);
+        let frame_ref = ctx.const_ref(frame_ptr as i64);
+        let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+        let mut sym = PyreSym::from_test_state(TestSymState {
+            frame: frame_ref,
+            jitcode: jitcode_ptr,
+            nlocals: 2,
+            valuestackdepth: 4,
+            locals_cells_stack_array_ref: locals_array,
+            symbolic_local_types: vec![Type::Ref, Type::Int],
+            symbolic_stack_types: vec![Type::Ref, Type::Int],
+            registers_r: vec![OpRef::NONE; 4],
+            concrete_stack: vec![],
+            concrete_namespace: frame.w_globals,
+            vable_last_instr: ctx.const_int(0),
+            vable_pycode: ctx.const_ref(0),
+            vable_valuestackdepth: ctx.const_int(0),
+            vable_debugdata: ctx.const_ref(0),
+            vable_lastblock: ctx.const_ref(0),
+            vable_w_globals: ctx.const_ref(0),
+            pre_opcode_vsd: None,
+            pre_opcode_registers_r: None,
+        });
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        let _ = state.capture_trace_guarded_int_payload(int_obj);
+
+        let recorder = ctx.into_recorder();
+        let mut saw_guard_nonnull_class = false;
+        let mut saw_pure_payload = false;
+        let recorded_ops: Vec<(OpCode, Vec<OpRef>)> = recorder
+            .ops()
+            .iter()
+            .map(|op| (op.opcode, op.args.to_vec()))
+            .collect();
+        for op in recorder.ops() {
+            if op.opcode == OpCode::GuardNonnullClass {
+                saw_guard_nonnull_class = true;
+            }
+            if op.opcode == OpCode::GetfieldGcPureI && op.args.as_slice() == &[int_obj] {
+                saw_pure_payload = true;
+            }
+        }
+        assert!(
+            saw_guard_nonnull_class,
+            "int payload fast path should guard object class via GuardNonnullClass: {:?}",
+            recorded_ops
+        );
+        assert!(
+            saw_pure_payload,
+            "int payload fast path should read the immutable payload with GetfieldGcPureI: {:?}",
+            recorded_ops
+        );
+    }
+
+    #[test]
+    fn test_branch_guard_preserves_pre_pop_stack_shape_with_compiled_trace_jitcode() {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::compile_exec;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::{w_int_new, w_list_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[1] = w_int_new(7);
+        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        frame.locals_w_mut()[3] = w_int_new(1);
+        frame.valuestackdepth = 4;
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+
+        let run_case = |record_branch_guard: bool| {
+            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
+            let lower_stack = OpRef(0);
+            let truth = OpRef(1);
+            let frame_ref = ctx.const_ref(frame_ptr as i64);
+            let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+            let mut sym = PyreSym::from_test_state(TestSymState {
+                frame: frame_ref,
+                jitcode: jitcode_ptr,
+                nlocals: 2,
+                valuestackdepth: 4,
+                locals_cells_stack_array_ref: locals_array,
+                symbolic_local_types: vec![Type::Ref, Type::Int],
+                symbolic_stack_types: vec![Type::Ref, Type::Int],
+                registers_r: vec![OpRef::NONE, OpRef::NONE, lower_stack, truth],
+                concrete_stack: vec![],
+                concrete_namespace: frame.w_globals,
+                vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
+                vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
+                vable_valuestackdepth: ctx.const_int(4),
+                vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
+                vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
+                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+                pre_opcode_vsd: None,
+                pre_opcode_registers_r: None,
+            });
+            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+            if record_branch_guard {
+                state.capture_record_branch_guard(OpRef::NONE, truth, true, resume_pc);
+            } else {
+                state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
+            }
+
+            let recorder = ctx.into_recorder();
+            let guard = recorder
+                .ops()
+                .last()
+                .expect("branch guard should be recorded");
+            let fail_args = guard
+                .fail_args
+                .as_ref()
+                .expect("branch guard should carry explicit fail args");
+            let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let active_boxes = &fail_args[n..];
+            assert_eq!(guard.opcode, OpCode::GuardTrue);
+            assert_eq!(fail_args.len(), n + live_regs.len());
+            assert_eq!(fail_args[0], frame_ref);
+            assert!(
+                active_boxes
+                    .windows(2)
+                    .any(|pair| pair == [lower_stack, truth]),
+                "pre-pop stack order should preserve lower stack slot before truth: {:?}",
+                active_boxes
+            );
+        };
+
+        run_case(true);
+        run_case(false);
+    }
+
+    #[test]
+    fn test_branch_truth_uses_concrete_parameter_with_compiled_trace_jitcode() {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_interpreter::{BranchOpcodeHandler, compile_exec};
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::{w_int_new, w_list_new};
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
+        frame.locals_w_mut()[1] = w_int_new(7);
+        frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
+        frame.locals_w_mut()[3] = w_int_new(1);
+        frame.valuestackdepth = 4;
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
+        let lower_stack = OpRef(0);
+        let truth = OpRef(1);
+        let frame_ref = ctx.const_ref(frame_ptr as i64);
+        let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+        let mut sym = PyreSym::from_test_state(TestSymState {
+            frame: frame_ref,
+            jitcode: jitcode_ptr,
+            nlocals: 2,
+            valuestackdepth: 4,
+            locals_cells_stack_array_ref: locals_array,
+            symbolic_local_types: vec![Type::Ref, Type::Int],
+            symbolic_stack_types: vec![Type::Ref, Type::Int],
+            registers_r: vec![OpRef::NONE, OpRef::NONE, lower_stack, truth],
+            concrete_stack: vec![],
+            concrete_namespace: frame.w_globals,
+            vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
+            vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
+            vable_valuestackdepth: ctx.const_int(4),
+            vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
+            vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            pre_opcode_vsd: None,
+            pre_opcode_registers_r: None,
+        });
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
+        assert_eq!(
+            state
+                .capture_concrete_branch_truth_for_value(truth, w_int_new(1))
+                .unwrap(),
+            true
+        );
+        <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
+
+        let recorder = ctx.into_recorder();
+        let guard = recorder.ops().last().expect("guard op should be present");
+        let fail_args = guard
+            .fail_args
+            .as_ref()
+            .expect("mixed-bank guard should carry fail args");
+        let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let active_boxes = &fail_args[n..];
+        assert_eq!(guard.opcode, OpCode::GuardTrue);
+        assert_eq!(fail_args.len(), n + live_regs.len());
+        assert!(
+            active_boxes
+                .windows(2)
+                .any(|pair| pair == [lower_stack, truth]),
+            "mixed-bank guard should preserve the Ref+Int stack pair order: {:?}",
+            active_boxes
+        );
+    }
+
+    #[test]
+    fn test_close_loop_args_at_target_pc_preserves_virtualizable_stack_with_compiled_trace_jitcode()
+    {
+        use majit_ir::Type;
+        use majit_metainterp::TraceCtx;
+        use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
+        use pyre_object::w_int_new;
+
+        let _ = driver_pair();
+        init_callbacks();
+        let (frame, jitcode_ptr, target_pc) = compiled_trace_fixture(
+            "def f(x):\n    return (x, x)\nf(1)\n",
+            "f",
+            &[1, 2],
+            |frame| {
+                frame.locals_w_mut()[0] = w_int_new(7);
+            },
+        );
+        let frame_ptr = (&*frame) as *const PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test(0);
+        let frame_ref = ctx.const_ref(frame_ptr as i64);
+        let local0 = ctx.const_ref(w_int_new(11) as usize as i64);
+        let stack0 = ctx.const_ref(w_int_new(22) as usize as i64);
+        let stack1 = ctx.const_ref(w_int_new(33) as usize as i64);
+        let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+        let mut sym = PyreSym::from_test_state(TestSymState {
+            frame: frame_ref,
+            jitcode: jitcode_ptr,
+            nlocals: 1,
+            valuestackdepth: 3,
+            locals_cells_stack_array_ref: locals_array,
+            symbolic_local_types: vec![Type::Ref],
+            symbolic_stack_types: vec![Type::Ref, Type::Ref],
+            registers_r: vec![local0, stack0, stack1],
+            concrete_stack: vec![],
+            concrete_namespace: frame.w_globals,
+            vable_last_instr: ctx.const_int(target_pc as i64 - 1),
+            vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
+            vable_valuestackdepth: ctx.const_int(3),
+            vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
+            vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            pre_opcode_vsd: None,
+            pre_opcode_registers_r: None,
+        });
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
+
+        let jump_args = state.capture_close_loop_args_at(Some(target_pc));
+
+        assert_eq!(
+            jump_args.len(),
+            pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + 3,
+            "JUMP carries local and stack slots from the virtualizable array"
+        );
+        assert_eq!(state.symbolic_valuestackdepth(), 3);
+        let nlocals = state.symbolic_nlocals();
+        let stack_only = state.symbolic_valuestackdepth() - nlocals;
+        assert_eq!(state.symbolic_registers_r().len(), nlocals + stack_only);
+        assert!(
+            state.symbolic_registers_r()[nlocals..]
+                .iter()
+                .all(|opref| !opref.is_none())
+        );
+    }
+
+    #[test]
+    fn test_trace_dynamic_list_index_typed_int_skips_object_unbox_with_compiled_trace_jitcode() {
+        use majit_ir::{OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_jit_trace::state::{MIFrame, PyreSym};
+        use pyre_object::w_int_new;
+
+        let (frame, jitcode_ptr, resume_pc) =
+            compiled_trace_fixture("def f(b):\n    return b\nf(1)\n", "f", &[0], |frame| {
+                frame.locals_w_mut()[0] = w_int_new(2);
+            });
+        let frame_ptr = (&*frame) as *const PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+        let key = OpRef(0);
+        let len = OpRef(1);
+        let mut sym = PyreSym::from_test_state(single_local_test_state(
+            &mut ctx,
+            &frame,
+            frame_ptr,
+            jitcode_ptr,
+            resume_pc,
+            Type::Int,
+            key,
+        ));
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        let raw_index = state.capture_trace_dynamic_list_index(key, len, 2);
+        assert_eq!(raw_index, key);
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_guards(), 2);
+        assert!(
+            recorder
+                .ops()
+                .iter()
+                .all(|op| op.opcode != majit_ir::OpCode::GuardNonnullClass),
+            "typed-int index should not guard object class for an unbox fast path: {:?}",
+            recorder.ops()
+        );
+        assert!(
+            recorder
+                .ops()
+                .iter()
+                .all(|op| op.opcode != majit_ir::OpCode::GetfieldGcPureI),
+            "typed-int index should not read boxed int payloads: {:?}",
+            recorder.ops()
+        );
+    }
+
+    #[test]
+    fn test_direct_len_value_returns_typed_raw_len_for_integer_list_with_compiled_trace_jitcode() {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_jit_trace::state::{MIFrame, PyreSym};
+        use pyre_object::{w_int_new, w_list_new};
+
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            assert!(pyre_object::listobject::w_list_uses_int_storage(list));
+        }
+        let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
+            "def f(x):\n    return len(x)\nf([1, 2, 3])\n",
+            "f",
+            &[0],
+            |frame| {
+                frame.locals_w_mut()[0] = list;
+            },
+        );
+        let frame_ptr = (&*frame) as *const PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let value = OpRef(0);
+        let callable = OpRef(1);
+        let mut sym = PyreSym::from_test_state(single_local_test_state(
+            &mut ctx,
+            &frame,
+            frame_ptr,
+            jitcode_ptr,
+            resume_pc,
+            Type::Ref,
+            value,
+        ));
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        let len = state
+            .capture_direct_len_value(callable, value, list)
+            .expect("integer-list len fast path should trace");
+        assert_eq!(state.capture_value_type(len), Type::Int);
+
+        let recorder = ctx.into_recorder();
+        assert_ne!(
+            recorder.ops().last().map(|op| op.opcode),
+            Some(OpCode::CallI)
+        );
+        let mut saw_len_field = false;
+        let mut saw_new = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if op.opcode == OpCode::New {
+                saw_new = true;
+            }
+            if op.opcode == OpCode::GetfieldGcI
+                && op.descr.as_ref().map(|d| d.index())
+                    == Some(pyre_jit_trace::descr::list_int_items_len_descr().index())
+            {
+                saw_len_field = true;
+            }
+        }
+        assert!(saw_len_field);
+        assert!(!saw_new);
+    }
+
+    #[test]
+    fn test_trace_direct_float_list_getitem_uses_gc_field_loads_for_list_object_with_compiled_trace_jitcode()
+     {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_jit_trace::state::{MIFrame, PyreSym};
+
+        let float_list = pyre_object::w_list_new(vec![
+            pyre_object::floatobject::w_float_new(1.5),
+            pyre_object::floatobject::w_float_new(2.5),
+            pyre_object::floatobject::w_float_new(3.5),
+        ]);
+        unsafe {
+            assert!(pyre_object::listobject::w_list_uses_float_storage(
+                float_list
+            ));
+        }
+        let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
+            "def f(x):\n    return x[2]\nf([1.5, 2.5, 3.5])\n",
+            "f",
+            &[0],
+            |frame| {
+                frame.locals_w_mut()[0] = float_list;
+            },
+        );
+        let frame_ptr = (&*frame) as *const PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
+        let list = OpRef(0);
+        let key = OpRef(1);
+        let mut sym = PyreSym::from_test_state(single_local_test_state(
+            &mut ctx,
+            &frame,
+            frame_ptr,
+            jitcode_ptr,
+            resume_pc,
+            Type::Ref,
+            list,
+        ));
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        let result = state.capture_generated_list_getitem_by_strategy(list, key, 2, 2);
+        assert_eq!(state.capture_value_type(result), Type::Float);
+
+        let recorder = ctx.into_recorder();
+        let mut saw_gc_field = false;
+        let mut saw_raw_field = false;
+        let mut saw_raw_array = false;
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            match op.opcode {
+                OpCode::GetfieldGcI if op.args.first().copied() == Some(list) => {
+                    saw_gc_field = true
+                }
+                OpCode::GetfieldRawI if op.args.first().copied() == Some(list) => {
+                    saw_raw_field = true
+                }
+                OpCode::GetarrayitemRawF => saw_raw_array = true,
+                _ => {}
+            }
+        }
+        assert!(saw_gc_field);
+        assert!(!saw_raw_field);
+        assert!(saw_raw_array);
+    }
+
+    #[test]
+    fn test_list_append_value_uses_raw_storage_fast_paths_with_compiled_trace_jitcode() {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_jit_trace::state::{MIFrame, PyreSym};
+
+        let run_case = |concrete_list: pyre_object::PyObjectRef,
+                        symbolic_value_type: Type,
+                        concrete_value: pyre_object::PyObjectRef,
+                        expected_len_descr_idx: u32,
+                        expect_box_alloc: bool| {
+            let (frame, jitcode_ptr, resume_pc) =
+                compiled_trace_fixture("def f(x):\n    return x\nf([1])\n", "f", &[0], |frame| {
+                    frame.locals_w_mut()[0] = concrete_list;
+                });
+            let frame_ptr = (&*frame) as *const PyFrame as usize;
+
+            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, symbolic_value_type]);
+            let list = OpRef(0);
+            let value = OpRef(1);
+            let mut sym = PyreSym::from_test_state(single_local_test_state(
+                &mut ctx,
+                &frame,
+                frame_ptr,
+                jitcode_ptr,
+                resume_pc,
+                Type::Ref,
+                list,
+            ));
+            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+            state
+                .capture_list_append_value(list, value, concrete_list, concrete_value)
+                .expect("raw-storage append fast path should trace");
+
+            let recorder = ctx.into_recorder();
+            let mut saw_raw_setitem = false;
+            let mut saw_len_update = false;
+            let mut saw_call = false;
+            let mut saw_new = false;
+            for pos in 2..(2 + recorder.num_ops() as u32) {
+                let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                    continue;
+                };
+                if matches!(
+                    op.opcode,
+                    OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
+                ) {
+                    saw_call = true;
+                }
+                if op.opcode == OpCode::New {
+                    saw_new = true;
+                }
+                if op.opcode == OpCode::SetarrayitemRaw {
+                    saw_raw_setitem = true;
+                }
+                if op.opcode == OpCode::SetfieldGc
+                    && op.descr.as_ref().map(|d| d.index()) == Some(expected_len_descr_idx)
+                {
+                    saw_len_update = true;
+                }
+            }
+            assert!(saw_raw_setitem);
+            assert!(saw_len_update);
+            assert!(!saw_call);
+            assert_eq!(saw_new, expect_box_alloc);
+        };
+
+        let int_list =
+            pyre_object::w_list_new(vec![pyre_object::w_int_new(1), pyre_object::w_int_new(2)]);
+        unsafe {
+            assert!(pyre_object::listobject::w_list_uses_int_storage(int_list));
+            assert!(pyre_object::listobject::w_list_can_append_without_realloc(
+                int_list
+            ));
+        }
+        run_case(
+            int_list,
+            Type::Int,
+            pyre_object::w_int_new(42),
+            pyre_jit_trace::descr::list_int_items_len_descr().index(),
+            false,
+        );
+
+        let float_list = pyre_object::w_list_new(vec![
+            pyre_object::w_float_new(1.5),
+            pyre_object::w_float_new(2.5),
+        ]);
+        unsafe {
+            assert!(pyre_object::listobject::w_list_uses_float_storage(
+                float_list
+            ));
+            assert!(pyre_object::listobject::w_list_can_append_without_realloc(
+                float_list
+            ));
+        }
+        run_case(
+            float_list,
+            Type::Float,
+            pyre_object::w_float_new(3.14),
+            pyre_jit_trace::descr::list_float_items_len_descr().index(),
+            false,
+        );
+    }
+
+    #[test]
+    fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int_with_compiled_trace_jitcode()
+     {
+        use majit_ir::{OpCode, OpRef, Type};
+        use majit_metainterp::TraceCtx;
+        use pyre_interpreter::IterOpcodeHandler;
+        use pyre_jit_trace::state::{MIFrame, PyreSym};
+
+        let range_iter = pyre_object::w_range_iter_new(0, 2, 1);
+        let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
+            "def f(it):\n    return it\nf(range(2))\n",
+            "f",
+            &[0],
+            |frame| {
+                frame.locals_w_mut()[0] = range_iter;
+            },
+        );
+        let frame_ptr = (&*frame) as *const PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let iter = OpRef(0);
+        let mut sym = PyreSym::from_test_state(single_local_test_state(
+            &mut ctx,
+            &frame,
+            frame_ptr,
+            jitcode_ptr,
+            resume_pc,
+            Type::Ref,
+            iter,
+        ));
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
+
+        let next = state
+            .capture_iter_next_value(iter, range_iter)
+            .expect("range iterator fast path should trace");
+        assert_eq!(state.capture_value_type(next.opref), Type::Int);
+        <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
+            .expect("typed range next should not need optional guard");
+
+        let recorder = ctx.into_recorder();
+        let mut saw_getfield_gc = false;
+        let mut saw_setfield_gc = false;
+        let mut saw_setfield_raw = false;
+        let mut saw_getfield_raw = false;
+        let mut saw_new = false;
+        let mut saw_optional_guard = false;
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            match op.opcode {
+                OpCode::GetfieldGcI if op.args.first().copied() == Some(iter) => {
+                    saw_getfield_gc = true
+                }
+                OpCode::SetfieldGc if op.args.first().copied() == Some(iter) => {
+                    saw_setfield_gc = true
+                }
+                OpCode::SetfieldRaw if op.args.first().copied() == Some(iter) => {
+                    saw_setfield_raw = true
+                }
+                OpCode::GetfieldRawI if op.args.first().copied() == Some(iter) => {
+                    saw_getfield_raw = true
+                }
+                OpCode::New => saw_new = true,
+                OpCode::GuardNonnull | OpCode::GuardIsnull => saw_optional_guard = true,
+                _ => {}
+            }
+        }
+        assert!(saw_getfield_gc);
+        assert!(saw_setfield_gc);
+        assert!(!saw_setfield_raw);
+        assert!(!saw_getfield_raw);
+        assert!(!saw_new);
+        assert!(!saw_optional_guard);
+    }
+
     #[test]
     fn test_eval_simple_addition() {
         let source = "x = 1 + 2";

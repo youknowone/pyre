@@ -520,6 +520,42 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, supplied))
 }
 
+/// Ensure the trace-side staticdata has a JitCode slot for this
+/// `W_CodeObject` and return its SD-local `jitcode.index`.
+///
+/// This is the real runtime path: it goes through `jitcode_for(code)`,
+/// which in turn invokes the registered compile callback when the slot is
+/// missing or still a skeleton. Used by higher-level integration tests in
+/// `pyre-jit` so they can exercise guard/resume decoding without
+/// reintroducing synthetic test-only JitCode builders in this crate.
+pub fn ensure_jitcode_index(code: *const ()) -> Option<i32> {
+    if code.is_null() {
+        return None;
+    }
+    let jitcode = jitcode_for(code);
+    Some(unsafe { (*jitcode).index })
+}
+
+/// Ensure the trace-side staticdata has a compiled `JitCode` slot for
+/// this `W_CodeObject` and return the runtime `JitCode*` as an opaque
+/// pointer.
+///
+/// Cross-crate tests in `pyre-jit` use this to seed `PyreSym.jitcode`
+/// with the same pointer the tracer and blackhole paths would see after
+/// `jitcode_for(code)` ran the registered compile callback.
+#[doc(hidden)]
+pub fn ensure_jitcode_ptr(code: *const ()) -> Option<*const ()> {
+    if code.is_null() {
+        return None;
+    }
+    Some(jitcode_for(code) as *const ())
+}
+
+#[doc(hidden)]
+pub fn frame_locals_cells_stack_array_ref(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    frame_locals_cells_stack_array(ctx, frame)
+}
+
 /// Read-only JitCode lookup by CodeObject-wrapper pointer.
 ///
 /// Blackhole/resume paths must not invoke the compile callback: any
@@ -608,39 +644,20 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         }
         // `CallControl.get_jitcode` drain fills pc_map + liveness
         // before any guard capture (pyjitpl.py:199 parity). Phase X-0
-        // (commit 0b30f5a85e) also eliminated the out-of-range-pc source
-        // that previously reached this branch by threading
-        // jitcode_index through `Snapshot::single_frame`. Release
-        // builds panic here — every remaining reach would be a bug.
-        // Debug builds retain the LiveVars fallback so the existing
-        // `PyreSym::new_uninit`-based unit test harness can still
-        // exercise this function without setting up a full jitcode.
-        if !cfg!(debug_assertions) {
-            panic!(
-                "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
-                 (pc_map.len={}, all_liveness.len={}). Phase X-0 removed the \
-                 known production trigger — further hits are bugs.",
-                jitcode_index,
-                pc,
-                payload.metadata.pc_map.len(),
-                sd.liveness_info.len(),
-            );
-        }
-        if !jc.code.is_null() {
-            let raw = unsafe { jc.raw_code() };
-            let live = crate::liveness::liveness_for(raw);
-            let code_ref = unsafe { &*raw };
-            let nlocals = code_ref.varnames.len();
-            let live_locals = (0..nlocals)
-                .filter(|&i| live.is_local_live(pc as usize, i))
-                .count();
-            let stack_depth = live.stack_depth_at(pc as usize);
-            let live_stack = (0..stack_depth)
-                .filter(|&i| live.is_stack_live(pc as usize, i))
-                .count();
-            return live_locals + live_stack;
-        }
-        0
+        // eliminated the out-of-range-pc source by threading
+        // jitcode_index through `Snapshot::single_frame`. Phase X-1(a)
+        // moved the remaining guard/resume tests onto the real
+        // compile/register path in `pyre-jit`. Unconditional panic —
+        // any hit is a bug.
+        panic!(
+            "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
+             (pc_map.len={}, all_liveness.len={}). Phase X-0/X-1 removed \
+             all known triggers — further hits are bugs.",
+            jitcode_index,
+            pc,
+            payload.metadata.pc_map.len(),
+            sd.liveness_info.len(),
+        );
     })
 }
 
@@ -1124,6 +1141,28 @@ pub struct PyreSym {
     #[vable(locals)]
     pub(crate) registers_r: Vec<OpRef>,
     pub(crate) registers_f: Vec<OpRef>,
+}
+
+#[doc(hidden)]
+pub struct TestSymState {
+    pub frame: OpRef,
+    pub jitcode: *const (),
+    pub nlocals: usize,
+    pub valuestackdepth: usize,
+    pub locals_cells_stack_array_ref: OpRef,
+    pub symbolic_local_types: Vec<Type>,
+    pub symbolic_stack_types: Vec<Type>,
+    pub registers_r: Vec<OpRef>,
+    pub concrete_stack: Vec<ConcreteValue>,
+    pub concrete_namespace: *mut pyre_interpreter::DictStorage,
+    pub vable_last_instr: OpRef,
+    pub vable_pycode: OpRef,
+    pub vable_valuestackdepth: OpRef,
+    pub vable_debugdata: OpRef,
+    pub vable_lastblock: OpRef,
+    pub vable_w_globals: OpRef,
+    pub pre_opcode_vsd: Option<usize>,
+    pub pre_opcode_registers_r: Option<Vec<OpRef>>,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -1904,6 +1943,29 @@ impl PyreSym {
             registers_r: Vec::new(),
             registers_f: Vec::new(),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn from_test_state(state: TestSymState) -> Self {
+        let mut sym = Self::new_uninit(state.frame);
+        sym.jitcode = state.jitcode as *const JitCode;
+        sym.nlocals = state.nlocals;
+        sym.valuestackdepth = state.valuestackdepth;
+        sym.locals_cells_stack_array_ref = state.locals_cells_stack_array_ref;
+        sym.symbolic_local_types = state.symbolic_local_types;
+        sym.symbolic_stack_types = state.symbolic_stack_types;
+        sym.registers_r = state.registers_r;
+        sym.concrete_stack = state.concrete_stack;
+        sym.concrete_namespace = state.concrete_namespace;
+        sym.vable_last_instr = state.vable_last_instr;
+        sym.vable_pycode = state.vable_pycode;
+        sym.vable_valuestackdepth = state.vable_valuestackdepth;
+        sym.vable_debugdata = state.vable_debugdata;
+        sym.vable_lastblock = state.vable_lastblock;
+        sym.vable_w_globals = state.vable_w_globals;
+        sym.pre_opcode_vsd = state.pre_opcode_vsd;
+        sym.pre_opcode_registers_r = state.pre_opcode_registers_r;
+        sym
     }
 
     /// Initialize symbolic tracking state. Called once when the owning
@@ -4006,46 +4068,18 @@ impl JitState for PyreJitState {
             true
         })();
         if !decoded_via_jitcode {
-            // Phase X-0 (commit 0b30f5a85e) eliminated the out-of-range-pc
-            // source that previously reached this branch. Release builds
-            // panic here — every remaining reach would be a bug. Debug
-            // builds retain the LiveVars fallback so unit-test harness
-            // paths that construct `PyreSym::new_uninit` without a full
-            // jitcode can still call this function.
-            if !cfg!(debug_assertions) {
-                panic!(
-                    "bridge resume decode: jitcode path failed — \
-                     w_code_ptr={:p} raw_code_ptr={:p} live_pc={} \
-                     nlocals={} stack_only={}. Phase X-0 removed the known \
-                     production trigger; further hits are bugs.",
-                    w_code_ptr, raw_code_ptr, live_pc, nlocals, stack_only
-                );
-            }
-            let live = if !raw_code_ptr.is_null() {
-                Some(liveness_for(raw_code_ptr))
-            } else {
-                None
-            };
-            for local_idx in 0..nlocals {
-                let is_live = live.map_or(true, |lv| lv.is_local_live(live_pc, local_idx));
-                if is_live {
-                    if let Some(value) = values.get(idx) {
-                        let boxed = virtualizable_box_value(value);
-                        let _ = self.set_local_at(local_idx, boxed);
-                    }
-                    idx += 1;
-                }
-            }
-            for stack_idx in 0..stack_only {
-                let is_live = live.map_or(true, |lv| lv.is_stack_live(live_pc, stack_idx));
-                if is_live {
-                    if let Some(value) = values.get(idx) {
-                        let boxed = virtualizable_box_value(value);
-                        let _ = self.set_stack_at(stack_idx, boxed);
-                    }
-                    idx += 1;
-                }
-            }
+            // Phase X-0 eliminated the out-of-range-pc source that
+            // previously reached this branch. Phase X-1(a) migrated the
+            // bridge-resume tests to the real trace-side jitcode
+            // registration path (`ensure_jitcode_index`). Unconditional
+            // panic — any hit is a bug.
+            panic!(
+                "bridge resume decode: jitcode path failed — \
+                 w_code_ptr={:p} raw_code_ptr={:p} live_pc={} \
+                 nlocals={} stack_only={}. Phase X-0/X-1 removed all \
+                 known triggers; further hits are bugs.",
+                w_code_ptr, raw_code_ptr, live_pc, nlocals, stack_only
+            );
         }
 
         // Clear stale slots beyond valuestackdepth (blackhole fresh frame parity).
@@ -4462,8 +4496,7 @@ mod tests {
     use pyre_interpreter::bytecode::BinaryOperator;
     use pyre_interpreter::eval::eval_frame_plain;
     use pyre_interpreter::{
-        BranchOpcodeHandler, IterOpcodeHandler, LocalOpcodeHandler, OpcodeStepExecutor,
-        SharedOpcodeHandler, compile_exec,
+        IterOpcodeHandler, OpcodeStepExecutor, SharedOpcodeHandler, compile_exec,
     };
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
@@ -4539,88 +4572,6 @@ mod tests {
         assert_eq!(field.field_type(), Type::Int);
         assert!(descr.is_always_pure());
         assert!(field.is_immutable());
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_guard_class_uses_guard_nonnull_class() {
-        let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![obj];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.nlocals = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        state.with_ctx(|this, ctx| {
-            this.guard_class(ctx, obj, &INT_TYPE as *const PyType);
-        });
-
-        let recorder = ctx.into_recorder();
-        let op = recorder.ops().last().expect("guard op should be present");
-        assert_eq!(op.opcode, OpCode::GuardNonnullClass);
-        assert_eq!(op.args[0], obj);
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_trace_guarded_int_payload_uses_guard_nonnull_class_and_pure_payload() {
-        let mut ctx = TraceCtx::for_test(1);
-        let int_obj = OpRef(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![int_obj];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.nlocals = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
-
-        let recorder = ctx.into_recorder();
-        let mut saw_guard_nonnull_class = false;
-        let mut saw_pure_payload = false;
-        for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
-            if op.opcode == OpCode::GuardNonnullClass {
-                saw_guard_nonnull_class = true;
-            }
-            if op.opcode == OpCode::GetfieldGcPureI && op.args.as_slice() == &[int_obj] {
-                saw_pure_payload = true;
-            }
-        }
-        assert!(
-            saw_guard_nonnull_class,
-            "int payload fast path should guard object class via GuardNonnullClass"
-        );
-        assert!(
-            saw_pure_payload,
-            "int payload fast path should read the immutable payload with GetfieldGcPureI"
-        );
     }
 
     #[test]
@@ -4856,114 +4807,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
-        use majit_ir::GcRef;
-        use pyre_interpreter::pyframe::PyFrame;
-        use pyre_interpreter::{ConstantData, compile_exec};
-
-        let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
-            .expect("test code should compile");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                    Some((**code).clone())
-                }
-                _ => None,
-            })
-            .expect("test source should contain function code");
-
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut state = PyreJitState {
-            frame: frame_ptr,
-            resume_pc: None,
-        };
-        state.set_next_instr(0);
-        state.set_valuestackdepth(4);
-        let meta = PyreMeta {
-            num_locals: 4,
-            ns_len: 0,
-            valuestackdepth: 4,
-            has_virtualizable: true,
-            // Stale trace-entry types: all locals looked boxed refs when the
-            // trace started, but guard failure can still carry a raw int in
-            // slot `i`.
-            slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
-        };
-        let values = vec![
-            Value::Ref(GcRef(frame_ptr)),             // frame
-            Value::Int(8),                            // last_instr
-            Value::Ref(GcRef(frame.pycode as usize)), // pycode
-            Value::Int(4),                            // valuestackdepth
-            Value::Ref(GcRef(0)),                     // debugdata
-            Value::Ref(GcRef(0)),                     // lastblock
-            Value::Ref(GcRef(0)),                     // w_globals
-            Value::Ref(GcRef(w_int_new(1) as usize)), // local a
-            Value::Ref(GcRef(w_int_new(2) as usize)), // local b
-            Value::Ref(GcRef(w_int_new(3) as usize)), // local c
-            Value::Int(7),                            // local i
-        ];
-
-        assert!(<PyreJitState as JitState>::restore_guard_failure_values(
-            &mut state,
-            &meta,
-            &values,
-            &majit_metainterp::blackhole::ExceptionState::default(),
-        ));
-
-        assert_eq!(state.next_instr(), 9);
-        assert_eq!(state.valuestackdepth(), 4);
-        let restored_i = state.local_at(3).expect("local i should be restored");
-        assert!(unsafe { is_int(restored_i) });
-        assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_load_local_checked_value_respects_symbolic_local_type() {
-        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
-            let mut ctx = TraceCtx::for_test(1);
-            let local = OpRef(0);
-            let mut sym = PyreSym::new_uninit(OpRef::NONE);
-            sym.registers_r = vec![local];
-            sym.symbolic_local_types = vec![symbolic_type];
-            sym.nlocals = 1;
-
-            let mut state = MIFrame {
-                ctx: &mut ctx,
-                sym: &mut sym,
-                fallthrough_pc: 0,
-                parent_frames: Vec::new(),
-                pending_inline_frame: None,
-                orgpc: 0,
-                concrete_frame_addr: 0,
-            };
-
-            let loaded =
-                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
-                    .expect("local should load");
-            assert_eq!(loaded.opref, local);
-
-            let recorder = ctx.into_recorder();
-            assert_eq!(recorder.ops().last().map(|op| op.opcode), expected_guard);
-        };
-
-        run_case(Type::Int, "j", None);
-        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
-    }
-
-    #[test]
     fn test_store_local_value_preserves_ref_slot_without_reboxing() {
         // RPython Box.type parity: `_opimpl_setarrayitem_vable`
         // (pyjitpl.py:1242-1247) writes the value's Ref box directly —
@@ -5007,38 +4850,6 @@ mod tests {
             "Ref value must be stored as-is, not reboxed",
         );
         assert_eq!(state.sym().symbolic_local_types[0], Type::Ref);
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_trace_dynamic_list_index_typed_int_skips_object_unbox() {
-        let mut ctx = TraceCtx::for_test(2);
-        let key = OpRef(0);
-        let len = OpRef(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![key];
-        sym.symbolic_local_types = vec![Type::Int];
-        sym.nlocals = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let raw_index = state.with_ctx(|this, ctx| this.trace_dynamic_list_index(ctx, key, len, 2));
-        assert_eq!(raw_index, key);
-
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
-        assert_eq!(recorder.num_guards(), 2);
     }
 
     #[test]
@@ -5352,670 +5163,8 @@ mod tests {
     // try_fused_compare_goto_if_not dispatcher consumed the fused
     // COMPARE_OP + POP_JUMP_IF* pair directly (pyjitpl.py:541-556 parity).
 
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_branch_guard_preserves_pre_pop_stack_shape() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code.clone()));
-        frame.set_last_instr_from_next_instr(456);
-        frame.fix_array_ptrs();
-        let mut ctx = TraceCtx::for_test(3);
-        let frame_ref = OpRef(0);
-        let lower_stack = OpRef(1);
-        let truth = OpRef(2);
-
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.nlocals() + 1;
-        sym.registers_r = vec![OpRef::NONE; sym.nlocals];
-        sym.registers_r.push(lower_stack);
-        sym.symbolic_local_types = vec![Type::Ref; sym.nlocals];
-        sym.symbolic_stack_types = vec![Type::Ref];
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 459,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        state.with_ctx(|this, ctx| {
-            this.record_branch_guard(ctx, OpRef::NONE, truth, true, this.fallthrough_pc);
-        });
-
-        let recorder = ctx.into_recorder();
-        let guard = recorder
-            .ops()
-            .last()
-            .expect("branch guard should be recorded");
-        let fail_args = guard
-            .fail_args
-            .as_ref()
-            .expect("branch guard should carry explicit fail args");
-        assert_eq!(guard.opcode, OpCode::GuardTrue);
-        // fail_args layout: [frame, {scalar header fields...}, stack slots...]
-        // Scalar header has NUM_SCALAR_INPUTARGS - 1 entries; total scalar
-        // count including frame is NUM_SCALAR_INPUTARGS. First box slot is
-        // at index NUM_SCALAR_INPUTARGS.
-        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        assert!(fail_args.len() >= n + 1);
-        assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[n + sym.nlocals], lower_stack);
-
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.set_last_instr_from_next_instr(456);
-        frame.fix_array_ptrs();
-        let mut ctx = TraceCtx::for_test(3);
-        let frame_ref = OpRef(0);
-        let lower_stack = OpRef(1);
-        let truth = OpRef(2);
-
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.nlocals() + 1;
-        sym.registers_r = vec![OpRef::NONE; sym.nlocals];
-        sym.registers_r.push(lower_stack);
-        sym.symbolic_local_types = vec![Type::Ref; sym.nlocals];
-        sym.symbolic_stack_types = vec![Type::Ref];
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 459,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        state.with_ctx(|this, ctx| {
-            this.generate_guard(ctx, OpCode::GuardTrue, &[truth]);
-        });
-
-        let recorder = ctx.into_recorder();
-        let guard = recorder
-            .ops()
-            .last()
-            .expect("branch guard should be recorded");
-        let fail_args = guard
-            .fail_args
-            .as_ref()
-            .expect("branch guard should carry explicit fail args");
-        assert_eq!(guard.opcode, OpCode::GuardTrue);
-        // fail_args: [frame, ni, code, vsd, debugdata, lastblock, ns, lower_stack, ...]
-        assert!(fail_args.len() >= 8);
-        assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[7], lower_stack);
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_branch_truth_uses_concrete_parameter() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.push(w_int_new(1));
-        frame.fix_array_ptrs();
-
-        let mut ctx = TraceCtx::for_test(2);
-        let frame_ref = OpRef(0);
-        let truth = OpRef(1);
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.nlocals = frame.nlocals();
-        sym.valuestackdepth = frame.valuestackdepth;
-        sym.registers_r = vec![OpRef::NONE; sym.nlocals];
-        sym.registers_r.push(truth);
-        sym.symbolic_local_types = vec![Type::Ref; sym.nlocals];
-        sym.symbolic_stack_types = vec![Type::Int];
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        state.with_ctx(|this, ctx| {
-            this.generate_guard(ctx, OpCode::GuardTrue, &[truth]);
-        });
-        // concrete_branch_truth_for_value now takes concrete value as parameter
-        assert_eq!(
-            state
-                .concrete_branch_truth_for_value(truth, w_int_new(1))
-                .unwrap(),
-            true
-        );
-        <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_current_fail_args_flushes_virtualizable_header_before_capture() {
-        let mut ctx = TraceCtx::for_test(2);
-        let frame_ref = OpRef(0);
-        let local0 = OpRef(1);
-        let stack0 = OpRef(2);
-        let stack1 = OpRef(3);
-
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.nlocals = 1;
-        sym.valuestackdepth = 3;
-        sym.vable_last_instr = ctx.const_int(12);
-        sym.vable_pycode = ctx.const_ref(0);
-        sym.vable_valuestackdepth = ctx.const_int(1);
-        sym.vable_debugdata = ctx.const_ref(0);
-        sym.vable_lastblock = ctx.const_ref(0);
-        sym.vable_w_globals = ctx.const_ref(0);
-        sym.registers_r = vec![local0, stack0, stack1];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
-
-        // fail_args layout: [frame, {scalar header fields...}, locals..., stack...]
-        // virtualizable.py:86 read_boxes: all static fields in order.
-        // Scalar header = NUM_SCALAR_INPUTARGS - 1 (excludes frame) fields:
-        //   last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals.
-        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        assert_eq!(fail_args.len(), n + 3);
-        assert_eq!(fail_args[0], frame_ref);
-        assert_eq!(fail_args[n], local0);
-        assert_eq!(fail_args[n + 1], stack0);
-        assert_eq!(fail_args[n + 2], stack1);
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_current_fail_args_materializes_symbolic_holes_from_concrete_frame() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("len(x)").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        let local_ref = w_int_new(41);
-        let stack_int = w_int_new(7);
-        frame.locals_w_mut()[0] = local_ref;
-        frame.locals_w_mut()[1] = stack_int;
-        frame.fix_array_ptrs();
-        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(1);
-        let frame_ref = OpRef(0);
-        let code_ref = frame.pycode;
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.nlocals = 1;
-        sym.valuestackdepth = 2;
-        sym.vable_last_instr = ctx.const_int(33);
-        sym.vable_pycode = ctx.const_ref(0);
-        sym.vable_valuestackdepth = ctx.const_int(0);
-        sym.vable_debugdata = ctx.const_ref(0);
-        sym.vable_lastblock = ctx.const_ref(0);
-        sym.vable_w_globals = ctx.const_ref(0);
-        sym.registers_r = vec![OpRef::NONE, OpRef::NONE];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.symbolic_stack_types = vec![Type::Int];
-        sym.jitcode = jitcode_for(code_ref);
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: frame_ptr,
-        };
-
-        let fail_args = state.with_ctx(|this, ctx| this.current_fail_args(ctx));
-
-        // fail_args: [frame, pc_const, vsd_const, live_slots...]
-        // Liveness-based: only slots live at orgpc are included.
-        assert!(
-            fail_args.len() >= crate::virtualizable_gen::NUM_SCALAR_INPUTARGS,
-            "must have frame + ni + code + vsd + ns header"
-        );
-        assert_eq!(fail_args[0], frame_ref);
-        assert!(
-            fail_args.iter().all(|arg| !arg.is_none()),
-            "materialized fail args should not contain OpRef::NONE holes"
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_close_loop_args_at_target_pc_preserves_virtualizable_stack() {
-        // PyPy reached_loop_header carries self.virtualizable_boxes[:-1]
-        // into the JUMP unchanged. virtualizable.py:86-98 read_boxes
-        // reads the full locals_cells_stack_w array, so close_loop_args_at
-        // must preserve stack slots instead of truncating to nlocals.
-        ensure_test_callbacks();
-        let mut ctx = TraceCtx::for_test(0);
-        let frame_ref = ctx.const_ref(0x1000);
-        let code_ref = ctx.const_ref(0x2000);
-        let namespace_ref = ctx.const_ref(0x3000);
-        let local0 = ctx.const_ref(0x4000);
-        let stack0 = ctx.const_ref(0x5000);
-        let stack1 = ctx.const_ref(0x6000);
-
-        let mut sym = PyreSym::new_uninit(frame_ref);
-        sym.nlocals = 1;
-        sym.valuestackdepth = 3;
-        sym.vable_last_instr = ctx.const_int(33);
-        sym.vable_pycode = code_ref;
-        sym.vable_valuestackdepth = ctx.const_int(3);
-        sym.vable_debugdata = ctx.const_ref(0);
-        sym.vable_lastblock = ctx.const_ref(0);
-        sym.vable_w_globals = namespace_ref;
-        sym.registers_r = vec![local0, stack0, stack1];
-        sym.symbolic_local_types = vec![Type::Ref];
-        sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
-        sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, Some(77)));
-
-        assert_eq!(
-            jump_args.len(),
-            crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + 3,
-            "JUMP carries local and stack slots from the virtualizable array"
-        );
-        assert_eq!(state.sym().valuestackdepth, 3);
-        let nlocals = state.sym().nlocals;
-        let stack_only = state.sym().valuestackdepth - nlocals;
-        assert_eq!(state.sym().registers_r.len(), nlocals + stack_only);
-        assert!(
-            state.sym().registers_r[nlocals..]
-                .iter()
-                .all(|opref| !opref.is_none())
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_direct_len_value_returns_typed_raw_len_for_integer_list() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("len(x)").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
-        unsafe {
-            assert!(w_list_uses_int_storage(list));
-        }
-        let arg_idx = frame.stack_base() + 2;
-        frame.locals_w_mut()[arg_idx] = list;
-        frame.fix_array_ptrs();
-        let mut ctx = TraceCtx::for_test(2);
-        let value = OpRef(0);
-        let callable = OpRef(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![value, callable];
-        sym.symbolic_local_types = vec![Type::Ref, Type::Ref];
-        sym.nlocals = 2;
-        sym.valuestackdepth = frame.stack_base();
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let len = state
-            .direct_len_value(callable, value, list)
-            .expect("integer-list len fast path should trace");
-        let len_type = state.value_type(len);
-        assert_eq!(
-            len_type,
-            Type::Int,
-            "len fast path should produce an Int-typed result"
-        );
-
-        let recorder = ctx.into_recorder();
-        assert_ne!(
-            recorder.ops().last().map(|op| op.opcode),
-            Some(OpCode::CallI),
-            "len(list) should not fall back to the builtin helper call path"
-        );
-        let mut saw_len_field = false;
-        let mut saw_new = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
-            if op.opcode == OpCode::New {
-                saw_new = true;
-            }
-            if op.opcode == OpCode::GetfieldGcI
-                && op.descr.as_ref().map(|d| d.index()) == Some(list_int_items_len_descr().index())
-            {
-                saw_len_field = true;
-            }
-        }
-        assert_eq!(len_type, Type::Int);
-        assert!(
-            saw_len_field,
-            "list len fast path should read the integer-list length field"
-        );
-        assert!(
-            !saw_new,
-            "len(list) should not allocate a W_Int box in the trace"
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_trace_direct_float_list_getitem_uses_gc_field_loads_for_list_object() {
-        let mut ctx = TraceCtx::for_test(2);
-        let list = OpRef(0);
-        let key = OpRef(1);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![list, key];
-        sym.symbolic_local_types = vec![Type::Ref, Type::Int];
-        sym.nlocals = 2;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let result = state.with_ctx(|this, ctx| {
-            crate::generated_list_getitem_by_strategy(this, ctx, list, key, 2, 2)
-        });
-        assert_eq!(state.value_type(result), Type::Float);
-
-        let recorder = ctx.into_recorder();
-        let mut saw_gc_field = false;
-        let mut saw_raw_field = false;
-        let mut saw_raw_array = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
-            match op.opcode {
-                OpCode::GetfieldGcI => saw_gc_field = true,
-                OpCode::GetfieldRawI => saw_raw_field = true,
-                OpCode::GetarrayitemRawF => saw_raw_array = true,
-                _ => {}
-            }
-        }
-        assert!(saw_gc_field, "list object fields should use GetfieldGcI");
-        assert!(
-            !saw_raw_field,
-            "float-list fast path should not use raw field loads on GC list objects"
-        );
-        assert!(saw_raw_array, "payload array access stays raw");
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_list_append_value_uses_raw_storage_fast_paths() {
-        use pyre_interpreter::pyframe::PyFrame;
-
-        let code = compile_exec("x = 1").expect("test code should compile");
-        let run_case = |concrete_list: pyre_object::PyObjectRef,
-                        symbolic_value_type: Type,
-                        concrete_value: pyre_object::PyObjectRef,
-                        expected_array_descr_idx: u32,
-                        expected_len_descr_idx: u32,
-                        case_name: &str,
-                        expect_box_alloc: bool| {
-            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, symbolic_value_type]);
-            let list = OpRef(0);
-            let value = OpRef(1);
-            let mut frame = Box::new(PyFrame::new(code.clone()));
-            frame.fix_array_ptrs();
-
-            let mut sym = PyreSym::new_uninit(OpRef::NONE);
-            sym.registers_r = vec![list, value];
-            sym.symbolic_local_types = vec![Type::Ref, symbolic_value_type];
-            sym.nlocals = 2;
-
-            let mut state = MIFrame {
-                ctx: &mut ctx,
-                sym: &mut sym,
-                fallthrough_pc: 0,
-                parent_frames: Vec::new(),
-                pending_inline_frame: None,
-                orgpc: 0,
-                concrete_frame_addr: 0,
-            };
-
-            state
-                .list_append_value(list, value, concrete_list, concrete_value)
-                .expect("raw-storage append fast path should trace");
-
-            let recorder = ctx.into_recorder();
-            let mut saw_raw_setitem = false;
-            let mut saw_len_update = false;
-            let mut saw_call = false;
-            let mut saw_new = false;
-            for pos in 2..(2 + recorder.num_ops() as u32) {
-                let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                    continue;
-                };
-                if matches!(
-                    op.opcode,
-                    OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
-                ) {
-                    saw_call = true;
-                }
-                if op.opcode == OpCode::New {
-                    saw_new = true;
-                }
-                if op.opcode == OpCode::SetarrayitemRaw
-                    && op.descr.as_ref().map(|d| d.index()) == Some(expected_array_descr_idx)
-                {
-                    saw_raw_setitem = true;
-                }
-                if op.opcode == OpCode::SetfieldGc
-                    && op.descr.as_ref().map(|d| d.index()) == Some(expected_len_descr_idx)
-                {
-                    saw_len_update = true;
-                }
-            }
-
-            assert!(
-                saw_raw_setitem,
-                "{} append should write through the raw payload array",
-                case_name
-            );
-            assert!(
-                saw_len_update,
-                "{} append should update the strategy length field",
-                case_name
-            );
-            assert!(
-                !saw_call,
-                "{} append should not fall back to jit_list_append",
-                case_name
-            );
-            assert_eq!(
-                saw_new, expect_box_alloc,
-                "{} append unexpected boxing allocation behavior",
-                case_name
-            );
-        };
-
-        let int_list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
-        unsafe {
-            assert!(w_list_uses_int_storage(int_list));
-            assert!(w_list_can_append_without_realloc(int_list));
-        }
-        run_case(
-            int_list,
-            Type::Int,
-            w_int_new(42),
-            int_array_descr().index(),
-            list_int_items_len_descr().index(),
-            "integer-list",
-            false,
-        );
-
-        let float_list = w_list_new(vec![
-            pyre_object::floatobject::w_float_new(1.5),
-            pyre_object::floatobject::w_float_new(2.5),
-        ]);
-        unsafe {
-            assert!(w_list_uses_float_storage(float_list));
-            assert!(w_list_can_append_without_realloc(float_list));
-        }
-        run_case(
-            float_list,
-            Type::Float,
-            pyre_object::w_float_new(3.14),
-            float_array_descr().index(),
-            list_float_items_len_descr().index(),
-            "float-list",
-            false,
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        not(debug_assertions),
-        ignore = "PyreSym::new_uninit skeleton fallback is debug-only (Phase X-1 gate)"
-    )]
-    fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int() {
-        use pyre_interpreter::pyframe::PyFrame;
-        use pyre_object::w_range_iter_new;
-
-        let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
-        frame.fix_array_ptrs();
-        let range_iter = w_range_iter_new(0, 2, 1);
-        frame.push(range_iter);
-        let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
-
-        let mut ctx = TraceCtx::for_test(1);
-        let iter = OpRef(0);
-        let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        // nlocals == 0 for this test; stack-only tail starts at registers_r[0].
-        sym.registers_r = vec![iter];
-        sym.symbolic_stack_types = vec![Type::Ref];
-        sym.concrete_stack = vec![ConcreteValue::Ref(range_iter)];
-        sym.valuestackdepth = 1;
-
-        let mut state = MIFrame {
-            ctx: &mut ctx,
-            sym: &mut sym,
-            fallthrough_pc: 0,
-            parent_frames: Vec::new(),
-            pending_inline_frame: None,
-            orgpc: 0,
-            concrete_frame_addr: 0,
-        };
-
-        let next = MIFrame::iter_next_value(&mut state, iter, range_iter)
-            .expect("range iterator fast path should trace");
-        assert_eq!(state.value_type(next.opref), Type::Int);
-        <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
-            .expect("typed range next should not need optional guard");
-
-        let recorder = ctx.into_recorder();
-        let mut saw_getfield_gc = false;
-        let mut saw_setfield_gc = false;
-        let mut saw_setfield_raw = false;
-        let mut saw_getfield_raw = false;
-        let mut saw_new = false;
-        let mut saw_optional_guard = false;
-        for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
-            match op.opcode {
-                OpCode::GetfieldGcI => saw_getfield_gc = true,
-                OpCode::SetfieldGc => saw_setfield_gc = true,
-                OpCode::SetfieldRaw => saw_setfield_raw = true,
-                OpCode::GetfieldRawI => saw_getfield_raw = true,
-                OpCode::New => saw_new = true,
-                OpCode::GuardNonnull | OpCode::GuardIsnull => saw_optional_guard = true,
-                _ => {}
-            }
-        }
-        assert!(
-            saw_getfield_gc,
-            "range iterator fields should use GetfieldGcI"
-        );
-        assert!(
-            saw_setfield_gc,
-            "range iterator current update should use SetfieldGc"
-        );
-        assert!(
-            !saw_setfield_raw,
-            "range iterator fast path should not use raw stores on GC iterator objects"
-        );
-        assert!(
-            !saw_getfield_raw,
-            "range iterator fast path should not use raw field loads on GC iterator objects"
-        );
-        assert!(
-            !saw_new,
-            "range iterator fast path should not box the yielded int"
-        );
-        assert!(
-            !saw_optional_guard,
-            "raw-int range iteration should not emit optional-value guards"
-        );
-    }
+    // test_close_loop_args_at_target_pc_preserves_virtualizable_stack moved
+    // to `pyre-jit` so close_loop_args_at runs with a real compiled jitcode.
 }
 
 // ── Virtualizable configuration ──────────────────────────────────────

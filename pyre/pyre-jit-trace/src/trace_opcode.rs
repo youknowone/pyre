@@ -81,7 +81,6 @@ use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
 };
 use crate::helpers::TraceHelperAccess;
-use crate::liveness::liveness_for;
 
 impl MIFrame {
     /// Get the concrete return value from the frame's stack top.
@@ -138,6 +137,137 @@ impl MIFrame {
             parent_frames: Vec::new(),
             pending_inline_frame: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn capture_current_fail_args(&mut self) -> Vec<OpRef> {
+        self.with_ctx(|this, ctx| this.current_fail_args(ctx))
+    }
+
+    #[doc(hidden)]
+    pub fn capture_guard_class(
+        &mut self,
+        obj: OpRef,
+        expected_type: *const pyre_object::pyobject::PyType,
+    ) {
+        self.with_ctx(|this, ctx| this.guard_class(ctx, obj, expected_type));
+    }
+
+    #[doc(hidden)]
+    pub fn capture_trace_guarded_int_payload(&mut self, int_obj: OpRef) -> OpRef {
+        self.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj))
+    }
+
+    #[doc(hidden)]
+    pub fn capture_record_branch_guard(
+        &mut self,
+        exitvalue: OpRef,
+        condition: OpRef,
+        branch_concrete: bool,
+        next_instr: usize,
+    ) {
+        self.with_ctx(|this, ctx| {
+            this.record_branch_guard(ctx, exitvalue, condition, branch_concrete, next_instr);
+        });
+    }
+
+    #[doc(hidden)]
+    pub fn capture_generate_guard(&mut self, opcode: OpCode, args: &[OpRef]) {
+        self.with_ctx(|this, ctx| this.generate_guard(ctx, opcode, args));
+    }
+
+    #[doc(hidden)]
+    pub fn capture_concrete_branch_truth_for_value(
+        &mut self,
+        value: OpRef,
+        concrete_val: pyre_object::PyObjectRef,
+    ) -> Result<bool, PyError> {
+        self.concrete_branch_truth_for_value(value, concrete_val)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_trace_dynamic_list_index(
+        &mut self,
+        key: OpRef,
+        len: OpRef,
+        concrete_key: i64,
+    ) -> OpRef {
+        self.with_ctx(|this, ctx| this.trace_dynamic_list_index(ctx, key, len, concrete_key))
+    }
+
+    #[doc(hidden)]
+    pub fn capture_generated_list_getitem_by_strategy(
+        &mut self,
+        list: OpRef,
+        key: OpRef,
+        concrete_key: i64,
+        strategy_id: i64,
+    ) -> OpRef {
+        self.with_ctx(|this, ctx| {
+            crate::generated_list_getitem_by_strategy(
+                this,
+                ctx,
+                list,
+                key,
+                concrete_key,
+                strategy_id,
+            )
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn capture_list_append_value(
+        &mut self,
+        list: OpRef,
+        value: OpRef,
+        concrete_list: pyre_object::PyObjectRef,
+        concrete_value: pyre_object::PyObjectRef,
+    ) -> Result<(), PyError> {
+        self.list_append_value(list, value, concrete_list, concrete_value)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_direct_len_value(
+        &mut self,
+        callable: OpRef,
+        value: OpRef,
+        concrete_value: pyre_object::PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        self.direct_len_value(callable, value, concrete_value)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_iter_next_value(
+        &mut self,
+        iter: OpRef,
+        concrete_iter: pyre_object::PyObjectRef,
+    ) -> Result<FrontendOp, PyError> {
+        self.iter_next_value(iter, concrete_iter)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_close_loop_args_at(&mut self, target_pc: Option<usize>) -> Vec<OpRef> {
+        self.with_ctx(|this, ctx| this.close_loop_args_at(ctx, target_pc))
+    }
+
+    #[doc(hidden)]
+    pub fn symbolic_nlocals(&self) -> usize {
+        self.sym().nlocals
+    }
+
+    #[doc(hidden)]
+    pub fn symbolic_valuestackdepth(&self) -> usize {
+        self.sym().valuestackdepth
+    }
+
+    #[doc(hidden)]
+    pub fn symbolic_registers_r(&self) -> &[OpRef] {
+        &self.sym().registers_r
+    }
+
+    #[doc(hidden)]
+    pub fn capture_value_type(&self, opref: OpRef) -> Type {
+        self.value_type(opref)
     }
 
     pub(crate) fn ctx(&mut self) -> &mut TraceCtx {
@@ -328,42 +458,16 @@ impl MIFrame {
         let jc = unsafe { &*jitcode_ptr };
         if jc.payload.metadata.pc_map.is_empty() {
             // `CallControl.get_jitcode` drain fills pc_map before any
-            // guard capture (pyjitpl.py:199 parity). Phase X-0 (commit
-            // 0b30f5a85e) also eliminated the out-of-range-pc source
-            // that previously reached this branch. Release builds panic
-            // here — every remaining reach would be a bug. Debug builds
-            // retain the LiveVars fallback so the existing
-            // `PyreSym::new_uninit`-based unit test harness can still
-            // call this function without setting up a full jitcode.
-            if !cfg!(debug_assertions) {
-                panic!(
-                    "get_list_of_active_boxes: skeleton jitcode (pc_map empty) \
-                     at live_pc={} — Phase X-0 removed the known production \
-                     trigger; further hits are bugs.",
-                    live_pc
-                );
-            }
-            let raw_code_ptr = unsafe { (*self.sym().jitcode).raw_code() };
-            let live = if !raw_code_ptr.is_null() {
-                Some(liveness_for(raw_code_ptr))
-            } else {
-                None
-            };
-            let mut boxes = Vec::with_capacity(nlocals + stack_values.len());
-            let locals_len = nlocals.min(registers_r_view.len());
-            for (idx, slot) in registers_r_view[..locals_len].iter().enumerate() {
-                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_local_live(live_pc, idx));
-                if is_live {
-                    boxes.push(*slot);
-                }
-            }
-            for (idx, slot) in stack_values.iter().enumerate() {
-                let is_live = live.map_or(!slot.is_none(), |lv| lv.is_stack_live(live_pc, idx));
-                if is_live {
-                    boxes.push(*slot);
-                }
-            }
-            return boxes;
+            // guard capture (pyjitpl.py:199 parity). Phase X-0 eliminated
+            // the out-of-range-pc source. Phase X-1(a) migrated the
+            // remaining guard/resume tests to the real compile path in
+            // `pyre-jit`. Unconditional panic — any hit is a bug.
+            panic!(
+                "get_list_of_active_boxes: skeleton jitcode (pc_map empty) \
+                 at live_pc={} — Phase X-0/X-1 removed all known triggers; \
+                 further hits are bugs.",
+                live_pc
+            );
         }
         // `pyjitpl.py:199-233` parity: decode the `-live-` offset from
         // the jitcode byte stream via `jitcode.get_live_vars_info(pc,

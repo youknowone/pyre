@@ -305,6 +305,8 @@ struct RegAllocator {
     /// `tool.algo.unionfind.UnionFind`). Created lazily; missing
     /// nodes self-rep.
     unionfind: HashMap<u16, u16>,
+    /// RPython `UnionFind.weight` — only roots carry entries.
+    unionfind_weight: HashMap<u16, usize>,
     coloring: HashMap<u16, u16>,
 }
 
@@ -313,6 +315,7 @@ impl RegAllocator {
         Self {
             depgraph: DependencyGraph::new(),
             unionfind: HashMap::new(),
+            unionfind_weight: HashMap::new(),
             coloring: HashMap::new(),
         }
     }
@@ -321,6 +324,7 @@ impl RegAllocator {
     fn find_rep(&mut self, v: u16) -> u16 {
         if !self.unionfind.contains_key(&v) {
             self.unionfind.insert(v, v);
+            self.unionfind_weight.insert(v, 1);
             return v;
         }
         let mut root = v;
@@ -336,21 +340,21 @@ impl RegAllocator {
         root
     }
 
-    /// `unionfind.union` — picks `v0` as the new representative
-    /// (matches `regalloc.py:106-112` `_, rep, _ = uf.union(v0, w0)`
-    /// + the if/else that picks `dg.coalesce(loser, rep)`).
+    /// `unionfind.union` — weighted union, matching
+    /// `rpython/tool/algo/unionfind.py:67-91`.
     fn union(&mut self, v0: u16, w0: u16) -> u16 {
         let r1 = self.find_rep(v0);
         let r2 = self.find_rep(w0);
         if r1 == r2 {
             return r1;
         }
-        // RPython UnionFind picks by weight; a deterministic
-        // smaller-index rep keeps coalesce results stable across runs
-        // without affecting correctness.
-        let (rep, loser) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
-        self.unionfind.insert(loser, rep);
-        rep
+        let w1 = self.unionfind_weight.get(&r1).copied().unwrap_or(1);
+        let w2 = self.unionfind_weight.get(&r2).copied().unwrap_or(1);
+        let (winner, loser) = if w1 >= w2 { (r1, r2) } else { (r2, r1) };
+        self.unionfind.insert(loser, winner);
+        self.unionfind_weight.remove(&loser);
+        *self.unionfind_weight.entry(winner).or_insert(0) = w1 + w2;
+        winner
     }
 
     /// `regalloc.py:26-77` `RegAllocator.make_dependencies`.
@@ -852,5 +856,22 @@ mod tests {
             new50, 0,
             "non-inputarg reg 50 reuses dead inputarg 0's color (no shift)"
         );
+    }
+
+    #[test]
+    fn weighted_union_prefers_heavier_partition() {
+        let mut alloc = RegAllocator::new();
+        assert_eq!(alloc.union(1, 2), 1);
+        assert_eq!(alloc.union(3, 4), 3);
+        assert_eq!(alloc.union(3, 5), 3);
+        assert_eq!(
+            alloc.union(1, 3),
+            3,
+            "RPython UnionFind keeps the heavier partition's representative"
+        );
+        assert_eq!(alloc.find_rep(1), 3);
+        assert_eq!(alloc.find_rep(2), 3);
+        assert_eq!(alloc.find_rep(4), 3);
+        assert_eq!(alloc.find_rep(5), 3);
     }
 }

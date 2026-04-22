@@ -267,19 +267,6 @@ impl LiveVars {
             .map_or(true, |w| (w >> bit) & 1 != 0)
     }
 
-    /// codewriter/liveness.py parity — stack registers.
-    /// Stack slot is live if index < stack_depth_at[pc].
-    pub fn is_stack_live(&self, pc: usize, stack_idx: usize) -> bool {
-        self.stack_depth_at
-            .get(pc)
-            .map_or(true, |&depth| stack_idx < depth)
-    }
-
-    /// Number of live stack slots at the given PC.
-    pub fn stack_depth_at(&self, pc: usize) -> usize {
-        self.stack_depth_at.get(pc).copied().unwrap_or(0)
-    }
-
     /// True iff the dataflow analysis reached `pc`. Unreachable pcs have
     /// their `stack_depth_at` slot left at the `usize::MAX` sentinel
     /// (liveness.rs:150) and must not be treated as having a real stack
