@@ -11,9 +11,9 @@
 //! Structural deviations from upstream (documented per CLAUDE.md
 //! parity rule #1):
 //!
-//! * `Variable.annotation` / `Variable.concretetype` are
-//!   `Option<()>` placeholders until `majit-annotator::SomeValue`
-//!   (Phase 4) and `majit-rtyper::Repr` (Phase 6) exist.
+//! * `Variable.annotation` is still an `Option<...>` carrier because
+//!   the annotator arrives later in the pipeline. `Variable.concretetype`
+//!   now stores the low-level `lltype` mirror directly.
 //! * `Constant.value` is a placeholder `ConstValue` enum pending a
 //!   Python object model at Phase 3 (`flowspace/operation.py` port);
 //!   RPython wraps arbitrary Python objects via `Hashable`.
@@ -84,7 +84,16 @@ pub struct HostObject {
 
 struct HostObjectInner {
     qualname: String,
+    name: Option<String>,
+    module_name: Option<String>,
     kind: HostObjectKind,
+}
+
+fn split_attr_name_module(qualname: &str) -> (String, Option<String>) {
+    match qualname.rsplit_once('.') {
+        Some((module, name)) => (name.to_string(), Some(module.to_string())),
+        None => (qualname.to_string(), None),
+    }
 }
 
 enum HostObjectKind {
@@ -219,6 +228,28 @@ impl std::fmt::Debug for HostObject {
 impl HostObject {
     pub fn qualname(&self) -> &str {
         &self.inner.qualname
+    }
+
+    fn simple_name(&self) -> &str {
+        self.inner
+            .name
+            .as_deref()
+            .unwrap_or_else(|| self.qualname())
+    }
+
+    fn module_name(&self) -> Option<&str> {
+        self.inner.module_name.as_deref().or_else(|| {
+            if self.is_class()
+                && HOST_ENV
+                    .lookup_builtin(self.qualname())
+                    .as_ref()
+                    .is_some_and(|builtin| builtin == self)
+            {
+                Some("__builtin__")
+            } else {
+                None
+            }
+        })
     }
 
     /// Pointer-identity handle — used where upstream relies on
@@ -451,9 +482,13 @@ impl HostObject {
     }
 
     pub fn new_class(qualname: impl Into<String>, bases: Vec<HostObject>) -> Self {
+        let qualname = qualname.into();
+        let (name, module_name) = split_attr_name_module(&qualname);
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(name),
+                module_name,
                 kind: HostObjectKind::Class {
                     bases,
                     members: Mutex::new(HashMap::new()),
@@ -473,9 +508,13 @@ impl HostObject {
         bases: Vec<HostObject>,
         members: HashMap<String, ConstValue>,
     ) -> Self {
+        let qualname = qualname.into();
+        let (name, module_name) = split_attr_name_module(&qualname);
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(name),
+                module_name,
                 kind: HostObjectKind::Class {
                     bases,
                     members: Mutex::new(members),
@@ -486,9 +525,12 @@ impl HostObject {
     }
 
     pub fn new_module(qualname: impl Into<String>) -> Self {
+        let qualname = qualname.into();
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                name: Some(qualname.clone()),
+                module_name: None,
+                qualname,
                 kind: HostObjectKind::Module {
                     members: Mutex::new(HashMap::new()),
                 },
@@ -497,9 +539,13 @@ impl HostObject {
     }
 
     pub fn new_builtin_callable(qualname: impl Into<String>) -> Self {
+        let qualname = qualname.into();
+        let (name, module_name) = split_attr_name_module(&qualname);
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(name),
+                module_name: Some(module_name.unwrap_or_else(|| "__builtin__".to_string())),
                 kind: HostObjectKind::BuiltinCallable,
             }),
         }
@@ -507,9 +553,17 @@ impl HostObject {
 
     pub fn new_user_function(graph_func: GraphFunc) -> Self {
         let qualname = graph_func.name.clone();
+        let name = graph_func
+            .code
+            .as_ref()
+            .map(|code| code.co_name.clone())
+            .unwrap_or_else(|| split_attr_name_module(&qualname).0);
+        let module_name = split_attr_name_module(&qualname).1;
         HostObject {
             inner: Arc::new(HostObjectInner {
                 qualname,
+                name: Some(name),
+                module_name,
                 kind: HostObjectKind::UserFunction {
                     graph_func: Box::new(graph_func),
                 },
@@ -531,6 +585,8 @@ impl HostObject {
         HostObject {
             inner: Arc::new(HostObjectInner {
                 qualname,
+                name: None,
+                module_name: None,
                 kind: HostObjectKind::Instance {
                     class_obj,
                     args,
@@ -543,9 +599,12 @@ impl HostObject {
     /// `Constant.value` 에 담긴 임의 host object 를 carry. `qualname`
     /// 은 debug 에 사용; identity 는 항상 새로운 Arc.
     pub fn new_opaque(qualname: impl Into<String>) -> Self {
+        let qualname = qualname.into();
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: None,
+                module_name: None,
                 kind: HostObjectKind::Opaque,
             }),
         }
@@ -564,9 +623,13 @@ impl HostObject {
         fset: Option<HostObject>,
         fdel: Option<HostObject>,
     ) -> Self {
+        let qualname = qualname.into();
+        let (name, _) = split_attr_name_module(&qualname);
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(name),
+                module_name: None,
                 kind: HostObjectKind::Property { fget, fset, fdel },
             }),
         }
@@ -603,9 +666,12 @@ impl HostObject {
 
     /// Python `staticmethod(func)` constructor.
     pub fn new_staticmethod(qualname: impl Into<String>, func: HostObject) -> Self {
+        let qualname = qualname.into();
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(func.simple_name().to_string()),
+                module_name: func.module_name().map(|s| s.to_string()),
                 kind: HostObjectKind::StaticMethod { func },
             }),
         }
@@ -626,9 +692,12 @@ impl HostObject {
 
     /// Python `classmethod(func)` constructor.
     pub fn new_classmethod(qualname: impl Into<String>, func: HostObject) -> Self {
+        let qualname = qualname.into();
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(func.simple_name().to_string()),
+                module_name: func.module_name().map(|s| s.to_string()),
                 kind: HostObjectKind::ClassMethod { func },
             }),
         }
@@ -655,13 +724,17 @@ impl HostObject {
         name: impl Into<String>,
         origin_class: HostObject,
     ) -> Self {
+        let qualname = qualname.into();
+        let name = name.into();
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(name.clone()),
+                module_name: func.module_name().map(|s| s.to_string()),
                 kind: HostObjectKind::BoundMethod {
                     self_obj,
                     func,
-                    name: name.into(),
+                    name,
                     origin_class,
                 },
             }),
@@ -703,9 +776,12 @@ impl HostObject {
     /// Host-level `weakref.ref(obj)` constructor. `referent=None`
     /// models a dead weakref whose target has been garbage-collected.
     pub fn new_weakref(qualname: impl Into<String>, referent: Option<HostObject>) -> Self {
+        let qualname = qualname.into();
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: None,
+                module_name: None,
                 kind: HostObjectKind::Weakref { referent },
             }),
         }
@@ -730,9 +806,13 @@ impl HostObject {
     /// `qualname` is the debug identifier (upstream `func.__qualname__`);
     /// `func` is invoked by [`Self::call_host`] with the positional args.
     pub fn new_native_callable(qualname: impl Into<String>, func: HostCallableFn) -> Self {
+        let qualname = qualname.into();
+        let (name, module_name) = split_attr_name_module(&qualname);
         HostObject {
             inner: Arc::new(HostObjectInner {
-                qualname: qualname.into(),
+                qualname,
+                name: Some(name),
+                module_name,
                 kind: HostObjectKind::NativeCallable { func },
             }),
         }
@@ -798,6 +878,82 @@ impl HostObject {
             HostObjectKind::BoundMethod { func, .. } => func.is_host_executable(),
             _ => false,
         }
+    }
+}
+
+fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue> {
+    match name {
+        "__class__" => pyobj.class_of().map(ConstValue::HostObject),
+        "__name__" => match &pyobj.inner.kind {
+            HostObjectKind::Class { .. }
+            | HostObjectKind::Module { .. }
+            | HostObjectKind::BuiltinCallable
+            | HostObjectKind::UserFunction { .. }
+            | HostObjectKind::BoundMethod { .. }
+            | HostObjectKind::NativeCallable { .. } => {
+                Some(ConstValue::Str(pyobj.simple_name().to_string()))
+            }
+            HostObjectKind::Property { .. } => {
+                Some(ConstValue::Str(pyobj.simple_name().to_string()))
+            }
+            HostObjectKind::StaticMethod { func } | HostObjectKind::ClassMethod { func } => {
+                Some(ConstValue::Str(func.simple_name().to_string()))
+            }
+            _ => None,
+        },
+        "__module__" => match &pyobj.inner.kind {
+            HostObjectKind::Module { .. } | HostObjectKind::Property { .. } => None,
+            HostObjectKind::Class { .. }
+            | HostObjectKind::BuiltinCallable
+            | HostObjectKind::UserFunction { .. }
+            | HostObjectKind::BoundMethod { .. }
+            | HostObjectKind::StaticMethod { .. }
+            | HostObjectKind::ClassMethod { .. }
+            | HostObjectKind::NativeCallable { .. } => pyobj
+                .module_name()
+                .map(|module| ConstValue::Str(module.to_string())),
+            _ => None,
+        },
+        "fget" if pyobj.is_property() => pyobj
+            .property_fget()
+            .cloned()
+            .map(ConstValue::HostObject)
+            .or(Some(ConstValue::None)),
+        "fset" if pyobj.is_property() => pyobj
+            .property_fset()
+            .cloned()
+            .map(ConstValue::HostObject)
+            .or(Some(ConstValue::None)),
+        "fdel" if pyobj.is_property() => pyobj
+            .property_fdel()
+            .cloned()
+            .map(ConstValue::HostObject)
+            .or(Some(ConstValue::None)),
+        "__func__" => pyobj
+            .bound_method_func()
+            .cloned()
+            .or_else(|| pyobj.staticmethod_func().cloned())
+            .or_else(|| pyobj.classmethod_func().cloned())
+            .map(ConstValue::HostObject),
+        "__self__" => match &pyobj.inner.kind {
+            HostObjectKind::BoundMethod { self_obj, .. } => {
+                Some(ConstValue::HostObject(self_obj.clone()))
+            }
+            HostObjectKind::BuiltinCallable => Some(ConstValue::HostObject(
+                pyobj
+                    .module_name()
+                    .and_then(|module| {
+                        if module == "__builtin__" {
+                            Some(HOST_ENV.builtin_module())
+                        } else {
+                            HOST_ENV.import_module(module)
+                        }
+                    })
+                    .unwrap_or_else(|| HOST_ENV.builtin_module()),
+            )),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1021,6 +1177,11 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
 ///   class-MRO lookup first, data descriptors (`property`) fire
 ///   before the instance dict, then `__dict__[name]`, then non-data
 ///   descriptors / raw class attrs, then `AttributeError`.
+/// * every remaining host object kind with a class (`function`,
+///   `builtin_function_or_method`, `property`, `staticmethod`,
+///   `classmethod`, `method`, `weakref`, ...) falls back to
+///   `type(obj).__mro__` lookup with no per-instance dict, matching
+///   the generic Python object path.
 ///
 /// Instance `property` getters are evaluated through
 /// [`HostObject::call_host`] against `property.fget`. A missing `fget`
@@ -1028,6 +1189,9 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
 /// `AttributeError: unreadable attribute`); a host-side failure during
 /// the getter call surfaces as `HostGetAttrError::Unsupported`.
 pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGetAttrError> {
+    if let Some(value) = host_object_own_getattr(pyobj, name) {
+        return Ok(value);
+    }
     if pyobj.is_module() {
         return pyobj
             .module_get(name)
@@ -1067,6 +1231,12 @@ pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGe
             return host_descriptor_get(value, name, Some(pyobj), cls, &origin_class);
         }
         return Err(HostGetAttrError::Missing);
+    }
+    if let Some(cls) = pyobj.class_of() {
+        let Some((value, origin_class)) = host_class_mro_lookup(&cls, name) else {
+            return Err(HostGetAttrError::Missing);
+        };
+        return host_descriptor_get(value, name, Some(pyobj), &cls, &origin_class);
     }
     Err(HostGetAttrError::Unsupported)
 }
@@ -1131,13 +1301,16 @@ fn c3_linearise(cls: &HostObject) -> Option<Vec<HostObject>> {
 /// API 는 이 접근만 노출한다.
 pub struct HostEnv {
     builtins: HashMap<String, HostObject>,
+    builtin_module: HostObject,
     modules: Mutex<HashMap<String, HostObject>>,
 }
 
 impl HostEnv {
     fn bootstrap() -> Self {
+        let builtin_module = HostObject::new_module("__builtin__");
         let mut env = HostEnv {
             builtins: HashMap::new(),
+            builtin_module,
             modules: Mutex::new(HashMap::new()),
         };
         env.bootstrap_builtin_exceptions();
@@ -1148,6 +1321,7 @@ impl HostEnv {
     }
 
     fn insert_builtin(&mut self, name: &str, obj: HostObject) {
+        self.builtin_module.module_set(name, obj.clone());
         self.builtins.insert(name.to_owned(), obj);
     }
 
@@ -1377,6 +1551,7 @@ impl HostEnv {
         );
 
         let mut mods = self.modules.lock().unwrap();
+        mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
         mods.insert("os.path".into(), os_path);
         mods.insert("rpython.rlib.rfile".into(), rfile);
@@ -1387,6 +1562,10 @@ impl HostEnv {
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.
     pub fn lookup_builtin(&self, name: &str) -> Option<HostObject> {
         self.builtins.get(name).cloned()
+    }
+
+    pub fn builtin_module(&self) -> HostObject {
+        self.builtin_module.clone()
     }
 
     /// upstream `__import__(name, …)` — `flowcontext.py:660`.
@@ -1508,10 +1687,16 @@ impl PartialEq for ConstValue {
             (ConstValue::List(a), ConstValue::List(b)) => a == b,
             (ConstValue::Bool(a), ConstValue::Bool(b)) => a == b,
             (ConstValue::None, ConstValue::None) => true,
-            (ConstValue::Code(a), ConstValue::Code(b)) => a == b,
-            (ConstValue::Function(a), ConstValue::Function(b)) => a == b,
+            (ConstValue::Code(a), ConstValue::Code(b)) => {
+                a._hashable_identity() == b._hashable_identity()
+            }
+            (ConstValue::Function(a), ConstValue::Function(b)) => {
+                a._hashable_identity() == b._hashable_identity()
+            }
             (ConstValue::Graphs(a), ConstValue::Graphs(b)) => a == b,
-            (ConstValue::LLPtr(a), ConstValue::LLPtr(b)) => a == b,
+            (ConstValue::LLPtr(a), ConstValue::LLPtr(b)) => {
+                a._hashable_identity() == b._hashable_identity()
+            }
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             _ => false,
@@ -1578,27 +1763,10 @@ impl Hash for ConstValue {
             ConstValue::Tuple(items) | ConstValue::List(items) => items.hash(state),
             ConstValue::Bool(value) => value.hash(state),
             ConstValue::None => {}
-            ConstValue::Code(code) => {
-                code.co_name.hash(state);
-                code.co_filename.hash(state);
-                code.co_firstlineno.hash(state);
-                code.co_argcount.hash(state);
-                code.co_nlocals.hash(state);
-                code.co_flags.hash(state);
-            }
-            ConstValue::Function(func) => {
-                func.name.hash(state);
-                func._jit_look_inside_.hash(state);
-                func.relax_sig_check.hash(state);
-                func.globals.hash(state);
-                func.closure.hash(state);
-                func.defaults.hash(state);
-                func.filename.hash(state);
-                func.firstlineno.hash(state);
-                func.code.as_ref().map(|code| &code.co_name).hash(state);
-            }
+            ConstValue::Code(code) => code._hashable_identity().hash(state),
+            ConstValue::Function(func) => func._hashable_identity().hash(state),
             ConstValue::Graphs(graphs) => graphs.hash(state),
-            ConstValue::LLPtr(ptr) => ptr.hash(state),
+            ConstValue::LLPtr(ptr) => ptr._hashable_identity().hash(state),
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
         }
@@ -1920,41 +2088,52 @@ impl Constant {
     ///     return True
     /// return False
     /// ```
-    /// Rust 매핑:
-    /// * type/ClassType/ModuleType arm → `HostObject::is_class()` or
-    ///   `is_module()` — 실제 host object 의 분류를 읽는다. builtin
-    ///   type (`const(type)`, `const(str)`, ...) 도 `is_class()` 로
-    ///   포착된다.
-    /// * `__class__.__module__ == '__builtin__'` arm → Rust enum 으로
-    ///   직접 표현되는 builtin 값들 (`Int` / `Float` / `Bool` / `Str` /
-    ///   `None` / `Tuple` / `List` / `Dict` / `Code`) 과 `HostObject`
-    ///   중 builtin-callable 분류.
-    /// * `_freeze_` arm → Rust 포트는 `_freeze_` 프로토콜을 갖지 않으므
-    ///   로 현재 만족하는 variant 없음 (Phase 5 annotator에서 도입).
-    ///
-    /// 최종 False 로 떨어지는 variant:
-    /// `Atom`, `Placeholder`, `Function(_)` (user function — upstream
-    /// `_freeze_` 없는 한 False), `HostObject::Instance` (user-defined
-    /// instance — `__class__.__module__` 이 `'__main__'` 등 — 기본
-    /// False), `SpecTag`.
     pub fn foldable(&self) -> bool {
-        match &self.value {
-            // `isinstance(to_check, type)` / ClassType / ModuleType.
+        let bound_self = match &self.value {
             ConstValue::HostObject(obj) => {
-                if obj.is_class() || obj.is_module() {
-                    true
-                } else if obj.is_builtin_callable() {
-                    // `builtin_function_or_method` 의 `__module__` 은
-                    // `'__builtin__'`.
-                    true
-                } else {
-                    // user function / user instance → `_freeze_` 가
-                    // 있어야 True. 미지원.
-                    false
-                }
+                obj.bound_method_self().cloned().map(ConstValue::HostObject)
             }
-            // `to_check.__class__.__module__ == '__builtin__'` — Python
-            // built-in primitive / container type 의 값.
+            _ => None,
+        };
+        let to_check = bound_self.as_ref().unwrap_or(&self.value);
+        if let ConstValue::HostObject(obj) = to_check
+            && (obj.is_class() || obj.is_module())
+        {
+            return true;
+        }
+        if Self::has_builtin_class_module(to_check) {
+            return true;
+        }
+        if let ConstValue::HostObject(obj) = to_check {
+            return Self::call_foldable_freeze_method(obj);
+        }
+        false
+    }
+
+    /// RPython `Constant.replace(mapping)` — Constants never rename.
+    pub fn replace<'a>(&'a self, _mapping: &'a HashMap<Variable, Variable>) -> &'a Constant {
+        self
+    }
+
+    /// RPython `rpython/tool/uid.py:35-39` — `Hashable.__init__` tries
+    /// `hash((type(value), value))` and falls back to `id(self.value)`
+    /// when that raises `TypeError`. Rust's derived `Hash` cannot throw,
+    /// so this predicate pre-classifies the `ConstValue` variants whose
+    /// contents are unhashable under Python's own rules
+    /// (`list.__hash__ = None`, `dict.__hash__ = None`) or whose Rust
+    /// container (`Graphs` is a `Vec<GraphId>`) has no meaningful
+    /// value-identity, routing them through the `self.id` (object
+    /// identity) branch of `PartialEq` / `Hash` for `Constant`.
+    fn uses_hashable_identity_fallback(value: &ConstValue) -> bool {
+        match value {
+            ConstValue::List(_) | ConstValue::Dict(_) | ConstValue::Graphs(_) => true,
+            ConstValue::Tuple(items) => items.iter().any(Self::uses_hashable_identity_fallback),
+            _ => false,
+        }
+    }
+
+    fn has_builtin_class_module(value: &ConstValue) -> bool {
+        match value {
             ConstValue::Int(_)
             | ConstValue::Float(_)
             | ConstValue::Bool(_)
@@ -1964,19 +2143,38 @@ impl Constant {
             | ConstValue::List(_)
             | ConstValue::Dict(_)
             | ConstValue::Code(_)
-            | ConstValue::Graphs(_) => true,
-            // 아래는 upstream 의 최종 `return False`.
+            | ConstValue::Function(_) => true,
+            ConstValue::HostObject(obj) => obj
+                .class_of()
+                .as_ref()
+                .is_some_and(|cls| cls.module_name() == Some("__builtin__")),
             ConstValue::Atom(_)
             | ConstValue::Placeholder
             | ConstValue::LLPtr(_)
-            | ConstValue::Function(_)
-            | ConstValue::SpecTag(_) => false,
+            | ConstValue::SpecTag(_)
+            | ConstValue::Graphs(_) => false,
         }
     }
 
-    /// RPython `Constant.replace(mapping)` — Constants never rename.
-    pub fn replace<'a>(&'a self, _mapping: &'a HashMap<Variable, Variable>) -> &'a Constant {
-        self
+    fn call_foldable_freeze_method(obj: &HostObject) -> bool {
+        let method = match host_getattr(obj, "_freeze_") {
+            Ok(ConstValue::HostObject(method)) => method,
+            Ok(other) => panic!(
+                "_freeze_ exists on {:?} but is not callable: {other:?}",
+                obj
+            ),
+            Err(HostGetAttrError::Missing) => return false,
+            Err(HostGetAttrError::Unsupported) => return false,
+        };
+        match method.call_host(&[]) {
+            Ok(ConstValue::Bool(true)) => true,
+            Ok(other) => panic!("_freeze_() must return True, got {other:?}"),
+            Err(HostCallError::RequiresFlowEvaluator(q)) => panic!(
+                "_freeze_() on {q:?} requires the Phase 6 host-graph evaluator \
+                 (user function body cannot be executed host-side yet)"
+            ),
+            Err(other) => panic!("_freeze_() call failed: {other}"),
+        }
     }
 }
 
@@ -1984,7 +2182,13 @@ static NEXT_CONSTANT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl PartialEq for Constant {
     fn eq(&self, other: &Self) -> bool {
-        self.value == other.value && self.concretetype == other.concretetype
+        if Self::uses_hashable_identity_fallback(&self.value)
+            || Self::uses_hashable_identity_fallback(&other.value)
+        {
+            self.id == other.id
+        } else {
+            self.value == other.value
+        }
     }
 }
 
@@ -1992,8 +2196,11 @@ impl Eq for Constant {}
 
 impl Hash for Constant {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.value.hash(state);
-        self.concretetype.hash(state);
+        if Self::uses_hashable_identity_fallback(&self.value) {
+            self.id.hash(state);
+        } else {
+            self.value.hash(state);
+        }
     }
 }
 
@@ -2028,7 +2235,7 @@ impl ConstValue {
             ConstValue::None => Some(false),
             ConstValue::Code(_) => Some(true),
             ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
-            ConstValue::LLPtr(_) => Some(true),
+            ConstValue::LLPtr(ptr) => Some(ptr.nonzero()),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
@@ -2653,8 +2860,10 @@ impl BlockRefExt for BlockRef {
 
 /// Stand-in for the Python function object attached to
 /// `FunctionGraph.func`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct GraphFunc {
+    /// Stable object identity for RPython `Hashable(function)` parity.
+    pub id: u64,
     /// Python function `__name__`.
     pub name: String,
     /// Upstream `func._sandbox_external_name`.
@@ -2705,6 +2914,7 @@ pub struct GraphFunc {
 impl GraphFunc {
     pub fn new(name: impl Into<String>, globals: Constant) -> Self {
         GraphFunc {
+            id: NEXT_GRAPH_FUNC_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             _sandbox_external_name: None,
             class_: None,
@@ -2728,8 +2938,13 @@ impl GraphFunc {
     /// `__closure__`; the `__code__.co_name` payload stays unchanged.
     pub fn with_new_name(&self, newname: &str) -> Self {
         let mut cloned = self.clone();
+        cloned.id = NEXT_GRAPH_FUNC_ID.fetch_add(1, Ordering::Relaxed);
         cloned.name = newname.to_string();
         cloned
+    }
+
+    pub fn _hashable_identity(&self) -> u64 {
+        self.id
     }
 
     pub fn from_host_code(code: HostCode, globals: Constant, defaults: Vec<Constant>) -> Self {
@@ -2741,6 +2956,16 @@ impl GraphFunc {
         func
     }
 }
+
+impl PartialEq for GraphFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for GraphFunc {}
+
+static NEXT_GRAPH_FUNC_ID: AtomicU64 = AtomicU64::new(1);
 
 /// RPython `flowspace/model.py:13-106` — `class FunctionGraph`.
 #[derive(Debug)]
@@ -3467,6 +3692,8 @@ mod tests {
     //! after `Block`, `Link`, and `FunctionGraph` exist.
 
     use super::*;
+    use crate::translator::rtyper::lltypesystem::lltype;
+    use std::collections::hash_map::DefaultHasher;
 
     #[test]
     fn variable_default_name_numbers_from_dummy_prefix() {
@@ -3495,10 +3722,10 @@ mod tests {
     #[test]
     fn variable_copy_preserves_annotation_and_concretetype() {
         use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut v = Variable::new();
         v.annotation = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
-        v.concretetype =
-            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed);
+        v.concretetype = Some(LowLevelType::Signed);
         let c = v.copy();
         let ca = c.annotation.as_ref().unwrap();
         let va = v.annotation.as_ref().unwrap();
@@ -3513,6 +3740,303 @@ mod tests {
         let c = Constant::new(ConstValue::Placeholder);
         let map = HashMap::new();
         assert!(std::ptr::eq(c.replace(&map), &c));
+    }
+
+    #[test]
+    fn constant_hashable_equality_ignores_concretetype() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let a = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Signed);
+        let b = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Unsigned);
+
+        assert_eq!(a, b);
+
+        let mut ha = std::collections::hash_map::DefaultHasher::new();
+        let mut hb = std::collections::hash_map::DefaultHasher::new();
+        a.hash(&mut ha);
+        b.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn llptr_constants_follow_hashable_pointer_identity() {
+        let ptr1 = lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::StructType::new(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )),
+        }
+        ._example();
+        let ptr2 = ptr1.clone();
+        let ptr3 = lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::StructType::new(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )),
+        }
+        ._example();
+
+        let c1 = Constant::new(ConstValue::LLPtr(Box::new(ptr1)));
+        let c2 = Constant::new(ConstValue::LLPtr(Box::new(ptr2)));
+        let c3 = Constant::new(ConstValue::LLPtr(Box::new(ptr3)));
+
+        let hash_of = |c: &Constant| {
+            let mut h = DefaultHasher::new();
+            c.hash(&mut h);
+            h.finish()
+        };
+
+        assert_eq!(c1, c2);
+        assert_eq!(hash_of(&c1), hash_of(&c2));
+        assert_ne!(c1, c3);
+        assert_ne!(hash_of(&c1), hash_of(&c3));
+    }
+
+    #[test]
+    fn llptr_truthiness_follows_pointer_nullity() {
+        let ptr_t = lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::StructType::new(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )),
+        };
+        let null_ptr = lltype::_ptr::new(ptr_t.clone(), Ok(None));
+        let nonnull_ptr = ptr_t._example();
+
+        assert_eq!(ConstValue::LLPtr(Box::new(null_ptr)).truthy(), Some(false));
+        assert_eq!(
+            ConstValue::LLPtr(Box::new(nonnull_ptr)).truthy(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn list_constants_use_hashable_identity_fallback() {
+        let a = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let b = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let c = a.clone();
+
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+        assert_eq!(a, c);
+        assert_eq!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn tuple_with_unhashable_item_uses_hashable_identity_fallback() {
+        let a = Constant::new(ConstValue::Tuple(vec![ConstValue::List(vec![
+            ConstValue::Int(1),
+        ])]));
+        let b = Constant::new(ConstValue::Tuple(vec![ConstValue::List(vec![
+            ConstValue::Int(1),
+        ])]));
+        let c = a.clone();
+
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+        assert_eq!(a, c);
+        assert_eq!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn function_constants_use_hashable_object_identity() {
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let a = Constant::new(ConstValue::Function(Box::new(GraphFunc::new(
+            "f",
+            globals.clone(),
+        ))));
+        let b = Constant::new(ConstValue::Function(Box::new(GraphFunc::new("f", globals))));
+        let c = a.clone();
+
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+        assert_eq!(a, c);
+        assert_eq!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn tuple_with_function_item_uses_element_hashable_identity() {
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let a = Constant::new(ConstValue::Tuple(vec![ConstValue::Function(Box::new(
+            GraphFunc::new("f", globals.clone()),
+        ))]));
+        let b = Constant::new(ConstValue::Tuple(vec![ConstValue::Function(Box::new(
+            GraphFunc::new("f", globals),
+        ))]));
+        let c = a.clone();
+
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+        assert_eq!(a, c);
+        assert_eq!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn code_constants_use_hashable_object_identity() {
+        let a = Constant::new(ConstValue::Code(Box::new(HostCode::new(
+            0,
+            0,
+            0,
+            0,
+            rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "<test>".to_string(),
+            "f".to_string(),
+            1,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new().into_boxed_slice(),
+        ))));
+        let b = Constant::new(ConstValue::Code(Box::new(HostCode::new(
+            0,
+            0,
+            0,
+            0,
+            rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "<test>".to_string(),
+            "f".to_string(),
+            1,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new().into_boxed_slice(),
+        ))));
+        let c = a.clone();
+
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+        assert_eq!(a, c);
+        assert_eq!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn graphs_constants_use_hashable_identity_fallback() {
+        let a = Constant::new(ConstValue::Graphs(vec![1, 2]));
+        let b = Constant::new(ConstValue::Graphs(vec![1, 2]));
+        let c = a.clone();
+
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+        assert_eq!(a, c);
+        assert_eq!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn function_constant_is_foldable() {
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let c = Constant::new(ConstValue::Function(Box::new(GraphFunc::new("f", globals))));
+        assert!(c.foldable());
+    }
+
+    #[test]
+    fn bound_method_foldable_uses_im_self() {
+        let cls = HostObject::new_class("pkg.C", vec![]);
+        let func = HostObject::new_user_function(GraphFunc::new(
+            "pkg.C.cm",
+            Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        let method = HostObject::new_bound_method("pkg.C.cm", cls.clone(), func, "cm", cls);
+        let c = Constant::new(ConstValue::HostObject(method));
+        assert!(c.foldable());
+    }
+
+    #[test]
+    fn builtin_exception_instance_is_foldable() {
+        let exc = HOST_ENV
+            .lookup_builtin("ValueError")
+            .expect("bootstrap must register ValueError");
+        let inst = exc
+            .reusable_prebuilt_instance()
+            .expect("class exposes reusable instance");
+        let c = Constant::new(ConstValue::HostObject(inst));
+        assert!(c.foldable());
+    }
+
+    #[test]
+    fn freeze_instance_is_foldable() {
+        let cls = HostObject::new_class("pkg.Frozen", vec![]);
+        cls.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.Frozen._freeze_",
+                Arc::new(|_args| Ok(ConstValue::Bool(true))),
+            )),
+        );
+        let inst = HostObject::new_instance(cls, Vec::new());
+        let c = Constant::new(ConstValue::HostObject(inst));
+        assert!(c.foldable());
+    }
+
+    #[test]
+    fn weakref_constant_is_not_foldable() {
+        let target = HostObject::new_class("pkg.C", vec![])
+            .reusable_prebuilt_instance()
+            .expect("class exposes reusable instance");
+        let wref = HostObject::new_weakref("weakref(pkg.C)", Some(target));
+        let c = Constant::new(ConstValue::HostObject(wref));
+        assert!(!c.foldable());
+    }
+
+    #[test]
+    fn native_callable_constant_is_foldable_via_builtin_class() {
+        let f = HostObject::new_native_callable("pkg.f", Arc::new(|_| Ok(ConstValue::Int(0))));
+        let c = Constant::new(ConstValue::HostObject(f));
+        assert!(c.foldable());
+    }
+
+    #[test]
+    fn builtin_class_constant_is_foldable() {
+        let int_cls = HOST_ENV.lookup_builtin("int").expect("builtin int class");
+        let c = Constant::new(ConstValue::HostObject(int_cls));
+        assert!(c.foldable());
+    }
+
+    #[test]
+    fn graphs_constant_is_not_foldable() {
+        let c = Constant::new(ConstValue::Graphs(vec![1, 2, 3]));
+        assert!(!c.foldable());
     }
 
     #[test]
@@ -4069,6 +4593,116 @@ mod tests {
             ConstValue::HostObject(h) => assert_eq!(h, prop),
             other => panic!("expected property descriptor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn host_getattr_property_fget_returns_raw_slot() {
+        let fget = HostObject::new_native_callable(
+            "pkg.Box.value_fget",
+            Arc::new(|_args| Ok(ConstValue::Int(7))),
+        );
+        let prop = HostObject::new_property("pkg.Box.value", Some(fget.clone()), None, None);
+        let out = host_getattr(&prop, "__name__").expect("property.__name__");
+        assert_eq!(out, ConstValue::Str("value".to_string()));
+        let out = host_getattr(&prop, "fget").expect("property.fget");
+        assert_eq!(out, ConstValue::HostObject(fget));
+        let out = host_getattr(&prop, "fset").expect("property.fset");
+        assert_eq!(out, ConstValue::None);
+    }
+
+    #[test]
+    fn host_getattr_staticmethod_and_classmethod_dunder_func_return_wrapped_callable() {
+        let func = HostObject::new_native_callable(
+            "pkg.Box.value",
+            Arc::new(|_args| Ok(ConstValue::Int(7))),
+        );
+        let sm = HostObject::new_staticmethod("pkg.Box.value", func.clone());
+        let cm = HostObject::new_classmethod("pkg.Box.value", func.clone());
+        let out = host_getattr(&sm, "__func__").expect("staticmethod.__func__");
+        assert_eq!(out, ConstValue::HostObject(func.clone()));
+        let out = host_getattr(&cm, "__func__").expect("classmethod.__func__");
+        assert_eq!(out, ConstValue::HostObject(func));
+    }
+
+    #[test]
+    fn host_getattr_bound_method_dunder_self_and_func_return_members() {
+        let self_obj = HostObject::new_instance(HostObject::new_class("pkg.Box", vec![]), vec![]);
+        let func = HostObject::new_native_callable(
+            "pkg.Box.value",
+            Arc::new(|_args| Ok(ConstValue::Int(7))),
+        );
+        let method = HostObject::new_bound_method(
+            "pkg.Box.value",
+            self_obj.clone(),
+            func.clone(),
+            "value",
+            HostObject::new_class("pkg.Box", vec![]),
+        );
+        let out = host_getattr(&method, "__self__").expect("method.__self__");
+        assert_eq!(out, ConstValue::HostObject(self_obj));
+        let out = host_getattr(&method, "__func__").expect("method.__func__");
+        assert_eq!(out, ConstValue::HostObject(func));
+    }
+
+    #[test]
+    fn host_getattr_user_function_dunder_name_and_module_follow_python_surface() {
+        let func = HostObject::new_user_function(GraphFunc::new(
+            "pkg.module.demo",
+            Constant::new(ConstValue::Dict(HashMap::new())),
+        ));
+        let out = host_getattr(&func, "__name__").expect("function.__name__");
+        assert_eq!(out, ConstValue::Str("demo".to_string()));
+        let out = host_getattr(&func, "__module__").expect("function.__module__");
+        assert_eq!(out, ConstValue::Str("pkg.module".to_string()));
+    }
+
+    #[test]
+    fn host_getattr_module_and_class_dunder_name_follow_python_surface() {
+        let module = HostObject::new_module("pkg.demo");
+        let out = host_getattr(&module, "__name__").expect("module.__name__");
+        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+        assert_eq!(
+            host_getattr(&module, "__module__"),
+            Err(HostGetAttrError::Missing)
+        );
+
+        let cls = HostObject::new_class("pkg.demo.Box", vec![]);
+        let out = host_getattr(&cls, "__name__").expect("class.__name__");
+        assert_eq!(out, ConstValue::Str("Box".to_string()));
+        let out = host_getattr(&cls, "__module__").expect("class.__module__");
+        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+    }
+
+    #[test]
+    fn host_getattr_staticmethod_and_classmethod_dunder_name_and_module_follow_wrapped_func() {
+        let func = HostObject::new_user_function(GraphFunc::new(
+            "pkg.demo.value",
+            Constant::new(ConstValue::None),
+        ));
+        let sm = HostObject::new_staticmethod("pkg.demo.value", func.clone());
+        let cm = HostObject::new_classmethod("pkg.demo.value", func);
+
+        let out = host_getattr(&sm, "__name__").expect("staticmethod.__name__");
+        assert_eq!(out, ConstValue::Str("value".to_string()));
+        let out = host_getattr(&sm, "__module__").expect("staticmethod.__module__");
+        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+
+        let out = host_getattr(&cm, "__name__").expect("classmethod.__name__");
+        assert_eq!(out, ConstValue::Str("value".to_string()));
+        let out = host_getattr(&cm, "__module__").expect("classmethod.__module__");
+        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+    }
+
+    #[test]
+    fn host_getattr_builtin_callable_dunder_self_returns_builtin_module() {
+        let func = HostObject::new_builtin_callable("len");
+        let out = host_getattr(&func, "__self__").expect("builtin callable.__self__");
+        let ConstValue::HostObject(module) = out else {
+            panic!("expected builtin module object");
+        };
+        assert!(module.is_module());
+        let name = host_getattr(&module, "__name__").expect("builtin module.__name__");
+        assert_eq!(name, ConstValue::Str("__builtin__".to_string()));
     }
 
     #[test]

@@ -254,6 +254,7 @@ mod tests {
     fn make_empty_host_code() -> HostCode {
         use super::super::argument::Signature;
         HostCode {
+            id: HostCode::fresh_identity(),
             co_name: "f".to_string(),
             co_filename: "<test>".to_string(),
             co_firstlineno: 1,

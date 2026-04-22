@@ -48,9 +48,10 @@ use core::fmt;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::super::flowspace::model::{Constant, HostObject, Variable};
+use super::super::flowspace::model::{ConstValue, Constant, HostObject, Variable};
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
+pub use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
 
 // ---------------------------------------------------------------------------
 // State / TLS (model.py:44-49).
@@ -122,6 +123,10 @@ pub enum KnownType {
     /// `r_uint` — the RPython sister of `int`, set when
     /// `SomeInteger.unsigned` is true.
     Ruint,
+    /// `r_longlong` — RPython's signed 64-bit integer type.
+    LongLong,
+    /// `r_ulonglong` — RPython's unsigned 64-bit integer type.
+    ULongLong,
     /// `bool` — the RPython `SomeBool.knowntype = bool`.
     Bool,
     /// `float` — the RPython `SomeFloat.knowntype = float`.
@@ -146,6 +151,8 @@ pub enum KnownType {
     /// `ReferenceType` — the RPython
     /// `SomeWeakRef.knowntype = weakref.ReferenceType`.
     WeakrefReference,
+    /// `lltype._ptr` — the RPython `SomePtr.knowntype = _ptr`.
+    LlPtr,
     /// Not a type this commit carries; future commits add `List`,
     /// `Tuple`, `Dict`, `Instance`, `Pbc`, `Iterator`, `Ptr`,
     /// `Address`.
@@ -159,6 +166,8 @@ impl fmt::Display for KnownType {
             KnownType::Type => "type",
             KnownType::Int => "int",
             KnownType::Ruint => "r_uint",
+            KnownType::LongLong => "r_longlong",
+            KnownType::ULongLong => "r_ulonglong",
             KnownType::Bool => "bool",
             KnownType::Float => "float",
             KnownType::Singlefloat => "r_singlefloat",
@@ -170,6 +179,7 @@ impl fmt::Display for KnownType {
             KnownType::BuiltinFunctionOrMethod => "builtin_function_or_method",
             KnownType::PropertyType => "property",
             KnownType::WeakrefReference => "ReferenceType",
+            KnownType::LlPtr => "_ptr",
             KnownType::Other => "<other>",
         };
         f.write_str(name)
@@ -466,10 +476,10 @@ impl SomeInteger {
     /// is strictly derived, so callers cannot pin both signedness and
     /// `KnownType::Ruint` to contradictory values.
     pub fn new_with_knowntype(nonneg: bool, knowntype: KnownType) -> Self {
-        // upstream: `unsigned = self.knowntype(-1) > 0`. Only r_uint
-        // (KnownType::Ruint) treats -1 as a positive value; all other
-        // integer KnownTypes are signed.
-        let unsigned = matches!(knowntype, KnownType::Ruint);
+        // upstream: `unsigned = self.knowntype(-1) > 0`. The unsigned
+        // rarithmetic integer families treat -1 as a positive value;
+        // all other integer KnownTypes are signed.
+        let unsigned = matches!(knowntype, KnownType::Ruint | KnownType::ULongLong);
         SomeInteger {
             base: SomeObjectBase::new(knowntype, true),
             nonneg: unsigned || nonneg,
@@ -1532,6 +1542,14 @@ impl SomeObjectTrait for SomeProperty {
     }
 }
 
+/// Re-export of [`SomePtr`], which RPython declares at
+/// `rpython/rtyper/lltypesystem/lltype.py:1520` (`class SomePtr(SomeObject)`).
+/// The struct lives next to its upstream home in
+/// [`crate::translator::rtyper::lltypesystem::lltype`]; this re-export
+/// lets the `SomeValue::Ptr` variant and local call-sites keep
+/// referring to it through the annotator-model module path.
+pub use crate::translator::rtyper::lltypesystem::lltype::SomePtr;
+
 /// RPython `SomeObject.needs_sandboxing` side-attribute payload
 /// (attached by `rtyper/extfunc.py:ExtFuncEntry.compute_annotation`
 /// when `config.translation.sandbox` is on). Upstream uses ad-hoc
@@ -1820,6 +1838,9 @@ pub enum SomeValue {
     PBC(SomePBC),
     None_(SomeNone),
     Property(SomeProperty),
+    Ptr(SomePtr),
+    InteriorPtr(SomeInteriorPtr),
+    LLADTMeth(SomeLLADTMeth),
     Builtin(SomeBuiltin),
     BuiltinMethod(SomeBuiltinMethod),
     WeakRef(SomeWeakRef),
@@ -1857,6 +1878,9 @@ pub enum SomeValueTag {
     PBC,
     None_,
     Property,
+    Ptr,
+    InteriorPtr,
+    LLADTMeth,
     Builtin,
     BuiltinMethod,
     WeakRef,
@@ -1897,6 +1921,9 @@ impl SomeValueTag {
             T::PBC => &[T::PBC, T::Object],
             T::None_ => &[T::None_, T::Object],
             T::Property => &[T::Property, T::Object],
+            T::Ptr => &[T::Ptr, T::Object],
+            T::InteriorPtr => &[T::InteriorPtr, T::Ptr, T::Object],
+            T::LLADTMeth => &[T::LLADTMeth, T::Object],
             T::Builtin => &[T::Builtin, T::Object],
             T::BuiltinMethod => &[T::BuiltinMethod, T::Object],
             T::WeakRef => &[T::WeakRef, T::Object],
@@ -1937,6 +1964,9 @@ impl SomeValue {
             SomeValue::PBC(_) => T::PBC,
             SomeValue::None_(_) => T::None_,
             SomeValue::Property(_) => T::Property,
+            SomeValue::Ptr(_) => T::Ptr,
+            SomeValue::InteriorPtr(_) => T::InteriorPtr,
+            SomeValue::LLADTMeth(_) => T::LLADTMeth,
             SomeValue::Builtin(_) => T::Builtin,
             SomeValue::BuiltinMethod(_) => T::BuiltinMethod,
             SomeValue::WeakRef(_) => T::WeakRef,
@@ -2064,6 +2094,9 @@ impl SomeValue {
             SomeValue::PBC(s) => s.base.const_box.as_ref(),
             SomeValue::None_(s) => s.base.const_box.as_ref(),
             SomeValue::Property(s) => s.base.const_box.as_ref(),
+            SomeValue::Ptr(s) => s.base.const_box.as_ref(),
+            SomeValue::InteriorPtr(s) => s.base.const_box.as_ref(),
+            SomeValue::LLADTMeth(s) => s.base.const_box.as_ref(),
             SomeValue::Builtin(s) => s.base.const_box.as_ref(),
             SomeValue::BuiltinMethod(s) => s.base.const_box.as_ref(),
             SomeValue::WeakRef(s) => s.base.const_box.as_ref(),
@@ -2091,6 +2124,9 @@ impl SomeValue {
                 })?;
                 bk.pbc_call(pbc, args, super::bookkeeper::PbcCallEmulated::None)
             }
+            SomeValue::Ptr(ptr) => ptr.call(args),
+            SomeValue::InteriorPtr(ptr) => ptr.call(args),
+            SomeValue::LLADTMeth(adtmeth) => adtmeth.call(args),
             SomeValue::None_(_) => Ok(s_impossible_value()),
             SomeValue::BuiltinMethod(method) => method.call(args),
             SomeValue::Builtin(sb) => {
@@ -2145,6 +2181,9 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::PBC(s) => s.knowntype(),
             SomeValue::None_(s) => s.knowntype(),
             SomeValue::Property(s) => s.knowntype(),
+            SomeValue::Ptr(s) => s.knowntype(),
+            SomeValue::InteriorPtr(s) => s.knowntype(),
+            SomeValue::LLADTMeth(s) => s.knowntype(),
             SomeValue::Builtin(s) => s.knowntype(),
             SomeValue::BuiltinMethod(s) => s.knowntype(),
             SomeValue::WeakRef(s) => s.knowntype(),
@@ -2176,6 +2215,9 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::PBC(s) => s.immutable(),
             SomeValue::None_(s) => s.immutable(),
             SomeValue::Property(s) => s.immutable(),
+            SomeValue::Ptr(s) => s.immutable(),
+            SomeValue::InteriorPtr(s) => s.immutable(),
+            SomeValue::LLADTMeth(s) => s.immutable(),
             SomeValue::Builtin(s) => s.immutable(),
             SomeValue::BuiltinMethod(s) => s.immutable(),
             SomeValue::WeakRef(s) => s.immutable(),
@@ -2207,6 +2249,9 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::PBC(s) => s.is_constant(),
             SomeValue::None_(s) => s.is_constant(),
             SomeValue::Property(s) => s.is_constant(),
+            SomeValue::Ptr(s) => s.is_constant(),
+            SomeValue::InteriorPtr(s) => s.is_constant(),
+            SomeValue::LLADTMeth(s) => s.is_constant(),
             SomeValue::Builtin(s) => s.is_constant(),
             SomeValue::BuiltinMethod(s) => s.is_constant(),
             SomeValue::WeakRef(s) => s.is_constant(),
@@ -2243,6 +2288,9 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::PBC(s) => s.can_be_none(),
             SomeValue::None_(s) => s.can_be_none(),
             SomeValue::Property(s) => s.can_be_none(),
+            SomeValue::Ptr(s) => s.can_be_none(),
+            SomeValue::InteriorPtr(s) => s.can_be_none(),
+            SomeValue::LLADTMeth(s) => s.can_be_none(),
             SomeValue::Builtin(s) => s.can_be_none(),
             SomeValue::BuiltinMethod(s) => s.can_be_none(),
             SomeValue::WeakRef(s) => s.can_be_none(),
@@ -2688,6 +2736,31 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             )))
         }
 
+        // llannotation.py:84-88 — low-level pointers union only when
+        // they carry the same `ll_ptrtype`.
+        (SomeValue::Ptr(a), SomeValue::Ptr(b)) => {
+            if a.ll_ptrtype != b.ll_ptrtype {
+                return Err(UnionError {
+                    lhs: s1.clone(),
+                    rhs: s2.clone(),
+                    msg: "RPython cannot unify distinct low-level pointer types".into(),
+                });
+            }
+            Ok(SomeValue::Ptr(SomePtr::new(a.ll_ptrtype.clone())))
+        }
+        (SomeValue::InteriorPtr(a), SomeValue::InteriorPtr(b)) => {
+            if a.ll_ptrtype != b.ll_ptrtype {
+                return Err(UnionError {
+                    lhs: s1.clone(),
+                    rhs: s2.clone(),
+                    msg: "RPython cannot unify distinct low-level pointer types".into(),
+                });
+            }
+            Ok(SomeValue::InteriorPtr(SomeInteriorPtr::new(
+                a.ll_ptrtype.clone(),
+            )))
+        }
+
         // `pair(SomeBuiltinMethod, SomeBuiltinMethod).union()` in
         // binaryop.py: analyser/methodname must match; `s_self`
         // widens by union.
@@ -2828,6 +2901,9 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
         SomeValue::Instance(v) => v.base.const_box = None,
         SomeValue::Exception(v) => v.base.const_box = None,
         SomeValue::Property(v) => v.base.const_box = None,
+        SomeValue::Ptr(v) => v.base.const_box = None,
+        SomeValue::InteriorPtr(v) => v.base.const_box = None,
+        SomeValue::LLADTMeth(v) => v.base.const_box = None,
         SomeValue::Builtin(v) => v.base.const_box = None,
         SomeValue::BuiltinMethod(v) => v.base.const_box = None,
         SomeValue::WeakRef(v) => v.base.const_box = None,
@@ -3172,6 +3248,7 @@ pub fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::GraphFunc;
     use std::rc::Rc;
 
     /// `ListDef::new(None, s_item, false, false)` shortcut — matches
@@ -3617,6 +3694,306 @@ mod tests {
         assert!(s.immutable());
         assert!(!s.can_be_none());
         assert_eq!(s.knowntype(), KnownType::BuiltinFunctionOrMethod);
+    }
+
+    #[test]
+    fn somelladtmeth_is_immutable_and_not_nullable() {
+        let s = SomeValue::LLADTMeth(SomeLLADTMeth::new(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelPointerType::Ptr(
+                crate::translator::rtyper::lltypesystem::lltype::Ptr {
+                    TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(
+                        crate::translator::rtyper::lltypesystem::lltype::FuncType {
+                            args: vec![],
+                            result:
+                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                        },
+                    ),
+                },
+            ),
+            ConstValue::HostObject(HostObject::new_user_function(GraphFunc::new(
+                "f",
+                Constant::new(ConstValue::Dict(Default::default())),
+            ))),
+        ));
+        assert!(s.immutable());
+        assert!(!s.can_be_none());
+        assert_eq!(s.knowntype(), KnownType::Object);
+    }
+
+    #[test]
+    fn someptr_call_returns_annotation_of_low_level_result() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Bool,
+            }),
+        });
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::new(false, false))],
+            None,
+            None,
+        );
+
+        let result = s_ptr
+            .call(&args)
+            .expect("low-level function pointer call must succeed");
+        assert!(matches!(result, SomeValue::Bool(_)));
+    }
+
+    #[test]
+    fn someptr_call_rejects_keyword_arguments() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![],
+            Some(std::collections::HashMap::from([(
+                "x".into(),
+                SomeValue::Integer(SomeInteger::new(false, false)),
+            )])),
+            None,
+        );
+
+        let err = s_ptr
+            .call(&args)
+            .expect_err("low-level function pointer call must reject kwargs");
+        assert!(err.msg.unwrap_or_default().contains("keyword arguments"));
+    }
+
+    #[test]
+    fn somevalue_call_routes_through_someptr_branch() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Bool,
+            }),
+        }));
+        let args = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
+
+        let result = s
+            .call(&args)
+            .expect("SomeValue::call must route SomePtr through SomePtr.call");
+        assert!(matches!(result, SomeValue::Bool(_)));
+    }
+
+    #[test]
+    fn someptr_getattr_rejects_nonconstant_field_name() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let s_attr = SomeString::new(false, false);
+        let err = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect_err("SomePtr.getattr must reject non-constant field names");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("non-constant field-name")
+        );
+    }
+
+    #[test]
+    fn someptr_setattr_rejects_nonconstant_field_name() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let s_attr = SomeString::new(false, false);
+        let err = s_ptr
+            .setattr(
+                &SomeValue::String(s_attr),
+                &SomeValue::Integer(SomeInteger::new(false, false)),
+            )
+            .expect_err("SomePtr.setattr must reject non-constant field names");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("non-constant field-name")
+        );
+    }
+
+    #[test]
+    fn someptr_getattr_surfaces_missing_field_error_on_function_pointer_subset() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("missing".into())));
+        let err = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect_err("function-pointer subset has no low-level fields");
+        assert!(err.msg.unwrap_or_default().contains("has no field"));
+    }
+
+    #[test]
+    fn someptr_setattr_surfaces_missing_field_error_on_function_pointer_subset() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("missing".into())));
+        let err = s_ptr
+            .setattr(
+                &SomeValue::String(s_attr),
+                &SomeValue::Integer(SomeInteger::new(false, false)),
+            )
+            .expect_err("function-pointer subset has no low-level fields");
+        assert!(err.msg.unwrap_or_default().contains("has no field"));
+    }
+
+    #[test]
+    fn someptr_getattr_reads_struct_field_annotation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, StructType,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(StructType::new(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("x".into())));
+
+        let result = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect("SomePtr.getattr must read struct field annotations");
+        assert!(matches!(result, SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn someptr_setattr_checks_struct_field_annotation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, StructType,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(StructType::new(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("x".into())));
+
+        let result = s_ptr
+            .setattr(
+                &SomeValue::String(s_attr),
+                &SomeValue::Integer(SomeInteger::new(false, false)),
+            )
+            .expect("SomePtr.setattr must accept matching struct field annotations");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn someptr_getattr_wraps_struct_adtmethod_as_lladtmeth() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, StructType};
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(StructType::with_adtmeths(
+                "S",
+                vec![],
+                vec![(
+                    "f".into(),
+                    ConstValue::HostObject(HostObject::new_user_function(GraphFunc::new(
+                        "f",
+                        Constant::new(ConstValue::Dict(Default::default())),
+                    ))),
+                )],
+            )),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("f".into())));
+
+        let result = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect("SomePtr.getattr must bind struct adt methods");
+        assert!(matches!(result, SomeValue::LLADTMeth(_)));
+    }
+
+    #[test]
+    fn someptr_getattr_exposes_nested_struct_field_as_someptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, StructType,
+        };
+
+        let inner = StructType::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(StructType::new(
+                "Outer",
+                vec![("x".into(), LowLevelType::Struct(Box::new(inner)))],
+            )),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("x".into())));
+
+        let result = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect("SomePtr.getattr must expose nested struct fields as SomePtr");
+        assert!(matches!(result, SomeValue::Ptr(_)));
+    }
+
+    #[test]
+    fn someptr_len_returns_constant_for_fixedsize_array_pointer() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArrayType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = super::super::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let _guard = ann.bookkeeper.at_position(None);
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 3)),
+        });
+        let result = s_ptr
+            .len()
+            .expect("SomePtr.len must read fixed-size-array length");
+        let SomeValue::Integer(i) = result else {
+            panic!("expected SomeInteger");
+        };
+        assert_eq!(i.base.const_box.unwrap().value, ConstValue::Int(3));
     }
 
     #[test]

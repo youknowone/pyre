@@ -33,9 +33,8 @@ use crate::annotator::model::KnownType;
 /// Rust port scopes the domain to [`KnownType`] variants the annotator
 /// actually exercises. Upstream `long` is Python 2's arbitrary-precision
 /// int, folded into [`KnownType::Int`] for Rust. `r_uint` maps to
-/// [`KnownType::Ruint`]. The wider-bit fallback (rarithmetic.py:224-225)
-/// lands with the `r_longlong` / `r_ulonglong` KnownType variants when
-/// those are added to the lattice.
+/// [`KnownType::Ruint`]. `r_longlong` / `r_ulonglong` map to the
+/// corresponding 64-bit [`KnownType`] variants.
 pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType {
     // Upstream: `if self_type is other_type:`.
     if self_type == other_type {
@@ -60,9 +59,22 @@ pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType
         return KnownType::Float;
     }
     // Upstream: `if self_type.SIGNED == other_type.SIGNED: build_int(...)`.
-    // Only r_uint is present in the Rust lattice currently; signedness
-    // comparison collapses to "both r_uint → r_uint" which the
-    // `self_type == other_type` branch above already handles.
+    if matches!(
+        (self_type, other_type),
+        (KnownType::LongLong, KnownType::Int)
+            | (KnownType::Int, KnownType::LongLong)
+            | (KnownType::LongLong, KnownType::LongLong)
+    ) {
+        return KnownType::LongLong;
+    }
+    if matches!(
+        (self_type, other_type),
+        (KnownType::ULongLong, KnownType::Ruint)
+            | (KnownType::Ruint, KnownType::ULongLong)
+            | (KnownType::ULongLong, KnownType::ULongLong)
+    ) {
+        return KnownType::ULongLong;
+    }
     panic!(
         "compute_restype: unsupported merge of {:?} and {:?}",
         self_type, other_type
@@ -83,11 +95,9 @@ pub fn signedtype(t: KnownType) -> bool {
     match t {
         // Upstream: `if t in (bool, int, long): return True`.
         KnownType::Bool | KnownType::Int => true,
-        // Upstream: `return t.SIGNED`. `r_uint` is unsigned; currently
-        // the lattice carries no other `_longlong` / `r_singlefloat`
-        // numeric types that would be SIGNED=True — if they land later
-        // their signedness match goes here.
-        KnownType::Ruint => false,
+        // Upstream: `return t.SIGNED`.
+        KnownType::LongLong => true,
+        KnownType::Ruint | KnownType::ULongLong => false,
         _ => false,
     }
 }
@@ -138,5 +148,14 @@ mod tests {
             compute_restype(KnownType::Int, KnownType::Float),
             KnownType::Float
         );
+    }
+
+    #[test]
+    fn signedtype_follows_rarithmetic_signed_flag() {
+        assert!(signedtype(KnownType::Bool));
+        assert!(signedtype(KnownType::Int));
+        assert!(signedtype(KnownType::LongLong));
+        assert!(!signedtype(KnownType::Ruint));
+        assert!(!signedtype(KnownType::ULongLong));
     }
 }

@@ -16,13 +16,9 @@
 //! * `BUILTIN_ANALYZERS` registry — ported in [`super::builtin`].
 //!   `SomeBuiltin.analyser_name` is seeded from the host qualname;
 //!   `SomeValue::call()` for `Builtin(_)` dispatches through
-//!   [`super::builtin::call_builtin`]. Upstream only routes registered
-//!   callables through `SomeBuiltin` (bookkeeper.py:309-311) and falls
-//!   every other builtin through to the `callable(x)` branch; the Rust
-//!   port preserves the "everything becomes `SomeBuiltin`" shape to
-//!   keep `policy.rs` sandboxing dispatch intact, so non-registered
-//!   qualnames surface at call time as
-//!   `AnnotatorError::new("no analyser registered for …")`.
+//!   [`super::builtin::call_builtin`]. Only registered builtins route
+//!   through `SomeBuiltin`, matching upstream
+//!   `bookkeeper.py:309-311`.
 //! * `classpbc_attr_families` / `all_specializations` — not yet
 //!   mirrored on the Rust bookkeeper; reachable only from rtyper-phase
 //!   consumers.
@@ -617,8 +613,7 @@ impl Bookkeeper {
     ///         s_callable.consider_call_site(args, s_result, call_op)
     /// ```
     ///
-    /// `SomeLLADTMeth` is an rtyper-side type the annotator never
-    /// constructs; that branch is a no-op here. `call_op.build_args`
+    /// `call_op.build_args`
     /// is opname-sensitive (`simple_call` →
     /// `ArgumentsForTranslation(list(args_s))`, `call_args` →
     /// `fromshape`); the simple_call path uses [`simple_args`].
@@ -628,17 +623,25 @@ impl Bookkeeper {
         op_key: Option<PositionKey>,
     ) -> Result<(), AnnotatorError> {
         let ann = self.annotator();
-        let Some(s_callable) = ann.annotation(&call_op.args[0]) else {
+        let Some(mut s_callable) = ann.annotation(&call_op.args[0]) else {
             return Ok(());
         };
-        // SomeLLADTMeth path is rtyper-only; not ported.
+        let mut args_s: Vec<SomeValue> = call_op
+            .args
+            .iter()
+            .skip(1)
+            .filter_map(|a| ann.annotation(a))
+            .collect();
+        if let SomeValue::LLADTMeth(adtmeth) = &s_callable {
+            let func = adtmeth.func.clone();
+            let ll_ptrtype = adtmeth.ll_ptrtype.clone();
+            s_callable = self.immutablevalue(&func)?;
+            args_s.insert(
+                0,
+                crate::translator::rtyper::llannotation::lltype_to_annotation(ll_ptrtype),
+            );
+        }
         if let SomeValue::PBC(pbc) = &s_callable {
-            let args_s: Vec<SomeValue> = call_op
-                .args
-                .iter()
-                .skip(1)
-                .filter_map(|a| ann.annotation(a))
-                .collect();
             let s_result = ann
                 .annotation(&call_op.result)
                 .unwrap_or(SomeValue::Impossible);
@@ -1612,9 +1615,9 @@ impl Bookkeeper {
     ///
     /// The function / class / bound-method / weakref / frozen-PBC /
     /// property / instance branches (bookkeeper.py:218-348) route
-    /// through [`Self::immutablevalue_hostobject`]. The
-    /// `extregistry.is_registered(x)` branch (bookkeeper.py:312-314)
-    /// still surfaces as [`AnnotatorError`].
+    /// through [`Self::immutablevalue_hostobject`]. The `_ptr`
+    /// extregistry branch (bookkeeper.py:312-314 via lltype.py:_ptrEntry)
+    /// routes through `translator/rtyper/extregistry.rs`.
     pub fn immutablevalue(self: &Rc<Self>, x: &ConstValue) -> Result<SomeValue, AnnotatorError> {
         match x {
             ConstValue::Bool(b) => {
@@ -1663,13 +1666,33 @@ impl Bookkeeper {
                 let host = HostObject::new_user_function((**func).clone());
                 self.immutablevalue_hostobject(&host, &ConstValue::HostObject(host.clone()))
             }
+            ConstValue::LLPtr(_) => {
+                assert!(crate::translator::rtyper::extregistry::is_registered(x));
+                let entry = crate::translator::rtyper::extregistry::lookup(x).expect(
+                    "Bookkeeper.immutablevalue(LLPtr): extregistry.lookup must succeed after \
+                     is_registered",
+                );
+                let mut result = entry.compute_annotation_bk(self)?;
+                // bookkeeper.py:350 — after the extregistry branch,
+                // upstream falls through to the common `result.const = x`.
+                // Keep that const_box on the SomePtr itself; otherwise
+                // SomePtr.bool/is_immutable_constant diverge from RPython.
+                match &mut result {
+                    SomeValue::Ptr(ptr) => {
+                        ptr.base.const_box = Some(Constant::new(x.clone()));
+                    }
+                    other => panic!(
+                        "Bookkeeper.immutablevalue(LLPtr): _ptrEntry must return SomePtr, got {other:?}"
+                    ),
+                }
+                Ok(result)
+            }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
-            | ConstValue::LLPtr(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder => {
-                // Code / LLPtr / SpecTag / Atom / Placeholder cover
+                // Code / Graphs / SpecTag / Atom / Placeholder cover
                 // internal flowspace / host-carrier values that
                 // upstream never feeds into immutablevalue. Keep the
                 // fail-fast stub so any unexpected call-site surfaces
@@ -1737,30 +1760,39 @@ impl Bookkeeper {
             return Ok(SomeValue::Property(super::model::SomeProperty::new(obj)));
         }
         // upstream bookkeeper.py:309-311 — `elif ishashable(x) and x
-        // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`. The Rust
-        // port routes two kinds of host objects into `SomeBuiltin`:
-        //
-        //   1. `HostObjectKind::BuiltinCallable` — every builtin
-        //      function gets a `SomeBuiltin`, whether or not
-        //      `builtin.rs` registered an analyser for it, because
-        //      `policy.rs` sandboxing dispatch inspects
-        //      `SomeValue::Builtin` directly. Missing analysers surface
-        //      at call time via `call_builtin`'s "no analyser
-        //      registered" error.
-        //   2. `HostObjectKind::Class` whose qualname is registered in
-        //      `BUILTIN_ANALYZERS` (e.g. `range`, `int`, `float`,
-        //      `bool`, `list`, `tuple`, `enumerate`, `reversed`,
-        //      `bytearray`). Upstream Python models these as
-        //      `type`-valued callables, and `bookkeeper.py:309-311`'s
-        //      membership test fires before `bookkeeper.py:315-316`'s
-        //      `tp is type` branch. Route them to `SomeBuiltin` to
-        //      match.
-        let is_registered_class = obj.is_class() && super::builtin::is_registered(obj.qualname());
-        if obj.is_builtin_callable() || is_registered_class {
+        // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`.
+        if super::builtin::is_registered(obj.qualname()) {
+            let module_name = match crate::flowspace::model::host_getattr(obj, "__module__") {
+                Ok(ConstValue::Str(s)) => s,
+                Ok(_) | Err(crate::flowspace::model::HostGetAttrError::Missing) => {
+                    "unknown".to_string()
+                }
+                Err(crate::flowspace::model::HostGetAttrError::Unsupported) => {
+                    return Err(AnnotatorError::new(format!(
+                        "Bookkeeper.immutablevalue(SomeBuiltin): getattr({:?}, '__module__') unsupported",
+                        obj.qualname()
+                    )));
+                }
+            };
+            let name = match crate::flowspace::model::host_getattr(obj, "__name__") {
+                Ok(ConstValue::Str(s)) => s,
+                Ok(other) => {
+                    return Err(AnnotatorError::new(format!(
+                        "Bookkeeper.immutablevalue(SomeBuiltin): {:?}.__name__ is not a string: {other:?}",
+                        obj.qualname()
+                    )));
+                }
+                Err(err) => {
+                    return Err(AnnotatorError::new(format!(
+                        "Bookkeeper.immutablevalue(SomeBuiltin): getattr({:?}, '__name__') failed: {err:?}",
+                        obj.qualname()
+                    )));
+                }
+            };
             let mut sb = SomeBuiltin::new(
                 obj.qualname().to_string(),
                 None,
-                Some(obj.qualname().to_string()),
+                Some(format!("{module_name}.{name}")),
             );
             sb.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::Builtin(sb));
@@ -2159,9 +2191,29 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::model::{SomeByteArray, SomeChar, SomeFloat};
     use crate::flowspace::model::GraphFunc;
+    use rustpython_compiler::{Mode, compile as rp_compile};
+    use rustpython_compiler_core::bytecode::ConstantData;
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    fn compiled_graph_func(src: &str, defaults: Vec<Constant>) -> GraphFunc {
+        let code = rp_compile(src, Mode::Exec, "<test>".into(), Default::default())
+            .expect("compile should succeed");
+        let inner = code
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some(&**code),
+                _ => None,
+            })
+            .expect("function body should be a code constant");
+        GraphFunc::from_host_code(
+            crate::flowspace::bytecode::HostCode::from_code(inner),
+            Constant::new(ConstValue::Dict(Default::default())),
+            defaults,
+        )
     }
 
     #[test]
@@ -2375,6 +2427,45 @@ mod tests {
     }
 
     #[test]
+    fn immutablevalue_llptr_returns_someptr() {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::{Block, FunctionGraph, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let bk = bk();
+        let start = Rc::new(RefCell::new(Block::new(vec![])));
+        let mut ret = Variable::new();
+        ret.concretetype = Some(lltype::LowLevelType::Void);
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "f",
+            start,
+            Hlvalue::Variable(ret),
+        )));
+        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype);
+        let expected_type = lltype::typeOf(&ptr);
+
+        let s = bk
+            .immutablevalue(&ConstValue::LLPtr(Box::new(ptr)))
+            .expect("LLPtr must route through extregistry SomePtr");
+
+        match s {
+            SomeValue::Ptr(p) => {
+                assert_eq!(p.ll_ptrtype, expected_type);
+                assert!(p.immutable());
+                assert!(!p.can_be_none());
+                assert!(p.is_constant());
+                assert!(matches!(
+                    p.base.const_box.as_ref().map(|c| &c.value),
+                    Some(ConstValue::LLPtr(_))
+                ));
+            }
+            other => panic!("expected SomePtr, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn immutablevalue_class_returns_constant_pbc() {
         // upstream bookkeeper.py:315-316 — `tp is type` produces
         // `SomeConstantType(x, self)`, a SomePBC subclass with
@@ -2409,10 +2500,12 @@ mod tests {
         // Function-kind Desc stub; real FunctionDesc wiring lands
         // when bookkeeper commit 2 ports getdesc.
         use crate::annotator::model::{DescKind, SomeValue};
-        use crate::flowspace::model::{Constant, GraphFunc, HostObject};
+        use crate::flowspace::model::HostObject;
         let bk = bk();
-        let globals = Constant::new(ConstValue::Dict(Default::default()));
-        let func = HostObject::new_user_function(GraphFunc::new("f", globals));
+        let func = HostObject::new_user_function(compiled_graph_func(
+            "def f(self):\n    return self\n",
+            Vec::new(),
+        ));
         let s = bk
             .immutablevalue(&ConstValue::HostObject(func))
             .expect("user-function HostObject must produce SomePBC");
@@ -2456,16 +2549,35 @@ mod tests {
     #[test]
     fn immutablevalue_builtin_callable_returns_somebuiltin() {
         // upstream bookkeeper.py:309-311 — BUILTIN_ANALYZERS lookup
-        // produces SomeBuiltin. Rust port wires the analyser_name
-        // from the host qualname until builtin.py lands the registry.
+        // produces SomeBuiltin with methodname
+        // `getattr(x, "__module__", "unknown") + "." + x.__name__`.
         use crate::annotator::model::SomeValue;
         use crate::flowspace::model::HostObject;
         let bk = bk();
-        let bltn = HostObject::new_builtin_callable("len");
+        let bltn = HostObject::new_builtin_callable("sys.getdefaultencoding");
         let s = bk
             .immutablevalue(&ConstValue::HostObject(bltn))
             .expect("builtin HostObject must produce SomeBuiltin");
-        assert!(matches!(s, SomeValue::Builtin(_)));
+        let SomeValue::Builtin(sb) = s else {
+            panic!("expected SomeBuiltin");
+        };
+        assert_eq!(sb.methodname.as_deref(), Some("sys.getdefaultencoding"));
+    }
+
+    #[test]
+    fn immutablevalue_builtin_class_uses_builtin_module_and_name_for_methodname() {
+        use crate::annotator::model::SomeValue;
+        let bk = bk();
+        let int_cls = crate::flowspace::model::HOST_ENV
+            .lookup_builtin("int")
+            .expect("builtin int class");
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(int_cls))
+            .expect("builtin class HostObject must produce SomeBuiltin");
+        let SomeValue::Builtin(sb) = s else {
+            panic!("expected SomeBuiltin");
+        };
+        assert_eq!(sb.methodname.as_deref(), Some("__builtin__.int"));
     }
 
     #[test]
@@ -3078,6 +3190,67 @@ mod tests {
         assert!(matches!(bool_ann, SomeValue::Bool(_)));
         let int_ann = bk.valueoftype(&AnnotationSpec::Int).unwrap();
         assert!(matches!(int_ann, SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn consider_call_site_routes_lladtmeth_through_immutablevalue_and_prepends_ptr() {
+        use crate::annotator::model::SomeLLADTMeth;
+        use crate::flowspace::model::{Hlvalue, HostObject, SpaceOperation, Variable};
+        use crate::flowspace::pygraph::PyGraph;
+        use crate::translator::rtyper::llannotation::lltype_to_annotation;
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, Ptr};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let _guard = ann.bookkeeper.at_position(None);
+
+        let gf = compiled_graph_func("def f(self):\n    return self\n", Vec::new());
+        let func = HostObject::new_user_function(gf.clone());
+        let fd = ann
+            .bookkeeper
+            .getdesc(&func)
+            .unwrap()
+            .as_function()
+            .unwrap();
+        fd.borrow().cache.borrow_mut().insert(
+            "".into(),
+            Rc::new(PyGraph::new(gf.clone(), gf.code.as_ref().unwrap())),
+        );
+        let ll_ptrtype = Ptr {
+            TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        };
+        let mut v_callable = Variable::named("adtmeth");
+        ann.setbinding(
+            &mut v_callable,
+            SomeValue::LLADTMeth(SomeLLADTMeth::new(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelPointerType::Ptr(
+                    ll_ptrtype.clone(),
+                ),
+                ConstValue::HostObject(func.clone()),
+            )),
+        );
+        let call_op = SpaceOperation::new(
+            "simple_call",
+            vec![Hlvalue::Variable(v_callable)],
+            Hlvalue::Variable(Variable::named("r")),
+        );
+
+        ann.bookkeeper
+            .consider_call_site(&call_op, None)
+            .expect("SomeLLADTMeth call site must flow through the wrapped function");
+
+        let family = fd.borrow().base.getcallfamily().unwrap();
+        let expected_shape = build_args_for_op("simple_call", &[lltype_to_annotation(ll_ptrtype)])
+            .unwrap()
+            .rawshape();
+        let family_ref = family.borrow();
+        let table = family_ref
+            .calltables
+            .get(&expected_shape)
+            .expect("SomeLLADTMeth must prepend ll_ptrtype to the call args");
+        assert_eq!(table.len(), 1);
     }
 
     #[test]

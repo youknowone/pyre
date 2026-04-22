@@ -1245,7 +1245,17 @@ impl ClassDesc {
             }
             // upstream: `elif self.pyobj is Exception: try: [s_arg] = args.fixedunpack(1)
             //                 except ValueError: pass else: assert not isinstance(s_arg, SomePtr)`.
-            // The Rust port has no SomePtr yet; the assert collapses to a no-op.
+            if this.borrow().pyobj.qualname() == "Exception"
+                && let Ok(unpacked) = args.fixedunpack(1)
+            {
+                let [s_arg] = unpacked.as_slice() else {
+                    unreachable!("fixedunpack(1) must return exactly one argument");
+                };
+                assert!(!matches!(
+                    s_arg,
+                    SomeValue::Ptr(_) | SomeValue::InteriorPtr(_)
+                ));
+            }
         } else {
             // upstream: `args = args.prepend(s_instance); s_init.call(args)`.
             let bound_args = args.prepend(s_instance.clone());
@@ -3743,5 +3753,37 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Cannot prove that the object is callable")
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn classdesc_pycall_exception_rejects_someptr_arg() {
+        use crate::annotator::model::SomePtr;
+        use crate::flowspace::model::{Block, FunctionGraph, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype;
+
+        let bk = make_bk();
+        let exc = HOST_ENV
+            .lookup_builtin("Exception")
+            .expect("HOST_ENV must bootstrap Exception");
+        let cdesc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            exc,
+            "Exception".into(),
+        )));
+
+        let start = Rc::new(RefCell::new(Block::new(vec![])));
+        let mut ret = Variable::new();
+        ret.concretetype = Some(lltype::LowLevelType::Void);
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "f",
+            start,
+            Hlvalue::Variable(ret),
+        )));
+        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype);
+        let s_arg = SomeValue::Ptr(SomePtr::new(lltype::typeOf(&ptr)));
+        let args = super::super::argument::ArgumentsForTranslation::new(vec![s_arg], None, None);
+
+        let _ = ClassDesc::pycall(&cdesc, None, &args, &SomeValue::Impossible, None);
     }
 }

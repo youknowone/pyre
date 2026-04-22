@@ -124,6 +124,7 @@ mod tests {
 
     fn make_host_code(name: &str, nlocals: u32, argcount: u32, varnames: &[&str]) -> HostCode {
         HostCode {
+            id: HostCode::fresh_identity(),
             co_name: name.to_string(),
             co_filename: "<test>".to_string(),
             co_firstlineno: 1,

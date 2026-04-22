@@ -2164,9 +2164,10 @@ mod tests {
     }
 
     #[test]
-    fn getattr_constfold_declines_on_non_foldable_obj() {
-        // upstream operation.py:634 — `w_obj.foldable()` gate. A user
-        // function (non-foldable) declines the fold silently.
+    fn getattr_constfold_user_function_missing_attr_raises() {
+        // upstream operation.py:634-642 — user function constants are
+        // foldable, so `getattr(function, "missing")` reaches the real
+        // getattr() call and raises FlowingError on AttributeError.
         use crate::flowspace::model::{GraphFunc, HostObject};
         let globals = Constant::new(ConstValue::None);
         let gf = GraphFunc::new("user_fn".to_string(), globals);
@@ -2175,7 +2176,27 @@ mod tests {
             OpKind::GetAttr,
             vec![c(ConstValue::HostObject(func)), cs("whatever")],
         );
-        assert!(op.constfold().unwrap().is_none());
+        let err = op
+            .constfold()
+            .expect_err("missing function attribute must escalate to FlowingError");
+        assert!(err.message.contains("always raises AttributeError"));
+    }
+
+    #[test]
+    fn getattr_constfold_user_function_dunder_name_returns_constant_str() {
+        use crate::flowspace::model::{GraphFunc, HostObject};
+        let globals = Constant::new(ConstValue::None);
+        let gf = GraphFunc::new("pkg.demo.user_fn".to_string(), globals);
+        let func = HostObject::new_user_function(gf);
+        let op = HLOperation::new(
+            OpKind::GetAttr,
+            vec![c(ConstValue::HostObject(func)), cs("__name__")],
+        );
+        let folded = op.constfold().expect("function.__name__ should fold");
+        let Some(Hlvalue::Constant(constant)) = folded else {
+            panic!("expected Constant result");
+        };
+        assert_eq!(constant.value, ConstValue::Str("user_fn".to_string()));
     }
 
     #[test]

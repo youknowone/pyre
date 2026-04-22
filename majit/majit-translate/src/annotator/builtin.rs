@@ -1041,13 +1041,10 @@ pub fn rarith_longlongmask(
     _kwds: &HashMap<String, SomeValue>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream: `SomeInteger(knowntype=rpython.rlib.rarithmetic.r_longlong)`.
-    //
-    // The Rust `KnownType` enum does not carry a distinct `LongLong`
-    // variant — `binaryop`'s integer promotion table currently collapses
-    // long-long into plain `int`, so the Rust port returns the default
-    // `SomeInteger` to match that collapsed lattice. If/when `KnownType`
-    // gains `LongLong`, update here to pin it.
-    Ok(SomeValue::Integer(SomeInteger::default()))
+    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+        false,
+        crate::annotator::model::KnownType::LongLong,
+    )))
 }
 
 /// Upstream `robjmodel_instantiate(s_clspbc, s_nonmovable=None)`

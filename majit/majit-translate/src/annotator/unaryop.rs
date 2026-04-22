@@ -107,6 +107,7 @@ pub fn init(
     init_someunicodecp_overrides(reg);
     init_someiterator_overrides(reg);
     init_somepbc_overrides(reg);
+    init_someptr_overrides(reg);
     init_somenone_overrides(reg);
     init_someweakref_overrides(reg);
 }
@@ -3156,6 +3157,111 @@ fn init_somepbc_overrides(
 }
 
 // =====================================================================
+// lltype.py:1566-1570 — SomePtr.bool
+// =====================================================================
+
+fn init_someptr_overrides(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Specialization>,
+    >,
+) {
+    fn with_ptr_like<R>(
+        s: &SomeValue,
+        f: impl FnOnce(&crate::annotator::model::SomePtr) -> R,
+        g: impl FnOnce(&crate::annotator::model::SomeInteriorPtr) -> R,
+    ) -> R {
+        match s {
+            SomeValue::Ptr(ptr) => f(ptr),
+            SomeValue::InteriorPtr(ptr) => g(ptr),
+            other => unreachable!("Ptr-tag dispatch must carry ptr-like value, got {other:?}"),
+        }
+    }
+    register(
+        reg,
+        OpKind::GetAttr,
+        SomeValueTag::Ptr,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s = ann
+                    .annotation(&hl.args[0])
+                    .expect("ptr.getattr: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("ptr.getattr: attr unbound");
+                with_ptr_like(
+                    &s,
+                    |ptr| ptr.getattr(&s_attr).expect("ptr.getattr must succeed"),
+                    |ptr| {
+                        ptr.getattr(&s_attr)
+                            .expect("interiorptr.getattr must succeed")
+                    },
+                )
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    register(
+        reg,
+        OpKind::Len,
+        SomeValueTag::Ptr,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s = ann.annotation(&hl.args[0]).expect("ptr.len: unbound");
+                with_ptr_like(
+                    &s,
+                    |ptr| ptr.len().expect("ptr.len must succeed"),
+                    |ptr| ptr.len().expect("interiorptr.len must succeed"),
+                )
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    register(
+        reg,
+        OpKind::Bool,
+        SomeValueTag::Ptr,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s = ann.annotation(&hl.args[0]).expect("ptr.bool: unbound");
+                with_ptr_like(&s, |ptr| ptr.bool(), |ptr| ptr.bool())
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    register(
+        reg,
+        OpKind::SetAttr,
+        SomeValueTag::Ptr,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s = ann
+                    .annotation(&hl.args[0])
+                    .expect("ptr.setattr: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("ptr.setattr: attr unbound");
+                let s_value = ann
+                    .annotation(&hl.args[2])
+                    .expect("ptr.setattr: value unbound");
+                with_ptr_like(
+                    &s,
+                    |ptr| {
+                        ptr.setattr(&s_attr, &s_value)
+                            .expect("ptr.setattr must succeed")
+                    },
+                    |ptr| {
+                        ptr.setattr(&s_attr, &s_value)
+                            .expect("interiorptr.setattr must succeed")
+                    },
+                )
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+}
+
+// =====================================================================
 // unaryop.py:1000-1021 — class __extend__(SomeNone)
 // =====================================================================
 
@@ -4104,6 +4210,155 @@ mod tests {
         let (hl, ann) = hl1(OpKind::Bool, SomeValue::Bool(SomeBool::new()));
         let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_someptr_bool_uses_ptr_override() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget, functionptr,
+        };
+
+        let ann = mk_ann();
+        let ptr = functionptr(
+            FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            },
+            "f",
+            None,
+            None,
+        );
+        let mut s_ptr = super::super::model::SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        s_ptr.base.const_box = Some(Constant::new(ConstValue::LLPtr(Box::new(ptr))));
+        let mut v = Variable::named("p");
+        ann.setbinding(&mut v, SomeValue::Ptr(s_ptr));
+        let hl = HLOperation::new(OpKind::Bool, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann).unwrap();
+        let SomeValue::Bool(b) = r else {
+            panic!("expected SomeBool");
+        };
+        assert_eq!(b.base.const_box.unwrap().value, ConstValue::Bool(true));
+    }
+
+    #[test]
+    fn consider_someptr_len_uses_ptr_override() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        // upstream `SomePtr.len()` (lltype.py:1550-1555) propagates
+        // `_fixedlength`'s `len()` probe, which raises `TypeError` on
+        // non-array pointers. Use an Array ptr so the override returns
+        // `SomeInteger(nonneg=True)` (the varsize-array path).
+        let ann = mk_ann();
+        let s_ptr = super::super::model::SomePtr::new(Ptr {
+            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+        });
+        let mut v = Variable::named("p");
+        ann.setbinding(&mut v, SomeValue::Ptr(s_ptr));
+        let hl = HLOperation::new(OpKind::Len, vec![Hlvalue::Variable(v)]);
+
+        let r = hl.consider(&ann).unwrap();
+        let SomeValue::Integer(i) = r else {
+            panic!("expected SomeInteger");
+        };
+        assert!(i.nonneg);
+    }
+
+    #[test]
+    fn consider_someinteriorptr_bool_uses_ptr_override() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            InteriorOffset, InteriorPtr, LowLevelType, StructType,
+        };
+
+        let ann = mk_ann();
+        let mut v = Variable::named("p");
+        ann.setbinding(
+            &mut v,
+            SomeValue::InteriorPtr(super::super::model::SomeInteriorPtr::new(InteriorPtr {
+                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(StructType::new(
+                    "S",
+                    vec![("x".into(), LowLevelType::Signed)],
+                )))),
+                TO: Box::new(LowLevelType::Signed),
+                offsets: vec![InteriorOffset::Field("x".into())],
+            })),
+        );
+        let hl = HLOperation::new(OpKind::Bool, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann).unwrap();
+        assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-constant field-name")]
+    fn consider_someptr_getattr_uses_ptr_override() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let s_ptr = super::super::model::SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(&mut v_ptr, SomeValue::Ptr(s_ptr));
+        let mut v_attr = Variable::named("name");
+        ann.setbinding(
+            &mut v_attr,
+            SomeValue::String(super::super::model::SomeString::new(false, false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![Hlvalue::Variable(v_ptr), Hlvalue::Variable(v_attr)],
+        );
+
+        let _ = hl.consider(&ann);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-constant field-name")]
+    fn consider_someptr_setattr_uses_ptr_override() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let s_ptr = super::super::model::SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(&mut v_ptr, SomeValue::Ptr(s_ptr));
+        let mut v_attr = Variable::named("name");
+        ann.setbinding(
+            &mut v_attr,
+            SomeValue::String(super::super::model::SomeString::new(false, false)),
+        );
+        let mut v_value = Variable::named("value");
+        ann.setbinding(
+            &mut v_value,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::SetAttr,
+            vec![
+                Hlvalue::Variable(v_ptr),
+                Hlvalue::Variable(v_attr),
+                Hlvalue::Variable(v_value),
+            ],
+        );
+
+        let _ = hl.consider(&ann);
     }
 
     #[test]

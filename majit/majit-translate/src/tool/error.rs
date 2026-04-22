@@ -185,6 +185,9 @@ fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
         ),
         SomeValue::None_(_) => "SomeNone()".into(),
         SomeValue::Property(_) => "SomeProperty()".into(),
+        SomeValue::Ptr(_) => "SomePtr(...)".into(),
+        SomeValue::InteriorPtr(_) => "SomeInteriorPtr(...)".into(),
+        SomeValue::LLADTMeth(_) => "SomeLLADTMeth(...)".into(),
         SomeValue::Builtin(_) => "SomeBuiltin()".into(),
         SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod()".into(),
         SomeValue::WeakRef(_) => "SomeWeakRef()".into(),
@@ -625,6 +628,7 @@ mod tests {
     fn mk_code() -> HostCode {
         use crate::flowspace::argument::Signature;
         HostCode {
+            id: HostCode::fresh_identity(),
             co_name: "f".into(),
             co_filename: "<test.py>".into(),
             co_firstlineno: 10,

@@ -2767,6 +2767,7 @@ mod tests {
             Constant::new(ConstValue::Dict(Default::default())),
         );
         func.code = Some(Box::new(HostCode {
+            id: HostCode::fresh_identity(),
             co_name: "f".to_string(),
             co_filename: "<test>".to_string(),
             co_firstlineno: 1,

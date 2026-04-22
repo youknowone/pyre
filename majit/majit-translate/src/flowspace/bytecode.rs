@@ -37,6 +37,8 @@ pub use rustpython_compiler_core::bytecode::{
     ExceptionTableEntry, Instruction, MakeFunctionFlag, OpArg, OpArgState,
 };
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::argument::Signature;
 
 /// Error raised when the bytecode stream cannot be decoded.
@@ -110,6 +112,8 @@ pub fn cpython_code_signature(code: &HostCode) -> Signature {
 /// instead of a byte-level `ord(co_code[offset])` loop.
 #[derive(Clone, Debug)]
 pub struct HostCode {
+    /// Stable object identity for RPython `Hashable(codeobj)` parity.
+    pub(crate) id: u64,
     pub co_argcount: u32,
     pub co_nlocals: u32,
     pub co_stacksize: u32,
@@ -135,28 +139,23 @@ pub struct HostCode {
 
 impl PartialEq for HostCode {
     fn eq(&self, other: &Self) -> bool {
-        self.co_argcount == other.co_argcount
-            && self.co_nlocals == other.co_nlocals
-            && self.co_stacksize == other.co_stacksize
-            && self.co_flags == other.co_flags
-            && self.co_code.original_bytes() == other.co_code.original_bytes()
-            && self.consts == other.consts
-            && self.names == other.names
-            && self.co_varnames == other.co_varnames
-            && self.co_freevars == other.co_freevars
-            && self.co_cellvars == other.co_cellvars
-            && self.co_filename == other.co_filename
-            && self.co_name == other.co_name
-            && self.co_firstlineno == other.co_firstlineno
-            && self.co_lnotab == other.co_lnotab
-            && self.exceptiontable == other.exceptiontable
-            && self.signature == other.signature
+        self.id == other.id
     }
 }
 
 impl Eq for HostCode {}
 
+static NEXT_HOST_CODE_ID: AtomicU64 = AtomicU64::new(1);
+
 impl HostCode {
+    pub(crate) fn fresh_identity() -> u64 {
+        NEXT_HOST_CODE_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn _hashable_identity(&self) -> u64 {
+        self.id
+    }
+
     /// RPython: `HostCode.__init__`.
     ///
     /// Structural note: RPython takes 13 positional arguments matching
@@ -183,6 +182,7 @@ impl HostCode {
     ) -> Self {
         assert!(nlocals as i64 >= 0, "nlocals must be non-negative");
         let mut host = Self {
+            id: Self::fresh_identity(),
             co_argcount: argcount,
             co_nlocals: nlocals,
             co_stacksize: stacksize,

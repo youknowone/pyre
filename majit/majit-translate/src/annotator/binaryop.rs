@@ -30,6 +30,8 @@ use super::model::{
     s_impossible_value, unionof,
 };
 use crate::tool::pairtype::DoubleDispatchRegistry;
+use crate::translator::rtyper::llannotation;
+use crate::translator::rtyper::lltypesystem::lltype;
 
 /// RPython `BINARY_OPERATIONS` (binaryop.py:22-23).
 ///
@@ -122,6 +124,7 @@ pub fn init(
     init_unicode_family_union_add(reg);
     init_cmp_str_unicode(reg);
     init_integer_list_pairtype(reg);
+    llannotation::init_pairtypes(reg);
     init_dict_dict_pairtype(reg);
     init_dict_object_pairtype(reg);
     init_dict_getitem(reg);
@@ -3281,6 +3284,142 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_ptr_integer_getitem_returns_low_level_item_annotation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let mut v0 = Variable::named("p");
+        let mut v1 = Variable::named("i");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Ptr(model::SomePtr::new(Ptr {
+                TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            })),
+        );
+        ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_ptr_integer_getitem_zero_length_fixed_array_returns_impossible() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArrayType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let mut v0 = Variable::named("p");
+        let mut v1 = Variable::named("i");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Ptr(model::SomePtr::new(Ptr {
+                TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 0)),
+            })),
+        );
+        ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_ptr_integer_setitem_checks_low_level_item_type() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let mut v0 = Variable::named("p");
+        let mut v1 = Variable::named("i");
+        let mut v2 = Variable::named("v");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Ptr(model::SomePtr::new(Ptr {
+                TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            })),
+        );
+        ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
+        ann.setbinding(&mut v2, SomeValue::Integer(SomeInteger::default()));
+        let hl = HLOperation::new(
+            OpKind::SetItem,
+            vec![
+                Hlvalue::Variable(v0),
+                Hlvalue::Variable(v1),
+                Hlvalue::Variable(v2),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_interiorptr_integer_getitem_returns_low_level_item_annotation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, InteriorOffset, InteriorPtr, LowLevelType, StructType,
+        };
+
+        let ann = mk_ann();
+        let mut v0 = Variable::named("p");
+        let mut v1 = Variable::named("i");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::InteriorPtr(model::SomeInteriorPtr::new(InteriorPtr {
+                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(StructType::new(
+                    "S",
+                    vec![(
+                        "arr".into(),
+                        LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed))),
+                    )],
+                )))),
+                TO: Box::new(LowLevelType::Array(Box::new(ArrayType::new(
+                    LowLevelType::Signed,
+                )))),
+                offsets: vec![InteriorOffset::Field("arr".into())],
+            })),
+        );
+        ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(matches!(r, SomeValue::Integer(_)), "got {:?}", r);
+    }
+
+    #[test]
+    #[should_panic(expected = "getitem index not an int")]
+    fn consider_ptr_object_getitem_rejects_non_integer_index() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let mut v0 = Variable::named("p");
+        let mut v1 = Variable::named("o");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Ptr(model::SomePtr::new(Ptr {
+                TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            })),
+        );
+        ann.setbinding(&mut v1, SomeValue::object());
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+        let _ = hl.consider(&ann);
     }
 
     #[test]
