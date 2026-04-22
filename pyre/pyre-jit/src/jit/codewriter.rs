@@ -499,6 +499,31 @@ fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
     block.borrow_mut().exits.push(link);
 }
 
+/// Step 6A slice S4a: atomically append `link` to `block.exits` and
+/// snapshot `source_state` into `link_exit_states` so later passes
+/// (`collect_link_slot_pairs`) can resolve the source-side register
+/// slots at this link.
+///
+/// RPython parity: there is no direct counterpart — RPython's
+/// `coalesce_variables` runs inline with Variable-keyed UnionFind
+/// over `graph.iterblocks()`, so no per-link state capture is
+/// needed.  pyre's regalloc runs after-the-fact on a u16-indexed
+/// SSARepr (`regalloc.rs` docstring, lines 26-36 PRE-EXISTING-
+/// ADAPTATION), so the collector needs the source FrameState to
+/// translate Variables back to slots.  The snapshot is the minimal
+/// bridging data — one FrameState per link, cloned at emission time
+/// (the walker discards its `currentstate` after the terminator
+/// finishes so a clone is the only way to preserve it).
+fn append_exit_with_state(
+    block: &super::flow::BlockRef,
+    link: super::flow::LinkRef,
+    source_state: &FrameState,
+    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
+) {
+    link_exit_states.insert(link.clone(), source_state.clone());
+    append_exit(block, link);
+}
+
 fn initialize_spam_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -525,6 +550,7 @@ fn make_next_block(
     currentblock: &SpamBlockRef,
     currentstate: &FrameState,
     next_offset: usize,
+    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
 ) -> SpamBlockRef {
     let mut fresh = |kind| fresh_variable_for_state(graph, kind);
     let mut newstate = currentstate.copy(&mut fresh);
@@ -533,9 +559,11 @@ fn make_next_block(
     let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
     newblock.block().borrow_mut().inputargs = newstate.getvariables();
     let outputargs = currentstate.getoutputargs(&newstate);
-    append_exit(
+    append_exit_with_state(
         &currentblock.block(),
         super::flow::Link::new(outputargs, Some(newblock.block()), None).into_ref(),
+        currentstate,
+        link_exit_states,
     );
     newblock
 }
@@ -548,6 +576,7 @@ fn mergeblock(
     currentblock: &SpamBlockRef,
     currentstate: &FrameState,
     next_offset: usize,
+    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
 ) -> SpamBlockRef {
     let candidates = joinpoints.entry(next_offset).or_default();
     for index in 0..candidates.len() {
@@ -561,9 +590,11 @@ fn mergeblock(
         };
         if newstate.matches(&block_state) {
             let outputargs = currentstate.getoutputargs(&newstate);
-            append_exit(
+            append_exit_with_state(
                 &currentblock.block(),
                 super::flow::Link::new(outputargs, Some(block.block()), None).into_ref(),
+                currentstate,
+                link_exit_states,
             );
             pc_blocks[next_offset] = Some(block.clone());
             return block;
@@ -577,18 +608,28 @@ fn mergeblock(
         let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
         newblock.block().borrow_mut().inputargs = newstate.getvariables();
         let outputargs = currentstate.getoutputargs(&newstate);
-        append_exit(
+        append_exit_with_state(
             &currentblock.block(),
             super::flow::Link::new(outputargs, Some(newblock.block()), None).into_ref(),
+            currentstate,
+            link_exit_states,
         );
 
         block.mark_dead();
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
         let old_outputargs = block_state.getoutputargs(&newstate);
-        block.block().recloseblock(vec![
-            super::flow::Link::new(old_outputargs, Some(newblock.block()), None).into_ref(),
-        ]);
+        // Supersede link: the dead candidate block's EXIT state is
+        // `block_state` (its stored FrameState — no mid-block ops
+        // were ever walked through it, since it was a joinpoint
+        // candidate not yet visited by the dispatch loop).  The new
+        // merged block absorbs its outgoing edge; snapshot
+        // `block_state` as the source EXIT so later passes see the
+        // correct Variables.
+        let supersede_link =
+            super::flow::Link::new(old_outputargs, Some(newblock.block()), None).into_ref();
+        link_exit_states.insert(supersede_link.clone(), block_state.clone());
+        block.block().recloseblock(vec![supersede_link]);
 
         candidates.remove(index);
         candidates.insert(0, newblock.clone());
@@ -596,7 +637,14 @@ fn mergeblock(
         return newblock;
     }
 
-    let newblock = make_next_block(code, graph, currentblock, currentstate, next_offset);
+    let newblock = make_next_block(
+        code,
+        graph,
+        currentblock,
+        currentstate,
+        next_offset,
+        link_exit_states,
+    );
     candidates.insert(0, newblock.clone());
     pc_blocks[next_offset] = Some(newblock.clone());
     newblock
@@ -661,6 +709,8 @@ fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
 fn attach_catch_exception_edge(
     block: &super::flow::BlockRef,
     target: super::flow::BlockRef,
+    source_state: Option<&FrameState>,
+    link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
 ) -> super::flow::LinkRef {
     let link = super::flow::Link::new(Vec::new(), Some(target), None).into_ref();
     let mut block_mut = block.borrow_mut();
@@ -668,7 +718,10 @@ fn attach_catch_exception_edge(
         super::flow::c_last_exception().into(),
     ));
     drop(block_mut);
-    append_exit(block, link.clone());
+    match source_state {
+        Some(state) => append_exit_with_state(block, link.clone(), state, link_exit_states),
+        None => append_exit(block, link.clone()),
+    }
     link
 }
 
@@ -720,66 +773,104 @@ fn collect_block_states(
     map
 }
 
-/// Step 6A slice S3: CFG-level collection of (source_slot, target_slot)
-/// coalesce pairs.  Pure function, no side effects.
+/// Step 6A slice S3 (S3c revision): CFG-level collection of
+/// `(source_slot, target_slot)` coalesce pairs.  Pure function, no
+/// side effects.
 ///
 /// Walks `graph.iterblocks()` → each block's exits.  For each Link:
-///   1. Source state = `block_states[source block]`.
-///   2. Target state = `block_states[link.target]`.  Skipped when
-///      either is absent — catch-landing blocks, `returnblock`, and
-///      `exceptblock` are constructed without a FrameState attached.
-///   3. For each position j in `zip(link.args, target.inputargs)`:
-///      - Ignore non-Variable link args (Constants, `None`).
-///      - Resolve each Variable to its SSARepr register slot via
-///        `FrameState::variable_slot` (S1 + S2).  Skip if either side
-///        fails (e.g. the `last_exception` pair, which has no slot).
-///      - Push `(source_slot, target_slot)` when both resolve.
+///   1. Source state = `link_exit_states[link]` — the walker's
+///      `currentstate` snapshot captured at terminator emission time
+///      (`flowcontext.py:1237,1268-1280`).  This is the source
+///      block's EXIT state, not its ENTRY state, because fresh
+///      Variables produced by mid-block operations live in
+///      `currentstate.locals_w` / `currentstate.stack` but never in
+///      the source block's stored ENTRY FrameState.
+///   2. Target state = `block_entry_states[link.target]` — the target
+///      block's ENTRY FrameState set up by `mergeblock` /
+///      `initialize_spam_block` (its mergeable positions correspond
+///      directly to `target.inputargs`).
+///   3. Links with no source EXIT entry or no target ENTRY entry
+///      (catch landings, `returnblock`, `exceptblock`) contribute no
+///      pairs.
+///   4. For each mergeable position `idx` that is a Variable on the
+///      target side AND a Variable on the source side:
+///        - Derive the SSARepr register slot via
+///          `FrameState::mergeable_index_to_slot(idx)` — both source
+///          and target use the same slot because pyre's walker packs
+///          `[locals 0..nlocals][stack nlocals..]` identically across
+///          all blocks of one CodeObject.
+///        - Skip positions where source has a Constant (link.args[j]
+///          is then a Constant — non-Variable link args do not
+///          contribute a coalesce pair, matching `regalloc.py:99-101`
+///          `if isinstance(v, Variable)`).
+///        - Skip positions that map to the `last_exception` pair
+///          (mergeable_index_to_slot returns None there).
+///        - Push the pair `(slot, slot)` for documentation / parity
+///          with `regalloc.py:79-96`.  Production links come from
+///          `FrameState::getoutputargs` (see `codewriter.rs:333-346`)
+///          which is positionally aligned by construction, so the
+///          emitted pairs are trivially equal in slot value — the
+///          CFG-level coalesce is a structural no-op in pyre's
+///          architecture.  Intra-block copy coalescing (not
+///          representable at the CFG / Link level) is handled by the
+///          SSARepr `*_copy` scanner at `regalloc.rs:440-467`.
 ///
-/// Upstream reference: `rpython/tool/algo/regalloc.py:79-112`
-/// `RegAllocator.coalesce_variables` iterates `graph.iterlinks()` and
-/// unions `link.args[i]` with `target.inputargs[i]` color-by-color.
-/// This function is the collection half; union-find composition is
-/// the consumer's job (S4 will feed the pairs into
-/// `RegAllocator::try_coalesce`).
+/// Upstream reference: `rpython/tool/algo/regalloc.py:79-96`
+/// `RegAllocator.coalesce_variables` iterates `graph.iterblocks()` →
+/// `block.exits` → `zip(link.args, link.target.inputargs)` and unions
+/// each Variable pair via `_try_coalesce`.  RPython has no FrameState
+/// indirection — Variables carry their own UnionFind identity.
+/// pyre's regalloc is u16-register-keyed (PRE-EXISTING-ADAPTATION;
+/// see `regalloc.rs:26-36`), so this helper projects Variables back
+/// onto slots through the positionally-aligned mergeable lists.
 ///
-/// Parallel to the SSARepr-level `pyre/pyre-jit/src/jit/regalloc.rs::
-/// coalesce_variables` scanner.  S4 will assert the CFG pairs form a
-/// subset of the scanner's union-find equivalences — the scanner also
-/// catches intra-block `*_copy` ops (e.g. STORE_FAST stack → local)
-/// that have no cross-block Link representation.
+/// Why positional, not Variable-keyed: pyre's walker can reuse one
+/// Variable across multiple mergeable positions simultaneously — e.g.
+/// `LoadFast` at `codewriter.rs:2413-2414` pushes the local's own
+/// Variable onto the stack, so that Variable lives at slot `x` (in
+/// `locals_w`) AND at slot `stack_base + depth` (in `stack`) in the
+/// same FrameState.  A Variable → single slot map would be ambiguous;
+/// the j-th `link.args` position carries the source Variable drawn
+/// from source.mergeable()[idx_j] by `getoutputargs`, and idx_j IS
+/// the slot by construction.
 fn collect_link_slot_pairs(
     graph: &super::flow::FunctionGraph,
-    block_states: &HashMap<super::flow::BlockRef, FrameState>,
+    block_entry_states: &HashMap<super::flow::BlockRef, FrameState>,
+    link_exit_states: &HashMap<super::flow::LinkRef, FrameState>,
 ) -> Vec<(u16, u16)> {
     let mut pairs = Vec::new();
     for block in graph.iterblocks() {
-        let Some(source_state) = block_states.get(&block) else {
-            continue;
-        };
         let block_borrow = block.borrow();
         for link in &block_borrow.exits {
-            let link_borrow = link.borrow();
-            let Some(target) = link_borrow.target.clone() else {
+            let Some(source_state) = link_exit_states.get(link) else {
                 continue;
             };
-            let Some(target_state) = block_states.get(&target) else {
+            let Some(target) = link.borrow().target.clone() else {
                 continue;
             };
-            let target_borrow = target.borrow();
-            for (arg, inputarg) in link_borrow.args.iter().zip(target_borrow.inputargs.iter()) {
-                let Some(v_src) = arg.as_ref().and_then(|v| v.as_variable()) else {
+            let Some(target_state) = block_entry_states.get(&target) else {
+                continue;
+            };
+            let source_mergeable = source_state.mergeable();
+            let target_mergeable = target_state.mergeable();
+            // `getoutputargs` assumes same-length mergeable lists (the
+            // walker's `copy` / `union` preserve position count).  If
+            // a caller hands in a target state from a different
+            // CodeObject, the arity check avoids emitting bogus pairs.
+            if source_mergeable.len() != target_mergeable.len() {
+                continue;
+            }
+            for (idx, target_value) in target_mergeable.iter().enumerate() {
+                let Some(super::flow::FlowValue::Variable(_)) = target_value else {
                     continue;
                 };
-                let Some(v_dst) = inputarg.as_variable() else {
+                let Some(super::flow::FlowValue::Variable(_)) = source_mergeable[idx] else {
                     continue;
                 };
-                let Some(src_slot) = source_state.variable_slot(&v_src) else {
+                let Some(slot) = target_state.mergeable_index_to_slot(idx) else {
                     continue;
                 };
-                let Some(dst_slot) = target_state.variable_slot(&v_dst) else {
-                    continue;
-                };
-                pairs.push((src_slot, dst_slot));
+                pairs.push((slot, slot));
             }
         }
     }
@@ -1579,6 +1670,15 @@ impl CodeWriter {
         let mut graph = new_shadow_graph(code);
         let mut pc_blocks: Vec<Option<SpamBlockRef>> = vec![None; num_instrs];
         let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
+        // Step 6A slice S4a: snapshot the walker's `currentstate` at
+        // every terminator emission so `collect_link_slot_pairs` can
+        // translate link-arg Variables to SSARepr register slots via
+        // the positional walk.  RPython does not need this map because
+        // `regalloc.py:79-96` unions Variables directly via UnionFind;
+        // pyre's u16-keyed regalloc (regalloc.rs:26-36 PRE-EXISTING-
+        // ADAPTATION) reads the source state per-link to project back
+        // onto slots.  Keyed on `LinkRef` (Rc-pointer identity).
+        let mut link_exit_states: HashMap<super::flow::LinkRef, FrameState> = HashMap::new();
         let start_state = entry_frame_state(code);
         if num_instrs > 0 {
             let start_block =
@@ -1823,8 +1923,15 @@ impl CodeWriter {
                 // now comes from the symbolic `FrameState` stack,
                 // matching `flatten.py:130-139` `make_return(args)`.
                 let link =
-                    super::flow::Link::new(vec![retval], Some(graph.returnblock.clone()), None);
-                append_exit(&current_block.block(), link.into_ref());
+                    super::flow::Link::new(vec![retval], Some(graph.returnblock.clone()), None)
+                        .into_ref();
+                // Step 6A slice S4a: snapshot the EXIT FrameState.
+                append_exit_with_state(
+                    &current_block.block(),
+                    link,
+                    &current_state,
+                    &mut link_exit_states,
+                );
                 needs_fallthrough = false;
             }};
         }
@@ -1867,6 +1974,7 @@ impl CodeWriter {
                         branch_state
                     },
                     target_py_pc,
+                    &mut link_exit_states,
                 );
                 needs_fallthrough = false;
             }};
@@ -1946,8 +2054,19 @@ impl CodeWriter {
                     ],
                     Some(graph.exceptblock.clone()),
                     None,
+                )
+                .into_ref();
+                // Step 6A slice S4a: snapshot the EXIT state.  The
+                // target exceptblock has `inputargs = [etype, evalue]`
+                // but pyre populates them with Constant sentinels on
+                // this link — `collect_link_slot_pairs` skips those
+                // positions (non-Variable source arg).
+                append_exit_with_state(
+                    &current_block.block(),
+                    link,
+                    &current_state,
+                    &mut link_exit_states,
                 );
-                append_exit(&current_block.block(), link.into_ref());
                 needs_fallthrough = false;
             }};
         }
@@ -1976,8 +2095,16 @@ impl CodeWriter {
                     ],
                     Some(graph.exceptblock.clone()),
                     None,
+                )
+                .into_ref();
+                // Step 6A slice S4a: snapshot the EXIT state (same
+                // reasoning as `emit_raise!`).
+                append_exit_with_state(
+                    &current_block.block(),
+                    link,
+                    &current_state,
+                    &mut link_exit_states,
                 );
-                append_exit(&current_block.block(), link.into_ref());
                 needs_fallthrough = false;
             }};
         }
@@ -2012,6 +2139,8 @@ impl CodeWriter {
                 attach_catch_exception_edge(
                     &current_block.block(),
                     catch_landing_blocks[&catch_label].block(),
+                    Some(&current_state),
+                    &mut link_exit_states,
                 );
             }};
         }
@@ -2047,6 +2176,7 @@ impl CodeWriter {
                         &current_block,
                         &current_state,
                         py_pc,
+                        &mut link_exit_states,
                     )
                 } else {
                     ensure_pc_block(
@@ -2143,6 +2273,7 @@ impl CodeWriter {
                         branch_state
                     },
                     py_pc,
+                    &mut link_exit_states,
                 );
             }};
         }
@@ -2175,6 +2306,7 @@ impl CodeWriter {
                         branch_state
                     },
                     py_pc,
+                    &mut link_exit_states,
                 );
             }};
         }
@@ -3819,7 +3951,7 @@ mod tests {
     use crate::jit::assembler::ArcByPtr;
     use crate::jit::flatten::Kind;
     use crate::jit::flow::{
-        Block, BlockRef, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, Variable,
+        Block, BlockRef, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkRef, Variable,
         VariableId, c_last_exception,
     };
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
@@ -3957,9 +4089,23 @@ mod tests {
         assert_eq!(state.variable_slot(&v_absent), None);
     }
 
-    /// Step 6A slice S3 regression: `collect_link_slot_pairs` on the
-    /// minimal startblock → next-block graph returns the pairwise
-    /// link.args / target.inputargs slot mapping.
+    /// Helper: build a `link_exit_states` map from `(LinkRef,
+    /// FrameState)` pairs.  Production walker will populate this by
+    /// cloning `currentstate` at each `append_exit` call
+    /// (`flowcontext.py:1237,1268-1280`).
+    fn link_exit_states_from(pairs: Vec<(LinkRef, FrameState)>) -> HashMap<LinkRef, FrameState> {
+        let mut map = HashMap::new();
+        for (link, state) in pairs {
+            map.insert(link, state);
+        }
+        map
+    }
+
+    /// Step 6A slice S3 regression: `collect_link_slot_pairs` emits a
+    /// trivially-equal slot pair at every mergeable position where
+    /// both source (EXIT state) and target (ENTRY state) hold a
+    /// Variable.  The pairs are positional by `getoutputargs`
+    /// construction (`codewriter.rs:333-346`); see S3c docstring.
     #[test]
     fn collect_link_slot_pairs_emits_positional_pairs_for_variable_links() {
         let start_arg = Variable::new(VariableId(0), Kind::Ref);
@@ -3972,97 +4118,42 @@ mod tests {
             None,
         );
         let mid = graph.new_block(vec![mid_arg.into(), mid_arg2.into()]);
-        graph.startblock.closeblock(vec![
-            Link::new(
-                vec![start_arg.into(), start_arg2.into()],
-                Some(mid.clone()),
-                None,
-            )
-            .into_ref(),
-        ]);
+        let link = Link::new(
+            vec![start_arg.into(), start_arg2.into()],
+            Some(mid.clone()),
+            None,
+        )
+        .into_ref();
+        graph.startblock.closeblock(vec![link.clone()]);
 
-        let mut block_states = HashMap::new();
-        block_states.insert(
-            graph.startblock.clone(),
-            FrameState::new(
-                vec![Some(start_arg.into()), Some(start_arg2.into())],
-                Vec::new(),
-                None,
-                Vec::new(),
-                0,
-            ),
+        let start_state = FrameState::new(
+            vec![Some(start_arg.into()), Some(start_arg2.into())],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
         );
-        block_states.insert(
-            mid.clone(),
-            FrameState::new(
-                vec![Some(mid_arg.into()), Some(mid_arg2.into())],
-                Vec::new(),
-                None,
-                Vec::new(),
-                0,
-            ),
+        let mid_state = FrameState::new(
+            vec![Some(mid_arg.into()), Some(mid_arg2.into())],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
         );
+        let mut block_entry_states = HashMap::new();
+        block_entry_states.insert(graph.startblock.clone(), start_state.clone());
+        block_entry_states.insert(mid.clone(), mid_state);
+        let link_exit_states = link_exit_states_from(vec![(link, start_state)]);
 
-        let pairs = collect_link_slot_pairs(&graph, &block_states);
+        let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
         assert_eq!(pairs, vec![(0, 0), (1, 1)]);
     }
 
-    /// Step 6A slice S3 regression: shuffled link.args → inputargs
-    /// produce non-identity slot pairs.
-    #[test]
-    fn collect_link_slot_pairs_respects_positional_shuffle() {
-        let a0 = Variable::new(VariableId(0), Kind::Ref);
-        let a1 = Variable::new(VariableId(1), Kind::Ref);
-        let a2 = Variable::new(VariableId(2), Kind::Ref);
-        let b0 = Variable::new(VariableId(3), Kind::Ref);
-        let b1 = Variable::new(VariableId(4), Kind::Ref);
-        let b2 = Variable::new(VariableId(5), Kind::Ref);
-        let mut graph = FunctionGraph::new(
-            "shuffle",
-            Block::shared(vec![a0.into(), a1.into(), a2.into()]),
-            None,
-        );
-        let next = graph.new_block(vec![b0.into(), b1.into(), b2.into()]);
-        // Rotate: source slot 2 → target slot 0, source 0 → target 1, source 1 → target 2.
-        graph.startblock.closeblock(vec![
-            Link::new(
-                vec![a2.into(), a0.into(), a1.into()],
-                Some(next.clone()),
-                None,
-            )
-            .into_ref(),
-        ]);
-
-        let mut block_states = HashMap::new();
-        block_states.insert(
-            graph.startblock.clone(),
-            FrameState::new(
-                vec![Some(a0.into()), Some(a1.into()), Some(a2.into())],
-                Vec::new(),
-                None,
-                Vec::new(),
-                0,
-            ),
-        );
-        block_states.insert(
-            next.clone(),
-            FrameState::new(
-                vec![Some(b0.into()), Some(b1.into()), Some(b2.into())],
-                Vec::new(),
-                None,
-                Vec::new(),
-                0,
-            ),
-        );
-
-        let pairs = collect_link_slot_pairs(&graph, &block_states);
-        assert_eq!(pairs, vec![(2, 0), (0, 1), (1, 2)]);
-    }
-
     /// Step 6A slice S3 regression: Constant link args do not
-    /// contribute a pair (no source slot).  Used by `emit_raise!` /
-    /// `emit_reraise!` which pass `Constant::signed(0)` sentinels
-    /// (PRE-EXISTING-ADAPTATION).
+    /// contribute a pair (source mergeable at that position is a
+    /// Constant, not a Variable).  Used by `emit_raise!` /
+    /// `emit_reraise!` which pass `Constant::signed(0)` sentinels.
+    /// Mirrors `regalloc.py:99-101` `if isinstance(v, Variable)`.
     #[test]
     fn collect_link_slot_pairs_skips_constant_link_args() {
         let start_arg = Variable::new(VariableId(0), Kind::Ref);
@@ -4070,12 +4161,25 @@ mod tests {
         let mut graph =
             FunctionGraph::new("with_const", Block::shared(vec![start_arg.into()]), None);
         let next = graph.new_block(vec![next_arg.into()]);
-        graph.startblock.closeblock(vec![
-            Link::new(vec![Constant::signed(42).into()], Some(next.clone()), None).into_ref(),
-        ]);
+        let link =
+            Link::new(vec![Constant::signed(42).into()], Some(next.clone()), None).into_ref();
+        graph.startblock.closeblock(vec![link.clone()]);
 
-        let mut block_states = HashMap::new();
-        block_states.insert(
+        // Source EXIT state has a Constant at position 0 (matching
+        // the Constant-carrying link arg) — e.g. `emit_raise!`
+        // placing `Constant::signed(0)` into the exception etype
+        // slot.  Target ENTRY state still has a Variable.
+        let start_exit = FrameState::new(
+            vec![Some(Constant::signed(42).into())],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
+        );
+        let next_state =
+            FrameState::new(vec![Some(next_arg.into())], Vec::new(), None, Vec::new(), 0);
+        let mut block_entry_states = HashMap::new();
+        block_entry_states.insert(
             graph.startblock.clone(),
             FrameState::new(
                 vec![Some(start_arg.into())],
@@ -4085,12 +4189,10 @@ mod tests {
                 0,
             ),
         );
-        block_states.insert(
-            next.clone(),
-            FrameState::new(vec![Some(next_arg.into())], Vec::new(), None, Vec::new(), 0),
-        );
+        block_entry_states.insert(next.clone(), next_state);
+        let link_exit_states = link_exit_states_from(vec![(link, start_exit)]);
 
-        let pairs = collect_link_slot_pairs(&graph, &block_states);
+        let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
         assert!(
             pairs.is_empty(),
             "constant link args contribute no coalesce pairs"
@@ -4099,8 +4201,8 @@ mod tests {
 
     /// Step 6A slice S3 regression: a Link whose target has no
     /// attached FrameState (catch landings, returnblock, exceptblock)
-    /// contributes no pairs.  Covers the `block_states.get(&target)`
-    /// early-exit branch.
+    /// contributes no pairs.  Covers the
+    /// `block_entry_states.get(&target)` early-exit branch.
     #[test]
     fn collect_link_slot_pairs_skips_missing_target_framestate() {
         let start_arg = Variable::new(VariableId(0), Kind::Ref);
@@ -4111,25 +4213,170 @@ mod tests {
             None,
         );
         let next = graph.new_block(vec![next_arg.into()]);
-        graph.startblock.closeblock(vec![
-            Link::new(vec![start_arg.into()], Some(next.clone()), None).into_ref(),
-        ]);
+        let link = Link::new(vec![start_arg.into()], Some(next.clone()), None).into_ref();
+        graph.startblock.closeblock(vec![link.clone()]);
 
-        let mut block_states = HashMap::new();
-        block_states.insert(
+        let start_state = FrameState::new(
+            vec![Some(start_arg.into())],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
+        );
+        let mut block_entry_states = HashMap::new();
+        block_entry_states.insert(graph.startblock.clone(), start_state.clone());
+        // Deliberately do NOT insert `next` — mimics catch landing block.
+        let link_exit_states = link_exit_states_from(vec![(link, start_state)]);
+
+        let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
+        assert!(pairs.is_empty());
+    }
+
+    /// Step 6A slice S3c regression: a Link whose source EXIT state
+    /// replaced the ENTRY-state Variable with a freshly-allocated
+    /// mid-block Variable still emits the correct slot pair.
+    /// Previously the helper consulted only the source block's ENTRY
+    /// state and missed the fresh Variable.  S3c supplies the source
+    /// state via `link_exit_states`; the positional walk ignores
+    /// identity and looks only at whether each mergeable position is
+    /// a Variable on both sides.
+    ///
+    /// Scenario:
+    ///  - Source ENTRY locals_w = [v_entry] at mergeable position 0.
+    ///  - Walker STORE_FAST overwrites locals_w[0] with v_exit; at
+    ///    terminator time currentstate.locals_w[0] == v_exit.
+    ///  - Link.args = [v_exit].  Target ENTRY locals_w = [v_target].
+    ///
+    /// Expected: one (0, 0) coalesce pair via link_exit_states[link].
+    /// See Task #222.
+    #[test]
+    fn collect_link_slot_pairs_finds_variable_via_link_exit_state() {
+        let v_entry = Variable::new(VariableId(0), Kind::Ref);
+        let v_exit = Variable::new(VariableId(1), Kind::Ref);
+        let v_target = Variable::new(VariableId(2), Kind::Ref);
+        let mut graph = FunctionGraph::new("exit_state", Block::shared(vec![v_entry.into()]), None);
+        let target = graph.new_block(vec![v_target.into()]);
+        let link = Link::new(vec![v_exit.into()], Some(target.clone()), None).into_ref();
+        graph.startblock.closeblock(vec![link.clone()]);
+
+        let start_entry =
+            FrameState::new(vec![Some(v_entry.into())], Vec::new(), None, Vec::new(), 0);
+        let start_exit =
+            FrameState::new(vec![Some(v_exit.into())], Vec::new(), None, Vec::new(), 0);
+        let target_entry =
+            FrameState::new(vec![Some(v_target.into())], Vec::new(), None, Vec::new(), 0);
+
+        let mut block_entry_states = HashMap::new();
+        block_entry_states.insert(graph.startblock.clone(), start_entry);
+        block_entry_states.insert(target.clone(), target_entry);
+        let link_exit_states = link_exit_states_from(vec![(link, start_exit)]);
+
+        let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
+        assert_eq!(
+            pairs,
+            vec![(0, 0)],
+            "EXIT-state Variable must not prevent pair emission",
+        );
+    }
+
+    /// Step 6A slice S3c regression: a Link with no
+    /// `link_exit_states` entry contributes no pairs.  Production
+    /// walker MUST populate the EXIT snapshot for every link it
+    /// emits; a missing entry (un-wired path or test that skipped it)
+    /// skips rather than panicking to keep the helper robust during
+    /// staged integration.
+    #[test]
+    fn collect_link_slot_pairs_skips_links_without_exit_state() {
+        let start_arg = Variable::new(VariableId(0), Kind::Ref);
+        let next_arg = Variable::new(VariableId(1), Kind::Ref);
+        let mut graph = FunctionGraph::new(
+            "missing_exit_state",
+            Block::shared(vec![start_arg.into()]),
+            None,
+        );
+        let next = graph.new_block(vec![next_arg.into()]);
+        let link = Link::new(vec![start_arg.into()], Some(next.clone()), None).into_ref();
+        graph.startblock.closeblock(vec![link]);
+
+        let start_state = FrameState::new(
+            vec![Some(start_arg.into())],
+            Vec::new(),
+            None,
+            Vec::new(),
+            0,
+        );
+        let next_state =
+            FrameState::new(vec![Some(next_arg.into())], Vec::new(), None, Vec::new(), 0);
+        let mut block_entry_states = HashMap::new();
+        block_entry_states.insert(graph.startblock.clone(), start_state);
+        block_entry_states.insert(next.clone(), next_state);
+        // Deliberately empty: no source EXIT state available.
+        let link_exit_states = HashMap::new();
+
+        let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
+        assert!(pairs.is_empty());
+    }
+
+    /// Step 6A slice S3c regression: `LoadFast`-style aliasing where
+    /// the same Variable lives at two mergeable positions
+    /// simultaneously (`codewriter.rs:2413-2414` pushes the local's
+    /// own Variable onto the stack).  The positional walk must emit
+    /// one pair per mergeable position, not one pair per Variable,
+    /// so both (0, 0) for the local slot and (1, 1) for the stack
+    /// slot fire.  Proves the helper is not vulnerable to
+    /// Variable-collision ambiguity.
+    #[test]
+    fn collect_link_slot_pairs_handles_variable_aliased_across_slots() {
+        let v_local = Variable::new(VariableId(0), Kind::Ref);
+        let v_next_local = Variable::new(VariableId(1), Kind::Ref);
+        let v_next_stack = Variable::new(VariableId(2), Kind::Ref);
+        let mut graph = FunctionGraph::new("aliased", Block::shared(vec![v_local.into()]), None);
+        // target inputargs == mergeable Variables in locals_w + stack
+        let next = graph.new_block(vec![v_next_local.into(), v_next_stack.into()]);
+        // Link carries v_local twice — once for locals_w[0], once for stack[0].
+        let link = Link::new(
+            vec![v_local.into(), v_local.into()],
+            Some(next.clone()),
+            None,
+        )
+        .into_ref();
+        graph.startblock.closeblock(vec![link.clone()]);
+
+        // Source EXIT state: locals_w[0] AND stack[0] both hold v_local.
+        let start_exit = FrameState::new(
+            vec![Some(v_local.into())],
+            vec![v_local.into()],
+            None,
+            Vec::new(),
+            0,
+        );
+        let next_entry = FrameState::new(
+            vec![Some(v_next_local.into())],
+            vec![v_next_stack.into()],
+            None,
+            Vec::new(),
+            0,
+        );
+        let mut block_entry_states = HashMap::new();
+        block_entry_states.insert(
             graph.startblock.clone(),
             FrameState::new(
-                vec![Some(start_arg.into())],
-                Vec::new(),
+                vec![Some(v_local.into())],
+                vec![v_local.into()],
                 None,
                 Vec::new(),
                 0,
             ),
         );
-        // Deliberately do NOT insert `next` — mimics catch landing block.
+        block_entry_states.insert(next.clone(), next_entry);
+        let link_exit_states = link_exit_states_from(vec![(link, start_exit)]);
 
-        let pairs = collect_link_slot_pairs(&graph, &block_states);
-        assert!(pairs.is_empty());
+        let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
+        assert_eq!(
+            pairs,
+            vec![(0, 0), (1, 1)],
+            "positional walk must emit one pair per mergeable slot, not per Variable",
+        );
     }
 
     /// Step 6A slice S3b regression: `collect_block_states` absorbs
@@ -4184,18 +4431,21 @@ mod tests {
         );
     }
 
-    /// Step 6A slice S3b + S3 end-to-end: when the block_states map is
-    /// built from the walker helpers, `collect_link_slot_pairs` yields
-    /// the same positional pairs as the hand-built variant.
+    /// Step 6A slice S3b + S3 end-to-end: when the
+    /// `block_entry_states` map is built from the walker helpers
+    /// (`collect_block_states`), `collect_link_slot_pairs` still
+    /// yields the same positional pair as the hand-built variant.
+    /// S3c revision: caller also supplies a `link_exit_states` map —
+    /// here populated with the source block's ENTRY state because the
+    /// fabricated graph has no mid-block ops.
     #[test]
     fn collect_block_states_feeds_collect_link_slot_pairs() {
         let start_arg = Variable::new(VariableId(0), Kind::Ref);
         let next_arg = Variable::new(VariableId(1), Kind::Ref);
         let mut graph = FunctionGraph::new("s3b_e2e", Block::shared(vec![start_arg.into()]), None);
         let next = graph.new_block(vec![next_arg.into()]);
-        graph.startblock.closeblock(vec![
-            Link::new(vec![start_arg.into()], Some(next.clone()), None).into_ref(),
-        ]);
+        let link = Link::new(vec![start_arg.into()], Some(next.clone()), None).into_ref();
+        graph.startblock.closeblock(vec![link.clone()]);
 
         let start_state = FrameState::new(
             vec![Some(start_arg.into())],
@@ -4217,8 +4467,10 @@ mod tests {
         let joinpoints = HashMap::new();
         let catch_landing_blocks = HashMap::new();
 
-        let block_states = collect_block_states(&pc_blocks, &joinpoints, &catch_landing_blocks);
-        let pairs = collect_link_slot_pairs(&graph, &block_states);
+        let block_entry_states =
+            collect_block_states(&pc_blocks, &joinpoints, &catch_landing_blocks);
+        let link_exit_states = link_exit_states_from(vec![(link, start_state)]);
+        let pairs = collect_link_slot_pairs(&graph, &block_entry_states, &link_exit_states);
         assert_eq!(pairs, vec![(0, 0)]);
     }
 
@@ -4550,8 +4802,14 @@ mod tests {
         let code = first_nested_function_code("def f():\n    return 1\n");
         let mut graph = new_shadow_graph(&code);
         let catch_block = graph.new_block(Vec::new());
+        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
 
-        let link = attach_catch_exception_edge(&graph.startblock, catch_block.clone());
+        let link = attach_catch_exception_edge(
+            &graph.startblock,
+            catch_block.clone(),
+            None,
+            &mut link_exit_states,
+        );
         let startblock = graph.startblock.borrow();
 
         assert_eq!(
@@ -4596,6 +4854,7 @@ mod tests {
         let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
         let mut pc_blocks = vec![None; code.instructions.len().max(2)];
         joinpoints.insert(1, vec![target_block.clone()]);
+        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
 
         let merged = mergeblock(
             &code,
@@ -4605,6 +4864,7 @@ mod tests {
             &current_block,
             &current_state,
             1,
+            &mut link_exit_states,
         );
 
         assert_eq!(merged, target_block);
@@ -4651,6 +4911,7 @@ mod tests {
         let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
         let mut pc_blocks = vec![None; code.instructions.len().max(3)];
         joinpoints.insert(2, vec![existing_block.clone()]);
+        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
 
         let merged = mergeblock(
             &code,
@@ -4660,6 +4921,7 @@ mod tests {
             &current_block,
             &source_state,
             2,
+            &mut link_exit_states,
         );
 
         assert_ne!(merged, existing_block);
