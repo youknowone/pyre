@@ -374,7 +374,7 @@ impl DynasmBackend {
             .collect();
         // rewrite.py:489 parity: inject str_descr/unicode_descr for NEWSTR/NEWUNICODE
         inject_builtin_string_descrs(&mut normalized);
-        let constant_types = std::mem::take(&mut self.constant_types);
+        let constant_types = self.constant_types.clone();
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
             let constants = &self.constants;
@@ -652,6 +652,7 @@ impl Backend for DynasmBackend {
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
+        let constant_types = std::mem::take(&mut self.constant_types);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let mut asm = Asm::new(
@@ -662,6 +663,7 @@ impl Backend for DynasmBackend {
             typeid_table,
             attached_descrs,
         );
+        asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
         let compiled = asm.assemble_loop(inputargs, &prepared_ops)?;
 
@@ -764,6 +766,7 @@ impl Backend for DynasmBackend {
 
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
+        let constant_types = std::mem::take(&mut self.constant_types);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let mut asm = Asm::new(
@@ -774,6 +777,7 @@ impl Backend for DynasmBackend {
             typeid_table,
             attached_descrs,
         );
+        asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
 
         let _orig_compiled = Self::get_compiled(original_token);

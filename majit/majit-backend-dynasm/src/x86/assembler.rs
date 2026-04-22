@@ -255,6 +255,8 @@ pub struct Assembler386 {
     value_types: HashMap<u32, Type>,
     /// Constants: OpRef index (>= 10000) → i64 value.
     constants: HashMap<u32, i64>,
+    /// Constant type annotations for float immediates and fail args.
+    constant_types: HashMap<u32, Type>,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -366,6 +368,7 @@ impl Assembler386 {
             opref_to_slot: HashMap::new(),
             value_types: HashMap::new(),
             constants,
+            constant_types: HashMap::new(),
             next_slot: 0,
             guard_success_cc: None,
             target_tokens_currently_compiling: HashMap::new(),
@@ -1225,7 +1228,7 @@ impl Assembler386 {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        let mut ra = RegAlloc::new(self.constants.clone());
+        let mut ra = RegAlloc::new(self.constants.clone(), self.constant_types.clone());
         if let Some(ref arglocs) = self.bridge_input_locs {
             ra.prepare_bridge(inputargs, arglocs, ops);
         } else {
@@ -5685,7 +5688,7 @@ impl Assembler386 {
     }
 
     /// Set constant type annotations for the next compile call.
-    pub fn set_constant_types(&mut self, _constant_types: HashMap<u32, majit_ir::Type>) {
-        // dynasm backend doesn't need type annotations for constants
+    pub fn set_constant_types(&mut self, constant_types: HashMap<u32, majit_ir::Type>) {
+        self.constant_types = constant_types;
     }
 }
