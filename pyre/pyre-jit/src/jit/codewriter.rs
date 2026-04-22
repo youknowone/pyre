@@ -550,22 +550,12 @@ fn output_link(
         .into_ref()
 }
 
+/// Build the `[w_type, w_value]` argument list for a Link targeting
+/// `graph.exceptblock`.  Mirrors `flatten.py:161-162` —
+/// `assert link.last_exception is not None; assert link.last_exc_value
+/// is not None`.  Callers must have seeded `source_state.last_exception`
+/// before emitting the link.
 fn exceptblock_link_args(source_state: &FrameState) -> Vec<super::flow::FlowValue> {
-    if let Some((w_type, w_value)) = &source_state.last_exception {
-        vec![w_type.clone(), w_value.clone()]
-    } else {
-        // PRE-EXISTING-ADAPTATION: some pyre paths still fail to
-        // materialize the exception pair in `FrameState.last_exception`.
-        // Preserve the old fallback until Phase 1 finishes wiring real
-        // `(w_type, w_value)` producers everywhere.
-        vec![
-            super::flow::Constant::signed(0).into(),
-            super::flow::Constant::signed(0).into(),
-        ]
-    }
-}
-
-fn exceptblock_link_args_strict(source_state: &FrameState) -> Vec<super::flow::FlowValue> {
     match &source_state.last_exception {
         Some((w_type, w_value)) => vec![w_type.clone(), w_value.clone()],
         None => panic!("exceptblock edge requires materialized exception pair"),
@@ -2190,7 +2180,7 @@ impl CodeWriter {
                 // `current_state.last_exception`.
                 let edge_state = explicit_raise_state(&mut graph, &current_state);
                 let link = super::flow::Link::new(
-                    exceptblock_link_args_strict(&edge_state),
+                    exceptblock_link_args(&edge_state),
                     Some(graph.exceptblock.clone()),
                     None,
                 );
@@ -4192,20 +4182,10 @@ mod tests {
     }
 
     #[test]
-    fn exceptblock_link_args_falls_back_when_exception_pair_missing() {
-        let state = sample_framestate();
-
-        assert_eq!(
-            exceptblock_link_args(&state),
-            vec![Constant::signed(0).into(), Constant::signed(0).into()],
-        );
-    }
-
-    #[test]
     #[should_panic(expected = "exceptblock edge requires materialized exception pair")]
-    fn exceptblock_link_args_strict_rejects_missing_exception_pair() {
+    fn exceptblock_link_args_rejects_missing_exception_pair() {
         let state = sample_framestate();
-        let _ = exceptblock_link_args_strict(&state);
+        let _ = exceptblock_link_args(&state);
     }
 
     #[test]
@@ -4391,9 +4371,9 @@ mod tests {
 
     /// Step 6A slice S3 regression: Constant link args do not
     /// contribute a pair (source mergeable at that position is a
-    /// Constant, not a Variable).  Used by `emit_raise!` /
-    /// `emit_reraise!` which pass `Constant::signed(0)` sentinels.
-    /// Mirrors `regalloc.py:99-101` `if isinstance(v, Variable)`.
+    /// Constant, not a Variable).  Mirrors `flatten.py:355-363`
+    /// `flatten_list` + `regalloc.py:99-101` `if isinstance(v,
+    /// Variable)` — Constants pass through unchanged.
     #[test]
     fn collect_link_slot_pairs_skips_constant_link_args() {
         let start_arg = Variable::new(VariableId(0), Kind::Ref);
@@ -4407,9 +4387,9 @@ mod tests {
         graph.startblock.closeblock(vec![link.clone()]);
 
         // Source EXIT state has a Constant at position 0 (matching
-        // the Constant-carrying link arg) — e.g. `emit_raise!`
-        // placing `Constant::signed(0)` into the exception etype
-        // slot.  Target ENTRY state still has a Variable.
+        // the Constant-carrying link arg) — e.g. a parameter with a
+        // default Constant flowing through a branch.  Target ENTRY
+        // state still has a Variable.
         let start_exit = FrameState::new(
             vec![Some(Constant::signed(42).into())],
             Vec::new(),
