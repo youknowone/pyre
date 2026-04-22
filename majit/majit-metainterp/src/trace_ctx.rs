@@ -856,12 +856,29 @@ impl TraceCtx {
     // `recorder::Trace` carries raw `OpRef` values and needs no constant
     // resolution at record time — but the signature shape matches
     // `TraceRecordBuffer::record_op_oprefs` / `record_guard_oprefs` /
-    // `close_loop_oprefs` / `finish_oprefs` (opencoder.rs:2335-2442), all
+    // `close_loop_oprefs` / `finish_oprefs` (opencoder.rs:2420-2551), all
     // of which consume `&ConstantPool` to resolve tagged-constant `OpRef`
-    // into wire bytes. Step 2e.2b swaps the `recorder` field type from
-    // `Trace` to `TraceRecordBuffer`; at that point the helper bodies
-    // change from the Vec-of-Op forms below to the `_oprefs` byte-stream
-    // forms, while the public record methods above stay untouched.
+    // into wire bytes.
+    //
+    // Step 2e.2b swaps the `recorder` field type from `Trace` to
+    // `TraceRecordBuffer`. Contrary to an earlier note here, this is NOT
+    // a simple helper-body replacement. TRB returns RPython-orthodox
+    // `_index`-based positions (box-yielding count, opencoder.py:664-670
+    // `record_op` returns `pos = self._index`), while
+    // `recorder::Trace::record_op` (recorder.rs:159-169) returns
+    // `OpRef(op_count)` — every op (void or not) gets a unique index.
+    // TRB's `_untag` (opencoder.rs:717-770) resolves `TAGBOX(v)` via
+    // `_cache[v]`, and `_cache` is indexed by `_index`, so callers that
+    // store an OpRef and later pass it as an arg must have stored an
+    // `_index`-based value. Across pyre, `op.pos.0` is used as a HashMap
+    // key (compile.rs, blackhole.rs, optimizeopt/*, pyjitpl/mod.rs) under
+    // the pyre-legacy "all ops unique" invariant; a straight swap would
+    // corrupt those maps. The swap therefore has to land together with
+    // caller-side OpRef convention migration.
+    //
+    // See `step2e_traceposition_parity_2026_04_22` memory +
+    // `rpython-trace-jitcode-hidden-candle.md` plan (Step 3–5) for the
+    // multi-session route.
 
     fn do_record_op(
         recorder: &mut Trace,
@@ -928,10 +945,17 @@ impl TraceCtx {
     // ── Step 2e.2b.glue: public TraceCtx wrappers over self.recorder ──
     //
     // These methods centralize every `ctx.recorder.X()` external call
-    // pattern. Post-swap (Step 2e.2b), only these helper bodies change
-    // to call `TraceRecordBuffer::close_loop_oprefs` / `finish_oprefs` /
-    // `get_trace_equivalent` etc.; external callers stay put. This keeps
-    // the Step 2e.2b field-type swap localized to TraceCtx.
+    // pattern, so the eventual TRB swap can be threaded through the
+    // `do_*` helpers above. TRB already has matching byte-stream entry
+    // points (`record_op_oprefs` / `close_loop_oprefs` / `finish_oprefs`
+    // at opencoder.rs:2536-2642), but the `TreeLoop`-shaped result
+    // produced by `recorder::Trace::get_trace()` has no RPython analogue
+    // — upstream (opencoder.py:848) exposes `get_iter()` and the
+    // optimizer walks the iterator directly, with no intermediate
+    // `Vec<Op>` materialization. Step 2e.2b must either port pyre's
+    // consumers onto an iterator-walk shape or introduce a documented
+    // pyre-ADAPTATION materializer (`TRB -> TreeLoop`) with a comment
+    // pointing at the specific RPython call that it stands in for.
 
     /// pyjitpl.py:3188-3190 `history.record1(rop.JUMP, ..., descr=ptoken)` —
     /// close the loop with an implicit no-descr JUMP.
