@@ -93,11 +93,6 @@ impl TreeLoop {
             .is_some_and(|op| op.opcode == OpCode::Finish)
     }
 
-    /// Get a reference to the operation at the given OpRef index.
-    pub fn get_op(&self, opref: OpRef) -> Option<&Op> {
-        self.ops.get(opref.0 as usize)
-    }
-
     /// Iterate over all operations.
     pub fn iter_ops(&self) -> impl Iterator<Item = &Op> {
         self.ops.iter()
@@ -549,25 +544,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_get_op() {
-        // get_op retrieves ops by index.
-        let inputargs = vec![InputArg::new_int(0)];
-        let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
-            Op::new(OpCode::Jump, &[OpRef(1)]),
-        ];
-        let trace = TreeLoop::new(inputargs, ops);
-
-        let op0 = trace.get_op(OpRef(0)).unwrap();
-        assert_eq!(op0.opcode, OpCode::IntAdd);
-
-        let op1 = trace.get_op(OpRef(1)).unwrap();
-        assert_eq!(op1.opcode, OpCode::Jump);
-
-        assert!(trace.get_op(OpRef(99)).is_none());
-    }
-
-    #[test]
     fn test_trace_iter_guards_filters_correctly() {
         // iter_guards returns only guard ops.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
@@ -863,26 +839,6 @@ mod tests {
         assert_eq!(guards[0].fail_args.as_ref().unwrap().len(), 0);
         assert_eq!(guards[1].fail_args.as_ref().unwrap().len(), 1);
         assert_eq!(guards[2].fail_args.as_ref().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn test_trace_get_op_returns_correct_positions() {
-        // get_op with valid and invalid indices.
-        let inputargs = vec![InputArg::new_int(0)];
-        let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
-            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(0)]),
-            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(1)]),
-            Op::new(OpCode::Jump, &[OpRef(3)]),
-        ];
-        let trace = TreeLoop::new(inputargs, ops);
-
-        assert_eq!(trace.get_op(OpRef(0)).unwrap().opcode, OpCode::IntAdd);
-        assert_eq!(trace.get_op(OpRef(1)).unwrap().opcode, OpCode::IntSub);
-        assert_eq!(trace.get_op(OpRef(2)).unwrap().opcode, OpCode::IntMul);
-        assert_eq!(trace.get_op(OpRef(3)).unwrap().opcode, OpCode::Jump);
-        assert!(trace.get_op(OpRef(4)).is_none());
-        assert!(trace.get_op(OpRef(100)).is_none());
     }
 
     #[test]
