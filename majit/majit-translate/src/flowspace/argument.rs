@@ -268,10 +268,6 @@ impl CallSpec {
     }
 }
 
-fn sequence_items(value: &super::model::ConstValue) -> Option<&[super::model::ConstValue]> {
-    value.sequence_items()
-}
-
 #[cfg(test)]
 mod test {
     use super::super::model::{ConstValue, Constant, Hlvalue};

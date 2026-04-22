@@ -61,21 +61,6 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
     Err(crate::PyError::type_error("must be real number"))
 }
 
-fn get_int(obj: PyObjectRef) -> i64 {
-    unsafe {
-        if is_int(obj) {
-            return w_int_get_value(obj);
-        }
-        if is_bool(obj) {
-            return if w_bool_get_value(obj) { 1 } else { 0 };
-        }
-        if is_float(obj) {
-            return floatobject::w_float_get_value(obj) as i64;
-        }
-    }
-    0
-}
-
 type PyResult = Result<PyObjectRef, crate::PyError>;
 
 fn map_err(r: pymath::Result<f64>) -> PyResult {

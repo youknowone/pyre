@@ -839,20 +839,6 @@ pub(crate) fn concrete_value_from_slot(obj: PyObjectRef) -> ConcreteValue {
     ConcreteValue::from_pyobj(obj)
 }
 
-/// Convert pyre's `ConcreteValue` (tagged Int/Float/Ref/Null) into the
-/// `majit_ir::Value` encoding used by `TraceCtx.virtualizable_values`.
-/// `Null` maps to `Value::Ref(GcRef::NULL)` — the vable shadow must hold a
-/// typed value for every slot, so we round-trip untracked refs as NULL
-/// pointers rather than losing the type.
-pub(crate) fn concrete_to_value(concrete: ConcreteValue) -> majit_ir::Value {
-    match concrete {
-        ConcreteValue::Int(v) => majit_ir::Value::Int(v),
-        ConcreteValue::Float(v) => majit_ir::Value::Float(v),
-        ConcreteValue::Ref(r) => majit_ir::Value::Ref(majit_ir::GcRef(r as usize)),
-        ConcreteValue::Null => majit_ir::Value::Ref(majit_ir::GcRef::NULL),
-    }
-}
-
 impl ConcreteValue {
     /// Convert from PyObjectRef (unbox if possible).
     /// Null pointers become ConcreteValue::Null ("untracked").

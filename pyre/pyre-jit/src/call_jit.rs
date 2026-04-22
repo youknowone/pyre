@@ -28,8 +28,6 @@ thread_local! {
     /// FFI boundaries (compiled code → callback → exception).
     static LAST_CA_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::error::PyError>> =
         const { std::cell::RefCell::new(None) };
-    static RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>, bool)>> =
-        const { UnsafeCell::new(None) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
 }
@@ -109,25 +107,6 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
     }
 
     true
-}
-
-fn recursive_dispatch(callable: PyObjectRef, green_key: u64) -> (Option<u64>, bool) {
-    RECURSIVE_DISPATCH_CACHE.with(|cell| unsafe {
-        let slot = &mut *cell.get();
-        if let Some((cached_key, token_num, memo_safe)) = *slot {
-            if cached_key == green_key && token_num.is_some() {
-                return (token_num, memo_safe);
-            }
-        }
-
-        let (driver, _) = crate::eval::driver_pair();
-        let token_num = driver.get_loop_token(green_key).map(|token| token.number);
-        let memo_safe = recursive_force_cache_safe(callable);
-        if token_num.is_some() {
-            *slot = Some((green_key, token_num, memo_safe));
-        }
-        (token_num, memo_safe)
-    })
 }
 
 fn self_recursive_dispatch(green_key: u64) -> Option<u64> {

@@ -1122,13 +1122,6 @@ fn expect_call_arg(op: &Operand) -> JitCallArg {
     }
 }
 
-fn expect_move(args: &[Operand], result: Option<&Register>, kind: Kind) -> (u16, u16) {
-    if let Some(dst) = result {
-        return (dst.index, expect_reg(&args[0], kind));
-    }
-    (expect_reg(&args[0], kind), expect_reg(&args[1], kind))
-}
-
 /// `flatten.py:333` source operand for `{kind}_copy`. The source may
 /// be either a Register (argcode `'i'`/`'r'`/`'f'`) or a Constant
 /// (argcode `'c'` in short form). `MoveSource` captures the shape so

@@ -3031,12 +3031,6 @@ fn try_generate_jitcode_body_inner(
 mod tests {
     use super::*;
 
-    fn try_lower(code: &str) -> Option<String> {
-        let expr: Expr = syn::parse_str(code).expect("failed to parse");
-        let result = try_generate_jitcode_body(&expr)?;
-        Some(result.to_string())
-    }
-
     fn parse_pat(code: &str) -> Pat {
         let match_code = format!("match x {{ {code} => () }}");
         let expr: syn::ExprMatch = syn::parse_str(&match_code).expect("failed to parse match");

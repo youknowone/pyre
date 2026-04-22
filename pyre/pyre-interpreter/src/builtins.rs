@@ -1198,35 +1198,6 @@ pub fn get_build_class_func() -> PyObjectRef {
     make_builtin_function("__build_class__", builtin_build_class)
 }
 
-/// `property(fget=None, fset=None, fdel=None, doc=None)` → W_PropertyObject
-///
-/// PyPy: descriptor.py W_Property
-fn builtin_property(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let fget = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let fset = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let fdel = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-    Ok(pyre_object::w_property_new(fget, fset, fdel))
-}
-
-/// `staticmethod(func)` → W_StaticMethodObject
-///
-/// PyPy: function.py StaticMethod — __get__ returns wrapped func as-is.
-fn builtin_staticmethod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(
-        !args.is_empty(),
-        "staticmethod requires a callable argument"
-    );
-    Ok(pyre_object::w_staticmethod_new(args[0]))
-}
-
-/// `classmethod(func)` → W_ClassMethodObject
-///
-/// PyPy: function.py ClassMethod — __get__ binds the class as first arg.
-fn builtin_classmethod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "classmethod requires a callable argument");
-    Ok(pyre_object::w_classmethod_new(args[0]))
-}
-
 /// `str(obj)` → convert to string
 pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -1562,53 +1533,6 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     ))
 }
 
-/// `bool(obj)` — PyPy: boolobject.py descr_new → space.is_true
-///
-/// Takes at most 1 positional argument. Validates __bool__ return type.
-pub(crate) fn builtin_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() > 1 {
-        return Err(crate::PyError::type_error(
-            "bool expected at most 1 argument, got more",
-        ));
-    }
-    if args.is_empty() {
-        return Ok(w_bool_from(false));
-    }
-    let obj = args[0];
-    // Strict __bool__ check: must return bool, not int.
-    // boolobject.py descr_new calls space.is_true(w_obj) which validates.
-    unsafe {
-        if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
-            // __bool__ = None → TypeError ("not supported")
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__bool__") {
-                if pyre_object::is_none(method) {
-                    return Err(crate::PyError::type_error(
-                        "object of this type has no len() or __bool__",
-                    ));
-                }
-                let result = crate::call_function(method, &[obj]);
-                if !result.is_null() && !is_bool(result) {
-                    let tp_name = (*(*result).ob_type).name;
-                    return Err(crate::PyError::type_error(format!(
-                        "__bool__ should return bool, returned {}",
-                        tp_name,
-                    )));
-                }
-            }
-            // __len__ = None → TypeError
-            if let Some(len_method) = crate::baseobjspace::lookup_in_type(w_type, "__len__") {
-                if pyre_object::is_none(len_method) {
-                    return Err(crate::PyError::type_error(
-                        "object of this type has no len() or __bool__",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(w_bool_from(crate::baseobjspace::is_true(obj)))
-}
-
 /// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
 fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() == 2, "hasattr() takes exactly two arguments");
@@ -1772,15 +1696,6 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         unsafe { w_dict_store(dict, k, v) };
     }
     Ok(dict)
-}
-
-/// `object()` — PyPy: objectobject.py descr__new__
-fn builtin_object(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // PyPy: objectobject.py descr__new__ → allocate bare object
-    // In Python, object() returns a featureless object instance.
-    // Use PY_NULL as type since there's no builtin 'object' W_TypeObject yet.
-    Ok(pyre_object::w_instance_new(pyre_object::PY_NULL))
-    // Full implementation requires a base object type in TypeDef.
 }
 
 /// `super()` — PyPy: descriptor.py W_Super

@@ -678,14 +678,3 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::generate_jit_state;
-    use crate::jit_interp::JitInterpConfig;
-
-    fn render(config: proc_macro2::TokenStream) -> String {
-        let parsed = syn::parse2::<JitInterpConfig>(config).expect("valid jit_interp config");
-        generate_jit_state(&parsed).to_string()
-    }
-}

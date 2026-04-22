@@ -3191,17 +3191,6 @@ mod tests {
         )
     }
 
-    fn dd_mutable(s_key: SomeValue, s_value: SomeValue) -> DictDef {
-        DictDef::new(
-            Some(Rc::new(super::super::bookkeeper::Bookkeeper::new())),
-            s_key,
-            s_value,
-            false,
-            false,
-            false,
-        )
-    }
-
     /// Build a stub [`DescEntry::Function`] for SomePBC lattice tests.
     ///
     /// RPython tests that exercise `SomePBC` membership build fresh
