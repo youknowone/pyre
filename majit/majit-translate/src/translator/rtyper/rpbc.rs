@@ -85,14 +85,15 @@ impl Eq for ConcreteCallTableRow {}
 #[derive(Clone, Debug, Default)]
 pub struct LLCallTable {
     /// Upstream `self.table` keyed by `(shape, index)`.
-    pub table: HashMap<(CallShape, usize), ConcreteCallTableRow>,
+    pub table: HashMap<(CallShape, usize), Rc<RefCell<ConcreteCallTableRow>>>,
     /// Upstream `self.uniquerows`.
-    pub uniquerows: Vec<ConcreteCallTableRow>,
+    pub uniquerows: Vec<Rc<RefCell<ConcreteCallTableRow>>>,
 }
 
 impl LLCallTable {
     pub fn lookup(&self, row: &ConcreteCallTableRow) -> Result<(usize, ConcreteCallTableRow), ()> {
         for (existingindex, existingrow) in self.uniquerows.iter().enumerate() {
+            let existingrow = existingrow.borrow();
             let mut mismatched = false;
             for (funcdesc, llfn) in &row.row {
                 if let Some(existing_llfn) = existingrow.row.get(funcdesc) {
@@ -123,9 +124,9 @@ impl LLCallTable {
 
     pub fn add(&mut self, row: ConcreteCallTableRow) {
         match self.lookup(&row) {
-            Err(()) => self.uniquerows.push(row),
+            Err(()) => self.uniquerows.push(Rc::new(RefCell::new(row))),
             Ok((index, merged)) => {
-                if merged == self.uniquerows[index] {
+                if merged == *self.uniquerows[index].borrow() {
                     return;
                 }
                 self.uniquerows.remove(index);
@@ -151,15 +152,19 @@ pub fn build_concrete_calltable(callfamily: &CallFamily) -> LLCallTable {
     for ((shape, index), row) in concreterows {
         let (existingindex, biggerrow) = llct.lookup(&row).expect("row must exist in LLCallTable");
         let canonical_row = llct.uniquerows[existingindex].clone();
-        assert!(biggerrow == canonical_row);
+        assert!(biggerrow == *canonical_row.borrow());
+        // Store the shared canonical row, not a snapshot clone: upstream
+        // `llct.table[(shape, index)] = row` aliases the same row object
+        // later decorated with `attrname`, so the Rust port must preserve
+        // that visibility through the `Rc<RefCell<_>>`.
         llct.table.insert((shape, index), canonical_row);
     }
 
     if llct.uniquerows.len() == 1 {
-        llct.uniquerows[0].attrname = None;
+        llct.uniquerows[0].borrow_mut().attrname = None;
     } else {
         for (finalindex, row) in llct.uniquerows.iter_mut().enumerate() {
-            row.attrname = Some(format!("variant{finalindex}"));
+            row.borrow_mut().attrname = Some(format!("variant{finalindex}"));
         }
     }
 
@@ -439,11 +444,11 @@ mod tests {
 
         let llct = build_concrete_calltable(&family);
         assert_eq!(llct.uniquerows.len(), 1);
-        let merged = &llct.uniquerows[0];
+        let merged = llct.uniquerows[0].borrow();
         assert_eq!(merged.row.len(), 3);
         assert_eq!(merged.attrname, None);
         assert_eq!(llct.table.len(), 2);
-        assert_eq!(llct.table.values().next().unwrap().row.len(), 3);
+        assert_eq!(llct.table.values().next().unwrap().borrow().row.len(), 3);
     }
 
     #[test]
@@ -467,11 +472,21 @@ mod tests {
         let mut attrnames: Vec<_> = llct
             .uniquerows
             .iter()
-            .map(|row| row.attrname.clone().unwrap())
+            .map(|row| row.borrow().attrname.clone().unwrap())
             .collect();
         attrnames.sort();
         assert_eq!(
             attrnames,
+            vec!["variant0".to_string(), "variant1".to_string()]
+        );
+        let mut table_attrnames: Vec<_> = llct
+            .table
+            .values()
+            .map(|row| row.borrow().attrname.clone().unwrap())
+            .collect();
+        table_attrnames.sort();
+        assert_eq!(
+            table_attrnames,
             vec!["variant0".to_string(), "variant1".to_string()]
         );
     }

@@ -4341,6 +4341,22 @@ mod tests {
             assert_eq!(bh.tmpreg_i, 42, "int_add(10, 32) should produce 42");
             assert_eq!(bh.return_type, BhReturnType::Int);
         }
+
+        #[test]
+        fn wire_bhimpl_handlers_keeps_setfield_gc_v_ird_on_ref_handler() {
+            let mut insns = HashMap::new();
+            insns.insert("setfield_gc_v/ird".to_string(), 0u8);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.setup_insns(&insns);
+            super::wire_bhimpl_handlers(&mut builder);
+
+            let wired = builder.dispatch_table[0];
+            assert_eq!(
+                wired as *const () as usize,
+                super::handler_setfield_gc_v_ird_pyre as *const () as usize
+            );
+        }
     }
 }
 
@@ -6211,15 +6227,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
-    // pyre-specific `_v` opname aliases: `OpKind::FieldWrite { ty }` emits
+    // pyre-specific `_v` opname alias: `OpKind::FieldWrite { ty }` emits
     // `setfield_gc_{kind}` with `_v` when the graph-level result type slot
-    // is Unknown/Void (assembler.rs op_kind_to_opname). Both `rid` and `ird`
-    // appear in the current bytecode/insns surfaces; they remain aliases for
-    // the canonical integer-flavoured `bhimpl_setfield_gc_i`.
-    // Register both spellings so `setup_insns` keeps the same fail-fast
-    // coverage contract as RPython blackhole.py.
+    // is Unknown/Void (assembler.rs op_kind_to_opname). The `rid` byte layout
+    // matches canonical `setfield_gc_i/rid`, so keep the alias on the integer
+    // bhimpl. The distinct `ird` tagged-int-base path is wired below to its
+    // dedicated Ref-value handler.
     builder.wire_handler("setfield_gc_v/rid", handler_setfield_gc_i);
-    builder.wire_handler("setfield_gc_v/ird", handler_setfield_gc_i);
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
     // Array item operations (blackhole.py:1329-1365)
