@@ -2215,7 +2215,7 @@ impl CodeWriter {
                 //
                 // `reraise` preserves the current handler exception.
                 let link = super::flow::Link::new(
-                    exceptblock_link_args_strict(&current_state),
+                    exceptblock_link_args(&current_state),
                     Some(graph.exceptblock.clone()),
                     None,
                 );
