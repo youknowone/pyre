@@ -9,6 +9,7 @@
 //! there as a temporary wiring bridge.
 
 pub mod lltypesystem;
+pub mod normalizecalls;
 pub mod rclass;
 pub mod rpbc;
 pub mod rtyper;

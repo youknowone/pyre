@@ -200,9 +200,23 @@ impl CallFamily {
         }
     }
 
-    // `find_row(bookkeeper, descs, args, op)` (description.py:54-59)
-    // is consumed only by `rtyper/rpbc.py` and lands with the rtyper
-    // port.
+    /// RPython `CallFamily.find_row(bookkeeper, descs, args, op)`
+    /// (description.py:54-59).
+    pub fn find_row(
+        &self,
+        bookkeeper: &Rc<Bookkeeper>,
+        descs: &[DescEntry],
+        args: &ArgumentsForTranslation,
+        op_key: Option<PositionKey>,
+    ) -> Result<(CallShape, usize), AnnotatorError> {
+        let shape = args.rawshape();
+        let _guard = bookkeeper.at_position(None);
+        let row = build_calltable_row(descs, args, op_key)?;
+        let index = self.calltable_lookup_row(&shape, &row).ok_or_else(|| {
+            AnnotatorError::new("LookupError: calltable row not found in CallFamily")
+        })?;
+        Ok((shape, index))
+    }
 }
 
 impl UnionFindInfo for Rc<RefCell<CallFamily>> {
@@ -625,6 +639,38 @@ impl DescEntry {
             _ => None,
         }
     }
+
+    /// Upstream `desc.get_graph(args, op)` polymorphic dispatch used by
+    /// `build_calltable_row` (description.py:62-68).
+    pub fn get_graph(
+        &self,
+        args: &ArgumentsForTranslation,
+        op_key: Option<PositionKey>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        match self {
+            DescEntry::Function(rc) => rc.borrow().get_graph(args, op_key),
+            DescEntry::Method(rc) => rc.borrow().get_graph(args, op_key),
+            DescEntry::MethodOfFrozen(rc) => rc.borrow().get_graph(args, op_key),
+            DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(format!(
+                "{:?} has no get_graph() for build_calltable_row",
+                self.kind()
+            ))),
+        }
+    }
+
+    /// Upstream `desc.rowkey()` polymorphic dispatch used by
+    /// `build_calltable_row` (description.py:66-67).
+    pub fn rowkey(&self) -> Result<DescKey, AnnotatorError> {
+        match self {
+            DescEntry::Function(rc) => Ok(FunctionDesc::rowkey(rc)),
+            DescEntry::Method(rc) => Ok(rc.borrow().rowkey()),
+            DescEntry::MethodOfFrozen(rc) => Ok(rc.borrow().rowkey()),
+            DescEntry::Frozen(_) | DescEntry::Class(_) => Err(AnnotatorError::new(format!(
+                "{:?} has no rowkey() for build_calltable_row",
+                self.kind()
+            ))),
+        }
+    }
 }
 
 /// Identity equality — two [`DescEntry`]s are equal iff they wrap the
@@ -722,6 +768,20 @@ impl std::fmt::Debug for AnnSignature {
     }
 }
 
+/// RPython `build_calltable_row(descs, args, op)` (description.py:62-68).
+pub fn build_calltable_row(
+    descs: &[DescEntry],
+    args: &ArgumentsForTranslation,
+    op_key: Option<PositionKey>,
+) -> Result<CallTableRow, AnnotatorError> {
+    let mut row = CallTableRow::new();
+    for desc in descs {
+        let graph = desc.get_graph(args, op_key.clone())?;
+        row.insert(desc.rowkey()?, graph);
+    }
+    Ok(row)
+}
+
 impl FunctionDesc {
     /// RPython `FunctionDesc.__init__(bookkeeper, pyobj, name,
     /// signature, defaults, specializer=None)` (description.py:193-203).
@@ -816,18 +876,34 @@ impl FunctionDesc {
         args: &ArgumentsForTranslation,
         graph: Option<&PyGraph>,
     ) -> Result<Vec<SomeValue>, AnnotatorError> {
-        let signature = graph.map_or(&self.signature, |graph| &graph.signature);
         // upstream description.py:256-264 — `if defaults:` walks each
         // Python value through `self.bookkeeper.immutablevalue(x)` at
         // parse time. `graph_defaults` overrides `self.defaults` when
         // the specializer built a `PyGraph` whose `__defaults__` tuple
         // diverged from the bare FunctionDesc's.
         let mut defs_s: Vec<SomeValue> = Vec::new();
-        let defaults_source: Option<&[Constant]> = graph
-            .map_or(Some(self.defaults.as_slice()), |graph| {
-                graph.defaults.as_deref()
-            });
-        for d in defaults_source.unwrap_or_default() {
+        if let Some(graph) = graph {
+            let signature = graph.signature.borrow();
+            let graph_defaults = graph.defaults.borrow();
+            for d in graph_defaults.as_deref().unwrap_or_default() {
+                // upstream: `if x is NODEFAULT: defs_s.append(None)`.
+                // NODEFAULT is not modelled as a dedicated sentinel; the
+                // immutablevalue path returns `s_impossible_value` for the
+                // placeholder Constant used to represent a missing default.
+                let s = self.base.bookkeeper.immutablevalue(&d.value)?;
+                defs_s.push(s);
+            }
+            return args
+                .match_signature(&signature, Some(&defs_s))
+                .map_err(|e: ArgErr| {
+                    AnnotatorError::new(format!(
+                        "signature mismatch: {}() {}",
+                        self.name,
+                        e.getmsg()
+                    ))
+                });
+        }
+        for d in self.defaults.as_slice() {
             // upstream: `if x is NODEFAULT: defs_s.append(None)`.
             // NODEFAULT is not modelled as a dedicated sentinel; the
             // immutablevalue path returns `s_impossible_value` for the
@@ -835,7 +911,7 @@ impl FunctionDesc {
             let s = self.base.bookkeeper.immutablevalue(&d.value)?;
             defs_s.push(s);
         }
-        args.match_signature(signature, Some(&defs_s))
+        args.match_signature(&self.signature, Some(&defs_s))
             .map_err(|e: ArgErr| {
                 AnnotatorError::new(format!(
                     "signature mismatch: {}() {}",
@@ -908,8 +984,8 @@ impl FunctionDesc {
         let pygraph = PyGraph {
             graph: Rc::new(RefCell::new(flow_graph)),
             func: graph_func,
-            signature,
-            defaults: Some(self.defaults.clone()),
+            signature: RefCell::new(signature),
+            defaults: RefCell::new(Some(self.defaults.clone())),
             access_directly: std::cell::Cell::new(false),
         };
         if let Some(alt_name) = alt_name {
@@ -953,7 +1029,9 @@ impl FunctionDesc {
             .and_then(|pyobj| pyobj.user_function())
             .and_then(|func| func.relax_sig_check)
             .unwrap_or(false);
-        if (graph.signature != self.signature || graph.defaults.as_ref() != Some(&self.defaults))
+        let graph_signature = graph.signature.borrow();
+        let graph_defaults = graph.defaults.borrow();
+        if (*graph_signature != self.signature || graph_defaults.as_ref() != Some(&self.defaults))
             && !relax_sig_check
         {
             return Err(AnnotatorError::new(format!(
@@ -1044,7 +1122,7 @@ impl FunctionDesc {
         use crate::flowspace::operation::{HLOperation, OpKind};
 
         // upstream: `argnames, vararg, kwarg = graph.signature; assert vararg`.
-        let old_sig = pygraph.signature.clone();
+        let old_sig = pygraph.signature.borrow().clone();
         if old_sig.varargname.is_none() {
             return Err(AnnotatorError::new(format!(
                 "apply_star_args_builder({}): graph signature missing *arg",
@@ -1113,9 +1191,9 @@ impl FunctionDesc {
 
         let mut argnames = old_sig.argnames;
         argnames.extend((0..nb_extra_args).map(|i| format!(".star{}", i)));
-        pygraph.signature = Signature::new(argnames, None, None);
+        *pygraph.signature.borrow_mut() = Signature::new(argnames, None, None);
         if nb_extra_args > 0 {
-            pygraph.defaults = None;
+            *pygraph.defaults.borrow_mut() = None;
         }
         checkgraph(&pygraph.graph.borrow());
         Ok(())
@@ -1478,11 +1556,8 @@ impl FunctionDesc {
         }
         let family = descs[0].borrow().base.getcallfamily()?;
         let shape = args.rawshape();
-        let mut row = CallTableRow::new();
-        for desc in descs {
-            let graph = desc.borrow().get_graph(args, op_key.clone())?;
-            row.insert(FunctionDesc::rowkey(desc), graph);
-        }
+        let desc_entries: Vec<DescEntry> = descs.iter().cloned().map(DescEntry::Function).collect();
+        let row = build_calltable_row(&desc_entries, args, op_key)?;
         family.borrow_mut().calltable_add_row(shape, row);
         let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
         let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
@@ -1856,17 +1931,8 @@ impl MethodDesc {
         let family = descs[0].borrow().base.getcallfamily()?;
         let mut shape = args.rawshape();
         shape.shape_cnt += 1;
-        let mut row = CallTableRow::new();
-        for desc in descs {
-            // upstream: `build_calltable_row(descs, args, op)` iterates
-            // `desc.get_graph(args, op)` per-desc; MethodDesc.get_graph
-            // delegates to funcdesc.get_graph after func_args prepends
-            // `self`. `rowkey` returns funcdesc.identity so the family
-            // is keyed by the underlying FunctionDesc (description.py:
-            // 467-471).
-            let graph = desc.borrow().get_graph(args, op_key.clone())?;
-            row.insert(DescKey::from_rc(&desc.borrow().funcdesc), graph);
-        }
+        let desc_entries: Vec<DescEntry> = descs.iter().cloned().map(DescEntry::Method).collect();
+        let row = build_calltable_row(&desc_entries, args, op_key)?;
         family.borrow_mut().calltable_add_row(shape, row);
         let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
         let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
@@ -2317,11 +2383,12 @@ impl MethodOfFrozenDesc {
         let family = descs[0].borrow().base.getcallfamily()?;
         let mut shape = args.rawshape();
         shape.shape_cnt += 1;
-        let mut row = CallTableRow::new();
-        for desc in descs {
-            let graph = desc.borrow().get_graph(args, op_key.clone())?;
-            row.insert(DescKey::from_rc(&desc.borrow().funcdesc), graph);
-        }
+        let desc_entries: Vec<DescEntry> = descs
+            .iter()
+            .cloned()
+            .map(DescEntry::MethodOfFrozen)
+            .collect();
+        let row = build_calltable_row(&desc_entries, args, op_key)?;
         family.borrow_mut().calltable_add_row(shape, row);
         let borrowed: Vec<_> = descs.iter().skip(1).map(|d| d.borrow()).collect();
         let others: Vec<&Desc> = borrowed.iter().map(|d| &d.base).collect();
@@ -2537,8 +2604,8 @@ mod tests {
         Rc::new(PyGraph {
             graph: Rc::new(std::cell::RefCell::new(graph)),
             func,
-            signature: sig,
-            defaults,
+            signature: std::cell::RefCell::new(sig),
+            defaults: std::cell::RefCell::new(defaults),
             access_directly: std::cell::Cell::new(false),
         })
     }
@@ -2838,12 +2905,12 @@ mod tests {
             "caller inputcells must stay unflattened"
         );
         assert_eq!(
-            graph.signature.argnames,
+            graph.signature.borrow().argnames,
             vec!["a".to_string(), ".star0".to_string(), ".star1".to_string()]
         );
-        assert!(graph.signature.varargname.is_none());
-        assert!(graph.signature.kwargname.is_none());
-        assert!(graph.defaults.is_none());
+        assert!(graph.signature.borrow().varargname.is_none());
+        assert!(graph.signature.borrow().kwargname.is_none());
+        assert!(graph.defaults.borrow().is_none());
         let startblock = graph.graph.borrow().startblock.clone();
         assert_eq!(startblock.borrow().inputargs.len(), 3);
         assert!(startblock.borrow().exits[0].borrow().prevblock.is_some());
@@ -3366,5 +3433,70 @@ mod tests {
         let args = ArgumentsForTranslation::new(vec![], None, None);
         let out = mfd.func_args(&args).expect("method-of-frozen args");
         assert!(matches!(out.arguments_w[0], SomeValue::PBC(_)));
+    }
+
+    #[test]
+    fn build_calltable_row_uses_method_rowkey_dispatch() {
+        let bk = bk();
+        let classdef = crate::annotator::classdesc::ClassDef::new_standalone("pkg.C", None);
+        bk.register_classdef(classdef.clone());
+        let func = compiled_graph_func("def m(self):\n    return self\n", Vec::new());
+        let host = HostObject::new_user_function(func.clone());
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            Some(host),
+            "m",
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(func.defaults.clone()),
+            None,
+        )));
+        let md = bk.getmethoddesc(
+            &fd,
+            ClassDefKey::from_classdef(&classdef),
+            Some(ClassDefKey::from_classdef(&classdef)),
+            "m",
+            std::collections::BTreeMap::new(),
+        );
+        let args = ArgumentsForTranslation::new(vec![], None, None);
+
+        let row = build_calltable_row(&[DescEntry::Method(md)], &args, None).unwrap();
+
+        let key = FunctionDesc::rowkey(&fd);
+        assert_eq!(row.len(), 1);
+        assert!(row.contains_key(&key));
+    }
+
+    #[test]
+    fn call_family_find_row_reuses_current_bookkeeper_position() {
+        let bk = bk();
+        let func = compiled_graph_func("def f(x):\n    return x\n", Vec::new());
+        let host = HostObject::new_user_function(func.clone());
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            Some(host),
+            "f",
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(func.defaults.clone()),
+            None,
+        )));
+        let args = ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::default())],
+            None,
+            None,
+        );
+        FunctionDesc::consider_call_site(&[fd.clone()], &args, &SomeValue::Impossible, None)
+            .unwrap();
+        bk.enter(Some(PositionKey::new(7, 8, 9)));
+
+        let family = fd.borrow().base.getcallfamily().unwrap();
+        let (shape, index) = family
+            .borrow()
+            .find_row(&bk, &[DescEntry::Function(fd)], &args, None)
+            .unwrap();
+
+        assert_eq!(shape, args.rawshape());
+        assert_eq!(index, 0);
+        assert_eq!(bk.current_position_key(), Some(PositionKey::new(7, 8, 9)));
+        bk.leave();
     }
 }

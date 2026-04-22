@@ -43,13 +43,13 @@ pub struct PyGraph {
     /// RPython `PyGraph.func`.
     pub func: GraphFunc,
     /// RPython `PyGraph.signature = code.signature`.
-    pub signature: Signature,
+    pub signature: RefCell<Signature>,
     /// RPython `PyGraph.defaults = func.__defaults__ or ()`.
     ///
     /// `None` is reserved for the star-arg builder path in
     /// `specialize.py`, which mutates a freshly-built graph to mean
     /// "defaults are unavailable for this specialized signature".
-    pub defaults: Option<Vec<Constant>>,
+    pub defaults: RefCell<Option<Vec<Constant>>>,
     /// RPython `graph.access_directly = True` set by
     /// `default_specialize()` when any argument carries the
     /// `access_directly` hint and `_jit_look_inside_` allows it.
@@ -82,8 +82,8 @@ impl PyGraph {
         // upstream: `self.signature = code.signature` / `self.defaults = ...`.
         PyGraph {
             graph: Rc::new(RefCell::new(graph)),
-            signature: code.signature.clone(),
-            defaults: Some(func.defaults.clone()),
+            signature: RefCell::new(code.signature.clone()),
+            defaults: RefCell::new(Some(func.defaults.clone())),
             access_directly: Cell::new(false),
             func,
         }
@@ -151,8 +151,8 @@ mod tests {
         let pygraph = PyGraph::new(func, &code);
 
         assert_eq!(pygraph.graph.borrow().name, "f");
-        assert_eq!(pygraph.defaults.as_ref().map_or(0, Vec::len), 0);
-        assert_eq!(pygraph.signature.num_argnames(), 2);
+        assert_eq!(pygraph.defaults.borrow().as_ref().map_or(0, Vec::len), 0);
+        assert_eq!(pygraph.signature.borrow().num_argnames(), 2);
         assert!(!pygraph.access_directly.get());
         // startblock.inputargs carries a Variable per formal arg
         // (no None slots leak through).

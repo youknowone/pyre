@@ -6201,13 +6201,15 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
-    // pyre-specific `_v` opname alias: `OpKind::FieldWrite { ty }` emits
-    // `setfield_gc_{kind}` with `_v` when the graph-level result type
-    // slot is Unknown/Void (assembler.rs op_kind_to_opname). The byte
-    // layout `rid` matches the canonical `setfield_gc_i/rid`, so the same
-    // handler reads the bytecode stream without change. Drops away once
-    // the emitter stops synthesizing `_v` opnames.
+    // pyre-specific `_v` opname aliases: `OpKind::FieldWrite { ty }` emits
+    // `setfield_gc_{kind}` with `_v` when the graph-level result type slot
+    // is Unknown/Void (assembler.rs op_kind_to_opname). Both `rid` and `ird`
+    // appear in the current bytecode/insns surfaces; they remain aliases for
+    // the canonical integer-flavoured `bhimpl_setfield_gc_i`.
+    // Register both spellings so `setup_insns` keeps the same fail-fast
+    // coverage contract as RPython blackhole.py.
     builder.wire_handler("setfield_gc_v/rid", handler_setfield_gc_i);
+    builder.wire_handler("setfield_gc_v/ird", handler_setfield_gc_i);
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
     // Array item operations (blackhole.py:1329-1365)
