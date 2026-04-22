@@ -789,7 +789,7 @@ impl JitCodeBuilder {
         &mut self,
         sub_jitcode_idx: u16,
         args_r: &[(u16, u16)],
-        return_i: Option<(u16, u16)>,
+        return_i: Option<u16>,
     ) {
         self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], return_i, None, None);
     }
@@ -798,7 +798,7 @@ impl JitCodeBuilder {
         &mut self,
         sub_jitcode_idx: u16,
         args_r: &[(u16, u16)],
-        return_r: Option<(u16, u16)>,
+        return_r: Option<u16>,
     ) {
         self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], None, return_r, None);
     }
@@ -807,7 +807,7 @@ impl JitCodeBuilder {
         &mut self,
         sub_jitcode_idx: u16,
         args_r: &[(u16, u16)],
-        _return_v: Option<(u16, u16)>,
+        _return_v: Option<u16>,
     ) {
         self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], None, None, None);
     }
@@ -817,7 +817,7 @@ impl JitCodeBuilder {
         sub_jitcode_idx: u16,
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
-        return_i: Option<(u16, u16)>,
+        return_i: Option<u16>,
     ) {
         self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], return_i, None, None);
     }
@@ -827,7 +827,7 @@ impl JitCodeBuilder {
         sub_jitcode_idx: u16,
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
-        return_r: Option<(u16, u16)>,
+        return_r: Option<u16>,
     ) {
         self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], None, return_r, None);
     }
@@ -837,7 +837,7 @@ impl JitCodeBuilder {
         sub_jitcode_idx: u16,
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
-        _return_v: Option<(u16, u16)>,
+        _return_v: Option<u16>,
     ) {
         self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], None, None, None);
     }
@@ -848,7 +848,7 @@ impl JitCodeBuilder {
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
         args_f: &[(u16, u16)],
-        return_i: Option<(u16, u16)>,
+        return_i: Option<u16>,
     ) {
         self.inline_call_grouped(
             sub_jitcode_idx,
@@ -867,7 +867,7 @@ impl JitCodeBuilder {
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
         args_f: &[(u16, u16)],
-        return_r: Option<(u16, u16)>,
+        return_r: Option<u16>,
     ) {
         self.inline_call_grouped(
             sub_jitcode_idx,
@@ -886,7 +886,7 @@ impl JitCodeBuilder {
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
         args_f: &[(u16, u16)],
-        return_f: Option<(u16, u16)>,
+        return_f: Option<u16>,
     ) {
         self.inline_call_grouped(
             sub_jitcode_idx,
@@ -905,7 +905,7 @@ impl JitCodeBuilder {
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
         args_f: &[(u16, u16)],
-        _return_v: Option<(u16, u16)>,
+        _return_v: Option<u16>,
     ) {
         self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, args_f, None, None, None);
     }
@@ -916,9 +916,9 @@ impl JitCodeBuilder {
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
         args_f: &[(u16, u16)],
-        return_i: Option<(u16, u16)>,
-        return_r: Option<(u16, u16)>,
-        return_f: Option<(u16, u16)>,
+        return_i: Option<u16>,
+        return_r: Option<u16>,
+        return_f: Option<u16>,
     ) {
         let mut typed_args = Vec::with_capacity(args_i.len() + args_r.len() + args_f.len());
         typed_args.extend(
@@ -943,9 +943,9 @@ impl JitCodeBuilder {
         &mut self,
         sub_jitcode_idx: u16,
         args: &[(JitArgKind, u16, u16)],
-        return_i: Option<(u16, u16)>,
-        return_r: Option<(u16, u16)>,
-        return_f: Option<(u16, u16)>,
+        return_i: Option<u16>,
+        return_r: Option<u16>,
+        return_f: Option<u16>,
     ) {
         for &(kind, caller_src, _) in args {
             match kind {
@@ -954,13 +954,13 @@ impl JitCodeBuilder {
                 JitArgKind::Float => self.touch_float_reg(caller_src),
             }
         }
-        if let Some((_, caller_dst)) = return_i {
+        if let Some(caller_dst) = return_i {
             self.touch_reg(caller_dst);
         }
-        if let Some((_, caller_dst)) = return_r {
+        if let Some(caller_dst) = return_r {
             self.touch_ref_reg(caller_dst);
         }
-        if let Some((_, caller_dst)) = return_f {
+        if let Some(caller_dst) = return_f {
             self.touch_float_reg(caller_dst);
         }
         self.push_u8(jitcode::BC_INLINE_CALL);
@@ -976,16 +976,10 @@ impl JitCodeBuilder {
         self.push_return_slot(return_f);
     }
 
-    fn push_return_slot(&mut self, ret: Option<(u16, u16)>) {
+    fn push_return_slot(&mut self, ret: Option<u16>) {
         match ret {
-            Some((callee_src, caller_dst)) => {
-                self.push_u16(callee_src);
-                self.push_u16(caller_dst);
-            }
-            None => {
-                self.push_u16(u16::MAX);
-                self.push_u16(u16::MAX);
-            }
+            Some(caller_dst) => self.push_u16(caller_dst),
+            None => self.push_u16(u16::MAX),
         }
     }
 

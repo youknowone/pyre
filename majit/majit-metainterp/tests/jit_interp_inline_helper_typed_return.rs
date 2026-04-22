@@ -12,6 +12,20 @@ fn assert_single_return_opcode(jitcode: &majit_metainterp::JitCode, key: &str) {
     assert_eq!(jitcode.code[0], opcode, "helper should end with {key}");
 }
 
+fn assert_trailing_return(
+    jitcode: &majit_metainterp::JitCode,
+    key: &str,
+    kind: majit_metainterp::JitArgKind,
+    reg: u16,
+) {
+    assert_single_return_opcode(jitcode, key);
+    assert_eq!(
+        jitcode.trailing_return_info(),
+        Some((kind, reg)),
+        "helper should expose trailing return info from jitcode bytecode"
+    );
+}
+
 // ── Ref-returning inline helpers ────────────────────────────────────
 
 #[jit_inline]
@@ -50,36 +64,34 @@ fn wrapped_int_identity(value: i64) -> i64 {
 
 #[test]
 fn jit_inline_ref_identity_generates_valid_jitcode() {
-    let (jitcode, return_reg, return_kind) = __majit_inline_jitcode_inline_ref_identity();
-    // return_kind == 1 means Ref
-    assert_eq!(return_kind, 1u8, "return kind should be Ref (1)");
-    assert_eq!(
-        return_reg, 0,
-        "return register should be the parameter register"
-    );
+    let jitcode = __majit_inline_jitcode_inline_ref_identity();
     // RPython jitcode.py:37-39 c_num_regs_i/r/f
     assert_eq!(jitcode.c_num_regs_i, 0, "no int registers needed");
     assert!(jitcode.c_num_regs_r >= 1, "at least 1 ref register needed");
     assert_eq!(jitcode.c_num_regs_f, 0, "no float registers needed");
-    assert_single_return_opcode(&jitcode, "ref_return/r");
+    assert_trailing_return(
+        &jitcode,
+        "ref_return/r",
+        majit_metainterp::JitArgKind::Ref,
+        0,
+    );
 }
 
 #[test]
 fn jit_inline_float_identity_generates_valid_jitcode() {
-    let (jitcode, return_reg, return_kind) = __majit_inline_jitcode_inline_float_identity();
-    // return_kind == 2 means Float
-    assert_eq!(return_kind, 2u8, "return kind should be Float (2)");
-    assert_eq!(
-        return_reg, 0,
-        "return register should be the parameter register"
-    );
+    let jitcode = __majit_inline_jitcode_inline_float_identity();
     assert_eq!(jitcode.c_num_regs_i, 0, "no int registers needed");
     assert_eq!(jitcode.c_num_regs_r, 0, "no ref registers needed");
     assert!(
         jitcode.c_num_regs_f >= 1,
         "at least 1 float register needed"
     );
-    assert_single_return_opcode(&jitcode, "float_return/f");
+    assert_trailing_return(
+        &jitcode,
+        "float_return/f",
+        majit_metainterp::JitArgKind::Float,
+        0,
+    );
 }
 
 #[test]
@@ -99,16 +111,16 @@ fn jit_inline_float_identity_keeps_interpreter_behavior() {
 
 #[test]
 fn jit_inline_mixed_identity_generates_dense_per_kind_jitcode() {
-    let (jitcode, return_reg, return_kind) = __majit_inline_jitcode_inline_mixed_int_identity();
-    assert_eq!(return_kind, 0u8, "return kind should be Int (0)");
-    assert_eq!(
-        return_reg, 0,
-        "mixed helper int parameter should live in dense int reg 0"
-    );
+    let jitcode = __majit_inline_jitcode_inline_mixed_int_identity();
     assert_eq!(jitcode.c_num_regs_i, 1, "one int register needed");
     assert_eq!(jitcode.c_num_regs_r, 1, "one ref register needed");
     assert_eq!(jitcode.c_num_regs_f, 1, "one float register needed");
-    assert_single_return_opcode(&jitcode, "int_return/i");
+    assert_trailing_return(
+        &jitcode,
+        "int_return/i",
+        majit_metainterp::JitArgKind::Int,
+        0,
+    );
 }
 
 #[test]
@@ -198,15 +210,21 @@ fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_poli
 fn jit_inline_ref_identity_works_through_jitcode_builder() {
     use majit_metainterp::JitCodeBuilder;
 
-    let (sub_jitcode, sub_return_reg, sub_return_kind) =
-        __majit_inline_jitcode_inline_ref_identity();
-    assert_eq!(sub_return_kind, 1u8, "ref helper should report Ref kind");
+    let sub_jitcode = __majit_inline_jitcode_inline_ref_identity();
+    let (sub_return_kind, _sub_return_reg) = sub_jitcode
+        .trailing_return_info()
+        .expect("ref helper should end in ref_return");
+    assert_eq!(
+        sub_return_kind,
+        majit_metainterp::JitArgKind::Ref,
+        "ref helper should report Ref kind"
+    );
 
     let mut builder = JitCodeBuilder::new();
     // Simulate: caller has a ref value in ref register 0
     builder.load_const_r_value(0, 0xDEAD);
     let sub_idx = builder.add_sub_jitcode(sub_jitcode);
-    builder.inline_call_r_r(sub_idx, &[(0, 0)], Some((sub_return_reg, 1)));
+    builder.inline_call_r_r(sub_idx, &[(0, 0)], Some(1));
     let jitcode = builder.finish();
 
     // Verify the JitCode was built without panics and has correct structure
@@ -227,10 +245,13 @@ fn jit_inline_ref_identity_works_through_jitcode_builder() {
 fn jit_inline_float_identity_works_through_jitcode_builder() {
     use majit_metainterp::JitCodeBuilder;
 
-    let (sub_jitcode, sub_return_reg, sub_return_kind) =
-        __majit_inline_jitcode_inline_float_identity();
+    let sub_jitcode = __majit_inline_jitcode_inline_float_identity();
+    let (sub_return_kind, _sub_return_reg) = sub_jitcode
+        .trailing_return_info()
+        .expect("float helper should end in float_return");
     assert_eq!(
-        sub_return_kind, 2u8,
+        sub_return_kind,
+        majit_metainterp::JitArgKind::Float,
         "float helper should report Float kind"
     );
 
@@ -238,7 +259,7 @@ fn jit_inline_float_identity_works_through_jitcode_builder() {
     // Simulate: caller has a float value in float register 0
     builder.load_const_f_value(0, f64::to_bits(3.14) as i64);
     let sub_idx = builder.add_sub_jitcode(sub_jitcode);
-    builder.inline_call_irf_f(sub_idx, &[], &[], &[(0, 0)], Some((sub_return_reg, 1)));
+    builder.inline_call_irf_f(sub_idx, &[], &[], &[(0, 0)], Some(1));
     let jitcode = builder.finish();
 
     assert!(
@@ -257,9 +278,15 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     use majit_metainterp::JitCodeBuilder;
     use majit_metainterp::blackhole::BlackholeInterpreter;
 
-    let (sub_jitcode, sub_return_reg, sub_return_kind) =
-        __majit_inline_jitcode_inline_mixed_int_identity();
-    assert_eq!(sub_return_kind, 0u8, "mixed helper should report Int kind");
+    let sub_jitcode = __majit_inline_jitcode_inline_mixed_int_identity();
+    let (sub_return_kind, sub_return_reg) = sub_jitcode
+        .trailing_return_info()
+        .expect("mixed helper should end in int_return");
+    assert_eq!(
+        sub_return_kind,
+        majit_metainterp::JitArgKind::Int,
+        "mixed helper should report Int kind"
+    );
     assert_eq!(
         sub_return_reg, 0,
         "mixed helper int parameter should live in dense int reg 0"
@@ -270,13 +297,7 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     builder.load_const_i_value(0, 21);
     builder.load_const_f_value(0, f64::to_bits(3.5) as i64);
     let sub_idx = builder.add_sub_jitcode(sub_jitcode);
-    builder.inline_call_irf_i(
-        sub_idx,
-        &[(0, 0)],
-        &[(0, 0)],
-        &[(0, 0)],
-        Some((sub_return_reg, 1)),
-    );
+    builder.inline_call_irf_i(sub_idx, &[(0, 0)], &[(0, 0)], &[(0, 0)], Some(1));
     let jitcode = builder.finish();
 
     let mut bh = BlackholeInterpreter::new();

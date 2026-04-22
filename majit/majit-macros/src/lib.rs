@@ -1250,12 +1250,6 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         InlineReturnKind::Float => quote! { __builder.float_return(#return_reg); },
     };
 
-    // Return kind code: 0 = Int, 1 = Ref, 2 = Float
-    let return_kind_code: u8 = match helper.return_kind {
-        InlineReturnKind::Int => 0,
-        InlineReturnKind::Ref => 1,
-        InlineReturnKind::Float => 2,
-    };
     // RPython jtransform.py: rewrite_call() bakes the result kind into the
     // emitted opname. Our inferred helper-policy surface can only model that
     // parity for int-return inline helpers; ref/float inline helpers must go
@@ -1296,12 +1290,12 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
-        pub(crate) fn #helper_name() -> (majit_metainterp::JitCode, u16, u8) {
+        pub(crate) fn #helper_name() -> majit_metainterp::JitCode {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
             #(#ensure_param_regs)*
             #helper_body
             #helper_return
-            (__builder.finish(), #return_reg, #return_kind_code)
+            __builder.finish()
         }
 
         #[doc(hidden)]

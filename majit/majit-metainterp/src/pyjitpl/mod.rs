@@ -8833,13 +8833,13 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2451: self.framestack.append(f) — push the root.
         let mut root_frame = crate::pyjitpl::MIFrame::new(jitcode, pc);
         {
-            // RPython `pyjitpl.py:2247-2253` `MIFrame.setup` populates
-            // the constants window with Const{Int,Ptr,Float} boxes.
+            // pyjitpl.py:86-90 `MIFrame.setup` calls `copy_constants`
+            // on each typed register array right after sizing.
             let ctx = self
                 .tracing
                 .as_mut()
                 .expect("trace_jitcode_with_framestack requires an active trace");
-            root_frame.fill_const_slots(ctx);
+            root_frame.copy_constants(ctx);
         }
         self.framestack.push(root_frame);
         let action = {
@@ -8949,6 +8949,14 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
         let mut frame = crate::pyjitpl::MIFrame::new(jitcode, 0);
         frame.greenkey = greenkey;
+        // pyjitpl.py:2450 `f.setup(jitcode, greenkey)` — `setup` calls
+        // `copy_constants` inline (pyjitpl.py:86-90) so the constants
+        // window is populated before the frame enters dispatch. Skip
+        // when there is no active trace (blackhole runs off its own
+        // register file and does not read MIFrame const slots).
+        if let Some(ctx) = self.tracing.as_mut() {
+            frame.copy_constants(ctx);
+        }
         self.framestack.push(frame);
         self.framestack.len() - 1
     }

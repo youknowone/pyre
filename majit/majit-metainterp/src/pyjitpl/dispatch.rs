@@ -479,17 +479,38 @@ where
                 ctx.pop_inline_frame();
             }
             if let Some(parent) = self.frames.frames.last_mut() {
-                if let Some((callee_src, caller_dst)) = finished_frame.return_i {
-                    parent.int_regs[caller_dst] = finished_frame.int_regs[callee_src];
-                    parent.int_values[caller_dst] = finished_frame.int_values[callee_src];
-                }
-                if let Some((callee_src, caller_dst)) = finished_frame.return_r {
-                    parent.ref_regs[caller_dst] = finished_frame.ref_regs[callee_src];
-                    parent.ref_values[caller_dst] = finished_frame.ref_values[callee_src];
-                }
-                if let Some((callee_src, caller_dst)) = finished_frame.return_f {
-                    parent.float_regs[caller_dst] = finished_frame.float_regs[callee_src];
-                    parent.float_values[caller_dst] = finished_frame.float_values[callee_src];
+                if let Some((return_kind, callee_src)) =
+                    finished_frame.jitcode.trailing_return_info()
+                {
+                    match return_kind {
+                        JitArgKind::Int => {
+                            let caller_dst = finished_frame
+                                .return_i
+                                .expect("inline int return missing caller destination");
+                            parent.int_regs[caller_dst] =
+                                finished_frame.int_regs[callee_src as usize];
+                            parent.int_values[caller_dst] =
+                                finished_frame.int_values[callee_src as usize];
+                        }
+                        JitArgKind::Ref => {
+                            let caller_dst = finished_frame
+                                .return_r
+                                .expect("inline ref return missing caller destination");
+                            parent.ref_regs[caller_dst] =
+                                finished_frame.ref_regs[callee_src as usize];
+                            parent.ref_values[caller_dst] =
+                                finished_frame.ref_values[callee_src as usize];
+                        }
+                        JitArgKind::Float => {
+                            let caller_dst = finished_frame
+                                .return_f
+                                .expect("inline float return missing caller destination");
+                            parent.float_regs[caller_dst] =
+                                finished_frame.float_regs[callee_src as usize];
+                            parent.float_values[caller_dst] =
+                                finished_frame.float_values[callee_src as usize];
+                        }
+                    }
                 }
             }
             return TraceAction::Continue;
@@ -1056,12 +1077,11 @@ where
                         arg_triples.push((kind, caller_src, callee_dst));
                     }
                     let decode_return_slot = |f: &mut MIFrame| {
-                        let src = f.next_u16() as usize;
                         let dst = f.next_u16() as usize;
-                        if src == u16::MAX as usize && dst == u16::MAX as usize {
+                        if dst == u16::MAX as usize {
                             None
                         } else {
-                            Some((src, dst))
+                            Some(dst)
                         }
                     };
                     let return_i = decode_return_slot(frame);
@@ -1086,9 +1106,9 @@ where
                     })
                     .clone();
                 let mut sub_frame = MIFrame::new(sub_jitcode, pc);
-                // RPython `pyjitpl.py:2247-2253` populates the constants
-                // window during `MIFrame.setup`.
-                sub_frame.fill_const_slots(ctx);
+                // pyjitpl.py:86-90 `MIFrame.setup` calls `copy_constants`
+                // on each typed register array after sizing.
+                sub_frame.copy_constants(ctx);
                 // dispatch.rs sub-jitcode inline frame (RPython pyjitpl
                 // perform_call for non-portal jitcodes). The structured
                 // greenkey has no pc-component meaning here — use
@@ -1881,10 +1901,10 @@ where
     let jitcode_arc = Arc::new(jitcode.clone());
     let mut standalone = StandaloneFrameStack::new();
     let mut frame = MIFrame::new(jitcode_arc, pc);
-    // RPython `pyjitpl.py:2247-2253` `MIFrame.setup` fills the
-    // constants window; bytecode operands indexed into
+    // pyjitpl.py:86-90 `MIFrame.setup` calls `copy_constants` on each
+    // typed register array; bytecode operands indexed into
     // `[num_regs_X .. num_regs_and_consts_X)` read these Const boxes.
-    frame.fill_const_slots(ctx);
+    frame.copy_constants(ctx);
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.run_to_end(ctx, sym, &runtime)

@@ -2368,7 +2368,10 @@ impl<'c> Lowerer<'c> {
                     let builder_path = inline_builder_path(&call.func)?;
                     let inline_call = inline_call_tokens(&arg_bindings, reg);
                     self.statements.push(quote! {
-                        let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = #builder_path();
+                        let __sub_jitcode = #builder_path();
+                        let (__sub_return_kind, _) = __sub_jitcode
+                            .trailing_return_info()
+                            .expect("inline helper jitcode must end in a typed return opcode");
                         let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                         #inline_call
                     });
@@ -2405,9 +2408,12 @@ impl<'c> Lowerer<'c> {
                                 __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
                             }
                             4u8 => {
-                                let __builder_fn: fn() -> (majit_metainterp::JitCode, u16, u8) =
+                                let __builder_fn: fn() -> majit_metainterp::JitCode =
                                     unsafe { std::mem::transmute(__inline_builder) };
-                                let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
+                                let __sub_jitcode = __builder_fn();
+                                let (__sub_return_kind, _) = __sub_jitcode
+                                    .trailing_return_info()
+                                    .expect("inline helper jitcode must end in a typed return opcode");
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                 #inline_call
                             }
@@ -2447,9 +2453,12 @@ impl<'c> Lowerer<'c> {
                                 __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
                             }
                             4u8 => {
-                                let __builder_fn: fn() -> (majit_metainterp::JitCode, u16, u8) =
+                                let __builder_fn: fn() -> majit_metainterp::JitCode =
                                     unsafe { std::mem::transmute(__inline_builder) };
-                                let (__sub_jitcode, __sub_return_reg, __sub_return_kind) = __builder_fn();
+                                let __sub_jitcode = __builder_fn();
+                                let (__sub_return_kind, _) = __sub_jitcode
+                                    .trailing_return_info()
+                                    .expect("inline helper jitcode must end in a typed return opcode");
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                 #inline_call
                             }
@@ -2814,7 +2823,7 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
                 #args_i,
                 #args_r,
                 #args_f,
-                Some((__sub_return_reg, #result_reg)),
+                Some(#result_reg),
             );
         }
     } else if has_int_args {
@@ -2823,7 +2832,7 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
                 __sub_idx,
                 #args_i,
                 #args_r,
-                Some((__sub_return_reg, #result_reg)),
+                Some(#result_reg),
             );
         }
     } else {
@@ -2831,7 +2840,7 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
             __builder.inline_call_r_i(
                 __sub_idx,
                 #args_r,
-                Some((__sub_return_reg, #result_reg)),
+                Some(#result_reg),
             );
         }
     };
@@ -2842,7 +2851,7 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
                 #args_i,
                 #args_r,
                 #args_f,
-                Some((__sub_return_reg, #result_reg)),
+                Some(#result_reg),
             );
         }
     } else if has_int_args {
@@ -2851,7 +2860,7 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
                 __sub_idx,
                 #args_i,
                 #args_r,
-                Some((__sub_return_reg, #result_reg)),
+                Some(#result_reg),
             );
         }
     } else {
@@ -2859,7 +2868,7 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
             __builder.inline_call_r_r(
                 __sub_idx,
                 #args_r,
-                Some((__sub_return_reg, #result_reg)),
+                Some(#result_reg),
             );
         }
     };
@@ -2869,23 +2878,20 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
             #args_i,
             #args_r,
             #args_f,
-            Some((__sub_return_reg, #result_reg)),
+            Some(#result_reg),
         );
     };
 
     quote! {
         match __sub_return_kind {
-            0u8 => {
+            majit_metainterp::JitArgKind::Int => {
                 #call_i
             }
-            1u8 => {
+            majit_metainterp::JitArgKind::Ref => {
                 #call_r
             }
-            2u8 => {
+            majit_metainterp::JitArgKind::Float => {
                 #call_f
-            }
-            _ => {
-                panic!("inline helper returned unknown return kind");
             }
         }
     }

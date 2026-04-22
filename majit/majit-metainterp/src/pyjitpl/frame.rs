@@ -72,9 +72,9 @@ pub struct MIFrame {
     pub float_regs: Vec<Option<OpRef>>,
     pub float_values: Vec<Option<i64>>,
     pub inline_frame: bool,
-    pub return_i: Option<(usize, usize)>,
-    pub return_r: Option<(usize, usize)>,
-    pub return_f: Option<(usize, usize)>,
+    pub return_i: Option<usize>,
+    pub return_r: Option<usize>,
+    pub return_f: Option<usize>,
     /// pyjitpl.py `MIFrame.greenkey` — set when this frame is a
     /// recursive portal call (pyjitpl.py:80).
     pub greenkey: Option<u64>,
@@ -148,14 +148,18 @@ impl MIFrame {
         read_u16(&self.jitcode.code, &mut self.code_cursor)
     }
 
-    /// RPython `pyjitpl.py:2247-2253` `MIFrame.setup` populates the
-    /// constants window `[num_regs_X .. num_regs_and_consts_X)` with
-    /// `Const{Int,Ptr,Float}` boxes so bytecode operands indexed into
-    /// that window read the constant without an extra opcode.  pyre
-    /// stores an `OpRef` + concrete `i64` pair per slot; call this
-    /// after `MIFrame::new` on any frame that will be driven by
-    /// tracing so the const area is valid.
-    pub fn fill_const_slots(&mut self, ctx: &mut crate::trace_ctx::TraceCtx) {
+    /// pyjitpl.py:98-119 `MIFrame.copy_constants`.
+    ///
+    /// RPython copies each entry of `jitcode.constants_{i,r,f}` into the
+    /// register file at `registers_X[num_regs_X + i]`, wrapping it in
+    /// `Const{Int,Ptr,Float}`. `MIFrame.setup` (pyjitpl.py:82-90) invokes
+    /// this inline right after sizing the register arrays to
+    /// `num_regs_and_consts_X`.
+    ///
+    /// pyre stores an `OpRef` + concrete `i64` pair per slot; `ctx` is
+    /// needed to intern the const into the trace context's constant pool
+    /// before the opref is written into the register file.
+    pub fn copy_constants(&mut self, ctx: &mut crate::trace_ctx::TraceCtx) {
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
         for (i, &value) in self.jitcode.constants_i.iter().enumerate() {
             let slot = num_regs_i + i;

@@ -274,7 +274,7 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     // assembles those operations.
     // blackhole.py:1278-1319 inline-call family intentionally omitted.
     // The helper-side `BC_INLINE_CALL` adapter in majit-metainterp uses a
-    // typed arg/return-slot payload that is not line-by-line compatible
+    // typed arg + caller-destination payload that is not line-by-line compatible
     // with canonical `inline_call_*` argcodes. The real RPython-shape
     // `inline_call_*` keys come from the translator/codewriter pipeline
     // when they are actually emitted; pre-registering them here would make
@@ -328,8 +328,6 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("int_le/ii>i", BC_INT_LE);
     m.insert("int_gt/ii>i", BC_INT_GT);
     m.insert("int_ge/ii>i", BC_INT_GE);
-    m.insert("int_neg/i>i", BC_INT_NEG);
-    m.insert("int_invert/i>i", BC_INT_INVERT);
     m.insert("int_neg/i>i", BC_INT_NEG);
     m.insert("int_invert/i>i", BC_INT_INVERT);
     m.insert("uint_rshift/ii>i", BC_UINT_RSHIFT);
@@ -678,6 +676,28 @@ impl JitCode {
     /// RPython `jitcode.py:62-63` `def num_regs_and_consts_f(self): return ord(self.c_num_regs_f) + len(self.constants_f)`.
     pub fn num_regs_and_consts_f(&self) -> usize {
         self.c_num_regs_f as usize + self.constants_f.len()
+    }
+
+    /// Inspect the trailing typed return opcode of a helper jitcode.
+    ///
+    /// RPython does not thread inline-helper result metadata through a
+    /// side-table; callers recover the return type from the callee bytecode
+    /// itself. `#[jit_inline]` helpers now terminate in the same typed
+    /// `*_return` opcode, so consumers should read that trailing instruction
+    /// instead of depending on an out-of-band `(return_reg, return_kind)` pair.
+    pub fn trailing_return_info(&self) -> Option<(JitArgKind, u16)> {
+        if self.code.last().copied() == Some(BC_VOID_RETURN) || self.code.len() < 3 {
+            return None;
+        }
+        let opcode_pos = self.code.len() - 3;
+        let opcode = self.code[opcode_pos];
+        let src = u16::from_le_bytes([self.code[opcode_pos + 1], self.code[opcode_pos + 2]]);
+        match opcode {
+            BC_INT_RETURN => Some((JitArgKind::Int, src)),
+            BC_REF_RETURN => Some((JitArgKind::Ref, src)),
+            BC_FLOAT_RETURN => Some((JitArgKind::Float, src)),
+            _ => None,
+        }
     }
 
     /// RPython jitcode.py:82-93 `get_live_vars_info(self, pc, op_live)`.

@@ -2153,7 +2153,8 @@ impl BlackholeInterpreter {
                     let callee_dst = self.next_u16() as usize;
                     arg_triples.push((kind, caller_src, callee_dst));
                 }
-                // Return slots: (callee_src, caller_dst) for i/r/f
+                // Return slots: caller dst for i/r/f; the callee src comes
+                // from its trailing typed return opcode.
                 let return_i = self.decode_return_slot();
                 let return_r = self.decode_return_slot();
                 let return_f = self.decode_return_slot();
@@ -2216,14 +2217,24 @@ impl BlackholeInterpreter {
                 }
 
                 // Copy return values
-                if let Some((callee_src, caller_dst)) = return_i {
-                    self.registers_i[caller_dst] = callee.registers_i[callee_src];
-                }
-                if let Some((callee_src, caller_dst)) = return_r {
-                    self.registers_r[caller_dst] = callee.registers_r[callee_src];
-                }
-                if let Some((callee_src, caller_dst)) = return_f {
-                    self.registers_f[caller_dst] = callee.registers_f[callee_src];
+                if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
+                    match return_kind {
+                        JitArgKind::Int => {
+                            let caller_dst =
+                                return_i.expect("inline int return missing caller destination");
+                            self.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
+                        }
+                        JitArgKind::Ref => {
+                            let caller_dst =
+                                return_r.expect("inline ref return missing caller destination");
+                            self.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
+                        }
+                        JitArgKind::Float => {
+                            let caller_dst =
+                                return_f.expect("inline float return missing caller destination");
+                            self.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
+                        }
+                    }
                 }
             }
             // -- Int-typed calls --
@@ -2528,14 +2539,13 @@ impl BlackholeInterpreter {
         args
     }
 
-    /// Decode a return slot pair from bytecode.
-    fn decode_return_slot(&mut self) -> Option<(usize, usize)> {
-        let src = self.next_u16() as usize;
+    /// Decode a caller destination slot from bytecode.
+    fn decode_return_slot(&mut self) -> Option<usize> {
         let dst = self.next_u16() as usize;
-        if src == u16::MAX as usize && dst == u16::MAX as usize {
+        if dst == u16::MAX as usize {
             None
         } else {
-            Some((src, dst))
+            Some(dst)
         }
     }
 }
@@ -4380,16 +4390,21 @@ mod tests {
 
         #[test]
         fn test_bh_interp_inline_call() {
-            // Build sub-jitcode: r0 = arg, result = r0 + r0
+            // Build sub-jitcode: r0 = arg, result = r0 + r0, return r1.
+            // pyjitpl.py:2247-2253 requires every callee to terminate
+            // in a typed return opcode so the caller's BC_INLINE_CALL
+            // can recover the callee's return register via
+            // `trailing_return_info()`.
             let mut sub = JitCodeBuilder::default();
             sub.record_binop_i(1, OpCode::IntAdd, 0, 0);
+            sub.int_return(1);
             let sub_jitcode = sub.finish();
 
             // Build main jitcode: r0 = 21, inline_call(sub, arg=r0) → r1
             let mut b = JitCodeBuilder::default();
             b.load_const_i_value(0, 21);
             let sub_idx = b.add_sub_jitcode(sub_jitcode);
-            b.inline_call_ir_i(sub_idx, &[(0, 0)], &[], Some((1, 1)));
+            b.inline_call_ir_i(sub_idx, &[(0, 0)], &[], Some(1));
             let jitcode = b.finish();
 
             let mut bh = BlackholeInterpreter::new();
