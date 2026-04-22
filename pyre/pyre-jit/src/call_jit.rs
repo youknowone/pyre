@@ -2785,35 +2785,60 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
-    if !unsafe { is_function(callable) } {
-        let err = pyre_interpreter::PyError::type_error("call on non-function callable");
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
-        return 0;
-    }
-    // blackhole.py:1224-1249 bhimpl_residual_call: residual calls in the
-    // blackhole go through cpu.bh_call_* which is a plain call, NOT
-    // through the portal runner. call_user_function_plain uses
-    // eval_frame_plain (no JIT re-entry), matching RPython semantics.
-    //
-    // Builtin functions (print, len, etc.) have no PyFrame and cannot go
-    // through call_user_function_plain. Dispatch directly.
-    let code = unsafe { pyre_interpreter::getcode(callable) };
-    if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
-        let func = unsafe { pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef) };
-        match func(args) {
-            Ok(result) if !result.is_null() => return result as i64,
-            Ok(_) => return 0,
+    // llmodel.py:822 bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
+    // Hot path: Function callables dispatched directly here (builtin or user
+    // code), matching call_user_function_plain so eval_frame_plain is used
+    // and JIT is not re-entered from the blackhole.
+    // Cold path: type/method/staticmethod/classmethod/callable-instance are
+    // delegated to call_function_impl_result under ForcePlainEvalGuard, which
+    // mirrors baseobjspace.py:1155 dispatch without re-entering the JIT.
+    if unsafe { is_function(callable) } {
+        let code = unsafe { pyre_interpreter::getcode(callable) };
+        if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
+            let func =
+                unsafe { pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef) };
+            return match func(args) {
+                Ok(result) if !result.is_null() => result as i64,
+                Ok(_) => 0,
+                Err(err) => {
+                    let exc_obj = err.to_exc_object();
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+                    0
+                }
+            };
+        }
+        let parent_frame_ptr =
+            majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
+        let parent_frame = unsafe { &*parent_frame_ptr };
+        return match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args)
+        {
+            Ok(result) => result as i64,
             Err(err) => {
                 let exc_obj = err.to_exc_object();
                 majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-                return 0;
+                0
             }
-        }
+        };
     }
+    // Cold path: type/method/staticmethod/classmethod/callable-instance.
+    // Ensure LAST_EXEC_CTX reflects the caller frame pinned in BH_VABLE_PTR
+    // before delegating to `call_function_impl_result`. `type_descr_call_impl`
+    // → `call_user_function_with_args` reads LAST_EXEC_CTX as the fallback
+    // execution context for `__new__`/`__init__` (call.rs:1104-1106); without
+    // this pin it would use whatever frame last entered `eval_frame_*`,
+    // which is not guaranteed to be the blackhole caller.
     let parent_frame_ptr =
         majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
-    let parent_frame = unsafe { &*parent_frame_ptr };
-    match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args) {
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    if !parent_frame_ptr.is_null() {
+        unsafe {
+            pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
+        }
+    }
+    let _plain_guard = pyre_interpreter::call::force_plain_eval();
+    let result = pyre_interpreter::call::call_function_impl_result(callable, args);
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+    match result {
         Ok(result) => result as i64,
         Err(err) => {
             let exc_obj = err.to_exc_object();
@@ -2868,6 +2893,80 @@ pub extern "C" fn bh_load_const_fn(w_code_ptr: i64, consti: i64) -> i64 {
 /// Box a raw integer into a PyObject (w_int_new wrapper).
 pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
     w_int_new(value) as i64
+}
+
+/// `eval.rs:1049-1128 RAISE_VARARGS` normalization for blackhole/JitCode.
+///
+/// JitCode's `raise/r` bytecode carries only the final exception object, so
+/// callers normalize `raise Type`, `raise builtin_callable`, and
+/// `raise X from Y` through this helper before emitting `raise/r`.
+pub extern "C" fn bh_normalize_raise_varargs_fn(exc: i64, cause: i64) -> i64 {
+    let exc = exc as PyObjectRef;
+    let raw_cause = cause as PyObjectRef;
+    let cause = if raw_cause.is_null() {
+        None
+    } else {
+        let exec_ctx = pyre_interpreter::call::take_last_exec_ctx();
+        match pyre_interpreter::eval::normalize_raise_cause(raw_cause, exec_ctx) {
+            Ok(cause) => Some(cause),
+            Err(err) => return err.to_exc_object() as i64,
+        }
+    };
+
+    let mut final_exc: PyObjectRef = unsafe {
+        if pyre_object::is_exception(exc) {
+            exc
+        } else {
+            let is_builtin_callable = is_function(exc)
+                && pyre_interpreter::is_builtin_code(
+                    pyre_interpreter::getcode(exc) as pyre_object::PyObjectRef
+                );
+            if is_builtin_callable {
+                let code = pyre_interpreter::getcode(exc);
+                let func = pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef);
+                match func(&[]) {
+                    Ok(obj) if pyre_object::is_exception(obj) => obj,
+                    Ok(obj) => {
+                        pyre_interpreter::PyError::runtime_error(pyre_interpreter::py_str(obj))
+                            .to_exc_object()
+                    }
+                    Err(err) => err.to_exc_object(),
+                }
+            } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+                let parent_frame_ptr =
+                    majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
+                if parent_frame_ptr.is_null() {
+                    return pyre_interpreter::PyError::runtime_error(
+                        "raise helper missing current frame",
+                    )
+                    .to_exc_object() as i64;
+                }
+                let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+                pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
+                let result = {
+                    let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                    pyre_interpreter::call::call_function_impl_result(exc, &[])
+                };
+                pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+                match result {
+                    Ok(obj) if pyre_object::is_exception(obj) => obj,
+                    Ok(_) => pyre_interpreter::PyError::type_error(
+                        "exceptions must derive from BaseException",
+                    )
+                    .to_exc_object(),
+                    Err(err) => err.to_exc_object(),
+                }
+            } else {
+                pyre_interpreter::PyError::type_error("exceptions must derive from BaseException")
+                    .to_exc_object()
+            }
+        }
+    };
+
+    if let Err(err) = pyre_interpreter::eval::attach_raise_cause(final_exc, cause) {
+        final_exc = err.to_exc_object();
+    }
+    final_exc as i64
 }
 
 /// Truthiness check: PyObjectRef → raw 0 or 1.
@@ -3031,4 +3130,19 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
         return 0;
     }
     1 // success (non-zero)
+}
+
+/// Read the current (per-thread) exception saved in
+/// `pyre_interpreter::eval::CURRENT_EXCEPTION`. Matches the read at
+/// `pyopcode.py:786 PUSH_EXC_INFO` (implicit via `executioncontext.sys_exc_info`).
+pub extern "C" fn bh_get_current_exception() -> i64 {
+    pyre_interpreter::eval::get_current_exception() as i64
+}
+
+/// Store `exc` into the per-thread `CURRENT_EXCEPTION` slot. Matches
+/// the write at `pyopcode.py:778 POP_EXCEPT` (restore of saved
+/// sys_exc_info) and at `pyopcode.py:786 PUSH_EXC_INFO` (new raised
+/// exception becomes current).
+pub extern "C" fn bh_set_current_exception(exc: i64) {
+    pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
 }

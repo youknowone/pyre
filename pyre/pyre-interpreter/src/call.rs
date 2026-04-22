@@ -132,6 +132,14 @@ pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
     LAST_EXEC_CTX.with(|c| c.set(ctx));
 }
 
+/// Snapshot the current thread-local execution context. Residual callers
+/// that need to temporarily pin a different context (blackhole's
+/// `bh_call_fn_impl` cold path, for example) pair this with
+/// `set_last_exec_ctx` to restore the prior value on return.
+pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
+    LAST_EXEC_CTX.with(|c| c.get())
+}
+
 /// Guard that temporarily forces all nested calls to use the plain
 /// interpreter, bypassing eval_with_jit. Used by force_fn to avoid
 /// re-entering compiled code from blackhole execution.

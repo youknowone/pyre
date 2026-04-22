@@ -57,10 +57,123 @@ use pyre_interpreter::eval::{
     attach_raise_cause, get_current_exception, normalize_raise_cause, normalize_raise_value,
     set_current_exception,
 };
+
+/// Runtime helper for traced `RAISE_VARARGS`.
+///
+/// The trace records the Python `CALL` that constructs an exception object,
+/// then `RAISE_VARARGS` itself must materialize a real JIT exception before
+/// `handle_possible_exception` emits `GuardException`. Without this explicit
+/// helper the compiled bridge contains only the constructor call plus
+/// `GuardException`, so the guard sees no pending exception and incorrectly
+/// resumes down the normal path.
+pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::jit_exc_raise(exc_obj);
+    #[cfg(feature = "dynasm")]
+    majit_backend_dynasm::jit_exc_raise(exc_obj);
+    let _ = exc_obj;
+}
+
+/// Runtime helper for traced `RAISE_VARARGS`.
+///
+/// Mirrors `eval.rs:1035-1129` on the compiled path:
+/// normalize the exception operand, normalize/attach the optional
+/// cause, and publish the final exception via `jit_exc_raise` so the
+/// following `GUARD_EXCEPTION` sees it.
+pub(crate) extern "C" fn normalize_raise_varargs_jit(
+    frame_ptr: i64,
+    exc_obj: i64,
+    cause_obj: i64,
+) -> i64 {
+    let frame_ptr = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
+    let exc = exc_obj as pyre_object::PyObjectRef;
+    let raw_cause = cause_obj as pyre_object::PyObjectRef;
+    let exec_ctx = if frame_ptr.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*frame_ptr).execution_context }
+    };
+
+    let cause = if raw_cause.is_null() {
+        None
+    } else {
+        match normalize_raise_cause(raw_cause, exec_ctx) {
+            Ok(cause) => Some(cause),
+            Err(err) => {
+                let exc = err.to_exc_object();
+                raise_exception_jit(exc as i64);
+                return exc as i64;
+            }
+        }
+    };
+
+    let mut final_exc: pyre_object::PyObjectRef = unsafe {
+        if pyre_object::is_exception(exc) {
+            exc
+        } else {
+            let is_builtin_callable =
+                is_function(exc) && is_builtin_code(getcode(exc) as pyre_object::PyObjectRef);
+            if is_builtin_callable {
+                let code = getcode(exc);
+                let func = builtin_code_get(code as pyre_object::PyObjectRef);
+                match func(&[]) {
+                    Ok(obj) if pyre_object::is_exception(obj) => obj,
+                    Ok(obj) => {
+                        PyError::runtime_error(pyre_interpreter::py_str(obj)).to_exc_object()
+                    }
+                    Err(err) => err.to_exc_object(),
+                }
+            } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+                if frame_ptr.is_null() {
+                    return PyError::runtime_error("raise helper missing current frame")
+                        .to_exc_object() as i64;
+                }
+                let frame = unsafe { &*frame_ptr };
+                let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+                pyre_interpreter::call::set_last_exec_ctx(frame.execution_context);
+                let result = {
+                    let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                    pyre_interpreter::call::call_function_impl_result(exc, &[])
+                };
+                pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+                match result {
+                    Ok(obj) if pyre_object::is_exception(obj) => obj,
+                    Ok(_) => PyError::type_error("exceptions must derive from BaseException")
+                        .to_exc_object(),
+                    Err(err) => err.to_exc_object(),
+                }
+            } else {
+                PyError::type_error("exceptions must derive from BaseException").to_exc_object()
+            }
+        }
+    };
+
+    if let Err(err) = attach_raise_cause(final_exc, cause) {
+        final_exc = err.to_exc_object();
+    }
+    raise_exception_jit(final_exc as i64);
+    final_exc as i64
+}
+
+/// Runtime helper for traced `PUSH_EXC_INFO`: read the per-thread
+/// `CURRENT_EXCEPTION` slot so the compiled bridge preserves
+/// `pyopcode.py:786` / `eval.rs:1220-1229` semantics (save the
+/// previous sys_exc_info before `CURRENT_EXCEPTION` is overwritten).
+pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
+    pyre_interpreter::eval::get_current_exception() as i64
+}
+
+/// Runtime helper for traced `PUSH_EXC_INFO` / `POP_EXCEPT`: write the
+/// per-thread `CURRENT_EXCEPTION` slot so the compiled bridge preserves
+/// `pyopcode.py:786/:778` / `eval.rs:1220-1229 / :1243-1249` semantics.
+pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
+    pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
+}
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
-    DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, decode_instruction_at,
-    execute_opcode_step, function_get_globals, is_builtin_code, is_function, range_iter_continues,
+    DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, builtin_code_get,
+    call_function, decode_instruction_at, execute_opcode_step, function_get_globals, getcode,
+    is_builtin_code, is_function, range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -5284,23 +5397,34 @@ impl OpcodeStepExecutor for MIFrame {
     // handle_possible_exception emits GUARD_EXCEPTION and continues at the
     // handler PC. These three overrides trace the handler-entry bytecodes.
     //
-    //   PUSH_EXC_INFO  → pop exc, push prev_exc, push exc (+1 depth)
+    //   PUSH_EXC_INFO   → pop exc, save prev CURRENT_EXCEPTION, set
+    //                     CURRENT_EXCEPTION = exc, push prev, push exc
+    //                     (pyopcode.py:786 / eval.rs:1220-1229)
     //   CHECK_EXC_MATCH → opimpl_goto_if_exception_mismatch (pyjitpl.py:1677)
-    //   POP_EXCEPT     → pop prev_exc, clear_exception (pyjitpl.py:2751)
+    //   POP_EXCEPT      → pop prev, restore CURRENT_EXCEPTION = prev,
+    //                     clear tracer last_exc_value (pyopcode.py:778 /
+    //                     eval.rs:1243-1249)
 
     fn push_exc_info(&mut self) -> Result<(), Self::Error> {
         let exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         let exc_obj = exc.concrete.to_pyobj();
-        let (prev_exc, prev_exc_opref) = {
-            let s = self.sym();
-            let prev_exc = s.current_exc_value;
-            let prev_exc_opref = if s.current_exc_box != OpRef::NONE {
-                s.current_exc_box
-            } else {
-                self.with_ctx(|_this, ctx| ctx.const_ref(prev_exc as i64))
-            };
-            (prev_exc, prev_exc_opref)
-        };
+        // Emit the residual save/restore pair BEFORE mutating concrete
+        // CURRENT_EXCEPTION so the compiled bridge performs the same
+        // `prev = CURRENT_EXCEPTION; CURRENT_EXCEPTION = exc` sequence at
+        // runtime (pyopcode.py:786 / eval.rs:1220-1229). Folding a
+        // trace-time `ctx.const_ref(prev_exc as i64)` into the bridge
+        // silently breaks nested exception state on re-entry.
+        let prev_exc_opref = self.with_ctx(|_this, ctx| {
+            ctx.call_ref_typed(trace_get_current_exception_jit as *const (), &[], &[])
+        });
+        self.with_ctx(|_this, ctx| {
+            ctx.call_void_typed(
+                trace_set_current_exception_jit as *const (),
+                &[exc.opref],
+                &[Type::Ref],
+            );
+        });
+        let prev_exc = get_current_exception();
         set_current_exception(exc_obj);
         <Self as SharedOpcodeHandler>::push_value(
             self,
@@ -5322,6 +5446,15 @@ impl OpcodeStepExecutor for MIFrame {
 
     fn pop_except(&mut self) -> Result<(), Self::Error> {
         let prev_exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
+        // Emit the residual restore so the compiled bridge writes back the
+        // saved sys_exc_info at runtime (pyopcode.py:778 / eval.rs:1243-1249).
+        self.with_ctx(|_this, ctx| {
+            ctx.call_void_typed(
+                trace_set_current_exception_jit as *const (),
+                &[prev_exc.opref],
+                &[Type::Ref],
+            );
+        });
         set_current_exception(prev_exc.concrete.to_pyobj());
         {
             let s = self.sym_mut();
@@ -5332,7 +5465,9 @@ impl OpcodeStepExecutor for MIFrame {
             unsafe { &mut *(self.concrete_frame_addr as *mut pyre_interpreter::pyframe::PyFrame) };
         let _ = frame.pop();
         // RPython pyjitpl.py:2751 clear_exception: exception fully handled.
-        self.sym_mut().last_exc_value = std::ptr::null_mut();
+        let s = self.sym_mut();
+        s.last_exc_value = std::ptr::null_mut();
+        s.class_of_last_exc_is_const = false;
         Ok(())
     }
 
@@ -5381,68 +5516,129 @@ impl OpcodeStepExecutor for MIFrame {
         Ok(())
     }
 
-    /// PyPy `RAISE_VARARGS` materialization, followed by RPython
-    /// pyjitpl.py:1688 `opimpl_raise` bookkeeping once an exception object
-    /// exists.
+    /// `pyopcode.py:704-720 RAISE_VARARGS` + `eval.rs:1049-1128` parity.
+    ///
+    /// pyre's tracer plays the role RPython splits between
+    /// `pypy/interpreter/pyopcode.py` (operand handling + normalization)
+    /// and `rpython/jit/metainterp/pyjitpl.py:1688 opimpl_raise`
+    /// (box-level bookkeeping). Both responsibilities live here:
+    ///
+    /// 1. Normalize the operand — `raise Type` and `raise builtin_callable`
+    ///    must call the type/callable to obtain an instance, matching
+    ///    `eval.rs:1049-1088` / `eval.rs:1091-1127`.
+    /// 2. For `argc == 2`, pop cause (TOS) before exception (TOS1) and
+    ///    attach it via `attach_raise_cause` so `raise X from Y` produces
+    ///    the same observable `__cause__` state as the interpreter.
+    /// 3. Emit a residual helper that performs the same normalization +
+    ///    `jit_exc_raise` sequence at runtime, then seed metainterp
+    ///    state (pyjitpl.py:1690-1696) from the trace-time concrete
+    ///    value so `handle_raise_varargs` → `finishframe_exception`
+    ///    keeps seeing a pending exception on both paths.
     fn raise_varargs(&mut self, argc: usize) -> Result<(), Self::Error> {
-        match argc {
-            0 => {
-                let exc = get_current_exception();
-                unsafe {
-                    if pyre_object::is_exception(exc) {
-                        return Err(PyError::from_exc_object(exc));
-                    }
-                }
-                Err(PyError::runtime_error("No active exception to reraise"))
+        if argc == 0 {
+            // `eval.rs:1032-1048 RAISE_VARARGS 0` — reraise from the
+            // active exception. Prefer the tracer-seeded
+            // `last_exc_value` (RPython pyjitpl.py:1701 opimpl_reraise),
+            // fall back to the `CURRENT_EXCEPTION` TLS slot the
+            // interpreter reads.
+            let exc = self.sym().last_exc_value;
+            if !exc.is_null() {
+                return Err(unsafe { PyError::from_exc_object(exc) });
             }
-            1 => {
-                let exc_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
-                let execution_context = self.active_execution_context();
-                let exc = normalize_raise_value(exc_val.concrete.to_pyobj(), execution_context);
-                let cause = None;
-                unsafe {
-                    if pyre_object::is_exception(exc) {
-                        attach_raise_cause(exc, cause)?;
-                        let exc_box = if exc == exc_val.concrete.to_pyobj() {
-                            exc_val.opref
-                        } else {
-                            self.with_ctx(|_this, ctx| ctx.const_ref(exc as i64))
-                        };
-                        self.seed_raised_exception(exc_box, exc);
-                        return Err(PyError::from_exc_object(exc));
-                    }
-                }
-                Err(PyError::type_error(
-                    "exceptions must derive from BaseException",
-                ))
+            let exc = get_current_exception();
+            if unsafe { pyre_object::is_exception(exc) } {
+                return Err(unsafe { PyError::from_exc_object(exc) });
             }
-            2 => {
-                let raw_cause = <Self as SharedOpcodeHandler>::pop_value(self)?;
-                let exc_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
-                let execution_context = self.active_execution_context();
-                let exc = normalize_raise_value(exc_val.concrete.to_pyobj(), execution_context);
-                let cause = Some(normalize_raise_cause(
-                    raw_cause.concrete.to_pyobj(),
-                    execution_context,
-                )?);
-                unsafe {
-                    if pyre_object::is_exception(exc) {
-                        attach_raise_cause(exc, cause)?;
-                        let exc_box = if exc == exc_val.concrete.to_pyobj() {
-                            exc_val.opref
-                        } else {
-                            self.with_ctx(|_this, ctx| ctx.const_ref(exc as i64))
-                        };
-                        self.seed_raised_exception(exc_box, exc);
-                        return Err(PyError::from_exc_object(exc));
-                    }
-                }
-                Err(PyError::type_error(
-                    "exceptions must derive from BaseException",
-                ))
-            }
-            _ => Err(PyError::type_error("too many arguments for raise")),
+            return Err(PyError::runtime_error("No active exception to reraise"));
         }
+        if argc > 2 {
+            return Err(PyError::type_error("too many arguments for raise"));
+        }
+        // `eval.rs:1091-1094 RAISE_VARARGS 2` pops cause (TOS) first,
+        // then exception (TOS1). `attach_raise_cause` runs only for
+        // argc == 2.
+        let execution_context = self.active_execution_context();
+        let (exc_val, cause, cause_opref) = if argc == 2 {
+            let raw_cause = <Self as SharedOpcodeHandler>::pop_value(self)?;
+            let exc_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
+            let raw_cause_obj = raw_cause.concrete.to_pyobj();
+            let cause = if raw_cause_obj.is_null() {
+                None
+            } else {
+                Some(normalize_raise_cause(raw_cause_obj, execution_context)?)
+            };
+            (exc_val, cause, raw_cause.opref)
+        } else {
+            let exc_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
+            let null_cause = self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::PY_NULL as i64));
+            (exc_val, None, null_cause)
+        };
+        let exc = exc_val.concrete.to_pyobj();
+        let emit_runtime_raise = |slf: &mut Self| {
+            slf.with_ctx(|this, ctx| {
+                ctx.call_ref_typed(
+                    normalize_raise_varargs_jit as *const (),
+                    &[this.frame(), exc_val.opref, cause_opref],
+                    &[Type::Ref, Type::Ref, Type::Ref],
+                )
+            })
+        };
+        if exc.is_null() {
+            let _ = emit_runtime_raise(self);
+            return Err(PyError::value_error("raised during tracing"));
+        }
+        unsafe {
+            if pyre_object::is_exception(exc) {
+                // `eval.rs:1053-1055 / :1096-1098`: already an instance.
+                let _ = emit_runtime_raise(self);
+                attach_raise_cause(exc, cause)?;
+                self.seed_raised_exception(exc_val.opref, exc);
+                return Err(PyError::from_exc_object(exc));
+            }
+            // `eval.rs:1056-1083 / :1099-1121`: `raise SomeType` /
+            // `raise builtin_exc_callable` normalizes by invoking the
+            // operand with no args. Run the call at trace time to get
+            // a concrete instance for `GUARD_CLASS` + state seeding,
+            // and emit a residual `call_ref` so the compiled trace
+            // re-invokes the constructor each iteration instead of
+            // folding the trace-time heap address into a `const_ref`.
+            //
+            // `is_builtin_callable` is a pyre PRE-EXISTING-ADAPTATION —
+            // pyopcode.py only gates on `exception_is_valid_obj_as_class_w`,
+            // but pyre still sees a few exception constructors exposed as
+            // builtin-function callables rather than W_TypeObject. The two
+            // arms are disjoint (a function is not `is_type_like_w`).
+            let is_builtin_callable =
+                is_function(exc) && is_builtin_code(getcode(exc) as pyre_object::PyObjectRef);
+            let is_exception_class =
+                pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc);
+            if is_builtin_callable || is_exception_class {
+                let result = if is_builtin_callable {
+                    let code = getcode(exc);
+                    let func = builtin_code_get(code as pyre_object::PyObjectRef);
+                    match func(&[]) {
+                        Ok(obj) => obj,
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    call_function(exc, &[])
+                };
+                if !pyre_object::is_exception(result) {
+                    return Err(PyError::type_error(
+                        "exceptions must derive from BaseException",
+                    ));
+                }
+                let exc_box = emit_runtime_raise(self);
+                attach_raise_cause(result, cause)?;
+                self.seed_raised_exception(exc_box, result);
+                return Err(PyError::from_exc_object(result));
+            }
+        }
+        // Non-null, not an instance / type / builtin callable — matches
+        // `eval.rs:1084-1087` / `eval.rs:1122-1126` fall-through.
+        Err(PyError::type_error(
+            "exceptions must derive from BaseException",
+        ))
     }
 
     /// RPython opimpl_reraise (pyjitpl.py:1701).

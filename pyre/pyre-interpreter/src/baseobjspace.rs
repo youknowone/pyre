@@ -1382,6 +1382,26 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
         .any(|&t| std::ptr::eq(t, cls))
 }
 
+/// pypy/interpreter/baseobjspace.py:1359 `exception_is_valid_obj_as_class_w`.
+///
+///   def exception_is_valid_obj_as_class_w(self, w_obj):
+///       if not self.isinstance_w(w_obj, self.w_type):
+///           return False
+///       return self.issubtype_w(w_obj, self.w_BaseException)
+///
+/// Canonical `BaseException` comes from the EXC_CLASS_REGISTRY populated at
+/// `make_exc_type` time — not from the mutable builtins dict — so a user
+/// rebinding `builtins.BaseException` cannot redirect the gate.
+pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
+    if !is_type_like_w(w_obj) {
+        return false;
+    }
+    let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
+        return false;
+    };
+    issubtype_w(w_obj, base_exc)
+}
+
 /// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:399
 /// `def pow(space, w_obj1, w_obj2, w_obj3)`. Tries the int/long modulus
 /// fast path, then forward `__pow__` and reverse `__rpow__` with the

@@ -1071,6 +1071,39 @@ impl OpcodeStepExecutor for PyFrame {
                     if pyre_object::is_exception(exc) {
                         attach_raise_cause(exc, cause)?;
                         Err(PyError::from_exc_object(exc))
+                    } else if crate::is_function(exc)
+                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
+                    {
+                        // raise TypeError → call TypeError() to create instance.
+                        // pyre PRE-EXISTING-ADAPTATION: some exception
+                        // constructors (e.g. TypeError) are exposed as
+                        // builtin_function objects rather than W_TypeObject,
+                        // so `exception_is_valid_obj_as_class_w` (is_type +
+                        // BaseException subtype) misses them.
+                        let code = crate::getcode(exc);
+                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
+                        match func(&[]) {
+                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
+                                attach_raise_cause(exc_obj, cause)?;
+                                Err(PyError::from_exc_object(exc_obj))
+                            }
+                            Ok(exc_obj) => {
+                                Err(PyError::runtime_error(&crate::py_str(exc_obj)))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else if crate::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+                        // pyopcode.py:711-713 — normalize class raise by
+                        // calling the type with no args.
+                        let result = crate::call_function(exc, &[]);
+                        if pyre_object::is_exception(result) {
+                            attach_raise_cause(result, cause)?;
+                            Err(PyError::from_exc_object(result))
+                        } else {
+                            Err(PyError::type_error(
+                                "exceptions must derive from BaseException",
+                            ))
+                        }
                     } else {
                         Err(PyError::type_error(
                             "exceptions must derive from BaseException",
@@ -1086,6 +1119,31 @@ impl OpcodeStepExecutor for PyFrame {
                     if pyre_object::is_exception(exc) {
                         attach_raise_cause(exc, cause)?;
                         Err(PyError::from_exc_object(exc))
+                    } else if crate::is_function(exc)
+                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
+                    {
+                        // pyre PRE-EXISTING-ADAPTATION — see argc=1 arm.
+                        let code = crate::getcode(exc);
+                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
+                        match func(&[]) {
+                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
+                                attach_raise_cause(exc_obj, cause)?;
+                                Err(PyError::from_exc_object(exc_obj))
+                            }
+                            Ok(exc_obj) => Err(PyError::runtime_error(&crate::py_str(exc_obj))),
+                            Err(e) => Err(e),
+                        }
+                    } else if crate::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+                        // pyopcode.py:711-713 — same normalization as argc=1.
+                        let result = crate::call_function(exc, &[]);
+                        if pyre_object::is_exception(result) {
+                            attach_raise_cause(result, cause)?;
+                            Err(PyError::from_exc_object(result))
+                        } else {
+                            Err(PyError::type_error(
+                                "exceptions must derive from BaseException",
+                            ))
+                        }
                     } else {
                         Err(PyError::type_error(
                             "exceptions must derive from BaseException",

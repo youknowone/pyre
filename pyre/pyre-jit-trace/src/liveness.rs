@@ -532,9 +532,9 @@ fn stack_effects(
         | Instruction::PopIter => (d - 1, d - 1),
         // YieldValue: sends TOS to caller, receives new value back. Net 0.
         Instruction::YieldValue { .. } => (d, d),
-        // PopExcept: codewriter emits no depth change (exception state
-        // is in TLS, cleared by interpreter). Must match codewriter.
-        Instruction::PopExcept => (d, d),
+        // PopExcept: codewriter pops the saved previous exception object
+        // from the value stack and restores TLS from it. Net -1.
+        Instruction::PopExcept => (d - 1, d - 1),
         // Pop two
         Instruction::EndFor => (d - 2, d - 2),
         // Pop 0, push 0 (identity stack effect)
@@ -571,9 +571,9 @@ fn stack_effects(
         Instruction::ImportName { .. } => (d - 1, d - 1),
         // LoadSuperAttr: pop 3 (global_super, cls, self), push 1. Net -2.
         Instruction::LoadSuperAttr { .. } => (d - 2, d - 2),
-        // CheckExcMatch: codewriter pops 2 (match_type + exception),
-        // pushes 1 (result). Net -1. Must match codewriter.
-        Instruction::CheckExcMatch => (d - 1, d - 1),
+        // CheckExcMatch: codewriter pops match_type, peeks the caught
+        // exception, then pushes the bool result. Net 0.
+        Instruction::CheckExcMatch => (d, d),
         // Pop 2 push 1 (net -1)
         Instruction::BinaryOp { .. }
         | Instruction::CompareOp { .. }
