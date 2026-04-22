@@ -481,6 +481,21 @@ impl ExitSwitch {
 
 pub type LinkArg = Option<FlowValue>;
 
+/// pyre-only adaptation: per-arg positional metadata recording which
+/// `FrameState.mergeable()` entries fed this `Link.args[j]` and which
+/// `target` mergeable entry it is meant to satisfy.
+///
+/// RPython keeps this correspondence implicitly in
+/// `FrameState.getoutputargs()`; pyre's slot-keyed regalloc needs the
+/// positions preserved explicitly so it can project `link.args[j] ↔
+/// link.target.inputargs[j]` back onto register slots without
+/// guessing from `Variable` identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LinkArgPosition {
+    pub source_mergeable_index: Option<usize>,
+    pub target_mergeable_index: Option<usize>,
+}
+
 /// Shared block identity. RPython gets object identity for free; Rust uses
 /// `Rc<RefCell<_>>` and pointer-identity equality.
 #[derive(Debug, Clone)]
@@ -575,6 +590,9 @@ impl Hash for LinkRef {
 pub struct Link {
     /// `link.args` — mixed list of Variables / Constants passed to `target`.
     pub args: Vec<LinkArg>,
+    /// pyre-only: preserved `FrameState.getoutputargs()` positions for
+    /// each `args[j]`.
+    pub arg_positions: Vec<LinkArgPosition>,
     /// `link.target` — successor block, optional during graph construction.
     pub target: Option<BlockRef>,
     /// `link.exitcase`.
@@ -602,11 +620,13 @@ impl Link {
         target: Option<BlockRef>,
         exitcase: Option<FlowValue>,
     ) -> Self {
+        let arg_len = args.len();
         if let Some(target) = &target {
-            assert_eq!(args.len(), target.input_arity(), "output args mismatch");
+            assert_eq!(arg_len, target.input_arity(), "output args mismatch");
         }
         Self {
             args,
+            arg_positions: vec![LinkArgPosition::default(); arg_len],
             target,
             exitcase,
             llexitcase: None,
@@ -624,6 +644,20 @@ impl Link {
     pub fn with_llexitcase(mut self, llexitcase: FlowValue) -> Self {
         self.llexitcase = Some(llexitcase);
         self
+    }
+
+    pub fn with_arg_positions(mut self, arg_positions: Vec<LinkArgPosition>) -> Self {
+        self.set_arg_positions(arg_positions);
+        self
+    }
+
+    pub fn set_arg_positions(&mut self, arg_positions: Vec<LinkArgPosition>) {
+        assert_eq!(
+            self.args.len(),
+            arg_positions.len(),
+            "link arg positions mismatch"
+        );
+        self.arg_positions = arg_positions;
     }
 
     /// `model.py:127-129` `Link.extravars`.
@@ -661,6 +695,7 @@ impl Link {
             self.target.clone(),
             self.exitcase.clone(),
         );
+        newlink.arg_positions = self.arg_positions.clone();
         newlink.prevblock = self.prevblock.clone();
         newlink.last_exception = self.last_exception.map(&mut rename);
         newlink.last_exc_value = self.last_exc_value.map(&mut rename);
@@ -1284,6 +1319,7 @@ mod tests {
         let start_borrow = start.borrow();
         let link = start_borrow.exits[0].borrow();
         assert_eq!(link.args, vec![Some(v.into())]);
+        assert_eq!(link.arg_positions, vec![LinkArgPosition::default()]);
         assert_eq!(link.target, Some(b));
         assert!(
             link.prevblock
@@ -1327,6 +1363,7 @@ mod tests {
 
         let copied = link.copy(|v| if v == v0 { v2 } else { v });
         assert_eq!(copied.args, vec![Some(v2.into())]);
+        assert_eq!(copied.arg_positions, vec![LinkArgPosition::default()]);
         assert_eq!(copied.last_exception, Some(v2));
         assert_eq!(copied.last_exc_value, Some(v1));
         assert!(
@@ -1358,6 +1395,26 @@ mod tests {
         let target = g.new_block(vec![Variable::new(VariableId(9), Kind::Int).into()]);
         let link = Link::new(vec![Constant::signed(42).into()], Some(target), None);
         assert_eq!(link.args, vec![Some(Constant::signed(42).into())]);
+        assert_eq!(link.arg_positions, vec![LinkArgPosition::default()]);
+    }
+
+    #[test]
+    fn link_arg_positions_round_trip() {
+        let v0 = Variable::new(VariableId(0), Kind::Ref);
+        let target = Block::shared(vec![v0.into()]);
+        let link = Link::new(vec![v0.into()], Some(target), None).with_arg_positions(vec![
+            LinkArgPosition {
+                source_mergeable_index: Some(3),
+                target_mergeable_index: Some(5),
+            },
+        ]);
+        assert_eq!(
+            link.arg_positions,
+            vec![LinkArgPosition {
+                source_mergeable_index: Some(3),
+                target_mergeable_index: Some(5),
+            }],
+        );
     }
 
     #[test]

@@ -1698,6 +1698,16 @@ impl BlackholeInterpreter {
                 // normal execution; skip the 2-byte label operand.
                 self.position += 2;
             }
+            jitcode::BC_LAST_EXCEPTION => {
+                let dst = self.next_u16() as usize;
+                let exc_obj = self.exception_last_value;
+                let typeptr = if let Some(cpu) = self.cpu {
+                    cpu.bh_classof(exc_obj)
+                } else {
+                    exc_obj
+                };
+                self.registers_i[dst] = typeptr;
+            }
             jitcode::BC_LAST_EXC_VALUE => {
                 let dst = self.next_u16() as usize;
                 self.registers_r[dst] = self.exception_last_value;

@@ -484,6 +484,10 @@ fn dispatch_op(
             state.builder.emit_raise(src);
         }
         "reraise" => state.builder.emit_reraise(),
+        "last_exception" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            state.builder.last_exception(dst);
+        }
         "last_exc_value" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
             state.builder.last_exc_value(dst);

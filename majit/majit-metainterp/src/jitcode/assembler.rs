@@ -590,6 +590,13 @@ impl JitCodeBuilder {
         self.push_u16(dst);
     }
 
+    /// RPython blackhole.py:987 `last_exception/>i`.
+    pub fn last_exception(&mut self, dst: u16) {
+        self.touch_reg(dst);
+        self.push_u8(jitcode::BC_LAST_EXCEPTION);
+        self.push_u16(dst);
+    }
+
     /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point.
     ///
     /// assembler.py:181-196 parity: encodes jdindex + 6 typed register

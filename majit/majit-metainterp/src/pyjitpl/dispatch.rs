@@ -980,6 +980,20 @@ where
             jitcode::BC_CATCH_EXCEPTION => {
                 let _target = self.frames.current_mut().next_u16();
             }
+            jitcode::BC_LAST_EXCEPTION => {
+                let dst = self.frames.current_mut().next_u16() as usize;
+                let exc_value = self.last_exception_value;
+                if exc_value == 0 {
+                    panic!("last_exception without active exception");
+                }
+                // RPython `bhimpl_last_exception` returns the exception
+                // class pointer.  The trace-side machine does not yet
+                // carry the full classof callback that MetaInterp uses,
+                // so match MetaInterp's conservative fallback and treat
+                // the exception word itself as the type pointer until
+                // typed-exception dispatch is wired end-to-end.
+                self.set_int_reg(dst, Some(ctx.const_int(exc_value)), Some(exc_value));
+            }
             jitcode::BC_LAST_EXC_VALUE => {
                 let dst = self.frames.current_mut().next_u16() as usize;
                 let opref = self
@@ -2778,6 +2792,38 @@ mod tests {
                 .iter()
                 .any(|op| op.opcode == OpCode::GuardValue),
             "handler must see last_exc_value and be able to promote it",
+        );
+    }
+
+    #[test]
+    fn raise_catch_inline_call_routes_to_handler_and_preserves_last_exception() {
+        let mut callee = JitCodeBuilder::new();
+        callee.load_const_r_value(0, 0xfeed);
+        callee.emit_raise(0);
+        let callee = callee.finish();
+
+        let mut caller = JitCodeBuilder::new();
+        let handler = caller.new_label();
+        let sub_idx = caller.add_sub_jitcode(callee);
+        caller.inline_call(sub_idx);
+        caller.catch_exception(handler);
+        caller.mark_label(handler);
+        caller.last_exception(0);
+        caller.int_guard_value(0);
+        let jitcode = caller.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        assert!(
+            recorder
+                .ops()
+                .iter()
+                .any(|op| op.opcode == OpCode::GuardValue),
+            "handler must see last_exception and be able to promote it",
         );
     }
 

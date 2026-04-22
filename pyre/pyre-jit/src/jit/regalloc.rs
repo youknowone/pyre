@@ -102,11 +102,19 @@ pub(super) struct AllocationResult {
 ///
 /// `nlocals` is the number of CPython fast locals (`code.varnames.len()`).
 ///
+/// `cfg_coalesce_pairs` is the output of
+/// `codewriter::collect_link_slot_pairs` — `(source_slot,
+/// target_slot)` pairs from CFG link boundaries, all of Ref kind
+/// because every `FrameState.mergeable()` position in pyre holds a
+/// Ref-kind Variable (locals, stack, last_exc pair).  See
+/// `collect_link_slot_pairs` docstring + `regalloc.py:79-96`.
+///
 /// RPython parity: `codewriter.py:45-47, 62-67`.
 pub(super) fn allocate_registers(
     ssarepr: &SSARepr,
     nlocals: usize,
     inputs: ExternalInputs,
+    cfg_coalesce_pairs: &[(u16, u16)],
 ) -> AllocationResult {
     // codewriter.py:45-47 `for kind in KINDS:
     //   regallocs[kind] = perform_register_allocation(graph, kind)`
@@ -134,7 +142,16 @@ pub(super) fn allocate_registers(
                 }
             }
         }
-        let alloc = perform_register_allocation(ssarepr, kind, &external);
+        // `cfg_coalesce_pairs` are CFG-level Variable pairs from Link
+        // boundaries (regalloc.py:79-96).  All mergeable positions in
+        // pyre's FrameState are Ref-kind, so pass them only to the
+        // Ref allocator; Int / Float regalloc sees an empty slice.
+        let cfg_pairs_for_kind: &[(u16, u16)] = if kind == Kind::Ref {
+            cfg_coalesce_pairs
+        } else {
+            &[]
+        };
+        let alloc = perform_register_allocation(ssarepr, kind, &external, cfg_pairs_for_kind);
         allocators.insert(kind, alloc);
     }
 
@@ -226,21 +243,44 @@ fn enforce_input_args(
 /// + `tool/algo/regalloc.py:8-15`. Builds a `RegAllocator` and runs
 /// the three-stage pipeline.
 ///
-/// pyre-jit does not yet feed a `FunctionGraph` into regalloc, so it
-/// cannot perform upstream's exact link-level
-/// `link.args ↔ link.target.inputargs` coalescing
-/// (`tool/algo/regalloc.py:79-96`). Preserve the long-standing
-/// SSARepr-level fallback until the flow-graph pipeline is wired:
-/// scan kind-matching `*_copy` ops and try to coalesce their source
-/// and destination colors. This remains a strict subset of RPython's
-/// behavior, but removing it entirely would regress existing parity.
+/// Dual coalesce sources:
+///   1. `cfg_coalesce_pairs` — pre-computed `(source_slot,
+///      target_slot)` pairs from `codewriter::collect_link_slot_pairs`.
+///      These are the upstream `tool/algo/regalloc.py:79-96`
+///      `link.args ↔ link.target.inputargs` pairs, projected from
+///      Variables onto pyre's u16 register slots via the walker's
+///      positional alignment (see `collect_link_slot_pairs`
+///      docstring).  Trivially-equal pairs by `getoutputargs`
+///      construction — their `try_coalesce` is a no-op when
+///      `src_slot == dst_slot`, but the call preserves RPython's
+///      exact iteration shape.
+///   2. SSARepr `*_copy` scanner (PRE-EXISTING-ADAPTATION) — pyre's
+///      walker emits intra-block `int_copy` / `ref_copy` /
+///      `float_copy` ops for stack shuffling / STORE_FAST sequences
+///      that have no CFG / Link representation.  The scanner unions
+///      each copy's src and dst so the chordal coloring reuses one
+///      color, turning the runtime copy into a no-op when
+///      `src_color == dst_color`.  Upstream does not have this
+///      SSARepr-level pass because `flatten.py:306-334`
+///      `insert_renamings` places its copies post-coalesce, so
+///      RPython's CFG-level `regalloc.py:79-96` is the sole coalesce
+///      source.  In pyre both sources are orthogonal — the CFG
+///      pairs cover cross-block link boundaries, the scanner covers
+///      intra-block shuffles — so both run.
 fn perform_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
     external_inputs: &[u16],
+    cfg_coalesce_pairs: &[(u16, u16)],
 ) -> RegAllocator {
     let mut alloc = RegAllocator::new();
     alloc.make_dependencies(ssarepr, kind, external_inputs);
+    // regalloc.py:79-96 CFG-level coalesce: union link.args[i] with
+    // link.target.inputargs[i] for every block exit.  Fed in from
+    // `codewriter::collect_link_slot_pairs` (Ref kind only).
+    for &(src_slot, dst_slot) in cfg_coalesce_pairs {
+        alloc.try_coalesce(src_slot, dst_slot);
+    }
     alloc.coalesce_variables(ssarepr, kind);
     alloc.find_node_coloring();
     alloc
@@ -657,7 +697,7 @@ mod tests {
             stack_base: 2,
             max_stack_depth: 0,
         };
-        let result = allocate_registers(&ssarepr, 2, inputs);
+        let result = allocate_registers(&ssarepr, 2, inputs, &[]);
         let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
         // locals 0,1 → colors 0,1; portal regs → 2,3.
         assert_eq!(new(0), 0, "local 0 must keep color 0 after enforce");
@@ -692,7 +732,7 @@ mod tests {
             stack_base: 1,
             max_stack_depth: 0,
         };
-        let result = allocate_registers(&ssarepr, 1, inputs);
+        let result = allocate_registers(&ssarepr, 1, inputs, &[]);
         let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
         assert_eq!(new(0), 0, "local 0 stays at color 0 (enforce_input_args)");
         assert_eq!(
@@ -732,7 +772,7 @@ mod tests {
             stack_base: 0,
             max_stack_depth: 0,
         };
-        let result = allocate_registers(&ssarepr, 0, inputs);
+        let result = allocate_registers(&ssarepr, 0, inputs, &[]);
         assert_eq!(result.num_regs.get(&Kind::Ref).copied(), Some(3));
         assert_eq!(result.num_regs.get(&Kind::Int).copied(), Some(1));
         assert_eq!(result.num_regs.get(&Kind::Float).copied(), Some(0));
@@ -763,7 +803,7 @@ mod tests {
             stack_base: 0,
             max_stack_depth: 0,
         };
-        let result = allocate_registers(&ssarepr, 0, inputs);
+        let result = allocate_registers(&ssarepr, 0, inputs, &[]);
         let new5 = result.rename.get(&(Kind::Ref, 5)).copied().unwrap_or(5);
         let new6 = result.rename.get(&(Kind::Ref, 6)).copied().unwrap_or(6);
         assert_eq!(
@@ -806,7 +846,7 @@ mod tests {
             stack_base: 1,
             max_stack_depth: 0,
         };
-        let result = allocate_registers(&ssarepr, 1, inputs);
+        let result = allocate_registers(&ssarepr, 1, inputs, &[]);
         let new50 = result.rename.get(&(Kind::Ref, 50)).copied().unwrap_or(50);
         assert_eq!(
             new50, 0,
