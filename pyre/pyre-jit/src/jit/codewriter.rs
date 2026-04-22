@@ -2187,9 +2187,9 @@ impl CodeWriter {
                 let link = link.into_ref();
                 // Step 6A slice S4a: snapshot the EXIT state.  The
                 // target exceptblock has `inputargs = [etype, evalue]`;
-                // `collect_link_slot_pairs` naturally skips any path
-                // still using the sentinel fallback (non-Variable source
-                // arg).
+                // `collect_link_slot_pairs` skips non-Variable source
+                // args on its own (`flatten.py:355-363` `flatten_list`
+                // — Constants pass through unchanged).
                 append_exit_with_state(
                     &current_block.block(),
                     link,
