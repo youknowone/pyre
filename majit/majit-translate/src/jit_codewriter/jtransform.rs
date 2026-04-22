@@ -203,8 +203,8 @@ pub struct Transformer<'a> {
     /// RPython: types are on `Variable.concretetype` — we pass them explicitly.
     type_state: Option<&'a crate::translate_legacy::rtyper::rtyper::TypeResolutionState>,
     /// RPython: `Transformer.vable_array_vars`.
-    /// Stores (array_index, itemsize, is_signed) per vable array variable.
-    vable_array_vars: std::collections::HashMap<ValueId, (usize, usize, bool)>,
+    /// Stores (vable_base, array_index, itemsize, is_signed) per vable array variable.
+    vable_array_vars: std::collections::HashMap<ValueId, (ValueId, usize, usize, bool)>,
     /// RPython: `Transformer.vable_flags`.
     #[allow(dead_code)]
     vable_flags: std::collections::HashMap<ValueId, VableFlag>,
@@ -615,11 +615,15 @@ impl<'a> Transformer<'a> {
         if let Some(array_field) = self.config.vable_arrays.iter().find(|c| c.matches(field)) {
             if let Some(result) = op.result {
                 // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
-                // We store (index, itemsize, is_signed) — the arraydescr properties.
+                // We store the vable base plus the arraydescr properties.
+                let base = match &op.kind {
+                    OpKind::FieldRead { base, .. } => *base,
+                    _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
+                };
                 let itemsize = array_field.array_itemsize.unwrap_or(8);
                 let is_signed = array_field.array_is_signed.unwrap_or(false);
                 self.vable_array_vars
-                    .insert(result, (array_field.index, itemsize, is_signed));
+                    .insert(result, (base, array_field.index, itemsize, is_signed));
             }
         }
         // Virtualizable scalar field → VableFieldRead
@@ -635,6 +639,10 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldRead {
+                    base: match &op.kind {
+                        OpKind::FieldRead { base, .. } => *base,
+                        _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
+                    },
                     field_index: vable_field.index,
                     ty: typed_ty.clone(),
                 },
@@ -764,6 +772,10 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldWrite {
+                    base: match &op.kind {
+                        OpKind::FieldWrite { base, .. } => *base,
+                        _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
+                    },
                     field_index: vable_field.index,
                     value,
                     ty: typed_ty,
@@ -800,7 +812,8 @@ impl<'a> Transformer<'a> {
             .result
             .and_then(|result| self.get_value_type(result))
             .unwrap_or_else(|| item_ty.clone());
-        if let Some(&(arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base) {
+        if let Some(&(vable_base, arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base)
+        {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
@@ -809,6 +822,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableArrayRead {
+                    base: vable_base,
                     array_index: arr_idx,
                     elem_index: index,
                     item_ty: typed_item_ty,
@@ -847,7 +861,8 @@ impl<'a> Transformer<'a> {
         let typed_item_ty = self
             .get_value_type(value)
             .unwrap_or_else(|| item_ty.clone());
-        if let Some(&(arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base) {
+        if let Some(&(vable_base, arr_idx, itemsize, is_signed)) = self.vable_array_vars.get(&base)
+        {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
@@ -856,6 +871,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableArrayWrite {
+                    base: vable_base,
                     array_index: arr_idx,
                     elem_index: index,
                     value,
@@ -2196,23 +2212,35 @@ fn remap_op(
         OpKind::GuardFalse { cond } => OpKind::GuardFalse {
             cond: remap_value(*cond, aliases),
         },
-        OpKind::VableFieldRead { .. } => op.kind.clone(),
+        OpKind::VableFieldRead {
+            base,
+            field_index,
+            ty,
+        } => OpKind::VableFieldRead {
+            base: remap_value(*base, aliases),
+            field_index: *field_index,
+            ty: ty.clone(),
+        },
         OpKind::VableFieldWrite {
+            base,
             field_index,
             value,
             ty,
         } => OpKind::VableFieldWrite {
+            base: remap_value(*base, aliases),
             field_index: *field_index,
             value: remap_value(*value, aliases),
             ty: ty.clone(),
         },
         OpKind::VableArrayRead {
+            base,
             array_index,
             elem_index,
             item_ty,
             array_itemsize,
             array_is_signed,
         } => OpKind::VableArrayRead {
+            base: remap_value(*base, aliases),
             array_index: *array_index,
             elem_index: remap_value(*elem_index, aliases),
             item_ty: item_ty.clone(),
@@ -2220,6 +2248,7 @@ fn remap_op(
             array_is_signed: *array_is_signed,
         },
         OpKind::VableArrayWrite {
+            base,
             array_index,
             elem_index,
             value,
@@ -2227,6 +2256,7 @@ fn remap_op(
             array_itemsize,
             array_is_signed,
         } => OpKind::VableArrayWrite {
+            base: remap_value(*base, aliases),
             array_index: *array_index,
             elem_index: remap_value(*elem_index, aliases),
             value: remap_value(*value, aliases),
@@ -2560,9 +2590,72 @@ mod tests {
         assert!(
             matches!(
                 &rewritten_op.kind,
-                OpKind::VableFieldRead { field_index: 0, .. }
+                OpKind::VableFieldRead {
+                    base: rewritten_base,
+                    field_index: 0,
+                    ..
+                } if *rewritten_base == base
             ),
             "expected VableFieldRead, got {:?}",
+            rewritten_op.kind
+        );
+    }
+
+    #[test]
+    fn rewrite_graph_tags_vable_arrays_with_explicit_base() {
+        let mut graph = FunctionGraph::new("test");
+        let base = graph.alloc_value();
+        let index = graph.alloc_value();
+        let array = graph
+            .push_op(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: array,
+                index,
+                item_ty: ValueType::Int,
+                array_type_id: None,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let result = rewrite_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 1);
+        let rewritten_op = &result.graph.block(graph.startblock).operations[1];
+        assert!(
+            matches!(
+                &rewritten_op.kind,
+                OpKind::VableArrayRead {
+                    base: rewritten_base,
+                    array_index: 0,
+                    ..
+                } if *rewritten_base == base
+            ),
+            "expected VableArrayRead with explicit base, got {:?}",
             rewritten_op.kind
         );
     }

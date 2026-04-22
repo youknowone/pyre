@@ -961,9 +961,14 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
-            // Vable field/array: encode field_index as descriptor.
-            // These don't have a base register (vable is implicit).
-            OpKind::VableFieldRead { field_index, .. } => {
+            // Vable field/array: encode the base register followed by the
+            // field_index descriptor, matching blackhole.py @arguments("r", "d").
+            OpKind::VableFieldRead {
+                base, field_index, ..
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
                 // RPython: vable field → VableField descriptor (index, not byte offset).
                 let descr_idx = self.descrs.len();
                 self.push_ready_descr(crate::jitcode::BhDescr::VableField {
@@ -984,8 +989,14 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::VableFieldWrite {
-                field_index, value, ..
+                base,
+                field_index,
+                value,
+                ..
             } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
@@ -1002,12 +1013,16 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::VableArrayRead {
+                base,
                 array_index,
                 elem_index,
                 item_ty,
                 array_itemsize,
                 array_is_signed,
             } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
@@ -1042,6 +1057,7 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::VableArrayWrite {
+                base,
                 array_index,
                 elem_index,
                 value,
@@ -1049,6 +1065,9 @@ impl Assembler {
                 array_itemsize,
                 array_is_signed,
             } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
@@ -2222,6 +2241,152 @@ mod tests {
         assert!(
             !asm.insns.contains_key("getarrayitem_gc_v/ird>i"),
             "unexpected getarrayitem_gc_v/ird>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assemble_vable_access_uses_explicit_base_argcodes() {
+        use crate::flatten::flatten as flatten_graph;
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("vable_access");
+        let base = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "frame".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let value = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "v".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let _field_result = graph.push_op(
+            graph.startblock,
+            OpKind::VableFieldRead {
+                base,
+                field_index: 0,
+                ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.push_op(
+            graph.startblock,
+            OpKind::VableFieldWrite {
+                base,
+                field_index: 0,
+                value,
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let array_result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::VableArrayRead {
+                    base,
+                    array_index: 1,
+                    elem_index: index,
+                    item_ty: ValueType::Int,
+                    array_itemsize: 8,
+                    array_is_signed: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op(
+            graph.startblock,
+            OpKind::VableArrayWrite {
+                base,
+                array_index: 1,
+                elem_index: index,
+                value,
+                item_ty: ValueType::Int,
+                array_itemsize: 8,
+                array_is_signed: true,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, Some(array_result));
+
+        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        type_state.concrete_types.insert(
+            base,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef,
+        );
+        type_state.concrete_types.insert(
+            index,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+        type_state.concrete_types.insert(
+            value,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+        type_state.concrete_types.insert(
+            array_result,
+            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+        );
+
+        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
+        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
+        let mut flat = flatten_graph(&graph, &regallocs);
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            asm.insns.contains_key("getfield_vable_i/rd>i"),
+            "expected canonical getfield_vable_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("setfield_vable_i/rid"),
+            "expected canonical setfield_vable_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("getarrayitem_vable_i/ridd>i"),
+            "expected canonical getarrayitem_vable_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("setarrayitem_vable_i/riidd"),
+            "expected canonical setarrayitem_vable_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getfield_vable_v/d>i"),
+            "unexpected getfield_vable_v/d>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("setfield_vable_v/id"),
+            "unexpected setfield_vable_v/id key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("setfield_vable_v/rd"),
+            "unexpected setfield_vable_v/rd key: {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
     }

@@ -340,12 +340,14 @@ pub enum OpKind {
     /// Virtualizable field read → reads from boxes, no heap op.
     /// RPython: `getfield_vable_i/r/f`
     VableFieldRead {
+        base: ValueId,
         field_index: usize,
         ty: ValueType,
     },
     /// Virtualizable field write → writes to boxes, no heap op.
     /// RPython: `setfield_vable_i/r/f`
     VableFieldWrite {
+        base: ValueId,
         field_index: usize,
         value: ValueId,
         ty: ValueType,
@@ -353,6 +355,7 @@ pub enum OpKind {
     /// Virtualizable array read → reads from boxes.
     /// RPython: `getarrayitem_vable_i/r/f`
     VableArrayRead {
+        base: ValueId,
         array_index: usize,
         elem_index: ValueId,
         item_ty: ValueType,
@@ -364,6 +367,7 @@ pub enum OpKind {
     /// Virtualizable array write → writes to boxes.
     /// RPython: `setarrayitem_vable_i/r/f`
     VableArrayWrite {
+        base: ValueId,
         array_index: usize,
         elem_index: ValueId,
         value: ValueId,

@@ -466,26 +466,35 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             field: field.clone(),
             mutate_field: mutate_field.clone(),
         },
-        OpKind::VableFieldRead { field_index, ty } => OpKind::VableFieldRead {
+        OpKind::VableFieldRead {
+            base,
+            field_index,
+            ty,
+        } => OpKind::VableFieldRead {
+            base: remap(base),
             field_index: *field_index,
             ty: ty.clone(),
         },
         OpKind::VableFieldWrite {
+            base,
             field_index,
             value,
             ty,
         } => OpKind::VableFieldWrite {
+            base: remap(base),
             field_index: *field_index,
             value: remap(value),
             ty: ty.clone(),
         },
         OpKind::VableArrayRead {
+            base,
             array_index,
             elem_index,
             item_ty,
             array_itemsize,
             array_is_signed,
         } => OpKind::VableArrayRead {
+            base: remap(base),
             array_index: *array_index,
             elem_index: remap(elem_index),
             item_ty: item_ty.clone(),
@@ -493,6 +502,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             array_is_signed: *array_is_signed,
         },
         OpKind::VableArrayWrite {
+            base,
             array_index,
             elem_index,
             value,
@@ -500,6 +510,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             array_itemsize,
             array_is_signed,
         } => OpKind::VableArrayWrite {
+            base: remap(base),
             array_index: *array_index,
             elem_index: remap(elem_index),
             value: remap(value),
@@ -712,12 +723,17 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         }
         OpKind::RecordQuasiImmutField { base, .. } => vec![*base],
         OpKind::JitDebug { args, .. } => args.clone(),
-        OpKind::VableFieldRead { .. } => vec![],
-        OpKind::VableFieldWrite { value, .. } => vec![*value],
-        OpKind::VableArrayRead { elem_index, .. } => vec![*elem_index],
+        OpKind::VableFieldRead { base, .. } => vec![*base],
+        OpKind::VableFieldWrite { base, value, .. } => vec![*base, *value],
+        OpKind::VableArrayRead {
+            base, elem_index, ..
+        } => vec![*base, *elem_index],
         OpKind::VableArrayWrite {
-            elem_index, value, ..
-        } => vec![*elem_index, *value],
+            base,
+            elem_index,
+            value,
+            ..
+        } => vec![*base, *elem_index, *value],
         OpKind::BinOp { lhs, rhs, .. } => vec![*lhs, *rhs],
         OpKind::UnaryOp { operand, .. } => vec![*operand],
         OpKind::CallElidable {
