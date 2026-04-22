@@ -37,8 +37,20 @@ impl FailDescr for WasmFailDescr {
         self.is_finish
     }
 
+    /// FINISH carries its one result in `fail_arg_types[0]` (or
+    /// nothing for void). compile.py:626-656 parity.
+    fn finish_result_type(&self) -> Type {
+        self.fail_arg_types.first().copied().unwrap_or(Type::Void)
+    }
+
     fn trace_id(&self) -> u64 {
         self.trace_id
+    }
+
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // finish → compile.py:626-656 `_DoneWithThisFrameDescr.handle_fail`;
+        // else  → compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
+        majit_ir::dispatch_handle_fail(self, ctx)
     }
 }
 

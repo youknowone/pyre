@@ -80,19 +80,25 @@ pub fn jit_exc_clear() {
 // assembler.py:345-350: jd.assembler_helper_adr — the slow path runtime
 // entry point for CALL_ASSEMBLER when callee doesn't finish normally.
 //
-// Cranelift uses register_call_assembler_blackhole/bridge/force/unbox_int.
-// Dynasm provides the same registration API and a C-callable trampoline
-// that the generated slow path code calls directly.
+// Cranelift uses the same frontend-owned handle_fail callback plus
+// force/unbox helpers. Dynasm provides matching registration hooks and
+// a C-callable trampoline that the generated slow path code calls
+// directly.
 
 use std::sync::OnceLock;
 
-/// Blackhole resume: (green_key, trace_id, fail_index, raw_values, len,
-/// typed_outputs, typed_len) → Option<result>
-pub type BlackholeFn = fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>;
-
-/// Bridge compilation: (green_key, trace_id, fail_index, raw_values, len,
-/// descr_addr) → compiled?
-pub type BridgeFn = fn(u64, u64, u32, *const i64, usize, usize) -> bool;
+/// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`
+/// specialized for CALL_ASSEMBLER slow paths.
+pub type CallAssemblerHandleFailFn = fn(
+    u64,
+    u64,
+    u32,
+    *const i64,
+    usize,
+    *const i64,
+    usize,
+    usize,
+) -> majit_ir::CallAssemblerHandleFailAction;
 
 /// Force callee: (callee_frame_ptr) → result
 pub type ForceFn = extern "C" fn(i64) -> i64;
@@ -100,19 +106,17 @@ pub type ForceFn = extern "C" fn(i64) -> i64;
 /// Unbox int from Ref: (raw_ref) → i64
 pub type UnboxIntFn = fn(i64) -> i64;
 
-static CA_BLACKHOLE_FN: OnceLock<BlackholeFn> = OnceLock::new();
-static CA_BRIDGE_FN: OnceLock<BridgeFn> = OnceLock::new();
+/// compile.py:1096-1097 `cast_instance_to_gcref(memory_error)` parity.
+pub type MemoryErrorFn = fn() -> usize;
+
+static CA_HANDLE_FAIL_FN: OnceLock<CallAssemblerHandleFailFn> = OnceLock::new();
 static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
 static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
+static CA_MEMORY_ERROR_FN: OnceLock<MemoryErrorFn> = OnceLock::new();
 
-/// Register blackhole resume handler (same API as Cranelift).
-pub fn register_call_assembler_blackhole(f: BlackholeFn) {
-    CA_BLACKHOLE_FN.set(f).ok();
-}
-
-/// Register bridge compilation handler (same API as Cranelift).
-pub fn register_call_assembler_bridge(f: BridgeFn) {
-    CA_BRIDGE_FN.set(f).ok();
+/// Register the frontend-owned CALL_ASSEMBLER handle_fail hook.
+pub fn register_call_assembler_handle_fail(f: CallAssemblerHandleFailFn) {
+    CA_HANDLE_FAIL_FN.set(f).ok();
 }
 
 /// Register force handler (same API as Cranelift).
@@ -129,6 +133,12 @@ pub fn call_assembler_force_fn_addr() -> usize {
 /// Register int unbox handler (same API as Cranelift).
 pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
     CA_UNBOX_INT_FN.set(f).ok();
+}
+
+/// Register the preallocated `MemoryError` object getter used by
+/// `PropagateExceptionDescr.handle_fail`.
+pub fn register_call_assembler_memory_error(f: MemoryErrorFn) {
+    CA_MEMORY_ERROR_FN.set(f).ok();
 }
 
 /// rpython/jit/backend/llsupport/llmodel.py:229-234 `insert_stack_check`
@@ -184,28 +194,25 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 ///     except jitexc.JitException as e:
 ///         return handle_jitexception(e)
 ///
-/// In upstream each `AbstractFailDescr` subclass carries its own
-/// `handle_fail`, and the helper's job is purely to dispatch. pyre
-/// encodes finish descrs as raw-pointer singletons
-/// (`done_with_this_frame_descr_{void,int,ref,float}`,
-/// `exit_frame_with_exception_descr_ref`) and resume-guard descrs as
-/// `DynasmFailDescr`, so this trampoline performs the type dispatch
-/// inline and delegates to one of the `handle_fail_*` helpers below.
-///
-/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre does not yet carry
-/// `FailDescr::handle_fail` as a virtual method because descrs are
-/// stored as raw `usize` sentinels rather than `Box<dyn FailDescr>`,
-/// and `metainterp_sd` / `jitdriver_sd` are not plumbed through
-/// `majit-backend`. Converting to an object-hierarchy requires
-/// reworking descr storage across both backends — tracked as a
-/// follow-up on top of this refactor. The body below is written so
-/// every branch lines up 1:1 with upstream's `handle_fail` sites.
+/// The trampoline resolves `jf_descr` back to a live `&dyn FailDescr`
+/// (via `guard::attached_fail_descr_by_ptr` for metainterp-attached
+/// finish / propagate descrs, and a direct `*const DynasmFailDescr`
+/// cast for guard-failure descrs whose `Arc` lives on the compiled
+/// loop's `fail_descrs` Vec) and invokes `FailDescr::handle_fail`
+/// through virtual dispatch into the `CallAssemblerHelperContext`
+/// implementation below.  The returned `HandleFailResult` is encoded
+/// back into `i64` by `handle_fail_result_to_i64`, mirroring upstream's
+/// `handle_jitexception` payload-extraction step.
 ///
 /// Input:  callee_jf_ptr = deadframe,
-///         green_key = caller loop's header_pc (used by CA_*_FN hooks
-///         to find the owning compiled trace).
+///         green_key = caller loop's header_pc (used by the resume-guard
+///         hook to find the owning compiled trace).
 /// Output: the int interpretation of the handled result (the caller
-///         re-casts to the portal's return type).
+///         re-casts to the portal's return type).  The caller stub
+///         distinguishes exit-with-exception via the synthesized
+///         FailDescr's `is_exit_frame_with_exception` flag (see
+///         `runner.rs::find_descr_by_ptr`); the raw gcref payload is
+///         carried in the returned `i64` bit pattern regardless.
 ///
 /// Always frees the callee jitframe before returning.
 pub extern "C" fn call_assembler_helper_trampoline(
@@ -218,163 +225,202 @@ pub extern "C" fn call_assembler_helper_trampoline(
     let frame_ptr = callee_jf_ptr;
     // warmspot.py:1022 `fail_descr = cpu.get_latest_descr(deadframe)`.
     let descr_raw = unsafe { llmodel::get_latest_descr(frame_ptr) };
-    // warmspot.py:1023-1028 `fail_descr.handle_fail(deadframe, ...)`.
-    let result = handle_fail_dispatch(descr_raw, frame_ptr, green_key);
-    unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
-    result
-}
-
-/// Dispatch to the `handle_fail` variant that matches `descr_raw`.
-/// Upstream equivalent: the virtual-method call in warmspot.py:1024,
-/// resolved at runtime by the Python class of `fail_descr`.
-fn handle_fail_dispatch(
-    descr_raw: usize,
-    frame_ptr: *mut jitframe::JitFrame,
-    green_key: u64,
-) -> i64 {
     if descr_raw == 0 {
-        // Deviation: unresolved-callee path. Upstream never reaches
-        // this state — an unlinked target is patched out before the
-        // CALL_ASSEMBLER emits the call. Retained as a safety fence.
+        // PRE-EXISTING-ADAPTATION: upstream never reaches this state
+        // (an unlinked callee is patched out before the CALL_ASSEMBLER
+        // emits its call).  Retained as a safety fence for backend-only
+        // tests that bypass the registration flow.
+        unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
         return 0;
     }
-    if guard::is_done_with_this_frame_descr(descr_raw) {
-        // compile.py:626-656 `_DoneWithThisFrameDescr` subclasses
-        // (Void/Int/Ref/Float) — the four finish singletons.
-        return handle_fail_done_with_this_frame(descr_raw, frame_ptr);
-    }
-    if guard::is_exit_frame_with_exception_descr(descr_raw) {
-        // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`:
-        //   value = cpu.get_ref_value(deadframe, 0)
-        //   raise jitexc.ExitFrameWithExceptionRef(value)
-        // pyre returns the raw slot-0 payload here; the caller stub
-        // observes `is_exit_frame_with_exception` on the synthesized
-        // FailDescr and re-raises through `jit_exc_value`.
-        return handle_fail_exit_frame_with_exception(frame_ptr);
-    }
-    // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-    let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
-    handle_fail_resume_guard(descr, descr_raw, frame_ptr, green_key)
+
+    let mut ctx = CallAssemblerHelperContext {
+        frame_ptr,
+        green_key,
+        descr_raw,
+    };
+    // warmspot.py:1023 `fail_descr.handle_fail(deadframe, ...)` — virtual
+    // dispatch through `FailDescr::handle_fail` into the concrete descr
+    // body (compile.py:626-662 finish variants / compile.py:1093-1099
+    // propagate-exception / compile.py:701-717 resume-guard).
+    let result = dispatch_current_fail_descr(&mut ctx);
+    unsafe { libc::free(ctx.frame_ptr as *mut std::ffi::c_void) };
+    // warmspot.py:1025-1026 `handle_jitexception` parity — unpack the
+    // HandleFailResult variant into the raw i64 the caller stub expects.
+    handle_fail_result_to_i64(result)
 }
 
-/// compile.py:626-656 `DoneWithThisFrameDescr{Void,Int,Ref,Float}.handle_fail`.
-///
-/// Upstream raises `jitexc.DoneWithThisFrame*(slot-0)` and
-/// `handle_jitexception` shape-casts the payload to the portal's
-/// return type.  pyre returns the raw i64 back; the JIT-emitted caller
-/// stub (`assembler_helper_wrapper`) reinterprets it as the correct
-/// kind.  Each subclass picks a different accessor so the returned
-/// bits carry the right sign-extension / pointer-tagging / float
-/// bit-layout for the portal return type:
-///
-/// * `DoneWithThisFrameDescrVoid.handle_fail` — no payload, return 0
-///   (compile.py:628-632).
-/// * `DoneWithThisFrameDescrInt.handle_fail` — `get_int_value(df, 0)`
-///   (compile.py:635-640).
-/// * `DoneWithThisFrameDescrRef.handle_fail` — `get_ref_value(df, 0)`
-///   (compile.py:644-649).
-/// * `DoneWithThisFrameDescrFloat.handle_fail` — `get_float_value(df, 0)`
-///   (compile.py:653-657).
-///
-/// The descr identity selects the accessor — matched through the four
-/// `guard::done_with_this_frame_descr_*_ptr()` singletons rather than
-/// a `fail_arg_types[0]` probe, because the Void descr carries no type
-/// entry at all.
-fn handle_fail_done_with_this_frame(descr_raw: usize, frame_ptr: *mut jitframe::JitFrame) -> i64 {
-    if descr_raw == guard::done_with_this_frame_descr_void_ptr() {
-        return 0;
-    }
-    if descr_raw == guard::done_with_this_frame_descr_int_ptr() {
-        return unsafe { llmodel::get_int_value_direct(frame_ptr, 0) as i64 };
-    }
-    if descr_raw == guard::done_with_this_frame_descr_ref_ptr() {
-        return unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 };
-    }
-    if descr_raw == guard::done_with_this_frame_descr_float_ptr() {
-        return unsafe { llmodel::get_float_value_direct(frame_ptr, 0) as i64 };
-    }
-    // Unreachable: `is_done_with_this_frame_descr` gate above already
-    // narrowed `descr_raw` to one of the four singletons.
-    0
-}
-
-/// compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`.
-///
-/// Upstream reads slot 0 as a gcref and raises
-/// `jitexc.ExitFrameWithExceptionRef(value)`.  Pyre hands the raw int
-/// payload back; the caller stub
-/// (`pyre/pyre-jit/src/eval.rs` handle_jit_outcome) routes the result
-/// into `PyError::from_exc_object` when the synthesized FailDescr
-/// carries `is_exit_frame_with_exception = true`.
-fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
-    unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 }
-}
-
-/// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-///
-/// Upstream:
-///     if must_compile(...) and not rstack.stack_almost_full():
-///         self._trace_and_compile_from_bridge(deadframe, ...)
-///     else:
-///         resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
-///     assert 0, "unreachable"
-///
-/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre's CA slow path always
-/// walks the bridge-tracer hook (`CA_BRIDGE_FN`) first and then runs
-/// the blackhole hook (`CA_BLACKHOLE_FN`), rather than choosing one
-/// via `must_compile`. The bridge hook is responsible for the
-/// _tracing and attaching_ step only; it never re-enters the newly
-/// attached bridge, so the blackhole hook still gets to finish the
-/// current frame. This differs from upstream's "trace+fall-through"
-/// semantics in `_trace_and_compile_from_bridge` but preserves the
-/// end result: each CA slow entry attaches at most one bridge _and_
-/// produces a resume value.
-fn handle_fail_resume_guard(
-    descr: &guard::DynasmFailDescr,
-    descr_raw: usize,
-    frame_ptr: *mut jitframe::JitFrame,
-    green_key: u64,
-) -> i64 {
-    let trace_id = descr.trace_id;
-    let fail_index = descr.fail_index;
-    let n_fail_args = descr.fail_arg_types.len();
-    let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
-    for i in 0..n_fail_args {
-        let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
-        raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
-    }
-
-    // compile.py:704-709 `_trace_and_compile_from_bridge`.
-    // The hook compiles+attaches; it does NOT re-enter the bridge.
-    if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
-        bridge_fn(
-            green_key,
-            trace_id,
-            fail_index,
-            raw_values.as_ptr(),
-            raw_values.len(),
-            descr_raw,
-        );
-    }
-
-    // compile.py:710-716 `resume_in_blackhole`.
-    if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
-        if let Some(bh_result) = blackhole(
-            green_key,
-            trace_id,
-            fail_index,
-            raw_values.as_ptr(),
-            raw_values.len(),
-            raw_values.as_ptr(),
-            raw_values.len(),
-        ) {
-            return bh_result;
+fn dispatch_current_fail_descr(ctx: &mut CallAssemblerHelperContext) -> majit_ir::HandleFailResult {
+    match guard::attached_fail_descr_by_ptr(ctx.descr_raw) {
+        Some(descr_ref) => {
+            let fd = descr_ref
+                .as_fail_descr()
+                .expect("attached descr must implement FailDescr");
+            fd.handle_fail(ctx)
+        }
+        None => {
+            // Guard-failure descr: the Arc is owned by the compiled
+            // loop's `fail_descrs` Vec (assembler.rs:238), so the raw
+            // pointer is stable for the lifetime of this call.
+            let descr = unsafe { &*(ctx.descr_raw as *const guard::DynasmFailDescr) };
+            <guard::DynasmFailDescr as majit_ir::FailDescr>::handle_fail(descr, ctx)
         }
     }
-    // `assert 0, "unreachable"` upstream — pyre returns 0 when neither
-    // hook is registered (e.g. bare-backend tests exercise the helper
-    // without a metainterp behind it).
-    0
+}
+
+/// `warmspot.handle_jitexception` (warmspot.py:982-999) payload unpack.
+///
+/// Upstream reads `e.result` / `e.value` out of the caught
+/// `jitexc.JitException` subclass and returns it with type-specific
+/// specialization. pyre collapses the jitexc hierarchy into the
+/// `HandleFailResult` enum (majit-ir/src/descr.rs:937-948) and unpacks
+/// here, producing the raw i64 bit pattern the JIT-emitted caller stub
+/// expects as `rax`.  The Ref / ExitFrame variants share an encoding
+/// because the caller distinguishes them through the synthesized
+/// `FailDescr::is_exit_frame_with_exception` flag rather than the
+/// return value itself.
+fn handle_fail_result_to_i64(result: majit_ir::HandleFailResult) -> i64 {
+    match result {
+        majit_ir::HandleFailResult::DoneWithThisFrameVoid => 0,
+        majit_ir::HandleFailResult::DoneWithThisFrameInt(v) => v,
+        majit_ir::HandleFailResult::DoneWithThisFrameRef(r) => r.0 as i64,
+        majit_ir::HandleFailResult::DoneWithThisFrameFloat(f) => f.to_bits() as i64,
+        majit_ir::HandleFailResult::ExitFrameWithExceptionRef(v) => v.0 as i64,
+    }
+}
+
+/// `HandleFailContext` (majit-ir/src/descr.rs:857-892) implementation
+/// that wires `FailDescr::handle_fail` bodies back to the CALL_ASSEMBLER
+/// helper frame.  Upstream's equivalent is the
+/// `(deadframe, metainterp_sd, jitdriver_sd)` tuple threaded through
+/// every `handle_fail` method in `rpython/jit/metainterp/compile.py`.
+struct CallAssemblerHelperContext {
+    frame_ptr: *mut jitframe::JitFrame,
+    green_key: u64,
+    /// `warmspot.py:1022` `fail_descr = cpu.get_latest_descr(deadframe)` —
+    /// stashed so `resume_guard` can hand the raw pointer to the bridge
+    /// tracer hook without re-reading `jf_descr`.
+    descr_raw: usize,
+}
+
+impl majit_ir::HandleFailContext for CallAssemblerHelperContext {
+    fn get_int_value(&self, idx: usize) -> i64 {
+        // llmodel.py:437-444
+        unsafe { llmodel::get_int_value_direct(self.frame_ptr, idx) as i64 }
+    }
+
+    fn get_ref_value(&self, idx: usize) -> majit_ir::GcRef {
+        // llmodel.py:446-453
+        majit_ir::GcRef(unsafe { llmodel::get_ref_value_direct(self.frame_ptr, idx) })
+    }
+
+    fn get_float_value(&self, idx: usize) -> u64 {
+        // llmodel.py:455-462
+        unsafe { llmodel::get_float_value_direct(self.frame_ptr, idx) }
+    }
+
+    fn grab_exc_value(&self) -> majit_ir::GcRef {
+        // llmodel.py:240-241 `deadframe.jf_guard_exc`.
+        majit_ir::GcRef(unsafe { (*self.frame_ptr).jf_guard_exc })
+    }
+
+    fn green_key(&self) -> u64 {
+        self.green_key
+    }
+
+    fn done_with_this_frame(&mut self, result_type: majit_ir::Type) -> majit_ir::HandleFailResult {
+        // compile.py:626-656 _DoneWithThisFrameDescr body routed by
+        // `result_type` — invoked from `dispatch_handle_fail` when a
+        // dual-role DynasmFailDescr carries `is_finish = true`.
+        match result_type {
+            majit_ir::Type::Void => majit_ir::HandleFailResult::DoneWithThisFrameVoid,
+            majit_ir::Type::Int => {
+                majit_ir::HandleFailResult::DoneWithThisFrameInt(self.get_int_value(0))
+            }
+            majit_ir::Type::Ref => {
+                majit_ir::HandleFailResult::DoneWithThisFrameRef(self.get_ref_value(0))
+            }
+            majit_ir::Type::Float => majit_ir::HandleFailResult::DoneWithThisFrameFloat(
+                f64::from_bits(self.get_float_value(0)),
+            ),
+        }
+    }
+
+    fn exit_frame_with_exception_ref(&mut self) -> majit_ir::HandleFailResult {
+        // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`
+        // body — invoked from `dispatch_handle_fail` when a dual-role
+        // DynasmFailDescr carries `is_exit_frame_with_exception = true`.
+        majit_ir::HandleFailResult::ExitFrameWithExceptionRef(self.get_ref_value(0))
+    }
+
+    fn memory_error_gcref(&mut self) -> majit_ir::GcRef {
+        CA_MEMORY_ERROR_FN
+            .get()
+            .map(|f| majit_ir::GcRef(f()))
+            .unwrap_or(majit_ir::GcRef::NULL)
+    }
+
+    fn resume_guard(&mut self, descr: &dyn majit_ir::FailDescr) -> majit_ir::HandleFailResult {
+        // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`:
+        //   if must_compile(...) and not rstack.stack_almost_full():
+        //       self._trace_and_compile_from_bridge(deadframe, ...)
+        //   else:
+        //       resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
+        //   assert 0, "unreachable"
+        let trace_id = descr.trace_id();
+        let fail_index = descr.fail_index();
+        let fail_arg_types = descr.fail_arg_types();
+        let fail_arg_locs = descr.fail_arg_locs();
+        let n_fail_args = fail_arg_types.len();
+        let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
+        for i in 0..n_fail_args {
+            let slot = fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
+            raw_values.push(unsafe { llmodel::get_int_value_direct(self.frame_ptr, slot) as i64 });
+        }
+
+        // compile.py:701-716 branch ownership stays in the frontend.
+        let handle_fail = CA_HANDLE_FAIL_FN
+            .get()
+            .expect("CALL_ASSEMBLER handle_fail hook must be registered before runtime use");
+        match handle_fail(
+            self.green_key,
+            trace_id,
+            fail_index,
+            raw_values.as_ptr(),
+            raw_values.len(),
+            raw_values.as_ptr(),
+            raw_values.len(),
+            self.descr_raw,
+        ) {
+            majit_ir::CallAssemblerHandleFailAction::ExecuteAttachedBridge => {
+                let bridge_addr =
+                    unsafe { (&*(self.descr_raw as *const guard::DynasmFailDescr)).bridge_addr() };
+                assert_ne!(
+                    bridge_addr, 0,
+                    "CALL_ASSEMBLER requested ExecuteAttachedBridge without an attached bridge"
+                );
+                let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
+                    unsafe { std::mem::transmute(bridge_addr) };
+                let result_jf = unsafe { func(self.frame_ptr) };
+                assert!(
+                    !result_jf.is_null(),
+                    "CALL_ASSEMBLER bridge execution returned a null jitframe"
+                );
+                self.frame_ptr = result_jf;
+                self.descr_raw = unsafe { llmodel::get_latest_descr(self.frame_ptr) };
+                assert_ne!(
+                    self.descr_raw, 0,
+                    "CALL_ASSEMBLER bridge execution produced a jitframe without jf_descr"
+                );
+                return dispatch_current_fail_descr(self);
+            }
+            majit_ir::CallAssemblerHandleFailAction::ReturnToCaller(result) => {
+                // The frontend already encoded the caller-visible
+                // return bits, matching warmspot.handle_jitexception.
+                return majit_ir::HandleFailResult::DoneWithThisFrameInt(result);
+            }
+        }
+    }
 }
 
 /// Return the address of the trampoline for embedding in generated code.
@@ -440,6 +486,11 @@ mod tests {
     use super::*;
     use majit_ir::Type;
     use std::sync::Arc;
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static TEST_HANDLE_FAIL_MODE: AtomicU8 = AtomicU8::new(0);
+    static REGISTER_TEST_BRIDGE_HOOK: Once = Once::new();
 
     unsafe fn alloc_test_jitframe(descr: usize, slots: &[i64]) -> *mut jitframe::JitFrame {
         let depth = slots.len();
@@ -451,7 +502,7 @@ mod tests {
             jitframe::JitFrame::init(ptr, jitframe::NULLFRAMEINFO, depth);
             llmodel::set_latest_descr(ptr, descr);
             for (index, value) in slots.iter().copied().enumerate() {
-                llmodel::set_int_value(ptr, index, value as isize);
+                llmodel::set_int_value_direct(ptr, index, value as isize);
             }
         }
         ptr
@@ -460,9 +511,32 @@ mod tests {
     extern "C" fn test_bridge_finish_int(jf: *mut jitframe::JitFrame) -> *mut jitframe::JitFrame {
         unsafe {
             llmodel::set_latest_descr(jf, guard::done_with_this_frame_descr_int_ptr());
-            llmodel::set_int_value(jf, 0, 321);
+            llmodel::set_int_value_direct(jf, 0, 321);
         }
         jf
+    }
+
+    fn test_bridge_compile_hook(
+        _green_key: u64,
+        _trace_id: u64,
+        _fail_index: u32,
+        _raw_values: *const i64,
+        _num_values: usize,
+        _raw_deadframe: *const i64,
+        _num_raw_deadframe: usize,
+        _descr_addr: usize,
+    ) -> majit_ir::CallAssemblerHandleFailAction {
+        match TEST_HANDLE_FAIL_MODE.load(Ordering::Relaxed) {
+            0 => majit_ir::CallAssemblerHandleFailAction::ReturnToCaller(0),
+            1 => majit_ir::CallAssemblerHandleFailAction::ExecuteAttachedBridge,
+            mode => panic!("unexpected TEST_HANDLE_FAIL_MODE={mode}"),
+        }
+    }
+
+    fn ensure_test_handle_fail_hook() {
+        REGISTER_TEST_BRIDGE_HOOK.call_once(|| {
+            register_call_assembler_handle_fail(test_bridge_compile_hook);
+        });
     }
 
     // ── Bug 1 regression: unresolved target must not dereference result as pointer ──
@@ -494,6 +568,8 @@ mod tests {
         // but we CAN verify the trampoline returns blackhole result (or 0)
         // without calling force. We do this by setting up a guard descr and
         // checking the trampoline reads fail_arg values correctly.
+        ensure_test_handle_fail_hook();
+        TEST_HANDLE_FAIL_MODE.store(0, Ordering::Relaxed);
 
         let descr = Arc::new(guard::DynasmFailDescr::new(
             7,  // fail_index
@@ -511,17 +587,20 @@ mod tests {
     }
 
     #[test]
-    fn test_helper_trampoline_does_not_execute_bridge() {
-        // compile.py:701 parity: helper does NOT re-enter bridges.
-        // Bridges are executed via patched guard jumps, not the helper.
+    fn test_helper_trampoline_dispatches_attached_bridge() {
+        // compile.py:704-709 parity: once _trace_and_compile_from_bridge
+        // attaches a bridge to the guard descr, re-entering the same
+        // deadframe follows that bridge and dispatches its resulting descr.
+        ensure_test_handle_fail_hook();
+        TEST_HANDLE_FAIL_MODE.store(1, Ordering::Relaxed);
         let descr = Arc::new(guard::DynasmFailDescr::new(3, 17, vec![Type::Int], false));
         descr.set_bridge_addr(test_bridge_finish_int as *const () as usize);
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
         let result = call_assembler_helper_trampoline(jf, 99);
-        // Helper blackhole-resumes (no blackhole registered → 0), NOT bridge result.
-        assert_eq!(result, 0);
+        TEST_HANDLE_FAIL_MODE.store(0, Ordering::Relaxed);
+        assert_eq!(result, 321);
 
         drop(descr);
     }
@@ -572,6 +651,12 @@ mod tests {
         }
         fn is_finish(&self) -> bool {
             true
+        }
+        fn handle_fail(
+            &self,
+            ctx: &mut dyn majit_ir::HandleFailContext,
+        ) -> majit_ir::HandleFailResult {
+            ctx.done_with_this_frame(self.0)
         }
     }
 

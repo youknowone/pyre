@@ -1664,6 +1664,11 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
     fn is_finish(&self) -> bool {
         self.is_finish
     }
+    /// FINISH carries its one result in `fail_arg_types[0]` (or
+    /// nothing for void). compile.py:626-656 parity.
+    fn finish_result_type(&self) -> Type {
+        self.fail_arg_types.first().copied().unwrap_or(Type::Void)
+    }
     fn trace_id(&self) -> u64 {
         self.trace_id
     }
@@ -1672,6 +1677,11 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
     }
     fn force_token_slots(&self) -> &[usize] {
         &self.force_token_slots
+    }
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // finish → compile.py:626-656 `_DoneWithThisFrameDescr.handle_fail`;
+        // else  → compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
+        majit_ir::dispatch_handle_fail(self, ctx)
     }
 }
 
@@ -1778,6 +1788,20 @@ impl FailDescr for DoneWithThisFrameDescrVoid {
         // `compile.py:624` `final_descr = True`.
         true
     }
+    fn finish_result_type(&self) -> Type {
+        // `compile.py:628` `class DoneWithThisFrameDescrVoid` raises
+        // `jitexc.DoneWithThisFrameVoid` — void result.
+        Type::Void
+    }
+    fn handle_fail(
+        &self,
+        _ctx: &mut dyn majit_ir::HandleFailContext,
+    ) -> majit_ir::HandleFailResult {
+        // `compile.py:627-629`:
+        //   assert jitdriver_sd.result_type == history.VOID
+        //   raise jitexc.DoneWithThisFrameVoid()
+        majit_ir::HandleFailResult::DoneWithThisFrameVoid
+    }
 }
 
 /// `compile.py:631-638` `class DoneWithThisFrameDescrInt(_DoneWithThisFrameDescr)`.
@@ -1788,6 +1812,15 @@ pub struct DoneWithThisFrameDescrInt(DoneWithThisFrameDescrBase);
 impl DoneWithThisFrameDescrInt {
     pub fn new() -> Self {
         Self(DoneWithThisFrameDescrBase::new(vec![Type::Int]))
+    }
+
+    /// `compile.py:632-633`:
+    /// ```python
+    /// def get_result(self, cpu, deadframe):
+    ///     return cpu.get_int_value(deadframe, 0)
+    /// ```
+    fn get_result(&self, ctx: &dyn majit_ir::HandleFailContext) -> i64 {
+        ctx.get_int_value(0)
     }
 }
 
@@ -1823,6 +1856,18 @@ impl FailDescr for DoneWithThisFrameDescrInt {
     fn is_finish(&self) -> bool {
         true
     }
+    fn finish_result_type(&self) -> Type {
+        // `compile.py:636` `class DoneWithThisFrameDescrInt` raises
+        // `jitexc.DoneWithThisFrameInt(cpu.get_int_value(deadframe, 0))`.
+        Type::Int
+    }
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // `compile.py:635-638`:
+        //   assert jitdriver_sd.result_type == history.INT
+        //   cpu = metainterp_sd.cpu
+        //   raise jitexc.DoneWithThisFrameInt(self.get_result(cpu, deadframe))
+        majit_ir::HandleFailResult::DoneWithThisFrameInt(self.get_result(ctx))
+    }
 }
 
 /// `compile.py:640-647` `class DoneWithThisFrameDescrRef(_DoneWithThisFrameDescr)`.
@@ -1833,6 +1878,15 @@ pub struct DoneWithThisFrameDescrRef(DoneWithThisFrameDescrBase);
 impl DoneWithThisFrameDescrRef {
     pub fn new() -> Self {
         Self(DoneWithThisFrameDescrBase::new(vec![Type::Ref]))
+    }
+
+    /// `compile.py:641-642`:
+    /// ```python
+    /// def get_result(self, cpu, deadframe):
+    ///     return cpu.get_ref_value(deadframe, 0)
+    /// ```
+    fn get_result(&self, ctx: &dyn majit_ir::HandleFailContext) -> majit_ir::GcRef {
+        ctx.get_ref_value(0)
     }
 }
 
@@ -1868,6 +1922,18 @@ impl FailDescr for DoneWithThisFrameDescrRef {
     fn is_finish(&self) -> bool {
         true
     }
+    fn finish_result_type(&self) -> Type {
+        // `compile.py:645` `class DoneWithThisFrameDescrRef` raises
+        // `jitexc.DoneWithThisFrameRef(cpu.get_ref_value(deadframe, 0))`.
+        Type::Ref
+    }
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // `compile.py:644-647`:
+        //   assert jitdriver_sd.result_type == history.REF
+        //   cpu = metainterp_sd.cpu
+        //   raise jitexc.DoneWithThisFrameRef(self.get_result(cpu, deadframe))
+        majit_ir::HandleFailResult::DoneWithThisFrameRef(self.get_result(ctx))
+    }
 }
 
 /// `compile.py:649-656` `class DoneWithThisFrameDescrFloat(_DoneWithThisFrameDescr)`.
@@ -1878,6 +1944,21 @@ pub struct DoneWithThisFrameDescrFloat(DoneWithThisFrameDescrBase);
 impl DoneWithThisFrameDescrFloat {
     pub fn new() -> Self {
         Self(DoneWithThisFrameDescrBase::new(vec![Type::Float]))
+    }
+
+    /// `compile.py:650-651`:
+    /// ```python
+    /// def get_result(self, cpu, deadframe):
+    ///     return cpu.get_float_value(deadframe, 0)
+    /// ```
+    ///
+    /// Upstream returns `longlong.FLOATSTORAGE` (bit-preserved i64). Pyre
+    /// carries the bits through `HandleFailContext::get_float_value` as
+    /// u64 and the caller rebinds to `f64` via `from_bits` inside
+    /// `handle_fail` so the result matches `HandleFailResult::
+    /// DoneWithThisFrameFloat(f64)` / `JitException::DoneWithThisFrameFloat(f64)`.
+    fn get_result(&self, ctx: &dyn majit_ir::HandleFailContext) -> u64 {
+        ctx.get_float_value(0)
     }
 }
 
@@ -1912,6 +1993,18 @@ impl FailDescr for DoneWithThisFrameDescrFloat {
     }
     fn is_finish(&self) -> bool {
         true
+    }
+    fn finish_result_type(&self) -> Type {
+        // `compile.py:654` `class DoneWithThisFrameDescrFloat` raises
+        // `jitexc.DoneWithThisFrameFloat(cpu.get_float_value(deadframe, 0))`.
+        Type::Float
+    }
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // `compile.py:653-656`:
+        //   assert jitdriver_sd.result_type == history.FLOAT
+        //   cpu = metainterp_sd.cpu
+        //   raise jitexc.DoneWithThisFrameFloat(self.get_result(cpu, deadframe))
+        majit_ir::HandleFailResult::DoneWithThisFrameFloat(f64::from_bits(self.get_result(ctx)))
     }
 }
 
@@ -1964,6 +2057,14 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
         // dispatches to `jitexc.ExitFrameWithExceptionRef` via `handle_fail`.
         true
     }
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // `compile.py:659-662`:
+        //   cpu = metainterp_sd.cpu
+        //   value = cpu.get_ref_value(deadframe, 0)
+        //   raise jitexc.ExitFrameWithExceptionRef(value)
+        let value = ctx.get_ref_value(0);
+        majit_ir::HandleFailResult::ExitFrameWithExceptionRef(value)
+    }
 }
 
 /// `compile.py:1092-1099` `class PropagateExceptionDescr(AbstractFailDescr)`.
@@ -2015,6 +2116,24 @@ impl FailDescr for PropagateExceptionDescr {
         // `compile.py:1092` `class PropagateExceptionDescr(AbstractFailDescr)` —
         // inherits `final_descr = False`.  This is a guard descr, not a finish.
         false
+    }
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // `compile.py:1093-1099`:
+        //   cpu = metainterp_sd.cpu
+        //   exception = cpu.grab_exc_value(deadframe)
+        //   if not exception:
+        //       exception = cast_instance_to_gcref(memory_error)
+        //   assert exception, "PropagateExceptionDescr: no exception??"
+        //   raise jitexc.ExitFrameWithExceptionRef(exception)
+        let mut exception = ctx.grab_exc_value();
+        if exception.is_null() {
+            exception = ctx.memory_error_gcref();
+        }
+        assert!(
+            !exception.is_null(),
+            "PropagateExceptionDescr: no exception??"
+        );
+        majit_ir::HandleFailResult::ExitFrameWithExceptionRef(exception)
     }
 }
 

@@ -797,6 +797,10 @@ pub fn insert_renamings(
     regallocs: &HashMap<RegKind, RegAllocResult>,
     ops: &mut Vec<FlatOp>,
 ) {
+    /// Per-kind rename item. `Color(n)` lives in the color space of
+    /// the enclosing `RegKind`; `Const` sources (constant link args)
+    /// are emitted as `%s_copy CONST -> reg` and thus never sit in
+    /// the cycle-detection input (they can't be read-destinations).
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     enum RenameItem {
         Color(usize),
@@ -840,7 +844,6 @@ pub fn insert_renamings(
     }
     let mut lst: Vec<Entry> = Vec::with_capacity(link.args.len());
     for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
-        // `flatten.py:310-311` skip.
         if Some(v) == link.last_exception.as_ref() || Some(v) == link.last_exc_value.as_ref() {
             continue;
         }

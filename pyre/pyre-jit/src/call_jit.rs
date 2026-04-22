@@ -6,6 +6,8 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::Once;
+#[cfg(feature = "dynasm")]
+use std::sync::OnceLock;
 
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
@@ -30,6 +32,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
+}
+
+#[cfg(feature = "dynasm")]
+fn call_assembler_memory_error() -> usize {
+    static MEMORY_ERROR: OnceLock<usize> = OnceLock::new();
+    *MEMORY_ERROR.get_or_init(|| pyre_interpreter::builtins::preallocated_memory_error() as usize)
 }
 
 /// Take stashed exception from blackhole/force FFI paths.
@@ -1376,10 +1384,7 @@ pub fn install_jit_call_bridge() {
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
-            majit_backend_cranelift::register_call_assembler_bridge(jit_ca_handle_guard_failure);
-            majit_backend_cranelift::register_call_assembler_blackhole(
-                jit_blackhole_resume_from_guard,
-            );
+            majit_backend_cranelift::register_call_assembler_handle_fail(jit_ca_handle_fail);
             majit_backend_cranelift::register_jitframe_layout(arena_global_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
             // resume.py:763-870 VStr/VUni.allocate parity — Cranelift
@@ -1413,11 +1418,9 @@ pub fn install_jit_call_bridge() {
         #[cfg(feature = "dynasm")]
         {
             majit_backend_dynasm::register_call_assembler_force(jit_force_callee_frame);
-            majit_backend_dynasm::register_call_assembler_bridge(jit_ca_handle_guard_failure);
-            majit_backend_dynasm::register_call_assembler_blackhole(
-                jit_blackhole_resume_from_guard,
-            );
+            majit_backend_dynasm::register_call_assembler_handle_fail(jit_ca_handle_fail);
             majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
+            majit_backend_dynasm::register_call_assembler_memory_error(call_assembler_memory_error);
             // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
             // parity. The backend inlines MOV [endaddr]; SUB rsp; CMP [lengthaddr]
             // in every JIT prologue and calls slowpath_addr on miss.
@@ -1533,11 +1536,55 @@ fn jit_blackhole_resume_from_guard(
     // Hitting this path means a guard was compiled without snapshot data.
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[blackhole-resume] no rd_numb for key={} trace={} fail={} (force_fn fallback)",
+            "[blackhole-resume] no rd_numb for key={} trace={} fail={} (backend test fallback)",
             actual_green_key, trace_id, fail_index,
         );
     }
     None
+}
+
+/// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail` parity
+/// for CALL_ASSEMBLER slow paths.
+fn jit_ca_handle_fail(
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    fail_values_ptr: *const i64,
+    num_fail_values: usize,
+    raw_deadframe_ptr: *const i64,
+    num_raw_deadframe: usize,
+    descr_addr: usize,
+) -> majit_ir::CallAssemblerHandleFailAction {
+    if jit_ca_handle_guard_failure(
+        green_key,
+        trace_id,
+        fail_index,
+        fail_values_ptr,
+        num_fail_values,
+        descr_addr,
+    ) {
+        // warmspot.py:1021-1028 assembler_call_helper catches the
+        // translated-mode ContinueRunningNormally raised after bridge
+        // compilation and re-enters via handle_jitexception →
+        // portal_runner. It does not execute the freshly attached
+        // bridge against the current deadframe directly.
+    }
+
+    match jit_blackhole_resume_from_guard(
+        green_key,
+        trace_id,
+        fail_index,
+        fail_values_ptr,
+        num_fail_values,
+        raw_deadframe_ptr,
+        num_raw_deadframe,
+    ) {
+        Some(result) => majit_ir::CallAssemblerHandleFailAction::ReturnToCaller(result),
+        None => panic!(
+            "CALL_ASSEMBLER guard failure missing blackhole result: key={} trace={} fail={}",
+            green_key, trace_id, fail_index
+        ),
+    }
 }
 
 /// resume.py:1312 blackhole_from_resumedata parity:
@@ -2196,14 +2243,17 @@ fn jit_ca_handle_guard_failure(
     }
 
     // compile.py:706-708 _trace_and_compile_from_bridge
-    let compiled = trace_and_compile_from_bridge(
-        owning_key,
-        trace_id,
-        fail_index,
-        frame,
-        raw_values,
-        &exit_layout,
-    );
+    let compiled = {
+        let _plain = pyre_interpreter::call::force_plain_eval();
+        trace_and_compile_from_bridge(
+            owning_key,
+            trace_id,
+            fail_index,
+            frame,
+            raw_values,
+            &exit_layout,
+        )
+    };
 
     // compile.py:790-795 self.done_compiling(): clear ST_BUSY_FLAG
     {

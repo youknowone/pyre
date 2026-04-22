@@ -365,6 +365,43 @@ pub fn is_exit_frame_with_exception_descr(ptr: usize) -> bool {
     ptr != 0 && ptr == exit_frame_with_exception_descr_ref_ptr()
 }
 
+/// `warmspot.py:1022 fail_descr = cpu.get_latest_descr(deadframe)` —
+/// turn a raw `jf_descr` pointer into the corresponding attached
+/// `DescrRef` (metainterp-side `_DoneWithThisFrameDescr` /
+/// `ExitFrameWithExceptionDescrRef` / `PropagateExceptionDescr`).
+///
+/// Upstream's Python `cpu.get_latest_descr` returns the actual object
+/// (via GCREF → AbstractFailDescr cast); pyre's JIT-emitted code
+/// stores the raw pointer of the attached `Arc` in `jf_descr`, so we
+/// look it back up by Arc-identity against each metainterp-owned
+/// thread-local slot. Returns `None` when `ptr` matches none of the
+/// attached descrs — the caller then treats `ptr` as a direct
+/// `*const DynasmFailDescr` (guard-failure path).
+pub fn attached_fail_descr_by_ptr(ptr: usize) -> Option<majit_ir::DescrRef> {
+    if ptr == 0 {
+        return None;
+    }
+    let slots: [&'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>; 6] = [
+        &DONE_WITH_THIS_FRAME_DESCR_VOID,
+        &DONE_WITH_THIS_FRAME_DESCR_INT,
+        &DONE_WITH_THIS_FRAME_DESCR_REF,
+        &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+        &EXIT_FRAME_WITH_EXCEPTION_DESCR_REF,
+        &PROPAGATE_EXCEPTION_DESCR,
+    ];
+    for slot in slots.iter() {
+        if let Some(d) = slot.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|arc| Arc::as_ptr(arc) as *const () as usize == ptr)
+                .cloned()
+        }) {
+            return Some(d);
+        }
+    }
+    None
+}
+
 impl Descr for DynasmFailDescr {}
 
 impl FailDescr for DynasmFailDescr {
@@ -376,12 +413,29 @@ impl FailDescr for DynasmFailDescr {
         &self.fail_arg_types
     }
 
+    fn fail_arg_locs(&self) -> &[Option<usize>] {
+        &self.fail_arg_locs
+    }
+
+    fn rd_locs(&self) -> &[u16] {
+        // `llsupport/assembler.py:240-278 store_info_on_descr` populates
+        // `self.rd_locs` from the regalloc-layer `fail_arg_locs`
+        // (x86/assembler.rs:2541-2562 / aarch64/assembler.rs:2550-2570).
+        &self.rd_locs
+    }
+
     fn is_finish(&self) -> bool {
         self.is_finish
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {
         self.is_exit_frame_with_exception
+    }
+
+    /// FINISH carries its one result in `fail_arg_types[0]` (or
+    /// nothing for void). compile.py:626-656 parity.
+    fn finish_result_type(&self) -> Type {
+        self.fail_arg_types.first().copied().unwrap_or(Type::Void)
     }
 
     fn trace_id(&self) -> u64 {
@@ -402,5 +456,11 @@ impl FailDescr for DynasmFailDescr {
 
     fn is_compiling(&self) -> bool {
         self.status.load(Ordering::Acquire) & Self::ST_BUSY_FLAG != 0
+    }
+
+    fn handle_fail(&self, ctx: &mut dyn majit_ir::HandleFailContext) -> majit_ir::HandleFailResult {
+        // finish → compile.py:626-656 `_DoneWithThisFrameDescr.handle_fail`;
+        // else  → compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
+        majit_ir::dispatch_handle_fail(self, ctx)
     }
 }

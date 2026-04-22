@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 /// executes them as ordinary function pointers.
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -1733,26 +1733,20 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 
 /// RPython resume_in_blackhole parity: callback to resume execution
 /// from the guard failure point using the blackhole interpreter.
-/// Args: (green_key, trace_id, fail_index, fail_values_ptr, num_fail_values) → result i64.
-/// This reads the guard's resume data, restores state from fail_values (deadframe),
-/// and executes the remaining IR ops from the guard point to Finish.
-/// bh_fn(green_key, trace_id, fail_index, rebuilt_values, num_rebuilt, raw_deadframe, num_raw)
-/// Unbox a Ref (boxed int pointer) to a raw i64 int value.
-static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
-    fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
+/// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`
+/// specialized for CALL_ASSEMBLER slow paths.
+static CALL_ASSEMBLER_HANDLE_FAIL_FN: OnceLock<
+    fn(
+        u64,
+        u64,
+        u32,
+        *const i64,
+        usize,
+        *const i64,
+        usize,
+        usize,
+    ) -> majit_ir::CallAssemblerHandleFailAction,
 > = OnceLock::new();
-
-/// Register a blackhole callback for call_assembler guard failure resume.
-pub fn register_call_assembler_blackhole(
-    f: fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
-) {
-    let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
-}
-
-/// compile.py:701-717 handle_fail callback for call_assembler guard failures.
-/// (green_key, trace_id, fail_index, raw_values_ptr, num_values, descr_addr) -> bridge_compiled.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize, usize) -> bool> =
-    OnceLock::new();
 
 // Thread-local raw local0 value from CallAssemblerI inputs,
 // for force_fn to re-box before interpreter execution.
@@ -2094,8 +2088,19 @@ pub fn execute_call_assembler_direct(
     }
 }
 
-pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize, usize) -> bool) {
-    let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
+pub fn register_call_assembler_handle_fail(
+    f: fn(
+        u64,
+        u64,
+        u32,
+        *const i64,
+        usize,
+        *const i64,
+        usize,
+        usize,
+    ) -> majit_ir::CallAssemblerHandleFailAction,
+) {
+    let _ = CALL_ASSEMBLER_HANDLE_FAIL_FN.set(f);
 }
 
 const CALL_ASSEMBLER_DEADFRAME_SENTINEL: u32 = u32::MAX - 1;
@@ -2577,6 +2582,50 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
     }
 }
 
+fn mark_call_assembler_finish(outcome: *mut i64) {
+    unsafe {
+        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
+        *outcome.add(1) = 0;
+    }
+}
+
+fn store_call_assembler_bridge_deadframe(outcome: *mut i64, frame: DeadFrame) -> u64 {
+    let df_handle = store_call_assembler_deadframe(frame);
+    unsafe {
+        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
+        *outcome.add(1) = df_handle as i64;
+    }
+    0
+}
+
+fn execute_call_assembler_attached_bridge(
+    fail_descr: &CraneliftFailDescr,
+    raw_outputs: &[i64],
+    outcome: *mut i64,
+) -> Option<u64> {
+    let bridge_guard = fail_descr.bridge_ref();
+    let bridge = bridge_guard.as_ref()?;
+    let mut bridge_outputs = raw_outputs.to_vec();
+    rebuild_state_after_failure(
+        &mut bridge_outputs,
+        &fail_descr.fail_arg_types,
+        fail_descr.recovery_layout_ref().as_ref(),
+        bridge.num_inputs,
+    );
+    let mut frame =
+        CraneliftBackend::execute_bridge(bridge, &bridge_outputs, &fail_descr.fail_arg_types);
+    let bridge_descr =
+        get_latest_descr_from_deadframe(&frame).expect("bridge deadframe must have a descriptor");
+    if bridge_descr.is_finish() {
+        mark_call_assembler_finish(outcome);
+        return Some(
+            finish_result_from_deadframe(&mut frame).expect("finish_result_from_deadframe failed")
+                as u64,
+        );
+    }
+    Some(store_call_assembler_bridge_deadframe(outcome, frame))
+}
+
 fn take_call_assembler_deadframe_from_outputs(outputs: &[i64]) -> DeadFrame {
     let handle = outputs
         .first()
@@ -2901,8 +2950,8 @@ fn emit_call_footer_shadowstack(
 }
 
 /// direct call_assembler path. Ultra-lightweight: just increments
-/// fail count, checks bridge (atomic + mutex only when bridge exists),
-/// and defers bridge compilation. Falls back to force_fn.
+/// fail count, consults the frontend-owned handle_fail decision, and
+/// dispatches an attached bridge when requested.
 #[inline(never)]
 extern "C" fn call_assembler_guard_failure(
     token_number: u64,
@@ -2978,93 +3027,40 @@ fn call_assembler_guard_failure_inner(
     let fail_descr = &target.fail_descrs[fail_index as usize];
     fail_descr.increment_fail_count();
 
-    // compile.py:701-717 handle_fail → must_compile → bridge tracing.
-    // Check jitcounter threshold; if reached, trace alternate path and
-    // compile bridge. The bridge is attached to fail_descr for fast
-    // dispatch on subsequent guard failures.
-    if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
-        let raw_num = fail_descr.fail_arg_types.len();
-        if bridge_fn(
-            target.green_key,
-            target.trace_id,
-            fail_index,
-            outputs_ptr,
-            raw_num,
-            Arc::as_ptr(fail_descr) as usize,
-        ) {
-            // Bridge compiled — dispatch with finish check.
+    let handle_fail = CALL_ASSEMBLER_HANDLE_FAIL_FN
+        .get()
+        .expect("CALL_ASSEMBLER handle_fail hook must be registered before runtime use");
+    let raw_num = fail_descr.fail_arg_types.len();
+    match handle_fail(
+        target.green_key,
+        target.trace_id,
+        fail_index,
+        outputs_ptr,
+        raw_num,
+        outputs_ptr,
+        raw_num,
+        Arc::as_ptr(fail_descr) as usize,
+    ) {
+        majit_ir::CallAssemblerHandleFailAction::ExecuteAttachedBridge => {
             let new_bridge_ptr = fail_descr.bridge_code_ptr();
-            if !new_bridge_ptr.is_null() {
-                let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
-                    unsafe { std::mem::transmute(new_bridge_ptr) };
-                let jf_ptr = unsafe {
-                    (outputs_ptr as *mut u8).sub(JF_FRAME_ITEM0_OFS as usize) as *mut i64
-                };
-                let result_jf = unsafe { func(jf_ptr) };
-                let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-                if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw) {
-                    // x86/assembler.py:2291-2303: load from returned frame.
-                    let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
-                    return unsafe { *result_jf.add(header_words) };
-                }
-                // Bridge didn't finish (or finished with exception) — fall
-                // through to blackhole/force so the exception routes through
-                // the top-level classifier, not the normal Done loader.
+            assert!(
+                !new_bridge_ptr.is_null(),
+                "CALL_ASSEMBLER requested ExecuteAttachedBridge without attached bridge code"
+            );
+            let func: unsafe extern "C" fn(*mut i64) -> *mut i64 =
+                unsafe { std::mem::transmute(new_bridge_ptr) };
+            let jf_ptr =
+                unsafe { (outputs_ptr as *mut u8).sub(JF_FRAME_ITEM0_OFS as usize) as *mut i64 };
+            let result_jf = unsafe { func(jf_ptr) };
+            let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+            if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw) {
+                let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+                return unsafe { *result_jf.add(header_words) };
             }
+            panic!("CALL_ASSEMBLER bridge execution did not finish normally");
         }
+        majit_ir::CallAssemblerHandleFailAction::ReturnToCaller(result) => result,
     }
-
-    // resume.py:1312 blackhole_from_resumedata parity: materialize
-    // virtuals before blackhole resume.
-    //
-    // RPython-orthodox (compile.py:701-716 handle_fail): when
-    // must_compile + !stack_almost_full, trace+attach a bridge;
-    // OTHERWISE resume_in_blackhole. There is NO force_fn fallback —
-    // handle_fail is declared `assert 0, "unreachable"` after both
-    // paths (bridge always raises via compile_trace's "raises in case
-    // it works", blackhole always raises via JitException). Dynasm's
-    // `call_assembler_helper_trampoline` mirrors this: blackhole result
-    // OR 0, no force_fn. The previous force_fn fallback created a new
-    // PyFrame with empty locals via PyFrame::new_for_call(code, &[], ...)
-    // in jit_force_callee_frame, which left locals_w[0] uninitialized;
-    // when portal_runner re-entered the JIT via try_function_entry_jit,
-    // the stale `n` value drove the self-recursive CA into an unbounded
-    // loop, blowing the shadow stack (see fib_recursive_plan_2026_04_20).
-    // Dynasm's call_assembler_helper_trampoline (majit-backend-dynasm/src/lib.rs
-    // :189-202) passes the raw deadframe values as BOTH fail_values AND
-    // raw_deadframe to bh_fn. blackhole_resume_via_rd_numb
-    // (pyre-jit/src/call_jit.rs:1351) only consumes `raw_deadframe`, so the
-    // rebuild_state_after_failure preprocessing step is functionally a
-    // no-op for the blackhole path — but when it empties `bh_outputs`
-    // (recovery.frames.slots order mismatched with raw_num), bh_fn sees
-    // `num_fail_values == 0` and returns None immediately
-    // (call_jit.rs:1293), which previously drove the force_fn fallback
-    // into garbage-frame territory.
-    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let green_key = target.green_key;
-        let trace_id = target.trace_id;
-        let raw_num = fail_descr.fail_arg_types.len();
-        if let Some(result) = bh_fn(
-            green_key,
-            trace_id,
-            fail_index,
-            outputs_ptr,
-            raw_num,
-            outputs_ptr,
-            raw_num,
-        ) {
-            // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
-            // e.result as-is. warmspot.py:982: ContinueRunningNormally
-            // applies unspecialize_value (identity for GCREF portal).
-            // warmspot.py:998: ExitFrameWithExceptionRef sets JIT_EXC_VALUE
-            // inside handle_blackhole_result; value here is garbage.
-            // No backend-side conversion — handle_jitexception handles all types.
-            return result;
-        }
-    }
-    let _ = inputs_ptr;
-    let _ = frame_ptr;
-    0
 }
 
 /// Fast path for call_assembler when a force callback is available.
@@ -3150,81 +3146,41 @@ fn call_assembler_fast_path_heap(
     // Guard failure — check for bridge, then fall back to force
     fail_descr.increment_fail_count();
 
-    let bridge_guard = fail_descr.bridge_ref();
-    if let Some(ref bridge) = *bridge_guard {
-        // rebuild_state_after_failure decodes recovery_layout to match
-        // what the bridge tracer saw via rebuild_from_resumedata.
-        let mut bridge_outputs = outputs;
-        rebuild_state_after_failure(
-            &mut bridge_outputs,
-            &fail_descr.fail_arg_types,
-            fail_descr.recovery_layout_ref().as_ref(),
-            bridge.num_inputs,
-        );
-        let mut frame =
-            CraneliftBackend::execute_bridge(bridge, &bridge_outputs, &fail_descr.fail_arg_types);
-        let bridge_descr = get_latest_descr_from_deadframe(&frame)
-            .expect("bridge deadframe must have a descriptor");
-        if bridge_descr.is_finish() {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            return finish_result_from_deadframe(&mut frame)
-                .expect("finish_result_from_deadframe failed") as u64;
-        }
-        let df_handle = store_call_assembler_deadframe(frame);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_DEADFRAME;
-            *outcome.add(1) = df_handle as i64;
-        }
-        return 0;
-    }
-    let _ = bridge_guard;
-
-    // resume.py:1312 blackhole_from_resumedata parity.
-    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let green_key = target.green_key;
-        let trace_id = target.trace_id;
-        let raw_num = fail_descr.fail_arg_types.len();
-        let raw_outputs = outputs.to_vec();
-        let mut bh_outputs = outputs.to_vec();
-        rebuild_state_after_failure(
-            &mut bh_outputs,
-            &fail_descr.fail_arg_types,
-            fail_descr.recovery_layout_ref().as_ref(),
-            raw_num,
-        );
-        let num_outputs = bh_outputs.len();
-        if let Some(result) = bh_fn(
-            green_key,
-            trace_id,
-            fail_index,
-            bh_outputs.as_ptr(),
-            num_outputs,
-            raw_outputs.as_ptr(),
-            raw_num,
-        ) {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
-            }
-            // warmspot.py:988-996: DoneWithThisFrame* returns typed result as-is.
-            // warmspot.py:998: exception already raised via jit_exc_raise.
-            return result as u64;
-        }
+    if let Some(result) = execute_call_assembler_attached_bridge(fail_descr, &outputs, outcome) {
+        return result;
     }
 
-    // RPython assembler_call_helper: force_fn receives the callee frame.
-    // outputs[0] holds the virtualizable frame (fail_args[0] = caller),
-    // but force_fn needs the callee frame which is inputs[0].
-    let callee_frame_ptr = inputs[0];
-    let result = force_fn(callee_frame_ptr);
-    unsafe {
-        *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-        *outcome.add(1) = 0;
+    let handle_fail = CALL_ASSEMBLER_HANDLE_FAIL_FN
+        .get()
+        .expect("CALL_ASSEMBLER handle_fail hook must be registered before runtime use");
+    let raw_num = fail_descr.fail_arg_types.len();
+    let raw_outputs = outputs.to_vec();
+    let mut bh_outputs = outputs.to_vec();
+    rebuild_state_after_failure(
+        &mut bh_outputs,
+        &fail_descr.fail_arg_types,
+        fail_descr.recovery_layout_ref().as_ref(),
+        raw_num,
+    );
+    match handle_fail(
+        target.green_key,
+        target.trace_id,
+        fail_index,
+        bh_outputs.as_ptr(),
+        bh_outputs.len(),
+        raw_outputs.as_ptr(),
+        raw_num,
+        Arc::as_ptr(fail_descr) as usize,
+    ) {
+        majit_ir::CallAssemblerHandleFailAction::ExecuteAttachedBridge => {
+            execute_call_assembler_attached_bridge(fail_descr, &outputs, outcome)
+                .expect("bridge must be attached after ExecuteAttachedBridge")
+        }
+        majit_ir::CallAssemblerHandleFailAction::ReturnToCaller(result) => {
+            mark_call_assembler_finish(outcome);
+            result as u64
+        }
     }
-    result as u64
 }
 
 extern "C" fn call_assembler_shim(
@@ -3316,47 +3272,39 @@ fn call_assembler_shim_inner(
             fail_values.len()
         );
     }
-    if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        // resume.py:1312 blackhole_from_resumedata parity.
+    if let Some(fail_descr) = target.fail_descrs.get(fail_index as usize) {
+        if let Some(result) =
+            execute_call_assembler_attached_bridge(fail_descr, &fail_values, outcome)
+        {
+            return result;
+        }
+        let handle_fail = CALL_ASSEMBLER_HANDLE_FAIL_FN
+            .get()
+            .expect("CALL_ASSEMBLER handle_fail hook must be registered before runtime use");
         let raw_num = fail_types.len();
         let raw_outputs = fail_values.clone();
         let mut bh_outputs = fail_values;
-        let recovery = target
-            .fail_descrs
-            .get(fail_index as usize)
-            .and_then(|d| d.recovery_layout_ref().as_ref().cloned());
+        let recovery = fail_descr.recovery_layout_ref().as_ref().cloned();
         rebuild_state_after_failure(&mut bh_outputs, fail_types, recovery.as_ref(), raw_num);
-        let num_outputs = bh_outputs.len();
-        if let Some(result) = bh_fn(
+        match handle_fail(
             target.green_key,
             target.trace_id,
             fail_index,
             bh_outputs.as_ptr(),
-            num_outputs,
+            bh_outputs.len(),
             raw_outputs.as_ptr(),
             raw_num,
+            Arc::as_ptr(fail_descr) as usize,
         ) {
-            unsafe {
-                *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-                *outcome.add(1) = 0;
+            majit_ir::CallAssemblerHandleFailAction::ExecuteAttachedBridge => {
+                return execute_call_assembler_attached_bridge(fail_descr, &raw_outputs, outcome)
+                    .expect("bridge must be attached after ExecuteAttachedBridge");
             }
-            // warmspot.py:988-996: typed result as-is.
-            return result as u64;
+            majit_ir::CallAssemblerHandleFailAction::ReturnToCaller(result) => {
+                mark_call_assembler_finish(outcome);
+                return result as u64;
+            }
         }
-    }
-    // Fallback: force_fn re-executes from scratch.
-    if let Some(force_fn) = CALL_ASSEMBLER_FORCE_FN.get() {
-        let callee_frame_ptr = input_slice[0];
-        let fli = target.num_scalar_inputargs;
-        if input_slice.len() > fli {
-            PENDING_FORCE_LOCAL0.with(|c| c.set(Some(input_slice[fli])));
-        }
-        let result = force_fn(callee_frame_ptr);
-        unsafe {
-            *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
-            *outcome.add(1) = 0;
-        }
-        return result as u64;
     }
 
     let handle = store_call_assembler_deadframe(frame);
@@ -12788,6 +12736,7 @@ mod tests {
     use majit_gc::trace::TypeInfo;
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut o = Op::new(opcode, args);

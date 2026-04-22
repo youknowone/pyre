@@ -28,24 +28,25 @@ pub enum ExcKind {
     ImportError = 13,
     NotImplementedError = 14,
     AssertionError = 15,
+    MemoryError = 16,
     /// Raised by `_weakref` when a proxy is dereferenced after the
     /// referent has been collected — pypy/module/_weakref/interp__weakref.py:347
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
-    ReferenceError = 16,
-    GeneratorExit = 17,
-    RecursionError = 18,
+    ReferenceError = 17,
+    GeneratorExit = 18,
+    RecursionError = 19,
     /// Base class for all operating-system errors
     /// (formerly IOError / WindowsError / EnvironmentError in Python 2).
     /// pypy/module/exceptions/interp_exceptions.py W_OSError.
-    OSError = 19,
+    OSError = 20,
     /// Subclass of OSError raised when a file or directory is not found.
-    FileNotFoundError = 20,
+    FileNotFoundError = 21,
     /// Subclass of ValueError raised by codecs on invalid input.
-    UnicodeDecodeError = 21,
+    UnicodeDecodeError = 22,
     /// Subclass of ValueError raised by codecs on invalid input.
-    UnicodeEncodeError = 22,
+    UnicodeEncodeError = 23,
     /// Raised by sys.exit(). Subclass of BaseException, not Exception.
-    SystemExit = 23,
+    SystemExit = 24,
 }
 
 /// Layout: `[ob_type: *const PyType | kind: ExcKind | message: *mut String]`
@@ -119,6 +120,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::ImportError => "ImportError",
         ExcKind::NotImplementedError => "NotImplementedError",
         ExcKind::AssertionError => "AssertionError",
+        ExcKind::MemoryError => "MemoryError",
         ExcKind::ReferenceError => "ReferenceError",
         ExcKind::GeneratorExit => "GeneratorExit",
         ExcKind::RecursionError => "RecursionError",
@@ -186,6 +188,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "ImportError" => Some(ExcKind::ImportError),
         "NotImplementedError" => Some(ExcKind::NotImplementedError),
         "AssertionError" => Some(ExcKind::AssertionError),
+        "MemoryError" => Some(ExcKind::MemoryError),
         "ReferenceError" => Some(ExcKind::ReferenceError),
         "GeneratorExit" => Some(ExcKind::GeneratorExit),
         "RecursionError" => Some(ExcKind::RecursionError),

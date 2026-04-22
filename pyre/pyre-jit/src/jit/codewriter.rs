@@ -2221,15 +2221,31 @@ impl CodeWriter {
                 // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
                 // re-raise opname shares the `Block.exits` topology
                 // (`flatten.py` emits the two as alternative codings
-                // of the same exception exit).
+                // of the same exception exit). Upstream
+                // `flowspace/flowcontext.py:1282` wires the real
+                // `(w_type, w_value)` FlowValues from the pending
+                // exception.
                 //
-                // `reraise` preserves the current handler exception.
+                // `FrameState.last_exception` (framestate.py:22).
+                // Upstream `rpython/jit/codewriter/flatten.py:161-162`
+                // `make_exception_link` asserts
+                //     assert link.last_exception is not None
+                //     assert link.last_exc_value is not None
+                // before emitting `reraise`, so reaching this macro
+                // with `current_state.last_exception == None` is a
+                // structural bug in the caller rather than a normal
+                // path. Fail loudly instead of quietly constructing
+                // a sentinel-filled exit link.
+                let (etype_var, evalue_var) = current_state.last_exception.clone().expect(
+                    "emit_reraise!: current_state.last_exception must be Some \
+                         (flatten.py:161-162 make_exception_link parity)",
+                );
                 let link = super::flow::Link::new(
-                    exceptblock_link_args_strict(&current_state),
+                    vec![etype_var, evalue_var],
                     Some(graph.exceptblock.clone()),
                     None,
-                );
-                let link = link.into_ref();
+                )
+                .into_ref();
                 // Step 6A slice S4a: snapshot the EXIT state (same
                 // reasoning as `emit_raise!`).
                 append_exit_with_state(
