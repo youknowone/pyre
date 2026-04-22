@@ -9,6 +9,8 @@
 //! there as a temporary wiring bridge.
 
 pub mod error;
+pub mod extregistry;
+pub mod llannotation;
 pub mod lltypesystem;
 pub mod normalizecalls;
 pub mod rclass;

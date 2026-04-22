@@ -695,6 +695,7 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let code = HostCode {
+            id: HostCode::fresh_identity(),
             co_name: "f".into(),
             co_filename: "<test>".into(),
             co_firstlineno: 1,
@@ -716,10 +717,31 @@ mod tests {
             GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default()))),
             &code,
         ));
+        {
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            let graph_borrow = graph.graph.borrow();
+            for arg in graph_borrow.startblock.borrow_mut().inputargs.iter_mut() {
+                if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
+                    v.concretetype = Some(LowLevelType::Signed);
+                }
+            }
+            for arg in graph_borrow.returnblock.borrow_mut().inputargs.iter_mut() {
+                if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
+                    v.concretetype = Some(LowLevelType::Void);
+                }
+            }
+        }
 
         let llfn = rtyper.getcallable(&graph);
-        assert_eq!(llfn._TYPE.args.len(), 1);
-        assert_eq!(llfn._obj().unwrap().graph.is_some(), true);
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, PtrTarget};
+        let PtrTarget::Func(func_t) = &llfn._TYPE.TO else {
+            panic!("expected Func ptr, got {:?}", llfn._TYPE.TO);
+        };
+        assert_eq!(func_t.args.len(), 1);
+        let _ptr_obj::Func(func_obj) = llfn._obj().unwrap() else {
+            panic!("expected _ptr_obj::Func");
+        };
+        assert_eq!(func_obj.graph.is_some(), true);
     }
 
     fn make_rtyper_weak() -> Weak<RPythonTyper> {

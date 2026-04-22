@@ -384,7 +384,10 @@ fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<
     };
     // upstream: `try: funcobj = f._obj except lltype.DelayedPointer: return None`.
     let funcobj = match f._obj() {
-        Ok(funcobj) => funcobj,
+        Ok(lltype::_ptr_obj::Func(funcobj)) => funcobj,
+        Ok(lltype::_ptr_obj::Struct(_)) => return None,
+        Ok(lltype::_ptr_obj::Array(_)) => return None,
+        Ok(lltype::_ptr_obj::Opaque(_)) => return None,
         Err(lltype::DelayedPointer) => return None,
     };
     // upstream: `try: return funcobj.graph except AttributeError: return None`.
@@ -2383,10 +2386,33 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    fn signed_var() -> Variable {
+        let mut v = Variable::new();
+        v.concretetype = Some(lltype::LowLevelType::Signed);
+        v
+    }
+
+    fn fn_ptr_var() -> Variable {
+        let mut v = Variable::new();
+        v.concretetype = Some(lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Func(lltype::FuncType {
+                args: vec![lltype::LowLevelType::Signed],
+                result: lltype::LowLevelType::Signed,
+            }),
+        })));
+        v
+    }
+
     #[test]
     fn get_graph_for_call_reads_llptr_funcobj_graph() {
         let start = Block::shared(vec![]);
-        let graph: GraphRef = Rc::new(RefCell::new(FunctionGraph::new("callee", start)));
+        let mut ret = Variable::new();
+        ret.concretetype = Some(lltype::LowLevelType::Void);
+        let graph: GraphRef = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "callee",
+            start,
+            Hlvalue::Variable(ret),
+        )));
         let translator = TranslationContext::new();
         translator.graphs.borrow_mut().push(graph.clone());
 
@@ -2401,13 +2427,17 @@ mod tests {
     #[test]
     fn get_graph_for_call_returns_none_for_delayed_pointer() {
         let translator = TranslationContext::new();
-        let arg = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(lltype::_ptr {
-            _TYPE: lltype::FuncType {
-                args: vec![],
-                result: lltype::LowLevelType::Void,
-            },
-            _obj0: Err(lltype::DelayedPointer),
-        }))));
+        let arg = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(
+            lltype::_ptr::new(
+                lltype::Ptr {
+                    TO: lltype::PtrTarget::Func(lltype::FuncType {
+                        args: vec![],
+                        result: lltype::LowLevelType::Void,
+                    }),
+                },
+                Err(lltype::DelayedPointer),
+            ),
+        ))));
 
         assert!(get_graph_for_call(&arg, &translator).is_none());
     }
@@ -2935,8 +2965,8 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let translator = ann.translator.borrow();
 
-        let callee_arg = Variable::new();
-        let callee_res = Variable::new();
+        let callee_arg = signed_var();
+        let callee_res = signed_var();
         let callee_start = Block::shared(vec![Hlvalue::Variable(callee_arg.clone())]);
         callee_start.borrow_mut().operations.push(SO::new(
             "int_add",
@@ -2946,9 +2976,10 @@ mod tests {
             ],
             Hlvalue::Variable(callee_res.clone()),
         ));
-        let callee = Rc::new(RefCell::new(FunctionGraph::new(
+        let callee = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "callee",
             callee_start.clone(),
+            Hlvalue::Variable(signed_var()),
         )));
         let callee_link = Link::new(
             vec![Hlvalue::Variable(callee_res.clone())],
@@ -2958,9 +2989,9 @@ mod tests {
         .into_ref();
         callee_start.closeblock(vec![callee_link]);
 
-        let caller_arg = Variable::new();
-        let call_res = Variable::new();
-        let live_res = Variable::new();
+        let caller_arg = signed_var();
+        let call_res = signed_var();
+        let live_res = signed_var();
         let caller_start = Block::shared(vec![Hlvalue::Variable(caller_arg.clone())]);
         caller_start.borrow_mut().operations.push(SO::new(
             "direct_call",
@@ -2981,9 +3012,10 @@ mod tests {
             ],
             Hlvalue::Variable(live_res.clone()),
         ));
-        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+        let caller = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "caller",
             caller_start.clone(),
+            Hlvalue::Variable(signed_var()),
         )));
         let caller_link = Link::new(
             vec![Hlvalue::Variable(live_res.clone())],
@@ -3014,11 +3046,15 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let translator = ann.translator.borrow();
 
-        let rec_arg = Variable::new();
-        let rec_call_res = Variable::new();
-        let rec_live_res = Variable::new();
+        let rec_arg = signed_var();
+        let rec_call_res = signed_var();
+        let rec_live_res = signed_var();
         let rec_start = Block::shared(vec![Hlvalue::Variable(rec_arg.clone())]);
-        let rec_graph = Rc::new(RefCell::new(FunctionGraph::new("rec", rec_start.clone())));
+        let rec_graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "rec",
+            rec_start.clone(),
+            Hlvalue::Variable(signed_var()),
+        )));
         let rec_ptr = Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
             &rec_graph,
             lltype::_getconcretetype,
@@ -3044,9 +3080,9 @@ mod tests {
         .into_ref();
         rec_start.closeblock(vec![rec_link]);
 
-        let caller_arg = Variable::new();
-        let call_res = Variable::new();
-        let live_res = Variable::new();
+        let caller_arg = signed_var();
+        let call_res = signed_var();
+        let live_res = signed_var();
         let caller_start = Block::shared(vec![Hlvalue::Variable(caller_arg.clone())]);
         caller_start.borrow_mut().operations.push(SO::new(
             "direct_call",
@@ -3061,9 +3097,10 @@ mod tests {
             ],
             Hlvalue::Variable(live_res.clone()),
         ));
-        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+        let caller = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "caller",
             caller_start.clone(),
+            Hlvalue::Variable(signed_var()),
         )));
         let caller_link = Link::new(
             vec![Hlvalue::Variable(live_res.clone())],
@@ -3095,8 +3132,8 @@ mod tests {
         let translator = ann.translator.borrow();
 
         let mk_pure_graph = |name: &str, delta: i64| {
-            let arg = Variable::new();
-            let res = Variable::new();
+            let arg = signed_var();
+            let res = signed_var();
             let start = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
             start.borrow_mut().operations.push(SO::new(
                 "int_add",
@@ -3106,7 +3143,11 @@ mod tests {
                 ],
                 Hlvalue::Variable(res.clone()),
             ));
-            let graph = Rc::new(RefCell::new(FunctionGraph::new(name, start.clone())));
+            let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+                name,
+                start.clone(),
+                Hlvalue::Variable(signed_var()),
+            )));
             let link = Link::new(
                 vec![Hlvalue::Variable(res)],
                 Some(graph.borrow().returnblock.clone()),
@@ -3120,10 +3161,10 @@ mod tests {
         let (callee_a, callee_a_start) = mk_pure_graph("f1", 1);
         let (callee_b, callee_b_start) = mk_pure_graph("f2", 2);
 
-        let wrapper_arg = Variable::new();
-        let runtime_funcptr = Variable::new();
-        let wrapper_call_res = Variable::new();
-        let wrapper_live_res = Variable::new();
+        let wrapper_arg = signed_var();
+        let runtime_funcptr = fn_ptr_var();
+        let wrapper_call_res = signed_var();
+        let wrapper_live_res = signed_var();
         let wrapper_start = Block::shared(vec![
             Hlvalue::Variable(wrapper_arg.clone()),
             Hlvalue::Variable(runtime_funcptr.clone()),
@@ -3148,9 +3189,10 @@ mod tests {
             ],
             Hlvalue::Variable(wrapper_live_res.clone()),
         ));
-        let wrapper = Rc::new(RefCell::new(FunctionGraph::new(
+        let wrapper = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "wrapper",
             wrapper_start.clone(),
+            Hlvalue::Variable(signed_var()),
         )));
         let wrapper_link = Link::new(
             vec![Hlvalue::Variable(wrapper_live_res.clone())],
@@ -3160,10 +3202,10 @@ mod tests {
         .into_ref();
         wrapper_start.closeblock(vec![wrapper_link]);
 
-        let caller_arg = Variable::new();
-        let caller_runtime_funcptr = Variable::new();
-        let caller_call_res = Variable::new();
-        let caller_live_res = Variable::new();
+        let caller_arg = signed_var();
+        let caller_runtime_funcptr = fn_ptr_var();
+        let caller_call_res = signed_var();
+        let caller_live_res = signed_var();
         let caller_start = Block::shared(vec![
             Hlvalue::Variable(caller_arg.clone()),
             Hlvalue::Variable(caller_runtime_funcptr.clone()),
@@ -3188,9 +3230,10 @@ mod tests {
             ],
             Hlvalue::Variable(caller_live_res.clone()),
         ));
-        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+        let caller = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "caller",
             caller_start.clone(),
+            Hlvalue::Variable(signed_var()),
         )));
         let caller_link = Link::new(
             vec![Hlvalue::Variable(caller_live_res.clone())],
@@ -3225,10 +3268,10 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let translator = ann.translator.borrow();
 
-        let wrapper_arg = Variable::new();
-        let runtime_funcptr = Variable::new();
-        let wrapper_call_res = Variable::new();
-        let wrapper_live_res = Variable::new();
+        let wrapper_arg = signed_var();
+        let runtime_funcptr = fn_ptr_var();
+        let wrapper_call_res = signed_var();
+        let wrapper_live_res = signed_var();
         let wrapper_start = Block::shared(vec![
             Hlvalue::Variable(wrapper_arg.clone()),
             Hlvalue::Variable(runtime_funcptr.clone()),
@@ -3250,9 +3293,10 @@ mod tests {
             ],
             Hlvalue::Variable(wrapper_live_res.clone()),
         ));
-        let wrapper = Rc::new(RefCell::new(FunctionGraph::new(
+        let wrapper = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "wrapper",
             wrapper_start.clone(),
+            Hlvalue::Variable(signed_var()),
         )));
         let wrapper_link = Link::new(
             vec![Hlvalue::Variable(wrapper_live_res.clone())],
@@ -3262,10 +3306,10 @@ mod tests {
         .into_ref();
         wrapper_start.closeblock(vec![wrapper_link]);
 
-        let caller_arg = Variable::new();
-        let caller_runtime_funcptr = Variable::new();
-        let caller_call_res = Variable::new();
-        let caller_live_res = Variable::new();
+        let caller_arg = signed_var();
+        let caller_runtime_funcptr = fn_ptr_var();
+        let caller_call_res = signed_var();
+        let caller_live_res = signed_var();
         let caller_start = Block::shared(vec![
             Hlvalue::Variable(caller_arg.clone()),
             Hlvalue::Variable(caller_runtime_funcptr.clone()),
@@ -3290,9 +3334,10 @@ mod tests {
             ],
             Hlvalue::Variable(caller_live_res.clone()),
         ));
-        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+        let caller = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "caller",
             caller_start.clone(),
+            Hlvalue::Variable(signed_var()),
         )));
         let caller_link = Link::new(
             vec![Hlvalue::Variable(caller_live_res.clone())],

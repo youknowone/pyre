@@ -743,15 +743,15 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     std::collections::HashSet::new();
                 let mut all_constant = true;
                 for v in newlist_args {
-                    // Bail out for constant carriers that
-                    // `Bookkeeper::immutablevalue` still rejects
-                    // (`Code`, `LLPtr`, `Atom`, `SpecTag`,
-                    // `Placeholder`). Filtering them up front keeps
-                    // the pass a pure optimisation — unsupported
-                    // constants simply defeat the rewrite instead of
-                    // crashing inside `ann.annotation(v)`.
+                    // Pre-filter on `Hlvalue::Constant`: a few internal
+                    // flowspace variants have no Python equivalent and
+                    // panic inside `Bookkeeper::immutablevalue`. Bail
+                    // out before `ann.annotation(v)` dispatches there.
+                    // Variables carry their cached annotation instead,
+                    // so the `is_valid_contains_key` post-check below
+                    // covers that side.
                     if let Hlvalue::Constant(c) = v
-                        && !is_supported_contains_key(&c.value)
+                        && !is_valid_contains_key(&c.value)
                     {
                         all_constant = false;
                         break;
@@ -764,12 +764,14 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                         all_constant = false;
                         break;
                     }
-                    let Some(key) = const_value_from(&s) else {
-                        // Unsupported immutable-constant carrier:
-                        // leave the original `contains` op intact.
+                    let Some(key) = s.const_().cloned() else {
                         all_constant = false;
                         break;
                     };
+                    if !is_valid_contains_key(&key) {
+                        all_constant = false;
+                        break;
+                    }
                     // upstream `items[s.const] = None` relies on Python
                     // dict key semantics where `1 == 1.0 == True` all
                     // hash to the same bucket and the FIRST insertion
@@ -841,51 +843,40 @@ fn canonical_dict_key(cv: ConstValue) -> ConstValue {
     }
 }
 
-/// `true` iff `cv` is safe to use as a dict key after
-/// `transform_list_contains` rewrites the source list into a
-/// `ConstValue::Dict`.
+/// Guard for rewriting `x in [k1, k2, ...]` into
+/// `x in {k1: None, ...}`. The rewrite stays a pure optimisation:
+/// any element that isn't a valid Python dict key defeats the rewrite
+/// and the original `contains` op stays untouched. Upstream gets this
+/// guarantee for free from Python's own dict (`TypeError: unhashable
+/// type` raised on ill-typed inputs never reaches the rewrite); the
+/// Rust port has to encode it explicitly because `ConstValue` has
+/// no native hash/equality tie to Python dict semantics.
 ///
-/// Two filters must pass:
+/// Rejected:
+///   * `List` / `Dict` — unhashable in Python.
+///   * `LLPtr` — RPython `_ptr.__hash__` raises `TypeError`, so a
+///     Python dict cannot accept it as a key.
+///   * `Code` / `Graphs` / `Atom` / `SpecTag` / `Placeholder` —
+///     internal flowspace carriers with no Python equivalent.
+///     `Bookkeeper::immutablevalue` returns an error for these, so
+///     `ann.annotation(Constant(_internal))` would panic in the
+///     caller before the hashability side could even be checked.
 ///
-/// 1. **Python-hashable content.** `ConstValue::List` and `Dict` are
-///    unhashable in Python (`list.__hash__ = None`), so any nested
-///    list/dict — including inside a tuple — means the rewritten dict
-///    would not faithfully reproduce the original list-membership
-///    semantics: `HashMap<ConstValue, _>` happily stores them under
-///    Rust's derived `Eq`, but Python's `dict[key] = ...` would raise
-///    TypeError. Bail on transitive list/dict presence.
-///
-/// 2. **`Bookkeeper::immutablevalue` coverage.** Internal flowspace
-///    carriers (`Code`, `LLPtr`, `Atom`, `SpecTag`, `Placeholder`)
-///    panic inside `immutablevalue` (see `bookkeeper.rs`).
-///    Feeding those into
-///    `ann.annotation(v)` would crash the pass on valid programs like
-///    `return x in [ll_fnptr]`, so filter them out.
-fn is_supported_contains_key(cv: &ConstValue) -> bool {
+/// Tuples recurse so `(True, [1])` is rejected the same way `[1]`
+/// would be on its own.
+fn is_valid_contains_key(cv: &ConstValue) -> bool {
     match cv {
         ConstValue::Bool(_)
         | ConstValue::Int(_)
         | ConstValue::Float(_)
         | ConstValue::Str(_)
-        | ConstValue::None => true,
-        // Tuples are hashable IFF every element is hashable.
-        ConstValue::Tuple(items) => items.iter().all(is_supported_contains_key),
-        // Lists and dicts are unhashable in Python. `x in [[1,2]]` or
-        // `x in [([True],)]` must stay as list iteration; the rewrite
-        // to a `HashMap<ConstValue, _>`-backed dict would diverge from
-        // Python's membership rules.
-        ConstValue::List(_) | ConstValue::Dict(_) => false,
-        // HostObject carriers still flow through `immutablevalue` —
-        // `HostObject(class)` / property / weakref produce the correct
-        // SomeBuiltin / SomePBC annotation for dict-key purposes.
-        ConstValue::HostObject(_) => true,
-        // GraphFunc-backed function constants route to a function
-        // SomePBC. Whether the rewrite can proceed depends on the
-        // needle binding's union-compatibility, checked separately in
-        // `can_generalize_contains_key`.
-        ConstValue::Function(_) => true,
-        // Internal carriers that `immutablevalue` still rejects.
-        ConstValue::Code(_)
+        | ConstValue::None
+        | ConstValue::HostObject(_)
+        | ConstValue::Function(_) => true,
+        ConstValue::Tuple(items) => items.iter().all(is_valid_contains_key),
+        ConstValue::List(_)
+        | ConstValue::Dict(_)
+        | ConstValue::Code(_)
         | ConstValue::Graphs(_)
         | ConstValue::LLPtr(_)
         | ConstValue::Atom(_)
@@ -893,15 +884,6 @@ fn is_supported_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::Placeholder => false,
     }
 }
-
-fn const_value_from(s: &super::super::annotator::model::SomeValue) -> Option<ConstValue> {
-    s.const_().cloned()
-}
-
-// References to unused imports during deferred-port phase would trip
-// the -Dwarnings profile; keep them live via the helper below.
-#[allow(dead_code)]
-fn _keep_graph_import_alive(_graph: &GraphRef) {}
 
 #[cfg(test)]
 mod tests {
@@ -1428,6 +1410,59 @@ mod tests {
 
         let ops = &block.borrow().operations;
         assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
+    }
+
+    #[test]
+    fn transform_list_contains_leaves_llptr_constant_newlist_alone() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{Block, FunctionGraph, Hlvalue, SpaceOperation, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let start = Rc::new(RefCell::new(Block::new(vec![])));
+        let mut ret = Variable::new();
+        ret.concretetype = Some(lltype::LowLevelType::Void);
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "callee",
+            start,
+            Hlvalue::Variable(ret),
+        )));
+        let ptr = lltype::getfunctionptr(&graph, lltype::_getconcretetype);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Constant(Constant::new(ConstValue::LLPtr(
+                Box::new(ptr),
+            )))],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        assert!(
+            matches!(ops[1].args[0], Hlvalue::Variable(_)),
+            "RPython _ptr objects are unhashable, so LLPtr lists stay unreduced"
+        );
     }
 
     #[test]

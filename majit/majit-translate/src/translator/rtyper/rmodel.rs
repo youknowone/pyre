@@ -21,7 +21,7 @@
 //!
 //! * `rtype_*` methods that take a `HighLevelOp` (e.g. `rtype_getattr`,
 //!   `rtype_str`, `rtype_bool`, `rtype_simple_call`, ...) — these land
-//!   when `HighLevelOp` is ported in the Commit 3.2 step
+//!   after the `HighLevelOp` copy/dispatch/inputarg surface is ported
 //!   (`rpython/rtyper/rtyper.py:617+`).
 //! * `Repr.__getattr__` autosetup side effect (`rmodel.py:95-106`) —
 //!   Rust has no `__getattr__`. Callers that previously relied on it
@@ -586,6 +586,170 @@ impl Repr for SimplePointerRepr {
     }
 }
 
+/// RPython `rptr.py:27-118` — `class PtrRepr(Repr)`.
+#[derive(Debug)]
+pub struct PtrRepr {
+    state: ReprState,
+    lltype: LowLevelType,
+}
+
+impl PtrRepr {
+    pub fn new(ptrtype: crate::translator::rtyper::lltypesystem::lltype::Ptr) -> Self {
+        PtrRepr {
+            state: ReprState::new(),
+            lltype: LowLevelType::Ptr(Box::new(ptrtype)),
+        }
+    }
+}
+
+impl Repr for PtrRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "PtrRepr"
+    }
+}
+
+fn ptr_from_container_lowleveltype(
+    ptrtype: &crate::translator::rtyper::lltypesystem::lltype::InteriorPtr,
+) -> crate::translator::rtyper::lltypesystem::lltype::Ptr {
+    use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+
+    Ptr {
+        TO: match &*ptrtype.PARENTTYPE {
+            LowLevelType::Struct(t) => PtrTarget::Struct((**t).clone()),
+            LowLevelType::Array(t) => PtrTarget::Array((**t).clone()),
+            LowLevelType::FixedSizeArray(t) => PtrTarget::FixedSizeArray((**t).clone()),
+            LowLevelType::Opaque(t) => PtrTarget::Opaque((**t).clone()),
+            LowLevelType::ForwardReference(t) => PtrTarget::ForwardReference((**t).clone()),
+            other => panic!("InteriorPtrRepr parent must be a container type, got {other:?}"),
+        },
+    }
+}
+
+fn interior_ptr_lowleveltype(
+    ptrtype: &crate::translator::rtyper::lltypesystem::lltype::InteriorPtr,
+) -> LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+
+    let parent_ptr = ptr_from_container_lowleveltype(ptrtype);
+    if ptrtype.offsets.iter().any(|offset| {
+        matches!(
+            offset,
+            crate::translator::rtyper::lltypesystem::lltype::InteriorOffset::Index(_)
+        )
+    }) {
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(parent_ptr._interior_ptr_type_with_index(&ptrtype.TO)),
+        }))
+    } else {
+        LowLevelType::Ptr(Box::new(parent_ptr))
+    }
+}
+
+/// RPython `rptr.py:220-298` — `class InteriorPtrRepr(Repr)`.
+#[derive(Debug)]
+pub struct InteriorPtrRepr {
+    state: ReprState,
+    lltype: LowLevelType,
+    _ptrtype: crate::translator::rtyper::lltypesystem::lltype::InteriorPtr,
+    pub v_offsets: Vec<Option<Constant>>,
+    pub parentptrtype: crate::translator::rtyper::lltypesystem::lltype::Ptr,
+}
+
+impl InteriorPtrRepr {
+    pub fn new(ptrtype: crate::translator::rtyper::lltypesystem::lltype::InteriorPtr) -> Self {
+        let lltype = interior_ptr_lowleveltype(&ptrtype);
+        let mut v_offsets = Vec::new();
+        let mut numitemoffsets = 0;
+        for offset in &ptrtype.offsets {
+            match offset {
+                crate::translator::rtyper::lltypesystem::lltype::InteriorOffset::Index(_) => {
+                    numitemoffsets += 1;
+                    v_offsets.push(None);
+                }
+                crate::translator::rtyper::lltypesystem::lltype::InteriorOffset::Field(name) => {
+                    v_offsets.push(Some(Constant::with_concretetype(
+                        ConstValue::Str(name.clone()),
+                        LowLevelType::Void,
+                    )));
+                }
+            }
+        }
+        assert!(numitemoffsets <= 1);
+        let parentptrtype = ptr_from_container_lowleveltype(&ptrtype);
+        InteriorPtrRepr {
+            state: ReprState::new(),
+            lltype,
+            _ptrtype: ptrtype,
+            v_offsets,
+            parentptrtype,
+        }
+    }
+}
+
+impl Repr for InteriorPtrRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "InteriorPtrRepr"
+    }
+}
+
+/// RPython `rptr.py:195-211` — `class LLADTMethRepr(Repr)`.
+#[derive(Debug)]
+pub struct LLADTMethRepr {
+    state: ReprState,
+    lltype: LowLevelType,
+    pub func: ConstValue,
+    pub ll_ptrtype: crate::translator::rtyper::lltypesystem::lltype::LowLevelPointerType,
+}
+
+impl LLADTMethRepr {
+    pub fn new(adtmeth: &crate::annotator::model::SomeLLADTMeth) -> Self {
+        let lltype = match &adtmeth.ll_ptrtype {
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelPointerType::Ptr(ptr) => {
+                LowLevelType::Ptr(Box::new(ptr.clone()))
+            }
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelPointerType::InteriorPtr(
+                ptr,
+            ) => interior_ptr_lowleveltype(ptr),
+        };
+        LLADTMethRepr {
+            state: ReprState::new(),
+            lltype,
+            func: adtmeth.func.clone(),
+            ll_ptrtype: adtmeth.ll_ptrtype.clone(),
+        }
+    }
+}
+
+impl Repr for LLADTMethRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "LLADTMethRepr"
+    }
+}
+
 // ____________________________________________________________
 // `rtyper_makekey` / `rtyper_makerepr` per-SomeXxx dispatch
 // (rmodel.py:276-293 + each r*.py `__extend__(SomeXxx)` block).
@@ -714,6 +878,16 @@ pub fn rtyper_makerepr(
         SomeValue::TypeOf(_) => Err(TyperError::missing_rtype_operation(
             "SomeTypeOf.rtyper_makerepr — no direct upstream counterpart; pyre adaptation",
         )),
+        SomeValue::Ptr(ptr) => {
+            Ok(std::sync::Arc::new(PtrRepr::new(ptr.ll_ptrtype.clone()))
+                as std::sync::Arc<dyn Repr>)
+        }
+        SomeValue::InteriorPtr(ptr) => Ok(std::sync::Arc::new(InteriorPtrRepr::new(
+            ptr.ll_ptrtype.clone(),
+        )) as std::sync::Arc<dyn Repr>),
+        SomeValue::LLADTMeth(adtmeth) => {
+            Ok(std::sync::Arc::new(LLADTMethRepr::new(adtmeth)) as std::sync::Arc<dyn Repr>)
+        }
     }
 }
 
@@ -736,8 +910,16 @@ impl fmt::Display for SimplePointerRepr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::{SomePtr, SomeValue};
+    use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
     use crate::translator::rtyper::lltypesystem::lltype::FuncType;
-    use std::sync::Arc;
+    use crate::translator::rtyper::rtyper::RPythonTyper;
+
+    fn rtyper_for_tests() -> RPythonTyper {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        RPythonTyper::new(&ann)
+    }
 
     #[test]
     fn voidrepr_lowleveltype_is_void_and_reprs_match_upstream() {
@@ -806,18 +988,20 @@ mod tests {
     }
 
     #[test]
-    fn convert_const_rejects_non_void_values_on_voidrepr() {
-        // rmodel.py:120-125 — _contains_value is the gate.
+    fn convert_const_on_voidrepr_accepts_any_value() {
+        // rmodel.py:120-125 — `convert_const` delegates to
+        // `_contains_value`, and `Void._contains_value` (lltype.py:194-197)
+        // returns True for any value. So `VoidRepr` accepts None, Int,
+        // Bool, etc. as valid constants of lowlevel type Void.
         let r = VoidRepr::new();
-        // Void only accepts None.
         let c = r.convert_const(&ConstValue::None).unwrap();
         assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Void));
 
-        let err = r.convert_const(&ConstValue::Int(42)).unwrap_err();
-        assert!(
-            err.to_string().contains("convert_const"),
-            "expected upstream-shaped error; got {err}"
-        );
+        let c = r.convert_const(&ConstValue::Int(42)).unwrap();
+        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Void));
+
+        let c = r.convert_const(&ConstValue::Bool(true)).unwrap();
+        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Void));
     }
 
     #[test]
@@ -856,10 +1040,14 @@ mod tests {
     #[test]
     fn simple_pointer_repr_only_accepts_none_constant() {
         // rmodel.py:365-375.
-        let ptr_ty = LowLevelType::Ptr(Arc::new(FuncType {
-            args: vec![],
-            result: LowLevelType::Void,
-        }));
+        let ptr_ty = LowLevelType::Ptr(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::Ptr {
+                TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(FuncType {
+                    args: vec![],
+                    result: LowLevelType::Void,
+                }),
+            },
+        ));
         let r = SimplePointerRepr::new(ptr_ty.clone());
         assert_eq!(r.lowleveltype(), &ptr_ty);
 
@@ -872,6 +1060,116 @@ mod tests {
                 .contains("only supports None as prebuilt constant"),
             "expected upstream phrase; got {err}"
         );
+    }
+
+    #[test]
+    fn ptr_somevalues_make_rptr_reprs() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+
+        let ptr = Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            }),
+        };
+        let rtyper = rtyper_for_tests();
+        let repr = rtyper_makerepr(&SomeValue::Ptr(SomePtr::new(ptr.clone())), &rtyper).unwrap();
+        assert_eq!(repr.class_name(), "PtrRepr");
+        assert_eq!(repr.lowleveltype(), &LowLevelType::Ptr(Box::new(ptr)));
+    }
+
+    #[test]
+    fn interior_ptr_somevalues_make_rptr_reprs() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            InteriorOffset, InteriorPtr, PtrTarget, StructType,
+        };
+
+        let parent = LowLevelType::Struct(Box::new(StructType::new(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let interior = InteriorPtr {
+            PARENTTYPE: Box::new(parent.clone()),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![InteriorOffset::Field("x".into())],
+        };
+        let rtyper = rtyper_for_tests();
+        let repr = rtyper_makerepr(
+            &SomeValue::InteriorPtr(SomeInteriorPtr::new(interior)),
+            &rtyper,
+        )
+        .unwrap();
+        assert_eq!(repr.class_name(), "InteriorPtrRepr");
+        assert_eq!(
+            repr.lowleveltype(),
+            &LowLevelType::Ptr(Box::new(
+                crate::translator::rtyper::lltypesystem::lltype::Ptr {
+                    TO: PtrTarget::Struct(match parent {
+                        LowLevelType::Struct(t) => *t,
+                        _ => unreachable!(),
+                    }),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn interior_ptr_repr_records_offsets_like_rptr_init() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            InteriorOffset, InteriorPtr, PtrTarget, StructType,
+        };
+
+        let parent = LowLevelType::Struct(Box::new(StructType::new(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let repr = InteriorPtrRepr::new(InteriorPtr {
+            PARENTTYPE: Box::new(parent),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![InteriorOffset::Field("x".into())],
+        });
+        assert_eq!(repr.v_offsets.len(), 1);
+        let Some(c_offset) = &repr.v_offsets[0] else {
+            panic!("field offset should be stored as a Void constant");
+        };
+        assert_eq!(c_offset.value, ConstValue::Str("x".into()));
+        assert_eq!(c_offset.concretetype, Some(LowLevelType::Void));
+        assert!(matches!(repr.parentptrtype.TO, PtrTarget::Struct(_)));
+    }
+
+    #[test]
+    #[should_panic]
+    fn interior_ptr_repr_rejects_multiple_item_offsets_like_rptr_init() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, InteriorOffset, InteriorPtr,
+        };
+
+        let _ = InteriorPtrRepr::new(InteriorPtr {
+            PARENTTYPE: Box::new(LowLevelType::Array(Box::new(ArrayType::gc(
+                LowLevelType::Signed,
+            )))),
+            TO: Box::new(LowLevelType::Signed),
+            offsets: vec![InteriorOffset::Index(0), InteriorOffset::Index(1)],
+        });
+    }
+
+    #[test]
+    fn lladtmeth_somevalues_make_rptr_reprs() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelPointerType, Ptr, PtrTarget,
+        };
+
+        let ptr = Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Signed,
+            }),
+        };
+        let adtmeth = SomeLLADTMeth::new(LowLevelPointerType::Ptr(ptr.clone()), ConstValue::None);
+        let rtyper = rtyper_for_tests();
+        let repr = rtyper_makerepr(&SomeValue::LLADTMeth(adtmeth), &rtyper).unwrap();
+        assert_eq!(repr.class_name(), "LLADTMethRepr");
+        assert_eq!(repr.lowleveltype(), &LowLevelType::Ptr(Box::new(ptr)));
     }
 
     #[test]

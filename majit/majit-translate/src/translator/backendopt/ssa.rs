@@ -456,7 +456,8 @@ pub fn ssi_to_ssa(graph: &FunctionGraph) {
         let first_ct = vlist.first().and_then(|v| v.concretetype.clone());
         for v in vlist {
             assert_eq!(
-                v.concretetype, first_ct,
+                v.concretetype.clone(),
+                first_ct,
                 "variables called {vname} have mixed concretetypes"
             );
         }

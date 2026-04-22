@@ -31,7 +31,7 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::model::{
     BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation,
 };
-use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType};
+use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType, PtrTarget};
 use crate::translator::rtyper::rclass;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 // `TypeResolutionState` lives under `translate_legacy` until majit-rtyper
@@ -56,10 +56,15 @@ impl ConcreteCallTableRow {
             last_llfn = Some(llfn.clone());
             concrete_row.insert(*funcdesc, llfn);
         }
-        let fntype = last_llfn
+        let fntype = match last_llfn
             .expect("ConcreteCallTableRow::from_row requires a non-empty row")
             ._TYPE
-            .clone();
+            .TO
+            .clone()
+        {
+            PtrTarget::Func(func) => func,
+            other => panic!("ConcreteCallTableRow expects Func ptr, got {other:?}"),
+        };
         ConcreteCallTableRow {
             row: concrete_row,
             fntype,
@@ -396,9 +401,18 @@ mod tests {
     }
 
     fn make_pygraph(name: &str) -> Rc<PyGraph> {
-        let arg = FlowHlvalue::Variable(FlowVariable::named("x"));
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut arg_var = FlowVariable::named("x");
+        arg_var.concretetype = Some(LowLevelType::Signed);
+        let arg = FlowHlvalue::Variable(arg_var);
         let startblock = FlowBlock::shared(vec![arg.clone()]);
-        let graph = FlowFunctionGraph::new(name, startblock.clone());
+        let mut ret_var = FlowVariable::new();
+        ret_var.concretetype = Some(LowLevelType::Void);
+        let graph = FlowFunctionGraph::with_return_var(
+            name,
+            startblock.clone(),
+            FlowHlvalue::Variable(ret_var),
+        );
         let link = Rc::new(std::cell::RefCell::new(FlowLink::new(
             vec![arg],
             Some(graph.returnblock.clone()),
@@ -437,7 +451,7 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         functionptr(
             FuncType {
-                args: vec![LowLevelType::Void; arity],
+                args: vec![LowLevelType::Signed; arity],
                 result: LowLevelType::Void,
             },
             name,
@@ -524,7 +538,7 @@ mod tests {
             .push(Rc::new(RefCell::new(ConcreteCallTableRow {
                 row: HashMap::from([(DescKey(10), fake_llfn("a", 1))]),
                 fntype: FuncType {
-                    args: vec![LowLevelType::Void],
+                    args: vec![LowLevelType::Signed],
                     result: LowLevelType::Void,
                 },
                 attrname: None,
@@ -533,7 +547,7 @@ mod tests {
         let row = ConcreteCallTableRow {
             row: HashMap::from([(DescKey(10), fake_llfn("a", 1))]),
             fntype: FuncType {
-                args: vec![LowLevelType::Void, LowLevelType::Void],
+                args: vec![LowLevelType::Signed, LowLevelType::Signed],
                 result: LowLevelType::Void,
             },
             attrname: None,
