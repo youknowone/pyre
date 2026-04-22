@@ -449,12 +449,6 @@ fn op_has_side_effects(op: &SpaceOperation) -> bool {
 ///         return op_has_side_effects(op)
 /// ```
 ///
-/// The indirect_call path reads `op.args[-1].value` which is an
-/// rtyper-synthesised list-of-graphs attached to the last call arg;
-/// that shape lands with the rtyper port. Until then the function
-/// only models the direct_call branch faithfully (mirroring upstream's
-/// conservative "has side effects" answer whenever the target graph
-/// can't be resolved) and treats other opnames via `op_has_side_effects`.
 fn rec_op_has_side_effects(
     translator: &TranslationContext,
     op: &SpaceOperation,
@@ -473,13 +467,42 @@ fn rec_op_has_side_effects(
         }
         false
     } else if op.opname == "indirect_call" {
-        // upstream: `graphs = op.args[-1].value`. ConstValue lacks the
-        // graph-list variant (rtyper-phase output), so conservatively
-        // report side effects.
-        true
+        let Some(Hlvalue::Constant(c_graphs)) = op.args.last() else {
+            return true;
+        };
+        let Some(graph_keys) = c_graphs.value.graphs() else {
+            return true;
+        };
+        let Some(graphs) = resolve_graph_family(translator, graph_keys) else {
+            return true;
+        };
+        for g in &graphs {
+            if !has_no_side_effects(translator, g, seen) {
+                return true;
+            }
+        }
+        false
     } else {
         op_has_side_effects(op)
     }
+}
+
+fn resolve_graph_family(
+    translator: &TranslationContext,
+    graph_keys: &[usize],
+) -> Option<Vec<GraphRef>> {
+    let graphs = translator.graphs.borrow();
+    let mut resolved: Vec<GraphRef> = Vec::with_capacity(graph_keys.len());
+    for graph_key in graph_keys {
+        let Some(graph) = graphs
+            .iter()
+            .find(|graph| GraphKey::of(graph).as_usize() == *graph_key)
+        else {
+            return None;
+        };
+        resolved.push(graph.clone());
+    }
+    Some(resolved)
 }
 
 /// Marker for `has_no_side_effects`'s `seen` set. Upstream stores graph
@@ -586,19 +609,24 @@ fn rtyper_already_seen(translator: &TranslationContext, graph: &GraphRef) -> boo
 /// (simplify.py:397-401). Thin wrapper around
 /// `transform_dead_op_vars_in_blocks`.
 pub fn transform_dead_op_vars(graph: &FunctionGraph, translator: Option<&TranslationContext>) {
-    transform_dead_op_vars_in_blocks(&graph.iterblocks(), 1, translator, graph);
+    transform_dead_op_vars_in_blocks(
+        &graph.iterblocks(),
+        1,
+        translator,
+        Some(graph.startblock.clone()),
+    );
 }
 
 /// RPython `transform_dead_op_vars_in_blocks(blocks, graphs, translator=None)`
-/// (simplify.py:422-524). Rust carries `graphs_len` plus the
-/// single-graph object instead of a heterogeneous Python list:
+/// (simplify.py:422-524). Rust carries `graphs_len` plus the optional
+/// single-graph start block instead of a heterogeneous Python list:
 /// upstream only branches on `len(graphs) == 1`, and the multi-graph
 /// arm recovers start blocks through `translator.annotator`.
 pub fn transform_dead_op_vars_in_blocks(
     blocks: &[BlockRef],
     graphs_len: usize,
     translator: Option<&TranslationContext>,
-    single_graph: &FunctionGraph,
+    single_graph_startblock: Option<BlockRef>,
 ) {
     // upstream: `set_of_blocks = set(blocks)`.
     let set_of_blocks: HashSet<BlockKey> = blocks.iter().map(BlockKey::of).collect();
@@ -610,7 +638,9 @@ pub fn transform_dead_op_vars_in_blocks(
     //                     for block in blocks}
     let start_blocks: HashSet<BlockKey> = if graphs_len == 1 {
         let mut start_blocks = HashSet::new();
-        start_blocks.insert(BlockKey::of(&single_graph.startblock));
+        let single_graph_startblock = single_graph_startblock
+            .expect("single-graph transform_dead_op_vars_in_blocks needs startblock");
+        start_blocks.insert(BlockKey::of(&single_graph_startblock));
         start_blocks
     } else {
         let translator =
@@ -621,20 +651,17 @@ pub fn transform_dead_op_vars_in_blocks(
         let annotated = annotator.annotated.borrow();
         let mut start_blocks = HashSet::new();
         for block in blocks {
-            // Upstream's `complete_helpers()` threads `added_blocks`
-            // into `simplify(block_subset=...)`, and `processblock()`
-            // keeps those entries in `added_blocks` even when the
-            // annotator resets `annotated[block]` to `None` (blocked
-            // or still-to-retry). Skip unannotated / blocked entries
-            // the same way the rest of `simplify()` ignores them —
-            // the annotator will revisit them on the next fixpoint
-            // iteration.
-            let Some(graph) = annotated
+            // Upstream indexes `translator.annotator.annotated[block]`
+            // directly here. By the time `complete_helpers()` reaches
+            // `simplify(block_subset=...)`, `complete()` has already
+            // raised on blocked (`False`) entries, so every block in
+            // the subset must resolve to its owning graph.
+            let graph = annotated
                 .get(&BlockKey::of(block))
                 .and_then(|graph| graph.as_ref())
-            else {
-                continue;
-            };
+                .expect(
+                    "transform_dead_op_vars_in_blocks: block_subset contains an unannotated/blocked block in the multi-graph path",
+                );
             start_blocks.insert(BlockKey::of(&graph.borrow().startblock));
         }
         start_blocks
@@ -2898,6 +2925,434 @@ mod tests {
 
         // Both dead ops are gone; block.operations is empty.
         assert!(start.borrow().operations.is_empty());
+    }
+
+    #[test]
+    fn transform_dead_op_vars_removes_side_effect_free_direct_call() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let translator = ann.translator.borrow();
+
+        let callee_arg = Variable::new();
+        let callee_res = Variable::new();
+        let callee_start = Block::shared(vec![Hlvalue::Variable(callee_arg.clone())]);
+        callee_start.borrow_mut().operations.push(SO::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(callee_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(123))),
+            ],
+            Hlvalue::Variable(callee_res.clone()),
+        ));
+        let callee = Rc::new(RefCell::new(FunctionGraph::new(
+            "callee",
+            callee_start.clone(),
+        )));
+        let callee_link = Link::new(
+            vec![Hlvalue::Variable(callee_res.clone())],
+            Some(callee.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        callee_start.closeblock(vec![callee_link]);
+
+        let caller_arg = Variable::new();
+        let call_res = Variable::new();
+        let live_res = Variable::new();
+        let caller_start = Block::shared(vec![Hlvalue::Variable(caller_arg.clone())]);
+        caller_start.borrow_mut().operations.push(SO::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
+                    &callee,
+                    lltype::_getconcretetype,
+                ))))),
+                Hlvalue::Variable(caller_arg.clone()),
+            ],
+            Hlvalue::Variable(call_res.clone()),
+        ));
+        caller_start.borrow_mut().operations.push(SO::new(
+            "int_mul",
+            vec![
+                Hlvalue::Variable(caller_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(12))),
+            ],
+            Hlvalue::Variable(live_res.clone()),
+        ));
+        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+            "caller",
+            caller_start.clone(),
+        )));
+        let caller_link = Link::new(
+            vec![Hlvalue::Variable(live_res.clone())],
+            Some(caller.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        caller_start.closeblock(vec![caller_link]);
+
+        translator.graphs.borrow_mut().push(callee.clone());
+        translator.graphs.borrow_mut().push(caller.clone());
+        let rtyper = translator.buildrtyper();
+        rtyper.mark_already_seen(&callee_start);
+        rtyper.mark_already_seen(&caller_start);
+
+        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+
+        let ops = &caller_start.borrow().operations;
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opname, "int_mul");
+    }
+
+    #[test]
+    fn transform_dead_op_vars_removes_recursive_side_effect_free_direct_call() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let translator = ann.translator.borrow();
+
+        let rec_arg = Variable::new();
+        let rec_call_res = Variable::new();
+        let rec_live_res = Variable::new();
+        let rec_start = Block::shared(vec![Hlvalue::Variable(rec_arg.clone())]);
+        let rec_graph = Rc::new(RefCell::new(FunctionGraph::new("rec", rec_start.clone())));
+        let rec_ptr = Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
+            &rec_graph,
+            lltype::_getconcretetype,
+        )))));
+        rec_start.borrow_mut().operations.push(SO::new(
+            "direct_call",
+            vec![rec_ptr.clone(), Hlvalue::Variable(rec_arg.clone())],
+            Hlvalue::Variable(rec_call_res.clone()),
+        ));
+        rec_start.borrow_mut().operations.push(SO::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(rec_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(1))),
+            ],
+            Hlvalue::Variable(rec_live_res.clone()),
+        ));
+        let rec_link = Link::new(
+            vec![Hlvalue::Variable(rec_live_res.clone())],
+            Some(rec_graph.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        rec_start.closeblock(vec![rec_link]);
+
+        let caller_arg = Variable::new();
+        let call_res = Variable::new();
+        let live_res = Variable::new();
+        let caller_start = Block::shared(vec![Hlvalue::Variable(caller_arg.clone())]);
+        caller_start.borrow_mut().operations.push(SO::new(
+            "direct_call",
+            vec![rec_ptr, Hlvalue::Variable(caller_arg.clone())],
+            Hlvalue::Variable(call_res.clone()),
+        ));
+        caller_start.borrow_mut().operations.push(SO::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(caller_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(42))),
+            ],
+            Hlvalue::Variable(live_res.clone()),
+        ));
+        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+            "caller",
+            caller_start.clone(),
+        )));
+        let caller_link = Link::new(
+            vec![Hlvalue::Variable(live_res.clone())],
+            Some(caller.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        caller_start.closeblock(vec![caller_link]);
+
+        translator.graphs.borrow_mut().push(rec_graph.clone());
+        translator.graphs.borrow_mut().push(caller.clone());
+        let rtyper = translator.buildrtyper();
+        rtyper.mark_already_seen(&rec_start);
+        rtyper.mark_already_seen(&caller_start);
+
+        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+
+        let ops = &caller_start.borrow().operations;
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opname, "int_add");
+    }
+
+    #[test]
+    fn transform_dead_op_vars_removes_side_effect_free_indirect_call_family() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let translator = ann.translator.borrow();
+
+        let mk_pure_graph = |name: &str, delta: i64| {
+            let arg = Variable::new();
+            let res = Variable::new();
+            let start = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+            start.borrow_mut().operations.push(SO::new(
+                "int_add",
+                vec![
+                    Hlvalue::Variable(arg.clone()),
+                    Hlvalue::Constant(C::new(CV::Int(delta))),
+                ],
+                Hlvalue::Variable(res.clone()),
+            ));
+            let graph = Rc::new(RefCell::new(FunctionGraph::new(name, start.clone())));
+            let link = Link::new(
+                vec![Hlvalue::Variable(res)],
+                Some(graph.borrow().returnblock.clone()),
+                None,
+            )
+            .into_ref();
+            start.closeblock(vec![link]);
+            (graph, start)
+        };
+
+        let (callee_a, callee_a_start) = mk_pure_graph("f1", 1);
+        let (callee_b, callee_b_start) = mk_pure_graph("f2", 2);
+
+        let wrapper_arg = Variable::new();
+        let runtime_funcptr = Variable::new();
+        let wrapper_call_res = Variable::new();
+        let wrapper_live_res = Variable::new();
+        let wrapper_start = Block::shared(vec![
+            Hlvalue::Variable(wrapper_arg.clone()),
+            Hlvalue::Variable(runtime_funcptr.clone()),
+        ]);
+        wrapper_start.borrow_mut().operations.push(SO::new(
+            "indirect_call",
+            vec![
+                Hlvalue::Variable(runtime_funcptr),
+                Hlvalue::Variable(wrapper_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Graphs(vec![
+                    GraphKey::of(&callee_a).as_usize(),
+                    GraphKey::of(&callee_b).as_usize(),
+                ]))),
+            ],
+            Hlvalue::Variable(wrapper_call_res),
+        ));
+        wrapper_start.borrow_mut().operations.push(SO::new(
+            "int_mul",
+            vec![
+                Hlvalue::Variable(wrapper_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(42))),
+            ],
+            Hlvalue::Variable(wrapper_live_res.clone()),
+        ));
+        let wrapper = Rc::new(RefCell::new(FunctionGraph::new(
+            "wrapper",
+            wrapper_start.clone(),
+        )));
+        let wrapper_link = Link::new(
+            vec![Hlvalue::Variable(wrapper_live_res.clone())],
+            Some(wrapper.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        wrapper_start.closeblock(vec![wrapper_link]);
+
+        let caller_arg = Variable::new();
+        let caller_runtime_funcptr = Variable::new();
+        let caller_call_res = Variable::new();
+        let caller_live_res = Variable::new();
+        let caller_start = Block::shared(vec![
+            Hlvalue::Variable(caller_arg.clone()),
+            Hlvalue::Variable(caller_runtime_funcptr.clone()),
+        ]);
+        caller_start.borrow_mut().operations.push(SO::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
+                    &wrapper,
+                    lltype::_getconcretetype,
+                ))))),
+                Hlvalue::Variable(caller_arg.clone()),
+                Hlvalue::Variable(caller_runtime_funcptr),
+            ],
+            Hlvalue::Variable(caller_call_res),
+        ));
+        caller_start.borrow_mut().operations.push(SO::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(caller_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(7))),
+            ],
+            Hlvalue::Variable(caller_live_res.clone()),
+        ));
+        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+            "caller",
+            caller_start.clone(),
+        )));
+        let caller_link = Link::new(
+            vec![Hlvalue::Variable(caller_live_res.clone())],
+            Some(caller.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        caller_start.closeblock(vec![caller_link]);
+
+        translator.graphs.borrow_mut().push(callee_a);
+        translator.graphs.borrow_mut().push(callee_b);
+        translator.graphs.borrow_mut().push(wrapper.clone());
+        translator.graphs.borrow_mut().push(caller.clone());
+        let rtyper = translator.buildrtyper();
+        rtyper.mark_already_seen(&callee_a_start);
+        rtyper.mark_already_seen(&callee_b_start);
+        rtyper.mark_already_seen(&wrapper_start);
+        rtyper.mark_already_seen(&caller_start);
+
+        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+
+        let ops = &caller_start.borrow().operations;
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opname, "int_add");
+    }
+
+    #[test]
+    fn transform_dead_op_vars_keeps_indirect_call_with_unknown_family() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let translator = ann.translator.borrow();
+
+        let wrapper_arg = Variable::new();
+        let runtime_funcptr = Variable::new();
+        let wrapper_call_res = Variable::new();
+        let wrapper_live_res = Variable::new();
+        let wrapper_start = Block::shared(vec![
+            Hlvalue::Variable(wrapper_arg.clone()),
+            Hlvalue::Variable(runtime_funcptr.clone()),
+        ]);
+        wrapper_start.borrow_mut().operations.push(SO::new(
+            "indirect_call",
+            vec![
+                Hlvalue::Variable(runtime_funcptr),
+                Hlvalue::Variable(wrapper_arg.clone()),
+                Hlvalue::Constant(C::new(CV::None)),
+            ],
+            Hlvalue::Variable(wrapper_call_res),
+        ));
+        wrapper_start.borrow_mut().operations.push(SO::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(wrapper_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(7))),
+            ],
+            Hlvalue::Variable(wrapper_live_res.clone()),
+        ));
+        let wrapper = Rc::new(RefCell::new(FunctionGraph::new(
+            "wrapper",
+            wrapper_start.clone(),
+        )));
+        let wrapper_link = Link::new(
+            vec![Hlvalue::Variable(wrapper_live_res.clone())],
+            Some(wrapper.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        wrapper_start.closeblock(vec![wrapper_link]);
+
+        let caller_arg = Variable::new();
+        let caller_runtime_funcptr = Variable::new();
+        let caller_call_res = Variable::new();
+        let caller_live_res = Variable::new();
+        let caller_start = Block::shared(vec![
+            Hlvalue::Variable(caller_arg.clone()),
+            Hlvalue::Variable(caller_runtime_funcptr.clone()),
+        ]);
+        caller_start.borrow_mut().operations.push(SO::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(C::new(CV::LLPtr(Box::new(lltype::getfunctionptr(
+                    &wrapper,
+                    lltype::_getconcretetype,
+                ))))),
+                Hlvalue::Variable(caller_arg.clone()),
+                Hlvalue::Variable(caller_runtime_funcptr),
+            ],
+            Hlvalue::Variable(caller_call_res),
+        ));
+        caller_start.borrow_mut().operations.push(SO::new(
+            "int_mul",
+            vec![
+                Hlvalue::Variable(caller_arg.clone()),
+                Hlvalue::Constant(C::new(CV::Int(3))),
+            ],
+            Hlvalue::Variable(caller_live_res.clone()),
+        ));
+        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+            "caller",
+            caller_start.clone(),
+        )));
+        let caller_link = Link::new(
+            vec![Hlvalue::Variable(caller_live_res.clone())],
+            Some(caller.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        caller_start.closeblock(vec![caller_link]);
+
+        translator.graphs.borrow_mut().push(wrapper.clone());
+        translator.graphs.borrow_mut().push(caller.clone());
+        let rtyper = translator.buildrtyper();
+        rtyper.mark_already_seen(&wrapper_start);
+        rtyper.mark_already_seen(&caller_start);
+
+        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+
+        let ops = &caller_start.borrow().operations;
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opname, "direct_call");
+        assert_eq!(ops[1].opname, "int_mul");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "transform_dead_op_vars_in_blocks: block_subset contains an unannotated/blocked block in the multi-graph path"
+    )]
+    fn transform_dead_op_vars_in_blocks_rejects_blocked_entries_in_multi_graph_path() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let translator = ann.translator.borrow();
+
+        let graph_a = Rc::new(RefCell::new(FunctionGraph::new(
+            "a",
+            Block::shared(vec![Hlvalue::Variable(Variable::new())]),
+        )));
+        let graph_b = Rc::new(RefCell::new(FunctionGraph::new(
+            "b",
+            Block::shared(vec![Hlvalue::Variable(Variable::new())]),
+        )));
+        let block_a = graph_a.borrow().startblock.clone();
+        let block_b = graph_b.borrow().startblock.clone();
+
+        translator.graphs.borrow_mut().push(graph_a.clone());
+        translator.graphs.borrow_mut().push(graph_b.clone());
+
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&block_a), Some(graph_a.clone()));
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&block_b), None);
+
+        transform_dead_op_vars_in_blocks(
+            &[block_a, block_b],
+            2,
+            Some(&translator),
+            Some(graph_a.borrow().startblock.clone()),
+        );
     }
 
     #[test]

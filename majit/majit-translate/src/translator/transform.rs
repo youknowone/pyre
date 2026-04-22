@@ -53,20 +53,21 @@ use crate::flowspace::model::{
 ///             seen.add(graph)
 /// ```
 ///
-/// The Rust port iterates the supplied block list, looks each one up
-/// in `ann.annotated` (upstream's direct dict indexing; missing or
-/// `None` entries are skipped — the annotator phase always populates
-/// `annotated[block]` with the owning graph before `checkgraphs` is
-/// reachable), and calls `checkgraph` on each distinct graph.
+/// Upstream indexes `ann.annotated[block]` directly here. By the time
+/// `transform_graph()` runs on an explicit `block_subset`
+/// (`complete_helpers()`'s path), `complete()` has already rejected
+/// blocked (`False`) entries, so every supplied block must resolve to
+/// its owning graph.
 pub fn checkgraphs(ann: &RPythonAnnotator, blocks: &[BlockRef]) {
     // upstream: `seen = set()`.
     let mut seen: HashSet<GraphKey> = HashSet::new();
     let annotated = ann.annotated.borrow();
     for block in blocks {
         // upstream: `graph = self.annotated[block]`.
-        let Some(Some(graph)) = annotated.get(&BlockKey::of(block)) else {
-            continue;
-        };
+        let graph = annotated
+            .get(&BlockKey::of(block))
+            .and_then(|graph| graph.as_ref())
+            .expect("checkgraphs: block_subset contains an unannotated/blocked block");
         // upstream: `if graph not in seen:`.
         let gkey = GraphKey::of(graph);
         if seen.insert(gkey) {
@@ -99,9 +100,10 @@ pub fn fully_annotated_blocks(ann: &RPythonAnnotator) -> Vec<BlockRef> {
         if value.is_none() {
             continue;
         }
-        if let Some(block) = all_blocks.get(key) {
-            result.push(block.clone());
-        }
+        let block = all_blocks
+            .get(key)
+            .expect("fully_annotated_blocks: annotated block missing from all_blocks");
+        result.push(block.clone());
     }
     result
 }
@@ -124,21 +126,16 @@ pub type TransformPass = fn(&RPythonAnnotator, &[BlockRef]);
 /// ]
 /// ```
 ///
-/// The four pattern-rewriting passes are defined in this module and
-/// stay available as freestanding functions, but three of them
-/// (`transform_allocate`, `transform_extend_with_str_slice`,
-/// `transform_extend_with_char_count`) are temporarily held back
-/// from this list until their synthetic opnames
-/// (`alloc_and_set`, `extend_with_str_slice`, `extend_with_char_count`)
-/// are registered in [`crate::flowspace::operation::OpKind`]. Upstream
-/// never reflows blocks after `transform_graph` fires, so the
-/// annotator never has to look up these opnames in `OpKind`; the Rust
-/// port can't rely on that invariant yet because
-/// [`RPythonAnnotator::reflowpendingblock`] may be reached from later
-/// helper-graph specialisation paths and `flowin_op_loop` panics on
-/// unknown raising opnames. `transform_list_contains` is currently a
-/// no-op (see its own doc comment) so it's safe to keep wired.
-pub const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[transform_list_contains];
+/// Keep the default pass list identical to upstream. These rewrites run
+/// after annotation completed, so `transform_graph` must not silently
+/// drop them just because later phases have not yet ported the lowered
+/// opnames.
+pub const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[
+    transform_allocate,
+    transform_extend_with_str_slice,
+    transform_extend_with_char_count,
+    transform_list_contains,
+];
 
 /// RPython `transform.py:253-272` — `transform_graph(ann, extra_passes,
 /// block_subset)`.
@@ -146,6 +143,8 @@ pub const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[transform_list_contains];
 /// ```python
 /// def transform_graph(ann, extra_passes=None, block_subset=None):
 ///     """Apply set of transformations available."""
+///     # WARNING: this produces incorrect results if the graph has been
+///     #          modified by t.simplify() after it had been annotated.
 ///     if extra_passes is None:
 ///         extra_passes = default_extra_passes
 ///     if block_subset is None:
@@ -157,15 +156,14 @@ pub const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[transform_list_contains];
 ///     transform_dead_code(ann, block_subset)
 ///     for pass_ in extra_passes:
 ///         pass_(ann, block_subset)
+///     # do this last, after the previous transformations had a
+///     # chance to remove dependency on certain variables
 ///     transform_dead_op_vars(ann, block_subset)
 ///     if ann.translator:
 ///         checkgraphs(ann, block_subset)
 /// ```
 ///
-/// `transform_dead_code` and `transform_dead_op_vars` are both no-ops
-/// at this commit (see module docs); the line-by-line placeholders are
-/// kept so the driver shape mirrors upstream exactly. The
-/// `ann.translator` guard collapses to an unconditional invocation
+/// The `ann.translator` guard collapses to an unconditional invocation
 /// because the Rust port always owns a `TranslationContext`
 /// (annrpython.py:30-35 default-constructs one when absent).
 pub fn transform_graph(
@@ -188,13 +186,14 @@ pub fn transform_graph(
 
     // upstream: `if ann.translator: checkgraphs(ann, block_subset)`.
     checkgraphs(ann, &subset);
-    // upstream: `transform_dead_code(ann, block_subset)` — deferred.
+    // upstream: `transform_dead_code(ann, block_subset)`.
     transform_dead_code(ann, &subset);
     // upstream: `for pass_ in extra_passes: pass_(ann, block_subset)`.
     for pass_ in extra_passes {
         pass_(ann, &subset);
     }
-    // upstream: `transform_dead_op_vars(ann, block_subset)` — deferred.
+    // upstream: do this last, after previous passes had a chance to
+    // remove dependency on certain variables.
     transform_dead_op_vars(ann, &subset);
     // upstream: `if ann.translator: checkgraphs(ann, block_subset)`.
     checkgraphs(ann, &subset);
@@ -464,26 +463,18 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
 /// set_of_blocks` branch.
 pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
     use crate::translator::simplify;
-    // Upstream's `transform_dead_op_vars_in_blocks` accepts an empty
-    // block subset and simply iterates nothing. The Rust port needs a
-    // representative `graph` reference for side-table construction; if
-    // the translator carries no graphs (e.g. `RPythonAnnotator::new`
-    // smoke tests that drive `simplify(None, None)` on an empty
-    // annotator) there is no work to do, so short-circuit.
     let translator = ann.translator.borrow();
     let graphs_len = translator.graphs.borrow().len();
-    let Some(single_graph) = translator.graphs.borrow().first().cloned() else {
-        debug_assert!(
-            block_subset.is_empty(),
-            "transform_dead_op_vars: block_subset is non-empty but translator has no graphs"
-        );
-        return;
-    };
+    let single_graph_startblock = translator
+        .graphs
+        .borrow()
+        .first()
+        .map(|graph| graph.borrow().startblock.clone());
     simplify::transform_dead_op_vars_in_blocks(
         block_subset,
         graphs_len,
         Some(&translator),
-        &single_graph.borrow(),
+        single_graph_startblock,
     );
 }
 
@@ -737,6 +728,7 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                 let Some(newlist_args) = newlist_sources.get(arg0_v) else {
                     continue;
                 };
+                let needle_binding = ann.binding(&op.args[1]);
                 let mut items: HashMap<ConstValue, ConstValue> = HashMap::new();
                 // Track the canonical (`hash(True) == hash(1) == hash(1.0)`)
                 // form of every key we have already absorbed. Python's
@@ -752,16 +744,12 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                 let mut all_constant = true;
                 for v in newlist_args {
                     // Bail out for constant carriers that
-                    // `Bookkeeper::immutablevalue` still panics on
-                    // (`ConstValue::Function`, `Code`, `LLPtr`,
-                    // `Atom`, `HostObject` outside the already-bound
-                    // cases, …). A real graph like `return x in
-                    // [inner]` where `inner` is a nested function
-                    // would crash in `ann.annotation(v)` before the
-                    // rewrite could fall back to the original
-                    // `contains`. Filtering up front keeps the pass
-                    // a pure optimisation — unsupported constants
-                    // simply defeat the rewrite.
+                    // `Bookkeeper::immutablevalue` still rejects
+                    // (`Code`, `LLPtr`, `Atom`, `SpecTag`,
+                    // `Placeholder`). Filtering them up front keeps
+                    // the pass a pure optimisation — unsupported
+                    // constants simply defeat the rewrite instead of
+                    // crashing inside `ann.annotation(v)`.
                     if let Hlvalue::Constant(c) = v
                         && !is_supported_contains_key(&c.value)
                     {
@@ -773,6 +761,10 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                         break;
                     };
                     if !s.is_immutable_constant() {
+                        all_constant = false;
+                        break;
+                    }
+                    if !can_generalize_contains_key(&s, &needle_binding) {
                         all_constant = false;
                         break;
                     }
@@ -815,7 +807,7 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     };
                     s_dict
                         .dictdef
-                        .generalize_key(&ann.binding(&op.args[1]))
+                        .generalize_key(&needle_binding)
                         .expect("transform_list_contains: generalize_key failed");
                 }
             }
@@ -876,11 +868,11 @@ fn canonical_dict_key(cv: ConstValue) -> ConstValue {
 ///    TypeError. Bail on transitive list/dict presence.
 ///
 /// 2. **`Bookkeeper::immutablevalue` coverage.** Internal flowspace
-///    carriers (`Function`, `Code`, `LLPtr`, `Atom`, `SpecTag`,
-///    `Placeholder`) panic inside `immutablevalue` (see
-///    `bookkeeper.rs:1609-1621`). Feeding those into
+///    carriers (`Code`, `LLPtr`, `Atom`, `SpecTag`, `Placeholder`)
+///    panic inside `immutablevalue` (see `bookkeeper.rs`).
+///    Feeding those into
 ///    `ann.annotation(v)` would crash the pass on valid programs like
-///    `return x in [inner_fn]`, so filter them out.
+///    `return x in [ll_fnptr]`, so filter them out.
 fn is_supported_contains_key(cv: &ConstValue) -> bool {
     match cv {
         ConstValue::Bool(_)
@@ -899,9 +891,14 @@ fn is_supported_contains_key(cv: &ConstValue) -> bool {
         // `HostObject(class)` / property / weakref produce the correct
         // SomeBuiltin / SomePBC annotation for dict-key purposes.
         ConstValue::HostObject(_) => true,
-        // Internal carriers that `immutablevalue` rejects.
-        ConstValue::Function(_)
-        | ConstValue::Code(_)
+        // GraphFunc-backed function constants route to a function
+        // SomePBC. Whether the rewrite can proceed depends on the
+        // needle binding's union-compatibility, checked separately in
+        // `can_generalize_contains_key`.
+        ConstValue::Function(_) => true,
+        // Internal carriers that `immutablevalue` still rejects.
+        ConstValue::Code(_)
+        | ConstValue::Graphs(_)
         | ConstValue::LLPtr(_)
         | ConstValue::Atom(_)
         | ConstValue::SpecTag(_)
@@ -935,6 +932,38 @@ fn const_value_from(s: &super::super::annotator::model::SomeValue) -> Option<Con
             Some(ConstValue::Tuple(items))
         }
         _ => None,
+    }
+}
+
+/// Preflight the downstream `s_dict.dictdef.generalize_key(...)`
+/// call for PBC-backed list constants.
+///
+/// Upstream `transform_list_contains()` always rewrites first and lets
+/// `generalize_key()` / `union()` decide whether the key lattice can
+/// absorb the needle. In the Rust port we need a non-panicking fast
+/// reject so the optimisation stays observationally optional.
+///
+/// Restrict the preflight to the cases where upstream's current
+/// `union()` subset is known to succeed:
+///
+/// * non-PBC keys: defer to the existing lattice
+/// * PBC key + `Impossible` / `None`
+/// * PBC key + PBC needle of the same `DescKind`
+fn can_generalize_contains_key(
+    key_s: &super::super::annotator::model::SomeValue,
+    needle_s: &super::super::annotator::model::SomeValue,
+) -> bool {
+    use super::super::annotator::model::SomeValue;
+
+    let SomeValue::PBC(key_pbc) = key_s else {
+        return true;
+    };
+    match needle_s {
+        SomeValue::Impossible | SomeValue::None_(_) => true,
+        SomeValue::PBC(needle_pbc) => {
+            matches!((key_pbc.get_kind(), needle_pbc.get_kind()), (Ok(a), Ok(b)) if a == b)
+        }
+        _ => false,
     }
 }
 
@@ -995,6 +1024,24 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "checkgraphs: block_subset contains an unannotated/blocked block")]
+    fn checkgraphs_rejects_blocked_entries() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_minimum_graph("g");
+        let start = graph.borrow().startblock.clone();
+        let blocked = Block::shared(vec![]);
+
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&start), Some(graph.clone()));
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&blocked), None);
+
+        checkgraphs(&ann, &[start, blocked]);
+    }
+
+    #[test]
     fn fully_annotated_blocks_skips_blocked_entries() {
         // One block fully annotated (Some(Some(graph))) and one block
         // with `None` (= upstream's `False`) should yield only the
@@ -1017,6 +1064,19 @@ mod tests {
         let blocks = fully_annotated_blocks(&ann);
         assert_eq!(blocks.len(), 1);
         assert!(Rc::ptr_eq(&blocks[0], &a));
+    }
+
+    #[test]
+    #[should_panic(expected = "fully_annotated_blocks: annotated block missing from all_blocks")]
+    fn fully_annotated_blocks_rejects_missing_all_blocks_entry() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_minimum_graph("g");
+        let block = Block::shared(vec![]);
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&block), Some(graph));
+
+        let _ = fully_annotated_blocks(&ann);
     }
 
     #[test]
@@ -1048,6 +1108,61 @@ mod tests {
         }
 
         transform_graph(&ann, None, Some(&[start.clone()]));
+    }
+
+    #[test]
+    fn transform_graph_default_extra_passes_apply_allocate_rewrite() {
+        use crate::flowspace::model::{LinkKey, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let a = Variable::new();
+        let b = Variable::new();
+        let c = Variable::new();
+        let d = Variable::new();
+        let start = Block::shared(vec![
+            Hlvalue::Variable(a.clone()),
+            Hlvalue::Variable(b.clone()),
+        ]);
+        let graph: GraphRef = Rc::new(RefCell::new(FunctionGraph::new("g", start.clone())));
+
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Variable(a.clone())],
+            Hlvalue::Variable(c.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "mul",
+            vec![Hlvalue::Variable(c.clone()), Hlvalue::Variable(b.clone())],
+            Hlvalue::Variable(d.clone()),
+        ));
+        let link = Link::new(
+            vec![Hlvalue::Variable(d.clone())],
+            Some(graph.borrow().returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![link]);
+
+        ann.translator
+            .borrow()
+            .graphs
+            .borrow_mut()
+            .push(graph.clone());
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&start), Some(graph.clone()));
+        ann.all_blocks
+            .borrow_mut()
+            .insert(BlockKey::of(&start), start.clone());
+        for link in &start.borrow().exits {
+            ann.links_followed.borrow_mut().insert(LinkKey::of(link));
+        }
+
+        transform_graph(&ann, None, Some(&[start.clone()]));
+
+        let ops = &start.borrow().operations;
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opname, "alloc_and_set");
     }
 
     #[test]
@@ -1241,6 +1356,65 @@ mod tests {
     }
 
     #[test]
+    fn transform_extend_with_char_count_rewrites_when_types_match() {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeChar, SomeInteger, SomeList, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let mut lst = Variable::new();
+        let mut ch = Variable::new();
+        let mut count = Variable::new();
+        let mul_result = Variable::new();
+        let result = Variable::new();
+
+        lst.annotation = Some(std::rc::Rc::new(SomeValue::List(SomeList::new(
+            ListDef::new(None, SomeValue::Impossible, false, false),
+        ))));
+        ch.annotation = Some(std::rc::Rc::new(SomeValue::Char(SomeChar::new(false))));
+        count.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "mul",
+            vec![
+                Hlvalue::Variable(ch.clone()),
+                Hlvalue::Variable(count.clone()),
+            ],
+            Hlvalue::Variable(mul_result.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "inplace_add",
+            vec![
+                Hlvalue::Variable(lst.clone()),
+                Hlvalue::Variable(mul_result.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+
+        transform_extend_with_char_count(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        assert_eq!(ops[0].opname, "mul");
+        assert_eq!(ops[1].opname, "extend_with_char_count");
+        let Hlvalue::Variable(arg0) = &ops[1].args[0] else {
+            panic!();
+        };
+        assert_eq!(arg0, &lst);
+        let Hlvalue::Variable(arg1) = &ops[1].args[1] else {
+            panic!();
+        };
+        assert_eq!(arg1, &ch);
+        let Hlvalue::Variable(arg2) = &ops[1].args[2] else {
+            panic!();
+        };
+        assert_eq!(arg2, &count);
+    }
+
+    #[test]
     fn transform_list_contains_rewrites_constant_newlist_to_dict_constant() {
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
@@ -1369,11 +1543,12 @@ mod tests {
     }
 
     #[test]
-    fn transform_list_contains_tolerates_unannotated_constant() {
-        // Codex P2 (round 9): `ann.annotation(v)` can legitimately
-        // return None for constant carriers the bookkeeper rejects
-        // (Function / Code / LLPtr / Atom). The rewrite must bail out
-        // gracefully instead of panicking.
+    fn transform_list_contains_tolerates_function_constant_key() {
+        // `ConstValue::Function` now supports `immutablevalue`, but
+        // the dict-key generalization step still cannot union a
+        // function SomePBC key with an arbitrary non-PBC needle. The
+        // optimisation must therefore bail out cleanly instead of
+        // panicking.
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::flowspace::model::{ConstValue as CV, Constant as C, GraphFunc, SpaceOperation};
 
@@ -1387,10 +1562,6 @@ mod tests {
         ))));
         let result = Variable::new();
 
-        // `Function(...)` is not reached by the bookkeeper's
-        // `immutablevalue`, so `ann.annotation(Constant(Function))`
-        // returns None. Before the fix the rewrite would
-        // `.expect(...)` on it and crash.
         let globals = C::new(CV::Dict(Default::default()));
         let gf = GraphFunc::new("inner", globals);
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -1407,13 +1578,157 @@ mod tests {
             Hlvalue::Variable(result),
         ));
 
-        // Must not panic.
         transform_list_contains(&ann, &[block.clone()]);
 
-        // The contains lhs must stay as a Variable since the rewrite
-        // bailed out.
-        let ops = &block.borrow().operations;
-        assert!(matches!(ops[1].args[0], Hlvalue::Variable(_)));
+        assert!(
+            matches!(block.borrow().operations[1].args[0], Hlvalue::Variable(_)),
+            "function-constant list should currently stay unreduced"
+        );
+    }
+
+    #[test]
+    fn transform_list_contains_rewrites_function_constant_key_for_pbc_needle() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, GraphFunc, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let globals = C::new(CV::Dict(Default::default()));
+        let gf = GraphFunc::new("inner", globals);
+        let func_const = Hlvalue::Constant(C::new(CV::Function(Box::new(gf))));
+        let needle_s = ann
+            .annotation(&func_const)
+            .expect("function constant should annotate to SomePBC");
+        let SomeValue::PBC(_) = &needle_s else {
+            panic!("expected function constant annotation to be SomePBC");
+        };
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(needle_s));
+        let result = Variable::new();
+
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![func_const],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        assert!(
+            matches!(
+                block.borrow().operations[1].args[0],
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::Dict(_),
+                    ..
+                })
+            ),
+            "function-constant list should rewrite when the needle is a compatible SomePBC"
+        );
+    }
+
+    #[test]
+    fn transform_list_contains_tolerates_class_constant_key() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            ConstValue as CV, Constant as C, HostObject, SpaceOperation,
+        };
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        ))));
+        let result = Variable::new();
+
+        let class = HostObject::new_class("pkg.C", vec![]);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Constant(C::new(CV::HostObject(class)))],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        assert!(
+            matches!(block.borrow().operations[1].args[0], Hlvalue::Variable(_)),
+            "class-constant list should stay unreduced for a non-PBC needle"
+        );
+    }
+
+    #[test]
+    fn transform_list_contains_rewrites_class_constant_key_for_pbc_needle() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{
+            ConstValue as CV, Constant as C, HostObject, SpaceOperation,
+        };
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let class_const = Hlvalue::Constant(C::new(CV::HostObject(HostObject::new_class(
+            "pkg.C",
+            vec![],
+        ))));
+        let needle_s = ann
+            .annotation(&class_const)
+            .expect("class constant should annotate to SomePBC");
+        let SomeValue::PBC(_) = &needle_s else {
+            panic!("expected class constant annotation to be SomePBC");
+        };
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(needle_s));
+        let result = Variable::new();
+
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![class_const],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        assert!(
+            matches!(
+                block.borrow().operations[1].args[0],
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::Dict(_),
+                    ..
+                })
+            ),
+            "class-constant list should rewrite when the needle is a compatible SomePBC"
+        );
     }
 
     #[test]

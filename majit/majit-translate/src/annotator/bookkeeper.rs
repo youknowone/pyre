@@ -1671,13 +1671,17 @@ impl Bookkeeper {
                 Ok(SomeValue::Dict(result))
             }
             ConstValue::HostObject(obj) => self.immutablevalue_hostobject(obj, x),
+            ConstValue::Function(func) => {
+                let host = HostObject::new_user_function((**func).clone());
+                self.immutablevalue_hostobject(&host, &ConstValue::HostObject(host.clone()))
+            }
             ConstValue::Code(_)
-            | ConstValue::Function(_)
+            | ConstValue::Graphs(_)
             | ConstValue::LLPtr(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder => {
-                // Code / Function / SpecTag / Atom / Placeholder cover
+                // Code / LLPtr / SpecTag / Atom / Placeholder cover
                 // internal flowspace / host-carrier values that
                 // upstream never feeds into immutablevalue. Keep the
                 // fail-fast stub so any unexpected call-site surfaces
@@ -2383,6 +2387,31 @@ mod tests {
                     pbc.descriptions.values().next().unwrap().kind(),
                     DescKind::Function
                 );
+            }
+            other => panic!("expected SomePBC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immutablevalue_const_function_returns_function_pbc() {
+        use crate::annotator::model::{DescKind, SomeValue};
+        use crate::flowspace::model::{Constant, GraphFunc};
+
+        let bk = bk();
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let func = GraphFunc::new("f", globals);
+        let s = bk
+            .immutablevalue(&ConstValue::Function(Box::new(func)))
+            .expect("ConstValue::Function must route to function SomePBC");
+
+        match s {
+            SomeValue::PBC(pbc) => {
+                assert_eq!(pbc.descriptions.len(), 1);
+                assert_eq!(
+                    pbc.descriptions.values().next().unwrap().kind(),
+                    DescKind::Function
+                );
+                assert!(pbc.base.const_box.is_some());
             }
             other => panic!("expected SomePBC, got {other:?}"),
         }

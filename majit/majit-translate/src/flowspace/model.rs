@@ -1413,7 +1413,7 @@ pub static HOST_ENV: LazyLock<HostEnv> = LazyLock::new(HostEnv::bootstrap);
 /// RPython `Constant.value` is the unwrapped Python object; the Rust
 /// port mirrors that contract with an explicit sum type until the
 /// wider host object model lands.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum ConstValue {
     /// Sentinel for the `c_last_exception` atom; populated by F1.4
     /// with `Constant(last_exception)`.
@@ -1456,6 +1456,15 @@ pub enum ConstValue {
     Code(Box<HostCode>),
     /// Python function object.
     Function(Box<GraphFunc>),
+    /// RPython `rpbc.py:216` trailing `c_graphs` constant carried by
+    /// `indirect_call(funcptr, *args, c_graphs)`.
+    ///
+    /// Upstream stores the graph objects themselves in the Python
+    /// list. Rust cannot embed graph refs or raw-pointer wrappers here
+    /// without breaking `HostEnv`'s global `Sync` invariants, so the
+    /// port stores graph identities as `usize` values
+    /// (`GraphKey::as_usize()`).
+    Graphs(Vec<usize>),
     /// RPython `lltype._ptr` function pointer constant.
     LLPtr(Box<_ptr>),
     /// Arbitrary host-level Python object (class, module, builtin
@@ -1474,6 +1483,32 @@ pub enum ConstValue {
     /// atomic counter.
     SpecTag(u64),
 }
+
+impl PartialEq for ConstValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ConstValue::Atom(a), ConstValue::Atom(b)) => a == b,
+            (ConstValue::Placeholder, ConstValue::Placeholder) => true,
+            (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
+            (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
+            (ConstValue::Dict(a), ConstValue::Dict(b)) => a == b,
+            (ConstValue::Str(a), ConstValue::Str(b)) => a == b,
+            (ConstValue::Tuple(a), ConstValue::Tuple(b)) => a == b,
+            (ConstValue::List(a), ConstValue::List(b)) => a == b,
+            (ConstValue::Bool(a), ConstValue::Bool(b)) => a == b,
+            (ConstValue::None, ConstValue::None) => true,
+            (ConstValue::Code(a), ConstValue::Code(b)) => a == b,
+            (ConstValue::Function(a), ConstValue::Function(b)) => a == b,
+            (ConstValue::Graphs(a), ConstValue::Graphs(b)) => a == b,
+            (ConstValue::LLPtr(a), ConstValue::LLPtr(b)) => a == b,
+            (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
+            (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConstValue {}
 
 impl std::fmt::Display for ConstValue {
     /// RPython `Constant.__repr__` prints the wrapped Python value via
@@ -1494,6 +1529,7 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
             | ConstValue::Code(_)
+            | ConstValue::Graphs(_)
             | ConstValue::LLPtr(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
         }
@@ -1550,6 +1586,7 @@ impl Hash for ConstValue {
                 func.firstlineno.hash(state);
                 func.code.as_ref().map(|code| &code.co_name).hash(state);
             }
+            ConstValue::Graphs(graphs) => graphs.hash(state),
             ConstValue::LLPtr(ptr) => ptr.hash(state),
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
@@ -1908,7 +1945,8 @@ impl Constant {
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
             | ConstValue::Dict(_)
-            | ConstValue::Code(_) => true,
+            | ConstValue::Code(_)
+            | ConstValue::Graphs(_) => true,
             // 아래는 upstream 의 최종 `return False`.
             ConstValue::Atom(_)
             | ConstValue::Placeholder
@@ -1954,6 +1992,7 @@ impl ConstValue {
             ConstValue::Bool(value) => Some(*value),
             ConstValue::None => Some(false),
             ConstValue::Code(_) => Some(true),
+            ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
             ConstValue::LLPtr(_) => Some(true),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
@@ -1965,6 +2004,13 @@ impl ConstValue {
     pub fn dict_items(&self) -> Option<&HashMap<ConstValue, ConstValue>> {
         match self {
             ConstValue::Dict(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    pub fn graphs(&self) -> Option<&[usize]> {
+        match self {
+            ConstValue::Graphs(graphs) => Some(graphs.as_slice()),
             _ => None,
         }
     }

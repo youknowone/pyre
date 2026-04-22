@@ -147,6 +147,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::Str(_)
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
+        | ConstValue::Graphs(_)
         | ConstValue::None
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)

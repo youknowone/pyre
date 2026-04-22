@@ -510,8 +510,10 @@ impl RPythonAnnotator {
             .added_blocks
             .borrow()
             .as_ref()
-            .map(|set| set.values().cloned().collect())
-            .unwrap_or_default();
+            .expect("complete_helpers: added_blocks tracker disappeared")
+            .values()
+            .cloned()
+            .collect();
         self.simplify(Some(subset_blocks.as_slice()), None);
         *self.added_blocks.borrow_mut() = saved;
     }
@@ -906,11 +908,14 @@ impl RPythonAnnotator {
                 let mut graphs: HashMap<GraphKey, GraphRef> = HashMap::new();
                 let mut got_blocked = false;
                 for bkey in added_set.keys() {
-                    match annotated.get(bkey) {
-                        Some(Some(graph)) => {
+                    match annotated
+                        .get(bkey)
+                        .expect("complete: added_blocks entry missing from annotated")
+                    {
+                        Some(graph) => {
                             graphs.insert(GraphKey::of(graph), Rc::clone(graph));
                         }
-                        _ => got_blocked = true,
+                        None => got_blocked = true,
                     }
                 }
                 (graphs.values().cloned().collect::<Vec<_>>(), got_blocked)
@@ -2131,6 +2136,7 @@ mod tests {
     use super::super::model::SomeInteger;
     use super::*;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn mk_graph(name: &str, n_args: usize) -> GraphRef {
@@ -2474,6 +2480,21 @@ mod tests {
         // through the "all empty" branch and exit cleanly.
         let translator = super::super::super::translator::translator::TranslationContext::new();
         let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        ann.complete();
+    }
+
+    #[test]
+    #[should_panic(expected = "complete: added_blocks entry missing from annotated")]
+    fn complete_rejects_added_blocks_entries_missing_from_annotated() {
+        let translator = super::super::super::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let graph = mk_graph("broken", 0);
+        let block = graph.borrow().startblock.clone();
+
+        ann.added_blocks
+            .borrow_mut()
+            .replace(HashMap::from([(BlockKey::of(&block), block)]));
+
         ann.complete();
     }
 

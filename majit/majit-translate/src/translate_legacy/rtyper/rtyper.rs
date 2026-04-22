@@ -108,6 +108,7 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::Str(_)
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
+        | ConstValue::Graphs(_)
         | ConstValue::None
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)

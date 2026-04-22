@@ -574,6 +574,7 @@ pub fn builtin_bool(
             ConstValue::Str(s) => !s.is_empty(),
             ConstValue::None => false,
             ConstValue::Tuple(items) | ConstValue::List(items) => !items.is_empty(),
+            ConstValue::Graphs(graphs) => !graphs.is_empty(),
             ConstValue::Dict(m) => !m.is_empty(),
             // HostObject / Function / Code etc. have no `__bool__`
             // override metadata in the Rust port, so take Python's
