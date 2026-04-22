@@ -1131,9 +1131,10 @@ pub struct PyreSym {
     /// RPython MetaInterp.class_of_last_exc_is_const (pyjitpl.py:2754):
     /// True after GUARD_EXCEPTION or GUARD_CLASS on the exception.
     pub(crate) class_of_last_exc_is_const: bool,
-    /// RPython MetaInterp.last_exc_box (pyjitpl.py:3386): symbolic OpRef
-    /// for the exception value. Set by handle_possible_exception after
-    /// GUARD_EXCEPTION, consumed by finishframe_exception for stack push.
+    /// RPython MetaInterp.last_exc_box (pyjitpl.py:1696, 3386): symbolic
+    /// OpRef for the exception value. Set directly by `opimpl_raise`, or
+    /// by handle_possible_exception after GUARD_EXCEPTION, then consumed
+    /// by finishframe_exception for stack push.
     pub(crate) last_exc_box: OpRef,
     /// pyjitpl.py:2597 virtualref_boxes: pairs of (jit_virtual, real_vref).
     /// Each pair: (symbolic OpRef, concrete pointer).
@@ -1297,11 +1298,9 @@ pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
         Instruction::Call { .. }
             | Instruction::StoreAttr { .. }
             | Instruction::StoreSubscr
-            | Instruction::ImportFrom { .. }
-            // RPython opimpl_raise/opimpl_reraise: always Err, needs
-            // GUARD_EXCEPTION + finishframe_exception for exception-path tracing.
-            | Instruction::RaiseVarargs { .. }
-            | Instruction::Reraise { .. }
+            | Instruction::ImportFrom { .. } // RPython raise/reraise are dedicated opimpls, not generic
+                                             // exc=True execute_varargs sites. They unwind directly instead
+                                             // of going through handle_possible_exception().
     )
 }
 
@@ -4550,7 +4549,7 @@ mod tests {
     use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{
         BranchOpcodeHandler, IterOpcodeHandler, LocalOpcodeHandler, Mode, OpcodeStepExecutor,
-        SharedOpcodeHandler, compile_exec, compile_source,
+        PyErrorKind, SharedOpcodeHandler, compile_exec, compile_source,
     };
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
@@ -4811,6 +4810,7 @@ mod tests {
         );
         assert!(contains_instruction(&reraise_code, |instruction| {
             matches!(instruction, Instruction::Reraise { .. })
+                && !instruction_may_raise(instruction)
                 && !instruction_needs_pre_opcode_snapshot(instruction)
         }));
     }
@@ -4843,9 +4843,255 @@ mod tests {
         );
         assert!(contains_instruction(&raise_code, |instruction| {
             matches!(instruction, Instruction::RaiseVarargs { .. })
-                && instruction_may_raise(instruction)
+                && !instruction_may_raise(instruction)
                 && instruction_needs_pre_opcode_snapshot(instruction)
         }));
+    }
+
+    #[test]
+    fn test_reraise_reuses_last_exception_object() {
+        let mut ctx = TraceCtx::for_test(1);
+        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.last_exc_value = exc;
+        sym.last_exc_box = ctx.const_ref(exc as i64);
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        let err = OpcodeStepExecutor::reraise(&mut state).expect_err("reraise should raise");
+        assert_eq!(err.to_exc_object(), exc);
+    }
+
+    #[test]
+    fn test_raise_varargs_zero_reuses_last_exception_object() {
+        let mut ctx = TraceCtx::for_test(1);
+        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.last_exc_value = exc;
+        sym.last_exc_box = ctx.const_ref(exc as i64);
+        pyre_interpreter::eval::set_current_exception(PY_NULL);
+        pyre_interpreter::eval::set_current_exception(exc);
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        let err =
+            OpcodeStepExecutor::raise_varargs(&mut state, 0).expect_err("bare raise should raise");
+        assert_eq!(err.to_exc_object(), exc);
+        pyre_interpreter::eval::set_current_exception(PY_NULL);
+    }
+
+    #[test]
+    fn test_raise_varargs_seeds_last_exception_box_for_finishframe_exception() {
+        let mut ctx = TraceCtx::for_test(1);
+        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let exc_ref = ctx.const_ref(exc as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(exc_ref, ConcreteValue::Ref(exc)),
+        )
+        .expect("push exception");
+
+        let err = OpcodeStepExecutor::raise_varargs(&mut state, 1)
+            .expect_err("explicit raise should raise");
+        assert_eq!(state.sym().last_exc_value, exc);
+        assert_eq!(state.sym().last_exc_box, exc_ref);
+        assert!(state.sym().class_of_last_exc_is_const);
+        assert_eq!(err.to_exc_object(), exc);
+    }
+
+    #[test]
+    fn test_raise_varargs_rejects_non_exception_values_like_interpreter() {
+        let mut ctx = TraceCtx::for_test(1);
+        let bad = pyre_object::w_int_new(7);
+        let bad_ref = ctx.const_ref(bad as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(bad_ref, ConcreteValue::Ref(bad)),
+        )
+        .expect("push invalid raise value");
+
+        let err = OpcodeStepExecutor::raise_varargs(&mut state, 1)
+            .expect_err("invalid raise should fail");
+        assert_eq!(err.kind, PyErrorKind::TypeError);
+        assert_eq!(err.message, "exceptions must derive from BaseException");
+        assert_eq!(state.sym().last_exc_value, PY_NULL);
+        assert_eq!(state.sym().last_exc_box, OpRef::NONE);
+    }
+
+    #[test]
+    fn test_raise_varargs_rejects_non_exception_types_like_interpreter() {
+        let code = compile_exec("x = int\n").expect("compile failed");
+        let mut frame = pyre_interpreter::PyFrame::new_with_context(
+            code,
+            Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        );
+        eval_frame_plain(&mut frame).expect("module body should execute");
+        let ty = unsafe {
+            (*frame.fget_w_globals())
+                .get("x")
+                .copied()
+                .expect("namespace should contain x")
+        };
+
+        let mut ctx = TraceCtx::for_test(1);
+        let ty_ref = ctx.const_ref(ty as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(ty_ref, ConcreteValue::Ref(ty)),
+        )
+        .expect("push non-exception type");
+
+        let err =
+            OpcodeStepExecutor::raise_varargs(&mut state, 1).expect_err("raising int should fail");
+        assert_eq!(err.kind, PyErrorKind::TypeError);
+        assert_eq!(err.message, "exceptions must derive from BaseException");
+        assert_eq!(state.sym().last_exc_value, PY_NULL);
+        assert_eq!(state.sym().last_exc_box, OpRef::NONE);
+    }
+
+    #[test]
+    fn test_raise_varargs_sets_cause_like_interpreter() {
+        let mut ctx = TraceCtx::for_test(1);
+        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let cause = pyre_interpreter::PyError::value_error("root").to_exc_object();
+        let exc_ref = ctx.const_ref(exc as i64);
+        let cause_ref = ctx.const_ref(cause as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(exc_ref, ConcreteValue::Ref(exc)),
+        )
+        .expect("push exception");
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(cause_ref, ConcreteValue::Ref(cause)),
+        )
+        .expect("push cause");
+
+        let err =
+            OpcodeStepExecutor::raise_varargs(&mut state, 2).expect_err("raise from should raise");
+        assert_eq!(err.to_exc_object(), exc);
+        assert_eq!(
+            pyre_interpreter::getattr(exc, "__cause__").expect("read cause"),
+            cause
+        );
+    }
+
+    #[test]
+    fn test_raise_varargs_rejects_invalid_cause_like_interpreter() {
+        let mut ctx = TraceCtx::for_test(1);
+        let exc = pyre_interpreter::PyError::runtime_error("boom").to_exc_object();
+        let cause = pyre_object::w_int_new(5);
+        let exc_ref = ctx.const_ref(exc as i64);
+        let cause_ref = ctx.const_ref(cause as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(exc_ref, ConcreteValue::Ref(exc)),
+        )
+        .expect("push exception");
+        <MIFrame as SharedOpcodeHandler>::push_value(
+            &mut state,
+            FrontendOp::new(cause_ref, ConcreteValue::Ref(cause)),
+        )
+        .expect("push invalid cause");
+
+        let err = OpcodeStepExecutor::raise_varargs(&mut state, 2)
+            .expect_err("invalid cause should fail");
+        assert_eq!(err.kind, PyErrorKind::TypeError);
+        assert_eq!(
+            err.message,
+            "exception cause must be None or derive from BaseException"
+        );
+        assert_eq!(state.sym().last_exc_value, PY_NULL);
+        assert_eq!(state.sym().last_exc_box, OpRef::NONE);
     }
 
     #[test]

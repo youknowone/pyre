@@ -3603,7 +3603,13 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(tb);
             }
             "__cause__" | "__context__" | "__suppress_context__" => {
-                return Ok(w_none());
+                let found = ATTR_TABLE.with(|table| {
+                    let table = table.borrow();
+                    table
+                        .get(&(obj as usize))
+                        .and_then(|d| d.get(name).copied())
+                });
+                return Ok(found.unwrap_or(w_none()));
             }
             "args" => {
                 return Ok(w_tuple_new(vec![]));

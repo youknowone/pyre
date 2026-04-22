@@ -74,6 +74,53 @@ pub fn set_current_exception(exc: PyObjectRef) {
     CURRENT_EXCEPTION.with(|current| current.set(exc));
 }
 
+fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        if cause.is_null() || pyre_object::is_none(cause) || pyre_object::is_exception(cause) {
+            return Ok(cause);
+        }
+        if crate::is_function(cause)
+            && crate::is_builtin_code(crate::getcode(cause) as pyre_object::PyObjectRef)
+        {
+            let code = crate::getcode(cause);
+            let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
+            return match func(&[]) {
+                Ok(cause_obj) if pyre_object::is_exception(cause_obj) => Ok(cause_obj),
+                Ok(_) => Err(PyError::type_error(
+                    "exception cause must be None or derive from BaseException",
+                )),
+                Err(e) => Err(e),
+            };
+        }
+        if pyre_object::is_type(cause) {
+            let result = crate::call_function(cause, &[]);
+            if pyre_object::is_exception(result) {
+                return Ok(result);
+            }
+        }
+    }
+    Err(PyError::type_error(
+        "exception cause must be None or derive from BaseException",
+    ))
+}
+
+fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
+    if let Some(cause_obj) = cause {
+        if !cause_obj.is_null() {
+            crate::baseobjspace::ATTR_TABLE.with(|table| {
+                let mut table = table.borrow_mut();
+                let attrs = table.entry(exc as usize).or_default();
+                attrs.insert("__cause__".to_string(), cause_obj);
+                attrs.insert(
+                    "__suppress_context__".to_string(),
+                    pyre_object::w_bool_from(true),
+                );
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Test whether `exc_value` matches the exception type specification
 /// `exc_type` — a single exception class, a class name string, or a tuple
 /// of classes (for `except (A, B)` clauses). PyPy: pyopcode.py
@@ -992,17 +1039,19 @@ impl OpcodeStepExecutor for PyFrame {
                 // PyPy: executioncontext.py sys_exc_info
                 let exc = CURRENT_EXCEPTION.with(|c| c.get());
                 if exc.is_null() || unsafe { pyre_object::is_none(exc) } {
-                    Err(PyError::runtime_error("no active exception to re-raise"))
+                    Err(PyError::runtime_error("No active exception to reraise"))
                 } else if unsafe { pyre_object::is_exception(exc) } {
                     Err(unsafe { PyError::from_exc_object(exc) })
                 } else {
-                    Err(PyError::runtime_error("no active exception to re-raise"))
+                    Err(PyError::runtime_error("No active exception to reraise"))
                 }
             }
             1 => {
                 let exc = self.pop();
+                let cause = None;
                 unsafe {
                     if pyre_object::is_exception(exc) {
+                        attach_raise_cause(exc, cause)?;
                         Err(PyError::from_exc_object(exc))
                     } else if crate::is_function(exc)
                         && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
@@ -1012,6 +1061,7 @@ impl OpcodeStepExecutor for PyFrame {
                         let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
                         match func(&[]) {
                             Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
+                                attach_raise_cause(exc_obj, cause)?;
                                 Err(PyError::from_exc_object(exc_obj))
                             }
                             Ok(exc_obj) => {
@@ -1024,24 +1074,57 @@ impl OpcodeStepExecutor for PyFrame {
                         // raise SomeType → call type() to create instance
                         let result = crate::call_function(exc, &[]);
                         if pyre_object::is_exception(result) {
+                            attach_raise_cause(result, cause)?;
                             Err(PyError::from_exc_object(result))
                         } else {
-                            Err(PyError::runtime_error(
+                            Err(PyError::type_error(
                                 "exceptions must derive from BaseException",
                             ))
                         }
                     } else {
-                        Err(PyError::runtime_error(
+                        Err(PyError::type_error(
                             "exceptions must derive from BaseException",
                         ))
                     }
                 }
             }
             2 => {
-                // raise X from Y — pop cause, then handle like argc=1
-                // __cause__ chaining is not yet implemented; just pop and discard.
-                let _cause = self.pop();
-                self.raise_varargs(1)
+                let raw_cause = self.pop();
+                let exc = self.pop();
+                let cause = Some(normalize_raise_cause(raw_cause)?);
+                unsafe {
+                    if pyre_object::is_exception(exc) {
+                        attach_raise_cause(exc, cause)?;
+                        Err(PyError::from_exc_object(exc))
+                    } else if crate::is_function(exc)
+                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
+                    {
+                        let code = crate::getcode(exc);
+                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
+                        match func(&[]) {
+                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
+                                attach_raise_cause(exc_obj, cause)?;
+                                Err(PyError::from_exc_object(exc_obj))
+                            }
+                            Ok(exc_obj) => Err(PyError::runtime_error(&crate::py_str(exc_obj))),
+                            Err(e) => Err(e),
+                        }
+                    } else if pyre_object::is_type(exc) {
+                        let result = crate::call_function(exc, &[]);
+                        if pyre_object::is_exception(result) {
+                            attach_raise_cause(result, cause)?;
+                            Err(PyError::from_exc_object(result))
+                        } else {
+                            Err(PyError::type_error(
+                                "exceptions must derive from BaseException",
+                            ))
+                        }
+                    } else {
+                        Err(PyError::type_error(
+                            "exceptions must derive from BaseException",
+                        ))
+                    }
+                }
             }
             _ => Err(PyError::type_error("too many arguments for raise")),
         }
