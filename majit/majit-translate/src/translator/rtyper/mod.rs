@@ -8,6 +8,7 @@
 //! `translator_legacy/rtyper/rtyper.rs`; these modules import it from
 //! there as a temporary wiring bridge.
 
+pub mod error;
 pub mod lltypesystem;
 pub mod normalizecalls;
 pub mod rclass;
