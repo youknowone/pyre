@@ -188,7 +188,9 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
 
         // Ops
         for op in &block.operations {
-            if matches!(&op.kind, crate::model::OpKind::Live) {
+            if matches!(&op.kind, crate::model::OpKind::Input { .. }) {
+                continue;
+            } else if matches!(&op.kind, crate::model::OpKind::Live) {
                 // RPython: -live- op becomes FlatOp::Live marker
                 ops.push(FlatOp::Live {
                     live_values: Vec::new(),
@@ -341,13 +343,19 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
 
     // Count total values
     let mut max_value = 0usize;
+    for block in &graph.blocks {
+        for &arg in &block.inputargs {
+            max_value = max_value.max(arg.0 + 1);
+        }
+        for op in &block.operations {
+            if let Some(ValueId(v)) = op.result {
+                max_value = max_value.max(v + 1);
+            }
+        }
+    }
     for op in &ops {
         match op {
-            FlatOp::Op(op) => {
-                if let Some(ValueId(v)) = op.result {
-                    max_value = max_value.max(v + 1);
-                }
-            }
+            FlatOp::Op(_) => {}
             FlatOp::Move {
                 dst: ValueId(d),
                 src,
@@ -1066,7 +1074,7 @@ where
 mod tests {
     use super::*;
     use crate::flowspace::model::ConstValue;
-    use crate::model::{ExitCase, FunctionGraph, OpKind, exception_exitcase};
+    use crate::model::{ExitCase, FunctionGraph, OpKind, SpaceOperation, exception_exitcase};
 
     /// Test helper — build a `regallocs` map that assigns each
     /// `ValueId(n)` the color `n` in `RegKind::Int`. This turns the
@@ -1189,6 +1197,53 @@ mod tests {
             .filter(|op| matches!(op, FlatOp::Move { .. }))
             .collect();
         assert_eq!(moves.len(), 1, "should have 1 Move for Phi resolution");
+    }
+
+    #[test]
+    fn flatten_skips_input_ops() {
+        let mut graph = FunctionGraph::new("inputs");
+        let entry = graph.startblock;
+        let input = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: crate::model::ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let value = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
+        let sum = graph
+            .push_op(
+                entry,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: input,
+                    rhs: value,
+                    result_ty: crate::model::ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(sum));
+
+        let flat = flatten(&graph, &identity_regallocs(8));
+        assert!(
+            !flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::Op(SpaceOperation {
+                    kind: OpKind::Input { .. },
+                    ..
+                })
+            )),
+            "flatten must not serialize input ops: {:?}",
+            flat.insns
+        );
+        assert!(
+            flat.num_values >= 3,
+            "input ValueIds must still contribute to num_values"
+        );
     }
 
     #[test]

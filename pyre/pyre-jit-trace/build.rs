@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let pyre_base = format!("{manifest_dir}/..");
+    let repo_root = format!("{manifest_dir}/../..");
 
     // Collect ALL source files from the active interpreter crates.
     let source_dirs = [
@@ -211,6 +212,11 @@ fn main() {
     for path in &source_paths {
         println!("cargo::rerun-if-changed={path}");
     }
+    emit_rerun_if_changed_recursive(&format!("{repo_root}/majit/majit-translate/src"));
+    println!(
+        "cargo::rerun-if-changed={}",
+        format!("{repo_root}/majit/majit-translate/build.rs")
+    );
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
 }
@@ -255,5 +261,15 @@ fn collect_rs_files(dir: &str, sources: &mut Vec<String>, paths: &mut Vec<String
                 eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path_str}: {e}");
             }
         }
+    }
+}
+
+fn emit_rerun_if_changed_recursive(dir: &str) {
+    for entry in WalkDir::new(dir) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        println!("cargo::rerun-if-changed={}", entry.path().display());
     }
 }

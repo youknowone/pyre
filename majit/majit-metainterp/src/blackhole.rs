@@ -4461,7 +4461,7 @@ mod tests {
         }
 
         #[test]
-        fn wire_bhimpl_handlers_leaves_dead_v_access_aliases_unwired() {
+        fn wire_bhimpl_handlers_wires_emitted_pyre_access_aliases() {
             let mut insns = HashMap::new();
             insns.insert("setfield_gc_v/rid".to_string(), 0u8);
             insns.insert("getarrayitem_gc_v/rid>i".to_string(), 1u8);
@@ -4469,19 +4469,43 @@ mod tests {
             insns.insert("getfield_gc_v/id>i".to_string(), 3u8);
             insns.insert("getarrayitem_gc_v/iid>i".to_string(), 4u8);
             insns.insert("getarrayitem_gc_v/ird>i".to_string(), 5u8);
-            insns.insert("setfield_gc_v/iid".to_string(), 6u8);
-            insns.insert("setfield_gc_v/ird".to_string(), 7u8);
-            insns.insert("setarrayitem_gc_v/iiid".to_string(), 8u8);
-            insns.insert("setfield_vable_v/id".to_string(), 9u8);
-            insns.insert("setfield_vable_v/rd".to_string(), 10u8);
-            insns.insert("getfield_vable_v/d>i".to_string(), 11u8);
+            insns.insert("setfield_gc_v/ird".to_string(), 6u8);
+            insns.insert("setfield_gc_i/iid".to_string(), 7u8);
+            insns.insert("getfield_gc_r/id>r".to_string(), 8u8);
+            insns.insert("getfield_vable_i/id>i".to_string(), 9u8);
+            insns.insert("setfield_vable_i/iid".to_string(), 10u8);
+            insns.insert("getfield_vable_v/id>i".to_string(), 11u8);
+            insns.insert("setfield_vable_v/ird".to_string(), 12u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
             super::wire_bhimpl_handlers(&mut builder);
 
             let placeholder = super::unwired_handler_placeholder as *const () as usize;
-            for &slot in &[0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
+            for &slot in &[0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+                assert_ne!(
+                    builder.dispatch_table[slot] as *const () as usize,
+                    placeholder
+                );
+            }
+        }
+
+        #[test]
+        fn wire_bhimpl_handlers_leaves_dead_v_access_aliases_unwired() {
+            let mut insns = HashMap::new();
+            insns.insert("setfield_gc_v/iid".to_string(), 0u8);
+            insns.insert("setarrayitem_gc_v/iiid".to_string(), 1u8);
+            insns.insert("setfield_vable_v/id".to_string(), 2u8);
+            insns.insert("setfield_vable_v/rd".to_string(), 3u8);
+            insns.insert("getfield_vable_v/d>i".to_string(), 4u8);
+            insns.insert("input_v/>i".to_string(), 5u8);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.setup_insns(&insns);
+            super::wire_bhimpl_handlers(&mut builder);
+
+            let placeholder = super::unwired_handler_placeholder as *const () as usize;
+            for &slot in &[0usize, 1, 2, 3, 4, 5] {
                 assert_eq!(
                     builder.dispatch_table[slot] as *const () as usize,
                     placeholder
@@ -4798,23 +4822,10 @@ fn handler_const_int_c_i(
     bh.registers_i[code[position + 1] as usize] = src;
     Ok(position + 2)
 }
-/// Handler for pyre-only `input_v/>i` — a graph-input marker emitted by
-/// `Assembler::encode_op` default branch (`assembler.rs:842-859`) whenever
-/// `OpKind::Input { ty: Void }` has no specialized arm. The bytecode
-/// layout: empty argcodes before `>`, 1 result-register byte after.
-///
-/// RPython has no `bhimpl_input_*` — function arguments are written to
-/// registers by the caller before `dispatch_loop()` runs
-/// (`blackhole.py:316-331` `setposition`, the inline_call / recursive_call
-/// handlers), so input opcodes never enter the byte stream. pyre emits
-/// them anyway as graph-position markers.  At dispatch time the target
-/// register has already been pre-populated, so the marker is a no-op:
-/// advance past the 1 destination byte and leave the register untouched.
-///
-/// The `unknown/>i` opname (emitted for `OpKind::Unknown { .. }`) shares
-/// the exact same byte layout and semantics; wire that to the same
-/// handler rather than introducing a clone.
-fn handler_input_marker_v_i(
+/// Handler for pyre-only `unknown/>i` — a no-op result marker emitted by
+/// `Assembler::encode_op`'s default branch for `OpKind::Unknown { .. }`.
+/// The bytecode layout has no args and a single destination register byte.
+fn handler_unknown_result_marker_i(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
@@ -5504,12 +5515,36 @@ fn handler_getfield_gc_i(
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
 }
+fn handler_getfield_gc_i_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
+    bh.registers_i[code[pos] as usize] = result;
+    Ok(pos + 1)
+}
 fn handler_getfield_gc_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
+    bh.registers_r[code[pos] as usize] = result.0 as i64;
+    Ok(pos + 1)
+}
+fn handler_getfield_gc_r_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
     let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
@@ -5542,12 +5577,36 @@ fn handler_setfield_gc_i(
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
+fn handler_setfield_gc_i_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
+    let value = bh.registers_i[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
+    Ok(pos)
+}
 fn handler_setfield_gc_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
+    let value = bh.registers_r[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
+    Ok(pos)
+}
+fn handler_setfield_gc_r_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
@@ -5591,6 +5650,30 @@ fn handler_getarrayitem_gc_i(
 ) -> Result<usize, DispatchError> {
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
+    Ok(pos + 1)
+}
+fn handler_getarrayitem_gc_i_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_i[code[position] as usize];
+    let index = bh.registers_i[code[position + 1] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
+    Ok(pos + 1)
+}
+fn handler_getarrayitem_gc_i_intbase_refindex(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let array = bh.registers_i[code[position] as usize];
+    let index = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu.expect("cpu not set");
     bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
@@ -6126,16 +6209,9 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // pyre's const_int/c>i is structurally a register copy — see
     // handler_const_int_c_i docs for the emit_const_i deviation.
     builder.wire_handler("const_int/c>i", handler_const_int_c_i);
-    // pyre-only graph-position markers emitted by `Assembler::encode_op`'s
-    // default branch for `OpKind::Input { ty: Void }` and
-    // `OpKind::Unknown { .. }` (assembler.rs:842-859). RPython has no
-    // bhimpl counterpart — function arguments are wired into registers
-    // before dispatch_loop runs (blackhole.py:316-331 `setposition`, the
-    // inline_call / recursive_call callers). At dispatch time the
-    // destination register is already populated, so the marker is a
-    // no-op that just advances past the 1 result byte.
-    builder.wire_handler("input_v/>i", handler_input_marker_v_i);
-    builder.wire_handler("unknown/>i", handler_input_marker_v_i);
+    // pyre-only unknown marker emitted by `Assembler::encode_op`'s
+    // default branch for `OpKind::Unknown { .. }`.
+    builder.wire_handler("unknown/>i", handler_unknown_result_marker_i);
 
     // Control flow
     builder.wire_handler("live/", handler_live);
@@ -6238,21 +6314,37 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_gc_i/rd>i", handler_getfield_gc_i);
     builder.wire_handler("getfield_gc_r/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f/rd>f", handler_getfield_gc_f);
+    // pyre build-time jitcodes still emit int-base and unresolved-kind
+    // aliases for a subset of field accesses. They use the same backend
+    // primitive; only the source register class / stale `_v` suffix differs.
+    builder.wire_handler("getfield_gc_i/id>i", handler_getfield_gc_i_intbase);
+    builder.wire_handler("getfield_gc_r/id>r", handler_getfield_gc_r_intbase);
+    builder.wire_handler("getfield_gc_v/id>i", handler_getfield_gc_i_intbase);
     builder.wire_handler("getfield_gc_i_pure/rd>i", handler_getfield_gc_i); // alias
     builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
+    builder.wire_handler("setfield_gc_i/iid", handler_setfield_gc_i_intbase);
+    builder.wire_handler("setfield_gc_v/rid", handler_setfield_gc_i);
+    builder.wire_handler("setfield_gc_v/ird", handler_setfield_gc_r_intbase);
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
     // Array item operations (blackhole.py:1329-1365)
     builder.wire_handler("getarrayitem_gc_i/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r/rid>r", handler_getarrayitem_gc_r);
+    builder.wire_handler("getarrayitem_gc_v/rid>i", handler_getarrayitem_gc_i);
+    builder.wire_handler("getarrayitem_gc_v/iid>i", handler_getarrayitem_gc_i_intbase);
+    builder.wire_handler(
+        "getarrayitem_gc_v/ird>i",
+        handler_getarrayitem_gc_i_intbase_refindex,
+    );
     builder.wire_handler("getarrayitem_gc_i_pure/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r_pure/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);
     builder.wire_handler("setarrayitem_gc_r/rird", handler_setarrayitem_gc_r);
+    builder.wire_handler("setarrayitem_gc_v/riid", handler_setarrayitem_gc_i);
 
     // Raw field operations (blackhole.py:1464-1502)
     builder.wire_handler("getfield_raw_i/id>i", handler_getfield_raw_i);
@@ -6407,9 +6499,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_vable_i/rd>i", handler_getfield_vable_i);
     builder.wire_handler("getfield_vable_r/rd>r", handler_getfield_vable_r);
     builder.wire_handler("getfield_vable_f/rd>f", handler_getfield_vable_f);
+    builder.wire_handler("getfield_vable_i/id>i", handler_getfield_vable_i_intbase);
+    builder.wire_handler("getfield_vable_v/id>i", handler_getfield_vable_i_intbase);
     builder.wire_handler("setfield_vable_i/rid", handler_setfield_vable_i);
     builder.wire_handler("setfield_vable_r/rrd", handler_setfield_vable_r);
     builder.wire_handler("setfield_vable_f/rfd", handler_setfield_vable_f);
+    builder.wire_handler("setfield_vable_i/iid", handler_setfield_vable_i_intbase);
+    builder.wire_handler("setfield_vable_v/ird", handler_setfield_vable_r_intbase);
     builder.wire_handler("getarrayitem_vable_i/ridd>i", handler_getarrayitem_vable_i);
     builder.wire_handler("getarrayitem_vable_r/ridd>r", handler_getarrayitem_vable_r);
     builder.wire_handler("setarrayitem_vable_i/riidd", handler_setarrayitem_vable_i);
@@ -6916,6 +7012,21 @@ fn handler_getfield_vable_i(
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
 }
+fn handler_getfield_vable_i_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[p] as usize];
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
+    }
+    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
+    Ok(p + 1)
+}
 fn handler_getfield_vable_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -6963,12 +7074,44 @@ fn handler_setfield_vable_i(
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
 }
+fn handler_setfield_vable_i_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[p] as usize];
+    let value = bh.registers_i[code[p + 1] as usize];
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
+    }
+    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
+    Ok(p)
+}
 fn handler_setfield_vable_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
+    let value = bh.registers_r[code[p + 1] as usize];
+    if !bh.virtualizable_info.is_null() {
+        let vinfo = unsafe { &*bh.virtualizable_info };
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
+    }
+    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let cpu = bh.cpu.expect("cpu not set");
+    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
+    Ok(p)
+}
+fn handler_setfield_vable_r_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };

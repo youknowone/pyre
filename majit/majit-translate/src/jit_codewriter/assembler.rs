@@ -556,6 +556,11 @@ impl Assembler {
         let mut argcodes = String::new();
 
         match &op.kind {
+            // RPython flatten.py keeps inputargs on Block.inputargs and does
+            // not serialize them as bytecode operations.
+            OpKind::Input { .. } => {
+                panic!("OpKind::Input must be eliminated before assembly");
+            }
             // RPython: inline_call → [jitcode, I[...], R[...], F[...]]
             OpKind::InlineCall {
                 jitcode,
@@ -2389,5 +2394,104 @@ mod tests {
             "unexpected setfield_vable_v/rd key: {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn assemble_skips_input_opnames_after_flatten() {
+        use crate::flatten::flatten as flatten_graph;
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("input_free_bytecode");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let sum = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(sum));
+
+        let mut value_kinds = HashMap::new();
+        value_kinds.insert(lhs, RegKind::Int);
+        value_kinds.insert(rhs, RegKind::Int);
+        value_kinds.insert(sum, RegKind::Int);
+
+        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
+        let mut flat = flatten_graph(&graph, &regallocs);
+        assert!(
+            !flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::Op(crate::model::SpaceOperation {
+                    kind: OpKind::Input { .. },
+                    ..
+                })
+            )),
+            "flatten unexpectedly left input ops: {:?}",
+            flat.insns
+        );
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            !asm.insns.keys().any(|key| key.starts_with("input_")),
+            "unexpected input opcode keys: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "OpKind::Input must be eliminated before assembly")]
+    fn assemble_rejects_input_ops() {
+        let mut flat = SSARepr {
+            name: "bad_input".into(),
+            insns: vec![FlatOp::Op(crate::model::SpaceOperation {
+                result: Some(ValueId(0)),
+                kind: crate::model::OpKind::Input {
+                    name: "x".into(),
+                    ty: crate::model::ValueType::Int,
+                },
+            })],
+            num_values: 1,
+            num_blocks: 1,
+            value_kinds: HashMap::new(),
+            insns_pos: None,
+        };
+        let mut regallocs = HashMap::new();
+        regallocs.insert(
+            RegKind::Int,
+            regalloc::RegAllocResult {
+                coloring: HashMap::from([(ValueId(0), 0usize)]),
+                num_regs: 1,
+            },
+        );
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
     }
 }
