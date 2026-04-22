@@ -33,7 +33,9 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _getconcretetype, _ptr, LowLevelType, getfunctionptr,
 };
-use crate::translator::rtyper::rmodel::{Repr, inputconst_from_lltype};
+use crate::translator::rtyper::rmodel::{
+    Repr, ReprKey, inputconst_from_lltype, rtyper_makekey, rtyper_makerepr,
+};
 use crate::translator::rtyper::rpbc::LLCallTable;
 
 /// RPython `class RPythonTyper(object)` (rtyper.py:42+).
@@ -53,6 +55,18 @@ pub struct RPythonTyper {
     /// RPython `self.concrete_calltables = {}` assigned in `__init__`
     /// (rtyper.py:57).
     pub concrete_calltables: RefCell<HashMap<usize, (LLCallTable, usize)>>,
+    /// RPython `self.reprs = {}` (`rtyper.py:54`) — cache keyed by
+    /// `s_obj.rtyper_makekey()`. Pyre stores `Option<Arc<dyn Repr>>`
+    /// because upstream pre-inserts `None` before calling
+    /// `rtyper_makerepr` to detect recursive `getrepr()` (rtyper.py:156).
+    pub reprs: RefCell<HashMap<ReprKey, Option<Arc<dyn Repr>>>>,
+    /// RPython `self._reprs_must_call_setup = []` (`rtyper.py:55`).
+    pub reprs_must_call_setup: RefCell<Vec<Arc<dyn Repr>>>,
+    /// RPython `self._seen_reprs_must_call_setup = {}` (`rtyper.py:56`).
+    ///
+    /// Pyre stores pointer-identity fingerprints so Arc-equal Reprs
+    /// are deduped without requiring `Hash + Eq` on the trait object.
+    pub seen_reprs_must_call_setup: RefCell<Vec<*const ()>>,
 }
 
 impl RPythonTyper {
@@ -66,6 +80,9 @@ impl RPythonTyper {
             annotator: Rc::downgrade(annotator),
             already_seen: RefCell::new(HashMap::new()),
             concrete_calltables: RefCell::new(HashMap::new()),
+            reprs: RefCell::new(HashMap::new()),
+            reprs_must_call_setup: RefCell::new(Vec::new()),
+            seen_reprs_must_call_setup: RefCell::new(Vec::new()),
         }
     }
 
@@ -110,6 +127,114 @@ impl RPythonTyper {
             .upgrade()
             .expect("RPythonTyper.annotator weak reference dropped");
         ann.binding(var)
+    }
+
+    /// RPython `RPythonTyper.add_pendingsetup(self, repr)`
+    /// (rtyper.py:105-111).
+    ///
+    /// ```python
+    /// def add_pendingsetup(self, repr):
+    ///     assert isinstance(repr, Repr)
+    ///     if repr in self._seen_reprs_must_call_setup:
+    ///         return
+    ///     self._reprs_must_call_setup.append(repr)
+    ///     self._seen_reprs_must_call_setup[repr] = True
+    /// ```
+    pub fn add_pendingsetup(&self, repr: Arc<dyn Repr>) {
+        let fingerprint = Arc::as_ptr(&repr) as *const ();
+        let mut seen = self.seen_reprs_must_call_setup.borrow_mut();
+        if seen.contains(&fingerprint) {
+            return;
+        }
+        seen.push(fingerprint);
+        self.reprs_must_call_setup.borrow_mut().push(repr);
+    }
+
+    /// RPython `RPythonTyper.getrepr(self, s_obj)` (rtyper.py:149-164).
+    ///
+    /// ```python
+    /// def getrepr(self, s_obj):
+    ///     key = s_obj.rtyper_makekey()
+    ///     assert key[0] is s_obj.__class__
+    ///     try:
+    ///         result = self.reprs[key]
+    ///     except KeyError:
+    ///         self.reprs[key] = None
+    ///         result = s_obj.rtyper_makerepr(self)
+    ///         assert not isinstance(result.lowleveltype, ContainerType), ...
+    ///         self.reprs[key] = result
+    ///         self.add_pendingsetup(result)
+    ///     assert result is not None     # recursive getrepr()!
+    ///     return result
+    /// ```
+    pub fn getrepr(&self, s_obj: &SomeValue) -> Result<Arc<dyn Repr>, TyperError> {
+        let key = rtyper_makekey(s_obj);
+        // Fast-path hit: entry present and Some → return clone.
+        if let Some(slot) = self.reprs.borrow().get(&key) {
+            return match slot {
+                Some(repr) => Ok(repr.clone()),
+                None => Err(TyperError::message(format!(
+                    "recursive getrepr() for {s_obj:?}"
+                ))),
+            };
+        }
+        // First time seeing this key: upstream pre-inserts None as the
+        // recursion sentinel, then materialises the Repr.
+        self.reprs.borrow_mut().insert(key.clone(), None);
+        let result = rtyper_makerepr(s_obj, self)?;
+        self.reprs.borrow_mut().insert(key, Some(result.clone()));
+        self.add_pendingsetup(result.clone());
+        Ok(result)
+    }
+
+    /// RPython `RPythonTyper.bindingrepr(self, var)` (rtyper.py:174-175).
+    ///
+    /// ```python
+    /// def bindingrepr(self, var):
+    ///     return self.getrepr(self.binding(var))
+    /// ```
+    pub fn bindingrepr(&self, var: &Hlvalue) -> Result<Arc<dyn Repr>, TyperError> {
+        let s_obj = self.binding(var);
+        self.getrepr(&s_obj)
+    }
+
+    /// RPython `RPythonTyper.call_all_setups(self)` (rtyper.py:243-256).
+    ///
+    /// ```python
+    /// def call_all_setups(self):
+    ///     must_setup_more = []
+    ///     delayed = []
+    ///     while self._reprs_must_call_setup:
+    ///         r = self._reprs_must_call_setup.pop()
+    ///         if r.is_setup_delayed():
+    ///             delayed.append(r)
+    ///         else:
+    ///             r.setup()
+    ///             must_setup_more.append(r)
+    ///     for r in must_setup_more:
+    ///         r.setup_final()
+    ///     self._reprs_must_call_setup.extend(delayed)
+    /// ```
+    pub fn call_all_setups(&self) -> Result<(), TyperError> {
+        let mut must_setup_more: Vec<Arc<dyn Repr>> = Vec::new();
+        let mut delayed: Vec<Arc<dyn Repr>> = Vec::new();
+        loop {
+            let r = self.reprs_must_call_setup.borrow_mut().pop();
+            let Some(r) = r else {
+                break;
+            };
+            if r.is_setup_delayed() {
+                delayed.push(r);
+            } else {
+                r.setup()?;
+                must_setup_more.push(r);
+            }
+        }
+        for r in &must_setup_more {
+            r.setup_final()?;
+        }
+        self.reprs_must_call_setup.borrow_mut().extend(delayed);
+        Ok(())
     }
 }
 
@@ -192,6 +317,52 @@ impl HighLevelOp {
     /// RPython `HighLevelOp.nb_args` property (rtyper.py:636-637).
     pub fn nb_args(&self) -> usize {
         self.args_v.borrow().len()
+    }
+
+    /// RPython `HighLevelOp.setup(self)` (rtyper.py:625-633).
+    ///
+    /// ```python
+    /// def setup(self):
+    ///     rtyper = self.rtyper
+    ///     spaceop = self.spaceop
+    ///     self.args_v   = list(spaceop.args)
+    ///     self.args_s   = [rtyper.binding(a) for a in spaceop.args]
+    ///     self.s_result = rtyper.binding(spaceop.result)
+    ///     self.args_r   = [rtyper.getrepr(s_a) for s_a in self.args_s]
+    ///     self.r_result = rtyper.getrepr(self.s_result)
+    ///     rtyper.call_all_setups()
+    /// ```
+    ///
+    /// `getrepr` arms for non-Impossible SomeValue variants currently
+    /// surface `MissingRTypeOperation` — cascading port work fills
+    /// them in (rint.rs, rfloat.rs, rpbc.rs, ...). Callers that hit
+    /// the error surface know exactly which upstream module to land
+    /// next.
+    pub fn setup(&self) -> Result<(), TyperError> {
+        let rtyper = self
+            .rtyper
+            .upgrade()
+            .ok_or_else(|| TyperError::message("HighLevelOp.rtyper weak reference dropped"))?;
+        *self.args_v.borrow_mut() = self.spaceop.args.clone();
+        let args_s: Vec<SomeValue> = self
+            .spaceop
+            .args
+            .iter()
+            .map(|a| rtyper.binding(a))
+            .collect();
+        *self.s_result.borrow_mut() = Some(rtyper.binding(&self.spaceop.result));
+        let mut args_r: Vec<Option<Arc<dyn Repr>>> = Vec::with_capacity(args_s.len());
+        for s_a in &args_s {
+            args_r.push(Some(rtyper.getrepr(s_a)?));
+        }
+        *self.args_r.borrow_mut() = args_r;
+        let s_result_clone = self.s_result.borrow().clone();
+        if let Some(s_r) = s_result_clone {
+            *self.r_result.borrow_mut() = Some(rtyper.getrepr(&s_r)?);
+        }
+        *self.args_s.borrow_mut() = args_s;
+        rtyper.call_all_setups()?;
+        Ok(())
     }
 
     /// RPython `HighLevelOp.has_implicit_exception(self, exc_cls)`
@@ -777,5 +948,133 @@ mod tests {
         let rtyper = RPythonTyper::new(&ann);
         let v = Hlvalue::Variable(Variable::new());
         let _ = rtyper.binding(&v);
+    }
+
+    #[test]
+    fn getrepr_caches_impossible_as_shared_singleton() {
+        // rtyper.py:149-164: first call materialises, second returns
+        // cached entry. For SomeImpossibleValue both arms target the
+        // same `impossible_repr` singleton, so pointer-equality via
+        // Arc::ptr_eq must hold.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let r1 = rtyper.getrepr(&SomeValue::Impossible).unwrap();
+        let r2 = rtyper.getrepr(&SomeValue::Impossible).unwrap();
+        assert!(Arc::ptr_eq(&r1, &r2));
+        // Cache now carries exactly one entry keyed by Impossible.
+        assert_eq!(rtyper.reprs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn getrepr_surfaces_missing_rtype_operation_for_unported_variants() {
+        // rtyper.py:157 — `s_obj.rtyper_makerepr(self)` raises when
+        // the variant has no concrete Repr yet. Pyre surfaces
+        // `MissingRTypeOperation` so cascading callers can anchor on
+        // the upstream module name in the error message.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let err = rtyper
+            .getrepr(&SomeValue::Integer(SomeInteger::default()))
+            .unwrap_err();
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("rint.py"));
+    }
+
+    #[test]
+    fn bindingrepr_passes_through_getrepr() {
+        // rtyper.py:174-175.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let mut var = Variable::new();
+        var.annotation = Some(Rc::new(SomeValue::Impossible));
+        let v = Hlvalue::Variable(var);
+        let repr = rtyper.bindingrepr(&v).unwrap();
+        // impossible_repr lowleveltype is Void.
+        assert_eq!(repr.lowleveltype(), &LowLevelType::Void);
+    }
+
+    #[test]
+    fn getrepr_adds_pendingsetup_once_per_key() {
+        // rtyper.py:105-111 + 162: `add_pendingsetup` dedupes by
+        // Repr instance; the second getrepr hit must not re-enqueue
+        // the cached Arc.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let _ = rtyper.getrepr(&SomeValue::Impossible).unwrap();
+        let after_first = rtyper.reprs_must_call_setup.borrow().len();
+        let _ = rtyper.getrepr(&SomeValue::Impossible).unwrap();
+        // Second call hits cache (rtyper.py:154-155) and skips
+        // add_pendingsetup entirely, so pending-setup depth is
+        // unchanged.
+        assert_eq!(rtyper.reprs_must_call_setup.borrow().len(), after_first);
+    }
+
+    #[test]
+    fn call_all_setups_drains_pending_reprs() {
+        // rtyper.py:243-256.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let _ = rtyper.getrepr(&SomeValue::Impossible).unwrap();
+        assert_eq!(rtyper.reprs_must_call_setup.borrow().len(), 1);
+        rtyper.call_all_setups().unwrap();
+        assert_eq!(rtyper.reprs_must_call_setup.borrow().len(), 0);
+    }
+
+    #[test]
+    fn highlevelop_setup_fills_args_and_result_reprs() {
+        // rtyper.py:625-633.
+        // Build a spaceop with one Impossible-typed arg + Impossible
+        // result; bind annotations so `rtyper.binding` succeeds.
+        let ann_rc = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
+        let mut arg_var = Variable::new();
+        arg_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        let mut result_var = Variable::new();
+        result_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![Hlvalue::Variable(arg_var)],
+            Hlvalue::Variable(result_var),
+        );
+        let weak = Rc::downgrade(&rtyper);
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
+        let hop = HighLevelOp::new(weak, spaceop, Vec::new(), llops);
+        hop.setup().unwrap();
+        assert_eq!(hop.args_v.borrow().len(), 1);
+        assert_eq!(hop.args_s.borrow().len(), 1);
+        assert_eq!(hop.args_r.borrow().len(), 1);
+        assert!(matches!(
+            hop.s_result.borrow().as_ref().unwrap(),
+            SomeValue::Impossible
+        ));
+        // Both args_r and r_result resolve to impossible_repr →
+        // lowleveltype Void.
+        let r_result = hop.r_result.borrow().as_ref().cloned().unwrap();
+        assert_eq!(r_result.lowleveltype(), &LowLevelType::Void);
+    }
+
+    #[test]
+    fn highlevelop_setup_surfaces_missing_rtype_operation_for_unported_arg() {
+        // rtyper.py:625-633 → rtyper.py:157 `s_obj.rtyper_makerepr`
+        // surfaces MissingRTypeOperation when the argument's
+        // SomeValue variant has no concrete Repr yet. Rather than
+        // silently fail, the setup path returns the structured
+        // TyperError so callers know which upstream module to land.
+        let ann_rc = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
+        let mut arg_var = Variable::new();
+        arg_var.annotation = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let mut result_var = Variable::new();
+        result_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![Hlvalue::Variable(arg_var)],
+            Hlvalue::Variable(result_var),
+        );
+        let weak = Rc::downgrade(&rtyper);
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
+        let hop = HighLevelOp::new(weak, spaceop, Vec::new(), llops);
+        let err = hop.setup().unwrap_err();
+        assert!(err.is_missing_rtype_operation());
     }
 }

@@ -508,10 +508,13 @@ impl Repr for VoidRepr {
 /// RPython `impossible_repr = VoidRepr()` (`rmodel.py:359`) — the
 /// singleton VoidRepr used for `SomeImpossibleValue` (`rmodel.py:288+`).
 ///
-/// Rust representation uses [`OnceLock`] for lazy, thread-safe init.
-pub fn impossible_repr() -> &'static VoidRepr {
-    static REPR: OnceLock<VoidRepr> = OnceLock::new();
-    REPR.get_or_init(VoidRepr::new)
+/// Rust returns an [`Arc<VoidRepr>`] clone of the cached singleton so
+/// the pointer identity upstream relies on (`r is impossible_repr`) is
+/// preserved through `Arc::ptr_eq`.
+pub fn impossible_repr() -> std::sync::Arc<VoidRepr> {
+    static REPR: OnceLock<std::sync::Arc<VoidRepr>> = OnceLock::new();
+    REPR.get_or_init(|| std::sync::Arc::new(VoidRepr::new()))
+        .clone()
 }
 
 /// RPython `class SimplePointerRepr(Repr)` (`rmodel.py:365-375`).
@@ -580,6 +583,137 @@ impl Repr for SimplePointerRepr {
             ConstValue::None,
             self.lltype.clone(),
         ))
+    }
+}
+
+// ____________________________________________________________
+// `rtyper_makekey` / `rtyper_makerepr` per-SomeXxx dispatch
+// (rmodel.py:276-293 + each r*.py `__extend__(SomeXxx)` block).
+
+/// RPython `S.rtyper_makekey()` upstream tuple hashed by
+/// `RPythonTyper.reprs` (rtyper.py:54+149).
+///
+/// Upstream returns a tuple like `(S.__class__, knowntype, unsigned)`
+/// which Python uses as a dict key. Rust mirrors via a typed enum so
+/// each variant carries the right discriminating data for the reprs
+/// cache.
+///
+/// Only `Impossible` is populated in this commit — other SomeValue
+/// variants land with their respective concrete Repr ports. The
+/// `Pending` variant carries a debug string so unimplemented keys
+/// still round-trip through `HashMap<ReprKey, Arc<dyn Repr>>` during
+/// bring-up.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReprKey {
+    /// RPython `SomeImpossibleValue.rtyper_makekey = (self.__class__,)`
+    /// (rmodel.py:292-293).
+    Impossible,
+    /// Pending variant — carries a textual discriminator from
+    /// `rtyper_makekey` arm that hasn't been ported yet.
+    Pending(String),
+}
+
+/// RPython `SomeXxx.rtyper_makekey()` dispatcher.
+///
+/// Upstream attaches a `rtyper_makekey` method per SomeXxx via the
+/// `__extend__` metaclass pattern (rmodel.py:292, rint.py:190,
+/// rbool.py:43, ...). Pyre centralises into this match since Rust has
+/// no `__extend__` equivalent.
+pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
+    use crate::annotator::model::SomeValue;
+    match s_obj {
+        // rmodel.py:292-293: SomeImpossibleValue.rtyper_makekey = (self.__class__,).
+        SomeValue::Impossible => ReprKey::Impossible,
+        // Remaining variants defer to their r*.rs ports. Emit a
+        // deterministic `Pending` key so the reprs cache still
+        // distinguishes entries by variant-shape — identical
+        // shape-strings collapse to one pending entry (matching
+        // upstream `(class, knowntype, ...)` identity for identical
+        // tuples).
+        other => ReprKey::Pending(format!("{other:?}")),
+    }
+}
+
+/// RPython `SomeXxx.rtyper_makerepr(rtyper)` dispatcher.
+///
+/// Upstream r*.py modules each contribute one arm per SomeXxx via
+/// `__extend__` (rmodel.py:289, rint.py:186, rbool.py:40, ...). Pyre
+/// centralises into this match; as each concrete Repr lands in its
+/// r*.rs file the arm flips from `MissingRTypeOperation` to the real
+/// constructor.
+pub fn rtyper_makerepr(
+    s_obj: &crate::annotator::model::SomeValue,
+    rtyper: &crate::translator::rtyper::rtyper::RPythonTyper,
+) -> Result<std::sync::Arc<dyn Repr>, TyperError> {
+    use crate::annotator::model::SomeValue;
+    let _ = rtyper; // unused until concrete repr ports consume it
+    match s_obj {
+        // rmodel.py:289-290: SomeImpossibleValue.rtyper_makerepr
+        // returns the singleton `impossible_repr`.
+        SomeValue::Impossible => Ok(impossible_repr() as std::sync::Arc<dyn Repr>),
+        // Every other SomeValue variant maps 1:1 to a concrete Repr
+        // defined in an r*.py upstream module. Pyre reports a
+        // structured MissingRTypeOperation with the expected target
+        // module so follow-up cascading ports can anchor on the
+        // surface without guessing.
+        SomeValue::Integer(_) => Err(TyperError::missing_rtype_operation(
+            "SomeInteger.rtyper_makerepr — port rpython/rtyper/rint.py IntegerRepr",
+        )),
+        SomeValue::Bool(_) => Err(TyperError::missing_rtype_operation(
+            "SomeBool.rtyper_makerepr — port rpython/rtyper/rbool.py BoolRepr",
+        )),
+        SomeValue::Float(_) | SomeValue::SingleFloat(_) | SomeValue::LongFloat(_) => {
+            Err(TyperError::missing_rtype_operation(
+                "SomeFloat.rtyper_makerepr — port rpython/rtyper/rfloat.py FloatRepr",
+            ))
+        }
+        SomeValue::String(_)
+        | SomeValue::UnicodeString(_)
+        | SomeValue::ByteArray(_)
+        | SomeValue::Char(_)
+        | SomeValue::UnicodeCodePoint(_) => Err(TyperError::missing_rtype_operation(
+            "SomeString/ByteArray/Char.rtyper_makerepr — port rpython/rtyper/rstr.py",
+        )),
+        SomeValue::Instance(_) | SomeValue::Exception(_) => {
+            Err(TyperError::missing_rtype_operation(
+                "SomeInstance.rtyper_makerepr — port rpython/rtyper/rclass.py InstanceRepr",
+            ))
+        }
+        SomeValue::Tuple(_) => Err(TyperError::missing_rtype_operation(
+            "SomeTuple.rtyper_makerepr — port rpython/rtyper/rtuple.py TupleRepr",
+        )),
+        SomeValue::List(_) => Err(TyperError::missing_rtype_operation(
+            "SomeList.rtyper_makerepr — port rpython/rtyper/rlist.py ListRepr",
+        )),
+        SomeValue::Dict(_) => Err(TyperError::missing_rtype_operation(
+            "SomeDict.rtyper_makerepr — port rpython/rtyper/rdict.py DictRepr",
+        )),
+        SomeValue::Iterator(_) => Err(TyperError::missing_rtype_operation(
+            "SomeIterator.rtyper_makerepr — port rpython/rtyper/rrange.py EnumerateIteratorRepr etc.",
+        )),
+        SomeValue::PBC(_) => Err(TyperError::missing_rtype_operation(
+            "SomePBC.rtyper_makerepr — port rpython/rtyper/rpbc.py PBCRepr family",
+        )),
+        SomeValue::Builtin(_) | SomeValue::BuiltinMethod(_) => {
+            Err(TyperError::missing_rtype_operation(
+                "SomeBuiltin.rtyper_makerepr — port rpython/rtyper/rpbc.py FunctionRepr",
+            ))
+        }
+        SomeValue::None_(_) => Err(TyperError::missing_rtype_operation(
+            "SomeNone.rtyper_makerepr — port rpython/rtyper/rnone.py NoneRepr",
+        )),
+        SomeValue::Object(_) | SomeValue::Type(_) => Err(TyperError::missing_rtype_operation(
+            "SomeObject/SomeType.rtyper_makerepr — port rpython/rtyper/robject.py",
+        )),
+        SomeValue::Property(_) => Err(TyperError::missing_rtype_operation(
+            "SomeProperty.rtyper_makerepr — port rpython/rtyper/rproperty.py",
+        )),
+        SomeValue::WeakRef(_) => Err(TyperError::missing_rtype_operation(
+            "SomeWeakRef.rtyper_makerepr — port rpython/rtyper/rweakref.py",
+        )),
+        SomeValue::TypeOf(_) => Err(TyperError::missing_rtype_operation(
+            "SomeTypeOf.rtyper_makerepr — no direct upstream counterpart; pyre adaptation",
+        )),
     }
 }
 
@@ -713,10 +847,10 @@ mod tests {
     #[test]
     fn impossible_repr_is_shared_singleton_pointer() {
         // `impossible_repr = VoidRepr()` module-level singleton
-        // (rmodel.py:359). Two calls return the same instance.
-        let a: *const VoidRepr = impossible_repr();
-        let b: *const VoidRepr = impossible_repr();
-        assert!(std::ptr::eq(a, b));
+        // (rmodel.py:359). Two calls return Arcs to the same instance.
+        let a = impossible_repr();
+        let b = impossible_repr();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
     }
 
     #[test]
