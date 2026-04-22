@@ -149,27 +149,6 @@ thread_local! {
 /// glue without taking locks. `swap(0, Relaxed)` drains atomically.
 static JIT_PENDING_EXCEPTION: AtomicI64 = AtomicI64::new(0);
 
-/// Test-only serialization lock for the JIT state globals.
-///
-/// Pyre is no-GIL single-threaded in production, so `JIT_PENDING_EXCEPTION`
-/// + `PYRE_STACKTOOBIG` are process-global atomics without per-thread
-/// isolation.  Under `cargo test`'s multi-threaded harness the internal
-/// stack_check tests (below) already serialize via a module-private
-/// mutex; other crates (notably `pyre-jit`) that race on the same
-/// globals must also acquire this lock.  Exposed as `pub` so
-/// cross-crate tests can hold it.
-///
-/// Poisoning is ignored so a single panicking test does not cascade
-/// into every follow-up test.
-pub static JIT_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Acquire `JIT_STATE_TEST_LOCK`, tolerating poisoning.
-pub fn lock_jit_state_tests() -> std::sync::MutexGuard<'static, ()> {
-    JIT_STATE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
 /// Read an approximation of the current stack pointer by taking the
 /// address of a stack-allocated local. The exact value depends on the
 /// caller's frame layout but is monotonically decreasing as recursion
@@ -521,10 +500,14 @@ pub fn stack_almost_full() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Internal tests acquire the crate-public `JIT_STATE_TEST_LOCK` so
-    // they serialize with cross-crate JIT-state tests that also
-    // acquire the same lock (see `pyre-jit/src/lib.rs` and
-    // `pyre-jit/src/eval.rs`).
+    use std::sync::Mutex;
+
+    /// Serialize access to the global `PYRE_STACKTOOBIG` so parallel
+    /// test threads can't stomp on each other. Previously the state
+    /// was per-thread (`thread_local!`) and tests didn't need this
+    /// lock; moving to a process-wide global (for JIT addressability)
+    /// introduces contention.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Reset every global back to its default — call from each test
     /// under `TEST_LOCK` so the order tests run in cannot poison
@@ -548,11 +531,10 @@ mod tests {
         PYRE_STACKTOOBIG.stack_end.store(value, Ordering::Relaxed);
     }
 
-    /// Acquire the crate-public JIT-state test mutex, tolerating
-    /// poisoning.  Shared with cross-crate tests via
-    /// `lock_jit_state_tests()`.
+    /// Acquire the test mutex, tolerating poisoning so a single
+    /// previous-test panic doesn't cascade into every follow-up test.
     fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
-        super::lock_jit_state_tests()
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]

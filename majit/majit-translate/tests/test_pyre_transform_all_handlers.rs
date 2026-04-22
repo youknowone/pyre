@@ -140,15 +140,24 @@ fn transform_all_handlers_to_jitcode() {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let mut cw = CodeWriter::new();
             let config = GraphTransformConfig::default();
-            let ssarepr = cw.transform_graph_to_jitcode(
+            // RPython `codewriter.py:33 transform_graph_to_jitcode(self,
+            // graph, jitcode, verbose, index)` mutates the JitCode in
+            // place and returns None. Tests read `jitcode.body()._ssarepr`
+            // afterwards (assembler.py:49 `jitcode._ssarepr = ssarepr`
+            // stores it on the body for dump/diagnostic access).
+            let idx = cc.finished_jitcodes_len();
+            cw.transform_graph_to_jitcode(
                 &graph_for_transform,
                 &path,
                 &mut cc,
                 &config,
                 &jitcode,
+                /* verbose = */ false,
+                idx,
             );
             let body = jitcode.body();
-            (ssarepr.insns.len(), body.code.len())
+            let ssarepr_len = body._ssarepr.as_ref().map(|s| s.insns.len()).unwrap_or(0);
+            (ssarepr_len, body.code.len())
         }));
 
         match outcome {

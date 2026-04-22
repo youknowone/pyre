@@ -36,15 +36,6 @@ pub mod x86;
 // RPython stores exception state in thread-local (GIL-protected) globals.
 // Cranelift uses JIT_EXC_VALUE / JIT_EXC_TYPE atomics (compiler.rs:515-517).
 // Dynasm uses the same pattern for structural equivalence.
-//
-// PRE-EXISTING-ADAPTATION: pyre is no-GIL, but dynasm-generated machine
-// code references the static addresses directly via `jit_exc_value_addr()`
-// consumers in the per-arch assemblers, so thread_local is not a drop-in.
-// This is a known race under no-GIL multi-thread JIT execution — fixing
-// it requires migrating the slot to a per-thread location keyed off of
-// the TLS pointer (mirroring CPython's `tstate->curexc_*`).  See the
-// matching PRE-EXISTING-ADAPTATION note in
-// `majit-backend-cranelift/src/compiler.rs`.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 

@@ -54,11 +54,6 @@ mod tests {
     fn stack_overflow_probe_raises_into_pending_exception_slot() {
         use pyre_interpreter::stack_check;
 
-        // Serialize with other tests that touch the process-global
-        // `JIT_PENDING_EXCEPTION` slot (e.g. JIT-running tests whose
-        // backend boundaries call `drain_jit_pending_exception`).
-        let _jit_guard = stack_check::lock_jit_state_tests();
-
         // Install the same backend bridge call_jit::install_jit_call_bridge
         // wires up at runtime, so the registered slowpath addresses
         // really are the ones the cranelift / dynasm prologues invoke.

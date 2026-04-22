@@ -14,12 +14,52 @@ pub use codegen::{
     CodegenValueKind, IoShim, JitDriverConfig, VirtualizableCodegenConfig, generate_jitcode,
 };
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::assembler::Assembler;
 use crate::call::CallControl;
 use crate::flatten::{RegKind, SSARepr, flatten_with_types};
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
 use crate::model::{FunctionGraph, ValueId};
+use crate::parse::CallPath;
+
+/// Output of `CodeWriter::make_jitcodes` — the populated JitCode registry
+/// paired with its alloc-order index view.
+///
+/// Parity shape: RPython `rpython/jit/codewriter/call.py:87-88` holds two
+/// fields on `CallControl` itself — `self.jitcodes = {}` (graph-keyed dict)
+/// and `self.all_jitcodes = []` (alloc-order list). Pyre preserves both
+/// fields on `CallControl` and additionally returns them as a single value
+/// from `make_jitcodes`. The wrapper is a PRE-EXISTING-ADAPTATION: upstream
+/// callers (`warmspot.py:281-282`) read `self.all_jitcodes` off the
+/// CallControl directly; pyre pairs the two views so that downstream
+/// consumers (e.g. `crate::generated::all_jitcodes`) receive one value and
+/// do not need to pass `CallControl` around to perform later lookups.
+pub struct AllJitCodes {
+    /// RPython `call.py:87 self.jitcodes = {}` (graph-keyed dict). Pyre's
+    /// graph identity at this boundary is `CallPath`.
+    pub by_path: HashMap<CallPath, Arc<JitCode>>,
+    /// RPython `call.py:88 self.all_jitcodes = []` (alloc-order list). The
+    /// `jitcode.index == i` invariant from `codewriter.py:80` is enforced
+    /// by `CallControl::collect_jitcodes_in_alloc_order`.
+    pub in_order: Vec<Arc<JitCode>>,
+}
+
+impl AllJitCodes {
+    pub fn len(&self) -> usize {
+        self.in_order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.in_order.is_empty()
+    }
+
+    pub fn get(&self, path: &CallPath) -> Option<&Arc<JitCode>> {
+        self.by_path.get(path)
+    }
+}
 
 /// RPython: `codewriter.py::CodeWriter`.
 ///
@@ -38,17 +78,31 @@ pub struct CodeWriter {
 
 impl CodeWriter {
     /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py:20-23).
+    ///
+    /// `debug` mirrors the class-level default `debug = True`
+    /// (`codewriter.py:18`). Upstream always produces per-jitcode
+    /// diagnostic output (`log.dot()` in `print_ssa_repr`), so pyre
+    /// matches by defaulting `debug: true`. Tests that want silent
+    /// operation may flip the field after construction.
     pub fn new() -> Self {
         Self {
             assembler: Assembler::new(),
-            debug: false,
+            debug: true,
         }
     }
 
     /// RPython: `CodeWriter.transform_graph_to_jitcode()` (codewriter.py:33-72).
     ///
     /// Transforms a FunctionGraph into a JitCode through the 4-step pipeline.
-    /// Returns both the flattened SSARepr (with liveness) and the assembled JitCode.
+    /// Upstream signature `(self, graph, jitcode, verbose, index)`. Pyre adds
+    /// `path` / `callcontrol` / `config` as PRE-EXISTING-ADAPTATION:
+    ///   - `path`: graph identity surrogate (upstream uses `graph` object
+    ///     identity; pyre uses `CallPath`).
+    ///   - `callcontrol`: upstream has `self.callcontrol`; pyre passes
+    ///     `&mut` due to Rust borrow-checker constraints (the Transformer
+    ///     borrows callcontrol during `transform()`).
+    ///   - `config`: pyre's `GraphTransformConfig` carries options that
+    ///     upstream keeps in globals / command-line flags.
     ///
     /// Steps:
     ///   0. annotate + rtype (majit-specific; RPython does this before codewriter)
@@ -57,6 +111,9 @@ impl CodeWriter {
     ///   3. flatten — `flatten_graph()` (codewriter.py:53)
     ///   3b. liveness — `compute_liveness()` (codewriter.py:56, called inside assemble)
     ///   4. assemble — `assembler.assemble()` (codewriter.py:67)
+    ///   5. `jitcode.index = index` (codewriter.py:68)
+    ///   6. `if self.debug: self.print_ssa_repr(ssarepr, portal_jd, verbose)`
+    ///      (codewriter.py:71-72)
     pub fn transform_graph_to_jitcode(
         &mut self,
         graph: &FunctionGraph,
@@ -64,7 +121,9 @@ impl CodeWriter {
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
         jitcode: &std::sync::Arc<JitCode>,
-    ) -> SSARepr {
+        verbose: bool,
+        index: usize,
+    ) {
         // RPython: graph = copygraph(graph, shallowvars=True) (codewriter.py:38)
         // In Rust, Transformer.transform() already clones the graph.
 
@@ -90,11 +149,24 @@ impl CodeWriter {
         crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
         let graph = &graph_owned;
 
+        // RPython codewriter.py:37 `portal_jd =
+        // self.callcontrol.jitdriver_sd_from_portal_graph(graph)` — look
+        // up the JitDriverStaticData keyed by portal graph identity. In
+        // pyre `CallPath` is the surrogate, so resolve via `path`. Store
+        // only the index to avoid a second borrow against
+        // `callcontrol` during Transformer construction; the
+        // Transformer can re-dereference `jitdrivers_sd[portal_jd_index]`
+        // on demand if it needs the full record.
+        let portal_jd_index = callcontrol
+            .jitdriver_sd_from_portal_graph(path)
+            .map(|jd| jd.index);
+
         // Step 1: jtransform (codewriter.py:42)
         // RPython: transform_graph(graph, cpu, callcontrol, portal_jd)
         let rewritten = {
             let mut transformer = crate::jtransform::Transformer::new(config)
                 .with_callcontrol(callcontrol)
+                .with_portal_jd(portal_jd_index)
                 .with_type_state(&type_state);
             transformer.transform(graph)
         };
@@ -193,19 +265,31 @@ impl CodeWriter {
         // see the same body without locking.
         jitcode.set_body(body);
 
-        if self.debug {
-            eprintln!(
-                "[CodeWriter] {} → {} ops, {} bytes, regs i={} r={} f={}",
-                jitcode.name,
-                ssarepr.insns.len(),
-                jitcode.code.len(),
-                jitcode.num_regs_i(),
-                jitcode.num_regs_r(),
-                jitcode.num_regs_f(),
-            );
-        }
+        // RPython `codewriter.py:68 jitcode.index = index` — assign the
+        // dense position in `all_jitcodes[]` immediately after
+        // `assembler.assemble(...)` (upstream line 67). The
+        // `in_order[i].index == i` invariant asserted by
+        // `CallControl::collect_jitcodes_in_alloc_order` (and mirrored in
+        // `test_phase_f_all_jitcodes::all_jitcodes_indices_match_alloc_order`)
+        // depends on the caller having passed `index = finished_jitcodes.len()`
+        // BEFORE appending.
+        jitcode.set_index(index);
 
-        ssarepr
+        if self.debug {
+            // RPython `codewriter.py:71-72` → `print_ssa_repr(ssarepr,
+            // portal_jd, verbose)` → `log.dot()` (default, verbose=False)
+            // or `print(format_assembler(ssarepr))` (verbose=True). Pyre
+            // currently mirrors only the low-noise branch: one line per
+            // jitcode with the name, analogous to upstream's udir
+            // filename (`codewriter.py:122-125
+            // dir.join(name+extra).write(format_assembler(ssarepr))`).
+            // The `verbose` parameter is plumbed to match the upstream
+            // signature; the high-verbosity branch lands when
+            // `format_assembler` is ported.
+            let _ = verbose;
+            let _ = &ssarepr;
+            eprintln!("[CodeWriter] {}", jitcode.name);
+        }
     }
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
@@ -215,7 +299,7 @@ impl CodeWriter {
         &mut self,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
-    ) -> Vec<std::sync::Arc<JitCode>> {
+    ) -> AllJitCodes {
         // RPython: self.callcontrol.grab_initial_jitcodes() (codewriter.py:76)
         callcontrol.grab_initial_jitcodes();
         self.make_jitcodes_pending(callcontrol, config)
@@ -229,6 +313,11 @@ impl CodeWriter {
     /// commits its body via `JitCode::set_body`. The
     /// `all_jitcodes[i].index == i` invariant (RPython codewriter.py:80)
     /// is guaranteed by `CallControl::collect_jitcodes_in_alloc_order`.
+    ///
+    /// `verbose` threads through to `transform_graph_to_jitcode`'s debug
+    /// branch; upstream `codewriter.py:74 make_jitcodes(verbose=False)`
+    /// treats `False` as the default, matching pyre's call site in
+    /// `make_jitcodes` which does not expose the knob to callers yet.
     pub fn drain_pending_graphs(
         &mut self,
         callcontrol: &mut CallControl,
@@ -267,8 +356,21 @@ impl CodeWriter {
                     jitcode.name,
                 );
             };
-            let _ssarepr =
-                self.transform_graph_to_jitcode(&graph, &path, callcontrol, config, &jitcode);
+            // RPython `codewriter.py:80` passes `index = len(all_jitcodes)`,
+            // i.e. the slot this jitcode will occupy AFTER the append on
+            // line 81. `finished_jitcodes_len()` is pyre's equivalent read.
+            let index = callcontrol.finished_jitcodes_len();
+            self.transform_graph_to_jitcode(
+                &graph,
+                &path,
+                callcontrol,
+                config,
+                &jitcode,
+                /* verbose = */ false,
+                index,
+            );
+            // RPython `codewriter.py:81 all_jitcodes.append(jitcode)`.
+            // `transform_graph_to_jitcode` already set `jitcode.index`.
             callcontrol.finish_jitcode(jitcode.clone());
 
             // RPython call.py:148: jd.mainjitcode.jitdriver_sd = jd
@@ -287,10 +389,12 @@ impl CodeWriter {
         &mut self,
         callcontrol: &mut CallControl,
         config: &GraphTransformConfig,
-    ) -> Vec<std::sync::Arc<JitCode>> {
+    ) -> AllJitCodes {
         self.drain_pending_graphs(callcontrol, config);
         self.assembler.finished(&callcontrol.callinfocollection);
-        callcontrol.collect_jitcodes_in_alloc_order()
+        let in_order = callcontrol.collect_jitcodes_in_alloc_order();
+        let by_path = callcontrol.jitcodes().clone();
+        AllJitCodes { by_path, in_order }
     }
 }
 

@@ -188,6 +188,14 @@ pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> Gr
 pub struct Transformer<'a> {
     /// RPython: `Transformer.callcontrol`.
     callcontrol: Option<&'a mut crate::call::CallControl>,
+    /// RPython: `Transformer.portal_jd` (`jtransform.py:65`) —
+    /// "non-None only for the portal graph(s)". Consulted by
+    /// `handle_jit_marker__jit_merge_point` (`jtransform.py:1690-1712`)
+    /// to stamp `portal_jd.index` onto the rewritten op and to assert
+    /// the marker's jitdriver matches this portal's. Pyre stores the
+    /// index alone; the full `JitDriverStaticData` is owned by
+    /// `CallControl::jitdrivers_sd` and can be looked up by index there.
+    portal_jd_index: Option<usize>,
     /// RPython: `Transformer.__init__` config for virtualizable lowering.
     config: &'a GraphTransformConfig,
     /// Type resolution state from the rtype pass.
@@ -236,9 +244,16 @@ enum RewriteResult {
 }
 
 impl<'a> Transformer<'a> {
+    /// RPython: `Transformer.__init__(cpu=None, callcontrol=None, portal_jd=None)`
+    /// (`jtransform.py:62-66`). Pyre keeps `cpu` / `callcontrol` behind
+    /// builder setters because the borrow checker demands a late binding
+    /// against the enclosing `CallControl`; `portal_jd` follows the same
+    /// pattern. All three fields start `None`, matching upstream class
+    /// defaults.
     pub fn new(config: &'a GraphTransformConfig) -> Self {
         Self {
             callcontrol: None,
+            portal_jd_index: None,
             config,
             type_state: None,
             vable_array_vars: std::collections::HashMap::new(),
@@ -257,6 +272,25 @@ impl<'a> Transformer<'a> {
     pub fn with_callcontrol(mut self, cc: &'a mut crate::call::CallControl) -> Self {
         self.callcontrol = Some(cc);
         self
+    }
+
+    /// Attach the portal JitDriverStaticData index for the current
+    /// graph. RPython `jtransform.py:65 self.portal_jd = portal_jd`
+    /// — "non-None only for the portal graph(s)". Pyre stores the
+    /// index into `CallControl::jitdrivers_sd` rather than a direct
+    /// reference so the builder does not force a second borrow of
+    /// `CallControl`. `handle_jit_marker__jit_merge_point`
+    /// (`jtransform.py:1690-1712`) uses this for both identity checks
+    /// and `Constant(portal_jd.index, lltype.Signed)` synthesis.
+    pub fn with_portal_jd(mut self, jd_index: Option<usize>) -> Self {
+        self.portal_jd_index = jd_index;
+        self
+    }
+
+    /// Accessor for the portal jitdriver index, matching upstream
+    /// `self.portal_jd` reads inside Transformer methods.
+    pub fn portal_jd_index(&self) -> Option<usize> {
+        self.portal_jd_index
     }
 
     /// Set the type resolution state for arg kind splitting.

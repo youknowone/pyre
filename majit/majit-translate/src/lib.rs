@@ -21,6 +21,11 @@ pub use jit_codewriter::{
 
 mod codegen;
 pub mod front;
+// Phase F: pyre-interpreter handler JitCode registry
+// (PRE-EXISTING-ADAPTATION per parity rule #1 — Rust source → FunctionGraph
+// bridge with no RPython counterpart; upstream assumes rtyper-produced
+// `translator.graphs` is already in memory at codewriter entry).
+pub mod generated;
 pub mod handler_spec;
 pub mod hints;
 pub mod inline;
@@ -451,6 +456,27 @@ fn analyze_pipeline_from_parsed(
                     impl_type,
                     graph.clone(),
                 );
+                // Parity with upstream `rpython/annotator/classdesc.py:749
+                // lookup` MRO walk: a trait default body is the
+                // "base-class method" for every impl that does not
+                // override it. Rust-idiomatic call sites emit the call
+                // as `<Trait>::<method>(receiver, ...)` —
+                // `front/ast.rs::canonical_call_target` turns that into
+                // `CallTarget::FunctionPath { segments: [<Trait>,
+                // <method>] }`. The upstream-equivalent registration key
+                // is therefore `[<Trait>, <method>]`. The pseudo-type
+                // path `[<default methods of Trait>, <method>]` set by
+                // `register_trait_method` is retained so the filter logic
+                // at `call.rs:1921,1970 resolve_method*` and
+                // `lib.rs:935 push_matching_trait_methods` can continue
+                // to distinguish "trait default" from "concrete impl".
+                if impl_info.for_type.starts_with("<default methods of ") {
+                    let direct_path = crate::parse::CallPath::from_segments([
+                        impl_info.trait_name.as_str(),
+                        method.name.as_str(),
+                    ]);
+                    call_control.register_function_graph(direct_path, graph.clone());
+                }
             }
             // RPython: op.result.concretetype for trait/default method calls.
             let path = crate::parse::CallPath::for_impl_method(impl_type, method.name.as_str());
@@ -674,6 +700,11 @@ fn analyze_pipeline_from_parsed(
     );
     pipeline.opcode_dispatch = opcode_dispatch;
     pipeline.jitcodes = jitcodes;
+    // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)
+    // captured before `call_control` is dropped. Needed because consumers
+    // that look up a JitCode by graph identity cannot reconstruct the key
+    // from the alloc-ordered `pipeline.jitcodes` vector alone.
+    pipeline.jitcodes_by_path = call_control.jitcodes().clone();
     pipeline.insns = insns;
     pipeline.descrs = descrs;
 

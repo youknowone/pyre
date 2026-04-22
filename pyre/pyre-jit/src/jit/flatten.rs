@@ -540,6 +540,327 @@ impl Insn {
     }
 }
 
+// --------------------------------------------------------------------------
+// `flatten.py:306-413` renaming helpers.
+//
+// These are the graph-level link renaming helpers that Step 6.3 (Task
+// #214) will call at each terminator edge.  They are added here as
+// pure functions — unwired to the walker yet — so that the walker
+// integration lands as a separate, reviewable step.
+//
+// Upstream `GraphFlattener.insert_renamings` + `generate_last_exc` +
+// `reorder_renaming_list` (`flatten.py:306-413`) expect a
+// `regallocs[kind]` mapping from `Variable → colour index`, driven by
+// `self.getcolor(v)` (`flatten.py:382-391`) which returns a `Constant`
+// for Constants and a `Register(kind, colour)` for Variables.  pyre's
+// production regalloc keys on SSARepr `ValueId`, not graph
+// `Variable` — so the public API here takes an explicit
+// `getcolor_variable: FnMut(&Variable) -> Register` closure.  A
+// future session migrating regalloc onto the graph will supply that
+// closure via the `AllocationResult`; for now callers provide a
+// synthetic mapping for testing.
+// --------------------------------------------------------------------------
+
+use std::collections::HashMap as StdHashMap;
+use std::collections::HashSet as StdHashSet;
+use std::hash::Hash as StdHash;
+
+/// `flatten.py:395-413` `reorder_renaming_list(frm, to)`.
+///
+/// Reorders a parallel `(frm[i], to[i])` renaming list so that each
+/// copy `frm[i] -> to[i]` fires only after every rename whose source
+/// matches `to[i]` has already been emitted.  Cycles are broken by
+/// turning the first cycle edge into a `(Some(frm), None)` push +
+/// later `(None, Some(to))` pop pair, letting the assembler route
+/// through the kind-typed scratch slot (`{kind}_push` / `{kind}_pop`).
+///
+/// Generic over the key type `T` so callers can pass either colour
+/// indices (upstream Python) or typed `Register` / enum keys (pyre).
+pub fn reorder_renaming_list<T>(frm: &[T], to: &[T]) -> Vec<(Option<T>, Option<T>)>
+where
+    T: Clone + Eq + StdHash,
+{
+    assert_eq!(
+        frm.len(),
+        to.len(),
+        "reorder_renaming_list: length mismatch"
+    );
+    let mut frm: Vec<Option<T>> = frm.iter().cloned().map(Some).collect();
+    let to: Vec<Option<T>> = to.iter().cloned().map(Some).collect();
+    let mut result: Vec<(Option<T>, Option<T>)> = Vec::new();
+    let mut pending: Vec<usize> = (0..to.len()).collect();
+    while !pending.is_empty() {
+        // `not_read = dict.fromkeys([frm[i] for i in pending_indices])`.
+        let not_read: StdHashSet<&T> = pending.iter().filter_map(|&i| frm[i].as_ref()).collect();
+        let mut still_pending: Vec<usize> = Vec::new();
+        for &i in &pending {
+            let to_val = to[i].as_ref();
+            let safe = match to_val {
+                Some(w) => !not_read.contains(w),
+                None => true,
+            };
+            if safe {
+                result.push((frm[i].clone(), to[i].clone()));
+            } else {
+                still_pending.push(i);
+            }
+        }
+        if still_pending.len() == pending.len() {
+            // `flatten.py:406-411` — no progress, cycle present.  Break
+            // the cycle at the first pending entry by converting its
+            // source into a `None` (emit a push), then retry.
+            let cycle_head = still_pending[0];
+            debug_assert!(
+                frm[cycle_head].is_some(),
+                "reorder_renaming_list: cycle detected but head is already None"
+            );
+            result.push((frm[cycle_head].clone(), None));
+            frm[cycle_head] = None;
+            continue;
+        }
+        pending = still_pending;
+    }
+    result
+}
+
+/// `flatten.py:336-347` `GraphFlattener.generate_last_exc`.
+///
+/// After `insert_renamings` has emitted its copy/push/pop sequence,
+/// `generate_last_exc` emits the `last_exception` / `last_exc_value`
+/// loads that populate the `link.target.inputargs` slots mapped to
+/// `link.last_exception` / `link.last_exc_value`.
+///
+/// Mirrors upstream's two-pass structure (types first, values second),
+/// matching the order in which an exception handler reads them back.
+pub fn generate_last_exc<F>(
+    link: &super::flow::Link,
+    target_inputargs: &[super::flow::FlowValue],
+    mut getcolor_variable: F,
+    ssarepr: &mut SSARepr,
+) where
+    F: FnMut(&super::flow::Variable) -> Register,
+{
+    use super::flow::FlowValue;
+    if link.last_exception.is_none() && link.last_exc_value.is_none() {
+        return;
+    }
+    let pairs: Vec<(&super::flow::FlowValue, &super::flow::FlowValue)> = link
+        .args
+        .iter()
+        .zip(target_inputargs.iter())
+        .filter_map(|(a, w)| {
+            let a = a.as_ref()?;
+            Some((a, w))
+        })
+        .collect();
+
+    // `flatten.py:342-344` `for v, w in zip(link.args, inputargs): if
+    // v is link.last_exception: emitline("last_exception", "->", getcolor(w))`.
+    if let Some(last_exc_type) = link.last_exception {
+        for (v, w) in &pairs {
+            if let FlowValue::Variable(var) = v {
+                if *var == last_exc_type {
+                    if let FlowValue::Variable(dst_var) = w {
+                        let dst_reg = getcolor_variable(dst_var);
+                        ssarepr.insns.push(Insn::op_with_result(
+                            "last_exception",
+                            Vec::new(),
+                            dst_reg,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // `flatten.py:345-347` symmetric pass for `last_exc_value`.
+    if let Some(last_exc_val) = link.last_exc_value {
+        for (v, w) in &pairs {
+            if let FlowValue::Variable(var) = v {
+                if *var == last_exc_val {
+                    if let FlowValue::Variable(dst_var) = w {
+                        let dst_reg = getcolor_variable(dst_var);
+                        ssarepr.insns.push(Insn::op_with_result(
+                            "last_exc_value",
+                            Vec::new(),
+                            dst_reg,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `flatten.py:306-334` `GraphFlattener.insert_renamings`.
+///
+/// Emits the `{kind}_copy` / `{kind}_push` / `{kind}_pop` Insns that
+/// implement `link.args -> link.target.inputargs` at a CFG edge.
+/// Sorts the renamings by destination register index, groups by kind,
+/// and feeds each group through `reorder_renaming_list` for cycle
+/// detection.
+///
+/// Step 6.3 (Task #214) will wire this at each terminator emitted by
+/// `transform_graph_to_jitcode`; until that lands, pyre relies on the
+/// post-hoc SSARepr-level `coalesce_variables` scanner
+/// (`pyre-jit/src/jit/regalloc.rs`) as a documented
+/// PRE-EXISTING-ADAPTATION.
+pub fn insert_renamings<F>(
+    link: &super::flow::Link,
+    target_inputargs: &[super::flow::FlowValue],
+    mut getcolor_variable: F,
+    ssarepr: &mut SSARepr,
+) where
+    F: FnMut(&super::flow::Variable) -> Register,
+{
+    use super::flow::{Constant as FlowConstant, FlowValue};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum RenameKey {
+        /// Source or destination that carries a kind-typed colour.
+        Reg(Register),
+        /// Source is a graph-level `Constant`; kept as its own key so
+        /// cycle detection never matches it against a `Reg` and so the
+        /// emission loop recovers the original `Constant` for
+        /// `constant_to_copy_source`.  Destinations are always `Reg`.
+        Const(FlowConstant),
+    }
+
+    // `flatten.py:308-311` — build the `(src_colour, dst_colour)` list,
+    // filtering out void-kind entries (pyre has no void, nothing to
+    // skip there) and the `last_exception` / `last_exc_value` extras
+    // that `generate_last_exc` handles separately.
+    assert_eq!(
+        link.args.len(),
+        target_inputargs.len(),
+        "insert_renamings: link.args and target.inputargs must have equal length"
+    );
+
+    let mut lst: Vec<(RenameKey, Register)> = Vec::new();
+    for (arg, target_input) in link.args.iter().zip(target_inputargs.iter()) {
+        let src = match arg.as_ref() {
+            Some(v) => v,
+            None => continue, // dead merge-path slot
+        };
+        // Skip extravars handled by `generate_last_exc`.
+        if let FlowValue::Variable(v) = src {
+            if Some(*v) == link.last_exception || Some(*v) == link.last_exc_value {
+                continue;
+            }
+        }
+        let dst_var = match target_input {
+            FlowValue::Variable(v) => v,
+            // Target inputargs are always Variables in a well-formed
+            // graph.  A Constant in an inputarg slot would be a
+            // front-end bug (see `model.py:185-188`).  Skip defensively.
+            FlowValue::Constant(_) => continue,
+        };
+        let dst_reg = getcolor_variable(dst_var);
+
+        let src_key = match src {
+            FlowValue::Variable(v) => {
+                let src_reg = getcolor_variable(v);
+                // `flatten.py:314` `if v == w: continue`.  After regalloc,
+                // equal registers mean the renaming is the identity.
+                if src_reg == dst_reg {
+                    continue;
+                }
+                RenameKey::Reg(src_reg)
+            }
+            FlowValue::Constant(c) => RenameKey::Const(c.clone()),
+        };
+        lst.push((src_key, dst_reg));
+    }
+
+    // `flatten.py:312` `lst.sort(key=lambda (v, w): w.index)`.
+    lst.sort_by_key(|(_, to)| to.index);
+
+    // `flatten.py:313-318` group by destination kind.
+    let mut by_kind: StdHashMap<Kind, (Vec<RenameKey>, Vec<RenameKey>)> = StdHashMap::new();
+    for (src_key, dst_reg) in lst {
+        let entry = by_kind
+            .entry(dst_reg.kind)
+            .or_insert_with(|| (Vec::new(), Vec::new()));
+        entry.0.push(src_key);
+        entry.1.push(RenameKey::Reg(dst_reg));
+    }
+
+    // `flatten.py:319-333` emit per-kind `{kind}_copy` / `{kind}_push`
+    // / `{kind}_pop` via `reorder_renaming_list`.
+    for kind in Kind::ALL {
+        let Some((frm_keys, to_keys)) = by_kind.remove(&kind) else {
+            continue;
+        };
+        let ordered = reorder_renaming_list(&frm_keys, &to_keys);
+        for (from, to) in ordered {
+            match (from, to) {
+                // `flatten.py:328-329` `if w is None: emitline("%s_push", v)`.
+                (Some(key), None) => {
+                    let src_reg = match key {
+                        RenameKey::Reg(r) => r,
+                        RenameKey::Const(_) => unreachable!(
+                            "reorder_renaming_list: Const source cannot participate in a cycle push"
+                        ),
+                    };
+                    ssarepr.insns.push(Insn::op(
+                        format!("{}_push", kind.as_str()),
+                        vec![Operand::Register(src_reg)],
+                    ));
+                }
+                // `flatten.py:330-331` `elif v is None: emitline("%s_pop", "->", w)`.
+                (None, Some(RenameKey::Reg(dst_reg))) => {
+                    ssarepr.insns.push(Insn::op_with_result(
+                        format!("{}_pop", kind.as_str()),
+                        Vec::new(),
+                        dst_reg,
+                    ));
+                }
+                // `flatten.py:332-333` `else: emitline("%s_copy", v, "->", w)`.
+                (Some(src_key), Some(RenameKey::Reg(dst_reg))) => {
+                    let src_operand = match src_key {
+                        RenameKey::Reg(r) => Operand::Register(r),
+                        RenameKey::Const(c) => constant_to_copy_source(&c),
+                    };
+                    ssarepr.insns.push(Insn::op_with_result(
+                        format!("{}_copy", kind.as_str()),
+                        vec![src_operand],
+                        dst_reg,
+                    ));
+                }
+                (None, None) | (_, Some(RenameKey::Const(_))) => {
+                    unreachable!("reorder_renaming_list produced malformed entry");
+                }
+            }
+        }
+    }
+
+    // `flatten.py:334` — tail-emit the `last_exception` / `last_exc_value`
+    // loads after the copy sequence.
+    generate_last_exc(link, target_inputargs, &mut getcolor_variable, ssarepr);
+}
+
+/// Map a graph-level `Constant` into the `Operand` shape expected by a
+/// `{kind}_copy` source slot.  Mirrors `assembler.py:162-174` which
+/// encodes constants as `i`/`c` argcode variants depending on kind.
+fn constant_to_copy_source(c: &super::flow::Constant) -> Operand {
+    use super::flow::ConstantValue;
+    match &c.value {
+        ConstantValue::None => Operand::ConstRef(0),
+        ConstantValue::Bool(b) => Operand::ConstInt(if *b { 1 } else { 0 }),
+        ConstantValue::Signed(v) => Operand::ConstInt(*v),
+        // Str / Atom / Opaque constants do not currently appear as
+        // `{kind}_copy` sources — pyre's walker only threads None /
+        // Bool / Signed / opaque host-object refs into link args.  An
+        // unexpected kind here means slice 2h extended the constant
+        // space without updating this mapping.
+        ConstantValue::Str(_) | ConstantValue::Atom(_) | ConstantValue::Opaque(_) => {
+            panic!(
+                "constant_to_copy_source: unsupported constant kind {:?}",
+                c.value
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +892,238 @@ mod tests {
     fn tlabel_equality_follows_name() {
         assert_eq!(TLabel::new("foo"), TLabel::new("foo"));
         assert_ne!(TLabel::new("foo"), TLabel::new("bar"));
+    }
+
+    // --------------------------------------------------------------------
+    // Renaming helpers (`reorder_renaming_list` / `insert_renamings` /
+    // `generate_last_exc`) ported from `flatten.py:306-413`.  Tests
+    // mirror `rpython/jit/codewriter/test/test_flatten.py:83-128`.
+    // --------------------------------------------------------------------
+
+    use super::super::flow::{Constant as FlowConstant, FlowValue, Link, Variable, VariableId};
+
+    fn var(id: u32, kind: Kind) -> Variable {
+        Variable::new(VariableId(id), kind)
+    }
+
+    fn reg(kind: Kind, index: u16) -> Register {
+        Register::new(kind, index)
+    }
+
+    /// Synthetic getcolor: maps `VariableId(n)` to `Register(kind, n as u16)`.
+    fn trivial_getcolor(v: &Variable) -> Register {
+        let kind = v.kind.expect("test variable must be typed");
+        Register::new(kind, v.id.0 as u16)
+    }
+
+    #[test]
+    fn reorder_renaming_list_identity_pass_through() {
+        // No aliasing — every (frm, to) fires in the original order.
+        let frm = vec![1u16, 2, 3];
+        let to = vec![10u16, 20, 30];
+        let result = reorder_renaming_list(&frm, &to);
+        assert_eq!(
+            result,
+            vec![
+                (Some(1), Some(10)),
+                (Some(2), Some(20)),
+                (Some(3), Some(30)),
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_renaming_list_reorders_to_avoid_overwrite() {
+        // `frm = [1, 2]`, `to = [2, 3]` — copy 2->3 first, then 1->2.
+        let frm = vec![1u16, 2];
+        let to = vec![2u16, 3];
+        let result = reorder_renaming_list(&frm, &to);
+        assert_eq!(result, vec![(Some(2), Some(3)), (Some(1), Some(2))]);
+    }
+
+    #[test]
+    fn reorder_renaming_list_breaks_two_cycle_via_push_pop() {
+        // Swap: frm=[1,2], to=[2,1]. Upstream breaks at the first
+        // pending slot: push(1); copy 2->1; pop(->2).
+        let frm = vec![1u16, 2];
+        let to = vec![2u16, 1];
+        let result = reorder_renaming_list(&frm, &to);
+        assert_eq!(
+            result,
+            vec![(Some(1), None), (Some(2), Some(1)), (None, Some(2)),]
+        );
+    }
+
+    #[test]
+    fn insert_renamings_emits_sorted_kind_grouped_copies() {
+        // Build a link that renames r0 -> r2 (Ref) and r1 -> r3 (Ref).
+        let v_src_a = var(0, Kind::Ref);
+        let v_src_b = var(1, Kind::Ref);
+        let v_dst_a = var(2, Kind::Ref);
+        let v_dst_b = var(3, Kind::Ref);
+        let link = Link::new(
+            vec![FlowValue::from(v_src_a), FlowValue::from(v_src_b)],
+            None,
+            None,
+        );
+        let inputargs = vec![FlowValue::from(v_dst_a), FlowValue::from(v_dst_b)];
+        let mut ssarepr = SSARepr::new("t");
+        insert_renamings(&link, &inputargs, trivial_getcolor, &mut ssarepr);
+
+        assert_eq!(ssarepr.insns.len(), 2);
+        for insn in &ssarepr.insns {
+            match insn {
+                Insn::Op {
+                    opname,
+                    args,
+                    result,
+                } => {
+                    assert_eq!(opname, "ref_copy");
+                    assert_eq!(args.len(), 1);
+                    assert!(result.is_some());
+                }
+                other => panic!("unexpected insn {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn insert_renamings_skips_identity_copies() {
+        // Source and destination share the same colour — emit nothing.
+        let v_same = var(0, Kind::Ref);
+        let link = Link::new(vec![FlowValue::from(v_same)], None, None);
+        let inputargs = vec![FlowValue::from(v_same)];
+        let mut ssarepr = SSARepr::new("t");
+        insert_renamings(&link, &inputargs, trivial_getcolor, &mut ssarepr);
+        assert!(ssarepr.insns.is_empty());
+    }
+
+    #[test]
+    fn insert_renamings_breaks_ref_swap_via_push_pop() {
+        // Swap r0 <-> r1.  `reorder_renaming_list` sees `frm=[1,0]`,
+        // `to=[0,1]` (after `lst.sort_by_key(w.index)`), cycle head
+        // becomes the first item → push(1), copy 0->1, pop(->0).
+        let v_a = var(0, Kind::Ref);
+        let v_b = var(1, Kind::Ref);
+        let link = Link::new(
+            // args in original order: (r0 -> ?, r1 -> ?)
+            vec![FlowValue::from(v_a), FlowValue::from(v_b)],
+            None,
+            None,
+        );
+        // target inputargs: slot 0 wants r1's value, slot 1 wants r0's value.
+        let inputargs = vec![FlowValue::from(v_b), FlowValue::from(v_a)];
+        // ... but trivial_getcolor maps Variable(id=n) -> Register(Ref, n),
+        // so the rename list is (r0 -> r1, r1 -> r0) — a 2-cycle.
+        let mut ssarepr = SSARepr::new("t");
+        insert_renamings(&link, &inputargs, trivial_getcolor, &mut ssarepr);
+
+        assert_eq!(ssarepr.insns.len(), 3);
+        let opnames: Vec<String> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|i| match i {
+                Insn::Op { opname, .. } => Some(opname.clone()),
+                _ => None,
+            })
+            .collect();
+        // Exactly one push, one copy, one pop — order as above.
+        assert_eq!(opnames, vec!["ref_push", "ref_copy", "ref_pop"]);
+    }
+
+    #[test]
+    fn insert_renamings_groups_by_kind() {
+        // Int and Ref renamings co-exist on the same link.  Both groups
+        // emit copies independently — no cross-kind interference.
+        let int_src = var(0, Kind::Int);
+        let int_dst = var(1, Kind::Int);
+        let ref_src = var(2, Kind::Ref);
+        let ref_dst = var(3, Kind::Ref);
+        let link = Link::new(
+            vec![FlowValue::from(int_src), FlowValue::from(ref_src)],
+            None,
+            None,
+        );
+        let inputargs = vec![FlowValue::from(int_dst), FlowValue::from(ref_dst)];
+        let mut ssarepr = SSARepr::new("t");
+        insert_renamings(&link, &inputargs, trivial_getcolor, &mut ssarepr);
+
+        let opnames: Vec<String> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|i| match i {
+                Insn::Op { opname, .. } => Some(opname.clone()),
+                _ => None,
+            })
+            .collect();
+        // `Kind::ALL = [Int, Ref, Float]` ordering guarantees int_copy
+        // fires before ref_copy.
+        assert_eq!(opnames, vec!["int_copy", "ref_copy"]);
+    }
+
+    #[test]
+    fn insert_renamings_constant_source_emits_copy_with_constint() {
+        // Constant source → emitted as `{kind}_copy ConstInt -> dst`.
+        let dst = var(0, Kind::Int);
+        let link = Link::new(vec![FlowValue::from(FlowConstant::signed(42))], None, None);
+        let inputargs = vec![FlowValue::from(dst)];
+        let mut ssarepr = SSARepr::new("t");
+        insert_renamings(&link, &inputargs, trivial_getcolor, &mut ssarepr);
+
+        assert_eq!(ssarepr.insns.len(), 1);
+        match &ssarepr.insns[0] {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "int_copy");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Operand::ConstInt(42)));
+                assert_eq!(*result, Some(reg(Kind::Int, 0)));
+            }
+            other => panic!("unexpected insn {:?}", other),
+        }
+    }
+
+    #[test]
+    fn insert_renamings_skips_last_exception_extras() {
+        // Extravars (`last_exception` / `last_exc_value`) must be routed
+        // through `generate_last_exc`, not the copy loop.
+        let exc_type = var(10, Kind::Ref);
+        let exc_value = var(11, Kind::Ref);
+        let dst_type = var(0, Kind::Ref);
+        let dst_value = var(1, Kind::Ref);
+        let mut link = Link::new(
+            vec![FlowValue::from(exc_type), FlowValue::from(exc_value)],
+            None,
+            None,
+        );
+        link.extravars(Some(exc_type), Some(exc_value));
+        let inputargs = vec![FlowValue::from(dst_type), FlowValue::from(dst_value)];
+        let mut ssarepr = SSARepr::new("t");
+        insert_renamings(&link, &inputargs, trivial_getcolor, &mut ssarepr);
+
+        // Copy loop: both args are extravars and skipped.  Tail
+        // `generate_last_exc`: emits last_exception -> r0, last_exc_value -> r1.
+        let opnames: Vec<String> = ssarepr
+            .insns
+            .iter()
+            .filter_map(|i| match i {
+                Insn::Op { opname, .. } => Some(opname.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opnames, vec!["last_exception", "last_exc_value"]);
+    }
+
+    #[test]
+    fn generate_last_exc_emits_nothing_when_extras_absent() {
+        let v = var(0, Kind::Ref);
+        let link = Link::new(vec![FlowValue::from(v)], None, None);
+        let inputargs = vec![FlowValue::from(v)];
+        let mut ssarepr = SSARepr::new("t");
+        generate_last_exc(&link, &inputargs, trivial_getcolor, &mut ssarepr);
+        assert!(ssarepr.insns.is_empty());
     }
 }

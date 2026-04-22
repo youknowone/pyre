@@ -135,9 +135,23 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
 
     // Run the transformer. A panic here fails the test and localizes the
     // first Rust pattern majit-translate's pipeline cannot lower.
+    //
+    // RPython `codewriter.py:33 transform_graph_to_jitcode(self, graph,
+    // jitcode, verbose, index)` returns None. The SSARepr is stashed on
+    // the jitcode body by `assembler.py:49 jitcode._ssarepr = ssarepr`
+    // and read back here for inspection, matching how upstream tests
+    // dig into ssarepr via `jitcode._ssarepr`.
     let mut cw = CodeWriter::new();
     let config = GraphTransformConfig::default();
-    let ssarepr = cw.transform_graph_to_jitcode(&sf.graph, &path, &mut cc, &config, &jitcode);
+    let idx = cc.finished_jitcodes_len();
+    cw.transform_graph_to_jitcode(
+        &sf.graph, &path, &mut cc, &config, &jitcode, /* verbose = */ false, idx,
+    );
+    let body = jitcode.body();
+    let ssarepr = body
+        ._ssarepr
+        .as_ref()
+        .expect("assembler must stash SSARepr on jitcode body per assembler.py:49");
 
     // Minimal shape check: the SSARepr must carry at least as many
     // instructions as the original graph had operations. Transform passes
@@ -164,7 +178,6 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
     );
 
     // The JitCode shell must have been populated with a body.
-    let body = jitcode.body();
     assert!(
         !body.code.is_empty(),
         "JitCode body code was empty after transform_graph_to_jitcode"

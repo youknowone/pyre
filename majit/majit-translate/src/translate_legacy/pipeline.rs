@@ -122,6 +122,22 @@ pub struct ProgramPipelineResult {
     /// `JitDriverStaticData.mainjitcode` or `IndirectCallTargets`) share
     /// identity with the values appearing here.
     pub jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// RPython: `rpython/jit/codewriter/call.py:87 self.jitcodes`
+    /// (graph-keyed dict). Pyre uses `CallPath` as graph identity at the
+    /// module boundary. Paired with `jitcodes` (which mirrors
+    /// `self.all_jitcodes` from `call.py:88`) so consumers can look up a
+    /// JitCode either by alloc-order index or by graph key.
+    ///
+    /// Skipped by serde because serde_json cannot serialize a HashMap
+    /// keyed by a struct (`CallPath` is not a `String`). The
+    /// `jit_metadata.json` round-trip used by `pyre-jit-trace/build.rs`
+    /// does not need this view — it reads the alloc-ordered `jitcodes`
+    /// vector directly. Consumers that require `by_path` read it from
+    /// the live in-memory `ProgramPipelineResult`, not from the JSON
+    /// artifact.
+    #[serde(skip)]
+    pub jitcodes_by_path:
+        std::collections::HashMap<crate::parse::CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
     /// RPython: `Assembler.insns` (assembler.py:?). The opcode-key → u8
     /// table grown on-demand by `write_insn`. Persisted alongside the
     /// jitcodes so the runtime can map bytecode bytes back to opnames —
@@ -211,6 +227,7 @@ pub fn analyze_program(
         functions,
         opcode_dispatch: Vec::new(),
         jitcodes: Vec::new(),
+        jitcodes_by_path: std::collections::HashMap::new(),
         insns: std::collections::HashMap::new(),
         descrs: Vec::new(),
         total_blocks,
@@ -365,6 +382,7 @@ mod tests {
                 flattened: Some(flattened),
             }],
             jitcodes: vec![Arc::new(JitCode::new("consts"))],
+            jitcodes_by_path: std::collections::HashMap::new(),
             insns: std::collections::HashMap::new(),
             descrs: Vec::new(),
             total_blocks: 1,

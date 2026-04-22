@@ -1544,13 +1544,32 @@ impl CallControl {
         self.jitcodes.get(path).cloned()
     }
 
-    /// Append a fully assembled jitcode to `all_jitcodes[]` and assign
-    /// its final dense index. Mirrors RPython `all_jitcodes.append(jitcode)`
-    /// immediately after `transform_graph_to_jitcode(...)`.
+    /// RPython `codewriter.py:81 all_jitcodes.append(jitcode)` — the
+    /// sole append site in upstream's `make_jitcodes` loop. `jitcode.index`
+    /// is already set by `transform_graph_to_jitcode` (upstream line 68);
+    /// this method is the final positional append.
     pub fn finish_jitcode(&mut self, jitcode: std::sync::Arc<crate::jitcode::JitCode>) {
-        let index = self.finished_jitcodes.len();
-        jitcode.set_index(index);
+        debug_assert_eq!(
+            jitcode.try_index(),
+            Some(self.finished_jitcodes.len()),
+            "finish_jitcode: jitcode {:?} arrives with index {:?} but \
+             would land at slot {}. Upstream `codewriter.py:68` assigns \
+             `jitcode.index = index` inside `transform_graph_to_jitcode`, \
+             which must match `len(all_jitcodes)` at the call site.",
+            jitcode.name,
+            jitcode.try_index(),
+            self.finished_jitcodes.len(),
+        );
         self.finished_jitcodes.push(jitcode);
+    }
+
+    /// Read the number of jitcodes already appended to `all_jitcodes[]`.
+    /// Drain loop callers use this to compute the `index` passed into
+    /// `transform_graph_to_jitcode` (upstream `codewriter.py:80
+    /// self.transform_graph_to_jitcode(graph, jitcode, verbose,
+    /// len(all_jitcodes))`).
+    pub fn finished_jitcodes_len(&self) -> usize {
+        self.finished_jitcodes.len()
     }
 
     /// RPython `call.py:182-187 get_jitcode_calldescr` source-of-truth for
@@ -2028,6 +2047,16 @@ impl CallControl {
     /// Access the function graphs map (for inline pass).
     pub fn function_graphs(&self) -> &HashMap<CallPath, FunctionGraph> {
         &self.function_graphs
+    }
+
+    /// Access the `{CallPath → Arc<JitCode>}` map.
+    ///
+    /// RPython: `call.py:87 self.jitcodes`. Pyre exposes the same map as a
+    /// read-only view so `CodeWriter::make_jitcodes` can pair it with
+    /// `collect_jitcodes_in_alloc_order` into a single `AllJitCodes`
+    /// return value.
+    pub fn jitcodes(&self) -> &HashMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>> {
+        &self.jitcodes
     }
 
     /// Access jitdriver static data.
