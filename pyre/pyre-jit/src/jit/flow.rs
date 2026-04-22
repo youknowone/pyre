@@ -43,7 +43,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use super::flatten::Kind;
+use super::flatten::{IndirectCallTargets, Kind};
 
 /// `rpython/flowspace/model.py:241` `class Variable(object)`.
 ///
@@ -407,11 +407,185 @@ impl From<Constant> for FlowValue {
     }
 }
 
+/// `rpython/jit/codewriter/flatten.py:35-51` `class ListOfKind(object)`,
+/// but at the pre-regalloc flow-graph stage where the contents are still
+/// Variables / Constants instead of flattened registers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FlowListOfKind {
+    pub kind: Kind,
+    pub content: Vec<FlowValue>,
+}
+
+impl FlowListOfKind {
+    pub fn new(kind: Kind, content: Vec<FlowValue>) -> Self {
+        Self { kind, content }
+    }
+
+    pub fn replace(&self, mapping: &HashMap<Variable, Variable>) -> Self {
+        Self {
+            kind: self.kind,
+            content: self
+                .content
+                .iter()
+                .map(|value| value.replace(mapping))
+                .collect(),
+        }
+    }
+}
+
+/// Pointer-identity wrapper for `majit_ir::DescrRef` so a descr can sit
+/// inside `SpaceOperationArg` despite `Arc<dyn Descr>` not deriving
+/// `Eq`/`Hash`.  Mirrors the treatment in `rpython/jit/metainterp/
+/// history.py` where `AbstractDescr` instances are singletons identified
+/// by Python `is` — two descrs are "equal" only when they are the same
+/// Python object.
+#[derive(Debug, Clone)]
+pub struct DescrByPtr(pub majit_ir::DescrRef);
+
+impl PartialEq for DescrByPtr {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for DescrByPtr {}
+
+impl std::hash::Hash for DescrByPtr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (std::sync::Arc::as_ptr(&self.0) as *const ()).hash(state);
+    }
+}
+
+/// Pointer-identity wrapper around `flatten::IndirectCallTargets` —
+/// `IndirectCallTargets` carries `Vec<Arc<JitCode>>` which does not
+/// derive `Eq`/`Hash`, and two SSARepr sites pointing at the SAME
+/// target list must dedup to the same assembler index
+/// (`assembler.py:197-206`).  Matches the treatment upstream gives
+/// `AbstractDescr` in `SpaceOperation.args` — identity by Python `is`,
+/// not structural equality.
+#[derive(Debug, Clone)]
+pub struct IndirectCallTargetsByPtr(pub Rc<IndirectCallTargets>);
+
+impl PartialEq for IndirectCallTargetsByPtr {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for IndirectCallTargetsByPtr {}
+
+impl std::hash::Hash for IndirectCallTargetsByPtr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (Rc::as_ptr(&self.0) as *const ()).hash(state);
+    }
+}
+
+/// `rpython/flowspace/model.py:436-439 SpaceOperation.args`.
+///
+/// Upstream is a duck-typed Python list that mixes `Variable`, `Constant`,
+/// `ListOfKind`, `AbstractDescr`, and `IndirectCallTargets` — see
+/// `flatten.py:358-370` where the serializer walks `op.args` and
+/// dispatches by `isinstance` against those five types.  pyre represents
+/// all five: `Value` covers `Variable | Constant`, `ListOfKind` wraps
+/// `flow::FlowListOfKind`, `Descr` wraps `majit_ir::DescrRef` (upstream
+/// `AbstractDescr`), and `IndirectCallTargets` wraps pyre's
+/// `flatten::IndirectCallTargets` (upstream `IndirectCallTargets`).
+///
+/// PRE-EXISTING-ADAPTATION: Rust needs a concrete sum type.  We cannot
+/// simply extend `FlowValue` to cover ListOfKind/Descr/IndirectCallTargets
+/// because `FlowValue` is also the element type of `Block.inputargs`,
+/// `SpaceOperation.result`, `Link.args`, `Link.exitcase`, and
+/// `Link.last_exception` — positions where upstream forbids anything
+/// but `Variable` (inputargs/result) or `Variable | Constant` (link
+/// args).  Widening `FlowValue` would relax those contracts.  The
+/// `SpaceOperationArg` sum is the minimal expression that keeps every
+/// other slot typed as upstream demands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SpaceOperationArg {
+    Value(FlowValue),
+    ListOfKind(FlowListOfKind),
+    Descr(DescrByPtr),
+    IndirectCallTargets(IndirectCallTargetsByPtr),
+}
+
+impl SpaceOperationArg {
+    pub fn replace(&self, mapping: &HashMap<Variable, Variable>) -> Self {
+        match self {
+            Self::Value(value) => Self::Value(value.replace(mapping)),
+            Self::ListOfKind(list) => Self::ListOfKind(list.replace(mapping)),
+            // `flatten.py:365-367` passes AbstractDescr and
+            // IndirectCallTargets through unchanged.
+            Self::Descr(descr) => Self::Descr(descr.clone()),
+            Self::IndirectCallTargets(targets) => Self::IndirectCallTargets(targets.clone()),
+        }
+    }
+
+    pub fn variables(&self) -> Vec<Variable> {
+        match self {
+            Self::Value(value) => value.as_variable().into_iter().collect(),
+            Self::ListOfKind(list) => list
+                .content
+                .iter()
+                .filter_map(FlowValue::as_variable)
+                .collect(),
+            Self::Descr(_) | Self::IndirectCallTargets(_) => Vec::new(),
+        }
+    }
+
+    pub fn constants(&self) -> Vec<Constant> {
+        match self {
+            Self::Value(value) => value.as_constant().cloned().into_iter().collect(),
+            Self::ListOfKind(list) => list
+                .content
+                .iter()
+                .filter_map(|value| value.as_constant().cloned())
+                .collect(),
+            Self::Descr(_) | Self::IndirectCallTargets(_) => Vec::new(),
+        }
+    }
+}
+
+impl From<majit_ir::DescrRef> for SpaceOperationArg {
+    fn from(descr: majit_ir::DescrRef) -> Self {
+        Self::Descr(DescrByPtr(descr))
+    }
+}
+
+impl From<Rc<IndirectCallTargets>> for SpaceOperationArg {
+    fn from(targets: Rc<IndirectCallTargets>) -> Self {
+        Self::IndirectCallTargets(IndirectCallTargetsByPtr(targets))
+    }
+}
+
+impl From<FlowValue> for SpaceOperationArg {
+    fn from(value: FlowValue) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl From<Variable> for SpaceOperationArg {
+    fn from(value: Variable) -> Self {
+        Self::Value(value.into())
+    }
+}
+
+impl From<Constant> for SpaceOperationArg {
+    fn from(value: Constant) -> Self {
+        Self::Value(value.into())
+    }
+}
+
+impl From<FlowListOfKind> for SpaceOperationArg {
+    fn from(value: FlowListOfKind) -> Self {
+        Self::ListOfKind(value)
+    }
+}
+
 /// `rpython/flowspace/model.py:434` `class SpaceOperation(object)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SpaceOperation {
     pub opname: String,
-    pub args: Vec<FlowValue>,
+    pub args: Vec<SpaceOperationArg>,
     pub result: Option<FlowValue>,
     pub offset: i64,
 }
@@ -419,7 +593,7 @@ pub struct SpaceOperation {
 impl SpaceOperation {
     pub fn new(
         opname: impl Into<String>,
-        args: Vec<FlowValue>,
+        args: Vec<SpaceOperationArg>,
         result: Option<FlowValue>,
         offset: i64,
     ) -> Self {
@@ -787,7 +961,9 @@ impl Block {
             .filter_map(FlowValue::as_variable)
             .collect();
         for op in &self.operations {
-            result.extend(op.args.iter().filter_map(FlowValue::as_variable));
+            for arg in &op.args {
+                result.extend(arg.variables());
+            }
             if let Some(result_value) = &op.result {
                 if let Some(variable) = result_value.as_variable() {
                     result.push(variable);
@@ -805,11 +981,9 @@ impl Block {
             .filter_map(|value| value.as_constant().cloned())
             .collect();
         for op in &self.operations {
-            result.extend(
-                op.args
-                    .iter()
-                    .filter_map(|value| value.as_constant().cloned()),
-            );
+            for arg in &op.args {
+                result.extend(arg.constants());
+            }
         }
         uniqueitems(result)
     }
@@ -1045,6 +1219,35 @@ fn copy_optional_value(
     value.map(|value| copy_value(value, varmap, next_variable_id, shallowvars))
 }
 
+fn copy_space_operation_arg(
+    arg: &SpaceOperationArg,
+    varmap: &mut HashMap<Variable, Variable>,
+    next_variable_id: &mut u32,
+    shallowvars: bool,
+) -> SpaceOperationArg {
+    match arg {
+        SpaceOperationArg::Value(value) => {
+            copy_value(value, varmap, next_variable_id, shallowvars).into()
+        }
+        SpaceOperationArg::ListOfKind(list) => FlowListOfKind::new(
+            list.kind,
+            list.content
+                .iter()
+                .map(|value| copy_value(value, varmap, next_variable_id, shallowvars))
+                .collect(),
+        )
+        .into(),
+        // `model.py:231-233` `Block.copy` passes AbstractDescr and
+        // IndirectCallTargets through unchanged — both carry
+        // graph-external identity and are shared by pointer across
+        // clones.
+        SpaceOperationArg::Descr(descr) => SpaceOperationArg::Descr(descr.clone()),
+        SpaceOperationArg::IndirectCallTargets(targets) => {
+            SpaceOperationArg::IndirectCallTargets(targets.clone())
+        }
+    }
+}
+
 fn copy_exitswitch(
     exitswitch: Option<&ExitSwitch>,
     varmap: &mut HashMap<Variable, Variable>,
@@ -1125,7 +1328,14 @@ pub fn copygraph(
                     args: op
                         .args
                         .iter()
-                        .map(|value| copy_value(value, local_varmap, next_variable_id, shallowvars))
+                        .map(|arg| {
+                            copy_space_operation_arg(
+                                arg,
+                                local_varmap,
+                                next_variable_id,
+                                shallowvars,
+                            )
+                        })
                         .collect(),
                     result: copy_optional_value(
                         op.result.as_ref(),
@@ -1544,10 +1754,8 @@ mod tests {
             Some(return_var)
         );
         assert_eq!(
-            copied_mid.borrow().operations[0].args[0]
-                .as_variable()
-                .map(|v| v.kind),
-            Some(Some(Kind::Ref))
+            copied_mid.borrow().operations[0].args[0].variables()[0].kind,
+            Some(Kind::Ref)
         );
         assert_eq!(
             copied_mid.borrow().operations[0]
@@ -1596,6 +1804,32 @@ mod tests {
             block.raising_op().expect("raising op expected").opname,
             "overflowing_add_ovf"
         );
+    }
+
+    #[test]
+    fn block_getvariables_and_constants_follow_listofkind_args() {
+        let v0 = Variable::new(VariableId(0), Kind::Int);
+        let v1 = Variable::new(VariableId(1), Kind::Int);
+        let block = Block::shared(vec![v0.into()]);
+        push_op(
+            &block,
+            SpaceOperation::new(
+                "jit_merge_point",
+                vec![
+                    FlowListOfKind::new(
+                        Kind::Int,
+                        vec![v0.into(), Constant::signed(7).into(), v1.into()],
+                    )
+                    .into(),
+                ],
+                None,
+                0,
+            ),
+        );
+
+        let block_borrow = block.borrow();
+        assert_eq!(block_borrow.getvariables(), vec![v0, v1]);
+        assert_eq!(block_borrow.getconstants(), vec![Constant::signed(7)]);
     }
 
     #[test]

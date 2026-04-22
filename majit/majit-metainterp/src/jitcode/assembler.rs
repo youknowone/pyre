@@ -677,6 +677,18 @@ impl JitCodeBuilder {
         self.push_u16(dst);
     }
 
+    /// RPython blackhole.py:976-985 `goto_if_exception_mismatch/iL`.
+    ///
+    /// `vtable` is an int operand index, which may refer either to a real
+    /// Int register or to an assembler-routed Int constant pool slot.
+    /// Unlike `last_exception`, this operand is not necessarily a live
+    /// register, so we intentionally do not call `touch_reg()` here.
+    pub fn goto_if_exception_mismatch(&mut self, vtable: u16, label: u16) {
+        self.write_insn("goto_if_exception_mismatch/iL");
+        self.push_u16(vtable);
+        self.push_label_ref(label);
+    }
+
     /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point.
     ///
     /// assembler.py:181-196 parity: encodes jdindex + 6 typed register

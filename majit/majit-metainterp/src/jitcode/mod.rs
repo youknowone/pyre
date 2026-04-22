@@ -89,6 +89,8 @@ pub(crate) const BC_CATCH_EXCEPTION: u8 = 89;
 pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
 /// RPython blackhole.py:987 `last_exception/>i`.
 pub(crate) const BC_LAST_EXCEPTION: u8 = 129;
+/// RPython blackhole.py:976-985 `goto_if_exception_mismatch/iL`.
+pub(crate) const BC_GOTO_IF_EXCEPTION_MISMATCH: u8 = 130;
 /// blackhole.py bhimpl_rvmprof_code: rvmprof enter/leave marker.
 pub(crate) const BC_RVMPROF_CODE: u8 = 91;
 
@@ -258,6 +260,10 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     // blackhole.py:987 `@arguments("self", returns="i") bhimpl_last_exception`
     // yields canonical key `last_exception/>i`.
     m.insert("last_exception/>i", BC_LAST_EXCEPTION);
+    m.insert(
+        "goto_if_exception_mismatch/iL",
+        BC_GOTO_IF_EXCEPTION_MISMATCH,
+    );
     // flatten.py:347 emits `last_exc_value, '->', reg`, so
     // assembler.py grows the canonical key `last_exc_value/>r`.
     m.insert("last_exc_value/>r", BC_LAST_EXC_VALUE);

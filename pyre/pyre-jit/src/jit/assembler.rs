@@ -678,10 +678,76 @@ fn dispatch_op(
             let label_id = builder_label(state, &label.name);
             state.builder.catch_exception(label_id);
         }
+        "goto_if_exception_mismatch" => {
+            let vtable = expect_int_reg_or_pool(state, &args[0]);
+            let label = expect_tlabel(&args[1]);
+            let label_id = builder_label(state, &label.name);
+            state.builder.goto_if_exception_mismatch(vtable, label_id);
+        }
         "jit_merge_point" => {
-            let greens_i = expect_list_regs(&args[0], Kind::Int);
-            let greens_r = expect_list_regs(&args[1], Kind::Ref);
-            let reds_r = expect_list_regs(&args[2], Kind::Ref);
+            // Two shapes accepted during the graph-path transition
+            // (Task #225 Phase 2):
+            //
+            // 1. 3-list pyre-native: `[greens_i, greens_r, reds_r]` —
+            //    the shape produced by `ssa_emitter.rs::emit_portal_jit_merge_point`.
+            //    float greens/reds and the jd_index constant are
+            //    elided (pyre has a single jitdriver and no float
+            //    slots in the portal contract).
+            // 2. 7-arg upstream-orthodox: `[jd_index_const, greens_i,
+            //    greens_r, greens_f, reds_i, reds_r, reds_f]` — the
+            //    shape produced by
+            //    `codewriter.rs::portal_jit_merge_point_graph_args`
+            //    matching `jtransform.py:1690-1712` +
+            //    `jtransform.py:437-445 make_three_lists`.
+            //
+            // The runtime builder takes only `(greens_i, greens_r,
+            // reds_r)`, so the 7-arg form lowers to 3 by extracting
+            // positions 1, 2, 5 after asserting the other slots are
+            // empty (pyre portal reds/greens contain no ints beyond
+            // greens_i and no floats at all) and the jd_index is 0
+            // (pyre single jitdriver).
+            let (greens_i, greens_r, reds_r) = match args.len() {
+                3 => (
+                    expect_list_regs_or_pool(state, &args[0], Kind::Int),
+                    expect_list_regs_or_pool(state, &args[1], Kind::Ref),
+                    expect_list_regs_or_pool(state, &args[2], Kind::Ref),
+                ),
+                7 => {
+                    let jd_index = match &args[0] {
+                        Operand::ConstInt(v) => *v,
+                        other => panic!(
+                            "jit_merge_point 7-arg expects ConstInt jd_index at arg[0], got {other:?}"
+                        ),
+                    };
+                    assert_eq!(
+                        jd_index, 0,
+                        "pyre has a single jitdriver; jd_index must be 0, got {jd_index}"
+                    );
+                    let greens_f = expect_list_regs_or_pool(state, &args[3], Kind::Float);
+                    let reds_i = expect_list_regs_or_pool(state, &args[4], Kind::Int);
+                    let reds_f = expect_list_regs_or_pool(state, &args[6], Kind::Float);
+                    assert!(
+                        greens_f.is_empty(),
+                        "pyre portal greens_f must be empty, got {greens_f:?}"
+                    );
+                    assert!(
+                        reds_i.is_empty(),
+                        "pyre portal reds_i must be empty, got {reds_i:?}"
+                    );
+                    assert!(
+                        reds_f.is_empty(),
+                        "pyre portal reds_f must be empty, got {reds_f:?}"
+                    );
+                    (
+                        expect_list_regs_or_pool(state, &args[1], Kind::Int),
+                        expect_list_regs_or_pool(state, &args[2], Kind::Ref),
+                        expect_list_regs_or_pool(state, &args[5], Kind::Ref),
+                    )
+                }
+                n => panic!(
+                    "jit_merge_point: expected 3 (pyre-native) or 7 (upstream-orthodox) args, got {n}"
+                ),
+            };
             state.builder.jit_merge_point(&greens_i, &greens_r, &reds_r);
         }
         "loop_header" => {
@@ -1539,6 +1605,23 @@ fn expect_small_u16(op: &Operand) -> u16 {
     }
 }
 
+fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
+    match op {
+        Operand::Register(Register {
+            kind: Kind::Int,
+            index,
+        }) => *index,
+        Operand::ConstInt(value) => {
+            let idx = state.builder.add_const_i(*value);
+            state.builder.num_regs_i() + idx
+        }
+        other => panic!(
+            "expected Int register or ConstInt routable through constant pool, got {:?}",
+            other
+        ),
+    }
+}
+
 fn expect_list_regs(op: &Operand, expected: Kind) -> Vec<u8> {
     match op {
         Operand::ListOfKind(ListOfKind { kind, content }) if *kind == expected => content
@@ -1549,6 +1632,77 @@ fn expect_list_regs(op: &Operand, expected: Kind) -> Vec<u8> {
             .collect(),
         _ => panic!("expected ListOfKind({:?}), got {:?}", expected, op),
     }
+}
+
+/// Like `expect_list_regs`, but also accepts `Operand::ConstInt` /
+/// `Operand::ConstRef` entries inside the `ListOfKind` and routes them
+/// through the runtime constant pool (`builder.add_const_i` /
+/// `builder.add_const_r`), returning the pool-backed register index
+/// (`num_regs_kind + pool_idx`).
+///
+/// Matches upstream `rpython/jit/codewriter/assembler.py:157-175`
+/// behavior where the assembler handles both pre-colored `Register`s
+/// and raw `Constant`s inside `ListOfKind` by emitting distinct
+/// argcodes ('i'/'r'/'f' for Register, 'c' for Constant) and routing
+/// Constants through the per-kind constant table at write time.
+///
+/// Pyre's production jit_merge_point historically emitted
+/// pre-pool-routed `Register` operands (via
+/// `ssa_emitter.rs::emit_portal_jit_merge_point`), so this function
+/// keeps that path working.  It also makes the 7-arg
+/// upstream-orthodox shape produced by
+/// `codewriter.rs::portal_jit_merge_point_graph_args` +
+/// `GraphFlattener` (which emits raw `ConstInt`/`ConstRef` inside
+/// `ListOfKind` because pyre's flow-graph constants are not
+/// pool-routed upstream) work end-to-end.
+fn expect_list_regs_or_pool(state: &mut AssemblyState, op: &Operand, expected: Kind) -> Vec<u8> {
+    let ListOfKind { kind, content } = match op {
+        Operand::ListOfKind(list) => list,
+        _ => panic!("expected ListOfKind({:?}), got {:?}", expected, op),
+    };
+    assert_eq!(
+        *kind, expected,
+        "list kind mismatch: expected {expected:?}, got {:?}",
+        kind
+    );
+    content
+        .iter()
+        .map(|item| {
+            let reg_idx = match item {
+                Operand::Register(Register { kind, index }) => {
+                    assert_eq!(
+                        *kind, expected,
+                        "register kind mismatch inside list: expected {expected:?}, got {:?}",
+                        kind
+                    );
+                    *index
+                }
+                Operand::ConstInt(value) => {
+                    assert_eq!(
+                        expected,
+                        Kind::Int,
+                        "ConstInt found inside non-int ListOfKind({expected:?})"
+                    );
+                    let idx = state.builder.add_const_i(*value);
+                    state.builder.num_regs_i() + idx
+                }
+                Operand::ConstRef(value) => {
+                    assert_eq!(
+                        expected,
+                        Kind::Ref,
+                        "ConstRef found inside non-ref ListOfKind({expected:?})"
+                    );
+                    let idx = state.builder.add_const_r(*value);
+                    state.builder.num_regs_r() + idx
+                }
+                other => panic!(
+                    "expected Register/ConstInt/ConstRef inside ListOfKind({expected:?}), \
+                     got {other:?}"
+                ),
+            };
+            u8::try_from(reg_idx).expect("register index exceeds u8")
+        })
+        .collect()
 }
 
 fn expect_call_args(args: &[Operand]) -> Vec<JitCallArg> {
@@ -1730,6 +1884,37 @@ mod tests {
         assert_eq!(
             insns.get("last_exc_value/>r"),
             wellknown.get("last_exc_value/>r")
+        );
+    }
+
+    #[test]
+    fn assemble_accumulates_canonical_goto_if_exception_mismatch_key() {
+        let mut assembler = Assembler::new();
+
+        let mut ssarepr = SSARepr::new("exc_match");
+        ssarepr.insns.push(Insn::op(
+            "goto_if_exception_mismatch",
+            vec![Operand::ConstInt(7), Operand::TLabel(TLabel::new("L1"))],
+        ));
+        ssarepr.insns.push(Insn::Label(Label::new("L1")));
+        ssarepr.insns.push(Insn::op(
+            "ref_return",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+        ));
+        assembler.assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let insns = assembler.insns_snapshot();
+        let wellknown = majit_metainterp::jitcode::wellknown_bh_insns();
+        assert_eq!(
+            insns.get("goto_if_exception_mismatch/iL"),
+            wellknown.get("goto_if_exception_mismatch/iL")
         );
     }
 

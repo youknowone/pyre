@@ -27,7 +27,8 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState}
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallFlavor, DescrOperand, Insn, Kind, ListOfKind, Operand, Register, ResKind, SSARepr, TLabel,
+    CallFlavor, DescrOperand, GraphFlattener, Insn, Kind, ListOfKind, Operand, Register, ResKind,
+    SSARepr, TLabel,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,91 @@ fn entry_inputargs(code: &CodeObject) -> Vec<super::flow::FlowValue> {
         .collect()
 }
 
+fn portal_graph_inputvars(code: &CodeObject) -> (super::flow::Variable, super::flow::Variable) {
+    let base = entry_arg_slots(code) as u32;
+    (
+        super::flow::Variable::new(super::flow::VariableId(base), Kind::Ref),
+        super::flow::Variable::new(super::flow::VariableId(base + 1), Kind::Ref),
+    )
+}
+
+fn graph_entry_inputargs(code: &CodeObject, portal_inputs: bool) -> Vec<super::flow::FlowValue> {
+    let mut inputargs = entry_inputargs(code);
+    if portal_inputs {
+        let (frame, ec) = portal_graph_inputvars(code);
+        inputargs.push(frame.into());
+        inputargs.push(ec.into());
+    }
+    inputargs
+}
+
+fn portal_graph_inputvars_from_startblock(
+    graph: &super::flow::FunctionGraph,
+) -> (super::flow::Variable, super::flow::Variable) {
+    let startblock = graph.startblock.borrow();
+    let len = startblock.inputargs.len();
+    assert!(
+        len >= 2,
+        "portal graph startblock missing frame/ec inputargs"
+    );
+    let frame = match &startblock.inputargs[len - 2] {
+        super::flow::FlowValue::Variable(variable) => *variable,
+        other => panic!("portal graph frame inputarg must be Variable, got {other:?}"),
+    };
+    let ec = match &startblock.inputargs[len - 1] {
+        super::flow::FlowValue::Variable(variable) => *variable,
+        other => panic!("portal graph ec inputarg must be Variable, got {other:?}"),
+    };
+    (frame, ec)
+}
+
+fn flow_value_kind(value: &super::flow::FlowValue) -> Kind {
+    match value {
+        super::flow::FlowValue::Variable(variable) => variable
+            .kind
+            .expect("flow graph variable missing kind in jit_merge_point arg"),
+        super::flow::FlowValue::Constant(constant) => constant
+            .kind
+            .expect("flow graph constant missing kind in jit_merge_point arg"),
+    }
+}
+
+fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::SpaceOperationArg> {
+    let mut ints = Vec::new();
+    let mut refs = Vec::new();
+    let mut floats = Vec::new();
+    for value in values {
+        match flow_value_kind(value) {
+            Kind::Int => ints.push(value.clone()),
+            Kind::Ref => refs.push(value.clone()),
+            Kind::Float => floats.push(value.clone()),
+        }
+    }
+    vec![
+        super::flow::FlowListOfKind::new(Kind::Int, ints).into(),
+        super::flow::FlowListOfKind::new(Kind::Ref, refs).into(),
+        super::flow::FlowListOfKind::new(Kind::Float, floats).into(),
+    ]
+}
+
+fn portal_jit_merge_point_graph_args(
+    graph: &super::flow::FunctionGraph,
+    next_instr: usize,
+    w_code: *const (),
+) -> Vec<super::flow::SpaceOperationArg> {
+    let (frame, ec) = portal_graph_inputvars_from_startblock(graph);
+    let greens = vec![
+        super::flow::Constant::signed(next_instr as i64).into(),
+        super::flow::Constant::signed(0).into(),
+        super::flow::Constant::opaque(format!("pycode@{w_code:p}"), Some(Kind::Ref)).into(),
+    ];
+    let reds = vec![frame.into(), ec.into()];
+    let mut args = vec![super::flow::Constant::signed(0).into()];
+    args.extend(make_three_flow_lists(&greens));
+    args.extend(make_three_flow_lists(&reds));
+    args
+}
+
 fn frame_blocks_for_offset(code: &CodeObject, next_offset: usize) -> Vec<FrameBlock> {
     if next_offset >= code.instructions.len() {
         return Vec::new();
@@ -108,6 +194,21 @@ struct FrameState {
     blocklist: Vec<FrameBlock>,
     /// `framestate.py:24` `next_offset`.
     next_offset: usize,
+    /// Graph-level portal red slots: the `(frame, ec)` Variables that
+    /// flow through every block of a portal graph.  Populated on the
+    /// entry FrameState (via `entry_frame_state(code, portal_inputs=
+    /// true)`) and propagated through block transitions unchanged —
+    /// portal Variables carry graph-level identity, not per-block SSA
+    /// names, so `copy()` passes them through without freshening and
+    /// `union()` requires both sides to agree.  Mirrors the red
+    /// carry-through in `rpython/jit/metainterp/warmspot.py` where the
+    /// jitdriver_sd.reds list names `(jitframe, ec)` that the portal
+    /// interpreter function threads through every iteration of the
+    /// loop.  Participates in `mergeable()` after the last-exception
+    /// pair so backedge `Link.args` produced by `getoutputargs()` stay
+    /// aligned with the portal `startblock.inputargs` appended by
+    /// `graph_entry_inputargs(code, portal_inputs=true)`.
+    portal_extras: Option<(super::flow::FlowValue, super::flow::FlowValue)>,
 }
 
 impl FrameState {
@@ -124,7 +225,21 @@ impl FrameState {
             last_exception,
             blocklist,
             next_offset,
+            portal_extras: None,
         }
+    }
+
+    /// Seed the graph-level portal `(frame, ec)` pair on this state.
+    /// Called from `entry_frame_state(code, portal_inputs=true)` for
+    /// the startblock state of portal graphs; every state derived from
+    /// that entry state via `copy()` or `union()` preserves the same
+    /// pair.
+    fn with_portal_extras(
+        mut self,
+        extras: (super::flow::FlowValue, super::flow::FlowValue),
+    ) -> Self {
+        self.portal_extras = Some(extras);
+        self
     }
 
     fn mergeable(&self) -> Vec<Option<super::flow::FlowValue>> {
@@ -136,6 +251,10 @@ impl FrameState {
         } else {
             data.push(Some(super::flow::Constant::none().into()));
             data.push(Some(super::flow::Constant::none().into()));
+        }
+        if let Some((frame, ec)) = &self.portal_extras {
+            data.push(Some(frame.clone()));
+            data.push(Some(ec.clone()));
         }
         data
     }
@@ -230,6 +349,9 @@ impl FrameState {
             }),
             blocklist: self.blocklist.clone(),
             next_offset: self.next_offset,
+            // Portal extras are graph-level identity — same Variables
+            // across every FrameState in the graph.  Do not freshen.
+            portal_extras: self.portal_extras.clone(),
         }
     }
 
@@ -321,13 +443,30 @@ impl FrameState {
                 )?,
             )),
         };
-        Some(Self::new(
+        // Portal extras carry graph-level identity; if the two sides
+        // are both portal-seeded they must reference the same Variables,
+        // otherwise the graph is malformed.  Non-portal graphs never
+        // populate them.
+        let portal_extras = match (&self.portal_extras, &other.portal_extras) {
+            (None, None) => None,
+            (Some(left), Some(right)) => {
+                if left == right {
+                    Some(left.clone())
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let mut merged = Self::new(
             locals_w,
             stack,
             last_exception,
             self.blocklist.clone(),
             self.next_offset,
-        ))
+        );
+        merged.portal_extras = portal_extras;
+        Some(merged)
     }
 
     fn getoutputargs(&self, targetstate: &Self) -> Vec<super::flow::FlowValue> {
@@ -431,7 +570,7 @@ fn union_kind(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
     if left == right { left } else { None }
 }
 
-fn entry_frame_state(code: &CodeObject) -> FrameState {
+fn entry_frame_state(code: &CodeObject, portal_inputs: bool) -> FrameState {
     let inputargs = entry_inputargs(code);
     let mut locals_w = vec![None; code.varnames.len()];
     for (index, value) in inputargs.into_iter().enumerate() {
@@ -439,13 +578,19 @@ fn entry_frame_state(code: &CodeObject) -> FrameState {
             locals_w[index] = Some(value);
         }
     }
-    FrameState::new(
+    let state = FrameState::new(
         locals_w,
         Vec::new(),
         None,
         frame_blocks_for_offset(code, 0),
         0,
-    )
+    );
+    if portal_inputs {
+        let (frame, ec) = portal_graph_inputvars(code);
+        state.with_portal_extras((frame.into(), ec.into()))
+    } else {
+        state
+    }
 }
 
 #[derive(Debug)]
@@ -558,10 +703,41 @@ fn output_link(
 fn exceptblock_link_args(source_state: &FrameState) -> Vec<super::flow::FlowValue> {
     match &source_state.last_exception {
         Some((w_type, w_value)) => vec![w_type.clone(), w_value.clone()],
-        None => panic!("exceptblock edge requires materialized exception pair"),
+        None => panic!(
+            "exceptblock edge requires materialized exception pair \
+             (flatten.py:161-162 make_exception_link parity)"
+        ),
     }
 }
 
+/// Allocate the fresh `(exc_type, exc_value)` Variable pair that
+/// represents an exception edge's payload at the graph level.
+///
+/// PRE-EXISTING-ADAPTATION vs `rpython/flowspace/flowcontext.py:1250-
+/// 1261 Raise.nomoreblocks`: RPython's flow analysis sees the Python
+/// source form `raise SomeError("msg")` and builds an
+/// `OperationException(w_type=Constant(SomeError), w_value=...)` from
+/// which `Raise.nomoreblocks` projects `[w_exc.w_type, w_exc.w_value]`
+/// as real trace-level values into the exception Link.  Pyre's tracer
+/// is one level lower: the stack carries a SINGLE Ref value
+/// (`obj_tmp0`, the exception instance), and the exception type is
+/// extracted at runtime inside the `raise` opcode's backend
+/// implementation (`ssa_emitter.rs emit_raise` + blackhole handler).
+/// There is no graph-level Variable that stands for "the type of the
+/// raised value" because pyre's graph emission is driven by bytecode,
+/// not by `raise`-statement source.  Synthesizing fresh Variables here
+/// matches `flowcontext.py:133-143 guessexception` — the same
+/// mechanism upstream itself uses on implicit exception edges, where
+/// type/value are also not statically knowable.
+///
+/// The fresh pair is carried on the Link as BOTH `link.args` AND
+/// `link.extravars` (see `exception_edge_extravars`), so the upstream
+/// `flatten.py:163-164 make_exception_link` check `link.args ==
+/// [link.last_exception, link.last_exc_value]` matches and the
+/// pass-through `raise` / `reraise` emission path fires.  The payload
+/// is structurally synthetic at the graph layer and becomes concrete
+/// only when the backend `raise`/`reraise` opcode populates the
+/// JitFrame's exception slots from `obj_tmp0` at runtime.
 fn exception_edge_vars(
     graph: &mut super::flow::FunctionGraph,
 ) -> (super::flow::Variable, super::flow::Variable) {
@@ -581,11 +757,73 @@ fn exception_landing_state(
     state
 }
 
+/// `flowcontext.py:635-636` computes `w_type = op.type(w_value).eval(self)`
+/// before `Raise.nomoreblocks` projects the explicit raise edge to
+/// `[w_exc.w_type, w_exc.w_value]`.
+///
+/// pyre's production bytecode still emits a single `raise/r` opcode and
+/// derives the exception type at runtime, but the shadow graph can still
+/// mirror the upstream shape exactly: record a graph-level `type`
+/// operation whose result becomes `link.args[0]`, and carry the actual
+/// raised value as `link.args[1]`.
+fn explicit_raise_exception_pair(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    raised_value: super::flow::FlowValue,
+    offset: i64,
+) -> (super::flow::FlowValue, super::flow::FlowValue) {
+    let exc_type = graph.fresh_variable(Kind::Ref);
+    record_graph_op(
+        block,
+        "type",
+        vec![raised_value.clone().into()],
+        Some(exc_type.into()),
+        offset,
+    );
+    (exc_type.into(), raised_value)
+}
+
 fn explicit_raise_state(
     graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
     source_state: &FrameState,
+    raised_value: super::flow::FlowValue,
+    offset: i64,
 ) -> FrameState {
-    exception_landing_state(graph, source_state)
+    let mut state = source_state.clone();
+    state.last_exception = Some(explicit_raise_exception_pair(
+        graph,
+        block,
+        raised_value,
+        offset,
+    ));
+    state
+}
+
+/// Extract the `(etype, evalue)` Variable pair from the edge state
+/// produced by `explicit_raise_state` / `exception_landing_state`.
+/// Mirrors the pattern used by `flowcontext.py:141-143` where the
+/// freshly-created `last_exc` / `last_exc_value` Variables are both
+/// placed into `link.args` AND attached to `link.extravars(...)`
+/// (`model.py:127-129 Link.extravars`) — so downstream passes that
+/// check `link.args == [link.last_exception, link.last_exc_value]`
+/// (`flatten.py:163-164 make_exception_link`) can identify the edge
+/// as a pass-through of the exception pair.
+fn exception_edge_extravars(
+    edge_state: &FrameState,
+) -> (super::flow::Variable, super::flow::Variable) {
+    let (w_type, w_value) = edge_state
+        .last_exception
+        .as_ref()
+        .expect("exception edge state missing last_exception pair");
+    let as_variable = |value: &super::flow::FlowValue| match value {
+        super::flow::FlowValue::Variable(v) => *v,
+        super::flow::FlowValue::Constant(_) => panic!(
+            "exception edge last_exception carries Constant; extravars \
+             expects Variables (flowcontext.py:130-134 guessexception)"
+        ),
+    };
+    (as_variable(w_type), as_variable(w_value))
 }
 
 fn update_catch_landing_state(
@@ -759,6 +997,34 @@ fn fresh_ref_value(graph: &mut super::flow::FunctionGraph) -> super::flow::FlowV
     graph.fresh_variable(Kind::Ref).into()
 }
 
+/// Step 6 transitional dual-write.  `rpython/jit/codewriter/codewriter.py:44-67`
+/// runs `perform_register_allocation(graph) → flatten_graph(graph) →
+/// compute_liveness(ssarepr) → assemble(ssarepr)`.  Upstream has **one**
+/// IR stream — the flow graph — which `flatten_graph` lowers into an
+/// `SSARepr`.
+///
+/// Pyre historically emitted `SSARepr` directly from the trace recorder
+/// and skipped the flow-graph stage.  Step 6A reintroduces the graph
+/// (so CFG-level `regalloc.py:79-96 coalesce_variables` can run), but the
+/// SSARepr emission has not yet been replaced with a `flatten_graph` pass
+/// (Task #214).  Until it is, each opcode handler must populate both
+/// streams — the SSARepr byte stream that backend/blackhole consume, and
+/// the graph that `FlowGraphRegAllocator` consumes.
+///
+/// Delete this helper once Task #214 lands and the SSARepr stream is
+/// generated from the graph by `flatten_graph`.
+fn record_graph_op(
+    block: &super::flow::BlockRef,
+    opname: impl Into<String>,
+    args: Vec<super::flow::SpaceOperationArg>,
+    result: Option<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::SpaceOperation {
+    let op = super::flow::SpaceOperation::new(opname, args, result, offset);
+    super::flow::push_op(block, op.clone());
+    op
+}
+
 fn sync_stack_state(graph: &mut super::flow::FunctionGraph, state: &mut FrameState, depth: u16) {
     while state.stack.len() > depth as usize {
         state.stack.pop();
@@ -768,8 +1034,11 @@ fn sync_stack_state(graph: &mut super::flow::FunctionGraph, state: &mut FrameSta
     }
 }
 
-fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
-    let start_inputargs = entry_frame_state(code).getvariables();
+fn new_shadow_graph_with_portal_inputs(
+    code: &CodeObject,
+    portal_inputs: bool,
+) -> super::flow::FunctionGraph {
+    let start_inputargs = graph_entry_inputargs(code, portal_inputs);
     let return_var = Some(super::flow::Variable::new(
         super::flow::VariableId(start_inputargs.len() as u32),
         Kind::Ref,
@@ -781,11 +1050,15 @@ fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
     )
 }
 
+fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
+    new_shadow_graph_with_portal_inputs(code, false)
+}
+
 fn attach_catch_exception_edge(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     target: &SpamBlockRef,
-    source_state: Option<&FrameState>,
+    source_state: &FrameState,
     link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
 ) -> super::flow::LinkRef {
     let mut link = super::flow::Link::new(Vec::new(), Some(target.block()), None);
@@ -794,21 +1067,12 @@ fn attach_catch_exception_edge(
         super::flow::c_last_exception().into(),
     ));
     drop(block_mut);
-    match source_state {
-        Some(state) => {
-            let (exc_type, exc_value) = exception_edge_vars(graph);
-            link.extravars(Some(exc_type), Some(exc_value));
-            update_catch_landing_state(graph, target, state);
-            let link = link.into_ref();
-            append_exit_with_state(block, link.clone(), state, link_exit_states);
-            link
-        }
-        None => {
-            let link = link.into_ref();
-            append_exit(block, link.clone());
-            link
-        }
-    }
+    let (exc_type, exc_value) = exception_edge_vars(graph);
+    link.extravars(Some(exc_type), Some(exc_value));
+    update_catch_landing_state(graph, target, source_state);
+    let link = link.into_ref();
+    append_exit_with_state(block, link.clone(), source_state, link_exit_states);
+    link
 }
 
 /// Step 6A slice S3b: collect `BlockRef → FrameState` entries from the
@@ -1814,7 +2078,18 @@ impl CodeWriter {
         // walker is still single-pass over Python bytecode, but the
         // shadow graph now carries the same per-block `FrameState`
         // object instead of a topology-only `BlockRef`.
-        let mut graph = new_shadow_graph(code);
+        //
+        // Portal graphs (whose bytecode contains a `jit_merge_point`
+        // marker, see `merge_point_pc`) carry two extra red inputs —
+        // `(frame, ec)` — appended to both `startblock.inputargs` via
+        // `graph_entry_inputargs(code, portal_inputs=true)` AND to
+        // `FrameState` via `entry_frame_state(code, portal_inputs=
+        // true)`.  `FrameState.portal_extras` carries those Variables
+        // through every block transition so `getoutputargs()` on any
+        // backedge produces link args aligned with the appended
+        // startblock slots.  Non-portal graphs populate neither side
+        // and behave exactly as before.
+        let mut graph = new_shadow_graph_with_portal_inputs(code, merge_point_pc.is_some());
         let mut pc_blocks: Vec<Option<SpamBlockRef>> = vec![None; num_instrs];
         let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
         // Step 6A slice S4a: snapshot the walker's `currentstate` at
@@ -1826,7 +2101,7 @@ impl CodeWriter {
         // ADAPTATION) reads the source state per-link to project back
         // onto slots.  Keyed on `LinkRef` (Rc-pointer identity).
         let mut link_exit_states: HashMap<super::flow::LinkRef, FrameState> = HashMap::new();
-        let start_state = entry_frame_state(code);
+        let start_state = entry_frame_state(code, merge_point_pc.is_some());
         if num_instrs > 0 {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
@@ -2122,20 +2397,6 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `loop_header`. RPython parity:
-        // `jtransform.py:1714-1718 handle_jit_marker__loop_header` emits
-        // `SpaceOperation('loop_header', [c_index], None)`; `assembler.py:220`
-        // turns it into the single-byte `loop_header/c` opcode. pyre has one
-        // jitdriver so `jdindex` is always 0 — the arg is the
-        // `Constant(jdindex, lltype.Signed)` from upstream.
-        macro_rules! emit_loop_header {
-            ($ssarepr:expr, $jdindex:expr) => {{
-                let jdindex: u16 = $jdindex;
-                let insn = Insn::op("loop_header", vec![Operand::ConstInt(jdindex as i64)]);
-                $ssarepr.insns.push(insn.clone());
-            }};
-        }
-
         // B6 Phase 3b dual emission for `abort_permanent`. The opname is
         // a pyre-only runtime construct (`BC_ABORT_PERMANENT`) with no
         // counterpart in `rpython/jit/codewriter/*` or
@@ -2168,28 +2429,39 @@ impl CodeWriter {
         // into `raise/r`. pyre's single `emit_raise(exc_reg)` call site
         // (RAISE_VARARGS with argc >= 1) corresponds to the same edge.
         macro_rules! emit_raise {
-            ($ssarepr:expr, $src:expr) => {{
+            ($ssarepr:expr, $src:expr, $evalue:expr, $offset:expr) => {{
                 let src = $src;
+                let evalue_fv: super::flow::FlowValue = $evalue;
+                let offset = $offset;
                 let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
                 $ssarepr.insns.push(insn.clone());
-                // Step 6.1 Phase 2c: attach the raise edge to
-                // `graph.exceptblock` (`model.py:22-23`).
+                // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
+                //   link = Link([w_exc.w_type, w_exc.w_value],
+                //               ctx.graph.exceptblock)
+                // `w_exc.w_value` is the actual trace-level FlowValue
+                // of the raised exception instance; `w_exc.w_type`
+                // upstream is a statically-known Constant because flow
+                // analysis sees the `raise SomeError(...)` source form.
                 //
-                // Explicit `raise value` creates a NEW exception pair;
-                // it must not reuse the currently-handled exception from
-                // `current_state.last_exception`.
-                let edge_state = explicit_raise_state(&mut graph, &current_state);
+                // pyre still emits a single runtime `raise/r`, but the
+                // shadow graph can mirror `flowcontext.py:635-636`
+                // exactly by recording `w_type = type(w_value)` and
+                // routing that result through the explicit raise edge.
+                // Like upstream `Raise.nomoreblocks`, this edge does
+                // NOT use `link.extravars`.
+                let edge_state = explicit_raise_state(
+                    &mut graph,
+                    &current_block.block(),
+                    &current_state,
+                    evalue_fv,
+                    offset,
+                );
                 let link = super::flow::Link::new(
                     exceptblock_link_args(&edge_state),
                     Some(graph.exceptblock.clone()),
                     None,
                 );
                 let link = link.into_ref();
-                // Step 6A slice S4a: snapshot the EXIT state.  The
-                // target exceptblock has `inputargs = [etype, evalue]`;
-                // `collect_link_slot_pairs` skips non-Variable source
-                // args on its own (`flatten.py:355-363` `flatten_list`
-                // — Constants pass through unchanged).
                 append_exit_with_state(
                     &current_block.block(),
                     link,
@@ -2213,12 +2485,30 @@ impl CodeWriter {
                 // (`flatten.py` emits the two as alternative codings
                 // of the same exception exit).
                 //
-                // `reraise` preserves the current handler exception.
-                let link = super::flow::Link::new(
+                // `reraise` preserves the current handler exception in
+                // `FrameState.last_exception` (framestate.py:22).
+                // Upstream `rpython/jit/codewriter/flatten.py:161-162`
+                // `make_exception_link` asserts
+                //     assert link.last_exception is not None
+                //     assert link.last_exc_value is not None
+                // before emitting `reraise`, so reaching this macro
+                // with `current_state.last_exception == None` is a
+                // structural bug in the caller rather than a normal
+                // path. Fail loudly instead of quietly constructing
+                // a sentinel-filled exit link.
+                let (etype, evalue) = exception_edge_extravars(&current_state);
+                let mut link = super::flow::Link::new(
                     exceptblock_link_args(&current_state),
                     Some(graph.exceptblock.clone()),
                     None,
                 );
+                // `flowcontext.py:141-143` `guessexception` / `model.py:
+                // 127-129 Link.extravars`: pass the exception pair as
+                // both `link.args` and `link.extravars` so the
+                // downstream `flatten.py:163-174 make_exception_link`
+                // check `link.args == [link.last_exception,
+                // link.last_exc_value]` matches and emits `reraise`.
+                link.extravars(Some(etype), Some(evalue));
                 let link = link.into_ref();
                 // Step 6A slice S4a: snapshot the EXIT state (same
                 // reasoning as `emit_raise!`).
@@ -2263,7 +2553,7 @@ impl CodeWriter {
                     &mut graph,
                     &current_block.block(),
                     &catch_landing_blocks[&catch_label],
-                    Some(&current_state),
+                    &current_state,
                     &mut link_exit_states,
                 );
             }};
@@ -2576,18 +2866,85 @@ impl CodeWriter {
                     // interp_jit.py:64 portal contract:
                     //   greens = ['next_instr', 'is_being_profiled', 'pycode']
                     //   reds = ['frame', 'ec']
-                    assembler.emit_portal_jit_merge_point(
-                        &mut ssarepr,
-                        &mut graph,
+                    //
+                    // Graph side: record the upstream-matched 7-arg
+                    // SpaceOperation per
+                    // `jtransform.py:1690-1712 handle_jit_marker__jit_merge_point`.
+                    // This parallels the SSARepr emission below so the
+                    // graph layer carries the full `[jd_index, 3 green
+                    // ListOfKinds, 3 red ListOfKinds]` shape that
+                    // upstream regalloc + flatten consume.
+                    //
+                    // PRE-EXISTING-ADAPTATION: SSARepr/byte side emits
+                    // pyre's native 3-list `(greens_i, greens_r, reds_r)`
+                    // shape via `emit_portal_jit_merge_point`.  The
+                    // assembler/blackhole/backend decoders (`assembler.rs:
+                    // 681`) read that compressed shape AND the upstream-
+                    // orthodox 7-arg shape (`assembler.rs` lowers the
+                    // 7-arg form to the same 3-list byte protocol the
+                    // runtime builder consumes).  pycode is carried as
+                    // an `Opaque(Ref)` Constant at the graph layer so
+                    // `Constant` Eq/Hash stays Clone + PartialEq-deriveable
+                    // (raw pointers cannot hash cleanly); the
+                    // `lower_constant` callback below recovers the
+                    // original `w_code` pointer from its closure capture
+                    // and routes it through the runtime constant pool.
+                    let w_code_i64 = w_code as i64;
+                    let (frame_var, ec_var) = portal_graph_inputvars(code);
+                    let graph_args =
+                        portal_jit_merge_point_graph_args(&graph, py_pc, w_code as *const ());
+                    let graph_op = record_graph_op(
                         &current_block.block(),
-                        py_pc,
-                        w_code as i64,
-                        portal_frame_reg,
-                        portal_ec_reg,
+                        "jit_merge_point",
+                        graph_args,
+                        None,
+                        py_pc as i64,
                     );
+                    GraphFlattener::new_with_constant_lowering(
+                        &mut ssarepr,
+                        |v: super::flow::Variable| {
+                            if v.id == frame_var.id {
+                                Register::new(Kind::Ref, portal_frame_reg)
+                            } else if v.id == ec_var.id {
+                                Register::new(Kind::Ref, portal_ec_reg)
+                            } else {
+                                panic!(
+                                    "portal jit_merge_point: unexpected graph Variable {v:?} \
+                                     (only portal frame/ec expected)"
+                                )
+                            }
+                        },
+                        |c: &super::flow::Constant| match (&c.value, c.kind) {
+                            (super::flow::ConstantValue::Signed(value), Some(Kind::Int)) => {
+                                Operand::ConstInt(*value)
+                            }
+                            (super::flow::ConstantValue::Opaque(_), Some(Kind::Ref)) => {
+                                // pycode ref — real pointer recovered
+                                // from closure capture above.  The
+                                // assembler's `expect_list_regs_or_pool`
+                                // routes `Operand::ConstRef` through
+                                // `builder.add_const_r`.
+                                Operand::ConstRef(w_code_i64)
+                            }
+                            other => {
+                                panic!("portal jit_merge_point: unexpected Constant {other:?}")
+                            }
+                        },
+                    )
+                    .emit_space_operation(&graph_op);
                 } else {
                     // pyre has a single jitdriver (PyPyJitDriver), index 0.
-                    emit_loop_header!(ssarepr, 0);
+                    let loop_header_op = record_graph_op(
+                        &current_block.block(),
+                        "loop_header",
+                        vec![super::flow::Constant::signed(0).into()],
+                        None,
+                        py_pc as i64,
+                    );
+                    GraphFlattener::new(&mut ssarepr, |_variable| {
+                        unreachable!("loop_header graph op does not carry Variables")
+                    })
+                    .emit_space_operation(&loop_header_op);
                 }
             }
 
@@ -2629,15 +2986,20 @@ impl CodeWriter {
             // superinstructions decompose to repeated plain LOAD_FAST /
             // STORE_FAST effects, so reuse the same lowering helper in all
             // three arms to keep the portal/non-portal behavior aligned.
+            //
+            // The shadow graph intentionally does NOT record these ops yet.
+            // Upstream jtransform uses pre-regalloc args
+            // `[v_base, index, arrayfielddescr, arraydescr]` /
+            // `[v_base, index, value, arrayfielddescr, arraydescr]`;
+            // pyre does not have those graph-level values wired yet, so
+            // recording the flattened `(field_idx, slot)` form here would
+            // introduce a parity bug.
             macro_rules! emit_fast_load_ref {
                 ($reg:expr) => {{
                     let reg = $reg;
                     if is_portal {
-                        emit_load_const_i!(
-                            ssarepr,
-                            int_tmp0,
-                            local_to_vable_slot(reg as usize) as i64
-                        );
+                        let vable_index = local_to_vable_slot(reg as usize) as i64;
+                        emit_load_const_i!(ssarepr, int_tmp0, vable_index);
                         emit_vable_getarrayitem_ref!(
                             ssarepr,
                             stack_base + current_depth,
@@ -2667,11 +3029,8 @@ impl CodeWriter {
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     if is_portal {
-                        emit_load_const_i!(
-                            ssarepr,
-                            int_tmp0,
-                            local_to_vable_slot(reg as usize) as i64
-                        );
+                        let vable_index = local_to_vable_slot(reg as usize) as i64;
+                        emit_load_const_i!(ssarepr, int_tmp0, vable_index);
                         emit_vable_setarrayitem_ref!(
                             ssarepr,
                             0_u16,
@@ -2836,23 +3195,22 @@ impl CodeWriter {
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let loaded = current_state
+                        .locals_w
+                        .get(load_reg as usize)
+                        .and_then(|value| value.clone())
+                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     if is_portal {
-                        emit_load_const_i!(
-                            ssarepr,
-                            int_tmp0,
-                            local_to_vable_slot(store_reg as usize) as i64
-                        );
+                        let store_vable_index = local_to_vable_slot(store_reg as usize) as i64;
+                        emit_load_const_i!(ssarepr, int_tmp0, store_vable_index);
                         emit_vable_setarrayitem_ref!(
                             ssarepr,
                             0_u16,
                             int_tmp0,
                             stack_base + current_depth
                         );
-                        emit_load_const_i!(
-                            ssarepr,
-                            int_tmp0,
-                            local_to_vable_slot(load_reg as usize) as i64
-                        );
+                        let load_vable_index = local_to_vable_slot(load_reg as usize) as i64;
+                        emit_load_const_i!(ssarepr, int_tmp0, load_vable_index);
                         emit_vable_getarrayitem_ref!(
                             ssarepr,
                             stack_base + current_depth,
@@ -2866,13 +3224,7 @@ impl CodeWriter {
                     if let Some(slot) = current_state.locals_w.get_mut(store_reg as usize) {
                         *slot = Some(stored);
                     }
-                    current_state.stack.push(
-                        current_state
-                            .locals_w
-                            .get(load_reg as usize)
-                            .and_then(|value| value.clone())
-                            .unwrap_or_else(|| fresh_ref_value(&mut graph)),
-                    );
+                    current_state.stack.push(loaded);
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -3304,8 +3656,20 @@ impl CodeWriter {
                     if n >= 1 {
                         current_depth -= 1;
                         emit_vsd!(current_depth);
+                        // Capture the trace-level FlowValue for the
+                        // raised value (stack top) BEFORE the pop, so
+                        // the exception link carries the real payload
+                        // rather than a synthesized fresh Variable.
+                        // Fall back to a fresh Variable only when the
+                        // walker's shadow stack is out of sync (e.g.
+                        // between sync_stack_state calls at block
+                        // boundaries) — safety net, not normal path.
+                        let evalue_fv = current_state
+                            .stack
+                            .pop()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth);
-                        emit_raise!(ssarepr, obj_tmp0);
+                        emit_raise!(ssarepr, obj_tmp0, evalue_fv, py_pc as i64);
                     } else {
                         // reraise: re-raise exception_last_value
                         emit_reraise!(ssarepr);
@@ -4113,7 +4477,7 @@ mod tests {
     use crate::jit::flatten::{Insn, Kind, Label as FlatLabel, Operand, Register, SSARepr};
     use crate::jit::flow::{
         Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkArgPosition, LinkRef,
-        Variable, VariableId, c_last_exception,
+        SpaceOperationArg, Variable, VariableId, c_last_exception,
     };
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
@@ -4164,7 +4528,7 @@ mod tests {
     }
 
     #[test]
-    fn exceptblock_link_args_prefers_framestate_exception_pair() {
+    fn exceptblock_link_args_uses_framestate_exception_pair() {
         let exc_type = Variable::new(VariableId(10), Kind::Ref);
         let exc_value = Variable::new(VariableId(11), Kind::Ref);
         let state = FrameState::new(
@@ -4189,11 +4553,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_raise_state_does_not_reuse_current_handler_exception() {
+    fn explicit_raise_state_records_type_of_raised_value() {
         let code = first_nested_function_code("def f(a):\n    return a\n");
         let mut graph = new_shadow_graph(&code);
+        let block = graph.startblock.clone();
         let handler_exc_type = Variable::new(VariableId(20), Kind::Ref);
         let handler_exc_value = Variable::new(VariableId(21), Kind::Ref);
+        let raised_value = Variable::new(VariableId(22), Kind::Ref);
         let state = FrameState::new(
             vec![Some(Variable::new(VariableId(0), Kind::Ref).into())],
             Vec::new(),
@@ -4202,14 +4568,23 @@ mod tests {
             0,
         );
 
-        let raised = explicit_raise_state(&mut graph, &state);
+        let raised = explicit_raise_state(&mut graph, &block, &state, raised_value.into(), 123);
         let Some((FlowValue::Variable(new_type), FlowValue::Variable(new_value))) =
             raised.last_exception
         else {
             panic!("explicit raise should materialize fresh exception vars");
         };
         assert_ne!(new_type.id, handler_exc_type.id);
-        assert_ne!(new_value.id, handler_exc_value.id);
+        assert_eq!(new_value.id, raised_value.id);
+
+        let block_borrow = block.borrow();
+        let Some(op) = block_borrow.operations.last() else {
+            panic!("explicit raise should record a graph operation");
+        };
+        assert_eq!(op.opname, "type");
+        assert_eq!(op.offset, 123);
+        assert_eq!(op.args, vec![SpaceOperationArg::from(raised_value)]);
+        assert_eq!(op.result, Some(new_type.into()));
     }
 
     fn identity_arg_positions(count: usize) -> Vec<LinkArgPosition> {
@@ -4875,10 +5250,133 @@ mod tests {
     }
 
     #[test]
+    fn graph_entry_inputargs_append_portal_frame_and_ec() {
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+
+        let inputargs = graph_entry_inputargs(&code, true);
+        let arg_slots = entry_arg_slots(&code);
+        assert_eq!(inputargs.len(), arg_slots + 2);
+        match &inputargs[arg_slots] {
+            FlowValue::Variable(variable) => {
+                assert_eq!(*variable, portal_graph_inputvars(&code).0);
+                assert_eq!(variable.kind, Some(Kind::Ref));
+            }
+            other => panic!("expected portal frame variable, got {other:?}"),
+        }
+        match &inputargs[arg_slots + 1] {
+            FlowValue::Variable(variable) => {
+                assert_eq!(*variable, portal_graph_inputvars(&code).1);
+                assert_eq!(variable.kind, Some(Kind::Ref));
+            }
+            other => panic!("expected portal ec variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn portal_shadow_graph_reserves_return_var_after_frame_and_ec() {
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+
+        let graph = new_shadow_graph_with_portal_inputs(&code, true);
+        let startblock = graph.startblock.borrow();
+        let returnblock = graph.returnblock.borrow();
+
+        assert_eq!(startblock.inputargs, graph_entry_inputargs(&code, true));
+        match &returnblock.inputargs[0] {
+            FlowValue::Variable(variable) => {
+                assert_eq!(
+                    variable.id,
+                    VariableId(graph_entry_inputargs(&code, true).len() as u32)
+                );
+                assert_eq!(variable.kind, Some(Kind::Ref));
+            }
+            other => panic!("expected variable return arg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn portal_jit_merge_point_graph_args_match_upstream_shape() {
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let graph = new_shadow_graph_with_portal_inputs(&code, true);
+        let args = portal_jit_merge_point_graph_args(&graph, 17, w_code as *const ());
+
+        assert_eq!(args.len(), 7);
+        match &args[0] {
+            SpaceOperationArg::Value(FlowValue::Constant(constant)) => {
+                assert_eq!(constant, &Constant::signed(0));
+            }
+            other => panic!("expected jdindex constant, got {other:?}"),
+        }
+        match &args[1] {
+            SpaceOperationArg::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Int);
+                assert_eq!(
+                    list.content,
+                    vec![Constant::signed(17).into(), Constant::signed(0).into()]
+                );
+            }
+            other => panic!("expected greens int list, got {other:?}"),
+        }
+        match &args[2] {
+            SpaceOperationArg::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Ref);
+                assert_eq!(list.content.len(), 1);
+                match &list.content[0] {
+                    FlowValue::Constant(constant) => {
+                        assert_eq!(constant.kind, Some(Kind::Ref));
+                    }
+                    other => panic!("expected pycode ref constant, got {other:?}"),
+                }
+            }
+            other => panic!("expected greens ref list, got {other:?}"),
+        }
+        match &args[3] {
+            SpaceOperationArg::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Float);
+                assert!(list.content.is_empty());
+            }
+            other => panic!("expected empty greens float list, got {other:?}"),
+        }
+        match &args[4] {
+            SpaceOperationArg::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Int);
+                assert!(list.content.is_empty());
+            }
+            other => panic!("expected empty reds int list, got {other:?}"),
+        }
+        match &args[5] {
+            SpaceOperationArg::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Ref);
+                assert_eq!(
+                    list.content,
+                    vec![
+                        portal_graph_inputvars(&code).0.into(),
+                        portal_graph_inputvars(&code).1.into(),
+                    ]
+                );
+            }
+            other => panic!("expected reds ref list, got {other:?}"),
+        }
+        match &args[6] {
+            SpaceOperationArg::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Float);
+                assert!(list.content.is_empty());
+            }
+            other => panic!("expected empty reds float list, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn entry_frame_state_matches_pygraph_locals_shape() {
         let code =
             first_nested_function_code("def f(a, b, *args, c, d, **kw):\n    return a + b\n");
-        let state = entry_frame_state(&code);
+        let state = entry_frame_state(&code, false);
 
         assert_eq!(state.locals_w.len(), code.varnames.len());
         assert_eq!(state.getvariables(), entry_inputargs(&code));
@@ -5066,13 +5564,14 @@ mod tests {
         let catch_block = graph.new_block(Vec::new());
         let catch_ref = SpamBlockRef::new(catch_block.clone(), None);
         let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
+        let source_state = FrameState::new(Vec::new(), Vec::new(), None, Vec::new(), 0);
         let startblock_ref = graph.startblock.clone();
 
         let link = attach_catch_exception_edge(
             &mut graph,
             &startblock_ref,
             &catch_ref,
-            None,
+            &source_state,
             &mut link_exit_states,
         );
         let startblock = graph.startblock.borrow();
@@ -5087,6 +5586,8 @@ mod tests {
         let link_borrow = startblock.exits[0].borrow();
         assert_eq!(link_borrow.target, Some(catch_block));
         assert_eq!(link_borrow.exitcase, None);
+        assert!(link_borrow.last_exception.is_some());
+        assert!(link_borrow.last_exc_value.is_some());
     }
 
     #[test]
@@ -5109,7 +5610,7 @@ mod tests {
             &mut graph,
             &startblock_ref,
             &catch_ref,
-            Some(&source_state),
+            &source_state,
             &mut link_exit_states,
         );
 

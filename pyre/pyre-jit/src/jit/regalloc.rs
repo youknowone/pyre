@@ -39,8 +39,331 @@ use std::collections::{HashMap, HashSet};
 
 use majit_translate::model::ValueId;
 use majit_translate::regalloc::DependencyGraph;
+use majit_translate::tool::algo::unionfind::UnionFind;
 
 use super::flatten::{DescrOperand, Insn, Kind, Operand, Register, SSARepr, TLabel};
+use super::flow::{ExitSwitch, ExitSwitchElement, FlowValue, FunctionGraph as FlowGraph, Variable};
+
+#[inline]
+fn variable_value_id(v: Variable) -> ValueId {
+    ValueId(v.id.0 as usize)
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GraphAllocationResult {
+    pub coloring: HashMap<super::flow::VariableId, u16>,
+    pub num_colors: u16,
+}
+
+/// Field names follow `rpython/tool/algo/regalloc.py:47-49` exactly —
+/// `_depgraph`, `_unionfind`, `_coloring`.  The union-find is the real
+/// `tool/algo/unionfind.py UnionFind` port (`()` info, matching upstream
+/// `info_factory=None`).
+struct FlowGraphRegAllocator {
+    _depgraph: DependencyGraph,
+    _unionfind: UnionFind<super::flow::VariableId, ()>,
+    _coloring: HashMap<super::flow::VariableId, u16>,
+}
+
+impl FlowGraphRegAllocator {
+    fn new() -> Self {
+        Self {
+            _depgraph: DependencyGraph::new(),
+            _unionfind: UnionFind::new(|_| ()),
+            _coloring: HashMap::new(),
+        }
+    }
+
+    fn make_dependencies(&mut self, graph: &FlowGraph, kind: Kind) {
+        for block in graph.iterblocks() {
+            let block_borrow = block.borrow();
+            let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::new();
+            for arg in &block_borrow.inputargs {
+                if let Some(v) = arg.as_variable() {
+                    if v.kind == Some(kind) {
+                        die_at.insert(v.id, 0);
+                    }
+                }
+            }
+            for (i, op) in block_borrow.operations.iter().enumerate() {
+                for arg in &op.args {
+                    for v in arg.variables() {
+                        if v.kind == Some(kind) {
+                            die_at.insert(v.id, i);
+                        }
+                    }
+                }
+                if let Some(v) = op.result.as_ref().and_then(FlowValue::as_variable) {
+                    if v.kind == Some(kind) {
+                        die_at.insert(v.id, i + 1);
+                    }
+                }
+            }
+            match &block_borrow.exitswitch {
+                Some(ExitSwitch::Value(value)) => {
+                    if let Some(v) = value.as_variable() {
+                        die_at.remove(&v.id);
+                    }
+                }
+                Some(ExitSwitch::Tuple(values)) => {
+                    for value in values {
+                        if let ExitSwitchElement::Value(value) = value {
+                            if let Some(v) = value.as_variable() {
+                                die_at.remove(&v.id);
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+            for link in &block_borrow.exits {
+                for arg in &link.borrow().args {
+                    if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
+                        die_at.remove(&v.id);
+                    }
+                }
+            }
+            let mut die_list: Vec<(usize, super::flow::VariableId)> =
+                die_at.into_iter().map(|(var, time)| (time, var)).collect();
+            die_list.sort_by_key(|(time, _)| *time);
+            die_list.push((usize::MAX, super::flow::VariableId(u32::MAX)));
+
+            let livevars: Vec<Variable> = block_borrow
+                .inputargs
+                .iter()
+                .filter_map(FlowValue::as_variable)
+                .filter(|v| v.kind == Some(kind))
+                .collect();
+            for (i, &v) in livevars.iter().enumerate() {
+                self._depgraph.add_node(variable_value_id(v));
+                for j in 0..i {
+                    self._depgraph
+                        .add_edge(variable_value_id(livevars[j]), variable_value_id(v));
+                }
+            }
+            // upstream: `livevars = set(livevars)` — shadow the list
+            // with the set rather than renaming to `alive`.
+            let mut livevars: HashSet<super::flow::VariableId> =
+                livevars.into_iter().map(|v| v.id).collect();
+            let mut die_index = 0;
+            for (i, op) in block_borrow.operations.iter().enumerate() {
+                while die_list[die_index].0 == i {
+                    livevars.remove(&die_list[die_index].1);
+                    die_index += 1;
+                }
+                if let Some(result) = op.result.as_ref().and_then(FlowValue::as_variable) {
+                    if result.kind == Some(kind) {
+                        self._depgraph.add_node(variable_value_id(result));
+                        // upstream (`regalloc.py:73`): add an edge from
+                        // every live var to `result`.  `result` is added
+                        // to `livevars` only *after* the loop, so no
+                        // self-edge guard is needed.
+                        for &v in &livevars {
+                            self._depgraph
+                                .add_edge(ValueId(v.0 as usize), variable_value_id(result));
+                        }
+                        livevars.insert(result.id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn coalesce_variables(&mut self, graph: &FlowGraph, kind: Kind) {
+        let mut pendingblocks = graph.iterblocks();
+        while let Some(block) = pendingblocks.pop() {
+            // Match `rpython/tool/algo/regalloc.py:82-86`: walk from the
+            // end of the graph first because resume/blackhole execution
+            // typically restarts in the middle rather than at the entry.
+            let block_borrow = block.borrow();
+            for link in &block_borrow.exits {
+                let link_borrow = link.borrow();
+                if let Some(v) = link_borrow.last_exception {
+                    if v.kind == Some(kind) {
+                        self._depgraph.add_node(variable_value_id(v));
+                    }
+                }
+                if let Some(v) = link_borrow.last_exc_value {
+                    if v.kind == Some(kind) {
+                        self._depgraph.add_node(variable_value_id(v));
+                    }
+                }
+                let Some(target) = link_borrow.target.clone() else {
+                    continue;
+                };
+                let target_borrow = target.borrow();
+                for (arg, target_input) in
+                    link_borrow.args.iter().zip(target_borrow.inputargs.iter())
+                {
+                    let Some(src) = arg.as_ref().and_then(FlowValue::as_variable) else {
+                        continue;
+                    };
+                    let Some(dst) = target_input.as_variable() else {
+                        continue;
+                    };
+                    self.try_coalesce(src, dst, kind);
+                }
+            }
+        }
+    }
+
+    fn try_coalesce(&mut self, v: Variable, w: Variable, kind: Kind) {
+        if v.kind != Some(kind) || w.kind != Some(kind) {
+            return;
+        }
+        let v0 = self._unionfind.find_rep(v.id);
+        let w0 = self._unionfind.find_rep(w.id);
+        if v0 == w0 {
+            return;
+        }
+        if self
+            ._depgraph
+            .has_edge(ValueId(v0.0 as usize), ValueId(w0.0 as usize))
+        {
+            return;
+        }
+        let (_, rep) = self._unionfind.union(v0, w0);
+        // upstream (`regalloc.py:108`): `assert uf.find_rep(v0) is
+        // uf.find_rep(w0) is rep`.
+        debug_assert_eq!(self._unionfind.find_rep(v0), rep);
+        debug_assert_eq!(self._unionfind.find_rep(w0), rep);
+        if rep == v0 {
+            self._depgraph
+                .coalesce(ValueId(w0.0 as usize), ValueId(v0.0 as usize));
+        } else {
+            // upstream (`regalloc.py:112`): `assert rep is w0`.
+            debug_assert_eq!(rep, w0);
+            self._depgraph
+                .coalesce(ValueId(v0.0 as usize), ValueId(w0.0 as usize));
+        }
+    }
+
+    fn find_node_coloring(&mut self) {
+        self._coloring = self
+            ._depgraph
+            .find_node_coloring()
+            .into_iter()
+            .map(|(value, color)| (super::flow::VariableId(value.0 as u32), color as u16))
+            .collect();
+    }
+
+    fn getcolor(&mut self, v: Variable) -> Option<u16> {
+        let rep = self._unionfind.find_rep(v.id);
+        self._coloring.get(&rep).copied()
+    }
+
+    fn find_num_colors(&self) -> u16 {
+        self._coloring.values().copied().max().map_or(0, |m| m + 1)
+    }
+}
+
+/// `rpython/tool/algo/regalloc.py:8-15 perform_register_allocation`.
+///
+/// Upstream signature is `(graph, consider_var, ListOfKind=())`.  Pyre
+/// bakes `consider_var` into the single `kind` filter because `Kind` is a
+/// closed enum (Int/Ref/Float) whereas upstream's `consider_var` is an
+/// open predicate over lltype concreteness.  `ListOfKind` is not a
+/// parameter because pyre has exactly one such class (`FlowListOfKind`).
+///
+/// The `_graph_` prefix disambiguates from the sibling
+/// `perform_register_allocation` SSARepr scanner further down in this
+/// module.  **Currently not invoked from the production regalloc
+/// path** — it is a tested algorithm port kept to cover the CFG-level
+/// coalesce rules of `regalloc.py:79-112 coalesce_variables`, but pyre
+/// cannot drop the SSARepr scanner and activate this one the way
+/// upstream does, for two orthogonal reasons:
+///
+///   1. Pyre's `getoutputargs()` builds `link.args` by positional walk
+///      over `targetstate.mergeable()` (`codewriter.rs::FrameState::
+///      getoutputargs`), so every pair this function would produce at
+///      the CFG level is trivially `(slot, slot)` — a structural no-op
+///      relative to what SSARepr-level coalescing already sees.
+///   2. The SSARepr scanner handles **intra-block** `*_copy`
+///      sequences (emitted by `emit_ref_copy!`/`emit_int_copy!` inline
+///      for STORE_FAST-LOAD_FAST fusions) that have no Link-level
+///      representation and therefore cannot be coalesced at the CFG
+///      level.
+///
+/// Keeping the helper documents that the RPython algorithm is ported
+/// correctly for the CFG shape pyre does maintain; the unit tests
+/// exercise exactly that surface.  It is not dead code, but it is also
+/// not a drop-in replacement for the scanner.
+pub(super) fn perform_graph_register_allocation(
+    graph: &FlowGraph,
+    kind: Kind,
+) -> GraphAllocationResult {
+    let mut allocator = FlowGraphRegAllocator::new();
+    allocator.make_dependencies(graph, kind);
+    allocator.coalesce_variables(graph, kind);
+    allocator.find_node_coloring();
+
+    let mut coloring = HashMap::new();
+    for block in graph.iterblocks() {
+        let block_borrow = block.borrow();
+        for variable in block_borrow.getvariables() {
+            if variable.kind == Some(kind) {
+                if let Some(color) = allocator.getcolor(variable) {
+                    coloring.insert(variable.id, color);
+                }
+            }
+        }
+        for link in &block_borrow.exits {
+            let link_borrow = link.borrow();
+            if let Some(v) = link_borrow.last_exception {
+                if v.kind == Some(kind) {
+                    if let Some(color) = allocator.getcolor(v) {
+                        coloring.insert(v.id, color);
+                    }
+                }
+            }
+            if let Some(v) = link_borrow.last_exc_value {
+                if v.kind == Some(kind) {
+                    if let Some(color) = allocator.getcolor(v) {
+                        coloring.insert(v.id, color);
+                    }
+                }
+            }
+            for arg in &link_borrow.args {
+                if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
+                    if v.kind == Some(kind) {
+                        if let Some(color) = allocator.getcolor(v) {
+                            coloring.insert(v.id, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    GraphAllocationResult {
+        coloring,
+        num_colors: allocator.find_num_colors(),
+    }
+}
+
+/// Run `perform_graph_register_allocation` once per `Kind` and collect
+/// the per-kind `GraphAllocationResult`s into a single map, mirroring
+/// `rpython/jit/codewriter/codewriter.py:44-46`:
+///
+/// ```python
+/// regallocs = {}
+/// for kind in KINDS:
+///     regallocs[kind] = perform_register_allocation(graph, kind)
+/// ```
+///
+/// The resulting `HashMap<Kind, GraphAllocationResult>` is the direct
+/// analog of upstream's `regallocs` dict and is the input shape that a
+/// future `flatten_graph(graph, regallocs, ...)` driver will read.
+/// (Phase 1 of the production-wiring plan tracked as Task #224.)
+pub(super) fn perform_graph_register_allocation_all_kinds(
+    graph: &FlowGraph,
+) -> HashMap<Kind, GraphAllocationResult> {
+    let mut regallocs = HashMap::new();
+    for &kind in &Kind::ALL {
+        regallocs.insert(kind, perform_graph_register_allocation(graph, kind));
+    }
+    regallocs
+}
 
 /// External-input registers preserved across coloring.
 ///
@@ -652,6 +975,10 @@ fn rename_register(reg: &mut Register, rename: &HashMap<(Kind, u16), u16>) {
 #[cfg(test)]
 mod tests {
     use super::super::flatten::{Insn, Kind, ListOfKind, Operand, Register, SSARepr};
+    use super::super::flow::{
+        Block, Constant, FlowListOfKind, FunctionGraph, Link, SpaceOperation, Variable, VariableId,
+        push_op,
+    };
     use super::*;
 
     fn op_def(name: &str, args: Vec<Operand>, result: Register) -> Insn {
@@ -668,6 +995,134 @@ mod tests {
 
     fn r(kind: Kind, idx: u16) -> Register {
         Register::new(kind, idx)
+    }
+
+    fn flow_var(id: u32, kind: Kind) -> Variable {
+        Variable::new(VariableId(id), kind)
+    }
+
+    #[test]
+    fn all_kinds_driver_produces_regalloc_for_every_kind() {
+        // Build a graph with one variable per kind as startblock inputs,
+        // and a returnblock that takes a single Int so the link has
+        // matching arity.
+        let v0 = flow_var(0, Kind::Int);
+        let vr = flow_var(1, Kind::Ref);
+        let vf = flow_var(2, Kind::Float);
+        let start = Block::shared(vec![v0.into(), vr.into(), vf.into()]);
+        let graph = FunctionGraph::new("all_kinds", start.clone(), Some(v0));
+        start.closeblock(vec![
+            Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        assert_eq!(regallocs.len(), 3);
+        for &kind in &Kind::ALL {
+            let result = regallocs
+                .get(&kind)
+                .unwrap_or_else(|| panic!("missing regalloc for {kind:?}"));
+            // Each kind has at least one variable (Int: v0 twice via
+            // return link; Ref: vr in startblock inputargs; Float: vf).
+            // Colorings never exceed num_colors.
+            assert!(
+                result.num_colors >= 1,
+                "kind {kind:?} expected at least one color, got {}",
+                result.num_colors
+            );
+            for (_id, color) in &result.coloring {
+                assert!(
+                    *color < result.num_colors,
+                    "kind {kind:?} color {color} exceeds num_colors {}",
+                    result.num_colors
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn graph_regalloc_reuses_color_for_non_overlapping_values() {
+        let v0 = flow_var(0, Kind::Int);
+        let v1 = flow_var(1, Kind::Int);
+        let start = Block::shared(vec![v0.into()]);
+        let mut graph = FunctionGraph::new("graph_regalloc", start.clone(), Some(v1));
+        push_op(
+            &start,
+            SpaceOperation::new("same_as", vec![v0.into()], Some(v1.into()), 0),
+        );
+        start.closeblock(vec![
+            Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        assert_eq!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
+        assert_eq!(result.num_colors, 1);
+    }
+
+    #[test]
+    fn graph_regalloc_coalesces_goto_link_args_with_target_inputargs() {
+        let v0 = flow_var(0, Kind::Int);
+        let v1 = flow_var(1, Kind::Int);
+        let start = Block::shared(vec![v0.into()]);
+        let mut graph = FunctionGraph::new("graph_goto", start.clone(), None);
+        let next = graph.new_block(vec![v1.into()]);
+        start.closeblock(vec![
+            Link::new(vec![v0.into()], Some(next.clone()), None).into_ref(),
+        ]);
+        next.closeblock(vec![
+            Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        assert_eq!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
+        assert_eq!(result.num_colors, 1);
+    }
+
+    #[test]
+    fn graph_regalloc_seeds_exception_extravars_as_colorable_nodes() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("graph_exc", start.clone(), None);
+        let target = graph.new_block(Vec::new());
+        let exc_type = flow_var(10, Kind::Int);
+        let mut link = Link::new(Vec::new(), Some(target), None);
+        link.extravars(Some(exc_type), None);
+        start.closeblock(vec![link.into_ref()]);
+
+        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        assert_eq!(result.coloring.get(&exc_type.id), Some(&0));
+        assert_eq!(result.num_colors, 1);
+    }
+
+    #[test]
+    fn graph_regalloc_marks_listofkind_args_as_uses() {
+        let v0 = flow_var(0, Kind::Int);
+        let v1 = flow_var(1, Kind::Int);
+        let start = Block::shared(vec![v0.into()]);
+        let mut graph = FunctionGraph::new("graph_listofkind", start.clone(), Some(v1));
+        push_op(
+            &start,
+            SpaceOperation::new(
+                "same_as",
+                vec![Constant::signed(1).into()],
+                Some(v1.into()),
+                0,
+            ),
+        );
+        push_op(
+            &start,
+            SpaceOperation::new(
+                "consume",
+                vec![FlowListOfKind::new(Kind::Int, vec![v0.into()]).into()],
+                None,
+                0,
+            ),
+        );
+        start.closeblock(vec![
+            Link::new(vec![v1.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let result = perform_graph_register_allocation(&graph, Kind::Int);
+        assert_ne!(result.coloring.get(&v0.id), result.coloring.get(&v1.id));
+        assert_eq!(result.num_colors, 2);
     }
 
     /// (a) inputargs land on consecutive colors `0..n-1` regardless

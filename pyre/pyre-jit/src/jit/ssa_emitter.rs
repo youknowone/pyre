@@ -12,14 +12,18 @@
 //!
 //! Reference: `rpython/jit/codewriter/codewriter.py:33-73`.
 //!
-//! `emit_portal_jit_merge_point` is the only semantic helper left —
-//! it registers the portal greens/reds constants with the builder and
-//! pushes the `jit_merge_point` Insn into the walker-local `SSARepr`.
+//! Portal `jit_merge_point` emission now runs through the graph layer:
+//! `codewriter.rs::portal_jit_merge_point_graph_args` builds the
+//! upstream-orthodox 7-arg shape; `record_graph_op` stores it; and
+//! `GraphFlattener::emit_space_operation` lowers it into the SSARepr
+//! with a custom `lower_constant` callback that routes pycode through
+//! the runtime constant pool.  The SSARepr-direct helper that used to
+//! live here is gone.
 
 use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
 
 use super::assembler::{Assembler, NumRegs};
-use super::flatten::{Insn, Kind, ListOfKind, Operand, SSARepr};
+use super::flatten::SSARepr;
 
 /// Setup-side carrier. Every method is either a `JitCodeBuilder`
 /// passthrough or `finish_with_positions_from` — the finalization hook
@@ -93,53 +97,6 @@ impl SSAReprEmitter {
 
     // ---- portal jit_merge_point ----
 
-    /// Portal-only lowering for `interp_jit.py`'s merge point arguments.
-    /// Registers the constant-pool entries for `next_instr` /
-    /// `is_being_profiled` / `pycode`, computes their `num_regs + idx`
-    /// positions, and pushes the `jit_merge_point` Insn into the
-    /// walker-local `SSARepr` with three `ListOfKind` sublists
-    /// (greens_i, greens_r, reds_r) — matching
-    /// `jtransform.py:rewrite_op_jit_merge_point`'s SpaceOperation shape.
-    pub fn emit_portal_jit_merge_point(
-        &mut self,
-        ssarepr: &mut SSARepr,
-        _graph: &mut super::flow::FunctionGraph,
-        _current_block: &super::flow::BlockRef,
-        next_instr: usize,
-        w_code: i64,
-        frame_reg: u16,
-        ec_reg: u16,
-    ) {
-        let next_instr_const_idx = self.add_const_i(next_instr as i64);
-        let is_being_profiled_const_idx = self.add_const_i(0);
-        let pycode_const_idx = self.add_const_r(w_code);
-        let num_regs_i = self.builder.num_regs_i();
-        let num_regs_r = self.builder.num_regs_r();
-        let gi_next_instr_reg =
-            u8::try_from(u32::from(num_regs_i) + u32::from(next_instr_const_idx))
-                .expect("jit_merge_point next_instr arg exceeds u8 encoding");
-        let gi_is_profiled_reg =
-            u8::try_from(u32::from(num_regs_i) + u32::from(is_being_profiled_const_idx))
-                .expect("jit_merge_point is_being_profiled arg exceeds u8 encoding");
-        let gr_pycode_reg = u8::try_from(u32::from(num_regs_r) + u32::from(pycode_const_idx))
-            .expect("jit_merge_point pycode arg exceeds u8 encoding");
-        let frame_reg =
-            u8::try_from(frame_reg).expect("jit_merge_point frame reg exceeds u8 encoding");
-        let ec_reg = u8::try_from(ec_reg).expect("jit_merge_point ec reg exceeds u8 encoding");
-        let greens_i: &[u8] = &[gi_next_instr_reg, gi_is_profiled_reg];
-        let greens_r: &[u8] = &[gr_pycode_reg];
-        let reds_r: &[u8] = &[frame_reg, ec_reg];
-        let insn = Insn::op(
-            "jit_merge_point",
-            vec![
-                list_of_regs(Kind::Int, greens_i),
-                list_of_regs(Kind::Ref, greens_r),
-                list_of_regs(Kind::Ref, reds_r),
-            ],
-        );
-        ssarepr.insns.push(insn.clone());
-    }
-
     // ---- finalization ----
 
     /// Translate an insn-index position into the corresponding JitCode
@@ -196,13 +153,4 @@ impl Default for SSAReprEmitter {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Materialise a `&[u8]` register list (walker-side compact form) as
-/// `ListOfKind` inside an `Operand`. Matches the encoding `assembler.py`
-/// expects for the `greens_i` / `greens_r` / `reds_r` arguments of
-/// `jit_merge_point`.
-fn list_of_regs(kind: Kind, regs: &[u8]) -> Operand {
-    let content: Vec<Operand> = regs.iter().map(|&r| Operand::reg(kind, r as u16)).collect();
-    Operand::ListOfKind(ListOfKind::new(kind, content))
 }

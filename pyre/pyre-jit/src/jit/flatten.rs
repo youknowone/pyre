@@ -16,9 +16,15 @@
 //! `---` and generic `Op` instructions) plus `Operand` for everything
 //! that appears inside a tuple.
 
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
+use majit_translate::jit_codewriter::flatten::reorder_renaming_list;
 use majit_translate::jitcode::BhDescr;
+
+use super::flow::{
+    BlockRef, Constant, ConstantValue, FlowValue, LinkRef, SpaceOperation, SpaceOperationArg,
+    Variable,
+};
 
 /// `rpython/jit/codewriter/flatten.py:59` `KINDS = ['int', 'ref', 'float']`.
 ///
@@ -540,9 +546,529 @@ impl Insn {
     }
 }
 
+/// Minimal production slice of `rpython/jit/codewriter/flatten.py:
+/// 60-350` `GraphFlattener`.
+///
+/// Upstream owns the whole `FunctionGraph -> SSARepr` lowering. pyre is
+/// still in the transitional dual-write phase, so this helper currently
+/// serializes individual graph-level `SpaceOperation`s into `Insn`s and is
+/// used only for the first production op migrated off direct SSA emission.
+/// Expand this helper as more ops move from `codewriter.rs` into the
+/// flow-graph + flatten pipeline.
+pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
+    ssarepr: &'a mut SSARepr,
+    get_register: F,
+    lower_constant: C,
+    seen_blocks: HashMap<BlockRef, bool>,
+    block_names: HashMap<BlockRef, String>,
+    link_names: HashMap<LinkRef, String>,
+    next_label_id: usize,
+    include_all_exc_links: bool,
+}
+
+impl<'a, F> GraphFlattener<'a, F>
+where
+    F: FnMut(Variable) -> Register,
+{
+    pub fn new(ssarepr: &'a mut SSARepr, get_register: F) -> Self {
+        Self {
+            ssarepr,
+            get_register,
+            lower_constant: flatten_constant_operand,
+            seen_blocks: HashMap::new(),
+            block_names: HashMap::new(),
+            link_names: HashMap::new(),
+            next_label_id: 0,
+            include_all_exc_links: false,
+        }
+    }
+}
+
+impl<'a, F, C> GraphFlattener<'a, F, C>
+where
+    F: FnMut(Variable) -> Register,
+    C: FnMut(&Constant) -> Operand,
+{
+    pub fn new_with_constant_lowering(
+        ssarepr: &'a mut SSARepr,
+        get_register: F,
+        lower_constant: C,
+    ) -> Self {
+        Self {
+            ssarepr,
+            get_register,
+            lower_constant,
+            seen_blocks: HashMap::new(),
+            block_names: HashMap::new(),
+            link_names: HashMap::new(),
+            next_label_id: 0,
+            include_all_exc_links: false,
+        }
+    }
+
+    pub fn emit_space_operation(&mut self, op: &SpaceOperation) {
+        let insn = self.flatten_space_operation(op);
+        self.ssarepr.insns.push(insn);
+    }
+
+    fn emitline(&mut self, insn: Insn) {
+        self.ssarepr.insns.push(insn);
+    }
+
+    fn label_name_for_block(&mut self, block: &BlockRef) -> String {
+        if let Some(name) = self.block_names.get(block) {
+            return name.clone();
+        }
+        let name = format!("block{}", self.next_label_id);
+        self.next_label_id += 1;
+        self.block_names.insert(block.clone(), name.clone());
+        name
+    }
+
+    fn label_name_for_link(&mut self, link: &LinkRef) -> String {
+        if let Some(name) = self.link_names.get(link) {
+            return name.clone();
+        }
+        let name = format!("link{}", self.next_label_id);
+        self.next_label_id += 1;
+        self.link_names.insert(link.clone(), name.clone());
+        name
+    }
+
+    fn tlabel_for_block(&mut self, block: &BlockRef) -> Operand {
+        Operand::TLabel(TLabel::new(self.label_name_for_block(block)))
+    }
+
+    fn tlabel_for_link(&mut self, link: &LinkRef) -> Operand {
+        Operand::TLabel(TLabel::new(self.label_name_for_link(link)))
+    }
+
+    fn label_for_block(&mut self, block: &BlockRef) -> Insn {
+        Insn::Label(Label::new(self.label_name_for_block(block)))
+    }
+
+    fn label_for_link(&mut self, link: &LinkRef) -> Insn {
+        Insn::Label(Label::new(self.label_name_for_link(link)))
+    }
+
+    fn flow_kind(value: &FlowValue) -> Option<Kind> {
+        match value {
+            FlowValue::Variable(variable) => variable.kind,
+            FlowValue::Constant(constant) => constant.kind,
+        }
+    }
+
+    fn rename_operand(&mut self, value: &FlowValue) -> RenameOperand {
+        match self.flatten_value(value) {
+            Operand::Register(register) => RenameOperand::Register(register),
+            Operand::ConstInt(value) => RenameOperand::ConstInt(value),
+            Operand::ConstRef(value) => RenameOperand::ConstRef(value),
+            Operand::ConstFloat(value) => RenameOperand::ConstFloat(value),
+            other => panic!("insert_renamings expects register/constant, got {other:?}"),
+        }
+    }
+
+    fn make_return(&mut self, args: &[FlowValue]) {
+        match args {
+            [value] => match Self::flow_kind(value) {
+                None => self.emitline(Insn::op("void_return", Vec::new())),
+                Some(kind) => {
+                    let opname = format!("{}_return", kind.as_str());
+                    let operand = self.flatten_value(value);
+                    self.emitline(Insn::op(opname, vec![operand]));
+                }
+            },
+            [_, exc_value] => {
+                if exc_value.as_variable().is_some() {
+                    self.emitline(Insn::live(Vec::new()));
+                }
+                let operand = self.flatten_value(exc_value);
+                self.emitline(Insn::op("raise", vec![operand]));
+            }
+            _ => panic!("make_return expects 1 or 2 args, got {}", args.len()),
+        }
+        self.emitline(Insn::Unreachable);
+    }
+
+    fn make_link(&mut self, link: &LinkRef, handling_ovf: bool) {
+        let (target, args, last_exception, last_exc_value, can_return_directly) = {
+            let link_borrow = link.borrow();
+            let target = link_borrow
+                .target
+                .clone()
+                .expect("link target required for make_link");
+            let target_is_final = target.borrow().exits.is_empty();
+            let uses_last_exception = link_borrow.args.iter().any(|arg| {
+                arg.as_ref()
+                    .and_then(FlowValue::as_variable)
+                    .is_some_and(|value| Some(value) == link_borrow.last_exception)
+            });
+            let uses_last_exc_value = link_borrow.args.iter().any(|arg| {
+                arg.as_ref()
+                    .and_then(FlowValue::as_variable)
+                    .is_some_and(|value| Some(value) == link_borrow.last_exc_value)
+            });
+            (
+                target,
+                link_borrow
+                    .args
+                    .iter()
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                link_borrow.last_exception,
+                link_borrow.last_exc_value,
+                target_is_final && !uses_last_exception && !uses_last_exc_value,
+            )
+        };
+        if can_return_directly {
+            self.make_return(&args);
+            return;
+        }
+        let _ = (last_exception, last_exc_value, handling_ovf);
+        self.insert_renamings(link);
+        self.make_bytecode_block(target, handling_ovf);
+    }
+
+    fn make_exception_link(&mut self, link: &LinkRef, handling_ovf: bool) {
+        let should_reraise = {
+            let link_borrow = link.borrow();
+            let Some(last_exception) = link_borrow.last_exception else {
+                panic!("make_exception_link requires last_exception");
+            };
+            let Some(last_exc_value) = link_borrow.last_exc_value else {
+                panic!("make_exception_link requires last_exc_value");
+            };
+            let target = link_borrow
+                .target
+                .clone()
+                .expect("link target required for make_exception_link");
+            target.borrow().operations.is_empty()
+                && target.borrow().exits.is_empty()
+                && link_borrow.args.len() == 2
+                && link_borrow.args[0] == Some(last_exception.into())
+                && link_borrow.args[1] == Some(last_exc_value.into())
+        };
+        if should_reraise {
+            assert!(
+                !handling_ovf,
+                "overflow exception edges are not modeled in pyre flatten_graph yet"
+            );
+            self.emitline(Insn::op("reraise", Vec::new()));
+            self.emitline(Insn::Unreachable);
+            return;
+        }
+        self.make_link(link, handling_ovf);
+    }
+
+    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
+        let exits = block.borrow().exits.clone();
+        if exits.len() == 1 {
+            self.make_link(&exits[0], handling_ovf);
+            return;
+        }
+        if block.borrow().canraise() {
+            if !self.include_all_exc_links && block.borrow().raising_op().is_none() {
+                self.make_link(&exits[0], false);
+                return;
+            }
+            let catch_label = self.tlabel_for_link(&exits[0]);
+            self.emitline(Insn::op("catch_exception", vec![catch_label]));
+            self.make_link(&exits[0], false);
+            let normal_label = self.label_for_link(&exits[0]);
+            self.emitline(normal_label);
+            let mut captured_all = false;
+            for link in exits.iter().skip(1) {
+                let llexitcase = link.borrow().llexitcase.clone();
+                if let Some(case) = llexitcase {
+                    let case_operand = self.flatten_value(&case);
+                    let mismatch_label = self.tlabel_for_link(link);
+                    self.emitline(Insn::op(
+                        "goto_if_exception_mismatch",
+                        vec![case_operand, mismatch_label],
+                    ));
+                    self.make_exception_link(link, false);
+                    let link_label = self.label_for_link(link);
+                    self.emitline(link_label);
+                } else {
+                    self.make_exception_link(link, false);
+                    captured_all = true;
+                    break;
+                }
+            }
+            if !captured_all {
+                self.emitline(Insn::op("reraise", Vec::new()));
+                self.emitline(Insn::Unreachable);
+            }
+            return;
+        }
+        panic!(
+            "flatten_graph: unsupported exits shape for block with {} exits",
+            exits.len()
+        );
+    }
+
+    fn insert_renamings(&mut self, link: &LinkRef) {
+        let (target_inputargs, last_exception, last_exc_value, link_args) = {
+            let link_borrow = link.borrow();
+            let target = link_borrow
+                .target
+                .clone()
+                .expect("link target required for insert_renamings");
+            (
+                target.borrow().inputargs.clone(),
+                link_borrow.last_exception,
+                link_borrow.last_exc_value,
+                link_borrow.args.clone(),
+            )
+        };
+
+        let mut pairs: Vec<(RenameOperand, Register)> = Vec::new();
+        for (index, arg) in link_args.iter().enumerate() {
+            let Some(src_value) = arg.as_ref() else {
+                continue;
+            };
+            let Some(dst_variable) = target_inputargs[index].as_variable() else {
+                continue;
+            };
+            let src_variable = src_value.as_variable();
+            if src_variable == last_exception || src_variable == last_exc_value {
+                continue;
+            }
+            let src = self.rename_operand(src_value);
+            let dst = (self.get_register)(dst_variable);
+            if src == RenameOperand::Register(dst) {
+                continue;
+            }
+            pairs.push((src, dst));
+        }
+        pairs.sort_by_key(|(_, dst)| dst.index);
+
+        let mut renamings: HashMap<Kind, (Vec<RenameOperand>, Vec<RenameOperand>)> = HashMap::new();
+        for (src, dst) in pairs {
+            let (frm, to) = renamings.entry(dst.kind).or_default();
+            frm.push(src);
+            to.push(RenameOperand::Register(dst));
+        }
+        for &kind in &Kind::ALL {
+            if let Some((frm, to)) = renamings.get(&kind) {
+                for (src, dst) in reorder_renaming_list(frm, to) {
+                    match (src, dst) {
+                        (Some(src), Some(RenameOperand::Register(dst))) => {
+                            self.emitline(Insn::op_with_result(
+                                format!("{}_copy", kind.as_str()),
+                                vec![src.into_operand()],
+                                dst,
+                            ));
+                        }
+                        (Some(RenameOperand::Register(src)), None) => {
+                            self.emitline(Insn::op(
+                                format!("{}_push", kind.as_str()),
+                                vec![Operand::Register(src)],
+                            ));
+                        }
+                        (None, Some(RenameOperand::Register(dst))) => {
+                            self.emitline(Insn::op_with_result(
+                                format!("{}_pop", kind.as_str()),
+                                Vec::new(),
+                                dst,
+                            ));
+                        }
+                        other => panic!("unexpected renaming step {other:?}"),
+                    }
+                }
+            }
+        }
+        let link_borrow = link.borrow();
+        self.generate_last_exc(&link_borrow, &target_inputargs);
+    }
+
+    fn generate_last_exc(&mut self, link: &super::flow::Link, inputargs: &[FlowValue]) {
+        if link.last_exception.is_none() && link.last_exc_value.is_none() {
+            return;
+        }
+        for (arg, inputarg) in link.args.iter().zip(inputargs) {
+            if arg.as_ref().and_then(FlowValue::as_variable) == link.last_exception {
+                let dst = inputarg
+                    .as_variable()
+                    .expect("last_exception target must be a Variable");
+                let dst_reg = (self.get_register)(dst);
+                self.emitline(Insn::op_with_result("last_exception", Vec::new(), dst_reg));
+            }
+        }
+        for (arg, inputarg) in link.args.iter().zip(inputargs) {
+            if arg.as_ref().and_then(FlowValue::as_variable) == link.last_exc_value {
+                let dst = inputarg
+                    .as_variable()
+                    .expect("last_exc_value target must be a Variable");
+                let dst_reg = (self.get_register)(dst);
+                self.emitline(Insn::op_with_result("last_exc_value", Vec::new(), dst_reg));
+            }
+        }
+    }
+
+    fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {
+        if block.borrow().exits.is_empty() {
+            let args = block.borrow().inputargs.clone();
+            self.make_return(&args);
+            return;
+        }
+        if self.seen_blocks.contains_key(&block) {
+            let target = self.tlabel_for_block(&block);
+            self.emitline(Insn::op("goto", vec![target]));
+            self.emitline(Insn::Unreachable);
+            return;
+        }
+        self.seen_blocks.insert(block.clone(), true);
+        let block_label = self.label_for_block(&block);
+        self.emitline(block_label);
+        let operations = block.borrow().operations.clone();
+        for op in &operations {
+            self.emit_space_operation(op);
+        }
+        self.insert_exits(&block, handling_ovf);
+    }
+
+    fn flatten_space_operation(&mut self, op: &SpaceOperation) -> Insn {
+        let args = op.args.iter().map(|arg| self.flatten_arg(arg)).collect();
+        match op.result {
+            None => Insn::op(op.opname.clone(), args),
+            Some(FlowValue::Variable(variable)) => {
+                let result = (self.get_register)(variable);
+                Insn::op_with_result(op.opname.clone(), args, result)
+            }
+            Some(FlowValue::Constant(ref constant)) => {
+                panic!(
+                    "GraphFlattener: op {} has Constant result {:?}; \
+                     flow graph results must be Variables",
+                    op.opname, constant
+                )
+            }
+        }
+    }
+
+    fn flatten_arg(&mut self, arg: &SpaceOperationArg) -> Operand {
+        match arg {
+            SpaceOperationArg::Value(value) => self.flatten_value(value),
+            SpaceOperationArg::ListOfKind(list) => Operand::ListOfKind(ListOfKind::new(
+                list.kind,
+                list.content
+                    .iter()
+                    .map(|value| self.flatten_value(value))
+                    .collect(),
+            )),
+            // `flatten.py:365-367` passes AbstractDescr through
+            // unchanged.  pyre's `DescrOperand` is a closed enum over
+            // specific descr flavors (Bh/SwitchDict/ResidualCall/…)
+            // rather than a transparent wrapper; picking the correct
+            // variant requires per-opname semantic context that the
+            // generic flatten path does not carry.  No graph-emitted
+            // op currently ships a Descr arg — add the per-opname
+            // mapping here alongside the first such producer.
+            SpaceOperationArg::Descr(_) => panic!(
+                "GraphFlattener: lowering SpaceOperationArg::Descr requires \
+                 per-opname DescrOperand mapping; no production consumer yet"
+            ),
+            // `flatten.py:365-367` also passes IndirectCallTargets
+            // through unchanged.  `Operand::IndirectCallTargets` takes a
+            // value, so clone the inner (the `Vec<Arc<JitCode>>` clone
+            // is cheap — it bumps Arc refcounts).
+            SpaceOperationArg::IndirectCallTargets(targets) => {
+                Operand::IndirectCallTargets((*targets.0).clone())
+            }
+        }
+    }
+
+    fn flatten_value(&mut self, value: &FlowValue) -> Operand {
+        match value {
+            FlowValue::Variable(variable) => Operand::Register((self.get_register)(*variable)),
+            FlowValue::Constant(constant) => (self.lower_constant)(constant),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RenameOperand {
+    Register(Register),
+    ConstInt(i64),
+    ConstRef(i64),
+    ConstFloat(i64),
+}
+
+impl RenameOperand {
+    fn into_operand(self) -> Operand {
+        match self {
+            Self::Register(register) => Operand::Register(register),
+            Self::ConstInt(value) => Operand::ConstInt(value),
+            Self::ConstRef(value) => Operand::ConstRef(value),
+            Self::ConstFloat(value) => Operand::ConstFloat(value),
+        }
+    }
+}
+
+fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
+    match (&constant.value, constant.kind) {
+        (ConstantValue::None, Some(Kind::Ref)) => Operand::ConstRef(0),
+        (ConstantValue::Bool(value), Some(Kind::Int)) => Operand::ConstInt(i64::from(*value)),
+        (ConstantValue::Signed(value), Some(Kind::Int)) => Operand::ConstInt(*value),
+        (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
+            panic!("GraphFlattener: opaque ref constants need runtime lowering support")
+        }
+        other => panic!("GraphFlattener: unsupported constant operand {other:?}"),
+    }
+}
+
+/// Block-level walker matching `rpython/jit/codewriter/flatten.py:60
+/// flatten_graph(graph, regallocs)`.  Walks every block in `graph`,
+/// emits a `Label` for each block and an `Insn` for each
+/// `SpaceOperation`, producing the SSARepr that the assembler consumes.
+///
+/// `regallocs` keyed by `Kind` provides the per-kind
+/// `GraphAllocationResult` that the caller computed via
+/// `regalloc::perform_graph_register_allocation_all_kinds(graph)`
+/// (upstream `codewriter.py:44-46`'s `regallocs` dict).  `get_register`
+/// projects `Variable` to `Register` using the appropriate per-kind
+/// coloring; `lower_constant` handles non-raw constants (pycode opaque
+/// refs, jitdriver descrs, etc.) that default `flatten_constant_operand`
+/// cannot express on its own.
+///
+/// **Phase 1 scaffold for Task #224**: currently covers the ops whose
+/// graph shape exists in production (`loop_header`, `jit_merge_point`
+/// with the 7-arg upstream shape); ops that pyre's walker still emits
+/// directly into the SSARepr (the bulk of opcodes in
+/// `codewriter.rs::transform_graph_to_jitcode`) do not yet have a
+/// corresponding graph-side `SpaceOperation`, so `flatten_graph`
+/// cannot reproduce the walker's full output.  Wiring Phase 1c
+/// replaces the direct SSARepr emission with `record_graph_op` at
+/// every walker emit point and then switches production to call this
+/// function in place of the walker's interleaved
+/// `ssarepr.insns.push(...)` calls.
+///
+/// Matches upstream structure:
+/// - `flatten_graph`: driver entry point (this function)
+/// - `generate_ssa_form`: block iteration + per-op dispatch
+///   (delegated here to `GraphFlattener::emit_space_operation`)
+/// - `make_bytecode_block`/`make_link`/`insert_exits`: block boundary
+///   handling — not yet implemented; `Label` insertion happens at
+///   block entry only, `insert_exits` equivalent is not yet wired.
+pub fn flatten_graph<F, C>(
+    graph: &super::flow::FunctionGraph,
+    ssarepr: &mut SSARepr,
+    get_register: F,
+    lower_constant: C,
+) where
+    F: FnMut(Variable) -> Register,
+    C: FnMut(&Constant) -> Operand,
+{
+    let mut flattener =
+        GraphFlattener::new_with_constant_lowering(ssarepr, get_register, lower_constant);
+    flattener.make_bytecode_block(graph.startblock.clone(), false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jit::flow::{FlowListOfKind, VariableId};
 
     #[test]
     fn register_repr_matches_rpython() {
@@ -571,5 +1097,339 @@ mod tests {
     fn tlabel_equality_follows_name() {
         assert_eq!(TLabel::new("foo"), TLabel::new("foo"));
         assert_ne!(TLabel::new("foo"), TLabel::new("bar"));
+    }
+
+    #[test]
+    fn graph_flattener_emits_loop_header_from_graph_op() {
+        let op = SpaceOperation::new("loop_header", vec![Constant::signed(0).into()], None, 17);
+        let mut ssarepr = SSARepr::new("test");
+        let mut flattener = GraphFlattener::new(&mut ssarepr, |_| {
+            Register::new(Kind::Ref, VariableId(0).0 as u16)
+        });
+
+        flattener.emit_space_operation(&op);
+
+        match &ssarepr.insns[..] {
+            [
+                Insn::Op {
+                    opname,
+                    args,
+                    result,
+                },
+            ] => {
+                assert_eq!(opname, "loop_header");
+                assert!(result.is_none());
+                assert!(matches!(args.as_slice(), [Operand::ConstInt(0)]));
+            }
+            other => panic!("unexpected insns: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_flattener_preserves_jit_merge_point_graph_shape() {
+        let frame = Variable::new(VariableId(10), Kind::Ref);
+        let ec = Variable::new(VariableId(11), Kind::Ref);
+        let op = SpaceOperation::new(
+            "jit_merge_point",
+            vec![
+                Constant::signed(0).into(),
+                FlowListOfKind::new(
+                    Kind::Int,
+                    vec![Constant::signed(17).into(), Constant::signed(0).into()],
+                )
+                .into(),
+                FlowListOfKind::new(
+                    Kind::Ref,
+                    vec![Constant::opaque("pycode", Some(Kind::Ref)).into()],
+                )
+                .into(),
+                FlowListOfKind::new(Kind::Float, vec![]).into(),
+                FlowListOfKind::new(Kind::Int, vec![]).into(),
+                FlowListOfKind::new(Kind::Ref, vec![frame.into(), ec.into()]).into(),
+                FlowListOfKind::new(Kind::Float, vec![]).into(),
+            ],
+            None,
+            3,
+        );
+        let mut ssarepr = SSARepr::new("test");
+        let mut flattener = GraphFlattener::new_with_constant_lowering(
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            |constant| match (&constant.value, constant.kind) {
+                (ConstantValue::Signed(value), Some(Kind::Int)) => Operand::ConstInt(*value),
+                (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(99),
+                other => panic!("unexpected test constant {other:?}"),
+            },
+        );
+
+        flattener.emit_space_operation(&op);
+
+        match &ssarepr.insns[..] {
+            [
+                Insn::Op {
+                    opname,
+                    args,
+                    result,
+                },
+            ] => {
+                assert_eq!(opname, "jit_merge_point");
+                assert!(result.is_none());
+                assert_eq!(args.len(), 7);
+                assert!(matches!(args[0], Operand::ConstInt(0)));
+                assert!(matches!(
+                    &args[1],
+                    Operand::ListOfKind(ListOfKind { kind: Kind::Int, content })
+                        if matches!(content.as_slice(), [Operand::ConstInt(17), Operand::ConstInt(0)])
+                ));
+                assert!(matches!(
+                    &args[2],
+                    Operand::ListOfKind(ListOfKind { kind: Kind::Ref, content })
+                        if matches!(content.as_slice(), [Operand::ConstRef(99)])
+                ));
+                assert!(matches!(
+                    &args[5],
+                    Operand::ListOfKind(ListOfKind { kind: Kind::Ref, content })
+                        if matches!(
+                            content.as_slice(),
+                            [
+                                Operand::Register(Register { kind: Kind::Ref, index: 10 }),
+                                Operand::Register(Register { kind: Kind::Ref, index: 11 })
+                            ]
+                        )
+                ));
+            }
+            other => panic!("unexpected insns: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_graph_walks_all_blocks_and_emits_each_op() {
+        // Synthetic graph with two blocks; each contains a loop_header
+        // op with a distinct offset tag.  flatten_graph must walk every
+        // block and emit one Insn per SpaceOperation.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let start_arg = Variable::new(VariableId(0), Kind::Ref);
+        let next_arg = Variable::new(VariableId(1), Kind::Ref);
+        let start = Block::shared(vec![start_arg.into()]);
+        let mut graph = FunctionGraph::new("flat_walk", start.clone(), None);
+        let next = graph.new_block(vec![next_arg.into()]);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("loop_header", vec![Constant::signed(0).into()], None, 0),
+        );
+        super::super::flow::push_op(
+            &next,
+            SpaceOperation::new("loop_header", vec![Constant::signed(0).into()], None, 1),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(vec![start_arg.into()], Some(next.clone()), None)
+                .into_ref(),
+        ]);
+        next.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![next_arg.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let mut ssarepr = SSARepr::new("flat_walk");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        // Two loop_header Insns emitted — one per block.
+        let header_count = ssarepr
+            .insns
+            .iter()
+            .filter(|i| matches!(i, Insn::Op { opname, .. } if opname == "loop_header"))
+            .count();
+        assert_eq!(
+            header_count, 2,
+            "flatten_graph should emit one Insn per SpaceOperation across all blocks; got {:?}",
+            ssarepr.insns
+        );
+    }
+
+    #[test]
+    fn flatten_graph_inserts_renamings_for_fallthrough_links() {
+        use crate::jit::flow::{Block, FunctionGraph, Link};
+        let src = Variable::new(VariableId(0), Kind::Ref);
+        let dst = Variable::new(VariableId(1), Kind::Ref);
+        let start = Block::shared(vec![src.into()]);
+        let mut graph = FunctionGraph::new("renaming", start.clone(), Some(dst));
+        let middle = graph.new_block(vec![dst.into()]);
+        start.closeblock(vec![
+            Link::new(vec![src.into()], Some(middle.clone()), None).into_ref(),
+        ]);
+        middle.closeblock(vec![
+            Link::new(vec![dst.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let mut ssarepr = SSARepr::new("renaming");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        assert!(ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op {
+                    opname,
+                    args,
+                    result: Some(Register {
+                        kind: Kind::Ref,
+                        index: 1
+                    }),
+                } if opname == "ref_copy"
+                    && matches!(
+                        args.as_slice(),
+                        [Operand::Register(Register {
+                            kind: Kind::Ref,
+                            index: 0
+                        })]
+                    )
+            )
+        }));
+    }
+
+    #[test]
+    fn flatten_graph_emits_exception_dispatch_and_last_exc_loads() {
+        use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
+        let normal = Variable::new(VariableId(0), Kind::Ref);
+        let exc_type = Variable::new(VariableId(1), Kind::Int);
+        let exc_value = Variable::new(VariableId(2), Kind::Ref);
+        let catch_type = Variable::new(VariableId(3), Kind::Int);
+        let catch_value = Variable::new(VariableId(4), Kind::Ref);
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("exc_dispatch", start.clone(), Some(normal));
+        let typed_handler = graph.new_block(vec![exc_type.into(), exc_value.into()]);
+        let catchall_handler = graph.new_block(vec![catch_type.into(), catch_value.into()]);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("call_can_raise", Vec::new(), None, 0),
+        );
+
+        typed_handler.closeblock(vec![
+            Link::new(
+                vec![exc_value.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        catchall_handler.closeblock(vec![
+            Link::new(
+                vec![catch_value.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(c_last_exception().into()));
+        let normal_link = Link::new(
+            vec![Constant::none().into()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        let mut typed_link = Link::new(
+            vec![exc_type.into(), exc_value.into()],
+            Some(typed_handler.clone()),
+            None,
+        )
+        .with_llexitcase(Constant::signed(7).into());
+        typed_link.extravars(Some(exc_type), Some(exc_value));
+        let mut catchall_link = Link::new(
+            vec![catch_type.into(), catch_value.into()],
+            Some(catchall_handler.clone()),
+            None,
+        );
+        catchall_link.extravars(Some(catch_type), Some(catch_value));
+        start.closeblock(vec![
+            normal_link,
+            typed_link.into_ref(),
+            catchall_link.into_ref(),
+        ]);
+
+        let mut ssarepr = SSARepr::new("exc_dispatch");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        assert!(
+            ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "catch_exception"))
+        );
+        assert!(ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "goto_if_exception_mismatch"
+                        && matches!(args.as_slice(), [Operand::ConstInt(7), Operand::TLabel(_)])
+            )
+        }));
+        assert!(
+            ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "last_exception"))
+        );
+        assert!(
+            ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "last_exc_value"))
+        );
+    }
+
+    #[test]
+    fn graph_flattener_emits_generic_result_op() {
+        let src = Variable::new(VariableId(0), Kind::Ref);
+        let dst = Variable::new(VariableId(1), Kind::Ref);
+        let op = SpaceOperation::new("type", vec![src.into()], Some(dst.into()), 23);
+        let mut ssarepr = SSARepr::new("generic");
+        let mut flattener = GraphFlattener::new(&mut ssarepr, |variable| {
+            Register::new(
+                variable.kind.expect("test variable kind"),
+                variable.id.0 as u16,
+            )
+        });
+
+        flattener.emit_space_operation(&op);
+
+        match &ssarepr.insns[..] {
+            [
+                Insn::Op {
+                    opname,
+                    args,
+                    result: Some(result),
+                },
+            ] => {
+                assert_eq!(opname, "type");
+                assert!(matches!(
+                    args.as_slice(),
+                    [Operand::Register(Register {
+                        kind: Kind::Ref,
+                        index: 0
+                    })]
+                ));
+                assert_eq!(*result, Register::new(Kind::Ref, 1));
+            }
+            other => panic!("unexpected insns: {other:?}"),
+        }
     }
 }
