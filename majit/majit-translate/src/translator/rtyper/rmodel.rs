@@ -102,8 +102,7 @@ fn void_field_const(name: &str) -> Hlvalue {
 fn hlvalue_concretetype(value: &Hlvalue) -> Result<LowLevelType, TyperError> {
     match value {
         Hlvalue::Variable(v) => v
-            .concretetype
-            .clone()
+            .concretetype()
             .ok_or_else(|| TyperError::message("Variable has no concretetype")),
         Hlvalue::Constant(c) => c
             .concretetype
@@ -2116,7 +2115,7 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "getattr");
         let mut v_ptr = Variable::new();
-        v_ptr.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v
             .borrow_mut()
             .extend([Hlvalue::Variable(v_ptr), void_field_const("x")]);
@@ -2154,7 +2153,7 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "setattr");
         let mut v_ptr = Variable::new();
-        v_ptr.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_ptr.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_ptr),
             void_field_const("x"),
@@ -2197,7 +2196,7 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "simple_call");
         let mut v_func = Variable::new();
-        v_func.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_func.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_func),
             Hlvalue::Constant(Constant::with_concretetype(
@@ -2257,7 +2256,7 @@ mod tests {
             Some(caller_start.clone()),
         )));
         let mut v_result = Variable::new();
-        v_result.concretetype = Some(func_type.result.clone());
+        v_result.set_concretetype(Some(func_type.result.clone()));
         let hop = HighLevelOp::new(
             rtyper.clone(),
             SpaceOperation::new(
@@ -2339,7 +2338,7 @@ mod tests {
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "getitem");
         let mut v_array = Variable::new();
-        v_array.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_array),
             Hlvalue::Constant(Constant::with_concretetype(
@@ -2376,7 +2375,7 @@ mod tests {
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "setitem");
         let mut v_array = Variable::new();
-        v_array.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_array),
             Hlvalue::Constant(Constant::with_concretetype(
@@ -2423,7 +2422,7 @@ mod tests {
         ));
         let hop = empty_hop(&rtyper, "getitem");
         let mut v_array = Variable::new();
-        v_array.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_array),
             Hlvalue::Constant(Constant::with_concretetype(
@@ -2464,9 +2463,9 @@ mod tests {
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "eq");
         let mut v_left = Variable::new();
-        v_left.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_left.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         let mut v_right = Variable::new();
-        v_right.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_right.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         hop.args_v
             .borrow_mut()
             .extend([Hlvalue::Variable(v_left), Hlvalue::Variable(v_right)]);
@@ -2582,7 +2581,7 @@ mod tests {
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "getitem");
         let mut v_self = Variable::new();
-        v_self.concretetype = Some(r_iptr.lowleveltype().clone());
+        v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_self),
             Hlvalue::Constant(Constant::with_concretetype(
@@ -2628,7 +2627,7 @@ mod tests {
         let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
         let hop = empty_hop(&rtyper, "setitem");
         let mut v_self = Variable::new();
-        v_self.concretetype = Some(r_iptr.lowleveltype().clone());
+        v_self.set_concretetype(Some(r_iptr.lowleveltype().clone()));
         hop.args_v.borrow_mut().extend([
             Hlvalue::Variable(v_self),
             Hlvalue::Constant(Constant::with_concretetype(

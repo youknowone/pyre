@@ -413,9 +413,9 @@ fn test_renamevariables() {
     // v = Variable()
     let v = Variable::new();
     // block.renamevariables({pieces.sum2: v})
-    let mut mapping: std::collections::HashMap<Variable, Variable> =
+    let mut mapping: std::collections::HashMap<Variable, Hlvalue> =
         std::collections::HashMap::new();
-    mapping.insert(sum2.clone(), v.clone());
+    mapping.insert(sum2.clone(), Hlvalue::Variable(v.clone()));
     pieces.whileblock.borrow_mut().renamevariables(&mapping);
 
     let vars = pieces.whileblock.borrow().getvariables();
@@ -430,8 +430,9 @@ fn test_renamevariables() {
     );
 
     // block.renamevariables({v: pieces.sum2})
-    let mut mapping2 = std::collections::HashMap::new();
-    mapping2.insert(v, sum2.clone());
+    let mut mapping2: std::collections::HashMap<Variable, Hlvalue> =
+        std::collections::HashMap::new();
+    mapping2.insert(v, Hlvalue::Variable(sum2.clone()));
     pieces.whileblock.borrow_mut().renamevariables(&mapping2);
     let vars = pieces.whileblock.borrow().getvariables();
     assert_eq!(

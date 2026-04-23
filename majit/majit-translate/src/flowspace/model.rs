@@ -1950,7 +1950,12 @@ pub struct Variable {
     /// via every clone `v2` with the same identity.
     pub annotation: Rc<std::cell::RefCell<Option<Rc<SomeValue>>>>,
     /// RPython `Variable.concretetype` (set by the rtyper).
-    pub concretetype: Option<ConcretetypePlaceholder>,
+    ///
+    /// Reference-semantic like `annotation` so that a write on one clone
+    /// (e.g. `rtyper.setconcretetype(v)`) is observable through every
+    /// other clone with the same identity — matching upstream Python's
+    /// `v.concretetype = X` mutation semantics via object references.
+    pub concretetype: Rc<std::cell::RefCell<Option<ConcretetypePlaceholder>>>,
 }
 
 impl Clone for Variable {
@@ -1959,15 +1964,15 @@ impl Clone for Variable {
     // "same" Variable relies on identity being preserved. `clone`
     // in Rust therefore aliases the identity; use `copy()` for
     // RPython `Variable.copy` semantics (new identity). The
-    // `_nr` / `annotation` cells Rc-share across clones so they act
-    // as if attached to the upstream Python object.
+    // `_nr` / `annotation` / `concretetype` cells Rc-share across
+    // clones so they act as if attached to the upstream Python object.
     fn clone(&self) -> Self {
         Variable {
             id: self.id,
             _name: self._name.clone(),
             _nr: Rc::clone(&self._nr),
             annotation: Rc::clone(&self.annotation),
-            concretetype: self.concretetype.clone(),
+            concretetype: Rc::clone(&self.concretetype),
         }
     }
 }
@@ -1997,7 +2002,7 @@ impl Variable {
             _name: DUMMYNAME.to_owned(),
             _nr: Rc::new(std::cell::Cell::new(-1)),
             annotation: Rc::new(std::cell::RefCell::new(None)),
-            concretetype: None,
+            concretetype: Rc::new(std::cell::RefCell::new(None)),
         }
     }
 
@@ -2116,22 +2121,43 @@ impl Variable {
     /// concretetype.
     pub fn copy(&self) -> Self {
         // `Variable::new()` allocates a fresh id *and* fresh _nr /
-        // annotation cells (new identity). We overwrite the prefix
-        // with the source's _name, matching RPython's `Variable(v)`
-        // path that copies the prefix via `rename`. Annotation is
-        // copied by VALUE into the new cell — sharing the source's
-        // Rc would alias mutable state across independent identities.
+        // annotation / concretetype cells (new identity). We
+        // overwrite the prefix with the source's _name, matching
+        // RPython's `Variable(v)` path that copies the prefix via
+        // `rename`. Annotation and concretetype are copied by VALUE
+        // into the new cells — sharing the source's Rcs would alias
+        // mutable state across independent identities.
         let mut newvar = Variable::new();
         newvar._name = self._name.clone();
         newvar._nr.set(-1);
         *newvar.annotation.borrow_mut() = self.annotation.borrow().clone();
-        newvar.concretetype = self.concretetype.clone();
+        *newvar.concretetype.borrow_mut() = self.concretetype.borrow().clone();
         newvar
     }
 
+    /// Shortcut for `self.concretetype.borrow().clone()` — returns the
+    /// current low-level type, if any, without leaking the `RefCell`
+    /// abstraction at call sites.
+    pub fn concretetype(&self) -> Option<ConcretetypePlaceholder> {
+        self.concretetype.borrow().clone()
+    }
+
+    /// Shortcut for `*self.concretetype.borrow_mut() = value` — mirrors
+    /// upstream `v.concretetype = X` with the reference-semantic
+    /// propagation guarantee (see the `concretetype` field).
+    pub fn set_concretetype(&self, value: Option<ConcretetypePlaceholder>) {
+        *self.concretetype.borrow_mut() = value;
+    }
+
     /// RPython `Variable.replace(mapping)`: `mapping.get(self, self)`.
-    pub fn replace<'a>(&'a self, mapping: &'a HashMap<Variable, Variable>) -> &'a Variable {
-        mapping.get(self).unwrap_or(self)
+    /// Upstream mapping values are polymorphic (Variable or Constant);
+    /// the Rust port routes through `Hlvalue` so Variable → Constant
+    /// substitutions work too.
+    pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
+        mapping
+            .get(self)
+            .cloned()
+            .unwrap_or_else(|| Hlvalue::Variable(self.clone()))
     }
 }
 
@@ -2232,8 +2258,8 @@ impl Constant {
     }
 
     /// RPython `Constant.replace(mapping)` — Constants never rename.
-    pub fn replace<'a>(&'a self, _mapping: &'a HashMap<Variable, Variable>) -> &'a Constant {
-        self
+    pub fn replace(&self, _mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
+        Hlvalue::Constant(self.clone())
     }
 
     /// RPython `rpython/tool/uid.py:35-39` — `Hashable.__init__` tries
@@ -2491,10 +2517,10 @@ impl Hlvalue {
     /// RPython `.replace(mapping)` dispatch — matches whichever
     /// subclass `Variable.replace` / `Constant.replace` method the
     /// cell carries.
-    pub fn replace(&self, mapping: &HashMap<Variable, Variable>) -> Hlvalue {
+    pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
         match self {
-            Hlvalue::Variable(v) => Hlvalue::Variable(v.replace(mapping).clone()),
-            Hlvalue::Constant(c) => Hlvalue::Constant(c.replace(mapping).clone()),
+            Hlvalue::Variable(v) => v.replace(mapping),
+            Hlvalue::Constant(c) => c.replace(mapping),
         }
     }
 }
@@ -2569,7 +2595,7 @@ impl SpaceOperation {
     ///
     /// Returns a fresh SpaceOperation with the same opname/offset and
     /// every arg/result remapped through `mapping`.
-    pub fn replace(&self, mapping: &HashMap<Variable, Variable>) -> SpaceOperation {
+    pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> SpaceOperation {
         let newargs: Vec<Hlvalue> = self.args.iter().map(|a| a.replace(mapping)).collect();
         let newresult = self.result.replace(mapping);
         SpaceOperation {
@@ -2766,7 +2792,7 @@ impl Link {
     }
 
     /// RPython `Link.replace(mapping)`.
-    pub fn replace(&self, mapping: &HashMap<Variable, Variable>) -> Link {
+    pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> Link {
         self.copy(|v| v.replace(mapping))
     }
 
@@ -2907,7 +2933,7 @@ impl Block {
     }
 
     /// RPython `Block.renamevariables(mapping)`.
-    pub fn renamevariables(&mut self, mapping: &HashMap<Variable, Variable>) {
+    pub fn renamevariables(&mut self, mapping: &HashMap<Variable, Hlvalue>) {
         self.inputargs = self.inputargs.iter().map(|a| a.replace(mapping)).collect();
         self.operations = self
             .operations
@@ -3854,21 +3880,21 @@ mod tests {
         let mut v = Variable::new();
         v.annotation
             .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::default()))));
-        v.concretetype = Some(LowLevelType::Signed);
+        v.set_concretetype(Some(LowLevelType::Signed));
         let c = v.copy();
         let ca = c.annotation.borrow().as_ref().unwrap().clone();
         let va = v.annotation.borrow().as_ref().unwrap().clone();
         // Rc shares the same allocation — identity preserved per
         // RPython parity (copy keeps reference to the same SomeValue).
         assert!(Rc::ptr_eq(&ca, &va));
-        assert_eq!(c.concretetype, v.concretetype);
+        assert_eq!(c.concretetype(), v.concretetype());
     }
 
     #[test]
-    fn constant_replace_returns_self() {
+    fn constant_replace_returns_self_wrapped_in_hlvalue() {
         let c = Constant::new(ConstValue::Placeholder);
-        let map = HashMap::new();
-        assert!(std::ptr::eq(c.replace(&map), &c));
+        let map: HashMap<Variable, Hlvalue> = HashMap::new();
+        assert_eq!(c.replace(&map), Hlvalue::Constant(c));
     }
 
     #[test]
@@ -4475,9 +4501,9 @@ mod tests {
         // Mapping r -> r', a -> a'; b unchanged.
         let r_new = Variable::named("r_new");
         let a_new = Variable::named("a_new");
-        let mut map: HashMap<Variable, Variable> = HashMap::new();
-        map.insert(r.clone(), r_new.clone());
-        map.insert(a.clone(), a_new.clone());
+        let mut map: HashMap<Variable, Hlvalue> = HashMap::new();
+        map.insert(r.clone(), Hlvalue::Variable(r_new.clone()));
+        map.insert(a.clone(), Hlvalue::Variable(a_new.clone()));
 
         let op = SpaceOperation::new(
             "int_add",

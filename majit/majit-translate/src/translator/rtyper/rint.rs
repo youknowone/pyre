@@ -496,10 +496,10 @@ fn has_nonnegargs_helper(funcname: &str) -> bool {
     matches!(funcname, "ll_int_py_div" | "ll_int_py_mod")
 }
 
-fn hlvalue_concretetype(value: &Hlvalue) -> Option<&LowLevelType> {
+fn hlvalue_concretetype(value: &Hlvalue) -> Option<LowLevelType> {
     match value {
-        Hlvalue::Variable(v) => v.concretetype.as_ref(),
-        Hlvalue::Constant(c) => c.concretetype.as_ref(),
+        Hlvalue::Variable(v) => v.concretetype(),
+        Hlvalue::Constant(c) => c.concretetype.clone(),
     }
 }
 
@@ -711,7 +711,6 @@ pub fn rtype_call_helper(
         .iter()
         .map(|v| {
             hlvalue_concretetype(v)
-                .cloned()
                 .ok_or_else(|| TyperError::message("gendirectcall argument missing concretetype"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -719,7 +718,7 @@ pub fn rtype_call_helper(
     let v_result = hop
         .gendirectcall(&llfunc, vlist)?
         .ok_or_else(|| TyperError::message("direct_call unexpectedly returned Void"))?;
-    if hlvalue_concretetype(&v_result) != Some(repr.lowleveltype()) {
+    if hlvalue_concretetype(&v_result).as_ref() != Some(repr.lowleveltype()) {
         return Err(TyperError::message(format!(
             "direct_call result type mismatch: expected {}, got {:?}",
             repr.lowleveltype().short_name(),
@@ -835,10 +834,10 @@ mod tests {
         s_arg: SomeValue,
         s_result: SomeValue,
     ) -> HighLevelOp {
-        let mut v_arg = Variable::new();
-        v_arg.concretetype = Some(arg_type.clone());
-        let mut v_result = Variable::new();
-        v_result.concretetype = Some(result_type);
+        let v_arg = Variable::new();
+        v_arg.set_concretetype(Some(arg_type.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(result_type));
         let hop = HighLevelOp::new(
             rtyper.clone(),
             SpaceOperation::new(
@@ -1006,12 +1005,12 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
-        let mut v_left = Variable::new();
-        v_left.concretetype = Some(LowLevelType::Bool);
-        let mut v_right = Variable::new();
-        v_right.concretetype = Some(LowLevelType::Bool);
-        let mut v_result = Variable::new();
-        v_result.concretetype = Some(LowLevelType::Bool);
+        let v_left = Variable::new();
+        v_left.set_concretetype(Some(LowLevelType::Bool));
+        let v_right = Variable::new();
+        v_right.set_concretetype(Some(LowLevelType::Bool));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Bool));
         let hop = HighLevelOp::new(
             rtyper.clone(),
             SpaceOperation::new(

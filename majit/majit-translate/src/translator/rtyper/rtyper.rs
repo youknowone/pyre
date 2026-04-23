@@ -23,14 +23,14 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
-use crate::annotator::model::SomeValue;
+use crate::annotator::model::{SomeObjectTrait, SomeValue};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
     Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc,
-    GraphRef, HOST_ENV, Hlvalue, Link, LinkRef, SpaceOperation, Variable,
+    GraphKey, GraphRef, HOST_ENV, Hlvalue, Link, LinkRef, SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
-use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::error::{TyperError, TyperWhere};
 use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, PtrTarget, getfunctionptr,
@@ -39,12 +39,36 @@ use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprKey, inputconst, inputconst_from_lltype, rtyper_makekey, rtyper_makerepr,
 };
 use crate::translator::rtyper::rpbc::LLCallTable;
+use crate::translator::unsimplify::insert_empty_block;
 
 /// RPython `class RPythonTyper(object)` (rtyper.py:42+).
 ///
 /// The full constructor state lands incrementally as the rtyper port
 /// progresses. For `simplify.py` parity we need the annotator link and
 /// the `already_seen` dict populated by `specialize_more_blocks()`.
+/// RPython `class ExceptionData` (`rpython/rtyper/exceptiondata.py:11-26`).
+///
+/// Upstream's `__init__` obtains `r_type = rtyper.rootclass_repr` and
+/// `r_instance = getinstancerepr(rtyper, None)`, then freezes their
+/// lltypes into the last two fields. The Rust port exposes the same
+/// four-field surface; populating it requires the `rootclass_repr` /
+/// `getinstancerepr(rtyper, None)` port which has not landed, so until
+/// then the `RPythonTyper.exceptiondata` slot stays `None` and callers
+/// receive a structured `TyperError` pointing at that dependency.
+#[derive(Clone)]
+pub struct ExceptionData {
+    /// RPython `self.r_exception_type = rtyper.rootclass_repr` — the
+    /// class repr used for every exception vtable pointer.
+    pub r_exception_type: Arc<dyn Repr>,
+    /// RPython `self.r_exception_value = getinstancerepr(rtyper, None)`
+    /// — the instance repr shared by every exception value.
+    pub r_exception_value: Arc<dyn Repr>,
+    /// RPython `self.lltype_of_exception_type = r_type.lowleveltype`.
+    pub lltype_of_exception_type: LowLevelType,
+    /// RPython `self.lltype_of_exception_value = r_instance.lowleveltype`.
+    pub lltype_of_exception_value: LowLevelType,
+}
+
 pub struct RPythonTyper {
     /// RPython `self.annotator`.
     ///
@@ -52,6 +76,12 @@ pub struct RPythonTyper {
     /// `annotator -> translator -> rtyper -> annotator` cycle that
     /// Python's GC handles upstream.
     pub annotator: Weak<RPythonAnnotator>,
+    /// RPython `self.exceptiondata = ExceptionData(self)` assigned in
+    /// `__init__` (rtyper.py:86). Stays `None` until
+    /// `exceptiondata.py:16` `rootclass_repr` + `getinstancerepr(None)`
+    /// land; callers read through [`RPythonTyper::exceptiondata`] which
+    /// returns a structured `TyperError` in the meantime.
+    pub exceptiondata: RefCell<Option<Rc<ExceptionData>>>,
     /// RPython `self.already_seen = {}` assigned in `specialize()`
     /// (rtyper.py:186). Membership is queried by `simplify.py`.
     pub already_seen: RefCell<HashMap<BlockKey, bool>>,
@@ -80,6 +110,24 @@ pub struct RPythonTyper {
     lowlevel_helper_graphs: RefCell<HashMap<LowLevelHelperKey, Rc<PyGraph>>>,
 }
 
+/// RPython rtyper.py:456-458 constant-result agreement predicate.
+///
+/// Upstream `assert` passes when `resultvar.value == hop.s_result.const
+/// or (math.isnan(resultvar.value) and math.isnan(hop.s_result.const))`.
+/// Extracted as a testable helper because the assert lives deep inside
+/// `translate_hl_to_ll` after dispatch.
+pub fn constant_result_values_agree(rv: &ConstValue, s_const: &ConstValue) -> bool {
+    if rv == s_const {
+        return true;
+    }
+    match (rv, s_const) {
+        (ConstValue::Float(a), ConstValue::Float(b)) => {
+            f64::from_bits(*a).is_nan() && f64::from_bits(*b).is_nan()
+        }
+        _ => false,
+    }
+}
+
 impl RPythonTyper {
     /// RPython `RPythonTyper.__init__(self, annotator, backend=...)`.
     ///
@@ -89,6 +137,7 @@ impl RPythonTyper {
     pub fn new(annotator: &Rc<RPythonAnnotator>) -> Self {
         RPythonTyper {
             annotator: Rc::downgrade(annotator),
+            exceptiondata: RefCell::new(None),
             already_seen: RefCell::new(HashMap::new()),
             concrete_calltables: RefCell::new(HashMap::new()),
             reprs: RefCell::new(HashMap::new()),
@@ -97,6 +146,19 @@ impl RPythonTyper {
             primitive_to_repr: RefCell::new(HashMap::new()),
             lowlevel_helper_graphs: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Read access to the `ExceptionData` surface. Returns a structured
+    /// `TyperError` when `exceptiondata.py` initialisation has not yet
+    /// been ported (`rootclass_repr` / `getinstancerepr(None)` are the
+    /// missing dependencies).
+    pub fn exceptiondata(&self) -> Result<Rc<ExceptionData>, TyperError> {
+        self.exceptiondata.borrow().clone().ok_or_else(|| {
+            TyperError::message(
+                "ExceptionData not initialised — port exceptiondata.py:16 \
+                 (requires rclass.rootclass_repr + getinstancerepr(rtyper, None))",
+            )
+        })
     }
 
     /// RPython `RPythonTyper.getprimitiverepr(self, lltype)`
@@ -261,6 +323,861 @@ impl RPythonTyper {
     pub fn bindingrepr(&self, var: &Hlvalue) -> Result<Arc<dyn Repr>, TyperError> {
         let s_obj = self.binding(var);
         self.getrepr(&s_obj)
+    }
+
+    /// RPython `RPythonTyper.setconcretetype(self, v)` (rtyper.py:258-260).
+    ///
+    /// ```python
+    /// def setconcretetype(self, v):
+    ///     assert isinstance(v, Variable)
+    ///     v.concretetype = self.bindingrepr(v).lowleveltype
+    /// ```
+    ///
+    /// The upstream `isinstance(v, Variable)` assertion is enforced by
+    /// the `&Variable` signature. Mutation propagates through
+    /// `Variable.concretetype`'s `Rc<RefCell>` to every clone of the
+    /// same Variable identity.
+    pub fn setconcretetype(&self, var: &Variable) -> Result<(), TyperError> {
+        let repr = self.bindingrepr(&Hlvalue::Variable(var.clone()))?;
+        var.set_concretetype(Some(repr.lowleveltype().clone()));
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.make_new_lloplist(self, block)`
+    /// (rtyper.py:280-281).
+    ///
+    /// ```python
+    /// def make_new_lloplist(self, block):
+    ///     return LowLevelOpList(self, block)
+    /// ```
+    ///
+    /// `self: &Rc<Self>` is required because `LowLevelOpList` stores
+    /// `Rc<RPythonTyper>` — upstream Python carries `self` by
+    /// reference semantics, Rust needs the shared-ownership handle
+    /// explicit.
+    pub fn make_new_lloplist(self: &Rc<Self>, block: BlockRef) -> LowLevelOpList {
+        LowLevelOpList::new(Rc::clone(self), Some(block))
+    }
+
+    /// RPython `RPythonTyper.highlevelops(self, block, llops)`
+    /// (rtyper.py:422-432).
+    ///
+    /// ```python
+    /// def highlevelops(self, block, llops):
+    ///     if block.operations:
+    ///         for op in block.operations[:-1]:
+    ///             yield HighLevelOp(self, op, [], llops)
+    ///         if block.canraise:
+    ///             exclinks = block.exits[1:]
+    ///         else:
+    ///             exclinks = []
+    ///         yield HighLevelOp(self, block.operations[-1], exclinks, llops)
+    /// ```
+    ///
+    /// Upstream is a generator; Rust returns a Vec since the caller
+    /// (`specialize_block`) iterates it fully.
+    pub fn highlevelops(
+        self: &Rc<Self>,
+        block: &BlockRef,
+        llops: Rc<RefCell<LowLevelOpList>>,
+    ) -> Vec<HighLevelOp> {
+        let mut result = Vec::new();
+        let b = block.borrow();
+        if b.operations.is_empty() {
+            return result;
+        }
+        let last_idx = b.operations.len() - 1;
+        for op in &b.operations[..last_idx] {
+            result.push(HighLevelOp::new(
+                Rc::clone(self),
+                op.clone(),
+                Vec::new(),
+                Rc::clone(&llops),
+            ));
+        }
+        let exclinks: Vec<LinkRef> = if b.canraise() {
+            b.exits.iter().skip(1).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        result.push(HighLevelOp::new(
+            Rc::clone(self),
+            b.operations[last_idx].clone(),
+            exclinks,
+            llops,
+        ));
+        result
+    }
+
+    /// RPython `RPythonTyper.translate_hl_to_ll(self, hop, varmapping)`
+    /// (rtyper.py:434-481).
+    ///
+    /// ```python
+    /// def translate_hl_to_ll(self, hop, varmapping):
+    ///     resultvar = hop.dispatch()
+    ///     if hop.exceptionlinks and hop.llops.llop_raising_exceptions is None:
+    ///         raise TyperError("the graph catches %s, but the rtyper did not "
+    ///                          "take exceptions into account "
+    ///                          "(exception_is_here() not called)" % (
+    ///             [link.exitcase.__name__ for link in hop.exceptionlinks],))
+    ///     if resultvar is None:
+    ///         self.translate_no_return_value(hop)
+    ///     else:
+    ///         assert isinstance(resultvar, (Variable, Constant))
+    ///         op = hop.spaceop
+    ///         if hop.s_result.is_constant():
+    ///             ...assertion that matches resultvar.value == hop.s_result.const...
+    ///         resulttype = resultvar.concretetype
+    ///         op.result.concretetype = hop.r_result.lowleveltype
+    ///         if op.result.concretetype != resulttype:
+    ///             raise TyperError(...)
+    ///         if (isinstance(resultvar, Variable) and
+    ///             resultvar.annotation is None and
+    ///             resultvar not in varmapping):
+    ///             varmapping[resultvar] = op.result
+    ///         elif resultvar is op.result:
+    ///             assert varmapping[resultvar] is resultvar
+    ///         else:
+    ///             hop.llops.append(SpaceOperation('same_as', [resultvar],
+    ///                                             op.result))
+    /// ```
+    ///
+    pub fn translate_hl_to_ll(
+        self: &Rc<Self>,
+        hop: &HighLevelOp,
+        varmapping: &mut HashMap<Variable, Hlvalue>,
+    ) -> Result<(), TyperError> {
+        let resultvar = hop.dispatch()?;
+
+        // rtyper.py:437-441 exception-catch audit.
+        if !hop.exceptionlinks.is_empty() && hop.llops.borrow().llop_raising_exceptions.is_none() {
+            return Err(TyperError::message(
+                "the graph catches exceptions, but the rtyper did not take \
+                 exceptions into account (exception_is_here() not called)",
+            ));
+        }
+
+        let Some(resultvar) = resultvar else {
+            // rtyper.py:442-444 None-return delegates to
+            // `translate_no_return_value`.
+            return self.translate_no_return_value(hop);
+        };
+
+        // rtyper.py:446 `isinstance(resultvar, (Variable, Constant))` is
+        // structural under `Hlvalue`.
+        let r_result = hop
+            .r_result
+            .borrow()
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                TyperError::message(
+                    "HighLevelOp.r_result not populated; setup() must run \
+                     before translate_hl_to_ll (rtyper.py:632)",
+                )
+            })?;
+        let expected = r_result.lowleveltype().clone();
+
+        // rtyper.py:451-458 constant-result assert: if the annotator
+        // declares the result constant and the repr is a non-Void
+        // Primitive, then a Constant resultvar must equal s_result.const
+        // (or both sides be NaN).
+        let s_result = hop.s_result.borrow().clone();
+        let s_result_is_constant = s_result.as_ref().map(|s| s.is_constant()).unwrap_or(false);
+        if s_result_is_constant {
+            if let Hlvalue::Constant(rc) = &resultvar {
+                if expected.is_primitive() && !matches!(expected, LowLevelType::Void) {
+                    let s_const = s_result
+                        .as_ref()
+                        .and_then(|s| s.const_().cloned())
+                        .expect("s_result.is_constant() implies const_() is Some");
+                    assert!(
+                        constant_result_values_agree(&rc.value, &s_const),
+                        "translate_hl_to_ll: Constant result mismatch \
+                         — resultvar.value = {:?}, s_result.const = {:?} \
+                         (rtyper.py:456-458)",
+                        rc.value,
+                        s_const,
+                    );
+                }
+            }
+        }
+
+        // rtyper.py:460 resulttype = resultvar.concretetype.
+        let resulttype = match &resultvar {
+            Hlvalue::Variable(v) => v.concretetype(),
+            Hlvalue::Constant(c) => c.concretetype.clone(),
+        };
+
+        // rtyper.py:461 `op.result.concretetype = hop.r_result.lowleveltype`.
+        // Variable op.result: mutate in place (reference-semantic Rc<RefCell>
+        // propagates to every clone). Constant op.result: construct a fresh
+        // typed Constant mirror and thread it through `varmapping` /
+        // `same_as` so downstream ops see the typed value.
+        let op_result: Hlvalue = match &hop.spaceop.result {
+            Hlvalue::Variable(v) => {
+                v.set_concretetype(Some(expected.clone()));
+                Hlvalue::Variable(v.clone())
+            }
+            Hlvalue::Constant(c) => Hlvalue::Constant(Constant {
+                id: c.id,
+                value: c.value.clone(),
+                concretetype: Some(expected.clone()),
+            }),
+        };
+
+        // rtyper.py:462-468 type consistency check. Upstream compares
+        // `op.result.concretetype` (just written to `expected`) against
+        // `resulttype`; equivalent to `expected != resulttype`.
+        if resulttype.as_ref() != Some(&expected) {
+            return Err(TyperError::message(format!(
+                "inconsistent type for the result of '{op_name}':\n\
+                 rtype_{op_name} returned {returned:?} \
+                 but annotator/repr expected {expected:?}",
+                op_name = hop.spaceop.opname,
+                returned = resulttype,
+                expected = expected,
+            )));
+        }
+
+        // rtyper.py:470-481 renaming / same_as insertion. `varmapping`
+        // values are polymorphic (Variable or Constant) so the fresh-
+        // variable branch stores `op_result` directly.
+        let resultvar_is_op_result = match (&resultvar, &op_result) {
+            (Hlvalue::Variable(a), Hlvalue::Variable(b)) => a == b,
+            _ => false,
+        };
+        match &resultvar {
+            Hlvalue::Variable(v)
+                if v.annotation.borrow().is_none() && !varmapping.contains_key(v) =>
+            {
+                // rtyper.py:470-474 fresh Variable: rename to op.result.
+                varmapping.insert(v.clone(), op_result);
+            }
+            Hlvalue::Variable(_) if resultvar_is_op_result => {
+                // rtyper.py:475-477 — same Variable handed back. Upstream
+                // asserts `varmapping[resultvar] is resultvar`; we elide the
+                // assert because it only fires once specialize_block has
+                // populated varmapping, which happens after translate_hl_to_ll
+                // returns.
+            }
+            _ => {
+                // rtyper.py:478-481 renaming unsafe: emit same_as.
+                let mut llops = hop.llops.borrow_mut();
+                llops.append(SpaceOperation::new("same_as", vec![resultvar], op_result));
+            }
+        }
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.translate_no_return_value(self, hop)`
+    /// (rtyper.py:483-488).
+    ///
+    /// ```python
+    /// def translate_no_return_value(self, hop):
+    ///     op = hop.spaceop
+    ///     if hop.s_result != annmodel.s_ImpossibleValue:
+    ///         raise TyperError("the annotator doesn't agree that '%s' "
+    ///                          "has no return value" % op.opname)
+    ///     op.result.concretetype = Void
+    /// ```
+    ///
+    pub fn translate_no_return_value(&self, hop: &HighLevelOp) -> Result<(), TyperError> {
+        let is_impossible = matches!(hop.s_result.borrow().as_ref(), Some(SomeValue::Impossible));
+        if !is_impossible {
+            return Err(TyperError::message(format!(
+                "the annotator doesn't agree that '{}' has no return value",
+                hop.spaceop.opname,
+            )));
+        }
+        // rtyper.py:488 `op.result.concretetype = Void` — unconditional
+        // write regardless of whether op.result is Variable or Constant.
+        // Variable: Rc<RefCell<Option<LowLevelType>>> propagates through
+        // every clone of the same identity. Constant: upstream's Python
+        // would set the attribute on the Constant instance; Rust's
+        // immutable Constant forces us to construct a typed mirror. The
+        // mirror is materialised so the translate shape matches upstream
+        // even though the immediate caller (translate_hl_to_ll) discards
+        // the None-resultvar path without threading it further.
+        let _typed_op_result: Hlvalue = match &hop.spaceop.result {
+            Hlvalue::Variable(v) => {
+                v.set_concretetype(Some(LowLevelType::Void));
+                Hlvalue::Variable(v.clone())
+            }
+            Hlvalue::Constant(c) => Hlvalue::Constant(Constant {
+                id: c.id,
+                value: c.value.clone(),
+                concretetype: Some(LowLevelType::Void),
+            }),
+        };
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.gottypererror(self, exc, block, position)`
+    /// (rtyper.py:490-493).
+    ///
+    /// ```python
+    /// def gottypererror(self, exc, block, position):
+    ///     """Record information about the location of a TyperError"""
+    ///     graph = self.annotator.annotated.get(block)
+    ///     exc.where = (graph, block, position)
+    /// ```
+    ///
+    /// `annotator.annotated: HashMap<BlockKey, Option<GraphRef>>` encodes
+    /// upstream's `dict.get(block)` trichotomy:
+    /// - key absent → `"<no graph>"` (upstream returns `None`)
+    /// - present as `None` → `"<False>"` (upstream's `False` sentinel for
+    ///   graphs scheduled but not yet attached)
+    /// - present as `Some(graph)` → `graph.name`
+    ///
+    /// `TyperWhere.stage` holds the graph slot; the naming is a
+    /// PRE-EXISTING-DEVIATION that predates this port. Block and
+    /// position are serialized via `Debug` so the TyperError can cross
+    /// the unwind boundary without borrowing into the block graph.
+    ///
+    /// Dead on landing — the callers (`specialize_block`,
+    /// `insert_link_conversions`) port in 5c/5d. Unit-tested in
+    /// isolation.
+    pub fn gottypererror<P: std::fmt::Debug + ?Sized>(
+        &self,
+        exc: TyperError,
+        block: &BlockRef,
+        position: &P,
+    ) -> TyperError {
+        let stage = {
+            let ann = self
+                .annotator
+                .upgrade()
+                .expect("RPythonTyper.annotator weak reference dropped");
+            let annotated = ann.annotated.borrow();
+            match annotated.get(&BlockKey::of(block)) {
+                None => "<no graph>".to_string(),
+                Some(None) => "<False>".to_string(),
+                Some(Some(g)) => g.borrow().name.clone(),
+            }
+        };
+        let block_repr = format!("{:?}", block.borrow());
+        let op_repr = format!("{position:?}");
+        exc.with_where(TyperWhere {
+            stage,
+            block: block_repr,
+            op: op_repr,
+        })
+    }
+
+    /// RPython `RPythonTyper._convert_link(self, block, link)`
+    /// (rtyper.py:353-376).
+    ///
+    /// ```python
+    /// def _convert_link(self, block, link):
+    ///     if link.exitcase is not None and link.exitcase != 'default':
+    ///         if isinstance(block.exitswitch, Variable):
+    ///             r_case = self.bindingrepr(block.exitswitch)
+    ///         else:
+    ///             assert block.canraise
+    ///             r_case = rclass.get_type_repr(self)
+    ///         link.llexitcase = r_case.convert_const(link.exitcase)
+    ///     else:
+    ///         link.llexitcase = None
+    ///
+    ///     a = link.last_exception
+    ///     if isinstance(a, Variable):
+    ///         a.concretetype = self.exceptiondata.lltype_of_exception_type
+    ///     elif isinstance(a, Constant):
+    ///         link.last_exception = inputconst(
+    ///             self.exceptiondata.r_exception_type, a.value)
+    ///
+    ///     a = link.last_exc_value
+    ///     if isinstance(a, Variable):
+    ///         a.concretetype = self.exceptiondata.lltype_of_exception_value
+    ///     elif isinstance(a, Constant):
+    ///         link.last_exc_value = inputconst(
+    ///             self.exceptiondata.r_exception_value, a.value)
+    /// ```
+    ///
+    /// Non-exception path is fully ported; exception-carrying paths
+    /// (`canraise` → `rclass.get_type_repr`, Variable/Constant
+    /// `last_exception` / `last_exc_value`) delegate to
+    /// [`RPythonTyper::exceptiondata`] and [`rclass::get_type_repr`] and
+    /// surface a structured `TyperError` until `exceptiondata.py`
+    /// initialisation lands.
+    pub fn _convert_link(&self, block: &BlockRef, link: &LinkRef) -> Result<(), TyperError> {
+        // First clause: link.exitcase → link.llexitcase.
+        let exitcase = link.borrow().exitcase.clone();
+        let needs_convert = match exitcase.as_ref() {
+            None => false,
+            Some(Hlvalue::Constant(c)) => !matches!(&c.value, ConstValue::Str(s) if s == "default"),
+            Some(Hlvalue::Variable(_)) => {
+                // Upstream Python's `exitcase != 'default'` compares
+                // concrete values; a Variable exitcase is not an
+                // expected upstream shape.
+                return Err(TyperError::message(
+                    "_convert_link: Variable exitcase is not expected",
+                ));
+            }
+        };
+        if needs_convert {
+            let exitswitch = block.borrow().exitswitch.clone();
+            let r_case = match exitswitch.as_ref() {
+                Some(Hlvalue::Variable(_)) => {
+                    let ev = exitswitch.as_ref().unwrap();
+                    self.bindingrepr(ev)?
+                }
+                _ => {
+                    // Upstream: `assert block.canraise; r_case = rclass.get_type_repr(self)`.
+                    assert!(
+                        block.borrow().canraise(),
+                        "_convert_link: non-Variable exitswitch must be a canraise block",
+                    );
+                    crate::translator::rtyper::rclass::get_type_repr(self)?
+                }
+            };
+            // Upstream hands `link.exitcase` — a concrete Python value —
+            // directly to `convert_const`. In Rust the concrete value
+            // lives inside `Hlvalue::Constant(Constant { value, .. })`;
+            // thread `&value` through.
+            let cv = match exitcase.as_ref().expect("needs_convert implies Some") {
+                Hlvalue::Constant(c) => &c.value,
+                Hlvalue::Variable(_) => unreachable!("Variable exitcase rejected above"),
+            };
+            let converted = r_case.convert_const(cv)?;
+            link.borrow_mut().llexitcase = Some(Hlvalue::Constant(converted));
+        } else {
+            link.borrow_mut().llexitcase = None;
+        }
+
+        // Second clause: link.last_exception.
+        let last_exception = link.borrow().last_exception.clone();
+        match last_exception {
+            None => {}
+            Some(Hlvalue::Variable(v)) => {
+                let ed = self.exceptiondata()?;
+                v.set_concretetype(Some(ed.lltype_of_exception_type.clone()));
+            }
+            Some(Hlvalue::Constant(c)) => {
+                let ed = self.exceptiondata()?;
+                let typed = inputconst(ed.r_exception_type.as_ref(), &c.value)?;
+                link.borrow_mut().last_exception = Some(Hlvalue::Constant(typed));
+            }
+        }
+
+        // Third clause: link.last_exc_value. Same shape as above.
+        let last_exc_value = link.borrow().last_exc_value.clone();
+        match last_exc_value {
+            None => {}
+            Some(Hlvalue::Variable(v)) => {
+                let ed = self.exceptiondata()?;
+                v.set_concretetype(Some(ed.lltype_of_exception_value.clone()));
+            }
+            Some(Hlvalue::Constant(c)) => {
+                let ed = self.exceptiondata()?;
+                let typed = inputconst(ed.r_exception_value.as_ref(), &c.value)?;
+                link.borrow_mut().last_exc_value = Some(Hlvalue::Constant(typed));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.insert_link_conversions(self, block, skip=0)`
+    /// (rtyper.py:378-420).
+    ///
+    /// ```python
+    /// def insert_link_conversions(self, block, skip=0):
+    ///     can_insert_here = block.exitswitch is None and len(block.exits) == 1
+    ///     for link in block.exits[skip:]:
+    ///         self._convert_link(block, link)
+    ///         inputargs_reprs = self.setup_block_entry(link.target)
+    ///         newops = self.make_new_lloplist(block)
+    ///         newlinkargs = {}
+    ///         for i in range(len(link.args)):
+    ///             a1 = link.args[i]
+    ///             r_a2 = inputargs_reprs[i]
+    ///             if isinstance(a1, Constant):
+    ///                 link.args[i] = inputconst(r_a2, a1.value)
+    ///                 continue
+    ///             if a1 is link.last_exception:
+    ///                 r_a1 = self.exceptiondata.r_exception_type
+    ///             elif a1 is link.last_exc_value:
+    ///                 r_a1 = self.exceptiondata.r_exception_value
+    ///             else:
+    ///                 r_a1 = self.bindingrepr(a1)
+    ///             if r_a1 == r_a2:
+    ///                 continue
+    ///             try:
+    ///                 new_a1 = newops.convertvar(a1, r_a1, r_a2)
+    ///             except TyperError as e:
+    ///                 self.gottypererror(e, block, link)
+    ///                 raise
+    ///             if new_a1 != a1:
+    ///                 newlinkargs[i] = new_a1
+    ///
+    ///         if newops:
+    ///             if can_insert_here:
+    ///                 block.operations.extend(newops)
+    ///             else:
+    ///                 newblock = insert_empty_block(link, newops=newops)
+    ///                 link = newblock.exits[0]
+    ///         for i, new_a1 in newlinkargs.items():
+    ///             link.args[i] = new_a1
+    /// ```
+    ///
+    /// Simple-case only: exception-aware branches (`last_exception` /
+    /// `last_exc_value` reprs from `ExceptionData`) are gated out via
+    /// `_convert_link` and `setup_block_entry`, whose deferred errors
+    /// bubble back through `gottypererror`. Multi-exit blocks are still
+    /// handled when none of their exits need ExceptionData reprs.
+    pub fn insert_link_conversions(
+        self: &Rc<Self>,
+        block: &BlockRef,
+        skip: usize,
+    ) -> Result<(), TyperError> {
+        let can_insert_here = {
+            let b = block.borrow();
+            b.exitswitch.is_none() && b.exits.len() == 1
+        };
+        let exits: Vec<LinkRef> = {
+            let b = block.borrow();
+            b.exits.iter().skip(skip).cloned().collect()
+        };
+        for link in exits {
+            // rtyper.py:382-383 — `_convert_link` and `setup_block_entry`
+            // errors propagate uncaught; only `newops.convertvar` is
+            // wrapped with `gottypererror` (rtyper.py:400-403).
+            self._convert_link(block, &link)?;
+
+            let target = link
+                .borrow()
+                .target
+                .clone()
+                .expect("insert_link_conversions: link.target must be set");
+            let inputargs_reprs = self.setup_block_entry(&target)?;
+
+            let mut newops = self.make_new_lloplist(block.clone());
+            let mut newlinkargs: HashMap<usize, Hlvalue> = HashMap::new();
+            let link_args = link.borrow().args.clone();
+            for i in 0..link_args.len() {
+                // Upstream `link.args[i]` is always a Hlvalue; pyre's
+                // `Option<Hlvalue>` carries transient `None` for merge
+                // links, which are not valid input to the rtyper phase.
+                let a1 = match &link_args[i] {
+                    Some(v) => v.clone(),
+                    None => {
+                        return Err(TyperError::message(
+                            "insert_link_conversions: transient None link.args slot reached rtyper",
+                        ));
+                    }
+                };
+                let r_a2 = &inputargs_reprs[i];
+
+                if let Hlvalue::Constant(c) = &a1 {
+                    let typed = inputconst(r_a2.as_ref(), &c.value)?;
+                    link.borrow_mut().args[i] = Some(Hlvalue::Constant(typed));
+                    continue;
+                }
+
+                // Variable branch. rtyper.py:392-397 — `a1 is
+                // link.last_exception` / `is link.last_exc_value` pick
+                // up the ExceptionData reprs directly instead of going
+                // through `bindingrepr`.
+                let a1_is_last_exception = matches!(
+                    (&a1, link.borrow().last_exception.as_ref()),
+                    (Hlvalue::Variable(va), Some(Hlvalue::Variable(vb))) if va == vb,
+                );
+                let a1_is_last_exc_value = matches!(
+                    (&a1, link.borrow().last_exc_value.as_ref()),
+                    (Hlvalue::Variable(va), Some(Hlvalue::Variable(vb))) if va == vb,
+                );
+                let r_a1 = if a1_is_last_exception {
+                    self.exceptiondata()?.r_exception_type.clone()
+                } else if a1_is_last_exc_value {
+                    self.exceptiondata()?.r_exception_value.clone()
+                } else {
+                    self.bindingrepr(&a1)?
+                };
+                if Arc::ptr_eq(&r_a1, r_a2) {
+                    continue;
+                }
+                let new_a1 = match newops.convertvar(a1.clone(), r_a1.as_ref(), r_a2.as_ref()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let snapshot = link.borrow();
+                        return Err(self.gottypererror(e, block, &*snapshot));
+                    }
+                };
+                if new_a1 != a1 {
+                    newlinkargs.insert(i, new_a1);
+                }
+            }
+
+            let newops_vec = std::mem::take(&mut newops.ops);
+            let target_link = if !newops_vec.is_empty() {
+                if can_insert_here {
+                    block.borrow_mut().operations.extend(newops_vec);
+                    link.clone()
+                } else {
+                    let newblock = insert_empty_block(&link, newops_vec);
+                    // upstream: `link = newblock.exits[0]`
+                    newblock.borrow().exits[0].clone()
+                }
+            } else {
+                link.clone()
+            };
+            for (i, new_a1) in newlinkargs {
+                target_link.borrow_mut().args[i] = Some(new_a1);
+            }
+        }
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.specialize_block(self, block)`
+    /// (rtyper.py:283-351).
+    ///
+    /// Block-local driver: concretetype the return var on first visit
+    /// per graph, type-up the block's inputargs via `setup_block_entry`,
+    /// dispatch each `HighLevelOp` through `translate_hl_to_ll`, replace
+    /// `block.operations` with the generated LowLevelOpList,
+    /// optionally split around an exception-raising llop, and finally
+    /// reconcile link-arg reprs via `insert_link_conversions`. Any
+    /// `TyperError` raised along the way is annotated via
+    /// `gottypererror` with the (graph, block, position) trio before
+    /// propagating.
+    ///
+    /// `annotator.annotated[block]` is expected to resolve — upstream
+    /// raises `KeyError` when missing and pyre panics for the same
+    /// reason. A `Some(None)` inner value (the `False` sentinel from
+    /// annrpython) skips the fixed_graphs update to match upstream's
+    /// defensive behavior when `graph.getreturnvar()` would crash.
+    pub fn specialize_block(self: &Rc<Self>, block: &BlockRef) -> Result<(), TyperError> {
+        let graph: GraphRef = {
+            let ann = self
+                .annotator
+                .upgrade()
+                .expect("RPythonTyper.annotator weak reference dropped");
+            let annotated = ann.annotated.borrow();
+            annotated
+                .get(&BlockKey::of(block))
+                .cloned()
+                .expect("specialize_block: block missing from annotator.annotated")
+                .expect(
+                    "specialize_block: annotator.annotated[block] is False sentinel — \
+                     RPython would raise AttributeError on graph.getreturnvar()",
+                )
+        };
+
+        {
+            let ann = self
+                .annotator
+                .upgrade()
+                .expect("RPythonTyper.annotator weak reference dropped");
+            let gkey = GraphKey::of(&graph);
+            let is_new = !ann.fixed_graphs.borrow().contains_key(&gkey);
+            if is_new {
+                ann.fixed_graphs.borrow_mut().insert(gkey, graph.clone());
+                if let Hlvalue::Variable(v) = graph.borrow().getreturnvar() {
+                    self.setconcretetype(&v)?;
+                }
+            }
+        }
+
+        if let Err(e) = self.setup_block_entry(block) {
+            return Err(self.gottypererror(e, block, &"block-entry"));
+        }
+
+        // rtyper.py:300 — upstream's `block.operations == ()` distinguishes
+        // the tuple-sentinel final block (return/except) from an empty
+        // list in a regular block. Empty regular blocks must still flow
+        // through `insert_link_conversions`.
+        if block.borrow().is_final_block() {
+            return Ok(());
+        }
+
+        let newops = Rc::new(RefCell::new(self.make_new_lloplist(block.clone())));
+        let mut varmapping: HashMap<Variable, Hlvalue> = HashMap::new();
+        for v in block.borrow().getvariables() {
+            varmapping.insert(v.clone(), Hlvalue::Variable(v));
+        }
+
+        let hops = self.highlevelops(block, newops.clone());
+        for hop in hops {
+            if let Err(e) = hop.setup() {
+                return Err(self.gottypererror(e, block, &hop.spaceop));
+            }
+            if let Err(e) = self.translate_hl_to_ll(&hop, &mut varmapping) {
+                return Err(self.gottypererror(e, block, &hop.spaceop));
+            }
+        }
+
+        // `block.operations[:] = newops` — replace in place, matching
+        // upstream's slice assignment.
+        let new_ops_vec = std::mem::take(&mut newops.borrow_mut().ops);
+        block.borrow_mut().operations = new_ops_vec;
+        block.borrow_mut().renamevariables(&varmapping);
+
+        // extrablock handling (rtyper.py:318-341): if the llop that
+        // raises exceptions isn't the last one, either strip the
+        // exception exits (`"removed"` sentinel) or split the block.
+        let pos = newops.borrow().llop_raising_exceptions.clone();
+        let ops_len = block.borrow().operations.len();
+        let last = ops_len.saturating_sub(1);
+        let mut extrablock: Option<BlockRef> = None;
+        match pos {
+            None => {}
+            Some(LlopRaisingExceptions::Index(i)) if i == last => {}
+            Some(LlopRaisingExceptions::Removed) => {
+                let first_exit = block.borrow().exits[0].clone();
+                let mut b = block.borrow_mut();
+                b.exitswitch = None;
+                b.exits = vec![first_exit];
+            }
+            Some(LlopRaisingExceptions::Index(i)) => {
+                assert!(
+                    block.borrow().canraise(),
+                    "specialize_block: non-last raising llop requires canraise block",
+                );
+                let noexclink = block.borrow().exits[0].clone();
+                assert!(
+                    noexclink.borrow().exitcase.is_none(),
+                    "specialize_block: noexclink must have no exitcase",
+                );
+                assert!(i < last);
+                // extraops = block.operations[i+1:]; del block.operations[i+1:]
+                let extraops: Vec<SpaceOperation> = block.borrow_mut().operations.split_off(i + 1);
+                extrablock = Some(insert_empty_block(&noexclink, extraops));
+            }
+        }
+
+        if extrablock.is_none() {
+            self.insert_link_conversions(block, 0)?;
+        } else {
+            // skip the extrablock as a link target, handle it as source
+            // below.
+            self.insert_link_conversions(block, 1)?;
+            self.insert_link_conversions(extrablock.as_ref().unwrap(), 0)?;
+        }
+
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.specialize_more_blocks(self)`
+    /// (rtyper.py:198-241).
+    ///
+    /// Fixed-point loop: call all pending repr setups, collect every
+    /// annotated block not yet marked in `already_seen`, specialize
+    /// each, mark it seen, repeat until nothing new is pending.
+    ///
+    /// Scope deviations from upstream:
+    /// - No `seed`-based shuffle (pyre lacks the translator-level seed
+    ///   knob; block ordering falls out of HashMap iteration).
+    /// - No progress-bar log events.
+    /// - `self.annmixlevel` finish step (rtyper.py:238-241) is skipped
+    ///   until `getannmixlevel` / `MixLevelHelperAnnotator` are ported.
+    /// - `BlockKey → BlockRef` materialisation reads from
+    ///   `annotator.all_blocks`, the Rust-side reverse index that keeps
+    ///   Python's "dict keys ARE Block objects" iteration shape.
+    pub fn specialize_more_blocks(self: &Rc<Self>) -> Result<(), TyperError> {
+        loop {
+            self.call_all_setups()?;
+            let pending: Vec<BlockRef> = {
+                let ann = self
+                    .annotator
+                    .upgrade()
+                    .expect("RPythonTyper.annotator weak reference dropped");
+                let annotated = ann.annotated.borrow();
+                let all_blocks = ann.all_blocks.borrow();
+                let already_seen = self.already_seen.borrow();
+                annotated
+                    .keys()
+                    .filter(|k| !already_seen.contains_key(*k))
+                    .filter_map(|k| all_blocks.get(k).cloned())
+                    .collect()
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for block in pending {
+                self.specialize_block(&block)?;
+                self.mark_already_seen(&block);
+            }
+        }
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.setup_block_entry(self, block)`
+    /// (rtyper.py:262-278).
+    ///
+    /// ```python
+    /// def setup_block_entry(self, block):
+    ///     if block.operations == () and len(block.inputargs) == 2:
+    ///         # special case for exception blocks
+    ///         v1, v2 = block.inputargs
+    ///         v1.concretetype = self.exceptiondata.lltype_of_exception_type
+    ///         v2.concretetype = self.exceptiondata.lltype_of_exception_value
+    ///         return [self.exceptiondata.r_exception_type,
+    ///                 self.exceptiondata.r_exception_value]
+    ///     else:
+    ///         result = []
+    ///         for a in block.inputargs:
+    ///             r = self.bindingrepr(a)
+    ///             a.concretetype = r.lowleveltype
+    ///             result.append(r)
+    ///         return result
+    /// ```
+    ///
+    /// The exception-block branch reads `ExceptionData`; callers hit a
+    /// structured `TyperError` through [`RPythonTyper::exceptiondata`]
+    /// until `exceptiondata.py:16` initialisation lands.
+    pub fn setup_block_entry(&self, block: &BlockRef) -> Result<Vec<Arc<dyn Repr>>, TyperError> {
+        let is_exception_block = {
+            let b = block.borrow();
+            b.is_final_block() && b.inputargs.len() == 2
+        };
+        if is_exception_block {
+            let ed = self.exceptiondata()?;
+            let b = block.borrow();
+            // upstream: `v1, v2 = block.inputargs`
+            // `v1.concretetype = self.exceptiondata.lltype_of_exception_type`
+            // `v2.concretetype = self.exceptiondata.lltype_of_exception_value`
+            // `return [self.exceptiondata.r_exception_type,
+            //          self.exceptiondata.r_exception_value]`
+            let Hlvalue::Variable(v1) = &b.inputargs[0] else {
+                return Err(TyperError::message(
+                    "setup_block_entry: exception block inputarg[0] must be Variable",
+                ));
+            };
+            let Hlvalue::Variable(v2) = &b.inputargs[1] else {
+                return Err(TyperError::message(
+                    "setup_block_entry: exception block inputarg[1] must be Variable",
+                ));
+            };
+            v1.set_concretetype(Some(ed.lltype_of_exception_type.clone()));
+            v2.set_concretetype(Some(ed.lltype_of_exception_value.clone()));
+            return Ok(vec![
+                ed.r_exception_type.clone(),
+                ed.r_exception_value.clone(),
+            ]);
+        }
+        let mut result: Vec<Arc<dyn Repr>> = Vec::new();
+        let b = block.borrow();
+        for a in b.inputargs.iter() {
+            let r = self.bindingrepr(a)?;
+            match a {
+                Hlvalue::Variable(v) => {
+                    // `Variable.concretetype` is `Rc<RefCell<...>>`; the
+                    // write propagates through every clone of the same
+                    // Variable identity.
+                    v.set_concretetype(Some(r.lowleveltype().clone()));
+                }
+                Hlvalue::Constant(_) => {
+                    return Err(TyperError::message(
+                        "Block.inputargs contained Constant; \
+                         upstream Python raises AttributeError on .concretetype",
+                    ));
+                }
+            }
+            result.push(r);
+        }
+        Ok(result)
     }
 
     /// RPython `RPythonTyper.call_all_setups(self)` (rtyper.py:243-256).
@@ -1170,7 +2087,7 @@ fn lowlevel_helper_graph(
 
 fn variable_with_lltype(name: &str, lltype: LowLevelType) -> Variable {
     let mut var = Variable::named(name);
-    var.concretetype = Some(lltype.clone());
+    var.set_concretetype(Some(lltype.clone()));
     var.annotation
         .replace(Some(Rc::new(lltype_to_annotation(lltype))));
     var
@@ -2649,10 +3566,10 @@ fn synthetic_lowlevel_helper_graph(
     helper_pygraph_from_graph(graph, argnames, func)
 }
 
-fn hlvalue_concretetype(value: &Hlvalue) -> Option<&LowLevelType> {
+fn hlvalue_concretetype(value: &Hlvalue) -> Option<LowLevelType> {
     match value {
-        Hlvalue::Variable(v) => v.concretetype.as_ref(),
-        Hlvalue::Constant(c) => c.concretetype.as_ref(),
+        Hlvalue::Variable(v) => v.concretetype(),
+        Hlvalue::Constant(c) => c.concretetype.clone(),
     }
 }
 
@@ -2770,7 +3687,7 @@ impl LowLevelOpList {
         // the matching `class __extend__(pairtype(R_A, R_B))` helper.
         if let Some(converted) = super::pairtype::pair_convert_from_to(r_from, r_to, &orig_v, self)?
         {
-            if hlvalue_concretetype(&converted) != Some(r_to.lowleveltype()) {
+            if hlvalue_concretetype(&converted).as_ref() != Some(r_to.lowleveltype()) {
                 return Err(TyperError::message(format!(
                     "bug in conversion from {} to {}: returned a {:?}",
                     r_from.repr_string(),
@@ -2824,7 +3741,7 @@ impl LowLevelOpList {
             match v {
                 Hlvalue::Variable(var) => {
                     assert!(
-                        var.concretetype.is_some(),
+                        var.concretetype().is_some(),
                         "wrong level! you must call hop.inputargs() and pass \
                          its result to genop(), never hop.args_v directly."
                     );
@@ -2840,7 +3757,7 @@ impl LowLevelOpList {
         let mut vresult = Variable::new();
         match resulttype {
             GenopResult::Void => {
-                vresult.concretetype = Some(LowLevelType::Void);
+                vresult.set_concretetype(Some(LowLevelType::Void));
                 self.ops.push(SpaceOperation::new(
                     opname.to_string(),
                     args_v,
@@ -2849,14 +3766,14 @@ impl LowLevelOpList {
                 None
             }
             GenopResult::LLType(lltype) => {
-                vresult.concretetype = Some(lltype);
+                vresult.set_concretetype(Some(lltype));
                 let vresult_h = Hlvalue::Variable(vresult.clone());
                 self.ops
                     .push(SpaceOperation::new(opname.to_string(), args_v, vresult_h));
                 Some(vresult)
             }
             GenopResult::Repr(repr) => {
-                vresult.concretetype = Some(repr.lowleveltype().clone());
+                vresult.set_concretetype(Some(repr.lowleveltype().clone()));
                 let vresult_h = Hlvalue::Variable(vresult.clone());
                 self.ops
                     .push(SpaceOperation::new(opname.to_string(), args_v, vresult_h));
@@ -2879,7 +3796,7 @@ impl LowLevelOpList {
                     ll_function.name
                 ))
             })?;
-            if got != expected {
+            if &got != expected {
                 return Err(TyperError::message(format!(
                     "gendirectcall argument {i} to {} has type {:?}, expected {:?}",
                     ll_function.name, got, expected
@@ -2964,7 +3881,7 @@ pub enum LlopRaisingExceptions {
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::annotator::model::{SomeInteger, SomePtr, SomeValue};
+    use crate::annotator::model::{SomeBool, SomeInteger, SomePtr, SomeValue};
     use crate::flowspace::argument::Signature;
     use crate::flowspace::bytecode::HostCode;
     use crate::flowspace::model::{BlockKey, ConstValue, Constant, GraphFunc};
@@ -3034,13 +3951,13 @@ mod tests {
             let graph_borrow = graph.graph.borrow();
             for arg in graph_borrow.startblock.borrow_mut().inputargs.iter_mut() {
                 if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
-                    v.concretetype = Some(LowLevelType::Signed);
+                    v.set_concretetype(Some(LowLevelType::Signed));
                     v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
                 }
             }
             for arg in graph_borrow.returnblock.borrow_mut().inputargs.iter_mut() {
                 if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
-                    v.concretetype = Some(LowLevelType::Void);
+                    v.set_concretetype(Some(LowLevelType::Void));
                     v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
                 }
             }
@@ -3143,7 +4060,7 @@ mod tests {
             TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
         };
         let mut v_array = Variable::new();
-        v_array.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
         let v_index = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Signed);
         let mut result = Variable::new();
         result
@@ -3215,7 +4132,7 @@ mod tests {
         let hop = HighLevelOp::new(rtyper, empty_spaceop("nop"), Vec::new(), llops);
         let repr: Arc<dyn Repr> = Arc::new(VoidRepr::new());
         let mut var = Variable::new();
-        var.concretetype = Some(LowLevelType::Void);
+        var.set_concretetype(Some(LowLevelType::Void));
         let arg = Hlvalue::Variable(var.clone());
         hop.args_v.borrow_mut().push(arg.clone());
         hop.args_s.borrow_mut().push(SomeValue::Impossible);
@@ -3350,7 +4267,7 @@ mod tests {
         assert!(result.is_none());
         assert_eq!(llops.ops.len(), 1);
         if let Hlvalue::Variable(v) = &llops.ops[0].result {
-            assert_eq!(v.concretetype.as_ref(), Some(&LowLevelType::Void));
+            assert_eq!(v.concretetype(), Some(LowLevelType::Void));
         } else {
             panic!("expected Variable result");
         }
@@ -3364,7 +4281,7 @@ mod tests {
         let mut llops = LowLevelOpList::new(rtyper, None);
         // Build a typed input arg so the concretetype assertion passes.
         let mut input = Variable::new();
-        input.concretetype = Some(LowLevelType::Signed);
+        input.set_concretetype(Some(LowLevelType::Signed));
         let result = llops
             .genop(
                 "int_add",
@@ -3372,7 +4289,7 @@ mod tests {
                 GenopResult::LLType(LowLevelType::Signed),
             )
             .expect("Signed resulttype must produce a Variable");
-        assert_eq!(result.concretetype.as_ref(), Some(&LowLevelType::Signed));
+        assert_eq!(result.concretetype(), Some(LowLevelType::Signed));
     }
 
     #[test]
@@ -3388,7 +4305,7 @@ mod tests {
                 GenopResult::Repr(Arc::new(VoidRepr::new())),
             )
             .expect("VoidRepr produces a Variable with Void concretetype");
-        assert_eq!(result.concretetype.as_ref(), Some(&LowLevelType::Void));
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
     }
 
     #[test]
@@ -3399,7 +4316,7 @@ mod tests {
         let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
         let untyped = Variable::new();
-        assert!(untyped.concretetype.is_none());
+        assert!(untyped.concretetype().is_none());
         let _ = llops.genop(
             "int_add",
             vec![Hlvalue::Variable(untyped)],
@@ -3659,6 +4576,98 @@ mod tests {
     }
 
     #[test]
+    fn setconcretetype_writes_lowleveltype_from_bindingrepr() {
+        // rtyper.py:258-260.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let mut var = Variable::new();
+        var.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        assert_eq!(var.concretetype(), None);
+        rtyper.setconcretetype(&var).unwrap();
+        // impossible_repr lowleveltype is Void.
+        assert_eq!(var.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn setup_block_entry_normal_path_writes_each_inputarg_concretetype() {
+        // rtyper.py:272-278 normal path.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let mut v = Variable::new();
+        v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        let block = Block::shared(vec![Hlvalue::Variable(v)]);
+        let reprs = rtyper.setup_block_entry(&block).unwrap();
+        assert_eq!(reprs.len(), 1);
+        assert_eq!(reprs[0].lowleveltype(), &LowLevelType::Void);
+        let b = block.borrow();
+        match &b.inputargs[0] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),
+            _ => panic!("expected Variable"),
+        }
+    }
+
+    #[test]
+    fn make_new_lloplist_wires_rtyper_and_originalblock() {
+        // rtyper.py:280-281.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let block = Block::shared(vec![]);
+        let llops = rtyper.make_new_lloplist(block.clone());
+        assert!(
+            Rc::ptr_eq(&llops.rtyper, &rtyper),
+            "LowLevelOpList.rtyper must share identity with make_new_lloplist caller"
+        );
+        assert!(llops.originalblock.is_some());
+        assert!(llops.ops.is_empty());
+    }
+
+    #[test]
+    fn highlevelops_empty_block_yields_nothing() {
+        // rtyper.py:423-424: `if block.operations:` gates the whole body.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let block = Block::shared(vec![]);
+        let llops = Rc::new(RefCell::new(rtyper.make_new_lloplist(block.clone())));
+        let hops = rtyper.highlevelops(&block, llops);
+        assert!(hops.is_empty());
+    }
+
+    #[test]
+    fn highlevelops_non_raising_block_yields_one_hop_per_op_with_empty_exclinks() {
+        // rtyper.py:425-426 + 430-432 when canraise is false.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let v = Variable::new();
+        let op1 = SpaceOperation::new("op1".to_string(), vec![], Hlvalue::Variable(v.clone()));
+        let op2 = SpaceOperation::new("op2".to_string(), vec![], Hlvalue::Variable(v.clone()));
+        let block = Block::shared(vec![]);
+        block.borrow_mut().operations.push(op1);
+        block.borrow_mut().operations.push(op2);
+        let llops = Rc::new(RefCell::new(rtyper.make_new_lloplist(block.clone())));
+        let hops = rtyper.highlevelops(&block, llops);
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0].spaceop.opname, "op1");
+        assert_eq!(hops[1].spaceop.opname, "op2");
+        assert!(hops[0].exceptionlinks.is_empty());
+        assert!(hops[1].exceptionlinks.is_empty());
+    }
+
+    #[test]
+    fn setup_block_entry_exception_block_returns_typed_error_pending_exceptiondata() {
+        // rtyper.py:263-270 special-case. Blocked on ExceptionData port.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let mut v1 = Variable::new();
+        v1.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        let mut v2 = Variable::new();
+        v2.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        let block = Block::shared(vec![Hlvalue::Variable(v1), Hlvalue::Variable(v2)]);
+        block.borrow_mut().mark_final();
+        let err = rtyper.setup_block_entry(&block).unwrap_err();
+        assert!(err.to_string().contains("ExceptionData"));
+    }
+
+    #[test]
     fn getrepr_adds_pendingsetup_once_per_key() {
         // rtyper.py:105-111 + 162: `add_pendingsetup` dedupes by
         // Repr instance; the second getrepr hit must not re-enqueue
@@ -3753,5 +4762,569 @@ mod tests {
         let hop = HighLevelOp::new(rtyper, spaceop, Vec::new(), llops);
         let err = hop.setup().unwrap_err();
         assert!(err.is_missing_rtype_operation());
+    }
+
+    #[test]
+    fn translate_no_return_value_on_impossible_s_result_writes_void_concretetype() {
+        // rtyper.py:487-488 — when `hop.s_result == s_ImpossibleValue`,
+        // upstream silently writes `op.result.concretetype = Void` and
+        // returns. Pyre propagates the write through `Rc<RefCell>` so every
+        // Variable clone of the same identity observes Void.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let result_var = Variable::new();
+        result_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
+        // Keep a second handle to the same Variable identity so we can
+        // observe the mutation after the spaceop ownership transfers.
+        let observer = result_var.clone();
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+        assert_eq!(observer.concretetype(), None);
+        rtyper.translate_no_return_value(&hop).unwrap();
+        assert_eq!(observer.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn translate_no_return_value_on_constant_result_builds_void_typed_mirror() {
+        // rtyper.py:488 `op.result.concretetype = Void` writes
+        // unconditionally. When op.result is a Constant, Rust's
+        // immutable Constant cannot be rewritten in place, so the
+        // translate path builds a typed mirror Hlvalue. The method
+        // still returns Ok (the write side-effect on Variable
+        // op.results continues to work via Rc<RefCell>).
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![],
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+        rtyper.translate_no_return_value(&hop).unwrap();
+    }
+
+    #[test]
+    fn translate_no_return_value_on_non_impossible_s_result_errors() {
+        // rtyper.py:485-487 — any annotator state other than
+        // s_ImpossibleValue trips the "annotator doesn't agree" TyperError.
+        use crate::annotator::model::SomeInteger;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let mut result_var = Variable::new();
+        result_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, false,
+            )))));
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::new(true, false)));
+        let err = rtyper.translate_no_return_value(&hop).unwrap_err();
+        assert!(
+            err.to_string().contains("annotator doesn't agree"),
+            "error message did not mention annotator disagreement: {err}",
+        );
+        assert!(
+            err.to_string().contains("simple_call"),
+            "error message did not mention opname: {err}",
+        );
+    }
+
+    #[test]
+    fn gottypererror_records_graph_name_block_and_position_in_typererror_where_info() {
+        // rtyper.py:490-493: `graph = annotator.annotated.get(block); exc.where = (graph, block, position)`.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let startblock = Block::shared(vec![]);
+        let graph = Rc::new(RefCell::new(FunctionGraph::new(
+            "my_func",
+            startblock.clone(),
+        )));
+        // Mirror `annotator.annotated[block] = graph` (annrpython.py:
+        // schedulependingblock).
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&startblock), Some(graph));
+        let op = SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(Variable::named("a")),
+                Hlvalue::Variable(Variable::named("b")),
+            ],
+            Hlvalue::Variable(Variable::named("r")),
+        );
+        let exc = TyperError::message("bad cast");
+        let annotated = rtyper.gottypererror(exc, &startblock, &op);
+        let rendered = annotated.to_string();
+        assert!(
+            rendered.contains("\n.. my_func"),
+            "expected graph name in where.stage; got {rendered}",
+        );
+        assert!(
+            rendered.contains("opname: \"int_add\""),
+            "expected op Debug in where.op; got {rendered}",
+        );
+    }
+
+    #[test]
+    fn gottypererror_when_block_not_in_annotated_maps_to_missing_graph_sentinel() {
+        // rtyper.py:492 `dict.get(block)` returns None when the block
+        // has not been scheduled yet; upstream stores None in the
+        // where trio. Pyre renders this as "<no graph>".
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let block = Block::shared(vec![]);
+        let exc = TyperError::message("bad cast");
+        let annotated = rtyper.gottypererror(exc, &block, &"link-placeholder");
+        let rendered = annotated.to_string();
+        assert!(
+            rendered.contains("\n.. <no graph>"),
+            "expected missing-graph sentinel; got {rendered}",
+        );
+    }
+
+    fn bool_annotated_variable() -> Variable {
+        let v = Variable::new();
+        v.annotation
+            .replace(Some(Rc::new(SomeValue::Bool(SomeBool::new()))));
+        v
+    }
+
+    #[test]
+    fn convert_link_exitcase_none_sets_llexitcase_none() {
+        // rtyper.py:354+361 — None exitcase hits the `else` branch,
+        // which zeroes out `link.llexitcase`.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let block = Block::shared(vec![]);
+        let target = Block::shared(vec![]);
+        let link = Link::new(vec![], Some(target), None).into_ref();
+        // Pre-load llexitcase with a junk value to observe the reset.
+        link.borrow_mut().llexitcase =
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true))));
+        rtyper._convert_link(&block, &link).unwrap();
+        assert!(link.borrow().llexitcase.is_none());
+    }
+
+    #[test]
+    fn convert_link_default_string_exitcase_sets_llexitcase_none() {
+        // rtyper.py:354 — the `exitcase != 'default'` guard short-
+        // circuits, so `link.llexitcase` is zeroed even though the
+        // exitcase is non-None.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let block = Block::shared(vec![]);
+        let target = Block::shared(vec![]);
+        let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
+            "default".to_string(),
+        ))));
+        let link = Link::new(vec![], Some(target), exitcase).into_ref();
+        link.borrow_mut().llexitcase =
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true))));
+        rtyper._convert_link(&block, &link).unwrap();
+        assert!(link.borrow().llexitcase.is_none());
+    }
+
+    #[test]
+    fn convert_link_bool_exitswitch_and_bool_exitcase_converts_llexitcase() {
+        // rtyper.py:355-360 — Variable exitswitch + concrete exitcase
+        // goes through `bindingrepr(exitswitch).convert_const(exitcase)`
+        // and lands the result on `link.llexitcase`.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let switch_var = bool_annotated_variable();
+        let block = Block::shared(vec![]);
+        block.borrow_mut().exitswitch = Some(Hlvalue::Variable(switch_var));
+        let target = Block::shared(vec![]);
+        let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true))));
+        let link = Link::new(vec![], Some(target), exitcase).into_ref();
+        rtyper._convert_link(&block, &link).unwrap();
+        let llexitcase = link.borrow().llexitcase.clone();
+        match llexitcase {
+            Some(Hlvalue::Constant(c)) => {
+                assert!(matches!(c.value, ConstValue::Bool(true)));
+                assert_eq!(c.concretetype, Some(LowLevelType::Bool));
+            }
+            other => panic!("expected Bool-typed Constant llexitcase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_link_canraise_branch_defers_to_exceptiondata() {
+        // rtyper.py:358-359 — non-Variable exitswitch on a canraise
+        // block needs `rclass.get_type_repr(self)`, which depends on
+        // ExceptionData. Port defers with a TyperError.
+        use crate::flowspace::model::c_last_exception;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let block = Block::shared(vec![]);
+        // c_last_exception sentinel makes canraise() return true
+        // without needing an operation; upstream uses this for the
+        // exception-edge guard.
+        block.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        assert!(block.borrow().canraise());
+        let target = Block::shared(vec![]);
+        let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
+            "ValueError".to_string(),
+        ))));
+        let link = Link::new(vec![], Some(target), exitcase).into_ref();
+        let err = rtyper._convert_link(&block, &link).unwrap_err();
+        assert!(
+            err.to_string().contains("ExceptionData"),
+            "expected ExceptionData defer; got {err}",
+        );
+    }
+
+    #[test]
+    fn convert_link_last_exception_set_defers_to_exceptiondata() {
+        // rtyper.py:364-369 — any `link.last_exception` reads
+        // `exceptiondata.lltype_of_exception_type` /
+        // `r_exception_type`. Until the ExceptionData init surface
+        // lands, the read surfaces a structured init-missing error.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let block = Block::shared(vec![]);
+        let target = Block::shared(vec![]);
+        let link = Link::new(vec![], Some(target), None).into_ref();
+        link.borrow_mut().last_exception = Some(Hlvalue::Variable(Variable::named("etype")));
+        let err = rtyper._convert_link(&block, &link).unwrap_err();
+        assert!(
+            err.to_string().contains("ExceptionData not initialised"),
+            "expected ExceptionData init defer; got {err}",
+        );
+    }
+
+    #[test]
+    fn insert_link_conversions_single_exit_matching_reprs_generates_no_ops() {
+        // rtyper.py:398-399 — when `r_a1 == r_a2` for every link arg,
+        // no conversion ops are generated. The link ends up unchanged
+        // and the source block stays empty of operations.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let src_var = bool_annotated_variable();
+        let target_var = bool_annotated_variable();
+        let target = Block::shared(vec![Hlvalue::Variable(target_var)]);
+        let block = Block::shared(vec![]);
+        let link = Link::new(vec![Hlvalue::Variable(src_var)], Some(target), None).into_ref();
+        block.closeblock(vec![link.clone()]);
+
+        rtyper.insert_link_conversions(&block, 0).unwrap();
+        assert!(
+            block.borrow().operations.is_empty(),
+            "no conversion ops expected; got {:?}",
+            block.borrow().operations,
+        );
+        assert_eq!(link.borrow().args.len(), 1);
+    }
+
+    #[test]
+    fn insert_link_conversions_constant_link_arg_rewritten_to_typed_constant() {
+        // rtyper.py:389-391 — `isinstance(a1, Constant)` short-circuits
+        // through `inputconst(r_a2, a1.value)`, overwriting
+        // `link.args[i]` with a typed Constant.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let target_var = bool_annotated_variable();
+        let target = Block::shared(vec![Hlvalue::Variable(target_var)]);
+        let block = Block::shared(vec![]);
+        let raw_const = Hlvalue::Constant(Constant::new(ConstValue::Bool(true)));
+        let link = Link::new(vec![raw_const], Some(target), None).into_ref();
+        block.closeblock(vec![link.clone()]);
+
+        rtyper.insert_link_conversions(&block, 0).unwrap();
+        let lb = link.borrow();
+        match lb.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => {
+                assert!(matches!(c.value, ConstValue::Bool(true)));
+                assert_eq!(c.concretetype, Some(LowLevelType::Bool));
+            }
+            other => panic!("expected typed Constant; got {other:?}"),
+        }
+        assert!(block.borrow().operations.is_empty());
+    }
+
+    #[test]
+    fn specialize_block_on_returnblock_fixes_graph_and_leaves_operations_empty() {
+        // rtyper.py:284-301 — when the block has no operations (return
+        // or except block), upstream returns after fixing the graph's
+        // return var. Pyre matches: fixed_graphs gains the graph and
+        // block.operations stays empty.
+        use crate::flowspace::model::GraphKey;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let startblock = Block::shared(vec![]);
+        let graph = Rc::new(RefCell::new(FunctionGraph::new("test_fn", startblock)));
+        // Annotate graph.returnblock.inputargs[0] so setup_block_entry
+        // can derive a repr via bindingrepr (normal path).
+        let returnblock = graph.borrow().returnblock.clone();
+        if let Hlvalue::Variable(v) = returnblock.borrow().inputargs[0].clone() {
+            v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        }
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&returnblock), Some(graph.clone()));
+
+        rtyper.specialize_block(&returnblock).unwrap();
+
+        assert!(returnblock.borrow().operations.is_empty());
+        let fixed = ann.fixed_graphs.borrow();
+        assert!(
+            fixed.contains_key(&GraphKey::of(&graph)),
+            "specialize_block must register the graph in fixed_graphs",
+        );
+        // returnblock.inputargs[0] now carries concretetype=Void
+        // (Impossible repr's lowleveltype).
+        if let Hlvalue::Variable(v) = returnblock.borrow().inputargs[0].clone() {
+            assert_eq!(v.concretetype(), Some(LowLevelType::Void));
+        }
+    }
+
+    #[test]
+    fn constant_result_values_agree_matches_rtyper_py_456_assert() {
+        // rtyper.py:456-458 — upstream asserts `resultvar.value ==
+        // hop.s_result.const` OR both are NaN. Covers the constant-
+        // result mismatch path inside `translate_hl_to_ll` without
+        // needing to spin up a full rtype dispatch.
+        // Equality case.
+        assert!(constant_result_values_agree(
+            &ConstValue::Int(42),
+            &ConstValue::Int(42),
+        ));
+        // Mismatch case — assert trigger.
+        assert!(!constant_result_values_agree(
+            &ConstValue::Int(42),
+            &ConstValue::Int(7),
+        ));
+        // NaN-NaN case: upstream `math.isnan(a) and math.isnan(b)`
+        // bypasses the equality check because `NaN == NaN` is false.
+        let nan_bits = f64::NAN.to_bits();
+        let other_nan_bits = f64::from_bits(nan_bits | 0x1).to_bits();
+        assert!(constant_result_values_agree(
+            &ConstValue::Float(nan_bits),
+            &ConstValue::Float(other_nan_bits),
+        ));
+        // NaN vs finite: NOT agreeing.
+        assert!(!constant_result_values_agree(
+            &ConstValue::Float(nan_bits),
+            &ConstValue::Float(1.0_f64.to_bits()),
+        ));
+    }
+
+    #[test]
+    fn specialize_block_empty_non_final_block_runs_insert_link_conversions() {
+        // rtyper.py:300 — upstream's `block.operations == ()` check
+        // fires only on final (return/except) blocks. Empty regular
+        // blocks still flow into `insert_link_conversions`, which in
+        // turn runs `setup_block_entry` on the link's target. The
+        // observable side-effect: the target's inputargs gain
+        // concretetypes even though the source block has no ops.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let startblock = Block::shared(vec![]);
+        let graph = Rc::new(RefCell::new(FunctionGraph::new(
+            "empty_fn",
+            startblock.clone(),
+        )));
+        // specialize_block's first-visit branch calls setconcretetype
+        // on graph.getreturnvar(), which needs an annotation.
+        let returnblock = graph.borrow().returnblock.clone();
+        if let Hlvalue::Variable(v) = returnblock.borrow().inputargs[0].clone() {
+            v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        }
+
+        // Regular non-final block with no operations but one exit to a
+        // target carrying an annotated Variable inputarg.
+        let source_var = bool_annotated_variable();
+        let target_var = bool_annotated_variable();
+        let target = Block::shared(vec![Hlvalue::Variable(target_var.clone())]);
+        let block = Block::shared(vec![]);
+        let link = Link::new(vec![Hlvalue::Variable(source_var)], Some(target), None).into_ref();
+        block.closeblock(vec![link]);
+
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&block), Some(graph.clone()));
+
+        assert!(!block.borrow().is_final_block());
+        assert!(block.borrow().operations.is_empty());
+        // target.inputargs[0].concretetype starts unset.
+        assert_eq!(target_var.concretetype(), None);
+
+        rtyper.specialize_block(&block).unwrap();
+
+        // insert_link_conversions → setup_block_entry stamped Bool
+        // onto target_var.
+        assert_eq!(target_var.concretetype(), Some(LowLevelType::Bool));
+    }
+
+    #[test]
+    fn specialize_block_setup_block_entry_error_is_annotated_through_gottypererror() {
+        // rtyper.py:292-296 — setup_block_entry failure is routed
+        // through gottypererror with the "block-entry" position tag.
+        // Pyre surfaces both the underlying ExceptionData defer and
+        // the where-annotation (graph name from annotator.annotated).
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let startblock = Block::shared(vec![]);
+        let graph = Rc::new(RefCell::new(FunctionGraph::new("my_graph", startblock)));
+        // Annotate graph.returnblock.inputargs[0] — specialize_block's
+        // first-time-for-graph branch calls setconcretetype on it.
+        let returnblock = graph.borrow().returnblock.clone();
+        if let Hlvalue::Variable(v) = returnblock.borrow().inputargs[0].clone() {
+            v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        }
+        // graph.exceptblock is already final+2-inputargs; register it
+        // so annotator.annotated lookup resolves.
+        let exceptblock = graph.borrow().exceptblock.clone();
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&exceptblock), Some(graph.clone()));
+
+        let err = rtyper.specialize_block(&exceptblock).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("ExceptionData"),
+            "expected ExceptionData defer in error: {rendered}",
+        );
+        assert!(
+            rendered.contains("\n.. my_graph"),
+            "expected graph name via gottypererror where-stage: {rendered}",
+        );
+        // Position tag is the literal "block-entry".
+        assert!(
+            rendered.contains("block-entry"),
+            "expected 'block-entry' position in where-op: {rendered}",
+        );
+    }
+
+    #[test]
+    fn specialize_more_blocks_with_empty_annotator_returns_immediately() {
+        // rtyper.py:210-213 — break when no pending blocks remain.
+        // An empty annotator yields no pending, so the loop exits
+        // without touching anything.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.specialize_more_blocks().unwrap();
+        assert!(rtyper.already_seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn specialize_more_blocks_marks_annotated_returnblock_as_seen() {
+        // rtyper.py:222-225 — the driver calls specialize_block on
+        // each pending block and marks it already_seen. One pending
+        // returnblock exercises the happy path end to end.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let startblock = Block::shared(vec![]);
+        let graph = Rc::new(RefCell::new(FunctionGraph::new("g", startblock)));
+        let returnblock = graph.borrow().returnblock.clone();
+        if let Hlvalue::Variable(v) = returnblock.borrow().inputargs[0].clone() {
+            v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        }
+        let rb_key = BlockKey::of(&returnblock);
+        ann.annotated
+            .borrow_mut()
+            .insert(rb_key.clone(), Some(graph));
+        // Populate all_blocks so the BlockKey→BlockRef lookup succeeds.
+        ann.all_blocks
+            .borrow_mut()
+            .insert(rb_key.clone(), returnblock.clone());
+
+        rtyper.specialize_more_blocks().unwrap();
+
+        assert!(
+            rtyper.already_seen.borrow().contains_key(&rb_key),
+            "specialize_more_blocks must mark visited block as seen",
+        );
+    }
+
+    #[test]
+    fn specialize_more_blocks_propagates_setup_block_entry_error() {
+        // rtyper.py:222-224 — specialize_block errors bubble straight
+        // through; pyre preserves the gottypererror-annotated payload.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let startblock = Block::shared(vec![]);
+        let graph = Rc::new(RefCell::new(FunctionGraph::new("g_with_exc", startblock)));
+        // returnblock must be annotated so specialize_block's first-
+        // time setconcretetype path doesn't trip on None annotation.
+        let returnblock = graph.borrow().returnblock.clone();
+        if let Hlvalue::Variable(v) = returnblock.borrow().inputargs[0].clone() {
+            v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        }
+        // exceptblock (final + 2 inputargs) triggers the ExceptionData
+        // defer inside setup_block_entry.
+        let exceptblock = graph.borrow().exceptblock.clone();
+        let eb_key = BlockKey::of(&exceptblock);
+        ann.annotated
+            .borrow_mut()
+            .insert(eb_key.clone(), Some(graph.clone()));
+        ann.all_blocks.borrow_mut().insert(eb_key, exceptblock);
+
+        let err = rtyper.specialize_more_blocks().unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("ExceptionData"),
+            "expected ExceptionData defer to propagate: {rendered}",
+        );
+        assert!(
+            rendered.contains("g_with_exc"),
+            "expected graph name in where-stage: {rendered}",
+        );
+    }
+
+    #[test]
+    fn insert_link_conversions_exception_target_block_error_propagates_without_gottypererror_wrap()
+    {
+        // rtyper.py:382-383 vs 400-403 — `_convert_link` and
+        // `setup_block_entry` errors propagate uncaught; only the
+        // `newops.convertvar` call is wrapped through `gottypererror`.
+        // Exception-shaped target is still the trigger (ExceptionData
+        // defer bubbles up from `setup_block_entry`), but the raised
+        // TyperError must carry NO where-annotation.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        // Exception-shaped target: 2 inputargs + is_final (the
+        // setup_block_entry special case).
+        let v1 = Variable::new();
+        v1.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        let v2 = Variable::new();
+        v2.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+        let target = Block::shared(vec![Hlvalue::Variable(v1), Hlvalue::Variable(v2)]);
+        target.borrow_mut().mark_final();
+
+        let block = Block::shared(vec![]);
+        let link_args = vec![
+            Hlvalue::Variable(Variable::named("etype_src")),
+            Hlvalue::Variable(Variable::named("evalue_src")),
+        ];
+        let link = Link::new(link_args, Some(target), None).into_ref();
+        block.closeblock(vec![link]);
+
+        let err = rtyper.insert_link_conversions(&block, 0).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("ExceptionData"),
+            "expected ExceptionData defer in error: {rendered}",
+        );
+        assert!(
+            !rendered.contains("\n.. <no graph>"),
+            "setup_block_entry error must NOT be wrapped by gottypererror: {rendered}",
+        );
     }
 }

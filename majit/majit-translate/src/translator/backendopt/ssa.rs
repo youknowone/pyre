@@ -453,10 +453,10 @@ pub fn ssi_to_ssa(graph: &FunctionGraph) {
         }
     }
     for (vname, vlist) in &variables_by_name {
-        let first_ct = vlist.first().and_then(|v| v.concretetype.clone());
+        let first_ct = vlist.first().and_then(|v| v.concretetype());
         for v in vlist {
             assert_eq!(
-                v.concretetype.clone(),
+                v.concretetype(),
                 first_ct,
                 "variables called {vname} have mixed concretetypes"
             );
@@ -605,8 +605,8 @@ pub fn ssa_to_ssi(
         }
         if let Some(w_var) = matched {
             // upstream: `block.renamevariables({v: w})`.
-            let mut renaming = HashMap::new();
-            renaming.insert(v.clone(), w_var);
+            let mut renaming: HashMap<Variable, Hlvalue> = HashMap::new();
+            renaming.insert(v.clone(), Hlvalue::Variable(w_var));
             block.borrow_mut().renamevariables(&renaming);
         } else {
             // upstream: else branch — add `v` to every incoming link.
@@ -621,8 +621,8 @@ pub fn ssa_to_ssi(
                 });
             let w = v.copy();
             variable_families.union(Hlvalue::Variable(v.clone()), Hlvalue::Variable(w.clone()));
-            let mut renaming = HashMap::new();
-            renaming.insert(v.clone(), w.clone());
+            let mut renaming: HashMap<Variable, Hlvalue> = HashMap::new();
+            renaming.insert(v.clone(), Hlvalue::Variable(w.clone()));
             block.borrow_mut().renamevariables(&renaming);
             block.borrow_mut().inputargs.push(Hlvalue::Variable(w));
             for link in &links {

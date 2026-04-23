@@ -954,9 +954,21 @@ impl HLOperation {
     }
 
     /// RPython `HLOperation.replace(mapping)` (operation.py:78-84).
-    pub fn replace(&self, mapping: &HashMap<Variable, Variable>) -> HLOperation {
+    ///
+    /// The mapping is polymorphic (`Variable → Variable | Constant`)
+    /// per `flowspace/model.py:347 Variable.replace`. HLOperation.result
+    /// is typed `Variable` in upstream too, and RPython's pre-rtyper
+    /// stages never rename a Variable into a Constant — the Rust port
+    /// keeps the field concrete and asserts that shape.
+    pub fn replace(&self, mapping: &HashMap<Variable, Hlvalue>) -> HLOperation {
         let newargs: Vec<Hlvalue> = self.args.iter().map(|a| a.replace(mapping)).collect();
-        let newresult = self.result.replace(mapping).clone();
+        let newresult = match self.result.replace(mapping) {
+            Hlvalue::Variable(v) => v,
+            Hlvalue::Constant(c) => panic!(
+                "HLOperation.replace: Variable result renamed to Constant ({c:?}) \
+                 — upstream HLOperation.result is always Variable"
+            ),
+        };
         HLOperation {
             kind: self.kind,
             args: newargs,
@@ -2730,8 +2742,8 @@ mod tests {
     fn replace_remaps_args_and_result() {
         let src = Variable::new();
         let dst = Variable::new();
-        let mut mapping = HashMap::new();
-        mapping.insert(src.clone(), dst.clone());
+        let mut mapping: HashMap<Variable, Hlvalue> = HashMap::new();
+        mapping.insert(src.clone(), Hlvalue::Variable(dst.clone()));
 
         let op = HLOperation {
             kind: OpKind::Add,

@@ -409,14 +409,14 @@ mod tests {
     fn make_pygraph(name: &str) -> Rc<PyGraph> {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut arg_var = FlowVariable::named("x");
-        arg_var.concretetype = Some(LowLevelType::Signed);
+        arg_var.set_concretetype(Some(LowLevelType::Signed));
         arg_var
             .annotation
             .replace(Some(Rc::new(SomeValue::Impossible)));
         let arg = FlowHlvalue::Variable(arg_var);
         let startblock = FlowBlock::shared(vec![arg.clone()]);
         let mut ret_var = FlowVariable::new();
-        ret_var.concretetype = Some(LowLevelType::Void);
+        ret_var.set_concretetype(Some(LowLevelType::Void));
         ret_var
             .annotation
             .replace(Some(Rc::new(SomeValue::Impossible)));

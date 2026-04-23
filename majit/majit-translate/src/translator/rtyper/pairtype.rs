@@ -1108,9 +1108,9 @@ mod tests {
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let mut v_int = Variable::new();
-        v_int.concretetype = Some(LowLevelType::Signed);
+        v_int.set_concretetype(Some(LowLevelType::Signed));
         let mut v_float = Variable::new();
-        v_float.concretetype = Some(LowLevelType::Float);
+        v_float.set_concretetype(Some(LowLevelType::Float));
         let hop = HighLevelOp::new(
             rtyper.clone(),
             SpaceOperation::new(

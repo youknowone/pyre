@@ -1431,8 +1431,8 @@ mod tests {
         let block = Block::shared(vec![]);
 
         let start = Rc::new(RefCell::new(Block::new(vec![])));
-        let mut ret = Variable::new();
-        ret.concretetype = Some(lltype::LowLevelType::Void);
+        let ret = Variable::new();
+        ret.set_concretetype(Some(lltype::LowLevelType::Void));
         let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "callee",
             start,

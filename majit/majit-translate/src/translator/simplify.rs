@@ -136,14 +136,9 @@ pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
     }
 }
 
-/// Inline helper — upstream's `.replace(mapping)` when `mapping` carries
-/// `dict[Variable, Hlvalue]`. The Rust port's `Hlvalue.replace` method
-/// narrows its signature to `HashMap<Variable, Variable>` because that
-/// is all its existing callers need (`copygraph`, `renamevariables`);
-/// `join_blocks` needs the upstream-wide semantics (a Variable can map
-/// to a Constant when the caller threads through `link.args`). This
-/// helper keeps the wide semantics local to `simplify.rs` instead of
-/// widening the public API surface.
+/// Thin wrapper around `Hlvalue::replace` kept for back-compat with
+/// this file's internal call shape — `Hlvalue::replace` is now
+/// polymorphic (`HashMap<Variable, Hlvalue>`) in line with upstream.
 fn rename_hl(v: &Hlvalue, mapping: &HashMap<Variable, Hlvalue>) -> Hlvalue {
     match v {
         Hlvalue::Variable(var) => mapping
@@ -920,13 +915,11 @@ fn isspecialvar(v: &Hlvalue) -> bool {
     }
 }
 
-/// Variable→Hlvalue counterpart of `Block::renamevariables` that
-/// upstream's `block.renamevariables(mapping)` needs when the mapping
-/// values are mixed Variable/Constant (as happens in
-/// `remove_identical_vars_SSA`). The Rust port's
-/// `Block::renamevariables` narrows to `HashMap<Variable, Variable>`;
-/// see the note above `rename_hl` for why we keep the wide path
-/// file-local.
+/// Extends `Block::renamevariables` with the `last_exception` /
+/// `last_exc_value` rewrites that upstream's `remove_identical_vars_SSA`
+/// requires. `Block::renamevariables` matches RPython's canonical shape
+/// (args / operations / exitswitch / link.args) but stops short of the
+/// exception-extras Links carry; this helper closes that gap.
 fn renamevariables_hl(block: &BlockRef, mapping: &HashMap<Variable, Hlvalue>) {
     if mapping.is_empty() {
         return;
@@ -1177,7 +1170,7 @@ pub fn remove_identical_vars(graph: &FunctionGraph) {
             .and_then(|l| l.borrow().target.clone())
             .expect("link.target missing");
 
-        let mut renaming: HashMap<Variable, Variable> = HashMap::new();
+        let mut renaming: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut family2blockvar: HashMap<Hlvalue, Variable> = HashMap::new();
         let mut kills: Vec<usize> = Vec::new();
 
@@ -1188,7 +1181,7 @@ pub fn remove_identical_vars(graph: &FunctionGraph) {
             };
             let v1 = variable_families.find_rep(Hlvalue::Variable(v.clone()));
             if let Some(existing) = family2blockvar.get(&v1) {
-                renaming.insert(v.clone(), existing.clone());
+                renaming.insert(v.clone(), Hlvalue::Variable(existing.clone()));
                 kills.push(i);
             } else {
                 family2blockvar.insert(v1, v.clone());
@@ -2916,19 +2909,19 @@ mod tests {
     use std::rc::Rc;
 
     fn signed_var() -> Variable {
-        let mut v = Variable::new();
-        v.concretetype = Some(lltype::LowLevelType::Signed);
+        let v = Variable::new();
+        v.set_concretetype(Some(lltype::LowLevelType::Signed));
         v
     }
 
     fn fn_ptr_var() -> Variable {
-        let mut v = Variable::new();
-        v.concretetype = Some(lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
+        let v = Variable::new();
+        v.set_concretetype(Some(lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
             TO: lltype::PtrTarget::Func(lltype::FuncType {
                 args: vec![lltype::LowLevelType::Signed],
                 result: lltype::LowLevelType::Signed,
             }),
-        })));
+        }))));
         v
     }
 
@@ -2939,8 +2932,8 @@ mod tests {
     #[test]
     fn get_graph_for_call_reads_llptr_funcobj_graph() {
         let start = Block::shared(vec![]);
-        let mut ret = Variable::new();
-        ret.concretetype = Some(lltype::LowLevelType::Void);
+        let ret = Variable::new();
+        ret.set_concretetype(Some(lltype::LowLevelType::Void));
         let graph: GraphRef = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "callee",
             start,

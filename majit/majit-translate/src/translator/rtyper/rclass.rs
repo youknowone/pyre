@@ -11,7 +11,12 @@
 //! the single condensed op `OpKind::VtableMethodPtr` instead — see the
 //! PRE-EXISTING-ADAPTATION block on that variant in `model.rs`.
 
+use std::sync::Arc;
+
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
+use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::rmodel::Repr;
+use crate::translator::rtyper::rtyper::RPythonTyper;
 // `TypeResolutionState` + `ConcreteType` live at
 // `jit_codewriter/type_state.rs` — a PRE-EXISTING-ADAPTATION side table
 // because pyre's jit_codewriter IR is value-id-based while RPython stores
@@ -52,4 +57,22 @@ pub fn class_get_method_ptr(
         .concrete_types
         .insert(funcptr, ConcreteType::Signed);
     funcptr
+}
+
+/// RPython `rclass.get_type_repr(rtyper)` (`rpython/rtyper/rclass.py:439-440`).
+///
+/// ```python
+/// def get_type_repr(rtyper):
+///     return rtyper.rootclass_repr
+/// ```
+///
+/// Upstream reads `rtyper.rootclass_repr` directly. The Rust port has
+/// not yet landed `rootclass_repr` (it depends on the `getclassrepr` /
+/// class-tree machinery), so this surface proxies through
+/// `ExceptionData.r_exception_type`, which upstream initialises from
+/// the same `rtyper.rootclass_repr` value at
+/// `exceptiondata.py:18`. The error returned when `ExceptionData` is
+/// not yet set points callers at the missing dependency.
+pub fn get_type_repr(rtyper: &RPythonTyper) -> Result<Arc<dyn Repr>, TyperError> {
+    Ok(rtyper.exceptiondata()?.r_exception_type.clone())
 }

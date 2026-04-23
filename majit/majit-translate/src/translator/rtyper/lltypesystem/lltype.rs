@@ -142,6 +142,28 @@ pub const CHAR: LowLevelType = LowLevelType::Char;
 pub const UNICHAR: LowLevelType = LowLevelType::UniChar;
 
 impl LowLevelType {
+    /// RPython `isinstance(self, Primitive)` — true for the scalar
+    /// types Number / Bool / Float / Char / UniChar / Void. `Ptr` is
+    /// NOT a Primitive in upstream's class hierarchy.
+    pub fn is_primitive(&self) -> bool {
+        matches!(
+            self,
+            LowLevelType::Void
+                | LowLevelType::Signed
+                | LowLevelType::Unsigned
+                | LowLevelType::SignedLongLong
+                | LowLevelType::SignedLongLongLong
+                | LowLevelType::UnsignedLongLong
+                | LowLevelType::UnsignedLongLongLong
+                | LowLevelType::Bool
+                | LowLevelType::Float
+                | LowLevelType::SingleFloat
+                | LowLevelType::LongFloat
+                | LowLevelType::Char
+                | LowLevelType::UniChar
+        )
+    }
+
     /// RPython `LowLevelType._contains_value(value)` — used by
     /// `Repr.convert_const` (`rmodel.py:122`) and by `inputconst`
     /// (`rmodel.py:390`) as the "does this low-level type admit this
@@ -2317,7 +2339,7 @@ pub fn _getconcretetype(v: &Hlvalue) -> Result<ConcretetypePlaceholder, TyperErr
     // `v.concretetype` lookup used by lltype-level tests and fails when
     // the rtyper has not assigned a concrete type yet.
     let concretetype = match v {
-        Hlvalue::Variable(v) => v.concretetype.clone(),
+        Hlvalue::Variable(v) => v.concretetype(),
         Hlvalue::Constant(c) => c.concretetype.clone(),
     };
     concretetype.ok_or_else(|| TyperError::message("missing concretetype for getfunctionptr"))
@@ -2406,7 +2428,7 @@ mod tests {
     fn functionptr_keeps_graph_on_funcobj() {
         let start = Rc::new(RefCell::new(Block::new(vec![])));
         let mut ret = Variable::new();
-        ret.concretetype = Some(LowLevelType::Void);
+        ret.set_concretetype(Some(LowLevelType::Void));
         let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "f",
             start,
@@ -2433,11 +2455,11 @@ mod tests {
         }
 
         let mut a0 = Variable::new();
-        a0.concretetype = Some(LowLevelType::Signed);
+        a0.set_concretetype(Some(LowLevelType::Signed));
         let mut a1 = Variable::new();
-        a1.concretetype = Some(LowLevelType::Bool);
+        a1.set_concretetype(Some(LowLevelType::Bool));
         let mut ret = Variable::new();
-        ret.concretetype = Some(LowLevelType::Void);
+        ret.set_concretetype(Some(LowLevelType::Void));
         let start = Rc::new(RefCell::new(Block::new(vec![
             Hlvalue::Variable(a0),
             Hlvalue::Variable(a1),
@@ -2467,7 +2489,7 @@ mod tests {
     fn getfunctionptr_copies_llfnobjattrs_from_graph_func() {
         let start = Rc::new(RefCell::new(Block::new(vec![])));
         let mut ret = Variable::new();
-        ret.concretetype = Some(LowLevelType::Void);
+        ret.set_concretetype(Some(LowLevelType::Void));
         let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
             "graph_name",
             start,
