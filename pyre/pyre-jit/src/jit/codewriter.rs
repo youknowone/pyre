@@ -1272,6 +1272,28 @@ fn emit_frontend_bool(
     // SSA helper call as a backend adaptation.  pyre represents
     // `lltype.Bool` in control-flow positions as `Kind::Int`, matching
     // the existing `goto_if_not` / `goto_if_not_int_is_zero` SSA ops.
+    //
+    // PRE-EXISTING-ADAPTATION: upstream's `op.bool(w_value).eval(self)`
+    // produces a single `lltype.Bool` Variable that flows into the
+    // block's exitswitch AND is reused as the `goto_if_not` input by
+    // `flatten.py:240-267`. pyre keeps two parallel value chains: the
+    // graph-side Variable returned here (consumed only by the front-end
+    // exitswitch) and a separate SSA `int_tmp0` produced by an
+    // immediately-following `emit_residual_call(truth_fn_idx, ...,
+    // ResKind::Int, Some(int_tmp0))` (consumed by `goto_if_not`). The
+    // duplication exists because `FunctionGraph` Variables and
+    // `SSARepr` registers live in two regalloc colorings that have not
+    // been unified yet.
+    //
+    // Convergence path: the Phase 3c switchover (see
+    // `emit_residual_call_shape` doc-block) moves the authoritative
+    // codewriter input from the runtime `SSAReprEmitter::ssarepr` to
+    // the walker-local `ssarepr` driven from `FunctionGraph`. At that
+    // point a single Variable can drive both the exitswitch and the
+    // flatten-emitted `goto_if_not`: lower `bool` as a residual_call to
+    // `truth_fn` in the same pass that lowers other graph ops to
+    // assembler Insns, dropping the second emit at the call sites
+    // below.
     emit_graph_op_with_result(
         graph,
         block,
@@ -2099,24 +2121,13 @@ fn decode_exception_catch_sites(
 /// shape (jtransform.py:414-435 `rewrite_call` parity).
 fn emit_residual_call(
     ssarepr: &mut SSARepr,
-    _graph: &mut super::flow::FunctionGraph,
-    current_block: &super::flow::BlockRef,
     flavor: CallFlavor,
     fn_idx: u16,
     call_args: &[majit_metainterp::jitcode::JitCallArg],
     reskind: ResKind,
     dst: Option<u16>,
 ) {
-    emit_residual_call_shape(
-        ssarepr,
-        _graph,
-        current_block,
-        flavor,
-        fn_idx,
-        call_args,
-        reskind,
-        dst,
-    );
+    emit_residual_call_shape(ssarepr, flavor, fn_idx, call_args, reskind, dst);
 }
 
 /// Upstream-shape Insn builder for the walker-local `ssarepr`. See
@@ -2145,15 +2156,29 @@ fn emit_residual_call(
 /// `SSAReprEmitter::ssarepr`) with one call here, which pushes the
 /// upstream-canonical shape into the walker-local `ssarepr` that
 /// Phase 3c will wire up as the authoritative `Assembler::assemble`
-/// input. Upstream stores `calldescr` (an `AbstractDescr` carrying
-/// `EffectInfo`) in the trailing slot; pyre threads a
-/// `DescrOperand::CallFlavor` there so Phase 3c's assembler dispatch
-/// can recover the (flavor, reskind) pair the runtime path resolves
-/// statically today.
+/// input.
+///
+/// PRE-EXISTING-ADAPTATION: upstream stores `calldescr` (an
+/// `AbstractDescr` carrying `EffectInfo`) in the trailing slot; pyre
+/// threads `DescrOperand::CallDescrStub{flavor, arg_kinds}` there so
+/// `assembler.rs::dispatch_residual_call` can recover the (flavor,
+/// reskind, per-param kind) tuple statically today.
+///
+/// Convergence path (Phase 3c switchover):
+///   1. Port `rpython/jit/codewriter/effectinfo.py::EffectInfo` and
+///      `CallInfoCollection` (needed independently by the heap/pure
+///      optimizer pass before `calldescr` interning is meaningful).
+///   2. Add a descr-id registry on `CodeWriter` so each `(fn_idx,
+///      flavor, kinds)` triple resolves to a stable `AbstractDescr`
+///      handle the assembler can store in a `Box<JitDescr>` slot.
+///   3. Replace `CallDescrStub` with `DescrOperand::Call(descr_id)` and
+///      shift `dispatch_residual_call` to look the (flavor, arg_kinds)
+///      pair off the descriptor table.
+/// Until step 1 lands the stub is the smallest faithful placeholder —
+/// expanding it in-place would just duplicate work the EffectInfo port
+/// will redo.
 fn emit_residual_call_shape(
     ssarepr: &mut SSARepr,
-    _graph: &mut super::flow::FunctionGraph,
-    _current_block: &super::flow::BlockRef,
     flavor: CallFlavor,
     fn_idx: u16,
     // Arguments in the C function's parameter order. `JitCallArg` carries
@@ -3080,9 +3105,9 @@ impl CodeWriter {
         // flatten.py:240-260 boolean exitswitch emission. When the bool is a
         // plain variable (truth_fn result), flatten emits `goto_if_not <v> L`
         // (alias of bhimpl_goto_if_not_int_is_true per blackhole.py:913).
-        // PopJumpIfTrue inverts the polarity via jtransform.py:1212
-        // `_rewrite_equality` + flatten.py:247 specialisation
-        // `goto_if_not_int_is_zero <v> L` (blackhole.py:916-920).
+        // Both POP_JUMP_IF_FALSE and POP_JUMP_IF_TRUE use that generic Bool
+        // exitswitch form; the polarity difference is encoded by which edge is
+        // arranged as `linkfalse`, not by changing the opcode.
         macro_rules! emit_goto_if_not {
             ($ssarepr:expr, $cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
@@ -3587,8 +3612,6 @@ impl CodeWriter {
                     // the next opcode's frontend push.
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::Plain,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
@@ -3613,8 +3636,6 @@ impl CodeWriter {
                     // so retiring the obj_tmp0 → stack ref_copy is safe.
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::Plain,
                         load_const_fn_idx,
                         &[
@@ -3789,8 +3810,6 @@ impl CodeWriter {
                     );
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         store_subscr_fn_idx,
                         &[
@@ -3852,8 +3871,6 @@ impl CodeWriter {
                     );
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
@@ -3895,8 +3912,6 @@ impl CodeWriter {
                     );
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
@@ -3924,15 +3939,17 @@ impl CodeWriter {
                         py_pc + 1,
                         delta.get(op_arg).as_usize(),
                     );
-                    let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                    emit_ref_copy!(ssarepr, obj_tmp0, value_reg);
+                    // A-slice 7: truth_fn reads cond directly from the popped
+                    // stack slot; `popvalue_ref` leaves the value at
+                    // `stack_base + current_depth` (the slot below the new
+                    // TOS), so there is no staging copy — mirrors upstream
+                    // flatten.py:240-260 which feeds the Variable straight to
+                    // `goto_if_not`.
+                    let cond_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     let cond_value = current_state
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    // A-slice 7: truth_fn reads cond directly from stack
-                    // slot; retires the obj_tmp0 staging ref_copy.
-                    let cond_reg = stack_base + current_depth;
                     let bool_value = emit_frontend_bool(
                         &mut graph,
                         &current_block.block(),
@@ -3944,8 +3961,6 @@ impl CodeWriter {
                         Some(super::flow::ExitSwitch::Value(bool_value.into()));
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(cond_reg)],
@@ -3959,12 +3974,12 @@ impl CodeWriter {
                     }
                 }
 
-                // jtransform.py:1212 `_rewrite_equality` rewrites
-                // `int_eq(x, 0)` → `int_is_zero(x)`; flatten.py:247
-                // specialises into `goto_if_not_int_is_zero <v> L`
-                // (blackhole.py:916-920). Polarity is inverted vs
-                // PopJumpIfFalse: target taken iff the truth-fn result
-                // is non-zero (truthy).
+                // flowcontext.py:761-763 POP_JUMP_IF_TRUE still branches on
+                // `guessbool(op.bool(w_value).eval(self))`, so upstream
+                // flatten.py handles it as the same generic Bool exitswitch
+                // shape as POP_JUMP_IF_FALSE. The polarity difference is only
+                // in the link ordering: jump target = True path, fallthrough =
+                // False path.
                 Instruction::PopJumpIfTrue { delta } => {
                     let target_py_pc = jump_target_forward(
                         code,
@@ -3972,13 +3987,13 @@ impl CodeWriter {
                         py_pc + 1,
                         delta.get(op_arg).as_usize(),
                     );
-                    let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                    emit_ref_copy!(ssarepr, obj_tmp0, value_reg);
+                    // A-slice 7: see PopJumpIfFalse — no obj_tmp0 staging
+                    // needed; the residual call reads the popped stack slot.
+                    let cond_reg = emit_popvalue_ref!(ssarepr, current_depth);
                     let cond_value = current_state
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    let cond_reg = stack_base + current_depth;
                     let bool_value = emit_frontend_bool(
                         &mut graph,
                         &current_block.block(),
@@ -3990,18 +4005,29 @@ impl CodeWriter {
                         Some(super::flow::ExitSwitch::Value(bool_value.into()));
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::Plain,
                         truth_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(cond_reg)],
                         ResKind::Int,
                         Some(int_tmp0),
                     );
-                    if target_py_pc < num_instrs {
-                        emit_goto_if_not_int_is_zero!(ssarepr, int_tmp0, target_py_pc);
+                    // `flatten.py:244-267` for a Bool exitswitch always
+                    // emits generic `goto_if_not cond, TLabel(linkfalse)`
+                    // + inline `make_link(linktrue)`.
+                    // `linkfalse.llexitcase == False`, so for
+                    // POP_JUMP_IF_TRUE the False link is the fallthrough
+                    // (PC+1) and the True link is the jump target.  The
+                    // specialised `goto_if_not_<opname>` form is reserved
+                    // for tuple exitswitches produced by
+                    // `jtransform.optimize_goto_if_not` (comparisons plus
+                    // zero/nonzero-style predicates), not generic Bool
+                    // exitswitches like this truthiness branch.
+                    let fallthrough_py_pc = py_pc + 1;
+                    if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
+                        emit_goto_if_not!(ssarepr, int_tmp0, fallthrough_py_pc);
+                        set_last_bool_exitcase(&current_block.block(), false);
+                        emit_goto!(ssarepr, target_py_pc);
                         set_last_bool_exitcase(&current_block.block(), true);
-                        pending_bool_fallthrough_case = Some(false);
                     }
                 }
 
@@ -4058,8 +4084,6 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, raw_namei);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         load_global_fn_idx,
                         &[
@@ -4161,8 +4185,6 @@ impl CodeWriter {
                         };
                         emit_residual_call(
                             &mut ssarepr,
-                            &mut graph,
-                            &current_block.block(),
                             CallFlavor::MayForce,
                             fn_idx,
                             &call_args,
@@ -4204,8 +4226,6 @@ impl CodeWriter {
                             .expect("subtract must have a jit binary-op tag");
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
@@ -4215,8 +4235,6 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, subtract_tag);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         binary_op_fn_idx,
                         &[
@@ -4298,8 +4316,6 @@ impl CodeWriter {
                     };
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         build_list_fn_idx,
                         &[
@@ -4354,8 +4370,6 @@ impl CodeWriter {
                         // normalization + `set_cause` attachment.
                         emit_residual_call(
                             &mut ssarepr,
-                            &mut graph,
-                            &current_block.block(),
                             CallFlavor::Plain,
                             normalize_raise_varargs_fn_idx,
                             &[
@@ -4394,8 +4408,6 @@ impl CodeWriter {
                     emit_ref_copy!(ssarepr, obj_tmp0, exc_reg);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::Plain,
                         get_current_exception_fn_idx,
                         &[],
@@ -4404,8 +4416,6 @@ impl CodeWriter {
                     );
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::Plain,
                         set_current_exception_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -4437,8 +4447,6 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, int_tmp0, 10);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::MayForce,
                         compare_fn_idx,
                         &[
@@ -4468,8 +4476,6 @@ impl CodeWriter {
                     emit_ref_copy!(ssarepr, obj_tmp0, prev_reg);
                     emit_residual_call(
                         &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
                         CallFlavor::Plain,
                         set_current_exception_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
@@ -4764,8 +4770,6 @@ impl CodeWriter {
                 emit_load_const_i!(ssarepr, int_tmp0, site.lasti_py_pc as i64);
                 emit_residual_call(
                     &mut ssarepr,
-                    &mut graph,
-                    &current_block.block(),
                     CallFlavor::Plain,
                     box_int_fn_idx,
                     &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
