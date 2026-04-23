@@ -185,7 +185,9 @@ fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
         ),
         SomeValue::None_(_) => "SomeNone()".into(),
         SomeValue::Property(_) => "SomeProperty()".into(),
-        SomeValue::Ptr(_) => "SomePtr(...)".into(),
+        // RPython `SomePtr(ll_ptrtype)` (`rpython/rtyper/llannotation.py:29`) —
+        // render as `SomePtr(T)` mirroring upstream.
+        SomeValue::Ptr(p) => format!("SomePtr({})", p.ll_ptrtype._to_short_name()),
         SomeValue::InteriorPtr(_) => "SomeInteriorPtr(...)".into(),
         SomeValue::LLADTMeth(_) => "SomeLLADTMeth(...)".into(),
         SomeValue::Builtin(_) => "SomeBuiltin()".into(),

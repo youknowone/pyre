@@ -1621,6 +1621,11 @@ pub enum ConstValue {
     /// `Eq`). Use `ConstValue::float(value)` / `ConstValue::as_float()`
     /// to convert.
     Float(u64),
+    /// RPython `r_singlefloat` constant, carried as IEEE754 `f32`
+    /// bit-pattern.
+    SingleFloat(u32),
+    /// RPython `r_longfloat` constant.
+    LongFloat(LongFloatValue),
     /// Python dict constant. Mirrors upstream `Constant(dict)` and is
     /// used both for `func.__globals__` and optimizer rewrites like
     /// `transform_list_contains`.
@@ -1681,6 +1686,8 @@ impl PartialEq for ConstValue {
             (ConstValue::Placeholder, ConstValue::Placeholder) => true,
             (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
+            (ConstValue::SingleFloat(a), ConstValue::SingleFloat(b)) => a == b,
+            (ConstValue::LongFloat(a), ConstValue::LongFloat(b)) => a == b,
             (ConstValue::Dict(a), ConstValue::Dict(b)) => a == b,
             (ConstValue::Str(a), ConstValue::Str(b)) => a == b,
             (ConstValue::Tuple(a), ConstValue::Tuple(b)) => a == b,
@@ -1706,6 +1713,68 @@ impl PartialEq for ConstValue {
 
 impl Eq for ConstValue {}
 
+/// RPython `class r_longfloat(object)` (`rarithmetic.py:674-699`).
+///
+/// Upstream `Constant.value` stores the wrapper object itself, not a raw
+/// primitive. Modeling `r_longfloat` as an identity-bearing heap object
+/// matters for Hashable-style constant/dict-key semantics: the same
+/// wrapper instance behaves like the same Python object, while two fresh
+/// `r_longfloat(float('nan'))` objects do not share dict-key behavior.
+#[derive(Debug)]
+struct LongFloatObject {
+    value: f64,
+}
+
+/// Flow-space carrier for upstream `r_longfloat` objects.
+#[derive(Clone, Debug)]
+pub struct LongFloatValue {
+    inner: Arc<LongFloatObject>,
+}
+
+impl LongFloatValue {
+    pub fn new(value: f64) -> Self {
+        LongFloatValue {
+            inner: Arc::new(LongFloatObject { value }),
+        }
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        self.inner.value
+    }
+
+    fn hashable_value_bits(&self) -> Option<u64> {
+        let value = self.as_f64();
+        if value.is_nan() {
+            None
+        } else if value == 0.0 {
+            Some(0.0f64.to_bits())
+        } else {
+            Some(value.to_bits())
+        }
+    }
+
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+}
+
+impl PartialEq for LongFloatValue {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) || self.as_f64() == other.as_f64()
+    }
+}
+
+impl Eq for LongFloatValue {}
+
+impl Hash for LongFloatValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.hashable_value_bits() {
+            Some(bits) => bits.hash(state),
+            None => self.identity().hash(state),
+        }
+    }
+}
+
 impl std::fmt::Display for ConstValue {
     /// RPython `Constant.__repr__` prints the wrapped Python value via
     /// `repr()`; pyre renders the simple leaf variants directly and
@@ -1716,6 +1785,8 @@ impl std::fmt::Display for ConstValue {
             ConstValue::Placeholder => f.write_str("<placeholder>"),
             ConstValue::Int(value) => write!(f, "{value}"),
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
+            ConstValue::SingleFloat(bits) => write!(f, "{}", f32::from_bits(*bits)),
+            ConstValue::LongFloat(value) => write!(f, "r_longfloat({})", value.as_f64()),
             ConstValue::Str(value) => write!(f, "{value:?}"),
             ConstValue::Bool(value) => write!(f, "{value}"),
             ConstValue::None => f.write_str("None"),
@@ -1740,6 +1811,8 @@ impl Hash for ConstValue {
             ConstValue::Placeholder => {}
             ConstValue::Int(value) => value.hash(state),
             ConstValue::Float(bits) => bits.hash(state),
+            ConstValue::SingleFloat(bits) => bits.hash(state),
+            ConstValue::LongFloat(value) => value.hash(state),
             ConstValue::Dict(items) => {
                 // HashMap iteration order is nondeterministic; hash
                 // each entry independently and sort the resulting
@@ -2136,6 +2209,8 @@ impl Constant {
         match value {
             ConstValue::Int(_)
             | ConstValue::Float(_)
+            | ConstValue::SingleFloat(_)
+            | ConstValue::LongFloat(_)
             | ConstValue::Bool(_)
             | ConstValue::Str(_)
             | ConstValue::None
@@ -2210,6 +2285,16 @@ impl ConstValue {
         ConstValue::Float(value.to_bits())
     }
 
+    /// Wrap an `f32` into the bit-preserving `SingleFloat` variant.
+    pub fn single_float(value: f32) -> Self {
+        ConstValue::SingleFloat(value.to_bits())
+    }
+
+    /// Wrap an `f64` into the `LongFloat` variant.
+    pub fn long_float(value: f64) -> Self {
+        ConstValue::LongFloat(LongFloatValue::new(value))
+    }
+
     /// Unwrap a `Float` variant back to `f64`. Returns `None` for
     /// other variants.
     pub fn as_float(&self) -> Option<f64> {
@@ -2228,6 +2313,7 @@ impl ConstValue {
             // Python `bool(float)` is `float != 0.0` (including -0.0
             // which equals 0.0 under IEEE 754).
             ConstValue::Float(bits) => Some(f64::from_bits(*bits) != 0.0),
+            ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => None,
             ConstValue::Dict(items) => Some(!items.is_empty()),
             ConstValue::Str(s) => Some(!s.is_empty()),
             ConstValue::Tuple(items) | ConstValue::List(items) => Some(!items.is_empty()),
@@ -2742,7 +2828,7 @@ impl Block {
     /// result).
     pub fn getvariables(&self) -> Vec<Variable> {
         let mut result: Vec<Variable> = Vec::new();
-        let mut push_var = |w: &Hlvalue, result: &mut Vec<Variable>| {
+        let push_var = |w: &Hlvalue, result: &mut Vec<Variable>| {
             if let Hlvalue::Variable(v) = w {
                 if !result.iter().any(|x| x == v) {
                     result.push(v.clone());
@@ -2765,7 +2851,7 @@ impl Block {
     /// in this block (inputargs + every op's args).
     pub fn getconstants(&self) -> Vec<Constant> {
         let mut result: Vec<Constant> = Vec::new();
-        let mut push_const = |w: &Hlvalue, result: &mut Vec<Constant>| {
+        let push_const = |w: &Hlvalue, result: &mut Vec<Constant>| {
             if let Hlvalue::Constant(c) = w {
                 if !result.iter().any(|x| x == c) {
                     result.push(c.clone());
@@ -3808,6 +3894,41 @@ mod tests {
             ConstValue::LLPtr(Box::new(nonnull_ptr)).truthy(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn singlefloat_and_longfloat_truthiness_are_not_folded() {
+        assert_eq!(ConstValue::single_float(1.0).truthy(), None);
+        assert_eq!(ConstValue::long_float(1.0).truthy(), None);
+    }
+
+    #[test]
+    fn longfloat_constants_compare_hash_like_wrapped_float_values() {
+        let pos_zero = ConstValue::long_float(0.0);
+        let neg_zero = ConstValue::long_float(-0.0);
+        let hash_of = |value: &ConstValue| {
+            let mut h = DefaultHasher::new();
+            value.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(pos_zero, neg_zero);
+        assert_eq!(hash_of(&pos_zero), hash_of(&neg_zero));
+    }
+
+    #[test]
+    fn longfloat_nan_constants_preserve_object_identity() {
+        let same = ConstValue::long_float(f64::NAN);
+        let same_clone = same.clone();
+        let fresh = ConstValue::long_float(f64::NAN);
+        let hash_of = |value: &ConstValue| {
+            let mut h = DefaultHasher::new();
+            value.hash(&mut h);
+            h.finish()
+        };
+
+        assert_eq!(same, same_clone);
+        assert_eq!(hash_of(&same), hash_of(&same_clone));
+        assert_ne!(same, fresh);
     }
 
     #[test]

@@ -280,6 +280,10 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
     match value {
         ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => ConcreteType::Signed,
         ConstValue::Float(_) => ConcreteType::Float,
+        ConstValue::SingleFloat(_) => ConcreteType::Signed,
+        ConstValue::LongFloat(_) => {
+            panic!("LongFloat constants are not supported by legacy rtyper")
+        }
         ConstValue::Placeholder => ConcreteType::Unknown,
         ConstValue::Atom(_)
         | ConstValue::Dict(_)

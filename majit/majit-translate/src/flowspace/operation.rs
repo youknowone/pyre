@@ -1344,8 +1344,8 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // --- comparisons (int / float / str / bool) ---
         (OpKind::Lt, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_lt())),
         (OpKind::Le, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_le())),
-        (OpKind::Eq, [a, b]) => Some(ConstValue::Bool(a == b)),
-        (OpKind::Ne, [a, b]) => Some(ConstValue::Bool(a != b)),
+        (OpKind::Eq, [a, b]) => Some(ConstValue::Bool(eq_fold(a, b))),
+        (OpKind::Ne, [a, b]) => Some(ConstValue::Bool(!eq_fold(a, b))),
         (OpKind::Gt, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_gt())),
         (OpKind::Ge, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_ge())),
 
@@ -1368,6 +1368,18 @@ fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Ordering> {
         (ConstValue::Str(x), ConstValue::Str(y)) => Some(x.cmp(y)),
         (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(x.cmp(y)),
         _ => None,
+    }
+}
+
+fn eq_fold(a: &ConstValue, b: &ConstValue) -> bool {
+    match (a, b) {
+        // `r_longfloat.__eq__` stays value-based even for the same
+        // wrapper object (`rarithmetic.py:692-693`). Keep `==` / `!=`
+        // constant folding on that raw semantic instead of reusing the
+        // Hashable-style identity shortcut carried by `ConstValue`
+        // for dict/set keys.
+        (ConstValue::LongFloat(a), ConstValue::LongFloat(b)) => a.as_f64() == b.as_f64(),
+        _ => a == b,
     }
 }
 
@@ -2315,6 +2327,29 @@ mod tests {
         );
         // cross-type: upstream raises TypeError → fold declines.
         assert_eq!(fold(OpKind::Lt, vec![ci(1), cs("a")]), None);
+    }
+
+    #[test]
+    fn constfold_longfloat_eq_uses_raw_wrapper_equality() {
+        let same = Constant::new(ConstValue::long_float(f64::NAN));
+        let same_clone = same.clone();
+        assert_eq!(
+            fold(
+                OpKind::Eq,
+                vec![Hlvalue::Constant(same), Hlvalue::Constant(same_clone)]
+            ),
+            Some(ConstValue::Bool(false))
+        );
+
+        let same = Constant::new(ConstValue::long_float(f64::NAN));
+        let same_clone = same.clone();
+        assert_eq!(
+            fold(
+                OpKind::Ne,
+                vec![Hlvalue::Constant(same), Hlvalue::Constant(same_clone)]
+            ),
+            Some(ConstValue::Bool(true))
+        );
     }
 
     #[test]

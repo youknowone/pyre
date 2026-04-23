@@ -869,6 +869,12 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         ConstValue::Bool(_)
         | ConstValue::Int(_)
         | ConstValue::Float(_)
+        // `rarithmetic.py` makes both wrappers hashable:
+        // `r_singlefloat.__hash__` hashes the stored bytes and
+        // `r_longfloat.__hash__` follows the wrapped float value,
+        // with NaN identity preserved by the wrapper-object carrier.
+        | ConstValue::SingleFloat(_)
+        | ConstValue::LongFloat(_)
         | ConstValue::Str(_)
         | ConstValue::None
         | ConstValue::HostObject(_)
@@ -1765,6 +1771,56 @@ mod tests {
         assert!(
             items.contains_key(&CV::Bool(true)),
             "first-inserted Bool(true) must win over Int(1); got {items:?}"
+        );
+    }
+
+    #[test]
+    fn transform_list_contains_preserves_longfloat_nan_identity() {
+        use crate::annotator::model::{SomeLongFloat, SomeValue};
+        use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+
+        let nan_key = CV::long_float(f64::NAN);
+        let same_object = nan_key.clone();
+        let fresh_object = CV::long_float(f64::NAN);
+
+        let list_v = Variable::new();
+        let mut needle = Variable::new();
+        needle.annotation = Some(std::rc::Rc::new(SomeValue::LongFloat(SomeLongFloat::new())));
+        let result = Variable::new();
+
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![Hlvalue::Constant(C::new(nan_key))],
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![
+                Hlvalue::Variable(list_v.clone()),
+                Hlvalue::Variable(needle.clone()),
+            ],
+            Hlvalue::Variable(result),
+        ));
+
+        transform_list_contains(&ann, &[block.clone()]);
+
+        let ops = &block.borrow().operations;
+        let Hlvalue::Constant(dict_c) = &ops[1].args[0] else {
+            panic!("contains lhs should be rewritten to Constant(dict)");
+        };
+        let CV::Dict(items) = &dict_c.value else {
+            panic!("contains lhs constant should carry Dict");
+        };
+        assert!(
+            items.contains_key(&same_object),
+            "clone of the same r_longfloat(NaN) object should hit the rewritten dict"
+        );
+        assert!(
+            !items.contains_key(&fresh_object),
+            "fresh r_longfloat(NaN) object should miss the rewritten dict"
         );
     }
 }

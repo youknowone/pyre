@@ -24,7 +24,6 @@ use std::rc::Rc;
 use super::super::flowspace::model::ConstValue;
 use super::super::flowspace::model::Constant;
 use super::super::flowspace::model::Hlvalue;
-use super::super::flowspace::model::Variable;
 use super::super::flowspace::operation::{
     BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation,
     register_single,
@@ -287,6 +286,21 @@ fn init_someobject_defaults(
                         r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
                     }
                     _ => {
+                        if s_obj.is_immutable_constant()
+                            && let Some(c) = s_obj.const_()
+                        {
+                            match c {
+                                ConstValue::SingleFloat(_) => {
+                                    panic!(
+                                        "AnnotatorError: not supported on r_singlefloat instances"
+                                    )
+                                }
+                                ConstValue::LongFloat(_) => {
+                                    panic!("AnnotatorError: not supported on r_longfloat instances")
+                                }
+                                _ => {}
+                            }
+                        }
                         if s_obj.is_immutable_constant()
                             && let Some(c) = s_obj.const_()
                             && let Some(truthy) = c.truthy()

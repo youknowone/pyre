@@ -170,6 +170,11 @@ fn const_value_type(value: &ConstValue) -> ValueType {
     match value {
         ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => ValueType::Int,
         ConstValue::Float(_) => ValueType::Float,
+        // `history.getkind(SingleFloat) == 'int'` because the JIT stores
+        // singlefloats in integer boxes.
+        ConstValue::SingleFloat(_) => ValueType::Int,
+        // `history.getkind(LongFloat)` is unsupported.
+        ConstValue::LongFloat(_) => panic!("LongFloat constants are not supported by legacy SSA"),
         ConstValue::Placeholder => ValueType::Unknown,
         ConstValue::Atom(_)
         | ConstValue::Dict(_)
