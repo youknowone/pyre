@@ -43,7 +43,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use super::flatten::{DescrOperand, IndirectCallTargets, Kind};
+use super::flatten::{IndirectCallTargets, Kind};
 
 /// `rpython/flowspace/model.py:241` `class Variable(object)`.
 ///
@@ -433,20 +433,18 @@ impl FlowListOfKind {
     }
 }
 
-/// Pointer-identity wrapper for `flatten::DescrOperand` so a descr can sit
-/// inside `SpaceOperationArg` while preserving Python-object identity.
-///
-/// Upstream `flatten.py:365-367` carries `AbstractDescr` objects directly in
-/// `SpaceOperation.args`, and both `liveness.py` / `assembler.py` key on the
-/// descr object's identity (`id(x)` semantics).  pyre's closed-world analog
-/// is `flatten::DescrOperand`, wrapped in `Rc` so cloning a graph operation
-/// preserves identity exactly like reusing the same Python descr object.
+/// Pointer-identity wrapper for `majit_ir::DescrRef` so a descr can sit
+/// inside `SpaceOperationArg` despite `Arc<dyn Descr>` not deriving
+/// `Eq`/`Hash`.  Mirrors the treatment in `rpython/jit/metainterp/
+/// history.py` where `AbstractDescr` instances are singletons identified
+/// by Python `is` — two descrs are "equal" only when they are the same
+/// Python object.
 #[derive(Debug, Clone)]
-pub struct DescrByPtr(pub Rc<DescrOperand>);
+pub struct DescrByPtr(pub majit_ir::DescrRef);
 
 impl PartialEq for DescrByPtr {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -454,7 +452,7 @@ impl Eq for DescrByPtr {}
 
 impl std::hash::Hash for DescrByPtr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (Rc::as_ptr(&self.0) as *const ()).hash(state);
+        (std::sync::Arc::as_ptr(&self.0) as *const ()).hash(state);
     }
 }
 
@@ -489,9 +487,8 @@ impl std::hash::Hash for IndirectCallTargetsByPtr {
 /// `flatten.py:358-370` where the serializer walks `op.args` and
 /// dispatches by `isinstance` against those five types.  pyre represents
 /// all five: `Value` covers `Variable | Constant`, `ListOfKind` wraps
-/// `flow::FlowListOfKind`, `Descr` wraps `Rc<flatten::DescrOperand>`
-/// (upstream `AbstractDescr` object identity), and `IndirectCallTargets`
-/// wraps pyre's
+/// `flow::FlowListOfKind`, `Descr` wraps `majit_ir::DescrRef` (upstream
+/// `AbstractDescr`), and `IndirectCallTargets` wraps pyre's
 /// `flatten::IndirectCallTargets` (upstream `IndirectCallTargets`).
 ///
 /// PRE-EXISTING-ADAPTATION: Rust needs a concrete sum type.  We cannot
@@ -548,15 +545,9 @@ impl SpaceOperationArg {
     }
 }
 
-impl From<Rc<DescrOperand>> for SpaceOperationArg {
-    fn from(descr: Rc<DescrOperand>) -> Self {
+impl From<majit_ir::DescrRef> for SpaceOperationArg {
+    fn from(descr: majit_ir::DescrRef) -> Self {
         Self::Descr(DescrByPtr(descr))
-    }
-}
-
-impl From<DescrOperand> for SpaceOperationArg {
-    fn from(descr: DescrOperand) -> Self {
-        Self::Descr(DescrByPtr(Rc::new(descr)))
     }
 }
 

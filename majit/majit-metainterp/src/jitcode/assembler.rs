@@ -761,6 +761,10 @@ impl JitCodeBuilder {
         self.write_insn("abort_permanent/");
     }
 
+    pub fn unreachable(&mut self) {
+        self.write_insn("unreachable/");
+    }
+
     /// blackhole.py bhimpl_raise(excvalue): raise exception from register.
     pub fn emit_raise(&mut self, src: u16) {
         self.write_insn("raise/r");

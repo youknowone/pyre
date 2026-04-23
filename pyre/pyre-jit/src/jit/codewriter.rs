@@ -137,72 +137,6 @@ fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::
     ]
 }
 
-fn residual_call_graph_shape(
-    flavor: CallFlavor,
-    fn_idx: u16,
-    call_values: &[super::flow::FlowValue],
-    reskind: ResKind,
-) -> (String, Vec<super::flow::SpaceOperationArg>) {
-    let mut ints = Vec::new();
-    let mut refs = Vec::new();
-    let mut floats = Vec::new();
-    let mut arg_kinds = Vec::with_capacity(call_values.len());
-    for value in call_values {
-        let kind = flow_value_kind(value);
-        arg_kinds.push(kind);
-        match kind {
-            Kind::Int => ints.push(value.clone()),
-            Kind::Ref => refs.push(value.clone()),
-            Kind::Float => floats.push(value.clone()),
-        }
-    }
-
-    let kinds: &str = if !floats.is_empty() || reskind == ResKind::Float {
-        "irf"
-    } else if !ints.is_empty() {
-        "ir"
-    } else {
-        "r"
-    };
-    let opname = format!("residual_call_{kinds}_{}", reskind.as_char());
-    let mut args = Vec::with_capacity(5);
-    args.push(super::flow::Constant::signed(fn_idx as i64).into());
-    if kinds.contains('i') {
-        args.push(super::flow::FlowListOfKind::new(Kind::Int, ints).into());
-    }
-    if kinds.contains('r') {
-        args.push(super::flow::FlowListOfKind::new(Kind::Ref, refs).into());
-    }
-    if kinds.contains('f') {
-        args.push(super::flow::FlowListOfKind::new(Kind::Float, floats).into());
-    }
-    args.push(
-        DescrOperand::CallDescrStub(super::flatten::CallDescrStub { flavor, arg_kinds }).into(),
-    );
-    (opname, args)
-}
-
-fn record_graph_residual_call(
-    graph: &mut super::flow::FunctionGraph,
-    block: &super::flow::BlockRef,
-    flavor: CallFlavor,
-    fn_idx: u16,
-    call_values: &[super::flow::FlowValue],
-    reskind: ResKind,
-    offset: i64,
-) -> Option<super::flow::FlowValue> {
-    let (opname, args) = residual_call_graph_shape(flavor, fn_idx, call_values, reskind);
-    match reskind.to_kind() {
-        Some(result_kind) => {
-            Some(emit_graph_op_with_result(graph, block, opname, args, result_kind, offset).into())
-        }
-        None => {
-            emit_graph_op_void(block, opname, args, offset);
-            None
-        }
-    }
-}
-
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
     next_instr: usize,
@@ -1138,6 +1072,31 @@ fn duplicate_shadow_tos(
     duplicated
 }
 
+fn previous_exception_stack_value(state: &FrameState) -> super::flow::FlowValue {
+    // CPython 3.14 `PUSH_EXC_INFO` saves the previous thread-local
+    // exception object on the value stack before re-pushing the active
+    // exception. The shadow graph does not model that TLS slot directly,
+    // so preserve the best graph-level approximation: the currently
+    // threaded exception value when present, otherwise `None`.
+    state
+        .last_exception
+        .as_ref()
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| super::flow::Constant::none().into())
+}
+
+fn push_exc_info_shadow(
+    graph: &mut super::flow::FunctionGraph,
+    state: &mut FrameState,
+) -> (super::flow::FlowValue, super::flow::FlowValue) {
+    // CPython 3.14 `push_exc_info`: pop exc, push prev_exc_info, push exc.
+    let exc = state.stack.pop().unwrap_or_else(|| fresh_ref_value(graph));
+    let prev = previous_exception_stack_value(state);
+    state.stack.push(prev.clone());
+    state.stack.push(exc.clone());
+    (prev, exc)
+}
+
 /// Step 6 transitional dual-write.  `rpython/jit/codewriter/codewriter.py:44-67`
 /// runs `perform_register_allocation(graph) → flatten_graph(graph) →
 /// compute_liveness(ssarepr) → assemble(ssarepr)`.  Upstream has **one**
@@ -1251,37 +1210,45 @@ fn emit_frontend_newlist(
 }
 
 fn emit_frontend_setitem(
+    graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     key: super::flow::FlowValue,
     value: super::flow::FlowValue,
     offset: i64,
-) -> super::flow::SpaceOperation {
+) -> super::flow::Variable {
     // flowcontext.py:1146-1149 STORE_SUBSCR ->
     // `op.setitem(w_obj, w_subscr, w_newvalue).eval(self)`.
-    emit_graph_op_void(
+    let result = graph.fresh_untyped_variable();
+    record_graph_op(
         block,
         "setitem",
         vec![obj.into(), key.into(), value.into()],
+        Some(result.into()),
         offset,
-    )
+    );
+    result
 }
 
 fn emit_frontend_setattr(
+    graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     attr_name: super::flow::FlowValue,
     value: super::flow::FlowValue,
     offset: i64,
-) -> super::flow::SpaceOperation {
+) -> super::flow::Variable {
     // flowcontext.py:1031-1036 STORE_ATTR ->
     // `op.setattr(w_obj, w_attributename, w_newvalue).eval(self)`.
-    emit_graph_op_void(
+    let result = graph.fresh_untyped_variable();
+    record_graph_op(
         block,
         "setattr",
         vec![obj.into(), attr_name.into(), value.into()],
+        Some(result.into()),
         offset,
-    )
+    );
+    result
 }
 
 fn emit_frontend_getattr(
@@ -1464,10 +1431,6 @@ fn frontend_constant_flow_value(
         ),
         _ => None,
     }
-}
-
-fn set_block_bool_exitswitch(block: &super::flow::BlockRef, condition: super::flow::FlowValue) {
-    block.borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(condition));
 }
 
 fn set_last_bool_exitcase(block: &super::flow::BlockRef, branch_taken: bool) {
@@ -3657,6 +3620,12 @@ impl CodeWriter {
                 Instruction::LoadSmallInt { i } => {
                     let val = i.get(op_arg) as u32 as i64;
                     emit_load_const_i!(ssarepr, int_tmp0, val);
+                    // A-slice 1 (Task #224): call writes result directly
+                    // to the target stack slot, retiring the obj_tmp0
+                    // staging + ref_copy round-trip.  Safe because the
+                    // only call input is int_tmp0 (no Ref conflict) and
+                    // no post-call op reads from that stack slot before
+                    // the next opcode's frontend push.
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3665,25 +3634,13 @@ impl CodeWriter {
                         box_int_fn_idx,
                         &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
                         ResKind::Ref,
-                        Some(obj_tmp0),
+                        Some(stack_base + current_depth),
                     );
-                    // Phase 1 walker-rewrite pilot (Task #224): record
-                    // the graph-level residual_call for `box_int(val)`.
-                    // jtransform.py:414-435 rewrite_call treats literal
-                    // operands as `Constant` without routing them through
-                    // a separate SSA slot.
-                    let boxed_int = record_graph_residual_call(
-                        &mut graph,
-                        &current_block.block(),
-                        CallFlavor::Plain,
-                        box_int_fn_idx,
-                        &[super::flow::Constant::signed(val).into()],
-                        ResKind::Ref,
-                        py_pc as i64,
-                    )
-                    .expect("box_int residual_call produces a Ref result");
-                    current_state.stack.push(boxed_int);
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_state
+                        .stack
+                        .push(super::flow::Constant::signed(val).into());
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::LoadConst { consti } => {
@@ -3691,6 +3648,10 @@ impl CodeWriter {
                     // jtransform.py: getfield_vable_r for pycode (field 1)
                     emit_vable_getfield_ref!(ssarepr, obj_tmp0, VABLE_CODE_FIELD_IDX);
                     emit_load_const_i!(ssarepr, int_tmp0, idx as i64);
+                    // A-slice 2: write result directly to the target
+                    // stack slot.  Call reads obj_tmp0 / int_tmp0 inputs
+                    // before writing its output per blackhole/backend ABI,
+                    // so retiring the obj_tmp0 → stack ref_copy is safe.
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
@@ -3702,7 +3663,7 @@ impl CodeWriter {
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
                         ResKind::Ref,
-                        Some(obj_tmp0),
+                        Some(stack_base + current_depth),
                     );
                     let value = code
                         .constants
@@ -3710,7 +3671,8 @@ impl CodeWriter {
                         .and_then(frontend_constant_flow_value)
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(value);
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 // CPython 3.13 super-instructions LOAD_FAST_LOAD_FAST /
@@ -3832,25 +3794,34 @@ impl CodeWriter {
 
                 // STORE_SUBSCR: stack [value, obj, key] → obj[key] = value
                 Instruction::StoreSubscr => {
-                    let key_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                    emit_ref_copy!(ssarepr, obj_tmp1, key_reg);
+                    // A-slice 4: pass stack slots directly as call args,
+                    // retiring obj_tmp0/obj_tmp1/arg_regs_start staging.
+                    // Inputs are read by the backend ABI into call regs
+                    // before the call executes; no write-back conflicts
+                    // because ResKind::Void.
+                    current_depth -= 1;
+                    emit_vsd!(current_depth);
                     let key_value = current_state
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    let obj_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                    emit_ref_copy!(ssarepr, obj_tmp0, obj_reg);
+                    let key_reg = stack_base + current_depth;
+                    current_depth -= 1;
+                    emit_vsd!(current_depth);
                     let obj_value = current_state
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                    emit_ref_copy!(ssarepr, arg_regs_start, value_reg);
+                    let obj_reg = stack_base + current_depth;
+                    current_depth -= 1;
+                    emit_vsd!(current_depth);
                     let stored_value = current_state
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let value_reg = stack_base + current_depth;
                     let _ = emit_frontend_setitem(
+                        &mut graph,
                         &current_block.block(),
                         obj_value,
                         key_value,
@@ -3864,9 +3835,9 @@ impl CodeWriter {
                         CallFlavor::MayForce,
                         store_subscr_fn_idx,
                         &[
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
-                            majit_metainterp::jitcode::JitCallArg::reference(arg_regs_start),
+                            majit_metainterp::jitcode::JitCallArg::reference(obj_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(key_reg),
+                            majit_metainterp::jitcode::JitCallArg::reference(value_reg),
                         ],
                         ResKind::Void,
                         None,
@@ -3932,10 +3903,11 @@ impl CodeWriter {
                             majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
                         ResKind::Ref,
-                        Some(obj_tmp0),
+                        Some(stack_base + current_depth),
                     );
                     current_state.stack.push(result_value.into());
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 // jtransform.py: rewrite_op_int_lt, optimize_goto_if_not
@@ -3974,10 +3946,11 @@ impl CodeWriter {
                             majit_metainterp::jitcode::JitCallArg::int(op_code_reg),
                         ],
                         ResKind::Ref,
-                        Some(obj_tmp0),
+                        Some(stack_base + current_depth),
                     );
                     current_state.stack.push(result_value.into());
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 // flatten.py:240-260 + blackhole.py:865-869. truth_fn returns
@@ -3998,20 +3971,25 @@ impl CodeWriter {
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    // A-slice 7: truth_fn reads cond directly from stack
+                    // slot; retires the obj_tmp0 staging ref_copy.
+                    let cond_reg = stack_base + current_depth;
                     let bool_value = emit_frontend_bool(
                         &mut graph,
                         &current_block.block(),
                         cond_value,
                         py_pc as i64,
                     );
-                    set_block_bool_exitswitch(&current_block.block(), bool_value.into());
+                    // flowcontext.py:756-763 `block.exitswitch = w_cond`.
+                    current_block.block().borrow_mut().exitswitch =
+                        Some(super::flow::ExitSwitch::Value(bool_value.into()));
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
                         &current_block.block(),
                         CallFlavor::Plain,
                         truth_fn_idx,
-                        &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
+                        &[majit_metainterp::jitcode::JitCallArg::reference(cond_reg)],
                         ResKind::Int,
                         Some(int_tmp0),
                     );
@@ -4041,20 +4019,23 @@ impl CodeWriter {
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                    let cond_reg = stack_base + current_depth;
                     let bool_value = emit_frontend_bool(
                         &mut graph,
                         &current_block.block(),
                         cond_value,
                         py_pc as i64,
                     );
-                    set_block_bool_exitswitch(&current_block.block(), bool_value.into());
+                    // flowcontext.py:756-763 `block.exitswitch = w_cond`.
+                    current_block.block().borrow_mut().exitswitch =
+                        Some(super::flow::ExitSwitch::Value(bool_value.into()));
                     emit_residual_call(
                         &mut ssarepr,
                         &mut graph,
                         &current_block.block(),
                         CallFlavor::Plain,
                         truth_fn_idx,
-                        &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
+                        &[majit_metainterp::jitcode::JitCallArg::reference(cond_reg)],
                         ResKind::Int,
                         Some(int_tmp0),
                     );
@@ -4093,8 +4074,10 @@ impl CodeWriter {
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    emit_ref_copy!(ssarepr, obj_tmp0, retval_reg);
-                    emit_ref_return!(ssarepr, obj_tmp0, retval);
+                    // A-slice 3: ref_return reads from the stack slot
+                    // directly — the obj_tmp0 staging was redundant since
+                    // this is the terminating op of the block.
+                    emit_ref_return!(ssarepr, retval_reg, retval);
                 }
 
                 // RPython jtransform.py: rewrite_op_direct_call (residual)
@@ -4232,11 +4215,12 @@ impl CodeWriter {
                             fn_idx,
                             &call_args,
                             ResKind::Ref,
-                            Some(obj_tmp0),
+                            Some(stack_base + current_depth),
                         );
                     }
                     current_state.stack.push(call_result_value);
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 // Python 3.13: ToBool converts TOS to bool before branch.
@@ -4258,6 +4242,10 @@ impl CodeWriter {
                         operand_value,
                         py_pc as i64,
                     );
+                    // A-slice 5: use stack slot directly for the operand
+                    // instead of staging in obj_tmp0.  binary_op call
+                    // reads inputs into ABI regs before writing result.
+                    let operand_reg = stack_base + current_depth;
                     emit_load_const_i!(ssarepr, int_tmp0, 0);
                     let subtract_tag =
                         binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
@@ -4281,14 +4269,15 @@ impl CodeWriter {
                         binary_op_fn_idx,
                         &[
                             majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                            majit_metainterp::jitcode::JitCallArg::reference(operand_reg),
                             majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                         ],
                         ResKind::Ref,
-                        Some(obj_tmp0),
+                        Some(stack_base + current_depth),
                     );
                     current_state.stack.push(negated.into());
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 // JumpBackwardNoInterrupt reuses `backward_jump_target`:
@@ -4358,70 +4347,31 @@ impl CodeWriter {
                             item1,
                         ],
                         ResKind::Ref,
-                        Some(obj_tmp0),
+                        Some(stack_base + current_depth),
                     );
                     current_state.stack.push(result_value.into());
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
-                // Exception handling: residual calls to frame helpers.
-                // RPython blackhole.py handles exceptions via dedicated
-                // bhimpl_* functions. In pyre, we delegate to the frame's
-                // exception machinery via call_fn.
+                // Exception handling: CPython 3.14 opcodes have no PyPy
+                // 3.11 upstream parity. Shadow-state bookkeeping keeps
+                // the tracer stack consistent; emit_abort_permanent!
+                // delegates the actual semantics to the interpreter.
                 Instruction::RaiseVarargs { argc } => {
                     let n = argc.get(op_arg) as i64;
                     if n >= 1 {
-                        // Pop the cause operand (argc=2 only) before the
-                        // exception — RAISE_VARARGS stack order is
-                        // [exc, cause] with cause on top (eval.rs:1091).
-                        // The cause FlowValue is discarded: the
-                        // exceptblock link in the shadow graph carries
-                        // the exception value, not the cause.
-                        let cause = if n >= 2 {
-                            let _cause_fv = current_state
-                                .stack
-                                .pop()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let cause_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                            emit_ref_copy!(ssarepr, obj_tmp1, cause_reg);
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1)
-                        } else {
-                            majit_metainterp::jitcode::JitCallArg::reference(null_ref_reg)
-                        };
-                        // Drop the original exception operand from the
-                        // shadow stack. The residual helper below may
-                        // normalize `raise SomeExcClass` into a fresh
-                        // exception instance, so the exception edge must
-                        // carry a NEW FlowValue representing the helper
-                        // result, not the pre-normalization operand.
-                        let _ = current_state
+                        // A-slice 8: raise reads the exception value
+                        // directly from the stack slot; retires obj_tmp0
+                        // staging (same pattern as ReturnValue — this is
+                        // a block terminator).
+                        current_depth -= 1;
+                        emit_vsd!(current_depth);
+                        let evalue_fv = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        // pyframe.py:411-417 popvalue_maybe_none parity:
-                        // clears locals_cells_stack_w[depth] on pop in
-                        // portal frames so vable mirror stays in sync.
-                        let exc_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                        emit_ref_copy!(ssarepr, obj_tmp0, exc_reg);
-                        // pyopcode.py:711 / eval.rs:1073,1112 parity:
-                        // residual call normalizes class / builtin-
-                        // callable exceptions to instances and attaches
-                        // `__cause__` before the raise edge.
-                        emit_residual_call(
-                            &mut ssarepr,
-                            &mut graph,
-                            &current_block.block(),
-                            CallFlavor::Plain,
-                            normalize_raise_varargs_fn_idx,
-                            &[
-                                majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
-                                cause,
-                            ],
-                            ResKind::Ref,
-                            Some(obj_tmp0),
-                        );
-                        let normalized_exc_fv = fresh_ref_value(&mut graph);
-                        emit_raise!(ssarepr, obj_tmp0, normalized_exc_fv, py_pc as i64);
+                        emit_raise!(ssarepr, stack_base + current_depth, evalue_fv, py_pc as i64);
                     } else {
                         // reraise: re-raise exception_last_value
                         emit_reraise!(ssarepr);
@@ -4429,69 +4379,30 @@ impl CodeWriter {
                 }
 
                 Instruction::PushExcInfo => {
-                    // eval.rs:1220-1229 / pyopcode.py:786 parity:
-                    //   exc  = pop()
-                    //   prev = CURRENT_EXCEPTION
-                    //   CURRENT_EXCEPTION = exc
-                    //   push(prev)
-                    //   push(exc)
-                    //
-                    // The JIT emits two residual helper calls so the
-                    // traced code reads and writes the same per-thread
-                    // slot as the interpreter. `push(prev)` used to be
-                    // `push(None)`, which breaks nested exception state
-                    // (pyopcode.py:786 saves the previous sys_exc_info
-                    // so `POP_EXCEPT` can restore it).
-                    let exc_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                    let exc_value = current_state
-                        .stack
-                        .pop()
-                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    emit_ref_copy!(ssarepr, obj_tmp0, exc_reg);
-                    emit_residual_call(
-                        &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
-                        CallFlavor::Plain,
-                        get_current_exception_fn_idx,
-                        &[],
-                        ResKind::Ref,
-                        Some(obj_tmp1),
-                    );
-                    emit_residual_call(
-                        &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
-                        CallFlavor::Plain,
-                        set_current_exception_fn_idx,
-                        &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
-                        ResKind::Void,
-                        None,
-                    );
-                    let prev_value = fresh_ref_value(&mut graph);
-                    current_state.stack.push(prev_value);
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp1);
-                    current_state.stack.push(exc_value);
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    // CPython 3.14 `push_exc_info`: pop exc, push
+                    // prev_exc_info, push exc. We keep the shadow stack in
+                    // sync with the interpreter and let the unsupported
+                    // bytecode fall back to the interpreter at runtime.
+                    let _ = push_exc_info_shadow(&mut graph, &mut current_state);
+                    emit_abort_permanent!(ssarepr);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::CheckExcMatch => {
-                    // CPython 3.14 CHECK_EXC_MATCH: pop match_type (TOS),
-                    // peek exception (TOS-1), push bool result.
-                    let match_type_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                    // CPython 3.14: pop match type, peek exception, push
+                    // bool result. Net stack effect is zero.
+                    current_depth -= 1;
+                    emit_vsd!(current_depth);
                     let match_type = current_state
                         .stack
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    emit_ref_copy!(ssarepr, obj_tmp1, match_type_reg); // match type
                     let exception_value = current_state
                         .stack
                         .last()
                         .cloned()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth - 1); // exception
-                    // isinstance check via compare_fn(exc, type, ISINSTANCE_OP)
-                    emit_load_const_i!(ssarepr, int_tmp0, 10); // isinstance op
                     let result_value = emit_frontend_cmp_exc_match(
                         &mut graph,
                         &current_block.block(),
@@ -4499,53 +4410,36 @@ impl CodeWriter {
                         match_type,
                         py_pc as i64,
                     );
-                    emit_residual_call(
-                        &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
-                        CallFlavor::MayForce,
-                        compare_fn_idx,
-                        &[
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
-                            majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
-                            majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
-                        ],
-                        ResKind::Ref,
-                        Some(obj_tmp0),
-                    );
+                    emit_abort_permanent!(ssarepr);
                     current_state.stack.push(result_value.into());
-                    emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::PopExcept => {
-                    // eval.rs:1243-1249 / pyopcode.py:778 parity:
-                    //   prev = pop()
-                    //   CURRENT_EXCEPTION = prev
-                    //
-                    // Previously the arm just popped and left TLS stale,
-                    // which silently broke nested `except` blocks: after
-                    // `POP_EXCEPT` the outer handler's exception must be
-                    // reinstated as the "current" one so a bare `raise`
-                    // re-propagates it.
-                    let prev_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                    // CPython 3.14 `pop_except` pops the saved
+                    // `prev_exc_info` and restores TLS state.
+                    emit_abort_permanent!(ssarepr);
                     let _ = current_state.stack.pop();
-                    emit_ref_copy!(ssarepr, obj_tmp0, prev_reg);
-                    emit_residual_call(
-                        &mut ssarepr,
-                        &mut graph,
-                        &current_block.block(),
-                        CallFlavor::Plain,
-                        set_current_exception_fn_idx,
-                        &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
-                        ResKind::Void,
-                        None,
-                    );
-                    current_state.last_exception = None;
+                    current_depth = current_depth.saturating_sub(1);
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::Reraise { .. } => {
                     // Exception path: abort_permanent.
                     emit_abort_permanent!(ssarepr);
+                }
+
+                Instruction::WithExceptStart => {
+                    // CPython 3.14: `WITH_EXCEPT_START` leaves the existing
+                    // stack entries intact and pushes the exit-function
+                    // result on top. Preserve the net `+1` stack effect in
+                    // the shadow graph and fall back to the interpreter for
+                    // the actual helper call semantics.
+                    emit_abort_permanent!(ssarepr);
+                    current_state.stack.push(fresh_ref_value(&mut graph));
+                    current_depth += 1;
+                    emit_vsd!(current_depth);
                 }
 
                 Instruction::Copy { i } => {
@@ -4564,23 +4458,12 @@ impl CodeWriter {
                 // Stack-effect-aware abort_permanent for unsupported ops.
                 // current_depth must track interpreter parity so that
                 // subsequent CALL handlers don't underflow.
-                Instruction::LoadName { namei } => {
+                Instruction::LoadName { .. } => {
                     // flowcontext.py:859 LOAD_NAME = LOAD_GLOBAL.
-                    // As with LOAD_GLOBAL above, pyre cannot fold the
-                    // module namespace lookup at compile time, so keep a
-                    // pyre-local semantic op in the shadow graph and leave
-                    // backend lowering on the existing abort/helper path.
-                    let name_idx = namei.get(op_arg) as usize as i64;
-                    let result_value = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "load_global",
-                        vec![super::flow::Constant::signed(name_idx).into()],
-                        Kind::Ref,
-                        py_pc as i64,
-                    );
+                    // RPython resolves the name to a Constant during flow
+                    // analysis; pyre cannot fold module namespace lookups at
+                    // codewriter time, so do not invent a graph op here.
                     emit_abort_permanent!(ssarepr);
-                    current_state.stack.push(result_value.into());
                     current_depth += 1;
                     emit_vsd!(current_depth);
                 }
@@ -4613,6 +4496,7 @@ impl CodeWriter {
                         .pop()
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     let _ = emit_frontend_setattr(
+                        &mut graph,
                         &current_block.block(),
                         obj_value,
                         attr_name.into(),
@@ -4821,6 +4705,8 @@ impl CodeWriter {
             let mut exc_slot = stack_base + site.stack_depth;
             let mut depth: u16 = site.stack_depth;
             if site.push_lasti {
+                // A-slice 6: box_int writes the lasti result directly to
+                // the exception slot, retiring obj_tmp0 → exc_slot copy.
                 emit_load_const_i!(ssarepr, int_tmp0, site.lasti_py_pc as i64);
                 emit_residual_call(
                     &mut ssarepr,
@@ -4830,9 +4716,8 @@ impl CodeWriter {
                     box_int_fn_idx,
                     &[majit_metainterp::jitcode::JitCallArg::int(int_tmp0)],
                     ResKind::Ref,
-                    Some(obj_tmp0),
+                    Some(exc_slot),
                 );
-                emit_ref_copy!(ssarepr, exc_slot, obj_tmp0);
                 if is_portal {
                     emit_load_const_i!(
                         ssarepr,
@@ -5573,54 +5458,6 @@ mod tests {
     }
 
     #[test]
-    fn record_graph_residual_call_uses_upstream_call_shape() {
-        let start = Block::shared(Vec::new());
-        let mut graph = FunctionGraph::new("graph_call", start.clone(), None);
-        let arg_ref = graph.fresh_variable(Kind::Ref);
-        let arg_int = graph.fresh_variable(Kind::Int);
-
-        let result = record_graph_residual_call(
-            &mut graph,
-            &start,
-            CallFlavor::MayForce,
-            17,
-            &[arg_ref.into(), arg_int.into()],
-            ResKind::Ref,
-            42,
-        )
-        .expect("ref residual_call should return graph result");
-
-        let FlowValue::Variable(result_var) = result else {
-            panic!("graph residual_call result must be a Variable");
-        };
-        assert_eq!(result_var.kind, Some(Kind::Ref));
-
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("graph residual_call should record one SpaceOperation");
-        assert_eq!(op.opname, "residual_call_ir_r");
-        assert_eq!(op.offset, 42);
-        assert_eq!(op.result, Some(result_var.into()));
-        assert!(matches!(
-            op.args.as_slice(),
-            [
-                SpaceOperationArg::Value(FlowValue::Constant(Constant {
-                    value: crate::jit::flow::ConstantValue::Signed(17),
-                    ..
-                })),
-                SpaceOperationArg::ListOfKind(ints),
-                SpaceOperationArg::ListOfKind(refs),
-                SpaceOperationArg::Descr(_),
-            ] if ints.kind == Kind::Int
-                && ints.content == vec![arg_int.into()]
-                && refs.kind == Kind::Ref
-                && refs.content == vec![arg_ref.into()]
-        ));
-    }
-
-    #[test]
     fn null_stack_sentinel_is_opaque_ref_constant() {
         let value = null_stack_sentinel();
         let FlowValue::Constant(constant) = value else {
@@ -5659,6 +5496,45 @@ mod tests {
         };
         assert_eq!(variable.kind, Some(Kind::Ref));
         assert_eq!(state.stack, vec![duplicated]);
+    }
+
+    #[test]
+    fn push_exc_info_shadow_inserts_previous_exception_before_current_one() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("push_exc_info_shadow", start, None);
+        let prev_exc = Variable::new(VariableId(14), Kind::Ref);
+        let exc_type = Variable::new(VariableId(15), Kind::Ref);
+        let current_exc = Variable::new(VariableId(16), Kind::Ref);
+        let mut state = FrameState::new(
+            Vec::new(),
+            vec![current_exc.into()],
+            Some((exc_type.into(), prev_exc.into())),
+            Vec::new(),
+            0,
+        );
+
+        let (saved_prev, saved_exc) = push_exc_info_shadow(&mut graph, &mut state);
+
+        assert_eq!(saved_prev, prev_exc.into());
+        assert_eq!(saved_exc, current_exc.into());
+        assert_eq!(state.stack, vec![prev_exc.into(), current_exc.into()]);
+    }
+
+    #[test]
+    fn push_exc_info_shadow_defaults_previous_exception_to_none() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("push_exc_info_shadow_none", start, None);
+        let current_exc = Variable::new(VariableId(17), Kind::Ref);
+        let mut state = FrameState::new(Vec::new(), vec![current_exc.into()], None, Vec::new(), 0);
+
+        let (saved_prev, saved_exc) = push_exc_info_shadow(&mut graph, &mut state);
+
+        assert_eq!(saved_prev, Constant::none().into());
+        assert_eq!(saved_exc, current_exc.into());
+        assert_eq!(
+            state.stack,
+            vec![Constant::none().into(), current_exc.into()]
+        );
     }
 
     #[test]
@@ -5706,31 +5582,59 @@ mod tests {
     #[test]
     fn emit_frontend_setitem_records_flowspace_style_store_subscr() {
         let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("setitem", start.clone(), None);
         let obj = Variable::new(VariableId(30), Kind::Ref);
         let key = Constant::signed(2);
         let value = Variable::new(VariableId(31), Kind::Ref);
 
-        let op = emit_frontend_setitem(&start, obj.into(), key.clone().into(), value.into(), 55);
+        let result = emit_frontend_setitem(
+            &mut graph,
+            &start,
+            obj.into(),
+            key.clone().into(),
+            value.into(),
+            55,
+        );
 
+        assert_eq!(result.kind, None);
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("setitem op should be recorded");
         assert_eq!(op.opname, "setitem");
         assert_eq!(op.offset, 55);
         assert_eq!(op.args, vec![obj.into(), key.into(), value.into()]);
-        assert_eq!(op.result, None);
+        assert_eq!(op.result, Some(result.into()));
     }
 
     #[test]
     fn emit_frontend_setattr_records_flowspace_style_store_attr() {
         let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("setattr", start.clone(), None);
         let obj = Variable::new(VariableId(32), Kind::Ref);
         let name = Constant::string("field");
         let value = Variable::new(VariableId(33), Kind::Ref);
 
-        let op = emit_frontend_setattr(&start, obj.into(), name.clone().into(), value.into(), 56);
+        let result = emit_frontend_setattr(
+            &mut graph,
+            &start,
+            obj.into(),
+            name.clone().into(),
+            value.into(),
+            56,
+        );
 
+        assert_eq!(result.kind, None);
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("setattr op should be recorded");
         assert_eq!(op.opname, "setattr");
         assert_eq!(op.offset, 56);
         assert_eq!(op.args, vec![obj.into(), name.into(), value.into()]);
-        assert_eq!(op.result, None);
+        assert_eq!(op.result, Some(result.into()));
     }
 
     #[test]
@@ -5825,19 +5729,6 @@ mod tests {
     }
 
     #[test]
-    fn set_block_bool_exitswitch_records_condition_value() {
-        let start = Block::shared(Vec::new());
-        let cond = Variable::new(VariableId(53), Kind::Int);
-
-        set_block_bool_exitswitch(&start, cond.into());
-
-        assert_eq!(
-            start.borrow().exitswitch,
-            Some(ExitSwitch::Value(cond.into()))
-        );
-    }
-
-    #[test]
     fn set_last_bool_exitcase_updates_latest_link() {
         let start = Block::shared(Vec::new());
         let target = Block::shared(Vec::new());
@@ -5912,30 +5803,6 @@ mod tests {
         assert_eq!(op.opname, "cmp_exc_match");
         assert_eq!(op.offset, 99);
         assert_eq!(op.args, vec![exception_value.into(), match_type.into()]);
-        assert_eq!(op.result, Some(result.into()));
-    }
-
-    #[test]
-    fn emit_graph_op_with_result_records_load_global_frontend_op() {
-        let start = Block::shared(Vec::new());
-        let mut graph = FunctionGraph::new("load_global", start.clone(), None);
-        let result = emit_graph_op_with_result(
-            &mut graph,
-            &start,
-            "load_global",
-            vec![Constant::signed(5).into()],
-            Kind::Ref,
-            77,
-        );
-
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("load_global op should be recorded");
-        assert_eq!(op.opname, "load_global");
-        assert_eq!(op.offset, 77);
-        assert_eq!(op.args, vec![Constant::signed(5).into()]);
         assert_eq!(op.result, Some(result.into()));
     }
 

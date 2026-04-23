@@ -782,6 +782,7 @@ fn dispatch_op(
         }
         "abort" => state.builder.abort(),
         "abort_permanent" => state.builder.abort_permanent(),
+        "unreachable" => state.builder.unreachable(),
         // `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
         // `v` is either a `Register` or a `Constant`. Register source
         // lowers to the primitive `move_{i,r,f}` builder method;

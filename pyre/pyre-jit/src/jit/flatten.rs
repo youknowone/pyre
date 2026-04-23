@@ -639,8 +639,12 @@ where
         Operand::TLabel(TLabel::new(self.label_name_for_block(block)))
     }
 
+    fn tlabel_value_for_link(&mut self, link: &LinkRef) -> TLabel {
+        TLabel::new(self.label_name_for_link(link))
+    }
+
     fn tlabel_for_link(&mut self, link: &LinkRef) -> Operand {
-        Operand::TLabel(TLabel::new(self.label_name_for_link(link)))
+        Operand::TLabel(self.tlabel_value_for_link(link))
     }
 
     fn label_for_block(&mut self, block: &BlockRef) -> Insn {
@@ -802,7 +806,8 @@ where
             }
             return;
         }
-        if exits.len() == 2 {
+        let exitswitch = block.borrow().exitswitch.clone();
+        if exits.len() == 2 && is_bool_or_tuple_exitswitch(&exits, &exitswitch) {
             let Some(exitswitch) = block.borrow().exitswitch.clone() else {
                 panic!("flatten_graph: 2-exit block missing exitswitch");
             };
@@ -811,26 +816,105 @@ where
             if linkfalse.borrow().llexitcase == Some(Constant::bool(true).into()) {
                 std::mem::swap(&mut linkfalse, &mut linktrue);
             }
-            let opargs = match exitswitch {
+            let (opname, mut opargs) = match exitswitch {
                 super::flow::ExitSwitch::Value(value) => {
-                    vec![self.flatten_value(&value), self.tlabel_for_link(&linkfalse)]
+                    ("goto_if_not".to_owned(), vec![self.flatten_value(&value)])
                 }
-                super::flow::ExitSwitch::Tuple(_) => {
-                    panic!("flatten_graph: tuple exitswitch not wired yet")
-                }
+                super::flow::ExitSwitch::Tuple(values) => self.flatten_tuple_exitswitch(values),
             };
+            opargs.push(self.tlabel_for_link(&linkfalse));
             self.emitline(Insn::live(Vec::new()));
-            self.emitline(Insn::op("goto_if_not", opargs));
+            self.emitline(Insn::op(opname, opargs));
             self.make_link(&linktrue, handling_ovf);
             let false_label = self.label_for_link(&linkfalse);
             self.emitline(false_label);
             self.make_link(&linkfalse, handling_ovf);
             return;
         }
-        panic!(
-            "flatten_graph: unsupported exits shape for block with {} exits",
-            exits.len()
-        );
+        self.insert_switch_exits(&exits, exitswitch, handling_ovf);
+    }
+
+    fn flatten_tuple_exitswitch(
+        &mut self,
+        values: Vec<super::flow::ExitSwitchElement>,
+    ) -> (String, Vec<Operand>) {
+        let mut iter = values.into_iter();
+        let opname = match iter.next() {
+            Some(super::flow::ExitSwitchElement::Marker(name)) => {
+                format!("goto_if_not_{name}")
+            }
+            other => panic!("flatten_graph: tuple exitswitch missing opname marker: {other:?}"),
+        };
+        let mut values: Vec<_> = iter.collect();
+        if matches!(
+            values.last(),
+            Some(super::flow::ExitSwitchElement::Marker(marker)) if marker == "-live-before"
+        ) {
+            values.pop();
+        }
+        let args = values
+            .into_iter()
+            .map(|value| match value {
+                super::flow::ExitSwitchElement::Value(value) => self.flatten_value(&value),
+                super::flow::ExitSwitchElement::Marker(marker) => {
+                    panic!("flatten_graph: unexpected tuple exitswitch marker {marker:?}")
+                }
+            })
+            .collect();
+        (opname, args)
+    }
+
+    fn insert_switch_exits(
+        &mut self,
+        exits: &[LinkRef],
+        exitswitch: Option<super::flow::ExitSwitch>,
+        handling_ovf: bool,
+    ) {
+        let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
+            panic!(
+                "flatten_graph: unsupported exits shape for block with {} exits",
+                exits.len()
+            );
+        };
+        let mut switches: Vec<LinkRef> = exits
+            .iter()
+            .filter(|link| !is_default_exitcase(&link.borrow().exitcase))
+            .cloned()
+            .collect();
+        switches.sort_by_key(|link| switch_llexitcase_key(&link.borrow().llexitcase));
+
+        let mut switchdict = SwitchDictDescr::new();
+        for switch in &switches {
+            let key = switch_llexitcase_key(&switch.borrow().llexitcase);
+            switchdict
+                .labels
+                .push((key, self.tlabel_value_for_link(switch)));
+        }
+
+        let switch_value = self.flatten_value(&exitswitch);
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "switch",
+            vec![
+                switch_value,
+                Operand::descr(DescrOperand::SwitchDict(switchdict)),
+            ],
+        ));
+        if let Some(default_link) = exits
+            .last()
+            .filter(|link| is_default_exitcase(&link.borrow().exitcase))
+        {
+            self.make_link(default_link, handling_ovf);
+        } else {
+            self.emitline(Insn::op("unreachable", Vec::new()));
+            self.emitline(Insn::Unreachable);
+        }
+        for switch in switches {
+            let link_label = self.label_for_link(&switch);
+            self.emitline(link_label);
+            self.emitline(Insn::live(Vec::new()));
+            self.make_link(&switch, handling_ovf);
+        }
     }
 
     fn insert_renamings(&mut self, link: &LinkRef) {
@@ -959,6 +1043,9 @@ where
         match op.result {
             None => Insn::op(op.opname.clone(), args),
             Some(FlowValue::Variable(variable)) => {
+                if variable.kind.is_none() {
+                    return Insn::op(op.opname.clone(), args);
+                }
                 let result = (self.get_register)(variable);
                 Insn::op_with_result(op.opname.clone(), args, result)
             }
@@ -983,10 +1070,17 @@ where
                     .collect(),
             )),
             // `flatten.py:365-367` passes AbstractDescr through
-            // unchanged. `flow::SpaceOperationArg::Descr` already carries
-            // the closed-world SSA-side `DescrOperand`, so flattening is
-            // the direct identity-preserving `Operand::Descr` wrap.
-            SpaceOperationArg::Descr(descr) => Operand::descr_rc(Rc::clone(&descr.0)),
+            // unchanged.  pyre's `DescrOperand` is a closed enum over
+            // specific descr flavors (Bh/SwitchDict/ResidualCall/…)
+            // rather than a transparent wrapper; picking the correct
+            // variant requires per-opname semantic context that the
+            // generic flatten path does not carry.  No graph-emitted
+            // op currently ships a Descr arg — add the per-opname
+            // mapping here alongside the first such producer.
+            SpaceOperationArg::Descr(_) => panic!(
+                "GraphFlattener: lowering SpaceOperationArg::Descr requires \
+                 per-opname DescrOperand mapping; no production consumer yet"
+            ),
             // `flatten.py:365-367` also passes IndirectCallTargets
             // through unchanged.  `Operand::IndirectCallTargets` takes a
             // value, so clone the inner (the `Vec<Arc<JitCode>>` clone
@@ -1002,6 +1096,46 @@ where
             FlowValue::Variable(variable) => Operand::Register((self.get_register)(*variable)),
             FlowValue::Constant(constant) => (self.lower_constant)(constant),
         }
+    }
+}
+
+fn is_bool_or_tuple_exitswitch(
+    exits: &[LinkRef],
+    exitswitch: &Option<super::flow::ExitSwitch>,
+) -> bool {
+    matches!(exitswitch, Some(super::flow::ExitSwitch::Tuple(_)))
+        || exits
+            .iter()
+            .all(|link| is_bool_exitcase(&link.borrow().llexitcase))
+}
+
+fn is_bool_exitcase(exitcase: &Option<FlowValue>) -> bool {
+    matches!(
+        exitcase,
+        Some(FlowValue::Constant(Constant {
+            value: ConstantValue::Bool(_),
+            ..
+        }))
+    )
+}
+
+fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
+    matches!(
+        exitcase,
+        Some(FlowValue::Constant(Constant {
+            value: ConstantValue::Str(value),
+            ..
+        })) if value == "default"
+    )
+}
+
+fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
+    match llexitcase {
+        Some(FlowValue::Constant(Constant {
+            value: ConstantValue::Signed(value),
+            ..
+        })) => *value,
+        other => panic!("flatten_graph: switch link requires signed llexitcase, got {other:?}"),
     }
 }
 
@@ -1467,6 +1601,183 @@ mod tests {
     }
 
     #[test]
+    fn flatten_graph_emits_integer_switch_exits() {
+        use crate::jit::flow::{Block, Constant, ExitSwitch, FunctionGraph, Link};
+
+        let selector = Variable::new(VariableId(0), Kind::Int);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![selector.into()]);
+        let graph = FunctionGraph::new("int_switch", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(selector.into()));
+        let case_three = Link::new(
+            vec![Constant::signed(30).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(3).into()),
+        )
+        .with_llexitcase(Constant::signed(3).into())
+        .into_ref();
+        let case_one = Link::new(
+            vec![Constant::signed(10).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(1).into()),
+        )
+        .with_llexitcase(Constant::signed(1).into())
+        .into_ref();
+        let default = Link::new(
+            vec![Constant::signed(99).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::string("default").into()),
+        )
+        .into_ref();
+        start.closeblock(vec![case_three, case_one, default]);
+
+        let mut ssarepr = SSARepr::new("int_switch");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        let switch = ssarepr
+            .insns
+            .iter()
+            .find_map(|insn| match insn {
+                Insn::Op { opname, args, .. } if opname == "switch" => Some(args),
+                _ => None,
+            })
+            .expect("integer exits should lower to switch");
+        assert!(matches!(
+            switch.as_slice(),
+            [
+                Operand::Register(Register {
+                    kind: Kind::Int,
+                    index: 0
+                }),
+                Operand::Descr(_),
+            ]
+        ));
+        let Operand::Descr(descr) = &switch[1] else {
+            panic!("switch second operand must be SwitchDictDescr");
+        };
+        let DescrOperand::SwitchDict(switchdict) = descr.as_ref() else {
+            panic!("switch second operand must be SwitchDictDescr");
+        };
+        let keys: Vec<_> = switchdict.labels.iter().map(|(key, _)| *key).collect();
+        assert_eq!(keys, vec![1, 3]);
+        assert!(ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "int_return" && matches!(args.as_slice(), [Operand::ConstInt(99)])
+            )
+        }));
+    }
+
+    #[test]
+    fn flatten_graph_emits_unreachable_op_and_marker_for_switch_without_default() {
+        use crate::jit::flow::{Block, Constant, ExitSwitch, FunctionGraph, Link};
+
+        let selector = Variable::new(VariableId(0), Kind::Int);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![selector.into()]);
+        let graph = FunctionGraph::new("int_switch_no_default", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(selector.into()));
+        let case_one = Link::new(
+            vec![Constant::signed(10).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(1).into()),
+        )
+        .with_llexitcase(Constant::signed(1).into())
+        .into_ref();
+        let case_three = Link::new(
+            vec![Constant::signed(30).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(3).into()),
+        )
+        .with_llexitcase(Constant::signed(3).into())
+        .into_ref();
+        start.closeblock(vec![case_three, case_one]);
+
+        let mut ssarepr = SSARepr::new("int_switch_no_default");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        let switch_idx = ssarepr
+            .insns
+            .iter()
+            .position(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "switch"))
+            .expect("integer exits should lower to switch");
+        assert!(matches!(
+            ssarepr.insns.get(switch_idx + 1),
+            Some(Insn::Op { opname, args, result }) if opname == "unreachable" && args.is_empty() && result.is_none()
+        ));
+        assert!(matches!(
+            ssarepr.insns.get(switch_idx + 2),
+            Some(Insn::Unreachable)
+        ));
+    }
+
+    #[test]
+    fn flatten_graph_emits_tuple_goto_if_not_exitswitch() {
+        use crate::jit::flow::{
+            Block, Constant, ExitSwitch, ExitSwitchElement, FunctionGraph, Link,
+        };
+
+        let ptr = Variable::new(VariableId(0), Kind::Ref);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![ptr.into()]);
+        let graph = FunctionGraph::new("tuple_branch", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Tuple(vec![
+            ExitSwitchElement::Marker("ptr_nonzero".to_owned()),
+            ExitSwitchElement::Value(ptr.into()),
+            ExitSwitchElement::Marker("-live-before".to_owned()),
+        ]));
+        let false_link = Link::new(
+            vec![Constant::signed(0).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::bool(false).into()),
+        )
+        .with_llexitcase(Constant::bool(false).into())
+        .into_ref();
+        let true_link = Link::new(
+            vec![Constant::signed(1).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::bool(true).into()),
+        )
+        .with_llexitcase(Constant::bool(true).into())
+        .into_ref();
+        start.closeblock(vec![false_link, true_link]);
+
+        let mut ssarepr = SSARepr::new("tuple_branch");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        assert!(ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "goto_if_not_ptr_nonzero"
+                        && matches!(
+                            args.as_slice(),
+                            [Operand::Register(Register { kind: Kind::Ref, index: 0 }), Operand::TLabel(_)]
+                        )
+            )
+        }));
+    }
+
+    #[test]
     fn graph_flattener_emits_generic_result_op() {
         let src = Variable::new(VariableId(0), Kind::Ref);
         let dst = Variable::new(VariableId(1), Kind::Ref);
@@ -1498,47 +1809,6 @@ mod tests {
                     })]
                 ));
                 assert_eq!(*result, Register::new(Kind::Ref, 1));
-            }
-            other => panic!("unexpected insns: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn graph_flattener_passes_descr_args_through_by_identity() {
-        let int_arg = Variable::new(VariableId(0), Kind::Int);
-        let ref_arg = Variable::new(VariableId(1), Kind::Ref);
-        let dst = Variable::new(VariableId(2), Kind::Ref);
-        let descr = Rc::new(DescrOperand::CallDescrStub(CallDescrStub {
-            flavor: CallFlavor::MayForce,
-            arg_kinds: vec![Kind::Ref, Kind::Int],
-        }));
-        let op = SpaceOperation::new(
-            "residual_call_ir_r",
-            vec![
-                Constant::signed(17).into(),
-                crate::jit::flow::FlowListOfKind::new(Kind::Int, vec![int_arg.into()]).into(),
-                crate::jit::flow::FlowListOfKind::new(Kind::Ref, vec![ref_arg.into()]).into(),
-                descr.clone().into(),
-            ],
-            Some(dst.into()),
-            29,
-        );
-        let mut ssarepr = SSARepr::new("descr_passthrough");
-        let mut flattener = GraphFlattener::new(&mut ssarepr, |variable| {
-            Register::new(
-                variable.kind.expect("test variable kind"),
-                variable.id.0 as u16,
-            )
-        });
-
-        flattener.emit_space_operation(&op);
-
-        match &ssarepr.insns[..] {
-            [Insn::Op { args, .. }] => {
-                let Operand::Descr(emitted) = &args[3] else {
-                    panic!("expected descr operand, got {:?}", args[3]);
-                };
-                assert!(Rc::ptr_eq(emitted, &descr));
             }
             other => panic!("unexpected insns: {other:?}"),
         }
