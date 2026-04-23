@@ -580,6 +580,7 @@ pub fn builtin_bool(
             // default `True`.
             ConstValue::HostObject(_)
             | ConstValue::Function(_)
+            | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
             | ConstValue::Code(_)
             | ConstValue::Atom(_)

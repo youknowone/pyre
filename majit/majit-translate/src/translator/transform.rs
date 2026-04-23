@@ -878,6 +878,7 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::Dict(_)
         | ConstValue::Code(_)
         | ConstValue::Graphs(_)
+        | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
         | ConstValue::Atom(_)
         | ConstValue::SpecTag(_)

@@ -19,10 +19,10 @@
 //!
 //! ## Deferred to follow-up commits
 //!
-//! * `rtype_*` methods that take a `HighLevelOp` (e.g. `rtype_getattr`,
-//!   `rtype_str`, `rtype_bool`, `rtype_simple_call`, ...) — these land
-//!   after the `HighLevelOp` copy/dispatch/inputarg surface is ported
-//!   (`rpython/rtyper/rtyper.py:617+`).
+//! * Concrete `rtype_*` overrides that take a `HighLevelOp` (e.g.
+//!   `PtrRepr.rtype_getattr`, `PtrRepr.rtype_simple_call`, ...) land
+//!   with their matching `r*.py` ports. The base `Repr` missing-operation
+//!   surface is present here.
 //! * `Repr.__getattr__` autosetup side effect (`rmodel.py:95-106`) —
 //!   Rust has no `__getattr__`. Callers that previously relied on it
 //!   must invoke [`Repr::setup`] explicitly before reading derived
@@ -53,13 +53,165 @@
 //! This commit scaffolds the bottom of the chain (`Repr` base + leaves)
 //! so follow-ups can land in order without retrofitting infrastructure.
 
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use crate::flowspace::model::{ConstValue, Constant};
+use crate::annotator::model::{KnownType, SomeValue};
+use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::llannotation::lltype_to_annotation;
+use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
+use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp};
+
+/// Result shape returned by `Repr.rtype_*` methods.
+///
+/// RPython returns either a low-level `Variable` / `Constant` or `None`.
+/// Rust carries both variable and constant cases as [`Hlvalue`].
+pub type RTypeResult = Result<Option<Hlvalue>, TyperError>;
+
+fn hop_r_result(hop: &HighLevelOp) -> Result<Arc<dyn Repr>, TyperError> {
+    hop.r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("HighLevelOp.r_result is not set"))
+}
+
+fn hop_arg_const_string(hop: &HighLevelOp, index: usize) -> Result<String, TyperError> {
+    let args_s = hop.args_s.borrow();
+    let value = args_s
+        .get(index)
+        .and_then(|s| s.const_())
+        .ok_or_else(|| TyperError::message("expected constant string annotation"))?;
+    let ConstValue::Str(attr) = value else {
+        return Err(TyperError::message(format!(
+            "expected constant string annotation, got {value:?}"
+        )));
+    };
+    Ok(attr.clone())
+}
+
+fn void_field_const(name: &str) -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::Str(name.to_string()),
+        LowLevelType::Void,
+    ))
+}
+
+fn hlvalue_concretetype(value: &Hlvalue) -> Result<LowLevelType, TyperError> {
+    match value {
+        Hlvalue::Variable(v) => v
+            .concretetype
+            .clone()
+            .ok_or_else(|| TyperError::message("Variable has no concretetype")),
+        Hlvalue::Constant(c) => c
+            .concretetype
+            .clone()
+            .ok_or_else(|| TyperError::message("Constant has no concretetype")),
+    }
+}
+
+fn ptr_type(ptr: &LowLevelType) -> &lltype::Ptr {
+    let LowLevelType::Ptr(ptr) = ptr else {
+        panic!("expected Ptr lowleveltype, got {ptr:?}");
+    };
+    ptr
+}
+
+fn ptr_target_struct(target: &lltype::PtrTarget) -> Option<lltype::StructType> {
+    match target {
+        lltype::PtrTarget::Struct(t) => Some(t.clone()),
+        lltype::PtrTarget::ForwardReference(t) => match t.resolved() {
+            Some(LowLevelType::Struct(t)) => Some(*t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ptr_target_func(target: &lltype::PtrTarget) -> Option<lltype::FuncType> {
+    match target {
+        lltype::PtrTarget::Func(t) => Some(t.clone()),
+        lltype::PtrTarget::ForwardReference(t) => match t.resolved() {
+            Some(LowLevelType::Func(t)) => Some(*t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ptr_target_field_type(target: &lltype::PtrTarget, attr: &str) -> Option<LowLevelType> {
+    ptr_target_struct(target).and_then(|struct_t| struct_t.getattr_field_type(attr))
+}
+
+fn ptr_target_array_item_type(target: &lltype::PtrTarget) -> Option<LowLevelType> {
+    match target {
+        lltype::PtrTarget::Array(t) => Some(t.OF.clone()),
+        lltype::PtrTarget::FixedSizeArray(t) => Some(t.OF.clone()),
+        lltype::PtrTarget::ForwardReference(t) => match t.resolved() {
+            Some(LowLevelType::Array(t)) => Some(t.OF.clone()),
+            Some(LowLevelType::FixedSizeArray(t)) => Some(t.OF.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ptr_target_fixed_length(target: &lltype::PtrTarget) -> Option<usize> {
+    match target {
+        lltype::PtrTarget::FixedSizeArray(t) => Some(t.length),
+        lltype::PtrTarget::ForwardReference(t) => match t.resolved() {
+            Some(LowLevelType::FixedSizeArray(t)) => Some(t.length),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn lowlevel_array_item_type(container: &LowLevelType) -> Option<LowLevelType> {
+    match container {
+        LowLevelType::Array(t) => Some(t.OF.clone()),
+        LowLevelType::FixedSizeArray(t) => Some(t.OF.clone()),
+        LowLevelType::ForwardReference(t) => match t.resolved() {
+            Some(LowLevelType::Array(t)) => Some(t.OF.clone()),
+            Some(LowLevelType::FixedSizeArray(t)) => Some(t.OF.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn lowlevel_container_field_type(container: &LowLevelType, attr: &str) -> Option<LowLevelType> {
+    match container {
+        LowLevelType::Struct(t) => t.getattr_field_type(attr),
+        LowLevelType::ForwardReference(t) => match t.resolved() {
+            Some(LowLevelType::Struct(t)) => t.getattr_field_type(attr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::LowLevelType(Box::new(lltype)),
+        LowLevelType::Void,
+    ))
+}
+
+fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
+    let flags = HashMap::from([(
+        ConstValue::Str("flavor".to_string()),
+        ConstValue::Str("gc".to_string()),
+    )]);
+    HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags)).map(Hlvalue::Constant)
+}
+
+fn rtype_ptr_comparison(r_ptr: &dyn Repr, hop: &HighLevelOp, opname: &str) -> RTypeResult {
+    let vlist = hop.inputargs(vec![ConvertedTo::from(r_ptr), ConvertedTo::from(r_ptr)])?;
+    Ok(hop.genop(opname, vlist, GenopResult::LLType(LowLevelType::Bool)))
+}
 
 /// RPython `setupstate` (`rmodel.py:10-15`).
 ///
@@ -181,6 +333,26 @@ pub trait Repr: Debug {
     /// `__class__.__name__`; each concrete Repr returns its type name
     /// here.
     fn class_name(&self) -> &'static str;
+
+    /// Pairtype-dispatch tag. RPython uses `self.__class__` directly
+    /// inside `pairtype(R_A, R_B)` metaclass lookups; Rust exposes the
+    /// same identity as the explicit [`super::pairtype::ReprClassId`]
+    /// enum. Default [`super::pairtype::ReprClassId::Repr`] matches
+    /// upstream's `pairtype(Repr, X)` / `pairtype(X, Repr)` base-class
+    /// catch-all. Every concrete Repr overrides this to return its
+    /// specific tag.
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::Repr
+    }
+
+    /// RPython `rptr.py:341`: `InteriorPtrRepr -> InteriorPtrRepr`
+    /// conversion is allowed only when `r_from.__dict__ == r_to.__dict__`.
+    /// Non-interior reprs return `None`; [`super::pairtype`] uses this
+    /// attribute-shaped key for the single conversion arm that needs the
+    /// full repr state instead of just `lowleveltype`.
+    fn interior_ptr_repr_dict_key(&self) -> Option<lltype::InteriorPtr> {
+        None
+    }
 
     /// RPython `Repr.setup(self)` (`rmodel.py:35-59`).
     ///
@@ -374,6 +546,246 @@ pub trait Repr: Debug {
         true
     }
 
+    /// RPython `make_missing_op(Repr, opname)` (`rmodel.py:330-340`).
+    fn missing_rtype_operation(&self, opname: &str) -> TyperError {
+        TyperError::missing_rtype_operation(format!(
+            "unimplemented operation: '{opname}' on {}",
+            self.repr_string()
+        ))
+    }
+
+    /// RPython `Repr.rtype_getattr(self, hop)` (`rmodel.py:182-193`).
+    fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let args_s = hop.args_s.borrow();
+        let s_attr = args_s
+            .get(1)
+            .ok_or_else(|| TyperError::message("getattr() missing attribute argument"))?;
+        if let Some(ConstValue::Str(attr)) = s_attr.const_() {
+            let s_obj = args_s
+                .first()
+                .ok_or_else(|| TyperError::message("getattr() missing object argument"))?;
+            if s_obj.find_method(attr).is_none() {
+                return Err(TyperError::message(format!(
+                    "no method {attr} on {s_obj:?}"
+                )));
+            }
+            drop(args_s);
+            let v = hop
+                .args_v
+                .borrow()
+                .first()
+                .cloned()
+                .ok_or_else(|| TyperError::message("getattr() missing object argument"))?;
+            if let Hlvalue::Constant(c) = &v {
+                return inputconst(self, &c.value).map(|c| Some(Hlvalue::Constant(c)));
+            }
+            if let Some(value) = hop
+                .args_s
+                .borrow()
+                .first()
+                .and_then(|s| s.const_())
+                .cloned()
+            {
+                return inputconst(self, &value).map(|c| Some(Hlvalue::Constant(c)));
+            }
+            return Ok(Some(v));
+        }
+        Err(TyperError::message(
+            "getattr() with a non-constant attribute name",
+        ))
+    }
+
+    fn rtype_setattr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("setattr"))
+    }
+
+    fn rtype_len(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("len"))
+    }
+
+    fn rtype_getitem(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("getitem"))
+    }
+
+    fn rtype_setitem(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("setitem"))
+    }
+
+    fn rtype_eq(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("eq"))
+    }
+
+    fn rtype_ne(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("ne"))
+    }
+
+    /// RPython `Repr.rtype_bool(self, hop)` (`rmodel.py:199-207`).
+    fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
+        match self.rtype_len(hop) {
+            Ok(Some(vlen)) => Ok(hop.genop(
+                "int_is_true",
+                vec![vlen],
+                GenopResult::LLType(LowLevelType::Bool),
+            )),
+            Ok(None) => Err(TyperError::message(format!(
+                "rtype_bool({}) returned no length value",
+                self.repr_string()
+            ))),
+            Err(err) if err.is_missing_rtype_operation() => {
+                let s_result = hop.s_result.borrow();
+                if let Some(s_result) = &*s_result
+                    && let Some(value) = s_result.const_()
+                {
+                    return HighLevelOp::inputconst(&LowLevelType::Bool, value)
+                        .map(|c| Some(Hlvalue::Constant(c)));
+                }
+                Err(TyperError::message(format!(
+                    "rtype_bool({}) not implemented",
+                    self.repr_string()
+                )))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn rtype_simple_call(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("simple_call"))
+    }
+
+    // ---- arithmetic / conversion missing-op defaults ----
+    //
+    // RPython `rmodel.py:342` registers missing-op stubs for
+    // `setattr len contains iter` on the base `Repr`. The pyre port
+    // pre-registers the wider slot set that concrete Reprs (`FloatRepr`,
+    // `IntegerRepr`, …) override — adding a slot is source-compatible
+    // whereas RPython can `setattr` at runtime via `make_missing_op`.
+    // Each default raises the same `MissingRTypeOperation` upstream's
+    // `make_missing_op` closure does.
+
+    fn rtype_neg(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("neg"))
+    }
+
+    fn rtype_neg_ovf(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("neg_ovf"))
+    }
+
+    fn rtype_pos(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("pos"))
+    }
+
+    fn rtype_abs(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("abs"))
+    }
+
+    fn rtype_abs_ovf(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("abs_ovf"))
+    }
+
+    fn rtype_int(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("int"))
+    }
+
+    fn rtype_float(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("float"))
+    }
+
+    fn rtype_invert(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("invert"))
+    }
+
+    fn rtype_bin(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("bin"))
+    }
+
+    fn rtype_call_args(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("call_args"))
+    }
+
+    fn rtype_delattr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("delattr"))
+    }
+
+    fn rtype_delslice(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("delslice"))
+    }
+
+    fn rtype_getslice(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("getslice"))
+    }
+
+    fn rtype_hash(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("hash"))
+    }
+
+    fn rtype_hex(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("hex"))
+    }
+
+    fn rtype_hint(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("hint"))
+    }
+
+    fn rtype_id(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("id"))
+    }
+
+    fn rtype_isinstance(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("isinstance"))
+    }
+
+    fn rtype_issubtype(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("issubtype"))
+    }
+
+    fn rtype_iter(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("iter"))
+    }
+
+    fn rtype_long(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("long"))
+    }
+
+    fn rtype_next(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("next"))
+    }
+
+    fn rtype_oct(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("oct"))
+    }
+
+    fn rtype_ord(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("ord"))
+    }
+
+    fn rtype_repr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("repr"))
+    }
+
+    fn rtype_setslice(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("setslice"))
+    }
+
+    fn rtype_str(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("str"))
+    }
+
+    fn rtype_type(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("type"))
+    }
+
+    fn rtype_chr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("chr"))
+    }
+
+    /// RPython `Repr.rtype_unichr(self, hop)` (`rmodel.py:177-178`).
+    fn rtype_unichr(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(TyperError::message(format!(
+            "no unichr() support for {}",
+            self.repr_string()
+        )))
+    }
+
     /// RPython `Repr._freeze_(self)` (`rmodel.py:108-109`).
     /// Always true — Repr instances are immutable once created.
     fn freeze(&self) -> bool {
@@ -503,6 +915,10 @@ impl Repr for VoidRepr {
     fn class_name(&self) -> &'static str {
         "VoidRepr"
     }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::VoidRepr
+    }
 }
 
 /// RPython `impossible_repr = VoidRepr()` (`rmodel.py:359`) — the
@@ -566,6 +982,10 @@ impl Repr for SimplePointerRepr {
         "SimplePointerRepr"
     }
 
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::SimplePointerRepr
+    }
+
     /// RPython override (`rmodel.py:371-375`): only accept `None`, emit
     /// `nullptr(self.lowleveltype.TO)`.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
@@ -600,6 +1020,10 @@ impl PtrRepr {
             lltype: LowLevelType::Ptr(Box::new(ptrtype)),
         }
     }
+
+    fn ptrtype(&self) -> &lltype::Ptr {
+        ptr_type(&self.lltype)
+    }
 }
 
 impl Repr for PtrRepr {
@@ -613,6 +1037,239 @@ impl Repr for PtrRepr {
 
     fn class_name(&self) -> &'static str {
         "PtrRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::PtrRepr
+    }
+
+    fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let attr = hop_arg_const_string(hop, 1)?;
+        let r_result = hop_r_result(hop)?;
+        if matches!(&*hop.s_result.borrow(), Some(SomeValue::LLADTMeth(_))) {
+            return hop.inputarg(&r_result, 0).map(Some);
+        }
+        if self.ptrtype()._example()._lookup_adtmeth(&attr).is_ok() {
+            let value = hop
+                .s_result
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.const_())
+                .ok_or_else(|| {
+                    TyperError::message("PtrRepr.rtype_getattr expected constant ADT member")
+                })?
+                .clone();
+            return HighLevelOp::inputconst(&r_result, &value).map(|c| Some(Hlvalue::Constant(c)));
+        }
+        let field_type = ptr_target_field_type(&self.ptrtype().TO, &attr)
+            .ok_or_else(|| TyperError::message(self.ptrtype()._nofield(&attr)))?;
+        let newopname = if field_type.is_container_type() {
+            if let Some(struct_t) = ptr_target_struct(&self.ptrtype().TO)
+                && let Some((first_attr, first_struct)) = struct_t._first_struct()
+                && first_attr == attr
+                && matches!(&field_type, LowLevelType::Struct(t) if t.as_ref() == first_struct)
+            {
+                let v_self = hop.inputarg(self, 0)?;
+                return Ok(hop.genop(
+                    "cast_pointer",
+                    vec![v_self],
+                    GenopResult::LLType(r_result.lowleveltype().clone()),
+                ));
+            } else if r_result.class_name() == "InteriorPtrRepr" {
+                return hop.inputarg(self, 0).map(Some);
+            } else {
+                "getsubstruct"
+            }
+        } else {
+            "getfield"
+        };
+        let void = LowLevelType::Void;
+        let vlist = hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(&void)])?;
+        Ok(hop.genop(
+            newopname,
+            vlist,
+            GenopResult::LLType(r_result.lowleveltype().clone()),
+        ))
+    }
+
+    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let attr = hop_arg_const_string(hop, 1)?;
+        let field_type = ptr_target_field_type(&self.ptrtype().TO, &attr)
+            .ok_or_else(|| TyperError::message(self.ptrtype()._nofield(&attr)))?;
+        assert!(!field_type.is_container_type());
+        let args_r = hop.args_r.borrow();
+        let r_value = args_r
+            .get(2)
+            .and_then(|r| r.as_ref())
+            .ok_or_else(|| TyperError::message("PtrRepr.rtype_setattr missing value repr"))?;
+        let void = LowLevelType::Void;
+        let vlist = hop.inputargs(vec![
+            ConvertedTo::from(self),
+            ConvertedTo::from(&void),
+            ConvertedTo::from(r_value),
+        ])?;
+        hop.genop("setfield", vlist, GenopResult::Void);
+        Ok(None)
+    }
+
+    fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
+        if let Some(length) = ptr_target_fixed_length(&self.ptrtype().TO) {
+            return HighLevelOp::inputconst(&LowLevelType::Signed, &ConstValue::Int(length as i64))
+                .map(|c| Some(Hlvalue::Constant(c)));
+        }
+        let r_result = hop_r_result(hop)?;
+        let vlist = hop.inputargs(vec![ConvertedTo::from(self)])?;
+        Ok(hop.genop(
+            "getarraysize",
+            vlist,
+            GenopResult::LLType(r_result.lowleveltype().clone()),
+        ))
+    }
+
+    fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::from(self)])?;
+        Ok(hop.genop(
+            "ptr_nonzero",
+            vlist,
+            GenopResult::LLType(LowLevelType::Bool),
+        ))
+    }
+
+    fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        let item_type = ptr_target_array_item_type(&self.ptrtype().TO).ok_or_else(|| {
+            TyperError::message(format!(
+                "getitem on non-array pointer {:?}",
+                self.ptrtype().TO
+            ))
+        })?;
+        let r_result = hop_r_result(hop)?;
+        if item_type.is_container_type() {
+            if r_result.class_name() == "InteriorPtrRepr" {
+                let mut inputs = hop.inputargs(vec![
+                    ConvertedTo::from(self),
+                    ConvertedTo::from(&LowLevelType::Signed),
+                ])?;
+                let v_index = inputs
+                    .pop()
+                    .ok_or_else(|| TyperError::message("PtrRepr.rtype_getitem missing index"))?;
+                let v_array = inputs
+                    .pop()
+                    .ok_or_else(|| TyperError::message("PtrRepr.rtype_getitem missing array"))?;
+                let interior_ptr_type = self.ptrtype()._interior_ptr_type_with_index(&item_type);
+                let v_interior_ptr = hop
+                    .genop(
+                        "malloc",
+                        vec![
+                            lowlevel_type_const(LowLevelType::Struct(Box::new(
+                                interior_ptr_type.clone(),
+                            ))),
+                            gc_flavor_const()?,
+                        ],
+                        GenopResult::LLType(LowLevelType::Ptr(Box::new(lltype::Ptr {
+                            TO: lltype::PtrTarget::Struct(interior_ptr_type),
+                        }))),
+                    )
+                    .ok_or_else(|| TyperError::message("malloc unexpectedly returned no value"))?;
+                hop.genop(
+                    "setfield",
+                    vec![v_interior_ptr.clone(), void_field_const("ptr"), v_array],
+                    GenopResult::Void,
+                );
+                hop.genop(
+                    "setfield",
+                    vec![v_interior_ptr.clone(), void_field_const("index"), v_index],
+                    GenopResult::Void,
+                );
+                return Ok(Some(v_interior_ptr));
+            }
+            let vlist = hop.inputargs(vec![
+                ConvertedTo::from(self),
+                ConvertedTo::from(&LowLevelType::Signed),
+            ])?;
+            return Ok(hop.genop(
+                "getarraysubstruct",
+                vlist,
+                GenopResult::LLType(r_result.lowleveltype().clone()),
+            ));
+        }
+        let vlist = hop.inputargs(vec![
+            ConvertedTo::from(self),
+            ConvertedTo::from(&LowLevelType::Signed),
+        ])?;
+        Ok(hop.genop(
+            "getarrayitem",
+            vlist,
+            GenopResult::LLType(r_result.lowleveltype().clone()),
+        ))
+    }
+
+    fn rtype_setitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        let item_type = ptr_target_array_item_type(&self.ptrtype().TO).ok_or_else(|| {
+            TyperError::message(format!(
+                "setitem on non-array pointer {:?}",
+                self.ptrtype().TO
+            ))
+        })?;
+        assert!(!item_type.is_container_type());
+        let args_r = hop.args_r.borrow();
+        let r_value = args_r
+            .get(2)
+            .and_then(|r| r.as_ref())
+            .ok_or_else(|| TyperError::message("PtrRepr.rtype_setitem missing value repr"))?;
+        let vlist = hop.inputargs(vec![
+            ConvertedTo::from(self),
+            ConvertedTo::from(&LowLevelType::Signed),
+            ConvertedTo::from(r_value),
+        ])?;
+        hop.genop("setarrayitem", vlist, GenopResult::Void);
+        Ok(None)
+    }
+
+    fn rtype_eq(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_ptr_comparison(self, hop, "ptr_eq")
+    }
+
+    fn rtype_ne(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_ptr_comparison(self, hop, "ptr_ne")
+    }
+
+    fn rtype_simple_call(&self, hop: &HighLevelOp) -> RTypeResult {
+        let func_type = ptr_target_func(&self.ptrtype().TO).ok_or_else(|| {
+            TyperError::message(format!("calling a non-function {:?}", self.ptrtype().TO))
+        })?;
+        let args_r = hop.args_r.borrow().clone();
+        let mut vlist = Vec::with_capacity(args_r.len() + 1);
+        for (i, r_arg) in args_r.iter().enumerate() {
+            let r_arg = r_arg
+                .as_ref()
+                .ok_or_else(|| TyperError::message("PtrRepr.rtype_simple_call missing arg repr"))?;
+            vlist.push(hop.inputarg(r_arg, i)?);
+        }
+        let nexpected = func_type.args.len();
+        let nactual = vlist.len().saturating_sub(1);
+        if nactual != nexpected {
+            return Err(TyperError::message(format!(
+                "argcount mismatch:  expected {nexpected} got {nactual}"
+            )));
+        }
+        let opname = if let Some(Hlvalue::Constant(c_func)) = vlist.first() {
+            if let ConstValue::LLPtr(ptr) = &c_func.value {
+                if let Ok(lltype::_ptr_obj::Func(func)) = ptr._obj() {
+                    if let Some(graph_id) = func.graph {
+                        hop.llops.borrow().record_extra_call_by_graph_id(graph_id)?;
+                    }
+                }
+            }
+            "direct_call"
+        } else {
+            vlist.push(Hlvalue::Constant(HighLevelOp::inputconst(
+                &LowLevelType::Void,
+                &ConstValue::None,
+            )?));
+            "indirect_call"
+        };
+        hop.exception_is_here()?;
+        Ok(hop.genop(opname, vlist, GenopResult::LLType(func_type.result.clone())))
     }
 }
 
@@ -692,6 +1349,82 @@ impl InteriorPtrRepr {
             parentptrtype,
         }
     }
+
+    fn result_target(&self) -> &LowLevelType {
+        self._ptrtype.TO.as_ref()
+    }
+
+    fn getinteriorfieldargs(
+        &self,
+        hop: &HighLevelOp,
+        v_self: Hlvalue,
+    ) -> Result<Vec<Hlvalue>, TyperError> {
+        let mut vlist = Vec::new();
+        let has_index = self.v_offsets.iter().any(|offset| offset.is_none());
+        let mut nameiter = Vec::<String>::new();
+        let mut name_index = 0usize;
+        let mut interior_struct = None;
+        if has_index {
+            let concretetype = hlvalue_concretetype(&v_self)?;
+            let ptr = ptr_type(&concretetype);
+            let struct_t = ptr_target_struct(&ptr.TO).ok_or_else(|| {
+                TyperError::message("InteriorPtrRepr expected struct concretetype")
+            })?;
+            nameiter = struct_t._names.clone();
+            let name = nameiter
+                .get(name_index)
+                .ok_or_else(|| TyperError::message("interior pointer struct has no fields"))?
+                .clone();
+            name_index += 1;
+            let field_type = struct_t.getattr_field_type(&name).ok_or_else(|| {
+                TyperError::message(format!("interior pointer struct missing field {name:?}"))
+            })?;
+            let v_field = hop
+                .genop(
+                    "getfield",
+                    vec![v_self.clone(), void_field_const(&name)],
+                    GenopResult::LLType(field_type),
+                )
+                .ok_or_else(|| TyperError::message("getfield unexpectedly returned no value"))?;
+            vlist.push(v_field);
+            interior_struct = Some(struct_t);
+        } else {
+            vlist.push(v_self.clone());
+        }
+        for v_offset in &self.v_offsets {
+            if let Some(v_offset) = v_offset {
+                vlist.push(Hlvalue::Constant(v_offset.clone()));
+            } else {
+                let struct_t = interior_struct
+                    .as_ref()
+                    .ok_or_else(|| TyperError::message("missing interior pointer struct"))?;
+                let name = nameiter
+                    .get(name_index)
+                    .ok_or_else(|| {
+                        TyperError::message("interior pointer offset has no matching field")
+                    })?
+                    .clone();
+                name_index += 1;
+                let field_type = struct_t.getattr_field_type(&name).ok_or_else(|| {
+                    TyperError::message(format!("interior pointer struct missing field {name:?}"))
+                })?;
+                let v_field = hop
+                    .genop(
+                        "getfield",
+                        vec![v_self.clone(), void_field_const(&name)],
+                        GenopResult::LLType(field_type),
+                    )
+                    .ok_or_else(|| {
+                        TyperError::message("getfield unexpectedly returned no value")
+                    })?;
+                vlist.push(v_field);
+            }
+        }
+        if has_index && name_index != nameiter.len() {
+            panic!("interior pointer field unpack left unused fields");
+        }
+        Ok(vlist)
+    }
 }
 
 impl Repr for InteriorPtrRepr {
@@ -705,6 +1438,181 @@ impl Repr for InteriorPtrRepr {
 
     fn class_name(&self) -> &'static str {
         "InteriorPtrRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::InteriorPtrRepr
+    }
+
+    fn interior_ptr_repr_dict_key(&self) -> Option<lltype::InteriorPtr> {
+        Some(self._ptrtype.clone())
+    }
+
+    fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
+        let mut inputs = hop.inputargs(vec![ConvertedTo::from(self)])?;
+        let v_self = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_len missing self"))?;
+        let vlist = self.getinteriorfieldargs(hop, v_self)?;
+        Ok(hop.genop(
+            "getinteriorarraysize",
+            vlist,
+            GenopResult::LLType(LowLevelType::Signed),
+        ))
+    }
+
+    fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let attr = hop_arg_const_string(hop, 1)?;
+        let r_result = hop_r_result(hop)?;
+        if matches!(&*hop.s_result.borrow(), Some(SomeValue::LLADTMeth(_))) {
+            return hop.inputarg(&r_result, 0).map(Some);
+        }
+        let field_type = lowlevel_container_field_type(self.result_target(), &attr)
+            .ok_or_else(|| TyperError::message(format!("missing interior field {attr:?}")))?;
+        if field_type.is_container_type() {
+            hop.inputarg(self, 0).map(Some)
+        } else {
+            let void = LowLevelType::Void;
+            let mut inputs =
+                hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(&void)])?;
+            let v_attr = inputs
+                .pop()
+                .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_getattr missing attr"))?;
+            let v_self = inputs
+                .pop()
+                .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_getattr missing self"))?;
+            let mut vlist = self.getinteriorfieldargs(hop, v_self)?;
+            vlist.push(v_attr);
+            Ok(hop.genop(
+                "getinteriorfield",
+                vlist,
+                GenopResult::LLType(r_result.lowleveltype().clone()),
+            ))
+        }
+    }
+
+    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let attr = hop_arg_const_string(hop, 1)?;
+        let field_type = lowlevel_container_field_type(self.result_target(), &attr)
+            .ok_or_else(|| TyperError::message(format!("missing interior field {attr:?}")))?;
+        assert!(!field_type.is_container_type());
+        let args_r = hop.args_r.borrow();
+        let r_value = args_r.get(2).and_then(|r| r.as_ref()).ok_or_else(|| {
+            TyperError::message("InteriorPtrRepr.rtype_setattr missing value repr")
+        })?;
+        let void = LowLevelType::Void;
+        let mut inputs = hop.inputargs(vec![
+            ConvertedTo::from(self),
+            ConvertedTo::from(&void),
+            ConvertedTo::from(r_value),
+        ])?;
+        let v_value = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_setattr missing value"))?;
+        let v_fieldname = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_setattr missing field"))?;
+        let v_self = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_setattr missing self"))?;
+        let mut vlist = self.getinteriorfieldargs(hop, v_self)?;
+        vlist.push(v_fieldname);
+        vlist.push(v_value);
+        Ok(hop.genop("setinteriorfield", vlist, GenopResult::Void))
+    }
+
+    fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        let item_type = lowlevel_array_item_type(self.result_target()).ok_or_else(|| {
+            TyperError::message(format!(
+                "getitem on non-array interior pointer {:?}",
+                self.result_target()
+            ))
+        })?;
+        if item_type.is_container_type() {
+            let mut inputs = hop.inputargs(vec![
+                ConvertedTo::from(self),
+                ConvertedTo::from(&LowLevelType::Signed),
+            ])?;
+            let v_index = inputs.pop().ok_or_else(|| {
+                TyperError::message("InteriorPtrRepr.rtype_getitem missing index")
+            })?;
+            let v_array = inputs.pop().ok_or_else(|| {
+                TyperError::message("InteriorPtrRepr.rtype_getitem missing array")
+            })?;
+            let interior_ptr_type =
+                ptr_type(self.lowleveltype())._interior_ptr_type_with_index(&item_type);
+            let v_interior_ptr = hop
+                .genop(
+                    "malloc",
+                    vec![
+                        lowlevel_type_const(LowLevelType::Struct(Box::new(
+                            interior_ptr_type.clone(),
+                        ))),
+                        gc_flavor_const()?,
+                    ],
+                    GenopResult::LLType(LowLevelType::Ptr(Box::new(lltype::Ptr {
+                        TO: lltype::PtrTarget::Struct(interior_ptr_type),
+                    }))),
+                )
+                .ok_or_else(|| TyperError::message("malloc unexpectedly returned no value"))?;
+            hop.genop(
+                "setfield",
+                vec![v_interior_ptr.clone(), void_field_const("ptr"), v_array],
+                GenopResult::Void,
+            );
+            hop.genop(
+                "setfield",
+                vec![v_interior_ptr.clone(), void_field_const("index"), v_index],
+                GenopResult::Void,
+            );
+            return Ok(Some(v_interior_ptr));
+        }
+        let mut inputs = hop.inputargs(vec![
+            ConvertedTo::from(self),
+            ConvertedTo::from(&LowLevelType::Signed),
+        ])?;
+        let v_index = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_getitem missing index"))?;
+        let v_self = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_getitem missing self"))?;
+        let mut vlist = self.getinteriorfieldargs(hop, v_self)?;
+        vlist.push(v_index);
+        Ok(hop.genop("getinteriorfield", vlist, GenopResult::LLType(item_type)))
+    }
+
+    fn rtype_setitem(&self, hop: &HighLevelOp) -> RTypeResult {
+        let item_type = lowlevel_array_item_type(self.result_target()).ok_or_else(|| {
+            TyperError::message(format!(
+                "setitem on non-array interior pointer {:?}",
+                self.result_target()
+            ))
+        })?;
+        assert!(!item_type.is_container_type());
+        let args_r = hop.args_r.borrow();
+        let r_value = args_r.get(2).and_then(|r| r.as_ref()).ok_or_else(|| {
+            TyperError::message("InteriorPtrRepr.rtype_setitem missing value repr")
+        })?;
+        let mut inputs = hop.inputargs(vec![
+            ConvertedTo::from(self),
+            ConvertedTo::from(&LowLevelType::Signed),
+            ConvertedTo::from(r_value),
+        ])?;
+        let v_value = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_setitem missing value"))?;
+        let v_index = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_setitem missing index"))?;
+        let v_self = inputs
+            .pop()
+            .ok_or_else(|| TyperError::message("InteriorPtrRepr.rtype_setitem missing self"))?;
+        let mut vlist = self.getinteriorfieldargs(hop, v_self)?;
+        vlist.push(v_index);
+        vlist.push(v_value);
+        hop.genop("setinteriorfield", vlist, GenopResult::Void);
+        Ok(None)
     }
 }
 
@@ -748,6 +1656,32 @@ impl Repr for LLADTMethRepr {
     fn class_name(&self) -> &'static str {
         "LLADTMethRepr"
     }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::LLADTMethRepr
+    }
+
+    fn rtype_simple_call(&self, hop: &HighLevelOp) -> RTypeResult {
+        let hop2 = hop.copy();
+        let func = self.func.clone();
+        let rtyper = &hop.rtyper;
+        let annotator = rtyper
+            .annotator
+            .upgrade()
+            .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
+        let s_func = annotator
+            .bookkeeper
+            .immutablevalue(&func)
+            .map_err(|err| TyperError::message(err.to_string()))?;
+        let v_ptr =
+            hop2.args_v.borrow().first().cloned().ok_or_else(|| {
+                TyperError::message("LLADTMethRepr.rtype_simple_call missing self")
+            })?;
+        hop2.r_s_popfirstarg();
+        hop2.v_s_insertfirstarg(v_ptr, lltype_to_annotation(self.ll_ptrtype.clone()))?;
+        hop2.v_s_insertfirstarg(Hlvalue::Constant(Constant::new(func)), s_func)?;
+        hop2.dispatch()
+    }
 }
 
 // ____________________________________________________________
@@ -772,6 +1706,24 @@ pub enum ReprKey {
     /// RPython `SomeImpossibleValue.rtyper_makekey = (self.__class__,)`
     /// (rmodel.py:292-293).
     Impossible,
+    /// RPython `SomeInteger.rtyper_makekey = (self.__class__,
+    /// self.knowntype)` (`rint.py:190-191`).
+    Integer(KnownType),
+    /// RPython `SomeNone.rtyper_makekey = (self.__class__,)`
+    /// (`rnone.py:39-40`).
+    None_,
+    /// RPython `SomeBool.rtyper_makekey = (self.__class__,)`
+    /// (`rbool.py:43-44`).
+    Bool,
+    /// RPython `SomeFloat.rtyper_makekey = (self.__class__,)`
+    /// (`rfloat.py:71-72`).
+    Float,
+    /// RPython `SomeSingleFloat.rtyper_makekey = (self.__class__,)`
+    /// (`rfloat.py:147-148`).
+    SingleFloat,
+    /// RPython `SomeLongFloat.rtyper_makekey = (self.__class__,)`
+    /// (`rfloat.py:163-164`).
+    LongFloat,
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -788,6 +1740,17 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
     match s_obj {
         // rmodel.py:292-293: SomeImpossibleValue.rtyper_makekey = (self.__class__,).
         SomeValue::Impossible => ReprKey::Impossible,
+        SomeValue::Integer(i) => ReprKey::Integer(i.base.knowntype),
+        // rnone.py:39-40: SomeNone.rtyper_makekey = (self.__class__,).
+        SomeValue::None_(_) => ReprKey::None_,
+        // rbool.py:43-44: SomeBool.rtyper_makekey = (self.__class__,).
+        SomeValue::Bool(_) => ReprKey::Bool,
+        // rfloat.py:71-72: SomeFloat.rtyper_makekey = (self.__class__,).
+        SomeValue::Float(_) => ReprKey::Float,
+        // rfloat.py:147-148: SomeSingleFloat.rtyper_makekey = (self.__class__,).
+        SomeValue::SingleFloat(_) => ReprKey::SingleFloat,
+        // rfloat.py:163-164: SomeLongFloat.rtyper_makekey = (self.__class__,).
+        SomeValue::LongFloat(_) => ReprKey::LongFloat,
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical
@@ -820,17 +1783,29 @@ pub fn rtyper_makerepr(
         // structured MissingRTypeOperation with the expected target
         // module so follow-up cascading ports can anchor on the
         // surface without guessing.
-        SomeValue::Integer(_) => Err(TyperError::missing_rtype_operation(
-            "SomeInteger.rtyper_makerepr — port rpython/rtyper/rint.py IntegerRepr",
-        )),
-        SomeValue::Bool(_) => Err(TyperError::missing_rtype_operation(
-            "SomeBool.rtyper_makerepr — port rpython/rtyper/rbool.py BoolRepr",
-        )),
-        SomeValue::Float(_) | SomeValue::SingleFloat(_) | SomeValue::LongFloat(_) => {
-            Err(TyperError::missing_rtype_operation(
-                "SomeFloat.rtyper_makerepr — port rpython/rtyper/rfloat.py FloatRepr",
-            ))
+        SomeValue::Integer(i) => Ok(crate::translator::rtyper::rint::getintegerrepr(
+            &lltype::build_number(None, i.base.knowntype),
+        ) as std::sync::Arc<dyn Repr>),
+        // rbool.py:39-41: SomeBool.rtyper_makerepr returns the singleton
+        // `bool_repr`.
+        SomeValue::Bool(_) => {
+            Ok(crate::translator::rtyper::rbool::bool_repr() as std::sync::Arc<dyn Repr>)
         }
+        // rfloat.py:67-69: SomeFloat.rtyper_makerepr returns the
+        // module-global `float_repr`.
+        SomeValue::Float(_) => {
+            Ok(crate::translator::rtyper::rfloat::float_repr() as std::sync::Arc<dyn Repr>)
+        }
+        // rfloat.py:144-148: SomeSingleFloat.rtyper_makerepr returns a
+        // fresh `SingleFloatRepr()` per call.
+        SomeValue::SingleFloat(_) => Ok(std::sync::Arc::new(
+            crate::translator::rtyper::rfloat::SingleFloatRepr::new(),
+        ) as std::sync::Arc<dyn Repr>),
+        // rfloat.py:160-164: SomeLongFloat.rtyper_makerepr returns a
+        // fresh `LongFloatRepr()` per call.
+        SomeValue::LongFloat(_) => Ok(std::sync::Arc::new(
+            crate::translator::rtyper::rfloat::LongFloatRepr::new(),
+        ) as std::sync::Arc<dyn Repr>),
         SomeValue::String(_)
         | SomeValue::UnicodeString(_)
         | SomeValue::ByteArray(_)
@@ -863,9 +1838,11 @@ pub fn rtyper_makerepr(
                 "SomeBuiltin.rtyper_makerepr — port rpython/rtyper/rpbc.py FunctionRepr",
             ))
         }
-        SomeValue::None_(_) => Err(TyperError::missing_rtype_operation(
-            "SomeNone.rtyper_makerepr — port rpython/rtyper/rnone.py NoneRepr",
-        )),
+        // rnone.py:35-37: SomeNone.rtyper_makerepr returns the singleton
+        // `none_repr`.
+        SomeValue::None_(_) => {
+            Ok(crate::translator::rtyper::rnone::none_repr() as std::sync::Arc<dyn Repr>)
+        }
         SomeValue::Object(_) | SomeValue::Type(_) => Err(TyperError::missing_rtype_operation(
             "SomeObject/SomeType.rtyper_makerepr — port rpython/rtyper/robject.py",
         )),
@@ -910,15 +1887,76 @@ impl fmt::Display for SimplePointerRepr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::annotator::model::{SomePtr, SomeValue};
+    use crate::annotator::model::{SomeInteger, SomePtr, SomeString, SomeValue};
+    use crate::flowspace::model::{Block, BlockKey, FunctionGraph, SpaceOperation, Variable};
     use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
     use crate::translator::rtyper::lltypesystem::lltype::FuncType;
-    use crate::translator::rtyper::rtyper::RPythonTyper;
+    use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+
+    #[derive(Debug)]
+    struct TestRepr {
+        state: ReprState,
+        lltype: LowLevelType,
+        class_name: &'static str,
+    }
+
+    impl TestRepr {
+        fn new(lltype: LowLevelType, class_name: &'static str) -> Self {
+            TestRepr {
+                state: ReprState::new(),
+                lltype,
+                class_name,
+            }
+        }
+    }
+
+    impl Repr for TestRepr {
+        fn lowleveltype(&self) -> &LowLevelType {
+            &self.lltype
+        }
+
+        fn state(&self) -> &ReprState {
+            &self.state
+        }
+
+        fn class_name(&self) -> &'static str {
+            self.class_name
+        }
+    }
 
     fn rtyper_for_tests() -> RPythonTyper {
         let ann = RPythonAnnotator::new(None, None, None, false);
         RPythonTyper::new(&ann)
+    }
+
+    fn live_rtyper_for_hop() -> (Rc<RPythonAnnotator>, Rc<RPythonTyper>) {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        (ann, rtyper)
+    }
+
+    fn const_string_annotation(value: &str) -> SomeValue {
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str(value.to_string())));
+        SomeValue::String(s_attr)
+    }
+
+    fn empty_hop(rtyper: &Rc<RPythonTyper>, opname: &str) -> HighLevelOp {
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                opname.to_string(),
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        )
     }
 
     #[test]
@@ -1063,6 +2101,391 @@ mod tests {
     }
 
     #[test]
+    fn ptrrepr_rtype_getattr_emits_getfield_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, StructType};
+
+        let ptr = Ptr {
+            TO: PtrTarget::Struct(StructType::new(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "getattr");
+        let mut v_ptr = Variable::new();
+        v_ptr.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        hop.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(v_ptr), void_field_const("x")]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            const_string_annotation("x"),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(impossible_repr() as Arc<dyn Repr>)]);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::new(false, false)));
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        let result = r_ptr.rtype_getattr(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        assert_eq!(ops.ops[0].args.len(), 2);
+    }
+
+    #[test]
+    fn ptrrepr_rtype_setattr_emits_setfield_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, StructType};
+
+        let ptr = Ptr {
+            TO: PtrTarget::Struct(StructType::new(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "setattr");
+        let mut v_ptr = Variable::new();
+        v_ptr.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_ptr),
+            void_field_const("x"),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(3),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            const_string_annotation("x"),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(r_ptr_dyn),
+            Some(impossible_repr() as Arc<dyn Repr>),
+            Some(r_signed),
+        ]);
+
+        assert!(r_ptr.rtype_setattr(&hop).unwrap().is_none());
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "setfield");
+        assert_eq!(ops.ops[0].args.len(), 3);
+    }
+
+    #[test]
+    fn ptrrepr_rtype_simple_call_emits_indirect_call_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+
+        let ptr = Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            }),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "simple_call");
+        let mut v_func = Variable::new();
+        v_func.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_func),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(5),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_signed.clone())]);
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        let result = r_ptr.rtype_simple_call(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "indirect_call");
+        assert_eq!(ops.ops[0].args.len(), 3);
+    }
+
+    #[test]
+    fn ptrrepr_rtype_simple_call_records_extra_call_for_direct_graph_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+        use crate::translator::translator::CallGraphKey;
+
+        let (ann, rtyper) = live_rtyper_for_hop();
+        let helper = rtyper
+            .lowlevel_helper_function("callee", vec![LowLevelType::Signed], LowLevelType::Signed)
+            .expect("helper graph");
+        let helper_graph = helper.graph.as_ref().expect("helper graph must exist");
+        let func_ptr = rtyper.getcallable(helper_graph).expect("getcallable");
+        let PtrTarget::Func(func_type) = func_ptr._TYPE.TO.clone() else {
+            panic!("helper callable must be a function pointer");
+        };
+        let r_ptr = Arc::new(PtrRepr::new(func_ptr._TYPE.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_signed: Arc<dyn Repr> = Arc::new(TestRepr::new(LowLevelType::Signed, "SignedRepr"));
+        let func_ptr_type = LowLevelType::Ptr(Box::new(func_ptr._TYPE.clone()));
+        let c_func = inputconst_from_lltype(&func_ptr_type, &ConstValue::LLPtr(Box::new(func_ptr)))
+            .expect("function ptr constant");
+
+        let caller_start = Block::shared(Vec::new());
+        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+            "caller",
+            caller_start.clone(),
+        )));
+        ann.translator.graphs.borrow_mut().push(caller.clone());
+        ann.annotated
+            .borrow_mut()
+            .insert(BlockKey::of(&caller_start), Some(caller.clone()));
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            Some(caller_start.clone()),
+        )));
+        let mut v_result = Variable::new();
+        v_result.concretetype = Some(func_type.result.clone());
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call",
+                vec![
+                    Hlvalue::Constant(c_func),
+                    Hlvalue::Constant(Constant::with_concretetype(
+                        ConstValue::Int(5),
+                        LowLevelType::Signed,
+                    )),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(r_ptr.ptrtype().clone())),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_signed.clone())]);
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        let result = r_ptr.rtype_simple_call(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        assert_eq!(llops.borrow().ops[0].opname, "direct_call");
+
+        let callgraph = &ann.translator;
+        let callgraph = callgraph.callgraph.borrow();
+        let expected_key = CallGraphKey {
+            caller: crate::flowspace::model::GraphKey::of(&caller),
+            callee: crate::flowspace::model::GraphKey::of(&helper_graph.graph),
+            tag_block: BlockKey::of(&caller_start),
+            tag_index: 0,
+        };
+        let edge = callgraph
+            .get(&expected_key)
+            .expect("direct call should record callgraph edge");
+        assert_eq!(
+            crate::flowspace::model::GraphKey::of(&edge.caller),
+            crate::flowspace::model::GraphKey::of(&caller)
+        );
+        assert_eq!(
+            crate::flowspace::model::GraphKey::of(&edge.callee),
+            crate::flowspace::model::GraphKey::of(&helper_graph.graph)
+        );
+    }
+
+    #[test]
+    fn ptrrepr_rtype_len_fixed_array_returns_constant_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArrayType, Ptr, PtrTarget};
+
+        let r_ptr = PtrRepr::new(Ptr {
+            TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 4)),
+        });
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "len");
+        let out = r_ptr.rtype_len(&hop).unwrap().unwrap();
+        let Hlvalue::Constant(c) = out else {
+            panic!("fixed array len should return a Constant");
+        };
+        assert_eq!(c.value, ConstValue::Int(4));
+        assert_eq!(c.concretetype, Some(LowLevelType::Signed));
+    }
+
+    #[test]
+    fn ptrrepr_rtype_getitem_emits_getarrayitem_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, Ptr, PtrTarget};
+
+        let ptr = Ptr {
+            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let hop = empty_hop(&rtyper, "getitem");
+        let mut v_array = Variable::new();
+        v_array.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_array),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_signed.clone())]);
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        let result = r_ptr.rtype_getitem(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "getarrayitem");
+    }
+
+    #[test]
+    fn ptrrepr_rtype_setitem_emits_setarrayitem_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, Ptr, PtrTarget};
+
+        let ptr = Ptr {
+            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let hop = empty_hop(&rtyper, "setitem");
+        let mut v_array = Variable::new();
+        v_array.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_array),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(9),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_signed.clone()), Some(r_signed)]);
+
+        assert!(r_ptr.rtype_setitem(&hop).unwrap().is_none());
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "setarrayitem");
+    }
+
+    #[test]
+    fn ptrrepr_rtype_getitem_container_result_allocates_interior_ptr_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, Ptr, PtrTarget, StructType,
+        };
+
+        let item = StructType::new("Item", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr = Ptr {
+            TO: PtrTarget::Array(ArrayType::gc(LowLevelType::Struct(Box::new(item)))),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let r_result: Arc<dyn Repr> = Arc::new(TestRepr::new(
+            LowLevelType::Ptr(Box::new(ptr.clone())),
+            "InteriorPtrRepr",
+        ));
+        let hop = empty_hop(&rtyper, "getitem");
+        let mut v_array = Variable::new();
+        v_array.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_array),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(2),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_signed)]);
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let result = r_ptr.rtype_getitem(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 3);
+        assert_eq!(ops.ops[0].opname, "malloc");
+        assert_eq!(ops.ops[1].opname, "setfield");
+        assert_eq!(ops.ops[2].opname, "setfield");
+    }
+
+    #[test]
+    fn ptrrepr_rtype_eq_ne_emit_pointer_comparisons_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+
+        let ptr = Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let hop = empty_hop(&rtyper, "eq");
+        let mut v_left = Variable::new();
+        v_left.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        let mut v_right = Variable::new();
+        v_right.concretetype = Some(LowLevelType::Ptr(Box::new(ptr.clone())));
+        hop.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(v_left), Hlvalue::Variable(v_right)]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr.clone())),
+            SomeValue::Ptr(SomePtr::new(ptr)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn.clone()), Some(r_ptr_dyn)]);
+
+        assert!(r_ptr.rtype_eq(&hop).unwrap().is_some());
+        assert!(r_ptr.rtype_ne(&hop).unwrap().is_some());
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops[0].opname, "ptr_eq");
+        assert_eq!(ops.ops[1].opname, "ptr_ne");
+    }
+
+    #[test]
     fn ptr_somevalues_make_rptr_reprs() {
         use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
 
@@ -1135,6 +2558,101 @@ mod tests {
         assert_eq!(c_offset.value, ConstValue::Str("x".into()));
         assert_eq!(c_offset.concretetype, Some(LowLevelType::Void));
         assert!(matches!(repr.parentptrtype.TO, PtrTarget::Struct(_)));
+    }
+
+    #[test]
+    fn interiorptr_rtype_getitem_emits_getinteriorfield_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, InteriorOffset, InteriorPtr, StructType,
+        };
+
+        let array_type = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed)));
+        let parent = LowLevelType::Struct(Box::new(StructType::new(
+            "Holder",
+            vec![("items".into(), array_type.clone())],
+        )));
+        let iptr = InteriorPtr {
+            PARENTTYPE: Box::new(parent.clone()),
+            TO: Box::new(array_type),
+            offsets: vec![InteriorOffset::Field("items".into())],
+        };
+        let r_iptr = Arc::new(InteriorPtrRepr::new(iptr.clone()));
+        let r_iptr_dyn: Arc<dyn Repr> = r_iptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let hop = empty_hop(&rtyper, "getitem");
+        let mut v_self = Variable::new();
+        v_self.concretetype = Some(r_iptr.lowleveltype().clone());
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_self),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(0),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::InteriorPtr(SomeInteriorPtr::new(iptr)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_iptr_dyn), Some(r_signed.clone())]);
+        *hop.r_result.borrow_mut() = Some(r_signed);
+
+        let result = r_iptr.rtype_getitem(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "getinteriorfield");
+    }
+
+    #[test]
+    fn interiorptr_rtype_setitem_emits_setinteriorfield_like_rptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            ArrayType, InteriorOffset, InteriorPtr, StructType,
+        };
+
+        let array_type = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed)));
+        let parent = LowLevelType::Struct(Box::new(StructType::new(
+            "Holder",
+            vec![("items".into(), array_type.clone())],
+        )));
+        let iptr = InteriorPtr {
+            PARENTTYPE: Box::new(parent.clone()),
+            TO: Box::new(array_type),
+            offsets: vec![InteriorOffset::Field("items".into())],
+        };
+        let r_iptr = Arc::new(InteriorPtrRepr::new(iptr.clone()));
+        let r_iptr_dyn: Arc<dyn Repr> = r_iptr.clone();
+        let (_ann, rtyper) = live_rtyper_for_hop();
+        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
+        let hop = empty_hop(&rtyper, "setitem");
+        let mut v_self = Variable::new();
+        v_self.concretetype = Some(r_iptr.lowleveltype().clone());
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Variable(v_self),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(0),
+                LowLevelType::Signed,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(8),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::InteriorPtr(SomeInteriorPtr::new(iptr)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_iptr_dyn), Some(r_signed.clone()), Some(r_signed)]);
+
+        assert!(r_iptr.rtype_setitem(&hop).unwrap().is_none());
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "setinteriorfield");
     }
 
     #[test]

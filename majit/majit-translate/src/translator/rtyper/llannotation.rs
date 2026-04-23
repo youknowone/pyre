@@ -145,9 +145,15 @@ where
         lltype::LowLevelType::SignedLongLong => {
             SomeValue::Integer(SomeInteger::new_with_knowntype(false, KnownType::LongLong))
         }
+        lltype::LowLevelType::SignedLongLongLong => SomeValue::Integer(
+            SomeInteger::new_with_knowntype(false, KnownType::LongLongLong),
+        ),
         lltype::LowLevelType::UnsignedLongLong => {
             SomeValue::Integer(SomeInteger::new_with_knowntype(false, KnownType::ULongLong))
         }
+        lltype::LowLevelType::UnsignedLongLongLong => SomeValue::Integer(
+            SomeInteger::new_with_knowntype(false, KnownType::ULongLongLong),
+        ),
         lltype::LowLevelType::InteriorPtr(t) => SomeValue::InteriorPtr(SomeInteriorPtr::new(*t)),
         lltype::LowLevelType::Ptr(t) => SomeValue::Ptr(SomePtr::new(*t)),
         other => {

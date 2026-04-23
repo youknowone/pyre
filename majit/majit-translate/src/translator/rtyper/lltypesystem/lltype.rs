@@ -18,6 +18,7 @@
 //!   `Array`, `ForwardReference`) land with the commit that consumes
 //!   them.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -171,13 +172,16 @@ impl LowLevelType {
             // upstream `Bool = Primitive("Bool", False)`.
             LowLevelType::Bool => matches!(value, ConstValue::Bool(_)),
             // upstream `Signed` / `Unsigned` / `SignedLongLong` /
-            // `UnsignedLongLong` all accept Python `int` (with range
+            // `SignedLongLongLong` / `UnsignedLongLong` /
+            // `UnsignedLongLongLong` all accept Python `int` (with range
             // checking upstream; pyre's `ConstValue::Int` is already i64
             // so the only check left is category match).
             LowLevelType::Signed
             | LowLevelType::Unsigned
             | LowLevelType::SignedLongLong
-            | LowLevelType::UnsignedLongLong => matches!(value, ConstValue::Int(_)),
+            | LowLevelType::SignedLongLongLong
+            | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong => matches!(value, ConstValue::Int(_)),
             // upstream `Float` / `SingleFloat` / `LongFloat` accept
             // Python `float`.
             LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
@@ -216,7 +220,9 @@ impl LowLevelType {
             LowLevelType::Signed => "Signed".to_string(),
             LowLevelType::Unsigned => "Unsigned".to_string(),
             LowLevelType::SignedLongLong => "SignedLongLong".to_string(),
+            LowLevelType::SignedLongLongLong => "SignedLongLongLong".to_string(),
             LowLevelType::UnsignedLongLong => "UnsignedLongLong".to_string(),
+            LowLevelType::UnsignedLongLongLong => "UnsignedLongLongLong".to_string(),
             LowLevelType::Float => "Float".to_string(),
             LowLevelType::SingleFloat => "SingleFloat".to_string(),
             LowLevelType::LongFloat => "LongFloat".to_string(),
@@ -276,7 +282,9 @@ pub enum LowLevelType {
     Signed,
     Unsigned,
     SignedLongLong,
+    SignedLongLongLong,
     UnsignedLongLong,
+    UnsignedLongLongLong,
     Bool,
     Float,
     SingleFloat,
@@ -310,7 +318,9 @@ impl PartialEq for LowLevelType {
             | (LowLevelType::Signed, LowLevelType::Signed)
             | (LowLevelType::Unsigned, LowLevelType::Unsigned)
             | (LowLevelType::SignedLongLong, LowLevelType::SignedLongLong)
+            | (LowLevelType::SignedLongLongLong, LowLevelType::SignedLongLongLong)
             | (LowLevelType::UnsignedLongLong, LowLevelType::UnsignedLongLong)
+            | (LowLevelType::UnsignedLongLongLong, LowLevelType::UnsignedLongLongLong)
             | (LowLevelType::Bool, LowLevelType::Bool)
             | (LowLevelType::Float, LowLevelType::Float)
             | (LowLevelType::SingleFloat, LowLevelType::SingleFloat)
@@ -343,47 +353,49 @@ impl Hash for LowLevelType {
             LowLevelType::Signed => 1_u8.hash(state),
             LowLevelType::Unsigned => 2_u8.hash(state),
             LowLevelType::SignedLongLong => 3_u8.hash(state),
-            LowLevelType::UnsignedLongLong => 4_u8.hash(state),
-            LowLevelType::Bool => 5_u8.hash(state),
-            LowLevelType::Float => 6_u8.hash(state),
-            LowLevelType::SingleFloat => 7_u8.hash(state),
-            LowLevelType::LongFloat => 8_u8.hash(state),
-            LowLevelType::Char => 9_u8.hash(state),
-            LowLevelType::UniChar => 10_u8.hash(state),
+            LowLevelType::SignedLongLongLong => 4_u8.hash(state),
+            LowLevelType::UnsignedLongLong => 5_u8.hash(state),
+            LowLevelType::UnsignedLongLongLong => 6_u8.hash(state),
+            LowLevelType::Bool => 7_u8.hash(state),
+            LowLevelType::Float => 8_u8.hash(state),
+            LowLevelType::SingleFloat => 9_u8.hash(state),
+            LowLevelType::LongFloat => 10_u8.hash(state),
+            LowLevelType::Char => 11_u8.hash(state),
+            LowLevelType::UniChar => 12_u8.hash(state),
             LowLevelType::Func(t) => {
-                11_u8.hash(state);
-                t.hash(state);
-            }
-            LowLevelType::Struct(t) => {
-                12_u8.hash(state);
-                t.hash(state);
-            }
-            LowLevelType::Array(t) => {
                 13_u8.hash(state);
                 t.hash(state);
             }
-            LowLevelType::FixedSizeArray(t) => {
+            LowLevelType::Struct(t) => {
                 14_u8.hash(state);
                 t.hash(state);
             }
-            LowLevelType::Opaque(t) => {
+            LowLevelType::Array(t) => {
                 15_u8.hash(state);
+                t.hash(state);
+            }
+            LowLevelType::FixedSizeArray(t) => {
+                16_u8.hash(state);
+                t.hash(state);
+            }
+            LowLevelType::Opaque(t) => {
+                17_u8.hash(state);
                 t.hash(state);
             }
             LowLevelType::ForwardReference(t) => {
                 if let Some(real) = t.resolved() {
                     real.hash(state);
                 } else {
-                    16_u8.hash(state);
+                    18_u8.hash(state);
                     t.hash(state);
                 }
             }
             LowLevelType::Ptr(t) => {
-                17_u8.hash(state);
+                19_u8.hash(state);
                 t.hash(state);
             }
             LowLevelType::InteriorPtr(t) => {
-                18_u8.hash(state);
+                20_u8.hash(state);
                 t.hash(state);
             }
         }
@@ -545,6 +557,7 @@ pub struct _func {
     pub _name: String,
     pub graph: Option<usize>,
     pub _callable: Option<String>,
+    pub attrs: HashMap<String, ConstValue>,
 }
 
 impl _func {
@@ -553,12 +566,14 @@ impl _func {
         _name: String,
         graph: Option<usize>,
         _callable: Option<String>,
+        attrs: HashMap<String, ConstValue>,
     ) -> Self {
         _func {
             TYPE,
             _name,
             graph,
             _callable,
+            attrs,
         }
     }
 }
@@ -813,6 +828,7 @@ impl PartialEq for _func {
             && self._name == other._name
             && self._callable == other._callable
             && self.graph == other.graph
+            && self.attrs == other.attrs
     }
 }
 
@@ -824,6 +840,12 @@ impl Hash for _func {
         self._name.hash(state);
         self._callable.hash(state);
         self.graph.hash(state);
+        let mut attrs: Vec<_> = self.attrs.iter().collect();
+        attrs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (key, value) in attrs {
+            key.hash(state);
+            value.hash(state);
+        }
     }
 }
 
@@ -1391,7 +1413,9 @@ impl LowLevelType {
             LowLevelType::Signed => LowLevelValue::Signed(0),
             LowLevelType::Unsigned => LowLevelValue::Unsigned(0),
             LowLevelType::SignedLongLong => LowLevelValue::Signed(0),
+            LowLevelType::SignedLongLongLong => LowLevelValue::Signed(0),
             LowLevelType::UnsignedLongLong => LowLevelValue::Unsigned(0),
+            LowLevelType::UnsignedLongLongLong => LowLevelValue::Unsigned(0),
             LowLevelType::Bool => LowLevelValue::Bool(false),
             LowLevelType::Float => LowLevelValue::Float(0.0f64.to_bits()),
             LowLevelType::SingleFloat => LowLevelValue::SingleFloat(0.0f32.to_bits()),
@@ -1468,6 +1492,7 @@ impl FuncType {
             "<example>".into(),
             None,
             Some("<example>".into()),
+            HashMap::new(),
         )
     }
 
@@ -1992,7 +2017,9 @@ impl LowLevelType {
             | LowLevelType::Signed
             | LowLevelType::Unsigned
             | LowLevelType::SignedLongLong
+            | LowLevelType::SignedLongLongLong
             | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong
             | LowLevelType::Float
             | LowLevelType::SingleFloat
             | LowLevelType::LongFloat
@@ -2016,7 +2043,9 @@ impl LowLevelType {
             | LowLevelType::Signed
             | LowLevelType::Unsigned
             | LowLevelType::SignedLongLong
+            | LowLevelType::SignedLongLongLong
             | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong
             | LowLevelType::Bool
             | LowLevelType::Float
             | LowLevelType::SingleFloat
@@ -2115,7 +2144,9 @@ impl Ptr {
                         | LowLevelType::Signed
                         | LowLevelType::Unsigned
                         | LowLevelType::SignedLongLong
+                        | LowLevelType::SignedLongLongLong
                         | LowLevelType::UnsignedLongLong
+                        | LowLevelType::UnsignedLongLongLong
                         | LowLevelType::Bool
                         | LowLevelType::Float
                         | LowLevelType::SingleFloat
@@ -2214,6 +2245,16 @@ pub fn functionptr(
     graph: Option<usize>,
     _callable: Option<String>,
 ) -> _ptr {
+    functionptr_with_attrs(TYPE, name, graph, _callable, HashMap::new())
+}
+
+fn functionptr_with_attrs(
+    TYPE: FuncType,
+    name: &str,
+    graph: Option<usize>,
+    _callable: Option<String>,
+    attrs: HashMap<String, ConstValue>,
+) -> _ptr {
     _ptr::new(
         Ptr {
             TO: PtrTarget::Func(TYPE.clone()),
@@ -2223,6 +2264,7 @@ pub fn functionptr(
             name.to_string(),
             graph,
             _callable,
+            attrs,
         )))),
     )
 }
@@ -2232,7 +2274,9 @@ pub fn build_number(_name: Option<()>, knowntype: KnownType) -> LowLevelType {
         KnownType::Int => LowLevelType::Signed,
         KnownType::Ruint => LowLevelType::Unsigned,
         KnownType::LongLong => LowLevelType::SignedLongLong,
+        KnownType::LongLongLong => LowLevelType::SignedLongLongLong,
         KnownType::ULongLong => LowLevelType::UnsignedLongLong,
+        KnownType::ULongLongLong => LowLevelType::UnsignedLongLongLong,
         other => panic!("lltype.build_number() does not support knowntype {other}"),
     }
 }
@@ -2293,14 +2337,30 @@ where
         args: llinputs,
         result: lloutput,
     };
-    let name = graph_b.name.clone();
-    let callable = graph_b.func.as_ref().map(|func| func.name.clone());
+    let mut name = graph_b.name.clone();
+    let mut callable = graph_b.func.as_ref().map(|func| func.name.clone());
+    let mut attrs = HashMap::new();
+    if let Some(func) = &graph_b.func {
+        attrs = func._llfnobjattrs_.clone();
+        if let Some(ConstValue::Str(forced_name)) = attrs.remove("_name") {
+            name = forced_name;
+        }
+        if let Some(forced_callable) = attrs.remove("_callable") {
+            callable = Some(match forced_callable {
+                ConstValue::Str(name) => name,
+                ConstValue::Function(func) => func.name,
+                ConstValue::HostObject(obj) => obj.qualname().to_string(),
+                other => format!("{other:?}"),
+            });
+        }
+    }
     drop(graph_b);
-    Ok(functionptr(
+    Ok(functionptr_with_attrs(
         ft,
         &name,
         Some(GraphKey::of(graph).as_usize()),
         callable,
+        attrs,
     ))
 }
 
@@ -2338,7 +2398,7 @@ impl crate::annotator::model::SomeObjectTrait for SomePtr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flowspace::model::{Block, FunctionGraph, Variable};
+    use crate::flowspace::model::{Block, Constant, FunctionGraph, GraphFunc, Variable};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2401,6 +2461,38 @@ mod tests {
         let graph = Rc::new(RefCell::new(FunctionGraph::new("f", start)));
 
         assert!(getfunctionptr(&graph, _getconcretetype).is_err());
+    }
+
+    #[test]
+    fn getfunctionptr_copies_llfnobjattrs_from_graph_func() {
+        let start = Rc::new(RefCell::new(Block::new(vec![])));
+        let mut ret = Variable::new();
+        ret.concretetype = Some(LowLevelType::Void);
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "graph_name",
+            start,
+            Hlvalue::Variable(ret),
+        )));
+        let mut func = GraphFunc::new("py_func", Constant::new(ConstValue::Dict(HashMap::new())));
+        func._llfnobjattrs_.insert(
+            "_name".to_string(),
+            ConstValue::Str("forced_name".to_string()),
+        );
+        func._llfnobjattrs_.insert(
+            "_callable".to_string(),
+            ConstValue::Str("forced_callable".to_string()),
+        );
+        func._llfnobjattrs_
+            .insert("extra".to_string(), ConstValue::Int(7));
+        graph.borrow_mut().func = Some(func);
+
+        let ptr = getfunctionptr(&graph, _getconcretetype).unwrap();
+        let _ptr_obj::Func(funcobj) = ptr._obj().unwrap() else {
+            panic!("functionptr must expose a function object");
+        };
+        assert_eq!(funcobj._name, "forced_name");
+        assert_eq!(funcobj._callable.as_deref(), Some("forced_callable"));
+        assert_eq!(funcobj.attrs.get("extra"), Some(&ConstValue::Int(7)));
     }
 
     #[test]
@@ -3420,6 +3512,7 @@ mod tests {
             "f".into(),
             None,
             Some("impl".into()),
+            HashMap::new(),
         );
         let _ = f.call(&[]);
     }
@@ -3436,6 +3529,7 @@ mod tests {
             "f".into(),
             None,
             Some("impl".into()),
+            HashMap::new(),
         );
         let _ = f.call(&[LowLevelValue::Bool(true)]);
     }
@@ -3452,6 +3546,7 @@ mod tests {
             "f".into(),
             None,
             None,
+            HashMap::new(),
         );
         let _ = f.call(&[]);
     }
@@ -3466,6 +3561,7 @@ mod tests {
             "f".into(),
             None,
             Some("impl".into()),
+            HashMap::new(),
         );
         let result = f.call(&[LowLevelValue::Signed(42)]);
         assert_eq!(result, LowLevelValue::Bool(false));

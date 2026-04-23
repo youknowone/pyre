@@ -125,8 +125,12 @@ pub enum KnownType {
     Ruint,
     /// `r_longlong` — RPython's signed 64-bit integer type.
     LongLong,
+    /// `r_longlonglong` — RPython's signed extended integer type.
+    LongLongLong,
     /// `r_ulonglong` — RPython's unsigned 64-bit integer type.
     ULongLong,
+    /// `r_ulonglonglong` — RPython's unsigned extended integer type.
+    ULongLongLong,
     /// `bool` — the RPython `SomeBool.knowntype = bool`.
     Bool,
     /// `float` — the RPython `SomeFloat.knowntype = float`.
@@ -167,7 +171,9 @@ impl fmt::Display for KnownType {
             KnownType::Int => "int",
             KnownType::Ruint => "r_uint",
             KnownType::LongLong => "r_longlong",
+            KnownType::LongLongLong => "r_longlonglong",
             KnownType::ULongLong => "r_ulonglong",
+            KnownType::ULongLongLong => "r_ulonglonglong",
             KnownType::Bool => "bool",
             KnownType::Float => "float",
             KnownType::Singlefloat => "r_singlefloat",
@@ -479,7 +485,10 @@ impl SomeInteger {
         // upstream: `unsigned = self.knowntype(-1) > 0`. The unsigned
         // rarithmetic integer families treat -1 as a positive value;
         // all other integer KnownTypes are signed.
-        let unsigned = matches!(knowntype, KnownType::Ruint | KnownType::ULongLong);
+        let unsigned = matches!(
+            knowntype,
+            KnownType::Ruint | KnownType::ULongLong | KnownType::ULongLongLong
+        );
         SomeInteger {
             base: SomeObjectBase::new(knowntype, true),
             nonneg: unsigned || nonneg,

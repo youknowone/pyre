@@ -914,6 +914,42 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
                 .map(|module| ConstValue::Str(module.to_string())),
             _ => None,
         },
+        "__globals__" => match &pyobj.inner.kind {
+            HostObjectKind::UserFunction { graph_func } => Some(graph_func.globals.value.clone()),
+            _ => None,
+        },
+        "__defaults__" => match &pyobj.inner.kind {
+            HostObjectKind::UserFunction { graph_func } => {
+                if graph_func.defaults.is_empty() {
+                    Some(ConstValue::None)
+                } else {
+                    Some(ConstValue::Tuple(
+                        graph_func
+                            .defaults
+                            .iter()
+                            .map(|constant| constant.value.clone())
+                            .collect(),
+                    ))
+                }
+            }
+            _ => None,
+        },
+        "__closure__" => match &pyobj.inner.kind {
+            HostObjectKind::UserFunction { graph_func } => {
+                if graph_func.closure.is_empty() {
+                    Some(ConstValue::None)
+                } else {
+                    Some(ConstValue::Tuple(
+                        graph_func
+                            .closure
+                            .iter()
+                            .map(|constant| constant.value.clone())
+                            .collect(),
+                    ))
+                }
+            }
+            _ => None,
+        },
         "fget" if pyobj.is_property() => pyobj
             .property_fget()
             .cloned()
@@ -1146,10 +1182,12 @@ fn host_descriptor_get(
 /// PRE-EXISTING-ADAPTATION: primitive constants (Int / Float / Str / …)
 /// would upstream execute Python's real `getattr` — e.g. `(1).real`
 /// evaluates through Python's `int.real` descriptor — and the Rust
-/// port has no Python runtime to defer to. Those paths currently
-/// return `Ok(None)` so the call falls through to the annotator's
-/// `find_method` / host-method emulators, matching upstream's
-/// `WrapException` swallow where `const` can't re-wrap the result.
+/// port has no Python runtime to defer to. The current port only
+/// reconstructs the object-level `__class__` path for those constants
+/// (via builtin class singletons) and otherwise returns `Ok(None)` so
+/// the call falls through to the annotator's `find_method` /
+/// host-method emulators, matching upstream's `WrapException` swallow
+/// where `const` can't re-wrap the result.
 pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>, String> {
     match obj {
         ConstValue::HostObject(h) => match host_getattr(h, name) {
@@ -1161,6 +1199,44 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
             )),
             Err(HostGetAttrError::Unsupported) => Ok(None),
         },
+        ConstValue::Function(func) => match name {
+            "__name__" => {
+                let (simple_name, _) = split_attr_name_module(&func.name);
+                Ok(Some(ConstValue::Str(simple_name)))
+            }
+            "__module__" => {
+                let (_, module_name) = split_attr_name_module(&func.name);
+                Ok(module_name.map(ConstValue::Str))
+            }
+            "__globals__" => Ok(Some(func.globals.value.clone())),
+            "__defaults__" => {
+                if func.defaults.is_empty() {
+                    Ok(Some(ConstValue::None))
+                } else {
+                    Ok(Some(ConstValue::Tuple(
+                        func.defaults
+                            .iter()
+                            .map(|constant| constant.value.clone())
+                            .collect(),
+                    )))
+                }
+            }
+            "__closure__" => {
+                if func.closure.is_empty() {
+                    Ok(Some(ConstValue::None))
+                } else {
+                    Ok(Some(ConstValue::Tuple(
+                        func.closure
+                            .iter()
+                            .map(|constant| constant.value.clone())
+                            .collect(),
+                    )))
+                }
+            }
+            "__class__" => Ok(obj.class_of().map(ConstValue::HostObject)),
+            _ => Ok(None),
+        },
+        _ if name == "__class__" => Ok(obj.class_of().map(ConstValue::HostObject)),
         _ => Ok(None),
     }
 }
@@ -1383,7 +1459,9 @@ impl HostEnv {
             "type",
             "object",
             "module",
+            "NoneType",
             "function",
+            "code",
             "method",
             "builtin_function_or_method",
             "str",
@@ -1655,6 +1733,10 @@ pub enum ConstValue {
     /// port stores graph identities as `usize` values
     /// (`GraphKey::as_usize()`).
     Graphs(Vec<usize>),
+    /// RPython flowmodel `Constant(TYPE, lltype.Void)` where `TYPE` is
+    /// itself an lltype object, e.g. `rptr.py`'s `INTERIOR_PTR_TYPE`
+    /// argument to `malloc`.
+    LowLevelType(Box<ConcretetypePlaceholder>),
     /// RPython `lltype._ptr` function pointer constant.
     LLPtr(Box<_ptr>),
     /// Arbitrary host-level Python object (class, module, builtin
@@ -1694,6 +1776,7 @@ impl PartialEq for ConstValue {
                 a._hashable_identity() == b._hashable_identity()
             }
             (ConstValue::Graphs(a), ConstValue::Graphs(b)) => a == b,
+            (ConstValue::LowLevelType(a), ConstValue::LowLevelType(b)) => a == b,
             (ConstValue::LLPtr(a), ConstValue::LLPtr(b)) => {
                 a._hashable_identity() == b._hashable_identity()
             }
@@ -1726,6 +1809,7 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::List(_)
             | ConstValue::Code(_)
             | ConstValue::Graphs(_)
+            | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
         }
@@ -1766,6 +1850,7 @@ impl Hash for ConstValue {
             ConstValue::Code(code) => code._hashable_identity().hash(state),
             ConstValue::Function(func) => func._hashable_identity().hash(state),
             ConstValue::Graphs(graphs) => graphs.hash(state),
+            ConstValue::LowLevelType(lltype) => lltype.hash(state),
             ConstValue::LLPtr(ptr) => ptr._hashable_identity().hash(state),
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
@@ -2128,11 +2213,20 @@ impl Constant {
         {
             return true;
         }
-        if Self::has_builtin_class_module(to_check) {
+        let class_module = to_check
+            .class_of()
+            .as_ref()
+            .and_then(|cls| cls.module_name().map(str::to_string));
+        if class_module.as_deref() == Some("__builtin__") {
             return true;
         }
         if let ConstValue::HostObject(obj) = to_check {
             return Self::call_foldable_freeze_method(obj);
+        }
+        if matches!(to_check, ConstValue::LowLevelType(_)) {
+            // RPython lltype.LowLevelType implements `_freeze_()` and
+            // returns True, so Constant(TYPE).foldable() is True.
+            return true;
         }
         false
     }
@@ -2156,30 +2250,6 @@ impl Constant {
             ConstValue::List(_) | ConstValue::Dict(_) | ConstValue::Graphs(_) => true,
             ConstValue::Tuple(items) => items.iter().any(Self::uses_hashable_identity_fallback),
             _ => false,
-        }
-    }
-
-    fn has_builtin_class_module(value: &ConstValue) -> bool {
-        match value {
-            ConstValue::Int(_)
-            | ConstValue::Float(_)
-            | ConstValue::Bool(_)
-            | ConstValue::Str(_)
-            | ConstValue::None
-            | ConstValue::Tuple(_)
-            | ConstValue::List(_)
-            | ConstValue::Dict(_)
-            | ConstValue::Code(_)
-            | ConstValue::Function(_) => true,
-            ConstValue::HostObject(obj) => obj
-                .class_of()
-                .as_ref()
-                .is_some_and(|cls| cls.module_name() == Some("__builtin__")),
-            ConstValue::Atom(_)
-            | ConstValue::Placeholder
-            | ConstValue::LLPtr(_)
-            | ConstValue::SpecTag(_)
-            | ConstValue::Graphs(_) => false,
         }
     }
 
@@ -2262,6 +2332,7 @@ impl ConstValue {
             ConstValue::None => Some(false),
             ConstValue::Code(_) => Some(true),
             ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
+            ConstValue::LowLevelType(_) => Some(true),
             ConstValue::LLPtr(ptr) => Some(ptr.nonzero()),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
@@ -2319,6 +2390,31 @@ impl ConstValue {
         match self {
             ConstValue::HostObject(obj) if obj.is_class() => Some(obj.qualname()),
             _ => None,
+        }
+    }
+
+    /// Host-level `obj.__class__` / `type(obj)` for the constant
+    /// variants that have a direct Python object analogue in the
+    /// current flow-space port.
+    pub fn class_of(&self) -> Option<HostObject> {
+        match self {
+            ConstValue::Int(_) => HOST_ENV.lookup_builtin("int"),
+            ConstValue::Float(_) => HOST_ENV.lookup_builtin("float"),
+            ConstValue::Bool(_) => HOST_ENV.lookup_builtin("bool"),
+            ConstValue::Str(_) => HOST_ENV.lookup_builtin("str"),
+            ConstValue::Tuple(_) => HOST_ENV.lookup_builtin("tuple"),
+            ConstValue::List(_) => HOST_ENV.lookup_builtin("list"),
+            ConstValue::Dict(_) => HOST_ENV.lookup_builtin("dict"),
+            ConstValue::None => HOST_ENV.lookup_builtin("NoneType"),
+            ConstValue::Code(_) => HOST_ENV.lookup_builtin("code"),
+            ConstValue::Function(_) => HOST_ENV.lookup_builtin("function"),
+            ConstValue::HostObject(obj) => obj.class_of(),
+            ConstValue::Atom(_)
+            | ConstValue::Placeholder
+            | ConstValue::Graphs(_)
+            | ConstValue::LowLevelType(_)
+            | ConstValue::LLPtr(_)
+            | ConstValue::SpecTag(_) => None,
         }
     }
 
@@ -2917,6 +3013,10 @@ pub struct GraphFunc {
     /// can apply the same default as upstream's
     /// `getattr(func, 'relax_sig_check', False)`.
     pub relax_sig_check: Option<bool>,
+    /// Upstream `func._llfnobjattrs_` consumed by
+    /// `lltype.getfunctionptr()`. It can force `_name`, `_callable`, or
+    /// arbitrary fields on the low-level function object.
+    pub _llfnobjattrs_: HashMap<String, ConstValue>,
     /// Python function `__globals__`, wrapped as a flow-space
     /// constant.
     pub globals: Constant,
@@ -2949,6 +3049,7 @@ impl GraphFunc {
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
             relax_sig_check: None,
+            _llfnobjattrs_: HashMap::new(),
             globals,
             closure: Vec::new(),
             defaults: Vec::new(),
@@ -4062,9 +4163,45 @@ mod tests {
     }
 
     #[test]
+    fn none_constant_is_foldable() {
+        let c = Constant::new(ConstValue::None);
+        assert!(c.foldable());
+    }
+
+    #[test]
+    fn code_constant_is_foldable() {
+        let c = Constant::new(ConstValue::Code(Box::new(HostCode::new(
+            0,
+            0,
+            0,
+            0,
+            rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "<test>".to_string(),
+            "f".to_string(),
+            1,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new().into_boxed_slice(),
+        ))));
+        assert!(c.foldable());
+    }
+
+    #[test]
     fn graphs_constant_is_not_foldable() {
         let c = Constant::new(ConstValue::Graphs(vec![1, 2, 3]));
         assert!(!c.foldable());
+    }
+
+    #[test]
+    fn low_level_type_constant_is_foldable() {
+        let c = Constant::new(ConstValue::LowLevelType(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+        )));
+        assert!(c.foldable());
     }
 
     #[test]
@@ -4673,6 +4810,13 @@ mod tests {
     }
 
     #[test]
+    fn host_getattr_builtin_callable_dunder_self_returns_builtin_module() {
+        let func = HostObject::new_builtin_callable("len");
+        let out = host_getattr(&func, "__self__").expect("builtin.__self__");
+        assert_eq!(out, ConstValue::HostObject(HOST_ENV.builtin_module()));
+    }
+
+    #[test]
     fn host_getattr_user_function_dunder_name_and_module_follow_python_surface() {
         let func = HostObject::new_user_function(GraphFunc::new(
             "pkg.module.demo",
@@ -4682,6 +4826,48 @@ mod tests {
         assert_eq!(out, ConstValue::Str("demo".to_string()));
         let out = host_getattr(&func, "__module__").expect("function.__module__");
         assert_eq!(out, ConstValue::Str("pkg.module".to_string()));
+    }
+
+    #[test]
+    fn host_getattr_user_function_dunder_globals_returns_raw_dict() {
+        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
+        let out = host_getattr(&func, "__globals__").expect("function.__globals__");
+        assert_eq!(out, ConstValue::Dict(HashMap::new()));
+    }
+
+    #[test]
+    fn host_getattr_user_function_dunder_defaults_returns_none_when_absent() {
+        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
+        let out = host_getattr(&func, "__defaults__").expect("function.__defaults__");
+        assert_eq!(out, ConstValue::None);
+    }
+
+    #[test]
+    fn host_getattr_user_function_dunder_closure_returns_none_when_absent() {
+        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
+        let out = host_getattr(&func, "__closure__").expect("function.__closure__");
+        assert_eq!(out, ConstValue::None);
+    }
+
+    #[test]
+    fn host_getattr_user_function_dunder_defaults_and_closure_return_tuple_payloads() {
+        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let mut graph_func = GraphFunc::new("pkg.module.demo", globals);
+        graph_func.defaults = vec![Constant::new(ConstValue::Int(7))];
+        graph_func.closure = vec![Constant::new(ConstValue::Str("cell".to_string()))];
+        let func = HostObject::new_user_function(graph_func);
+
+        let defaults = host_getattr(&func, "__defaults__").expect("function.__defaults__");
+        assert_eq!(defaults, ConstValue::Tuple(vec![ConstValue::Int(7)]));
+
+        let closure = host_getattr(&func, "__closure__").expect("function.__closure__");
+        assert_eq!(
+            closure,
+            ConstValue::Tuple(vec![ConstValue::Str("cell".to_string())])
+        );
     }
 
     #[test]
@@ -4719,18 +4905,6 @@ mod tests {
         assert_eq!(out, ConstValue::Str("value".to_string()));
         let out = host_getattr(&cm, "__module__").expect("classmethod.__module__");
         assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
-    }
-
-    #[test]
-    fn host_getattr_builtin_callable_dunder_self_returns_builtin_module() {
-        let func = HostObject::new_builtin_callable("len");
-        let out = host_getattr(&func, "__self__").expect("builtin callable.__self__");
-        let ConstValue::HostObject(module) = out else {
-            panic!("expected builtin module object");
-        };
-        assert!(module.is_module());
-        let name = host_getattr(&module, "__name__").expect("builtin module.__name__");
-        assert_eq!(name, ConstValue::Str("__builtin__".to_string()));
     }
 
     #[test]
