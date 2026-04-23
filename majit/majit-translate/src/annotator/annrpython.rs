@@ -2315,7 +2315,9 @@ impl RPythonAnnotator {
         //         self.annotated[block] = False
         //         self.blocked_blocks[block] = (graph, e.opindex)
         //     except Exception as e:
-        //         ...
+        //         # hack for debug tools only
+        //         if not hasattr(e, '__annotator_block'):
+        //             setattr(e, '__annotator_block', block)
         //         raise
         match self.flowin(graph, block) {
             Ok(()) => {}
@@ -2326,7 +2328,10 @@ impl RPythonAnnotator {
                     (Rc::clone(block), Rc::clone(graph), e.opindex),
                 );
             }
-            Err(FlowinError::Annotator(e)) => return Err(e),
+            Err(FlowinError::Annotator(mut e)) => {
+                e.set_annotator_block(block);
+                return Err(e);
+            }
             Err(FlowinError::Harmless(_)) => {
                 unreachable!("flowin() should swallow HarmlesslyBlocked before processblock()")
             }

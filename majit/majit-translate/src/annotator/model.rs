@@ -48,7 +48,9 @@ use core::fmt;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::super::flowspace::model::{ConstValue, Constant, HostObject, Variable};
+use super::super::flowspace::model::{
+    BlockKey, BlockRef, ConstValue, Constant, HostObject, Variable,
+};
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
 pub use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
@@ -2432,10 +2434,22 @@ pub fn s_unicode0() -> SomeValue {
 /// RPython `class AnnotatorError(Exception)` (model.py:714-725). Base
 /// error raised by the annotator outside of the structural `UnionError`
 /// path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `block` carries the `__annotator_block` debug attribute that upstream
+/// attaches at `rpython/annotator/annrpython.py:402` so
+/// `rpython/tool/error.py:143` can render a "Processing block:" section
+/// when the annotator aborts. Only the pointer identity is kept (as a
+/// `usize`) so the error stays `Send` for `panic_any`; a full block
+/// lookup can go through the translator's block table when
+/// `rpython/tool/error.py` is ported. The field is populated by
+/// [`set_annotator_block`] from `processblock` and stays `None`
+/// otherwise. Equality ignores `block` since upstream compares error
+/// values by message.
+#[derive(Clone, Debug)]
 pub struct AnnotatorError {
     pub msg: Option<String>,
     pub source: Option<String>,
+    pub block: Option<usize>,
 }
 
 impl AnnotatorError {
@@ -2443,9 +2457,31 @@ impl AnnotatorError {
         AnnotatorError {
             msg: Some(msg.into()),
             source: None,
+            block: None,
+        }
+    }
+
+    /// upstream `annrpython.py:402-405`:
+    ///
+    ///     if not hasattr(e, '__annotator_block'):
+    ///         setattr(e, '__annotator_block', block)
+    ///
+    /// Attaches the offending block to the error only on the first
+    /// re-raise so the innermost `processblock` wins.
+    pub fn set_annotator_block(&mut self, block: &BlockRef) {
+        if self.block.is_none() {
+            self.block = Some(BlockKey::of(block).as_usize());
         }
     }
 }
+
+impl PartialEq for AnnotatorError {
+    fn eq(&self, other: &Self) -> bool {
+        self.msg == other.msg && self.source == other.source
+    }
+}
+
+impl Eq for AnnotatorError {}
 
 impl fmt::Display for AnnotatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
