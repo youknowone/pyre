@@ -878,16 +878,20 @@ impl GcRewriterImpl {
     /// `emit_pending_zeros` (rewrite.py:761-766) does not re-zero a slot
     /// that the explicit SETFIELD_GC is about to overwrite.
     ///
-    /// pyre's rewriter does not yet track delayed zero-setfields
-    /// (there is no `delayed_zero_setfields` field on `RewriteState`;
-    /// `handle_new` emits the tid + vtable stores synchronously at
-    /// allocation time), so the clear is a no-op.  The call site is
-    /// kept for structural parity with rewrite.py:394 — when
-    /// `_delayed_zero_setfields` (rewrite.py:61) is ported the body
-    /// here can follow rewrite.py:507-512 line-by-line without
-    /// touching the caller.
+    /// PRE-EXISTING-ADAPTATION: pyre's `handle_new` above emits no
+    /// field-zeroing ops because the nursery allocator zero-fills the
+    /// payload bytes (`gen_malloc_nursery` → `alloc_nursery_no_collect`
+    /// returns zeroed memory).  With nothing pending, there is nothing
+    /// for the eventual `emit_pending_zeros` flush to skip, and
+    /// `_delayed_zero_setfields` itself has no data to carry — hence
+    /// the no-op body here.  The call site is kept for structural
+    /// parity with rewrite.py:394 so that when pyre's allocator gains a
+    /// non-zero-fill path and `handle_new` starts emitting explicit
+    /// zero-setfields, the body here can track the pending entries per
+    /// rewrite.py:507-512 without touching the caller.
     fn consider_setfield_gc(&self, _op: &Op, _st: &mut RewriteState) {
-        // no-op: delayed-zero-setfield tracking not yet ported.
+        // no-op: `handle_new` does not emit delayed-zero setfields in
+        // pyre's zero-fill nursery path, so there is nothing to clear.
     }
 
     // ────────────────────────────────────────────────────────

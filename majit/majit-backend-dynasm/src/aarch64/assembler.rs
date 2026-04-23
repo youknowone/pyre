@@ -1941,8 +1941,13 @@ impl AssemblerARM64 {
                             })
                             .unwrap_or(8),
                     };
+                    // aarch64/opassembler.py:402 keeps `ofs_loc.value` at
+                    // the Signed word width; `_try_use_older_box` (rewrite.
+                    // py:383-387) may fold large displacements into the
+                    // offset immediate so the emitter handles the full
+                    // range via the check_imm_arg / materialize fallback.
                     let ofs = match arglocs.get(4) {
-                        Some(Loc::Immed(i)) => i.value as i32,
+                        Some(Loc::Immed(i)) => i.value,
                         _ => 0,
                     };
                     self.emit_op_gcload_indexed_regalloc(base, index, res, ofs, nsize);
@@ -1958,8 +1963,11 @@ impl AssemblerARM64 {
                         Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
                         _ => 8,
                     };
+                    // aarch64/opassembler.py:385-392 keeps `ofs_loc.value`
+                    // at the Signed word width; large displacements folded
+                    // in via `_try_use_older_box` must not be truncated.
                     let ofs = match arglocs.get(4) {
-                        Some(Loc::Immed(i)) => i.value as i32,
+                        Some(Loc::Immed(i)) => i.value,
                         _ => 0,
                     };
                     // aarch64/opassembler.py:385-392: combine ofs into ip0 = index + ofs.
@@ -1972,7 +1980,7 @@ impl AssemblerARM64 {
                                 ; mov x16, X(index.value)
                                 ; add x16, x16, ofs as u32);
                         } else {
-                            self.emit_mov_imm64(16, ofs as i64);
+                            self.emit_mov_imm64(16, ofs);
                             dynasm!(self.mc ; .arch aarch64
                                 ; add x16, x16, X(index.value));
                         }
@@ -5377,13 +5385,31 @@ impl AssemblerARM64 {
 
     /// COPYSTRCONTENT / COPYUNICODECONTENT: copy substring.
     /// arg(0)=src, arg(1)=dst, arg(2)=src_start, arg(3)=dst_start, arg(4)=length.
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream `rpython/jit/backend/llsupport/
+    /// rewrite.py:1045-1080` `rewrite_copy_str_content` lowers these ops
+    /// to a CALL_N(memcpy, effective_dst, effective_src, count) at the
+    /// rewriter stage.  pyre's GC rewriter does not yet emit that call
+    /// (the `memcpy_descr` / `emit_load_effective_address` infrastructure
+    /// is not ported), so the backend performs the effective-address
+    /// arithmetic and the memmove call itself.  Mirrors upstream's
+    /// basesize handling (`rewrite.py:1049-1053`).
     fn genop_discard_copystrcontent(&mut self, op: &Op) {
-        let (base_size, item_size) = op
+        let (mut base_size, item_size) = op
             .descr
             .as_ref()
             .and_then(|d| d.as_array_descr())
             .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((16, 1));
+        // rewrite.py:1049-1053 `rewrite_copy_str_content` — COPYSTRCONTENT
+        // uses `str_descr.basesize - 1` to skip the `extra_item_after_alloc`
+        // null terminator carried by `rstr.STR.chars` (`rstr.py:1226-1228`).
+        // COPYUNICODECONTENT's unicode_descr has no extra item.  Mirrors the
+        // same correction `strgetsetitem_token` applies for STR{GET,SET}ITEM.
+        if op.opcode == OpCode::Copystrcontent {
+            debug_assert_eq!(item_size, 1, "COPYSTRCONTENT itemsize must be 1");
+            base_size -= 1;
+        }
 
         // Compute byte_count = length * item_size
         self.load_arg_to_rax(op.arg(4));

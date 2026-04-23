@@ -167,27 +167,32 @@ impl AssemblerARM64 {
     /// upstream aarch64 regalloc asserts the IR-level `factor == 1`
     /// (see `_prepare_op_gc_load_indexed` at regalloc.py:566), so the
     /// index already carries byte-scaled units by construction.
+    ///
+    /// `ofs` is kept at full i64 width to mirror upstream's `ofs_loc.value`
+    /// (regalloc.py:566 passes the raw Signed); `_try_use_older_box` may
+    /// fold large displacements into the offset immediate, so narrowing to
+    /// i32 would silently truncate those.
     pub(crate) fn emit_op_gcload_indexed_regalloc(
         &mut self,
         base: &RegLoc,
         index: &RegLoc,
         dst: &RegLoc,
-        ofs: i32,
+        ofs: i64,
         size: i64,
     ) {
         let abs_size = size.unsigned_abs() as usize;
         let signed = size < 0;
         if ofs != 0 {
             // aarch64/opassembler.py:403-408 — combined = index + ofs
-            // staged through x16 (LARGE_IMM_SCRATCH).  ADD_ri imm range
-            // is 0..4095; for anything else fall back to
-            // `mov x16, #ofs; add x16, x16, index`.
+            // staged through x16 (LARGE_IMM_SCRATCH).  `check_imm_arg`
+            // (regalloc.py:161) admits 0..4095 for ADD_ri; anything else
+            // falls back to `mov x16, #ofs; add x16, x16, index`.
             if (0..4096).contains(&ofs) {
                 dynasm!(self.mc ; .arch aarch64
                     ; mov x16, X(index.value)
                     ; add x16, x16, ofs as u32);
             } else {
-                self.emit_mov_imm64(16, ofs as i64);
+                self.emit_mov_imm64(16, ofs);
                 dynasm!(self.mc ; .arch aarch64
                     ; add x16, x16, X(index.value));
             }
