@@ -367,7 +367,7 @@ impl RPythonAnnotator {
             }
         });
         if !translator_was_provided {
-            translator.set_annotator(Rc::clone(&ann));
+            translator.set_annotator(Rc::downgrade(&ann));
         }
         ann
     }

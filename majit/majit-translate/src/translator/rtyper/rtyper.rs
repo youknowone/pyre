@@ -188,8 +188,6 @@ impl RPythonTyper {
     ///     return s_obj
     /// ```
     ///
-    /// Panics on missing binding (matching upstream's `KeyError`);
-    /// callers handle missing bindings with `annotation()` first.
     pub fn binding(&self, var: &Hlvalue) -> SomeValue {
         let ann = self
             .annotator
@@ -240,12 +238,10 @@ impl RPythonTyper {
         let key = rtyper_makekey(s_obj);
         // Fast-path hit: entry present and Some → return clone.
         if let Some(slot) = self.reprs.borrow().get(&key) {
-            return match slot {
-                Some(repr) => Ok(repr.clone()),
-                None => Err(TyperError::message(format!(
-                    "recursive getrepr() for {s_obj:?}"
-                ))),
-            };
+            let result = slot
+                .as_ref()
+                .expect("recursive getrepr() should not observe None sentinel");
+            return Ok(result.clone());
         }
         // First time seeing this key: upstream pre-inserts None as the
         // recursion sentinel, then materialises the Repr.
@@ -3589,9 +3585,8 @@ mod tests {
 
     #[test]
     fn rtyper_binding_passes_through_annotator_value() {
-        // rtyper.py:170-172 `binding(var)` raises KeyError when unset;
-        // Rust panics via the underlying annotator. Exercise the
-        // positive path here by pre-seeding an annotation.
+        // rtyper.py:170-172 returns the annotator binding on the
+        // positive path.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let mut var = Variable::new();
@@ -3606,7 +3601,8 @@ mod tests {
     #[should_panic(expected = "KeyError: no binding")]
     fn rtyper_binding_panics_on_missing_variable() {
         // rtyper.py:170-172 — upstream raises KeyError when the
-        // annotator has no binding. Rust matches via panic.
+        // annotator has no binding. Rust mirrors that through the
+        // direct `annotator.binding()` path.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let v = Hlvalue::Variable(Variable::new());

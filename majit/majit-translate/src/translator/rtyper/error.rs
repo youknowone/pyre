@@ -144,8 +144,8 @@ impl fmt::Display for TyperError {
     /// return result
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (class_name, text, where_info) = self.parts();
-        write!(f, "{class_name}: {text}")?;
+        let (_class_name, text, where_info) = self.parts();
+        write!(f, "{text}")?;
         if let Some(w) = where_info {
             write!(f, "\n.. {}\n.. {}\n.. {}", w.stage, w.block, w.op)?;
         }
@@ -160,12 +160,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_variant_uses_class_name_prefix() {
-        // upstream `TyperError.__str__` returns the Exception base's
-        // formatted message; pyre prefixes the class name so mixed
-        // logs disambiguate kinds at a glance.
+    fn message_variant_matches_upstream_without_class_name_prefix() {
         let e = TyperError::message("bad cast");
-        assert_eq!(e.to_string(), "TyperError: bad cast");
+        assert_eq!(e.to_string(), "bad cast");
         assert!(!e.is_missing_rtype_operation());
         assert!(!e.is_broken_repr());
     }
@@ -176,7 +173,7 @@ mod tests {
         // callers check `.is_missing_rtype_operation()`.
         let e = TyperError::missing_rtype_operation("no iter() for Void");
         assert!(e.is_missing_rtype_operation());
-        assert_eq!(e.to_string(), "MissingRTypeOperation: no iter() for Void");
+        assert_eq!(e.to_string(), "no iter() for Void");
     }
 
     #[test]
@@ -186,7 +183,7 @@ mod tests {
         // detection via `.is_broken_repr()`.
         let e = TyperError::broken_repr("cannot setup already failed Repr: <FooRepr>");
         assert!(e.is_broken_repr());
-        assert!(e.to_string().starts_with("BrokenReprTyperError: "));
+        assert_eq!(e.to_string(), "cannot setup already failed Repr: <FooRepr>");
     }
 
     #[test]

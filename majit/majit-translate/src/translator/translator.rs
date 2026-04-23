@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::annotator::policy::AnnotatorPolicy;
@@ -82,6 +82,10 @@ pub struct FlowingFlags {
     pub list_comprehension_operations: Option<bool>,
 }
 
+/// Minimal carrier for upstream `get_platform(config)` result.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Platform;
+
 // RPython `self.exceptiontransformer = None` (translator.py:33) and
 // `TranslationContext.getexceptiontransformer()` (translator.py:86-92)
 // are intentionally NOT ported here. Upstream constructs an
@@ -104,11 +108,8 @@ fn get_combined_translation_config() -> TranslationConfig {
     }
 }
 
-/// RPython `rpython.config.translationoption.get_platform(config)`.
-/// The full platform registry is not ported yet; current config
-/// coverage only needs the default host platform marker.
-fn get_platform(_config: &TranslationConfig) -> String {
-    "host".to_string()
+fn get_platform(_config: &TranslationConfig) -> Platform {
+    Platform
 }
 
 /// Key for [`TranslationContext::callgraph`]. Matches upstream's
@@ -146,14 +147,13 @@ pub struct TranslationContext {
     /// RPython `self.annotator = None` (translator.py:31).
     ///
     /// Upstream stores a direct back-reference to the live
-    /// `RPythonAnnotator`. Rust keeps the same strong ownership edge,
-    /// intentionally mirroring Python's `translator -> annotator ->
-    /// translator` driver cycle.
-    pub annotator: RefCell<Option<Rc<RPythonAnnotator>>>,
+    /// `RPythonAnnotator`. Rust keeps the same lookup surface but uses
+    /// `Weak` to avoid the refcount cycle that Python's GC collects.
+    pub annotator: RefCell<Option<Weak<RPythonAnnotator>>>,
     /// RPython `self.rtyper = None` (translator.py:32).
     pub rtyper: RefCell<Option<Rc<RPythonTyper>>>,
     /// RPython `self.platform = get_platform(config)` (translator.py:36).
-    pub platform: String,
+    pub platform: Platform,
     // `self.exceptiontransformer = None` (translator.py:33) lands
     // when `rpython/translator/exceptiontransform.py` is ported. See
     // module header.
@@ -199,8 +199,8 @@ impl TranslationContext {
         }
         let platform = get_platform(&config);
         TranslationContext {
-            platform,
             config,
+            platform,
             annotator: RefCell::new(None),
             rtyper: RefCell::new(None),
             graphs: RefCell::new(Vec::new()),
@@ -213,12 +213,12 @@ impl TranslationContext {
     /// RPython `translator.annotator = self` assignment performed in
     /// `RPythonAnnotator.__init__` (annrpython.py:30-35) and
     /// `TranslationContext.buildannotator()` (translator.py:73-75).
-    pub fn set_annotator(&self, annotator: Rc<RPythonAnnotator>) {
+    pub fn set_annotator(&self, annotator: Weak<RPythonAnnotator>) {
         *self.annotator.borrow_mut() = Some(annotator);
     }
 
     pub fn annotator(&self) -> Option<Rc<RPythonAnnotator>> {
-        self.annotator.borrow().as_ref().cloned()
+        self.annotator.borrow().as_ref().and_then(Weak::upgrade)
     }
 
     /// RPython `TranslationContext.buildannotator()` (translator.py:70-75).
@@ -235,7 +235,7 @@ impl TranslationContext {
             None,
             self.config.translation.keepgoing,
         );
-        self.set_annotator(Rc::clone(&annotator));
+        self.set_annotator(Rc::downgrade(&annotator));
         annotator
     }
 
@@ -448,21 +448,22 @@ mod tests {
     }
 
     #[test]
-    fn implicit_annotator_backlink_is_strong_like_upstream() {
+    fn implicit_annotator_backlink_drops_with_annotator_rc() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let translator = ann.translator.clone();
         assert!(translator.annotator().is_some());
         drop(ann);
-        assert!(translator.annotator().is_some());
+        assert!(translator.annotator().is_none());
     }
 
     #[test]
-    fn buildannotator_backlink_retains_annotator_like_upstream() {
+    fn buildannotator_backlink_drops_when_annotator_is_gone() {
         let ctx = Rc::new(TranslationContext::new());
         {
             let _ann = ctx.buildannotator(None);
+            assert!(ctx.annotator().is_some());
         }
-        assert!(ctx.annotator().is_some());
+        assert!(ctx.annotator().is_none());
     }
 
     #[test]
@@ -503,12 +504,6 @@ mod tests {
         // field that is actually consumed by the current Rust port.
         let ctx = TranslationContext::new();
         assert!(ctx._prebuilt_graphs.borrow().is_empty());
-    }
-
-    #[test]
-    fn new_context_sets_platform_on_context() {
-        let ctx = TranslationContext::new();
-        assert_eq!(ctx.platform, "host");
     }
 
     #[test]
