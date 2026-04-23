@@ -891,9 +891,30 @@ extern "C" fn jit_reacquire_gil_shim() {
     }
 }
 
+// ── rewrite.py:489 parity: inject str_descr/unicode_descr ──
+//
+// Token semantics come from `symbolic.get_array_token(rstr.STR/UNICODE, ...)`
+// and `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...)` (see
+// `rpython/jit/backend/llsupport/symbolic.py:7,29`). See the matching
+// comment in `majit-backend-dynasm/src/runner.rs` for full layout
+// rationale — both backends mirror the upstream rstr layout.
+
+/// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.
 const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+/// `symbolic.get_field_token(..., 'hash', ...).size` — assert == WORD at
+/// rewrite.py:286,292.
+const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
+/// `symbolic.get_array_token(...).ofs_length`.
 const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
-const BUILTIN_STRING_BASE_SIZE: usize = BUILTIN_STRING_LEN_OFFSET + std::mem::size_of::<usize>();
+/// STR token `basesize` — header + extra_item_after_alloc.
+const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+/// UNICODE token `basesize` — header only.
+const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
+/// Byte offset of the first `chars[]` slot at runtime, for backend tests
+/// (`BUILTIN_STR_TOKEN_BASE_SIZE - 1`: subtract the extra_item_after_alloc
+/// since tests address char[0] directly).
+#[cfg(test)]
+const BUILTIN_STRING_CHARS_OFFSET: usize = BUILTIN_STR_TOKEN_BASE_SIZE - 1;
 
 // ---------------------------------------------------------------------------
 // Helpers (free functions to avoid borrow conflicts)
@@ -3540,38 +3561,53 @@ fn cl_type_for_size(size: usize) -> cranelift_codegen::ir::Type {
     }
 }
 
+/// `symbolic.get_array_token(rstr.STR/UNICODE, ...)` token triple wrapped
+/// as an `ArrayDescr`.  See the parallel helper in
+/// `majit-backend-dynasm/src/runner.rs` for rationale.
 fn builtin_string_array_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
-    let item_size = match opcode {
+    let (base_size, item_size) = match opcode {
         OpCode::Newstr
         | OpCode::Strlen
         | OpCode::Strgetitem
         | OpCode::Strsetitem
-        | OpCode::Copystrcontent
-        | OpCode::Strhash => 1,
+        | OpCode::Copystrcontent => (BUILTIN_STR_TOKEN_BASE_SIZE, 1),
         OpCode::Newunicode
         | OpCode::Unicodelen
         | OpCode::Unicodegetitem
         | OpCode::Unicodesetitem
-        | OpCode::Copyunicodecontent
-        | OpCode::Unicodehash => 4,
+        | OpCode::Copyunicodecontent => (BUILTIN_UNICODE_TOKEN_BASE_SIZE, 4),
         _ => return None,
     };
 
     let len_descr = Arc::new(BuiltinFieldDescr {
         offset: BUILTIN_STRING_LEN_OFFSET,
-        field_size: 8,
+        field_size: BUILTIN_STRING_HASH_SIZE,
         field_type: Type::Int,
         signed: false,
     });
     Some(Arc::new(BuiltinArrayDescr {
-        // Match RPython's string/unicode JIT-visible layout closely enough:
-        // cached hash word, length word, then the character data.
-        base_size: BUILTIN_STRING_BASE_SIZE,
+        base_size,
         item_size,
         type_id: 0,
         item_type: Type::Int,
         signed: false,
         len_descr,
+    }))
+}
+
+/// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...)` wrapped as a
+/// FieldDescr.  Injected for STRHASH/UNICODEHASH so rewrite.py:283-294
+/// can decode it with `unpack_fielddescr(...)`.
+fn builtin_string_hash_field_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
+    if !matches!(opcode, OpCode::Strhash | OpCode::Unicodehash) {
+        return None;
+    }
+    Some(Arc::new(BuiltinFieldDescr {
+        offset: BUILTIN_STRING_HASH_OFFSET,
+        field_size: BUILTIN_STRING_HASH_SIZE,
+        field_type: Type::Int,
+        // rewrite.py:288,293 pass `sign=True`.
+        signed: true,
     }))
 }
 
@@ -4152,10 +4188,13 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
 
 fn inject_builtin_string_descrs(ops: &mut [Op]) {
     for op in ops {
-        if op.descr.is_none() {
-            if let Some(descr) = builtin_string_array_descr(op.opcode) {
-                op.descr = Some(descr);
-            }
+        if op.descr.is_some() {
+            continue;
+        }
+        if let Some(descr) = builtin_string_array_descr(op.opcode) {
+            op.descr = Some(descr);
+        } else if let Some(descr) = builtin_string_hash_field_descr(op.opcode) {
+            op.descr = Some(descr);
         }
     }
 }
@@ -9620,16 +9659,26 @@ impl CraneliftBackend {
                 }
 
                 OpCode::Strhash | OpCode::Unicodehash => {
+                    // rewrite.py:283-294 parity — `get_field_token(rstr.STR,
+                    // 'hash', ...)`.  Injected upstream of GC rewriter; see
+                    // `builtin_string_hash_field_descr` above.  The assert
+                    // `size == WORD` at rewrite.py:286,292 mirrors here.
+                    let descr = op
+                        .descr
+                        .as_ref()
+                        .expect("strhash/unicodehash op must have a descriptor");
+                    let fd = descr
+                        .as_field_descr()
+                        .expect("strhash/unicodehash descriptor must be a FieldDescr");
+                    assert_eq!(fd.field_size(), std::mem::size_of::<usize>());
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let addr = builder
-                        .ins()
-                        .iadd_imm(base, BUILTIN_STRING_HASH_OFFSET as i64);
+                    let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
                     let hash = emit_load_from_addr(
                         &mut builder,
                         addr,
-                        Type::Int,
-                        std::mem::size_of::<usize>(),
-                        true,
+                        fd.field_type(),
+                        fd.field_size(),
+                        fd.is_field_signed(),
                         op.opcode,
                     )?;
                     builder.def_var(var(vi), hash);
@@ -9639,6 +9688,11 @@ impl CraneliftBackend {
                 // Strgetitem/Unicodegetitem: args[0] = base, args[1] = index
                 // Treated as array item access using the descriptor's base_size/item_size.
                 OpCode::Strgetitem | OpCode::Unicodegetitem => {
+                    // rewrite.py:295-306 parity — `get_array_token(rstr.STR,
+                    // ...)` returns `basesize` already inclusive of the STR
+                    // `extra_item_after_alloc=1` null terminator, and
+                    // rewrite.py:299/311 subtracts it before emitting the
+                    // address arithmetic.  UNICODE has no extra item.
                     let descr = op
                         .descr
                         .as_ref()
@@ -9646,14 +9700,20 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("str/unicodegetitem descriptor must be an ArrayDescr");
+                    let itemsize = ad.item_size() as i64;
+                    let basesize = if itemsize == 1 {
+                        ad.base_size() as i64 - 1
+                    } else {
+                        ad.base_size() as i64
+                    };
 
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
                         op.arg(0),
                         op.arg(1),
-                        ad.item_size() as i64,
-                        ad.base_size() as i64,
+                        itemsize,
+                        basesize,
                     );
                     let r = emit_load_from_addr(
                         &mut builder,
@@ -9668,6 +9728,8 @@ impl CraneliftBackend {
 
                 // Strsetitem/Unicodesetitem: args[0] = base, args[1] = index, args[2] = value
                 OpCode::Strsetitem | OpCode::Unicodesetitem => {
+                    // rewrite.py:307-318 parity.  See STRGETITEM note above
+                    // for the `basesize -= 1` rationale.
                     let descr = op
                         .descr
                         .as_ref()
@@ -9675,6 +9737,12 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("str/unicodesetitem descriptor must be an ArrayDescr");
+                    let itemsize = ad.item_size() as i64;
+                    let basesize = if itemsize == 1 {
+                        ad.base_size() as i64 - 1
+                    } else {
+                        ad.base_size() as i64
+                    };
 
                     let val = resolve_opref(&mut builder, &constants, op.arg(2));
                     let addr = emit_scaled_index_addr(
@@ -9682,8 +9750,8 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0),
                         op.arg(1),
-                        ad.item_size() as i64,
-                        ad.base_size() as i64,
+                        itemsize,
+                        basesize,
                     );
                     emit_store_to_addr(
                         &mut builder,
@@ -9696,6 +9764,9 @@ impl CraneliftBackend {
                 }
 
                 OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
+                    // rstr.py:1204-1215 parity — the source/destination
+                    // addresses skip the extra null character for STR, just
+                    // like STR{GET,SET}ITEM.
                     let descr = op
                         .descr
                         .as_ref()
@@ -9703,22 +9774,28 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("copystr/unicodecontent descriptor must be an ArrayDescr");
+                    let itemsize = ad.item_size() as i64;
+                    let basesize = if itemsize == 1 {
+                        ad.base_size() as i64 - 1
+                    } else {
+                        ad.base_size() as i64
+                    };
 
                     let src_addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
                         op.arg(0),
                         op.arg(2),
-                        ad.item_size() as i64,
-                        ad.base_size() as i64,
+                        itemsize,
+                        basesize,
                     );
                     let dst_addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
                         op.arg(1),
                         op.arg(3),
-                        ad.item_size() as i64,
-                        ad.base_size() as i64,
+                        itemsize,
+                        basesize,
                     );
                     let length =
                         resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(4));
@@ -10706,37 +10783,23 @@ impl CraneliftBackend {
                 // Newstr: allocate a byte string of length args[0].
                 // Newunicode: allocate a unicode string of length args[0].
                 // Layout: 16-byte header + length * char_size bytes.
-                OpCode::Newstr => {
+                OpCode::Newstr | OpCode::Newunicode => {
+                    // get_array_token(rstr.STR/UNICODE, ...) basesize/itemsize.
+                    // STR basesize = 17 (includes +1 extra_item_after_alloc);
+                    // UNICODE basesize = 16. Allocated bytes per rstr.malloc
+                    // are `basesize + n * itemsize`.
+                    let descr = op
+                        .descr
+                        .as_ref()
+                        .expect("newstr/newunicode op must have an ArrayDescr");
+                    let ad = descr
+                        .as_array_descr()
+                        .expect("newstr/newunicode descriptor must be an ArrayDescr");
                     let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                     let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let len = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let base_size = builder.ins().iconst(cl_types::I64, 16);
-                    let item_size = builder.ins().iconst(cl_types::I64, 1);
-                    let result = emit_collecting_gc_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jf_ptr,
-                        &ref_root_slots,
-                        &defined_ref_vars,
-                        ref_root_base_ofs,
-                        per_call_gcmap,
-                        runtime_id,
-                        gc_alloc_varsize_shim as *const () as usize,
-                        &[base_size, item_size, len],
-                        Some(cl_types::I64),
-                    )
-                    .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    builder.def_var(jf_ptr_var, jf_ptr);
-                    builder.def_var(var(vi), result);
-                }
-                OpCode::Newunicode => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-                    let len = resolve_opref(&mut builder, &constants, op.arg(0));
-                    let base_size = builder.ins().iconst(cl_types::I64, 16);
-                    let item_size = builder.ins().iconst(cl_types::I64, 4);
+                    let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
+                    let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
                     let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
@@ -17768,9 +17831,9 @@ mod tests {
         unsafe {
             *(ptr.add(BUILTIN_STRING_HASH_OFFSET) as *mut i64) = -7;
             *(ptr.add(BUILTIN_STRING_LEN_OFFSET) as *mut usize) = 3;
-            *ptr.add(BUILTIN_STRING_BASE_SIZE) = b'a';
-            *ptr.add(BUILTIN_STRING_BASE_SIZE + 1) = b'b';
-            *ptr.add(BUILTIN_STRING_BASE_SIZE + 2) = b'c';
+            *ptr.add(BUILTIN_STRING_CHARS_OFFSET) = b'a';
+            *ptr.add(BUILTIN_STRING_CHARS_OFFSET + 1) = b'b';
+            *ptr.add(BUILTIN_STRING_CHARS_OFFSET + 2) = b'c';
         }
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr as usize))]);
@@ -17804,7 +17867,7 @@ mod tests {
         unsafe {
             *(ptr.add(BUILTIN_STRING_HASH_OFFSET) as *mut i64) = -11;
             *(ptr.add(BUILTIN_STRING_LEN_OFFSET) as *mut usize) = 1;
-            *(ptr.add(BUILTIN_STRING_BASE_SIZE) as *mut u32) = 0x2603;
+            *(ptr.add(BUILTIN_STRING_CHARS_OFFSET) as *mut u32) = 0x2603;
         }
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr as usize))]);

@@ -2984,7 +2984,16 @@ impl RegAlloc {
         let base_loc = self.make_sure_var_in_reg(op.args[0], Type::Ref, &args, None, false);
         // aarch64/regalloc.py:565
         let index_loc = self.make_sure_var_in_reg(op.args[1], Type::Int, &args, None, false);
-        // aarch64/regalloc.py:566-568: assert scale==1, ofs/nsize
+        // aarch64/regalloc.py:566 `assert boxes[2].getint() == 1` — aarch64 load
+        // has no scaled addressing form, so the rewriter must have already
+        // pre-scaled the index (load_supported_factors = (1,) per
+        // `gc_store_supported_factors()` in runner.rs).
+        let scale = self.const_value(op.args[2]);
+        assert_eq!(
+            scale, 1,
+            "aarch64 GcLoadIndexed requires factor == 1 (got {scale})"
+        );
+        // aarch64/regalloc.py:567-568: ofs/nsize getint
         let ofs = if op.args.len() > 3 {
             self.const_value(op.args[3])
         } else {

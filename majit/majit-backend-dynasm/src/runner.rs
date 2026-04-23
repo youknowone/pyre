@@ -1459,9 +1459,40 @@ mod tests {
 }
 
 // ── rewrite.py:489 parity: inject str_descr/unicode_descr ──
+//
+// Token semantics come from `symbolic.get_array_token(rstr.STR/UNICODE, ...)`
+// and `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...)` (see
+// `rpython/jit/backend/llsupport/symbolic.py:7,29`). The layout encoded by
+// `rstr.STR.become(GcStruct('rpy_string', ('hash', Signed), ('chars',
+// Array(Char, hints={'extra_item_after_alloc': 1}))))`
+// (`rpython/rtyper/lltypesystem/rstr.py:1226`) is:
+//
+//   [ hash (WORD) | chars.length (WORD) | chars[0..n] | +1 extra null ]
+//
+// `get_array_token` returns `basesize = before_array_part +
+// carray.items.offset + extra_item_after_alloc`, so for STR the token
+// `basesize` is 17 (not 16) — rewrite.py:295 then subtracts 1 for the
+// extra null character when emitting STR{GET,SET}ITEM. UNICODE has no
+// `extra_item_after_alloc` hint, so its token `basesize` is 16.
+//
+// Hash lives in its own field (the `hash` struct member), separate from
+// the array tail. rewrite.py:283-294 reads it with
+// `get_field_token(..., 'hash', ...)`, not `get_array_token(...)`.
 
+/// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.
+const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+/// `symbolic.get_field_token(..., 'hash', ...).size` — assert == WORD at
+/// rewrite.py:286,292.
+const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
+/// `symbolic.get_array_token(rstr.STR/UNICODE, ...).ofs_length` =
+/// `before_array_part + carray.length.offset`.
 const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
-const BUILTIN_STRING_BASE_SIZE: usize = BUILTIN_STRING_LEN_OFFSET + std::mem::size_of::<usize>();
+/// STR token `basesize` — `before_array_part(8) + carray.items.offset(8) +
+/// extra_item_after_alloc(1) = 17`.
+const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+/// UNICODE token `basesize` — `before_array_part(8) + carray.items.offset(8)
+/// = 16` (no extra_item_after_alloc).
+const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
 
 #[derive(Debug)]
 struct BuiltinFieldDescr {
@@ -1529,31 +1560,35 @@ impl majit_ir::ArrayDescr for BuiltinArrayDescr {
     }
 }
 
+/// `symbolic.get_array_token(rstr.STR/UNICODE, ...)` token triple wrapped
+/// as an `ArrayDescr`.  Fed to NEW{STR,UNICODE} / STR{LEN,GETITEM,SETITEM}
+/// / UNICODE{LEN,GETITEM,SETITEM} / COPY{STR,UNICODE}CONTENT — every op
+/// that upstream dispatches through `get_array_token` at
+/// `rewrite.py:273-318`.  STR{,UNICODE}HASH takes a separate FieldDescr
+/// (see `builtin_string_hash_field_descr` below).
 fn builtin_string_array_descr(opcode: majit_ir::OpCode) -> Option<majit_ir::DescrRef> {
     use majit_ir::OpCode;
-    let item_size = match opcode {
+    let (base_size, item_size) = match opcode {
         OpCode::Newstr
         | OpCode::Strlen
         | OpCode::Strgetitem
         | OpCode::Strsetitem
-        | OpCode::Copystrcontent
-        | OpCode::Strhash => 1,
+        | OpCode::Copystrcontent => (BUILTIN_STR_TOKEN_BASE_SIZE, 1),
         OpCode::Newunicode
         | OpCode::Unicodelen
         | OpCode::Unicodegetitem
         | OpCode::Unicodesetitem
-        | OpCode::Copyunicodecontent
-        | OpCode::Unicodehash => 4,
+        | OpCode::Copyunicodecontent => (BUILTIN_UNICODE_TOKEN_BASE_SIZE, 4),
         _ => return None,
     };
     let len_descr = Arc::new(BuiltinFieldDescr {
         offset: BUILTIN_STRING_LEN_OFFSET,
-        field_size: 8,
+        field_size: BUILTIN_STRING_HASH_SIZE,
         field_type: Type::Int,
         signed: false,
     });
     Some(Arc::new(BuiltinArrayDescr {
-        base_size: BUILTIN_STRING_BASE_SIZE,
+        base_size,
         item_size,
         type_id: 0,
         item_type: Type::Int,
@@ -1562,12 +1597,34 @@ fn builtin_string_array_descr(opcode: majit_ir::OpCode) -> Option<majit_ir::Desc
     }))
 }
 
+/// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...)` wrapped as a
+/// FieldDescr.  rewrite.py:283-294 reads STRHASH/UNICODEHASH via
+/// `get_field_token`, not `get_array_token`.  Kept separate so the two
+/// upstream token helpers have independent pyre counterparts.
+fn builtin_string_hash_field_descr(opcode: majit_ir::OpCode) -> Option<majit_ir::DescrRef> {
+    use majit_ir::OpCode;
+    if !matches!(opcode, OpCode::Strhash | OpCode::Unicodehash) {
+        return None;
+    }
+    Some(Arc::new(BuiltinFieldDescr {
+        offset: BUILTIN_STRING_HASH_OFFSET,
+        field_size: BUILTIN_STRING_HASH_SIZE,
+        field_type: Type::Int,
+        // rewrite.py:288,293 pass `sign=True` for STR/UNICODE hash — the
+        // `hash` struct field is `Signed`.
+        signed: true,
+    }))
+}
+
 fn inject_builtin_string_descrs(ops: &mut [Op]) {
     for op in ops {
-        if op.descr.is_none() {
-            if let Some(descr) = builtin_string_array_descr(op.opcode) {
-                op.descr = Some(descr);
-            }
+        if op.descr.is_some() {
+            continue;
+        }
+        if let Some(descr) = builtin_string_array_descr(op.opcode) {
+            op.descr = Some(descr);
+        } else if let Some(descr) = builtin_string_hash_field_descr(op.opcode) {
+            op.descr = Some(descr);
         }
     }
 }

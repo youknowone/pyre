@@ -793,7 +793,7 @@ impl AssemblerARM64 {
     }
 
     // ── AArch64 helper: load a 64-bit immediate into register Xn ──
-    fn emit_mov_imm64(&mut self, reg: u32, val: i64) {
+    pub(crate) fn emit_mov_imm64(&mut self, reg: u32, val: i64) {
         let v = val as u64;
         let r = reg as u8;
         dynasm!(self.mc ; .arch aarch64
@@ -1921,6 +1921,32 @@ impl AssemblerARM64 {
                 };
                 // aarch64/opassembler.py:368: self._write_to_mem(value_loc, base_loc, ofs_loc, scale)
                 self.emit_op_gcstore_regalloc(base, ofs_loc, &val_reg, size);
+            }
+            // ── aarch64/opassembler.py:396-412 _emit_op_gc_load_indexed ──
+            // arglocs = [res_loc, base_loc, index_loc, imm(nsize), imm(ofs)]
+            // per `consider_gc_load_indexed` in regalloc.rs:2981-3014.
+            OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
+                if let (Some(Loc::Reg(res)), Some(Loc::Reg(base)), Some(Loc::Reg(index))) =
+                    (arglocs.first(), arglocs.get(1), arglocs.get(2))
+                {
+                    let nsize = match arglocs.get(3) {
+                        Some(Loc::Immed(i)) => i.value,
+                        _ => op
+                            .descr
+                            .as_ref()
+                            .and_then(|d| d.as_array_descr())
+                            .map(|ad| {
+                                let s = ad.item_size() as i64;
+                                if ad.is_item_signed() { -s } else { s }
+                            })
+                            .unwrap_or(8),
+                    };
+                    let ofs = match arglocs.get(4) {
+                        Some(Loc::Immed(i)) => i.value as i32,
+                        _ => 0,
+                    };
+                    self.emit_op_gcload_indexed_regalloc(base, index, res, ofs, nsize);
+                }
             }
             // ── aarch64/opassembler.py:381 emit_op_gc_store_indexed ──
             // arglocs = [value_loc, base_loc, index_loc, imm(size), imm(ofs)]
@@ -4857,7 +4883,17 @@ impl AssemblerARM64 {
     /// RPython string representation. For RPython strings, the length
     /// is typically at offset 8 (after the GC header / hash field).
     fn genop_strlen(&mut self, op: &Op) {
-        let offset = Self::field_offset_from_descr(op);
+        // rewrite.py:273-282 parity — the length field offset comes from
+        // `get_array_token(rstr.STR/UNICODE, ...)` → `ArrayDescr.lendescr`
+        // in the JIT descr model.  Upstream emits `GC_LOAD_I` reading
+        // `ArrayDescr.lendescr.offset`; the direct path mirrors that.
+        let offset = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .and_then(|ad| ad.len_descr())
+            .map(|ld| ld.offset() as i32)
+            .unwrap_or_else(|| Self::field_offset_from_descr(op));
         self.load_arg_to_rax(op.arg(0));
 
         dynasm!(self.mc ; .arch aarch64
@@ -4869,15 +4905,21 @@ impl AssemblerARM64 {
 
     /// STRGETITEM / UNICODEGETITEM: result = string[index]
     /// arg0 = string pointer, arg1 = index.
-    /// Characters are stored after the header. For RPython strings
-    /// (1 byte per char), address = base + base_size + index.
+    /// Address = base + (basesize - extra_null) + index * itemsize, per
+    /// `rewrite.py:295-306` — STR has `extra_item_after_alloc=1` so the
+    /// token basesize overshoots the first char by 1.
     fn genop_strgetitem(&mut self, op: &Op) {
-        let (base_size, item_size) = op
+        let (token_base, item_size) = op
             .descr
             .as_ref()
             .and_then(|d| d.as_array_descr())
             .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-            .unwrap_or((16, 1)); // Default for RPython rstr: 16-byte header, 1-byte items
+            .unwrap_or((17, 1)); // rstr.STR token defaults (basesize=17, itemsize=1)
+        let base_size = if item_size == 1 {
+            token_base - 1 // rewrite.py:299 — skip the extra null character
+        } else {
+            token_base
+        };
 
         self.load_arg_to_rax(op.arg(0)); // string pointer
         self.load_arg_to_rcx(op.arg(1)); // index
@@ -5389,13 +5431,31 @@ impl AssemblerARM64 {
     }
 
     /// NEWSTR: allocate a byte string of given length.
+    /// `base_size` / `item_size` come from the injected ArrayDescr
+    /// (`builtin_string_array_descr` in `runner.rs`), which encodes
+    /// `get_array_token(rstr.STR, ...)` — basesize includes the +1
+    /// extra_item_after_alloc null terminator.
     fn genop_newstr(&mut self, op: &Op) {
-        self.genop_alloc_varsize(op, 16, 1);
+        let (base_size, item_size) = Self::array_token_from_descr(op, 16, 1);
+        self.genop_alloc_varsize(op, base_size, item_size);
     }
 
     /// NEWUNICODE: allocate a unicode string (4-byte chars).
+    /// Basesize = 16 (no extra_item_after_alloc), itemsize = 4.
     fn genop_newunicode(&mut self, op: &Op) {
-        self.genop_alloc_varsize(op, 16, 4);
+        let (base_size, item_size) = Self::array_token_from_descr(op, 16, 4);
+        self.genop_alloc_varsize(op, base_size, item_size);
+    }
+
+    /// Read `(base_size, item_size)` from the injected ArrayDescr.
+    /// Fallback used only when the descr is missing (should never happen
+    /// for NEWSTR/NEWUNICODE after `inject_builtin_string_descrs`).
+    fn array_token_from_descr(op: &Op, fallback_base: i64, fallback_item: i64) -> (i64, i64) {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .unwrap_or((fallback_base, fallback_item))
     }
 
     /// Shared implementation for NEWSTR / NEWUNICODE / NEW_ARRAY.

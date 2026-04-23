@@ -25,6 +25,54 @@ fn round_up(size: usize) -> usize {
     (size + NURSERY_ALIGN - 1) & !(NURSERY_ALIGN - 1)
 }
 
+/// `get_array_token(rstr.STR, ...)` / `get_array_token(rstr.UNICODE, ...)`
+/// as consumed by rewrite.py:295-318.  Reads `(itemsize, basesize)` from
+/// the injected ArrayDescr and applies the `basesize -= 1` correction
+/// for STR (the extra_item_after_alloc null).
+fn strgetsetitem_token(op: &Op, is_str: bool) -> (i64, i64) {
+    let descr = op
+        .descr
+        .as_ref()
+        .expect("STR/UNICODE getitem/setitem op must carry an ArrayDescr");
+    let ad = descr
+        .as_array_descr()
+        .expect("STR/UNICODE getitem/setitem descr must be an ArrayDescr");
+    let itemsize = ad.item_size() as i64;
+    let mut basesize = ad.base_size() as i64;
+    if is_str {
+        // rewrite.py:298 assert itemsize == 1 for STR.
+        assert_eq!(
+            itemsize, 1,
+            "rewrite.py:298 STR getitem/setitem itemsize must be 1"
+        );
+        basesize -= 1; // rewrite.py:299 — skip extra null character
+    }
+    (itemsize, basesize)
+}
+
+/// resoperation.py:1524-1531 `OpHelpers.get_gc_load`.
+/// Select GC_LOAD_I / GC_LOAD_R / GC_LOAD_F by result type.
+fn get_gc_load(tp: Type) -> OpCode {
+    match tp {
+        Type::Int => OpCode::GcLoadI,
+        Type::Ref => OpCode::GcLoadR,
+        Type::Float => OpCode::GcLoadF,
+        Type::Void => panic!("get_gc_load: cannot lower a Void-typed load"),
+    }
+}
+
+/// resoperation.py:1533-1541 `OpHelpers.get_gc_load_indexed`.
+/// Select GC_LOAD_INDEXED_I / GC_LOAD_INDEXED_R / GC_LOAD_INDEXED_F by
+/// result type.
+fn get_gc_load_indexed(tp: Type) -> OpCode {
+    match tp {
+        Type::Int => OpCode::GcLoadIndexedI,
+        Type::Ref => OpCode::GcLoadIndexedR,
+        Type::Float => OpCode::GcLoadIndexedF,
+        Type::Void => panic!("get_gc_load_indexed: cannot lower a Void-typed load"),
+    }
+}
+
 /// regalloc.py:871 — compiled_loop_token._ll_initial_locs + frame_info.
 ///
 /// Per-callee metadata needed by handle_call_assembler to allocate and
@@ -232,6 +280,22 @@ struct RewriteState {
     /// at iteration `i` and swaps the rewritten op in place of the
     /// original (rewrite.py:366-367).
     changed_ops: HashMap<usize, Op>,
+
+    /// rewrite.py:96-99 `get_box_replacement` — source→replacement mapping
+    /// for ops that `transform_to_gc_load` has forwarded to a lowered
+    /// form (GC_LOAD / GC_LOAD_INDEXED / GC_STORE / GC_STORE_INDEXED).
+    /// Upstream sets this via `op.set_forwarded(newload)` and
+    /// `emit_op` follows the forwarding at emission time.  In this Rust
+    /// port we operate on owned `Op` values, so the replacement is
+    /// keyed by the main-loop iteration index (stashed in
+    /// `current_i`) and consumed by `emit_maybe_forwarded` when the
+    /// outer dispatch reaches the op's emission site.
+    forwarded_ops: HashMap<usize, Op>,
+    /// Current main-loop iteration index, set by the outer dispatch
+    /// before invoking `transform_to_gc_load` / `handle_*` helpers.
+    /// Read by `set_forwarded` / `emit_maybe_forwarded` to key the
+    /// `forwarded_ops` map.
+    current_i: usize,
 }
 
 impl RewriteState {
@@ -253,6 +317,8 @@ impl RewriteState {
             _constant_additions: HashMap::new(),
             next_const_idx: 0,
             changed_ops: HashMap::new(),
+            forwarded_ops: HashMap::new(),
+            current_i: 0,
         }
     }
 
@@ -447,6 +513,35 @@ impl RewriteState {
             self.record_result_mapping(original.pos, result);
         }
         result
+    }
+
+    /// rewrite.py:128-130 `replace_op_with(op, newop)` — stash `lowered`
+    /// as the replacement for the op at the current main-loop iteration.
+    /// A subsequent `emit_maybe_forwarded` call for the same iteration
+    /// will emit the stashed replacement.
+    fn set_forwarded(&mut self, lowered: Op) {
+        self.forwarded_ops.insert(self.current_i, lowered);
+    }
+
+    /// rewrite.py:100-126 `emit_op` — emits either the replacement
+    /// previously stashed via `set_forwarded` (if any) or the rewritten
+    /// original.  Preserves the original's position mapping so downstream
+    /// uses of the original's `OpRef` resolve to the lowered op's result.
+    fn emit_maybe_forwarded(&mut self, original: &Op) -> OpRef {
+        if let Some(lowered) = self.forwarded_ops.remove(&self.current_i) {
+            let result = if original.result_type() == Type::Void {
+                self.emit(lowered)
+            } else {
+                self.emit_result(lowered, original.pos)
+            };
+            if original.result_type() != Type::Void {
+                self.record_result_mapping(original.pos, result);
+            }
+            result
+        } else {
+            let rewritten = self.rewrite_op(original);
+            self.emit_rewritten_from(original, rewritten)
+        }
     }
 
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
@@ -726,10 +821,18 @@ impl GcRewriterImpl {
     // SETFIELD_GC  → maybe COND_CALL_GC_WB + SETFIELD_GC
     // ────────────────────────────────────────────────────────
 
-    fn handle_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
-        let rewritten = st.rewrite_op(op);
-        let obj = rewritten.arg(0);
-
+    /// rewrite.py:926-934 `handle_write_barrier_setfield`.
+    /// Emits a write barrier before the store when the stored value is a
+    /// non-null reference into a pointer-bearing field AND the base has
+    /// not already been WB'd.  Does *not* emit the store itself — the
+    /// caller is expected to follow up with `emit_maybe_forwarded` so
+    /// the lowered GC_STORE (forwarded by `transform_to_gc_load`) lands
+    /// after the WB.
+    fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState) {
+        let obj = st.resolve(op.arg(0));
+        if st.wb_already_applied(obj) {
+            return;
+        }
         // rewrite.py:930-931: check the stored VALUE's type.
         //   v = op.getarg(1)
         //   if (v.type == 'r' and (not isinstance(v, ConstPtr) or
@@ -737,7 +840,7 @@ impl GcRewriterImpl {
         //
         // Gate on field descriptor: if the field is not a pointer field,
         // the GC won't trace it, so no WB is needed regardless of value
-        // type. In RPython val.type=='r' implies the field is GCREF;
+        // type.  In RPython val.type=='r' implies the field is GCREF;
         // here ForceToken (Ref) stores to an Int-typed field (offset 128),
         // a pyre-specific divergence.
         let field_is_ptr = op
@@ -746,7 +849,7 @@ impl GcRewriterImpl {
             .and_then(|d| d.as_field_descr())
             .map(|fd| fd.is_pointer_field())
             .unwrap_or(false);
-        let val = rewritten.arg(1);
+        let val = st.resolve(op.arg(1));
         let val_is_ref = if field_is_ptr {
             match st.result_type_of(val) {
                 Some(tp) => tp == Type::Ref,
@@ -755,17 +858,36 @@ impl GcRewriterImpl {
         } else {
             false
         };
-        let is_null_const = val_is_ref && st.is_null_constant(val);
-
-        if val_is_ref && !is_null_const && !st.wb_already_applied(obj) {
-            // Emit COND_CALL_GC_WB(obj) before the store.
-            let wb_op = Op::new(OpCode::CondCallGcWb, &[obj]);
-            st.emit(wb_op);
-            st.remember_wb(obj);
+        if !val_is_ref || st.is_null_constant(val) {
+            return;
         }
+        self.gen_write_barrier(obj, st);
+    }
 
-        // Emit the original SETFIELD_GC unchanged.
-        st.emit(rewritten);
+    /// rewrite.py:948-953 `gen_write_barrier`.
+    fn gen_write_barrier(&self, v_base: OpRef, st: &mut RewriteState) {
+        let wb_op = Op::new(OpCode::CondCallGcWb, &[v_base]);
+        st.emit(wb_op);
+        st.remember_wb(v_base);
+    }
+
+    /// rewrite.py:506-512 `consider_setfield_gc`.
+    ///
+    /// Upstream drops the (base, offset) entry from
+    /// `_delayed_zero_setfields` so the pending-zero flush at
+    /// `emit_pending_zeros` (rewrite.py:761-766) does not re-zero a slot
+    /// that the explicit SETFIELD_GC is about to overwrite.
+    ///
+    /// pyre's rewriter does not yet track delayed zero-setfields
+    /// (there is no `delayed_zero_setfields` field on `RewriteState`;
+    /// `handle_new` emits the tid + vtable stores synchronously at
+    /// allocation time), so the clear is a no-op.  The call site is
+    /// kept for structural parity with rewrite.py:394 — when
+    /// `_delayed_zero_setfields` (rewrite.py:61) is ported the body
+    /// here can follow rewrite.py:507-512 line-by-line without
+    /// touching the caller.
+    fn consider_setfield_gc(&self, _op: &Op, _st: &mut RewriteState) {
+        // no-op: delayed-zero-setfield tracking not yet ported.
     }
 
     // ────────────────────────────────────────────────────────
@@ -819,37 +941,48 @@ impl GcRewriterImpl {
     }
 
     /// rewrite.py:132-138 handle_setarrayitem.
-    ///
-    /// RPython lowers SETARRAYITEM_GC / SETARRAYITEM_RAW into GC_STORE /
-    /// GC_STORE_INDEXED here via `emit_gc_store_or_indexed`. That path is
-    /// currently disabled on pyre's dynasm backend: the lowered store
-    /// triggers the +N/100 extra-store phenomenon under bridge reentry
-    /// (nbody_extra_stores_2026_04_18, nbody_sl_blocker_2026_04_20),
-    /// which corrupts nbody's accumulated float state even though each
-    /// individual store IR is correct. Until the bridge-reentry root
-    /// cause is addressed, emit the original SETARRAYITEM op unchanged;
-    /// the backend `regalloc_perform` default arm is a no-op for this
-    /// opcode, which matches the pre-rewrite silent-drop behavior under
-    /// which nbody and all other benches produced correct output on
-    /// dynasm. The WB/guard parity from `consider_setarrayitem_gc` +
-    /// `handle_write_barrier_setarrayitem` above is retained.
-    ///
-    /// `emit_gc_store_or_indexed` is kept (unused) because it will be
-    /// re-wired once the bridge-reentry fix lands.
+    /// Lowers SETARRAYITEM_GC / SETARRAYITEM_RAW into GC_STORE /
+    /// GC_STORE_INDEXED via `emit_gc_store_or_indexed`, which forwards
+    /// the original op to the lowered form (the emission happens later
+    /// in the main loop via `emit_maybe_forwarded` for RAW and via the
+    /// SETARRAYITEM_GC write-barrier arm for GC).
     fn handle_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
-        let rewritten = st.rewrite_op(op);
-        st.emit(rewritten);
-        // Reference to keep the lowering helper from being flagged dead
-        // until the bridge-reentry fix re-enables it.
-        let _ = Self::emit_gc_store_or_indexed;
+        let descr = op.descr.as_ref().expect("SETARRAYITEM needs ArrayDescr");
+        let ad = descr
+            .as_array_descr()
+            .expect("SETARRAYITEM descr must be ArrayDescr");
+        let itemsize = ad.item_size() as i64;
+        let basesize = ad.base_size() as i64;
+        let ptr = st.resolve(op.arg(0));
+        let index = st.resolve(op.arg(1));
+        let value = st.resolve(op.arg(2));
+        self.emit_gc_store_or_indexed(
+            Some(op),
+            ptr,
+            index,
+            value,
+            itemsize,
+            itemsize,
+            basesize,
+            st,
+        );
     }
 
     /// rewrite.py:140-158 emit_gc_store_or_indexed (with cpu_simplify_scale
     /// inlined). `load_supported_factors` drives the non-constant branch:
     /// factors outside that set are pre-scaled in IR, factors inside it pass
     /// through to the backend's native addressing mode.
+    ///
+    /// When `original` is `Some`, the lowered GC_STORE / GC_STORE_INDEXED is
+    /// *forwarded* as the replacement for the original op (upstream's
+    /// `replace_op_with`); the main loop emits the forwarded op at the
+    /// appropriate point in the output stream (after any write barrier).
+    /// When `None`, the lowered op is emitted directly — used for
+    /// internal stores synthesised by the rewriter that do not replace an
+    /// input op (e.g. tid initialisation for fresh allocations).
     fn emit_gc_store_or_indexed(
         &self,
+        original: Option<&Op>,
         ptr: OpRef,
         mut index: OpRef,
         value: OpRef,
@@ -869,10 +1002,12 @@ impl GcRewriterImpl {
             offset = index_val * factor + offset;
             let offset_ref = st.const_int(offset);
             let itemsize_ref = st.const_int(itemsize);
-            st.emit(Op::new(
-                OpCode::GcStore,
-                &[ptr, offset_ref, value, itemsize_ref],
-            ));
+            let newload = Op::new(OpCode::GcStore, &[ptr, offset_ref, value, itemsize_ref]);
+            if original.is_some() {
+                st.set_forwarded(newload);
+            } else {
+                st.emit(newload);
+            }
             return;
         }
 
@@ -880,6 +1015,103 @@ impl GcRewriterImpl {
         // Pre-scale only when the CPU's native addressing mode cannot carry
         // this factor (mirrors `factor != 1 and factor not in
         // cpu.load_supported_factors`).
+        if factor != 1 && !self.load_supported_factors.contains(&factor) {
+            assert!(factor > 0, "cpu_simplify_scale: factor must be positive");
+            let mul_op = if (factor & (factor - 1)) == 0 {
+                let shift = (factor as u64).trailing_zeros() as i64;
+                let shift_ref = st.const_int(shift);
+                Op::new(OpCode::IntLshift, &[index, shift_ref])
+            } else {
+                let factor_ref = st.const_int(factor);
+                Op::new(OpCode::IntMul, &[index, factor_ref])
+            };
+            // rewrite.py:169-170 — the pre-scale op is emitted directly
+            // (not forwarded) even when the final store is forwarded.
+            let scaled = st.emit_result(mul_op, OpRef::NONE);
+            st.result_types.insert(scaled.0, Type::Int);
+            index = scaled;
+            factor = 1;
+        }
+
+        let factor_ref = st.const_int(factor);
+        let offset_ref = st.const_int(offset);
+        let itemsize_ref = st.const_int(itemsize);
+        let newload = Op::new(
+            OpCode::GcStoreIndexed,
+            &[ptr, index, value, factor_ref, offset_ref, itemsize_ref],
+        );
+        if original.is_some() {
+            st.set_forwarded(newload);
+        } else {
+            st.emit(newload);
+        }
+    }
+
+    /// rewrite.py:160-164 handle_getarrayitem.
+    /// Lowers GETARRAYITEM_{GC,RAW}_{I,R,F} (including the PURE variants,
+    /// per rewrite.py:216-219) into GC_LOAD / GC_LOAD_INDEXED by
+    /// forwarding the op through `emit_gc_load_or_indexed`.
+    fn handle_getarrayitem(&self, op: &Op, st: &mut RewriteState) {
+        let descr = op.descr.as_ref().expect("GETARRAYITEM needs ArrayDescr");
+        let ad = descr
+            .as_array_descr()
+            .expect("GETARRAYITEM descr must be ArrayDescr");
+        let itemsize = ad.item_size() as i64;
+        let ofs = ad.base_size() as i64;
+        let sign = ad.is_item_signed();
+        let ptr = st.resolve(op.arg(0));
+        let index = st.resolve(op.arg(1));
+        self.emit_gc_load_or_indexed(op, ptr, index, itemsize, itemsize, ofs, sign, st);
+    }
+
+    /// rewrite.py:184-210 emit_gc_load_or_indexed (with cpu_simplify_scale
+    /// inlined). Forwards `original` to either GC_LOAD_{I,R,F} (when the
+    /// index resolves to a constant) or GC_LOAD_INDEXED_{I,R,F}.
+    ///
+    /// The caller is expected to supply the already-resolved
+    /// `ptr` / `index` args and the raw (itemsize, factor, offset, sign)
+    /// tuple from `unpack_arraydescr` / `unpack_fielddescr` /
+    /// `unpack_interiorfielddescr` or from `get_array_token` /
+    /// `get_field_token` for the string and unicode helpers.
+    ///
+    /// `sign` is encoded into the emitted `itemsize` arg by negating it
+    /// (rewrite.py:192-194) — the backend decodes the sign back out of
+    /// the sign bit on the nsize operand.
+    fn emit_gc_load_or_indexed(
+        &self,
+        original: &Op,
+        ptr: OpRef,
+        mut index: OpRef,
+        itemsize: i64,
+        mut factor: i64,
+        mut offset: i64,
+        sign: bool,
+        st: &mut RewriteState,
+    ) {
+        // rewrite.py:186-187: index_box, offset = self._try_use_older_box(
+        //     index_box, factor, offset)
+        let (new_index, new_offset) = st._try_use_older_box(index, factor, offset);
+        index = new_index;
+        offset = new_offset;
+
+        // rewrite.py:192-194: encode signed-ness into the itemsize value.
+        let itemsize_enc = if sign { -itemsize } else { itemsize };
+
+        // rewrite.py:196-198: optype from op.type (result-kind of the
+        // original load op determines the GC_LOAD_I / R / F variant).
+        let optype = original.opcode.result_type();
+
+        // rewrite.py:1118-1122 cpu_simplify_scale, ConstInt path.
+        if let Some(index_val) = st.resolve_constant(index.0) {
+            offset = index_val * factor + offset;
+            let offset_ref = st.const_int(offset);
+            let itemsize_ref = st.const_int(itemsize_enc);
+            let newload = Op::new(get_gc_load(optype), &[ptr, offset_ref, itemsize_ref]);
+            st.set_forwarded(newload);
+            return;
+        }
+
+        // rewrite.py:1124-1134 cpu_simplify_scale, non-constant path.
         if factor != 1 && !self.load_supported_factors.contains(&factor) {
             assert!(factor > 0, "cpu_simplify_scale: factor must be positive");
             let mul_op = if (factor & (factor - 1)) == 0 {
@@ -898,11 +1130,356 @@ impl GcRewriterImpl {
 
         let factor_ref = st.const_int(factor);
         let offset_ref = st.const_int(offset);
-        let itemsize_ref = st.const_int(itemsize);
-        st.emit(Op::new(
-            OpCode::GcStoreIndexed,
-            &[ptr, index, value, factor_ref, offset_ref, itemsize_ref],
-        ));
+        let itemsize_ref = st.const_int(itemsize_enc);
+        let newload = Op::new(
+            get_gc_load_indexed(optype),
+            &[ptr, index, factor_ref, offset_ref, itemsize_ref],
+        );
+        st.set_forwarded(newload);
+    }
+
+    /// rewrite.py:212-342 `transform_to_gc_load`.
+    ///
+    /// Central dispatcher that lowers high-level memory accessors to
+    /// GC_LOAD / GC_LOAD_INDEXED / GC_STORE / GC_STORE_INDEXED. Each arm
+    /// matches its upstream counterpart line-by-line; the emission uses
+    /// `emit_gc_load_or_indexed` / `emit_gc_store_or_indexed`, which
+    /// either forward the op (when `original` is `Some`) or emit directly.
+    ///
+    /// Returns `true` only for the `GETFIELD_GC_*` fast-path at
+    /// rewrite.py:259-260, which flushes pending zeros, forwards, and
+    /// emits the forwarded op itself — the caller (`rewrite`) then
+    /// skips the rest of the main-loop body.  All other arms forward
+    /// the op and return `false`, delegating emission to the main loop
+    /// via `emit_maybe_forwarded` (or the write-barrier arms).
+    fn transform_to_gc_load(&self, op: &Op, st: &mut RewriteState) -> bool {
+        const NOT_SIGNED: bool = false;
+        let opnum = op.opcode;
+
+        // rewrite.py:216-218 `rop.is_getarrayitem(opnum) or opnum in
+        // (GETARRAYITEM_RAW_I, GETARRAYITEM_RAW_F)`.  Upstream omits
+        // GETARRAYITEM_RAW_R because codewriter rejects raw ref array
+        // reads at `rpython/jit/codewriter/jtransform.py:775`
+        // (`getarrayitem_raw_r not supported`); mirror that omission so
+        // a rogue GETARRAYITEM_RAW_R does not get silently lowered into
+        // GC_LOAD_INDEXED_R here.
+        if opnum.is_getarrayitem()
+            || matches!(opnum, OpCode::GetarrayitemRawI | OpCode::GetarrayitemRawF)
+        {
+            self.handle_getarrayitem(op, st);
+            return false;
+        }
+        // rewrite.py:220-221
+        if matches!(opnum, OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw) {
+            self.handle_setarrayitem(op, st);
+            return false;
+        }
+        // rewrite.py:222-227 RAW_STORE
+        if matches!(opnum, OpCode::RawStore) {
+            let descr = op.descr.as_ref().expect("RAW_STORE needs ArrayDescr");
+            let ad = descr
+                .as_array_descr()
+                .expect("RAW_STORE descr must be ArrayDescr");
+            let itemsize = ad.item_size() as i64;
+            let ofs = ad.base_size() as i64;
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
+            self.emit_gc_store_or_indexed(Some(op), ptr, index, value, itemsize, 1, ofs, st);
+            return false;
+        }
+        // rewrite.py:228-232 RAW_LOAD_{I,F}
+        if matches!(opnum, OpCode::RawLoadI | OpCode::RawLoadF) {
+            let descr = op.descr.as_ref().expect("RAW_LOAD needs ArrayDescr");
+            let ad = descr
+                .as_array_descr()
+                .expect("RAW_LOAD descr must be ArrayDescr");
+            let itemsize = ad.item_size() as i64;
+            let ofs = ad.base_size() as i64;
+            let sign = ad.is_item_signed();
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            self.emit_gc_load_or_indexed(op, ptr, index, itemsize, 1, ofs, sign, st);
+            return false;
+        }
+        // rewrite.py:233-238 GETINTERIORFIELD_GC_{I,R,F}
+        if matches!(
+            opnum,
+            OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcR | OpCode::GetinteriorfieldGcF
+        ) {
+            let descr = op
+                .descr
+                .as_ref()
+                .expect("GETINTERIORFIELD needs InteriorFieldDescr");
+            let ifd = descr
+                .as_interior_field_descr()
+                .expect("GETINTERIORFIELD descr must be InteriorFieldDescr");
+            let ad = ifd.array_descr();
+            let fd = ifd.field_descr();
+            let ofs = (ad.base_size() + fd.offset()) as i64;
+            let itemsize = ad.item_size() as i64;
+            let fieldsize = fd.field_size() as i64;
+            let sign = fd.is_field_signed();
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            self.emit_gc_load_or_indexed(op, ptr, index, fieldsize, itemsize, ofs, sign, st);
+            return false;
+        }
+        // rewrite.py:239-245 SETINTERIORFIELD_{RAW,GC}
+        if matches!(
+            opnum,
+            OpCode::SetinteriorfieldRaw | OpCode::SetinteriorfieldGc
+        ) {
+            let descr = op
+                .descr
+                .as_ref()
+                .expect("SETINTERIORFIELD needs InteriorFieldDescr");
+            let ifd = descr
+                .as_interior_field_descr()
+                .expect("SETINTERIORFIELD descr must be InteriorFieldDescr");
+            let ad = ifd.array_descr();
+            let fd = ifd.field_descr();
+            let ofs = (ad.base_size() + fd.offset()) as i64;
+            let itemsize = ad.item_size() as i64;
+            let fieldsize = fd.field_size() as i64;
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
+            self.emit_gc_store_or_indexed(
+                Some(op),
+                ptr,
+                index,
+                value,
+                fieldsize,
+                itemsize,
+                ofs,
+                st,
+            );
+            return false;
+        }
+        // rewrite.py:246-247 GETFIELD_{GC,RAW}_{I,R,F}.
+        // Upstream excludes GETFIELD_GC_PURE_{I,R,F}: the pure variants
+        // are `is_always_pure` at `resoperation.rs:1228` and must retain
+        // their pure-op identity; lowering them to GC_LOAD_* would drop
+        // purity and let the optimizer CSE-fold them differently from
+        // their upstream siblings.  So the pure arm is intentionally
+        // not handled here and falls through to the main loop's default
+        // arm (which emits the op unchanged).
+        if matches!(
+            opnum,
+            OpCode::GetfieldGcI
+                | OpCode::GetfieldGcR
+                | OpCode::GetfieldGcF
+                | OpCode::GetfieldRawI
+                | OpCode::GetfieldRawR
+                | OpCode::GetfieldRawF
+        ) {
+            let descr = op.descr.as_ref().expect("GETFIELD needs FieldDescr");
+            let fd = descr
+                .as_field_descr()
+                .expect("GETFIELD descr must be FieldDescr");
+            let ofs = fd.offset() as i64;
+            let itemsize = fd.field_size() as i64;
+            let sign = fd.is_field_signed();
+            let ptr = st.resolve(op.arg(0));
+            let cint_zero = st.const_int(0);
+            let is_gc = matches!(
+                opnum,
+                OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF,
+            );
+            if is_gc {
+                // rewrite.py:250-260 — flush pending zeros, forward, and
+                // emit the forwarded op *here* so that the main loop
+                // short-circuits (return True).
+                st.emit_pending_zeros();
+                self.emit_gc_load_or_indexed(op, ptr, cint_zero, itemsize, 1, ofs, sign, st);
+                st.emit_maybe_forwarded(op);
+                return true;
+            }
+            self.emit_gc_load_or_indexed(op, ptr, cint_zero, itemsize, 1, ofs, sign, st);
+            return false;
+        }
+        // rewrite.py:262-266 SETFIELD_{GC,RAW}
+        if matches!(opnum, OpCode::SetfieldGc | OpCode::SetfieldRaw) {
+            let descr = op.descr.as_ref().expect("SETFIELD needs FieldDescr");
+            let fd = descr
+                .as_field_descr()
+                .expect("SETFIELD descr must be FieldDescr");
+            let ofs = fd.offset() as i64;
+            let itemsize = fd.field_size() as i64;
+            let ptr = st.resolve(op.arg(0));
+            let value = st.resolve(op.arg(1));
+            let cint_zero = st.const_int(0);
+            self.emit_gc_store_or_indexed(Some(op), ptr, cint_zero, value, itemsize, 1, ofs, st);
+            return false;
+        }
+        // rewrite.py:267-272 ARRAYLEN_GC
+        if matches!(opnum, OpCode::ArraylenGc) {
+            let descr = op.descr.as_ref().expect("ARRAYLEN_GC needs ArrayDescr");
+            let ad = descr
+                .as_array_descr()
+                .expect("ARRAYLEN_GC descr must be ArrayDescr");
+            let ofs = ad
+                .len_descr()
+                .expect("ARRAYLEN_GC descr must have lendescr")
+                .offset() as i64;
+            // rewrite.py:272 WORD itemsize, unsigned.
+            let word = std::mem::size_of::<usize>() as i64;
+            let ptr = st.resolve(op.arg(0));
+            let cint_zero = st.const_int(0);
+            self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, NOT_SIGNED, st);
+            return false;
+        }
+        // rewrite.py:273-282 STRLEN / UNICODELEN — load length field
+        // via `get_array_token(...).ofs_length`, which lives on the
+        // ArrayDescr as `lendescr.offset`.  Upstream reads a WORD,
+        // unsigned.
+        if matches!(opnum, OpCode::Strlen | OpCode::Unicodelen) {
+            let word = std::mem::size_of::<usize>() as i64;
+            let descr = op
+                .descr
+                .as_ref()
+                .expect("STRLEN/UNICODELEN op must carry an ArrayDescr");
+            let ad = descr
+                .as_array_descr()
+                .expect("STRLEN/UNICODELEN descr must be an ArrayDescr");
+            let ld = ad
+                .len_descr()
+                .expect("STR/UNICODE ArrayDescr must carry lendescr");
+            let ofs = ld.offset() as i64;
+            let ptr = st.resolve(op.arg(0));
+            let cint_zero = st.const_int(0);
+            self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, NOT_SIGNED, st);
+            return false;
+        }
+        // rewrite.py:283-294 STRHASH / UNICODEHASH — `get_field_token(
+        // rstr.STR/UNICODE, 'hash', ...)` with `sign=True` and
+        // `assert size == WORD`.  The upstream call returns
+        // (offset, size); pyre injects a FieldDescr that carries both.
+        if matches!(opnum, OpCode::Strhash | OpCode::Unicodehash) {
+            let word = std::mem::size_of::<usize>() as i64;
+            let descr = op
+                .descr
+                .as_ref()
+                .expect("STRHASH/UNICODEHASH op must carry a FieldDescr");
+            let fd = descr
+                .as_field_descr()
+                .expect("STRHASH/UNICODEHASH descr must be a FieldDescr");
+            assert_eq!(fd.field_size() as i64, word, "rewrite.py:286/292 assert");
+            let ofs = fd.offset() as i64;
+            let ptr = st.resolve(op.arg(0));
+            let cint_zero = st.const_int(0);
+            self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, true, st);
+            return false;
+        }
+        // rewrite.py:295-301 STRGETITEM — `basesize -= 1` skips the
+        // `extra_item_after_alloc` null terminator carried by
+        // `rstr.STR.chars` (`rstr.py:1226-1228`).  `itemsize == 1` is
+        // asserted upstream at rewrite.py:298.
+        if matches!(opnum, OpCode::Strgetitem) {
+            let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ true);
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            self.emit_gc_load_or_indexed(
+                op, ptr, index, itemsize, itemsize, basesize, NOT_SIGNED, st,
+            );
+            return false;
+        }
+        // rewrite.py:302-306 UNICODEGETITEM — UNICODE has no
+        // extra_item_after_alloc, so basesize is used as-is.
+        if matches!(opnum, OpCode::Unicodegetitem) {
+            let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ false);
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            self.emit_gc_load_or_indexed(
+                op, ptr, index, itemsize, itemsize, basesize, NOT_SIGNED, st,
+            );
+            return false;
+        }
+        // rewrite.py:307-313 STRSETITEM.
+        if matches!(opnum, OpCode::Strsetitem) {
+            let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ true);
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
+            self.emit_gc_store_or_indexed(
+                Some(op),
+                ptr,
+                index,
+                value,
+                itemsize,
+                itemsize,
+                basesize,
+                st,
+            );
+            return false;
+        }
+        // rewrite.py:314-318 UNICODESETITEM.
+        if matches!(opnum, OpCode::Unicodesetitem) {
+            let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ false);
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
+            self.emit_gc_store_or_indexed(
+                Some(op),
+                ptr,
+                index,
+                value,
+                itemsize,
+                itemsize,
+                basesize,
+                st,
+            );
+            return false;
+        }
+        // rewrite.py:319-330 GC_LOAD_INDEXED_{I,R,F} normalisation.
+        if matches!(
+            opnum,
+            OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
+        ) {
+            let scale = st
+                .resolve_constant(op.arg(2).0)
+                .expect("GC_LOAD_INDEXED scale must be ConstInt");
+            let offset = st
+                .resolve_constant(op.arg(3).0)
+                .expect("GC_LOAD_INDEXED offset must be ConstInt");
+            let size = st
+                .resolve_constant(op.arg(4).0)
+                .expect("GC_LOAD_INDEXED size must be ConstInt");
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            self.emit_gc_load_or_indexed(op, ptr, index, size.abs(), scale, offset, size < 0, st);
+            return false;
+        }
+        if matches!(opnum, OpCode::GcStoreIndexed) {
+            let scale = st
+                .resolve_constant(op.arg(3).0)
+                .expect("GC_STORE_INDEXED scale must be ConstInt");
+            let offset = st
+                .resolve_constant(op.arg(4).0)
+                .expect("GC_STORE_INDEXED offset must be ConstInt");
+            let size = st
+                .resolve_constant(op.arg(5).0)
+                .expect("GC_STORE_INDEXED size must be ConstInt");
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
+            // rewrite.py:338: use abs(size) for safety even though store
+            // size is expected to be positive.
+            self.emit_gc_store_or_indexed(
+                Some(op),
+                ptr,
+                index,
+                value,
+                size.abs(),
+                scale,
+                offset,
+                st,
+            );
+            return false;
+        }
+        // rewrite.py:342
+        false
     }
 
     // ────────────────────────────────────────────────────────
@@ -1244,6 +1821,7 @@ impl GcRewriter for GcRewriterImpl {
             // op on a previous iteration, use the stashed replacement.
             let owned = st.changed_ops.remove(&i);
             let op: &Op = owned.as_ref().unwrap_or(orig_op);
+            st.current_i = i;
 
             // rewrite.py:376-378 — is_guard OR could_merge_with_next_guard
             // triggers emit_pending_zeros at the top of the iteration.
@@ -1255,6 +1833,14 @@ impl GcRewriter for GcRewriterImpl {
             let merges = self.could_merge_with_next_guard(op, i, &ops, &mut st);
             if op.opcode.is_guard() || merges {
                 st.emit_pending_zeros();
+            }
+
+            // rewrite.py:368-370 — transform_to_gc_load forwards memory
+            // accessors to GC_LOAD / GC_STORE forms.  Returns true only
+            // for the GETFIELD_GC fast-path, which also emits the
+            // forwarded op itself.
+            if self.transform_to_gc_load(op, &mut st) {
+                continue;
             }
 
             match op.opcode {
@@ -1285,23 +1871,31 @@ impl GcRewriter for GcRewriterImpl {
                 }
 
                 // ── Stores that may need a write barrier ──
+                //
+                // rewrite.py:392-404 — the write-barrier section runs AFTER
+                // `transform_to_gc_load` has forwarded the store op to
+                // GC_STORE / GC_STORE_INDEXED.  `emit_maybe_forwarded`
+                // follows the forward and emits the lowered op.
                 OpCode::SetfieldGc => {
-                    self.handle_setfield_gc(op, &mut st);
+                    // rewrite.py:393-395 — consider_setfield_gc clears the
+                    // pending zero-init entry before WB emission.
+                    self.consider_setfield_gc(op, &mut st);
+                    self.handle_write_barrier_setfield(op, &mut st);
+                    st.emit_maybe_forwarded(op);
+                    continue;
+                }
+                OpCode::SetinteriorfieldGc => {
+                    // rewrite.py:946 `handle_write_barrier_setinteriorfield
+                    // = handle_write_barrier_setarrayitem`.
+                    self.handle_write_barrier_setarrayitem(op, &mut st);
+                    st.emit_maybe_forwarded(op);
+                    continue;
                 }
                 OpCode::SetarrayitemGc => {
                     // rewrite.py:401-404
                     self.consider_setarrayitem_gc(op, &mut st);
                     self.handle_write_barrier_setarrayitem(op, &mut st);
-                    // rewrite.py:220-221 transform_to_gc_load forwards the op
-                    // to GC_STORE_INDEXED; emit it now (RPython's emit_op at
-                    // the tail of handle_write_barrier_setarrayitem follows
-                    // the forwarding to do the same).
-                    self.handle_setarrayitem(op, &mut st);
-                    continue;
-                }
-                OpCode::SetarrayitemRaw => {
-                    // rewrite.py:220-221 transform_to_gc_load — no WB for raw.
-                    self.handle_setarrayitem(op, &mut st);
+                    st.emit_maybe_forwarded(op);
                     continue;
                 }
 
@@ -1377,11 +1971,8 @@ impl GcRewriter for GcRewriterImpl {
                 }
 
                 // rewrite.py:383-387 — record INT_ADD/INT_SUB whose
-                // constant operand can later be folded into a
-                // GC_STORE_INDEXED / GC_LOAD_INDEXED offset.  The
-                // recording is structurally complete; the consumer
-                // (_try_use_older_box) is parked until the
-                // setarrayitem-to-GC_STORE_INDEXED lowering is ported.
+                // constant operand is later folded into a GC_STORE_INDEXED
+                // / GC_LOAD_INDEXED offset via `_try_use_older_box`.
                 OpCode::IntAdd | OpCode::IntAddOvf => {
                     let rewritten = st.rewrite_op(op);
                     st.record_int_add_or_sub(&rewritten, false);
@@ -1393,10 +1984,13 @@ impl GcRewriter for GcRewriterImpl {
                     st.emit_rewritten_from(op, rewritten);
                 }
 
-                // ── Everything else: pass through unchanged. ──
+                // ── Everything else: follow forwarding if `transform_to_gc_load`
+                // has forwarded this op (GETARRAYITEM, GETFIELD_RAW,
+                // SETFIELD_RAW, SETARRAYITEM_RAW, SETINTERIORFIELD_RAW,
+                // ARRAYLEN_GC, RAW_LOAD, RAW_STORE, GC_LOAD_INDEXED,
+                // GC_STORE_INDEXED …); otherwise pass through unchanged.
                 _ => {
-                    let rewritten = st.rewrite_op(op);
-                    st.emit_rewritten_from(op, rewritten);
+                    st.emit_maybe_forwarded(op);
                 }
             }
         }
@@ -1641,6 +2235,9 @@ mod tests {
 
     #[test]
     fn test_setfield_gc_ref_needs_wb() {
+        // rewrite.py:262-266 + 401-404: transform_to_gc_load forwards
+        // SETFIELD_GC to GC_STORE; the write-barrier arm emits WB then
+        // emit_maybe_forwarded follows the forward.
         let rw = make_rewriter();
         let obj = OpRef(0);
         let val = OpRef(1);
@@ -1652,11 +2249,71 @@ mod tests {
 
         let result = rw.rewrite_for_gc(&ops);
 
-        // Expect: CondCallGcWb(obj), SetfieldGc(obj, val)
+        // Expect: CondCallGcWb(obj), GcStore(obj, 0, val, itemsize)
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
         assert_eq!(result[0].args[0], obj);
-        assert_eq!(result[1].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[1].opcode, OpCode::GcStore);
+    }
+
+    // ── Parity guards against `transform_to_gc_load` over-reaching ──
+
+    #[test]
+    fn test_getfield_gc_pure_not_lowered() {
+        // rewrite.py:246-247 excludes GETFIELD_GC_PURE_{I,R,F} from the
+        // lowering arm — upstream only handles GETFIELD_GC_{I,R,F} and
+        // GETFIELD_RAW_{I,R,F}.  The pure variant is `is_always_pure`
+        // at `resoperation.rs:1228` and must retain that identity; a
+        // stray lowering to GC_LOAD_R would drop purity semantics.
+        let rw = make_rewriter();
+        let obj = OpRef(0);
+        let ops = vec![Op::with_descr(
+            OpCode::GetfieldGcPureR,
+            &[obj],
+            ref_field_descr(),
+        )];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcPureR);
+        assert!(
+            !result.iter().any(|op| matches!(
+                op.opcode,
+                OpCode::GcLoadR | OpCode::GcLoadI | OpCode::GcLoadF
+            )),
+            "GETFIELD_GC_PURE_R must not be lowered to GC_LOAD_*"
+        );
+    }
+
+    #[test]
+    fn test_getarrayitem_raw_r_not_lowered() {
+        // rewrite.py:216-218 only pulls GETARRAYITEM_RAW_I and
+        // GETARRAYITEM_RAW_F into the lowering arm; GETARRAYITEM_RAW_R
+        // is intentionally missing because `jtransform.py:775`
+        // (`getarrayitem_raw_r not supported`) rejects raw ref array
+        // reads earlier at codewriter time.  If one somehow reaches
+        // the rewriter here it must pass through — otherwise we would
+        // be enabling a code path upstream explicitly disallows.
+        let rw = make_rewriter();
+        let obj = OpRef(0);
+        let idx = OpRef(1);
+        let ops = vec![Op::with_descr(
+            OpCode::GetarrayitemRawR,
+            &[obj, idx],
+            array_descr_ref(),
+        )];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GetarrayitemRawR);
+        assert!(
+            !result
+                .iter()
+                .any(|op| matches!(op.opcode, OpCode::GcLoadIndexedR | OpCode::GcLoadR)),
+            "GETARRAYITEM_RAW_R must not be lowered to GC_LOAD_INDEXED_R / GC_LOAD_R"
+        );
     }
 
     // ── Test 4: SETFIELD_GC with Int value → no write barrier ──
@@ -1674,9 +2331,9 @@ mod tests {
 
         let result = rw.rewrite_for_gc(&ops);
 
-        // Only the original SetfieldGc, no write barrier.
+        // Only the lowered GC_STORE — no WB for non-ref fields.
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(result[0].opcode, OpCode::GcStore);
     }
 
     // ── Test 5: Non-GC ops pass through unchanged ──
@@ -1780,7 +2437,7 @@ mod tests {
 
         let result = rw.rewrite_for_gc(&ops);
 
-        // Only one CondCallGcWb, then two SetfieldGc.
+        // Only one CondCallGcWb, then two lowered GC_STORE.
         let wb_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::CondCallGcWb)
@@ -1789,7 +2446,7 @@ mod tests {
         assert_eq!(
             result
                 .iter()
-                .filter(|o| o.opcode == OpCode::SetfieldGc)
+                .filter(|o| o.opcode == OpCode::GcStore)
                 .count(),
             2
         );
@@ -1862,12 +2519,16 @@ mod tests {
         // make_rewriter() has jit_wb_cards_set = 0 (card marking disabled).
         // rewrite.py:955-973: without card marking, gen_write_barrier_array
         // falls back to gen_write_barrier → COND_CALL_GC_WB.
+        // rewrite.py:132 + 1124-1130: non-constant index, itemsize=8 is
+        // power-of-2 and not in load_supported_factors=[1] → pre-scale
+        // via INT_LSHIFT before GC_STORE_INDEXED.
         //
-        // The rewrite.py:132 lowering to GC_STORE_INDEXED is currently
-        // disabled in `handle_setarrayitem` (nbody extra-store blocker).
-        // While disabled, the SETARRAYITEM op passes through unchanged
-        // after the WB, restoring the pre-lowering shape: WB + original
-        // SETARRAYITEM.
+        // Emission order is [pre-scale, WB, lowered store] because
+        // `transform_to_gc_load` runs *before* the write-barrier arm
+        // (rewrite.py:368-370, 401-404) — the pre-scale INT_LSHIFT is
+        // emitted inline inside emit_gc_store_or_indexed while the
+        // GC_STORE_INDEXED itself is forwarded and emitted only after
+        // the WB via `emit_maybe_forwarded`.
         let rw = make_rewriter();
         let obj = OpRef(0);
         let idx = OpRef(1);
@@ -1880,10 +2541,11 @@ mod tests {
 
         let result = rw.rewrite_for_gc(&ops);
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
-        assert_eq!(result[0].args[0], obj);
-        assert_eq!(result[1].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].opcode, OpCode::IntLshift);
+        assert_eq!(result[1].opcode, OpCode::CondCallGcWb);
+        assert_eq!(result[1].args[0], obj);
+        assert_eq!(result[2].opcode, OpCode::GcStoreIndexed);
     }
 
     // ── Test 12: Collecting op clears WB memoisation ──
@@ -1973,10 +2635,19 @@ mod tests {
             wb_count >= 1,
             "at least the pre-existing WB_ARRAY is preserved"
         );
+        // rewrite.py:132 + 220-221: SETARRAYITEM_GC is lowered to
+        // GC_STORE_INDEXED via handle_setarrayitem → emit_gc_store_or_indexed.
         assert_eq!(
             twice
                 .iter()
                 .filter(|op| op.opcode == OpCode::SetarrayitemGc)
+                .count(),
+            0
+        );
+        assert_eq!(
+            twice
+                .iter()
+                .filter(|op| op.opcode == OpCode::GcStoreIndexed)
                 .count(),
             1
         );

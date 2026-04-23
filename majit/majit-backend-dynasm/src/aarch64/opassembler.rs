@@ -160,6 +160,44 @@ impl AssemblerARM64 {
     // aarch64/opassembler.py:365-370 emit_op_gc_store
     // x86/assembler.py:1746 genop_gc_store — size_loc
 
+    /// aarch64/opassembler.py:396-412 `_emit_op_gc_load_indexed` parity.
+    /// Folds `ofs` into the index via ADD (with LARGE_IMM_SCRATCH = x16
+    /// spillover when the immediate does not fit the ADD encoding),
+    /// then emits the sized load from `[base + combined_index]`.  The
+    /// upstream aarch64 regalloc asserts the IR-level `factor == 1`
+    /// (see `_prepare_op_gc_load_indexed` at regalloc.py:566), so the
+    /// index already carries byte-scaled units by construction.
+    pub(crate) fn emit_op_gcload_indexed_regalloc(
+        &mut self,
+        base: &RegLoc,
+        index: &RegLoc,
+        dst: &RegLoc,
+        ofs: i32,
+        size: i64,
+    ) {
+        let abs_size = size.unsigned_abs() as usize;
+        let signed = size < 0;
+        if ofs != 0 {
+            // aarch64/opassembler.py:403-408 — combined = index + ofs
+            // staged through x16 (LARGE_IMM_SCRATCH).  ADD_ri imm range
+            // is 0..4095; for anything else fall back to
+            // `mov x16, #ofs; add x16, x16, index`.
+            if (0..4096).contains(&ofs) {
+                dynasm!(self.mc ; .arch aarch64
+                    ; mov x16, X(index.value)
+                    ; add x16, x16, ofs as u32);
+            } else {
+                self.emit_mov_imm64(16, ofs as i64);
+                dynasm!(self.mc ; .arch aarch64
+                    ; add x16, x16, X(index.value));
+            }
+            let combined = RegLoc::new(16, false);
+            self.emit_load_sized(base, 0, Some(&combined), dst, abs_size, signed);
+        } else {
+            self.emit_load_sized(base, 0, Some(index), dst, abs_size, signed);
+        }
+    }
+
     /// `size`: byte size (1/2/4/8).
     /// aarch64/opassembler.py:365 emit_op_gc_store parity.
     pub(crate) fn emit_op_gcstore_regalloc(
