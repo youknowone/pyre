@@ -1730,8 +1730,15 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
             .path
             .get_ident()
             .and_then(|ident| ctx.local_type_roots.get(&ident.to_string()).cloned()),
+        syn::Expr::Cast(cast) => {
+            type_root_ident(&cast.ty).map(|root| qualify_type_name(&root, &ctx.module_prefix))
+        }
         syn::Expr::Reference(reference) => receiver_type_root(&reference.expr, ctx),
         syn::Expr::Paren(paren) => receiver_type_root(&paren.expr, ctx),
+        syn::Expr::Unary(unary) => match &unary.op {
+            syn::UnOp::Deref(_) => receiver_type_root(&unary.expr, ctx),
+            _ => None,
+        },
         syn::Expr::Field(field) => receiver_type_root(&field.base, ctx),
         syn::Expr::Index(index) => receiver_type_root(&index.expr, ctx),
         _ => None,
@@ -1975,6 +1982,7 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
             }
         }
         syn::Type::Reference(reference) => type_root_ident(&reference.elem),
+        syn::Type::Ptr(ptr) => type_root_ident(&ptr.elem),
         syn::Type::Paren(paren) => type_root_ident(&paren.elem),
         syn::Type::Group(group) => type_root_ident(&group.elem),
         // `dyn Trait + 'a` / `&mut dyn Trait` (after deref) — return the
@@ -2582,6 +2590,33 @@ mod tests {
                 OpKind::ArrayRead { item_ty, .. } if *item_ty == ValueType::Int
             )),
             "expected typed ArrayRead, got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn lowers_cast_deref_field_access_with_typed_float_fieldread() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct PyObject { ob_type: i64, w_class: i64 }
+            struct W_FloatObject { ob_header: PyObject, floatval: f64 }
+            type PyObjectRef = *mut PyObject;
+
+            unsafe fn w_float_get_value(obj: PyObjectRef) -> f64 {
+                (*(obj as *const W_FloatObject)).floatval
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty, .. }
+                    if field.name == "floatval" && *ty == ValueType::Float
+            )),
+            "expected typed float FieldRead for 'floatval', got {:?}",
             ops
         );
     }

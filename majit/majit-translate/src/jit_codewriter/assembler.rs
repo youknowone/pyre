@@ -66,6 +66,10 @@ pub struct Assembler {
     /// exact function.  RPython tracks this via `self.jitcode.name`
     /// captured at `assembler.py:56 self.setup(ssarepr.name)`.
     current_graph_name: Option<String>,
+    /// Pretty-printed FlatOp currently being encoded, only used by
+    /// the `MAJIT_COVERAGE_PANIC=1` diagnostic so the missing-ValueId
+    /// panic can cite the offending op.
+    current_flatop_debug: Option<String>,
 }
 
 impl Assembler {
@@ -83,6 +87,7 @@ impl Assembler {
             all_liveness_positions: HashMap::new(),
             num_liveness_ops: 0,
             current_graph_name: None,
+            current_flatop_debug: None,
         }
     }
 
@@ -114,6 +119,18 @@ impl Assembler {
         crate::liveness::compute_liveness(ssarepr);
         self.current_graph_name = Some(ssarepr.name.clone());
 
+        // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
+        // every ValueId referenced in `ssarepr.insns` that has no
+        // regalloc coloring in any class.  Complements the
+        // `MAJIT_COVERAGE_PANIC=1` path (which panics at the first gap
+        // hit during `write_insn`) by surfacing the full per-graph gap
+        // catalogue in one build.  Upstream RPython has no analogue —
+        // the invariant is guaranteed by rtyper's `concretetype`
+        // annotation so the lookup cannot miss.
+        if std::env::var("MAJIT_COVERAGE_AUDIT").is_ok() {
+            self.run_coverage_audit(ssarepr, regallocs);
+        }
+
         let num_regs_i = regallocs.get(&RegKind::Int).map_or(0, |r| r.num_regs);
         let num_regs_r = regallocs.get(&RegKind::Ref).map_or(0, |r| r.num_regs);
         let num_regs_f = regallocs.get(&RegKind::Float).map_or(0, |r| r.num_regs);
@@ -144,10 +161,15 @@ impl Assembler {
         // (insns_pos write) without aliasing the borrow used by the
         // write_insn loop.
         let ops = ssarepr.insns.clone();
+        let debug_enabled = std::env::var("MAJIT_COVERAGE_PANIC").is_ok();
         for op in &ops {
             insns_pos.push(state.code.len());
+            if debug_enabled {
+                self.current_flatop_debug = Some(format!("{op:?}"));
+            }
             self.write_insn(op, regallocs, &mut state);
         }
+        self.current_flatop_debug = None;
         ssarepr.insns_pos = Some(insns_pos);
 
         // RPython assembler.py:45,250-258: self.fix_labels()
@@ -1259,10 +1281,20 @@ impl Assembler {
 
     /// Look up the register index (as u8) for a ValueId.
     /// RPython: registers are single-byte indices.
+    ///
+    /// Iterates in fixed `[Int, Ref, Float]` order so the resolution
+    /// is reproducible across processes.  Rust `HashMap` uses SipHash
+    /// with a per-process random seed, whereas RPython's `regalloc.py`
+    /// derives kind directly from `getkind(v.concretetype)` — there is
+    /// no HashMap iteration.  Mirroring that determinism here keeps
+    /// downstream artefacts (`opcode_insns.bin`, `MAJIT_COVERAGE_PANIC`
+    /// reports) byte-stable run to run.
     fn lookup_reg(&self, v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> u8 {
-        for ra in regallocs.values() {
-            if let Some(&color) = ra.coloring.get(&v) {
-                return color as u8;
+        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+            if let Some(ra) = regallocs.get(&kind) {
+                if let Some(&color) = ra.coloring.get(&v) {
+                    return color as u8;
+                }
             }
         }
         0
@@ -1270,12 +1302,18 @@ impl Assembler {
 
     /// Look up register index AND kind character for a ValueId.
     /// Returns (register_index, kind_char) where kind_char ∈ {'i','r','f'}.
+    ///
+    /// Same fixed-order iteration as `lookup_reg`; see that method for
+    /// the rationale.
     fn lookup_reg_with_kind(
         &self,
         v: ValueId,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> (u8, char) {
-        for (kind, ra) in regallocs {
+        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+            let Some(ra) = regallocs.get(&kind) else {
+                continue;
+            };
             if let Some(&color) = ra.coloring.get(&v) {
                 let kind_char = match kind {
                     RegKind::Int => 'i',
@@ -1287,28 +1325,27 @@ impl Assembler {
         }
         // RPython `rpython/jit/codewriter/regalloc.py` + rtyper parity:
         // every `Variable` reaching the assembler has a `concretetype`
-        // and therefore a regalloc coloring in exactly one of the three
-        // classes. A missing entry means the annotator / rtyper left
-        // the value untyped — upstream would never reach `assemble()`
-        // in that state. Fail loud so coverage gaps get fixed at the
-        // annotator / rtyper layer instead of silently emitting the
-        // pyre-only `*_intbase` aliases that a `(0, 'i')` fallback
-        // used to produce.
-        // RPython `rpython/jit/codewriter/regalloc.py` + rtyper parity:
-        // every `Variable` reaching the assembler has a `concretetype`
         // and therefore a regalloc coloring in exactly one of the
         // three classes.  Pyre's annotator/rtyper still leaves a
-        // handful of edge-case values untyped (synthetic flatten
-        // results, complex match-arm phis); closing those gaps is
-        // tracked as structural follow-ups (task #71).  Until then,
-        // fall back to `(0, 'r')` — the same canonical default
+        // handful of edge-case values untyped (ExprIf/ExprMatch/
+        // ExprWhile/ExprForLoop conds when the cond expression cannot
+        // yet be lowered — iterator protocol / switch-based match /
+        // Let variant not yet ported); closing those gaps is tracked
+        // as structural follow-ups (task #71).  Until then, fall back
+        // to `(0, 'r')` — the same canonical default
         // `jtransform.get_value_kind` picks — so `opcode_insns.bin`
         // never re-enters the silent `(0, 'i')` → `_intbase` alias
         // path.  The `MAJIT_COVERAGE_PANIC=1` env var surfaces the
         // gap at debug time with a full class-coverage snapshot.
         if std::env::var("MAJIT_COVERAGE_PANIC").is_ok() {
-            let class_coverage: Vec<_> = regallocs
+            // Iterate in fixed `[Int, Ref, Float]` order so the
+            // coverage report for the same `(graph, op, ValueId)` is
+            // byte-stable across processes.  HashMap iteration order
+            // would otherwise vary per-process and mask whether the
+            // same gap reappears between runs.
+            let class_coverage: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
                 .iter()
+                .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
                 .map(|(k, ra)| {
                     let min = ra.coloring.keys().map(|v| v.0).min();
                     let max = ra.coloring.keys().map(|v| v.0).max();
@@ -1317,22 +1354,209 @@ impl Assembler {
                 .collect();
             panic!(
                 "lookup_reg_with_kind: value {v:?} has no regalloc coloring \
-                 (graph={:?}, regalloc_coverage={:?})",
-                self.current_graph_name, class_coverage
+                 (graph={:?}, op={:?}, regalloc_coverage={:?})",
+                self.current_graph_name, self.current_flatop_debug, class_coverage
             );
         }
         (0, 'r')
     }
 
+    /// Eagerly walk every `FlatOp` in `ssarepr.insns` and report every
+    /// `ValueId` that lacks a regalloc coloring in any class.
+    ///
+    /// Pyre-only diagnostic — RPython's `assembler.py` never needs
+    /// this because `rtyper` guarantees that every `Variable`'s
+    /// `concretetype` produces exactly one `(kind, color)` via
+    /// `getkind()` + `regalloc.py`.  Pyre's annotator / rtyper still
+    /// has known coverage gaps (tracked as task #71 / #74), and the
+    /// `lookup_reg_with_kind` fallback silently emits a `(0, 'r')`
+    /// default at write time — which masks how many distinct gaps
+    /// exist per graph.  `MAJIT_COVERAGE_PANIC=1` aborts at the first
+    /// gap, losing the rest; this walker enumerates them all up
+    /// front so the full gap catalogue surfaces in a single build.
+    ///
+    /// Output goes through `cargo:warning=` so the build script
+    /// runner (`build.rs`) surfaces each line to the user.
+    fn run_coverage_audit(&self, ssarepr: &SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
+        // For each ValueId, track: has a def site (result of some op),
+        // count of direct operand uses, count of Live markers mentioning
+        // it.  Live-only gaps (no def, no operand use) point at backward
+        // liveness leakage; uses-without-def at missing rtyper coverage;
+        // def-without-coverage at regalloc class mismatch.
+        #[derive(Default)]
+        struct ValueSites {
+            has_def: bool,
+            use_count: usize,
+            live_count: usize,
+            first_use_tag: Option<&'static str>,
+        }
+
+        fn opkind_tag(kind: &crate::model::OpKind) -> &'static str {
+            use crate::model::OpKind;
+            match kind {
+                OpKind::Input { .. } => "Input",
+                OpKind::ConstInt(_) => "ConstInt",
+                OpKind::FieldRead { .. } => "FieldRead",
+                OpKind::FieldWrite { .. } => "FieldWrite",
+                OpKind::ArrayRead { .. } => "ArrayRead",
+                OpKind::ArrayWrite { .. } => "ArrayWrite",
+                OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
+                OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
+                OpKind::Call { .. } => "Call",
+                OpKind::GuardTrue { .. } => "GuardTrue",
+                OpKind::GuardFalse { .. } => "GuardFalse",
+                OpKind::GuardValue { .. } => "GuardValue",
+                OpKind::VtableMethodPtr { .. } => "VtableMethodPtr",
+                OpKind::IndirectCall { .. } => "IndirectCall",
+                OpKind::VableFieldRead { .. } => "VableFieldRead",
+                OpKind::VableFieldWrite { .. } => "VableFieldWrite",
+                OpKind::VableArrayRead { .. } => "VableArrayRead",
+                OpKind::VableArrayWrite { .. } => "VableArrayWrite",
+                OpKind::BinOp { .. } => "BinOp",
+                OpKind::UnaryOp { .. } => "UnaryOp",
+                OpKind::VableForce => "VableForce",
+                OpKind::CallElidable { .. } => "CallElidable",
+                OpKind::CallResidual { .. } => "CallResidual",
+                OpKind::CallMayForce { .. } => "CallMayForce",
+                OpKind::InlineCall { .. } => "InlineCall",
+                OpKind::RecursiveCall { .. } => "RecursiveCall",
+                OpKind::JitDebug { .. } => "JitDebug",
+                OpKind::AssertGreen { .. } => "AssertGreen",
+                OpKind::CurrentTraceLength => "CurrentTraceLength",
+                OpKind::IsConstant { .. } => "IsConstant",
+                OpKind::IsVirtual { .. } => "IsVirtual",
+                OpKind::ConditionalCall { .. } => "ConditionalCall",
+                OpKind::ConditionalCallValue { .. } => "ConditionalCallValue",
+                OpKind::RecordKnownResult { .. } => "RecordKnownResult",
+                OpKind::RecordQuasiImmutField { .. } => "RecordQuasiImmutField",
+                OpKind::Live => "Live",
+                OpKind::Unknown { .. } => "Unknown",
+            }
+        }
+        let mut sites: std::collections::HashMap<ValueId, ValueSites> =
+            std::collections::HashMap::new();
+
+        for op in &ssarepr.insns {
+            match op {
+                FlatOp::Op(inner) => {
+                    let tag = opkind_tag(&inner.kind);
+                    if let Some(r) = inner.result {
+                        sites.entry(r).or_default().has_def = true;
+                    }
+                    for v in crate::inline::op_value_refs(&inner.kind) {
+                        let s = sites.entry(v).or_default();
+                        s.use_count += 1;
+                        s.first_use_tag.get_or_insert(tag);
+                    }
+                }
+                FlatOp::GotoIfNot { cond, .. } => {
+                    let s = sites.entry(*cond).or_default();
+                    s.use_count += 1;
+                    s.first_use_tag.get_or_insert("GotoIfNot");
+                }
+                FlatOp::IntBinOpJumpIfOvf { lhs, rhs, dst, .. } => {
+                    sites.entry(*dst).or_default().has_def = true;
+                    for v in [*lhs, *rhs] {
+                        let s = sites.entry(v).or_default();
+                        s.use_count += 1;
+                        s.first_use_tag.get_or_insert("IntBinOpJumpIfOvf");
+                    }
+                }
+                FlatOp::Move { dst, src } => {
+                    sites.entry(*dst).or_default().has_def = true;
+                    if let Some(v) = src.as_value() {
+                        let s = sites.entry(v).or_default();
+                        s.use_count += 1;
+                        s.first_use_tag.get_or_insert("Move");
+                    }
+                }
+                FlatOp::Push(v) => {
+                    let s = sites.entry(*v).or_default();
+                    s.use_count += 1;
+                    s.first_use_tag.get_or_insert("Push");
+                }
+                FlatOp::Pop(v) => {
+                    sites.entry(*v).or_default().has_def = true;
+                }
+                FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
+                    sites.entry(*dst).or_default().has_def = true;
+                }
+                FlatOp::IntReturn(a)
+                | FlatOp::RefReturn(a)
+                | FlatOp::FloatReturn(a)
+                | FlatOp::Raise(a) => {
+                    if let Some(v) = a.as_value() {
+                        let s = sites.entry(v).or_default();
+                        s.use_count += 1;
+                        s.first_use_tag.get_or_insert("Return/Raise");
+                    }
+                }
+                FlatOp::Live { live_values } => {
+                    for v in live_values {
+                        sites.entry(*v).or_default().live_count += 1;
+                    }
+                }
+                FlatOp::Label(_)
+                | FlatOp::Jump(_)
+                | FlatOp::VoidReturn
+                | FlatOp::Unreachable
+                | FlatOp::CatchException { .. }
+                | FlatOp::GotoIfExceptionMismatch { .. }
+                | FlatOp::Reraise => {}
+            }
+        }
+
+        let mut gaps: Vec<(ValueId, &ValueSites)> = Vec::new();
+        for (v, s) in &sites {
+            let covered = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                .iter()
+                .any(|k| {
+                    regallocs
+                        .get(k)
+                        .is_some_and(|ra| ra.coloring.contains_key(v))
+                });
+            if !covered {
+                gaps.push((*v, s));
+            }
+        }
+        gaps.sort_by_key(|(v, _)| v.0);
+
+        if gaps.is_empty() {
+            return;
+        }
+
+        let class_coverage: Vec<(RegKind, usize)> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+            .iter()
+            .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra.coloring.len())))
+            .collect();
+        println!(
+            "cargo:warning=[MAJIT_COVERAGE_AUDIT] graph={:?} gaps={} regalloc_coverage={:?}",
+            ssarepr.name,
+            gaps.len(),
+            class_coverage,
+        );
+        for (v, s) in &gaps {
+            let first_use = s.first_use_tag.unwrap_or("<no use>");
+            println!(
+                "cargo:warning=  - {v:?} def={} uses={} live={} first_use={}",
+                s.has_def, s.use_count, s.live_count, first_use,
+            );
+        }
+    }
+
     /// Look up just the kind for a ValueId.
+    ///
+    /// Fixed-order iteration, same rationale as `lookup_reg`.
     fn lookup_kind(
         &self,
         v: ValueId,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> Option<RegKind> {
-        for (kind, ra) in regallocs {
-            if ra.coloring.contains_key(&v) {
-                return Some(*kind);
+        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+            if let Some(ra) = regallocs.get(&kind) {
+                if ra.coloring.contains_key(&v) {
+                    return Some(kind);
+                }
             }
         }
         None

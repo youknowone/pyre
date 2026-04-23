@@ -172,7 +172,19 @@ fn main() {
     // needs this side by side with opcode_jitcodes.bin. RPython
     // equivalent: the table handed to `BlackholeInterpBuilder::setup_insns`
     // at metainterp startup (pyjitpl.py:2227-2243).
-    let insns_bin = bincode::serialize(&pipeline.insns).unwrap();
+    //
+    // Serialize through a `BTreeMap` view so the byte output is stable
+    // across processes.  `pipeline.insns` is a `HashMap<String, u8>`
+    // and `bincode` walks it in iteration order; Rust's `HashMap` uses
+    // SipHash with a per-process random seed, which would otherwise
+    // make `opcode_insns.bin` byte-differ on each build.  RPython's
+    // equivalent (`assembler.py:220` `self.insns = {}`) is a Python
+    // dict with stable insertion-order iteration, so run-to-run
+    // stability is the expected behaviour.  Serde's map format is
+    // HashMap / BTreeMap compatible, so the runtime deserializer that
+    // receives a `HashMap<String, u8>` back is unaffected.
+    let insns_sorted: std::collections::BTreeMap<&String, &u8> = pipeline.insns.iter().collect();
+    let insns_bin = bincode::serialize(&insns_sorted).unwrap();
     std::fs::write(format!("{out_dir}/opcode_insns.bin"), &insns_bin).unwrap();
 
     // RPython `blackhole.py:59 self.setup_descrs(asm.descrs)` + `:102-103

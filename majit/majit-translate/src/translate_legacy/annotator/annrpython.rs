@@ -38,15 +38,27 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     if let Some(&evalue) = exceptblock.inputargs.get(1) {
         state.set(evalue, ValueType::Ref);
     }
-    // `returnblock.inputargs[0]` — the function's return value.  The
-    // declared return type isn't carried on `FunctionGraph` (pyre
-    // threads it through `CallControl.declared_return_kind` later), so
-    // seed a conservative `Ref` default.  Link propagation from the
-    // emit sites (`set_return`) overrides this when the actual
-    // return op produces an `Int` / `Float` value.
+    // `returnblock.inputargs[0]` must not be pre-seeded to `Ref`.
+    // Doing so collapses a real `Float`/`Int` return into
+    // `union_type(Ref, Float|Int) == Unknown`, which the legacy rtyper
+    // then backfills to `GcRef`.  Seed only the pyre-only synthetic
+    // `return None` placeholder values here; normal non-void returns
+    // are inferred from the incoming Link args.
     let returnblock = graph.block(graph.returnblock);
     if let Some(&ret) = returnblock.inputargs.first() {
-        state.set(ret, ValueType::Ref);
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != graph.returnblock {
+                    continue;
+                }
+                if let Some(LinkArg::Value(src)) = link.args.first()
+                    && is_synthetic_return_void_value(graph, *src)
+                {
+                    state.set(*src, ValueType::Void);
+                    state.set(ret, ValueType::Void);
+                }
+            }
+        }
     }
 
     // Process all blocks (simple single-pass for acyclic; loops need fixpoint)
@@ -162,6 +174,18 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::Function(_)
         | ConstValue::HostObject(_) => ValueType::Ref,
     }
+}
+
+fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
+    for block in &graph.blocks {
+        if block.inputargs.contains(&value) {
+            return false;
+        }
+        if block.operations.iter().any(|op| op.result == Some(value)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Infer the output type of an operation from its inputs.
@@ -423,5 +447,41 @@ mod tests {
         assert_eq!(state.get(last_exc_value), &ValueType::Ref);
         assert_eq!(state.get(etype), &ValueType::Int);
         assert_eq!(state.get(evalue), &ValueType::Ref);
+    }
+
+    #[test]
+    fn propagates_float_return_into_returnblock() {
+        let mut graph = FunctionGraph::new("float_return");
+        let entry = graph.startblock;
+        let base = graph.alloc_value();
+        let result = graph
+            .push_op(
+                entry,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor::new("floatval", None),
+                    ty: ValueType::Float,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result));
+
+        let state = annotate(&graph);
+        let ret = graph.block(graph.returnblock).inputargs[0];
+        assert_eq!(state.get(result), &ValueType::Float);
+        assert_eq!(state.get(ret), &ValueType::Float);
+    }
+
+    #[test]
+    fn synthetic_void_return_stays_void() {
+        let mut graph = FunctionGraph::new("void_return");
+        let entry = graph.startblock;
+        graph.set_return(entry, None);
+
+        let state = annotate(&graph);
+        let ret = graph.block(graph.returnblock).inputargs[0];
+        assert_eq!(state.get(ret), &ValueType::Void);
     }
 }

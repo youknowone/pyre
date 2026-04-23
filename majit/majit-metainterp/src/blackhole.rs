@@ -4685,6 +4685,31 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
     a.wrapping_mul(b)
 }
 
+/// RPython support.py:255-264 `_ll_2_int_floordiv(x, y)`.
+///
+/// blackhole convention: division by zero yields the default int result 0.
+fn bhimpl_int_floordiv(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0;
+    }
+    let d = a.wrapping_div(b);
+    if (a ^ b) < 0 && d.wrapping_mul(b) != a {
+        d.wrapping_sub(1)
+    } else {
+        d
+    }
+}
+
+/// RPython support.py:266-270 `_ll_2_int_mod(x, y)`.
+///
+/// blackhole convention: modulo by zero yields the default int result 0.
+fn bhimpl_int_mod(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0;
+    }
+    ((a % b) + b) % b
+}
+
 /// blackhole.py:499-501 `bhimpl_int_and(a, b): return a & b`.
 fn bhimpl_int_and(a: i64, b: i64) -> i64 {
     a & b
@@ -4791,15 +4816,23 @@ bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
 bhhandler_ri_i!(handler_int_add_ri, bhimpl_int_add);
 bhhandler_ri_i!(handler_int_sub_ri, bhimpl_int_sub);
 bhhandler_ri_i!(handler_int_mul_ri, bhimpl_int_mul);
+bhhandler_ri_i!(handler_int_div_ri, bhimpl_int_floordiv);
 bhhandler_ri_i!(handler_int_and_ri, bhimpl_int_and);
+bhhandler_ri_i!(handler_int_lshift_ri, bhimpl_int_lshift);
 bhhandler_ri_i!(handler_int_rshift_ri, bhimpl_int_rshift);
 bhhandler_ir_i!(handler_int_add_ir, bhimpl_int_add);
 bhhandler_ir_i!(handler_int_sub_ir, bhimpl_int_sub);
 bhhandler_ir_i!(handler_int_and_ir, bhimpl_int_and);
+bhhandler_ir_i!(handler_int_eq_ir, bhimpl_int_eq);
+bhhandler_ir_i!(handler_int_ne_ir, bhimpl_int_ne);
+bhhandler_ir_i!(handler_int_lt_ir, bhimpl_int_lt);
+bhhandler_ir_i!(handler_int_gt_ir, bhimpl_int_gt);
+bhhandler_ir_i!(handler_int_rshift_ir, bhimpl_int_rshift);
 bhhandler_ri_i!(handler_int_or_ri, bhimpl_int_or);
 bhhandler_ir_i!(handler_int_or_ir, bhimpl_int_or);
 bhhandler_ir_i!(handler_int_le_ir, bhimpl_int_le);
 bhhandler_ri_i!(handler_int_eq_ri, bhimpl_int_eq);
+bhhandler_ri_i!(handler_int_ne_ri, bhimpl_int_ne);
 bhhandler_ri_i!(handler_int_gt_ri, bhimpl_int_gt);
 
 // pyre-only: `a += b` in Rust front-end (`front/ast.rs:1604` maps
@@ -4809,6 +4842,7 @@ bhhandler_ri_i!(handler_int_gt_ri, bhimpl_int_gt);
 // no RPython analog; canonical RPython lowers `+=` to plain BINARY_ADD
 // before reaching jtransform.
 bhhandler_ii_i!(handler_int_add_assign_pyre, bhimpl_int_add);
+bhhandler_ii_i!(handler_int_sub_assign_pyre, bhimpl_int_sub);
 
 // pyre-only: `*x` in Rust front-end (`front/ast.rs:1577` maps
 // `syn::UnOp::Deref` to the UnaryOp name `"deref"`). After rtyper
@@ -4853,6 +4887,8 @@ fn handler_unknown_result_marker_r(
     Ok(position + 1)
 }
 bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
+bhhandler_ii_i!(handler_int_floordiv, bhimpl_int_floordiv);
+bhhandler_ii_i!(handler_int_mod, bhimpl_int_mod);
 bhhandler_ii_i!(handler_int_and, bhimpl_int_and);
 bhhandler_ii_i!(handler_int_or, bhimpl_int_or);
 bhhandler_ii_i!(handler_int_xor, bhimpl_int_xor);
@@ -5152,8 +5188,16 @@ bhhandler_r_i!(handler_ptr_nonzero, bhimpl_ptr_nonzero);
 // Unknown→GcRef fallback (tracked as structural debt).
 bhhandler_rr_i!(handler_int_add_rr, bhimpl_int_add);
 bhhandler_rr_i!(handler_int_sub_rr, bhimpl_int_sub);
+bhhandler_rr_i!(handler_int_sub_assign_rr, bhimpl_int_sub);
+bhhandler_rr_i!(handler_int_mod_rr, bhimpl_int_mod);
 bhhandler_rr_i!(handler_int_or_rr, bhimpl_int_or);
+bhhandler_rr_i!(handler_int_and_rr, bhimpl_int_and);
+bhhandler_rr_i!(handler_int_xor_rr, bhimpl_int_xor);
+bhhandler_rr_i!(handler_int_lt_rr, bhimpl_int_lt);
 bhhandler_rr_i!(handler_int_le_rr, bhimpl_int_le);
+bhhandler_rr_i!(handler_int_eq_rr, bhimpl_int_eq);
+bhhandler_rr_i!(handler_int_ne_rr, bhimpl_int_ne);
+bhhandler_rr_i!(handler_int_gt_rr, bhimpl_int_gt);
 bhhandler_rr_i!(handler_int_ge_rr, bhimpl_int_ge);
 
 // pyre-only `int_same_as/r>i`: identity op where source is Ref-classified
@@ -5161,6 +5205,7 @@ bhhandler_rr_i!(handler_int_ge_rr, bhimpl_int_ge);
 // RPython uses `same_as_r` / `same_as_i` with matching register class on
 // both sides.
 bhhandler_r_i!(handler_int_same_as_r, bhimpl_int_same_as);
+bhhandler_r_i!(handler_int_neg_r, bhimpl_int_neg);
 
 // ref/float copy (blackhole.py:641-645)
 fn handler_ref_copy(
@@ -5598,6 +5643,18 @@ fn handler_getfield_gc_f(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
+    let (descr, pos) = read_descr(bh, code, position + 1);
+    let cpu = bh.cpu.expect("cpu not set");
+    let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
+    bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
+    Ok(pos + 1)
+}
+fn handler_getfield_gc_f_intbase(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu.expect("cpu not set");
     let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
@@ -6258,29 +6315,50 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_add/ri>i", handler_int_add_ri);
     builder.wire_handler("int_sub/ri>i", handler_int_sub_ri);
     builder.wire_handler("int_mul/ri>i", handler_int_mul_ri);
+    builder.wire_handler("int_div/ri>i", handler_int_div_ri);
     builder.wire_handler("int_and/ri>i", handler_int_and_ri);
+    builder.wire_handler("int_lshift/ri>i", handler_int_lshift_ri);
     builder.wire_handler("int_rshift/ri>i", handler_int_rshift_ri);
     builder.wire_handler("int_add/ir>i", handler_int_add_ir);
     builder.wire_handler("int_sub/ir>i", handler_int_sub_ir);
     builder.wire_handler("int_and/ir>i", handler_int_and_ir);
+    builder.wire_handler("int_eq/ir>i", handler_int_eq_ir);
+    builder.wire_handler("int_ne/ir>i", handler_int_ne_ir);
+    builder.wire_handler("int_lt/ir>i", handler_int_lt_ir);
+    builder.wire_handler("int_gt/ir>i", handler_int_gt_ir);
+    builder.wire_handler("int_rshift/ir>i", handler_int_rshift_ir);
     builder.wire_handler("int_or/ri>i", handler_int_or_ri);
     builder.wire_handler("int_or/ir>i", handler_int_or_ir);
     builder.wire_handler("int_le/ir>i", handler_int_le_ir);
     builder.wire_handler("int_eq/ri>i", handler_int_eq_ri);
+    builder.wire_handler("int_ne/ri>i", handler_int_ne_ri);
     builder.wire_handler("int_gt/ri>i", handler_int_gt_ri);
     // pyre-only `/rr>i` arithmetic aliases (see handler defs): rtyper
     // coverage gap classifies both operands as Ref for tagged-int values.
     builder.wire_handler("int_add/rr>i", handler_int_add_rr);
     builder.wire_handler("int_sub/rr>i", handler_int_sub_rr);
+    builder.wire_handler("int_sub_assign/rr>i", handler_int_sub_assign_rr);
+    builder.wire_handler("int_mod/rr>i", handler_int_mod_rr);
     builder.wire_handler("int_or/rr>i", handler_int_or_rr);
+    builder.wire_handler("int_and/rr>i", handler_int_and_rr);
+    builder.wire_handler("int_xor/rr>i", handler_int_xor_rr);
+    builder.wire_handler("int_lt/rr>i", handler_int_lt_rr);
     builder.wire_handler("int_le/rr>i", handler_int_le_rr);
+    builder.wire_handler("int_eq/rr>i", handler_int_eq_rr);
+    builder.wire_handler("int_ne/rr>i", handler_int_ne_rr);
+    builder.wire_handler("int_gt/rr>i", handler_int_gt_rr);
     builder.wire_handler("int_ge/rr>i", handler_int_ge_rr);
     builder.wire_handler("int_same_as/r>i", handler_int_same_as_r);
+    builder.wire_handler("int_neg/r>i", handler_int_neg_r);
     // pyre-only primitives — see handler comments for rationale.
     builder.wire_handler("int_add_assign/ii>i", handler_int_add_assign_pyre);
+    builder.wire_handler("int_sub_assign/ii>i", handler_int_sub_assign_pyre);
     builder.wire_handler("int_deref/i>i", handler_int_deref_pyre);
     builder.wire_handler("unknown/", handler_unknown_marker_pyre);
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
+    builder.wire_handler("int_div/ii>i", handler_int_floordiv);
+    builder.wire_handler("int_floordiv/ii>i", handler_int_floordiv);
+    builder.wire_handler("int_mod/ii>i", handler_int_mod);
     builder.wire_handler("int_and/ii>i", handler_int_and);
     builder.wire_handler("int_or/ii>i", handler_int_or);
     builder.wire_handler("int_xor/ii>i", handler_int_xor);
@@ -6414,6 +6492,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_gc_f/rd>f", handler_getfield_gc_f);
     builder.wire_handler("getfield_gc_i/id>i", handler_getfield_gc_i_intbase);
     builder.wire_handler("getfield_gc_r/id>r", handler_getfield_gc_r_intbase);
+    builder.wire_handler("getfield_gc_f/id>f", handler_getfield_gc_f_intbase);
     builder.wire_handler("getfield_gc_i_pure/rd>i", handler_getfield_gc_i);
     builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
