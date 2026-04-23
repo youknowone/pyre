@@ -8,7 +8,11 @@ pub use majit_translate::jitcode::{
 pub(crate) const BC_LOOP_HEADER: u8 = 12;
 pub(crate) const BC_ABORT: u8 = 13;
 pub(crate) const BC_ABORT_PERMANENT: u8 = 14;
-pub(crate) const BC_UNREACHABLE: u8 = BC_ABORT_PERMANENT;
+/// RPython `blackhole.py:962` `bhimpl_unreachable()` raises
+/// `AssertionError("unreachable")`. Distinct from `BC_ABORT_PERMANENT`
+/// which permits the interpreter to take over via
+/// `DispatchError::RaiseException`.
+pub(crate) const BC_UNREACHABLE: u8 = 19;
 /// RPython `blackhole.py:913` aliases `bhimpl_goto_if_not_int_is_true`
 /// to `bhimpl_goto_if_not`, whose body takes the branch iff the int
 /// register is zero/false (`goto_if_not_int_is_true/iL`).
@@ -253,9 +257,9 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     // counterpart; keys kept pyre-local (no `>`-return marker).
     m.insert("abort/", BC_ABORT);
     m.insert("abort_permanent/", BC_ABORT_PERMANENT);
-    // RPython blackhole.py:963 `bhimpl_unreachable()` raises an assertion.
-    // pyre keeps that canonical key but aliases it to BC_ABORT_PERMANENT so
-    // it cannot fall through.
+    // RPython blackhole.py:962 `bhimpl_unreachable()` raises
+    // `AssertionError("unreachable")`. Distinct opcode from
+    // `abort_permanent/` so the interpreter fallback path cannot be taken.
     m.insert("unreachable/", BC_UNREACHABLE);
 
     // pyre-only virtualizable state-field / state-array / state-varray

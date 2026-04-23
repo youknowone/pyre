@@ -2123,6 +2123,12 @@ impl BlackholeInterpreter {
                 self.aborted = true;
                 return Err(DispatchError::LeaveFrame);
             }
+            jitcode::BC_UNREACHABLE => {
+                // blackhole.py:962 `bhimpl_unreachable()` raises
+                // `AssertionError("unreachable")`. A jitcode reaching this
+                // opcode is a codegen bug — there is no recovery path.
+                panic!("bhimpl_unreachable reached");
+            }
             // blackhole.py:1000 bhimpl_raise(excvalue)
             jitcode::BC_RAISE => {
                 let src = self.next_u16() as usize;
