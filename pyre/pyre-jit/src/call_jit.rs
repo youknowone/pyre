@@ -2898,70 +2898,70 @@ pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
 /// `eval.rs:1049-1128 RAISE_VARARGS` normalization for blackhole/JitCode.
 ///
 /// JitCode's `raise/r` bytecode carries only the final exception object, so
-/// callers normalize `raise Type`, `raise builtin_callable`, and
-/// `raise X from Y` through this helper before emitting `raise/r`.
+/// callers normalize `raise Type` and `raise X from Y` through this helper
+/// before emitting `raise/r`.
 pub extern "C" fn bh_normalize_raise_varargs_fn(exc: i64, cause: i64) -> i64 {
     let exc = exc as PyObjectRef;
     let raw_cause = cause as PyObjectRef;
+
+    // pyopcode.py:704-722 — cause and exc normalization share
+    // `self.space` / `frame.execution_context`. Pin the blackhole's
+    // `BH_VABLE_PTR` frame context for the whole body so the
+    // cause-class-call and exc-class-call observe the same namespace.
+    let parent_frame_ptr =
+        majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
+    let frame_ctx = if parent_frame_ptr.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*parent_frame_ptr).execution_context }
+    };
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    if !frame_ctx.is_null() {
+        pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
+    }
+
     let cause = if raw_cause.is_null() {
         None
     } else {
-        let exec_ctx = pyre_interpreter::call::take_last_exec_ctx();
-        match pyre_interpreter::eval::normalize_raise_cause(raw_cause, exec_ctx) {
+        match pyre_interpreter::eval::normalize_raise_cause(raw_cause, frame_ctx) {
             Ok(cause) => Some(cause),
-            Err(err) => return err.to_exc_object() as i64,
+            Err(err) => {
+                pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+                return err.to_exc_object() as i64;
+            }
         }
     };
 
     let mut final_exc: PyObjectRef = unsafe {
         if pyre_object::is_exception(exc) {
             exc
-        } else {
-            let is_builtin_callable = is_function(exc)
-                && pyre_interpreter::is_builtin_code(
-                    pyre_interpreter::getcode(exc) as pyre_object::PyObjectRef
-                );
-            if is_builtin_callable {
-                let code = pyre_interpreter::getcode(exc);
-                let func = pyre_interpreter::builtin_code_get(code as pyre_object::PyObjectRef);
-                match func(&[]) {
-                    Ok(obj) if pyre_object::is_exception(obj) => obj,
-                    Ok(obj) => {
-                        pyre_interpreter::PyError::runtime_error(pyre_interpreter::py_str(obj))
-                            .to_exc_object()
-                    }
-                    Err(err) => err.to_exc_object(),
-                }
-            } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-                let parent_frame_ptr =
-                    majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
-                if parent_frame_ptr.is_null() {
-                    return pyre_interpreter::PyError::runtime_error(
-                        "raise helper missing current frame",
-                    )
-                    .to_exc_object() as i64;
-                }
-                let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
-                pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
-                let result = {
-                    let _plain_guard = pyre_interpreter::call::force_plain_eval();
-                    pyre_interpreter::call::call_function_impl_result(exc, &[])
-                };
+        } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+            if frame_ctx.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
-                match result {
-                    Ok(obj) if pyre_object::is_exception(obj) => obj,
-                    Ok(_) => pyre_interpreter::PyError::type_error(
-                        "exceptions must derive from BaseException",
-                    )
-                    .to_exc_object(),
-                    Err(err) => err.to_exc_object(),
-                }
-            } else {
-                pyre_interpreter::PyError::type_error("exceptions must derive from BaseException")
-                    .to_exc_object()
+                return pyre_interpreter::PyError::runtime_error(
+                    "raise helper missing current frame",
+                )
+                .to_exc_object() as i64;
             }
+            let result = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(exc, &[])
+            };
+            match result {
+                Ok(obj) if pyre_object::is_exception(obj) => obj,
+                Ok(_) => pyre_interpreter::PyError::type_error(
+                    "exceptions must derive from BaseException",
+                )
+                .to_exc_object(),
+                Err(err) => err.to_exc_object(),
+            }
+        } else {
+            pyre_interpreter::PyError::type_error("exceptions must derive from BaseException")
+                .to_exc_object()
         }
     };
+
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
 
     if let Err(err) = pyre_interpreter::eval::attach_raise_cause(final_exc, cause) {
         final_exc = err.to_exc_object();
@@ -3145,4 +3145,32 @@ pub extern "C" fn bh_get_current_exception() -> i64 {
 /// exception becomes current).
 pub extern "C" fn bh_set_current_exception(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyre_interpreter::eval::eval_frame_plain;
+    use pyre_interpreter::{PyErrorKind, compile_exec};
+
+    #[test]
+    fn bh_normalize_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
+        let code = compile_exec("x = len\n").expect("compile failed");
+        let mut frame = pyre_interpreter::PyFrame::new_with_context(
+            code,
+            std::rc::Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        );
+        eval_frame_plain(&mut frame).expect("module body should execute");
+        let callable = unsafe {
+            (*frame.fget_w_globals())
+                .get("x")
+                .copied()
+                .expect("namespace should contain x")
+        };
+
+        let result = bh_normalize_raise_varargs_fn(callable as i64, pyre_object::PY_NULL as i64);
+        let err = unsafe { pyre_interpreter::PyError::from_exc_object(result as PyObjectRef) };
+        assert_eq!(err.kind, PyErrorKind::TypeError);
+        assert_eq!(err.message, "exceptions must derive from BaseException");
+    }
 }

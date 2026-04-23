@@ -1065,45 +1065,23 @@ impl OpcodeStepExecutor for PyFrame {
                 }
             }
             1 => {
-                let exc = normalize_raise_value(self.pop(), self.execution_context);
-                let cause = None;
+                // pyopcode.py:708-722 — cause=None, normalize exc.
+                let w_value = self.pop();
                 unsafe {
-                    if pyre_object::is_exception(exc) {
-                        attach_raise_cause(exc, cause)?;
-                        Err(PyError::from_exc_object(exc))
-                    } else if crate::is_function(exc)
-                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
-                    {
-                        // raise TypeError → call TypeError() to create instance.
-                        // pyre PRE-EXISTING-ADAPTATION: some exception
-                        // constructors (e.g. TypeError) are exposed as
-                        // builtin_function objects rather than W_TypeObject,
-                        // so `exception_is_valid_obj_as_class_w` (is_type +
-                        // BaseException subtype) misses them.
-                        let code = crate::getcode(exc);
-                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-                        match func(&[]) {
-                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
-                                attach_raise_cause(exc_obj, cause)?;
-                                Err(PyError::from_exc_object(exc_obj))
-                            }
-                            Ok(exc_obj) => {
-                                Err(PyError::runtime_error(&crate::py_str(exc_obj)))
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else if crate::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-                        // pyopcode.py:711-713 — normalize class raise by
-                        // calling the type with no args.
-                        let result = crate::call_function(exc, &[]);
+                    if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
+                        // pyopcode.py:711-713 — class raise: call the type.
+                        let result = crate::call_function(w_value, &[]);
                         if pyre_object::is_exception(result) {
-                            attach_raise_cause(result, cause)?;
+                            attach_raise_cause(result, None)?;
                             Err(PyError::from_exc_object(result))
                         } else {
                             Err(PyError::type_error(
                                 "exceptions must derive from BaseException",
                             ))
                         }
+                    } else if pyre_object::is_exception(w_value) {
+                        attach_raise_cause(w_value, None)?;
+                        Err(PyError::from_exc_object(w_value))
                     } else {
                         Err(PyError::type_error(
                             "exceptions must derive from BaseException",
@@ -1112,30 +1090,14 @@ impl OpcodeStepExecutor for PyFrame {
                 }
             }
             2 => {
+                // pyopcode.py:704-722 — pop+normalize cause first, then exc.
                 let raw_cause = self.pop();
-                let exc = normalize_raise_value(self.pop(), self.execution_context);
                 let cause = Some(normalize_raise_cause(raw_cause, self.execution_context)?);
+                let w_value = self.pop();
                 unsafe {
-                    if pyre_object::is_exception(exc) {
-                        attach_raise_cause(exc, cause)?;
-                        Err(PyError::from_exc_object(exc))
-                    } else if crate::is_function(exc)
-                        && crate::is_builtin_code(crate::getcode(exc) as pyre_object::PyObjectRef)
-                    {
-                        // pyre PRE-EXISTING-ADAPTATION — see argc=1 arm.
-                        let code = crate::getcode(exc);
-                        let func = crate::builtin_code_get(code as pyre_object::PyObjectRef);
-                        match func(&[]) {
-                            Ok(exc_obj) if pyre_object::is_exception(exc_obj) => {
-                                attach_raise_cause(exc_obj, cause)?;
-                                Err(PyError::from_exc_object(exc_obj))
-                            }
-                            Ok(exc_obj) => Err(PyError::runtime_error(&crate::py_str(exc_obj))),
-                            Err(e) => Err(e),
-                        }
-                    } else if crate::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-                        // pyopcode.py:711-713 — same normalization as argc=1.
-                        let result = crate::call_function(exc, &[]);
+                    if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
+                        // pyopcode.py:711-713 — class raise: call the type.
+                        let result = crate::call_function(w_value, &[]);
                         if pyre_object::is_exception(result) {
                             attach_raise_cause(result, cause)?;
                             Err(PyError::from_exc_object(result))
@@ -1144,6 +1106,9 @@ impl OpcodeStepExecutor for PyFrame {
                                 "exceptions must derive from BaseException",
                             ))
                         }
+                    } else if pyre_object::is_exception(w_value) {
+                        attach_raise_cause(w_value, cause)?;
+                        Err(PyError::from_exc_object(w_value))
                     } else {
                         Err(PyError::type_error(
                             "exceptions must derive from BaseException",
@@ -2313,11 +2278,11 @@ mod tests {
         let good = *w_globals.get("good").expect("missing good");
         let bad = *w_globals.get("bad").expect("missing bad");
 
-        assert!(exception_is_valid_obj_as_class_w(
+        assert!(super::exception_is_valid_obj_as_class_w(
             good,
             frame.execution_context
         ));
-        assert!(!exception_is_valid_obj_as_class_w(
+        assert!(!super::exception_is_valid_obj_as_class_w(
             bad,
             frame.execution_context
         ));

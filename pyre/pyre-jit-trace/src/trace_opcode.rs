@@ -53,10 +53,7 @@ pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
         }
     }
 }
-use pyre_interpreter::eval::{
-    attach_raise_cause, get_current_exception, normalize_raise_cause, normalize_raise_value,
-    set_current_exception,
-};
+use pyre_interpreter::eval::{get_current_exception, set_current_exception};
 
 /// Runtime helper for traced `RAISE_VARARGS`.
 ///
@@ -88,18 +85,28 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
     let frame_ptr = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
     let exc = exc_obj as pyre_object::PyObjectRef;
     let raw_cause = cause_obj as pyre_object::PyObjectRef;
-    let exec_ctx = if frame_ptr.is_null() {
+
+    // pyopcode.py:704-722 — cause and exc normalization both run against
+    // `self.space`/`frame.execution_context`. Pin the caller's frame
+    // context for the whole body so the cause-class-call and the
+    // exc-class-call observe the same namespace / thread state.
+    let frame_ctx = if frame_ptr.is_null() {
         std::ptr::null()
     } else {
         unsafe { (*frame_ptr).execution_context }
     };
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    if !frame_ctx.is_null() {
+        pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
+    }
 
     let cause = if raw_cause.is_null() {
         None
     } else {
-        match normalize_raise_cause(raw_cause, exec_ctx) {
+        match normalize_raise_cause(raw_cause) {
             Ok(cause) => Some(cause),
             Err(err) => {
+                pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
                 let exc = err.to_exc_object();
                 raise_exception_jit(exc as i64);
                 return exc as i64;
@@ -110,43 +117,31 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
     let mut final_exc: pyre_object::PyObjectRef = unsafe {
         if pyre_object::is_exception(exc) {
             exc
-        } else {
-            let is_builtin_callable =
-                is_function(exc) && is_builtin_code(getcode(exc) as pyre_object::PyObjectRef);
-            if is_builtin_callable {
-                let code = getcode(exc);
-                let func = builtin_code_get(code as pyre_object::PyObjectRef);
-                match func(&[]) {
-                    Ok(obj) if pyre_object::is_exception(obj) => obj,
-                    Ok(obj) => {
-                        PyError::runtime_error(pyre_interpreter::py_str(obj)).to_exc_object()
-                    }
-                    Err(err) => err.to_exc_object(),
-                }
-            } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-                if frame_ptr.is_null() {
-                    return PyError::runtime_error("raise helper missing current frame")
-                        .to_exc_object() as i64;
-                }
-                let frame = unsafe { &*frame_ptr };
-                let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
-                pyre_interpreter::call::set_last_exec_ctx(frame.execution_context);
-                let result = {
-                    let _plain_guard = pyre_interpreter::call::force_plain_eval();
-                    pyre_interpreter::call::call_function_impl_result(exc, &[])
-                };
+        } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+            if frame_ctx.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
-                match result {
-                    Ok(obj) if pyre_object::is_exception(obj) => obj,
-                    Ok(_) => PyError::type_error("exceptions must derive from BaseException")
-                        .to_exc_object(),
-                    Err(err) => err.to_exc_object(),
-                }
-            } else {
-                PyError::type_error("exceptions must derive from BaseException").to_exc_object()
+                let err =
+                    PyError::runtime_error("raise helper missing current frame").to_exc_object();
+                raise_exception_jit(err as i64);
+                return err as i64;
             }
+            let result = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(exc, &[])
+            };
+            match result {
+                Ok(obj) if pyre_object::is_exception(obj) => obj,
+                Ok(_) => {
+                    PyError::type_error("exceptions must derive from BaseException").to_exc_object()
+                }
+                Err(err) => err.to_exc_object(),
+            }
+        } else {
+            PyError::type_error("exceptions must derive from BaseException").to_exc_object()
         }
     };
+
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
 
     if let Err(err) = attach_raise_cause(final_exc, cause) {
         final_exc = err.to_exc_object();
@@ -171,9 +166,9 @@ pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
 }
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
-    DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, builtin_code_get,
-    call_function, decode_instruction_at, execute_opcode_step, function_get_globals, getcode,
-    is_builtin_code, is_function, range_iter_continues,
+    DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function,
+    decode_instruction_at, execute_opcode_step, function_get_globals, is_builtin_code, is_function,
+    range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -198,6 +193,46 @@ use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
 };
 use crate::helpers::TraceHelperAccess;
+
+/// `pyre/pyre-interpreter/src/eval.rs::normalize_raise_cause` parity —
+/// unwrap a `raise X from Y` cause operand: accept None/exception
+/// instances verbatim, and call exception classes to produce instances.
+fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    unsafe {
+        if cause.is_null() || pyre_object::is_none(cause) || pyre_object::is_exception(cause) {
+            return Ok(cause);
+        }
+        if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(cause) {
+            let result = call_function(cause, &[]);
+            if pyre_object::is_exception(result) {
+                return Ok(result);
+            }
+        }
+    }
+    Err(PyError::type_error(
+        "exception cause must be None or derive from BaseException",
+    ))
+}
+
+/// `pyre/pyre-interpreter/src/eval.rs::attach_raise_cause` parity —
+/// record `__cause__` / `__suppress_context__` on the exception so
+/// `raise X from Y` chains match the interpreter's observable state.
+fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
+    if let Some(cause_obj) = cause {
+        if !cause_obj.is_null() {
+            pyre_interpreter::baseobjspace::ATTR_TABLE.with(|table| {
+                let mut table = table.borrow_mut();
+                let attrs = table.entry(exc as usize).or_default();
+                attrs.insert("__cause__".to_string(), cause_obj);
+                attrs.insert(
+                    "__suppress_context__".to_string(),
+                    pyre_object::w_bool_from(true),
+                );
+            });
+        }
+    }
+    Ok(())
+}
 
 impl MIFrame {
     fn active_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
@@ -5523,8 +5558,8 @@ impl OpcodeStepExecutor for MIFrame {
     /// and `rpython/jit/metainterp/pyjitpl.py:1688 opimpl_raise`
     /// (box-level bookkeeping). Both responsibilities live here:
     ///
-    /// 1. Normalize the operand — `raise Type` and `raise builtin_callable`
-    ///    must call the type/callable to obtain an instance, matching
+    /// 1. Normalize the operand — `raise Type` must call the exception
+    ///    class to obtain an instance, matching
     ///    `eval.rs:1049-1088` / `eval.rs:1091-1127`.
     /// 2. For `argc == 2`, pop cause (TOS) before exception (TOS1) and
     ///    attach it via `attach_raise_cause` so `raise X from Y` produces
@@ -5557,7 +5592,6 @@ impl OpcodeStepExecutor for MIFrame {
         // `eval.rs:1091-1094 RAISE_VARARGS 2` pops cause (TOS) first,
         // then exception (TOS1). `attach_raise_cause` runs only for
         // argc == 2.
-        let execution_context = self.active_execution_context();
         let (exc_val, cause, cause_opref) = if argc == 2 {
             let raw_cause = <Self as SharedOpcodeHandler>::pop_value(self)?;
             let exc_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
@@ -5565,7 +5599,7 @@ impl OpcodeStepExecutor for MIFrame {
             let cause = if raw_cause_obj.is_null() {
                 None
             } else {
-                Some(normalize_raise_cause(raw_cause_obj, execution_context)?)
+                Some(normalize_raise_cause(raw_cause_obj)?)
             };
             (exc_val, cause, raw_cause.opref)
         } else {
@@ -5595,34 +5629,15 @@ impl OpcodeStepExecutor for MIFrame {
                 self.seed_raised_exception(exc_val.opref, exc);
                 return Err(PyError::from_exc_object(exc));
             }
-            // `eval.rs:1056-1083 / :1099-1121`: `raise SomeType` /
-            // `raise builtin_exc_callable` normalizes by invoking the
-            // operand with no args. Run the call at trace time to get
-            // a concrete instance for `GUARD_CLASS` + state seeding,
-            // and emit a residual `call_ref` so the compiled trace
-            // re-invokes the constructor each iteration instead of
-            // folding the trace-time heap address into a `const_ref`.
-            //
-            // `is_builtin_callable` is a pyre PRE-EXISTING-ADAPTATION —
-            // pyopcode.py only gates on `exception_is_valid_obj_as_class_w`,
-            // but pyre still sees a few exception constructors exposed as
-            // builtin-function callables rather than W_TypeObject. The two
-            // arms are disjoint (a function is not `is_type_like_w`).
-            let is_builtin_callable =
-                is_function(exc) && is_builtin_code(getcode(exc) as pyre_object::PyObjectRef);
-            let is_exception_class =
-                pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc);
-            if is_builtin_callable || is_exception_class {
-                let result = if is_builtin_callable {
-                    let code = getcode(exc);
-                    let func = builtin_code_get(code as pyre_object::PyObjectRef);
-                    match func(&[]) {
-                        Ok(obj) => obj,
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    call_function(exc, &[])
-                };
+            // `eval.rs:1056-1083 / :1099-1121`: `raise SomeType`
+            // normalizes by invoking the exception class with no args.
+            // Run the call at trace time to get a concrete instance for
+            // `GUARD_CLASS` + state seeding, and emit a residual
+            // `call_ref` so the compiled trace re-invokes the constructor
+            // each iteration instead of folding the trace-time heap
+            // address into a `const_ref`.
+            if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
+                let result = call_function(exc, &[]);
                 if !pyre_object::is_exception(result) {
                     return Err(PyError::type_error(
                         "exceptions must derive from BaseException",
@@ -5634,7 +5649,7 @@ impl OpcodeStepExecutor for MIFrame {
                 return Err(PyError::from_exc_object(result));
             }
         }
-        // Non-null, not an instance / type / builtin callable — matches
+        // Non-null, not an instance / exception class — matches
         // `eval.rs:1084-1087` / `eval.rs:1122-1126` fall-through.
         Err(PyError::type_error(
             "exceptions must derive from BaseException",
@@ -5660,5 +5675,65 @@ impl OpcodeStepExecutor for MIFrame {
         Err(PyError::type_error(format!(
             "unsupported instruction during trace: {instruction:?}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyre_interpreter::eval::eval_frame_plain;
+    use std::rc::Rc;
+
+    #[cfg(feature = "cranelift")]
+    fn clear_pending_jit_exception() {
+        majit_backend_cranelift::jit_exc_raise(0);
+    }
+
+    #[cfg(all(not(feature = "cranelift"), feature = "dynasm"))]
+    fn clear_pending_jit_exception() {
+        majit_backend_dynasm::jit_exc_raise(0);
+    }
+
+    #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
+    fn clear_pending_jit_exception() {}
+
+    #[cfg(feature = "cranelift")]
+    fn pending_jit_exception_raw() -> i64 {
+        majit_backend_cranelift::jit_exc_value_raw()
+    }
+
+    #[cfg(all(not(feature = "cranelift"), feature = "dynasm"))]
+    fn pending_jit_exception_raw() -> i64 {
+        majit_backend_dynasm::jit_exc_value_raw()
+    }
+
+    #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
+    fn pending_jit_exception_raw() -> i64 {
+        0
+    }
+
+    #[test]
+    fn normalize_raise_varargs_jit_null_frame_still_publishes_pending_exception() {
+        clear_pending_jit_exception();
+        let code = pyre_interpreter::compile_exec("x = ValueError\n").expect("compile failed");
+        let mut frame = pyre_interpreter::PyFrame::new_with_context(
+            code,
+            Rc::new(pyre_interpreter::PyExecutionContext::default()),
+        );
+        eval_frame_plain(&mut frame).expect("module body should execute");
+        let exc_class = unsafe {
+            (*frame.fget_w_globals())
+                .get("x")
+                .copied()
+                .expect("namespace should contain ValueError")
+        };
+
+        let result = normalize_raise_varargs_jit(0, exc_class as i64, pyre_object::PY_NULL as i64);
+
+        assert_eq!(result, pending_jit_exception_raw());
+        let err = unsafe { pyre_interpreter::PyError::from_exc_object(result as PyObjectRef) };
+        assert_eq!(err.kind, pyre_interpreter::PyErrorKind::RuntimeError);
+        assert_eq!(err.message, "raise helper missing current frame");
+        clear_pending_jit_exception();
     }
 }

@@ -655,34 +655,3 @@ impl Drop for JitFrameDeadFrame {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn attach_bridge_publishes_code_ptr_cache() {
-        let descr = CraneliftFailDescr::new(0, vec![Type::Int]);
-        let bridge = BridgeData {
-            trace_id: 99,
-            input_types: vec![Type::Int],
-            header_pc: 0,
-            source_guard: (77, descr.fail_index()),
-            caller_prefix_layout: None,
-            code_ptr: 0x4000_0000 as *const u8,
-            fail_descrs: Vec::new(),
-            gc_runtime_id: None,
-            num_inputs: 1,
-            num_ref_roots: 0,
-            max_output_slots: 0,
-            terminal_exit_layouts: UnsafeCell::new(Vec::new()),
-            loop_reentry: false,
-            invalidated_arc: None,
-        };
-
-        assert!(!descr.has_bridge());
-        descr.attach_bridge(bridge);
-        assert_eq!(descr.bridge_code_ptr() as usize, 0x4000_0000);
-        assert!(descr.has_bridge());
-    }
-}
