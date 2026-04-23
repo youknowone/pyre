@@ -840,11 +840,24 @@ impl GcRewriterImpl {
     // NEW_ARRAY / NEW_ARRAY_CLEAR  → CALL_MALLOC_NURSERY_VARSIZE
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:848 gen_malloc_nursery_varsize parity.
+    /// rewrite.py:546-586 handle_new_array parity.
+    ///
     /// kind: FLAG_ARRAY=0, FLAG_STR=1, FLAG_UNICODE=2.
+    ///
+    /// TODO(rewrite.py:546-584 four-path port): upstream splits this
+    /// into (a) constant total_size nursery fast path
+    /// (`gen_malloc_nursery`), (b) varsize nursery fast path with
+    /// early return (`gen_malloc_nursery_varsize`), (c) boehm path
+    /// (`gen_boehm_malloc_array`), and (d) the generic slow path
+    /// (`gen_malloc_array` / `gen_malloc_str` / `gen_malloc_unicode`).
+    /// Pyre currently collapses all four into a single
+    /// `CALL_MALLOC_NURSERY_VARSIZE` IR op and defers the path
+    /// distinction to the backend runner where the nursery bump
+    /// allocator state actually lives. Converging on upstream needs
+    /// `nursery_free`/`nursery_top` state and the malloc-external
+    /// helpers surfaced into the rewriter so each branch can emit its
+    /// upstream-shaped op set.
     fn handle_new_array(&self, op: &Op, st: &mut RewriteState, kind: i64) {
-        let is_clear = op.opcode == OpCode::NewArrayClear;
-
         let descr_ref = op
             .descr
             .as_ref()
@@ -869,35 +882,23 @@ impl GcRewriterImpl {
         let result = st.emit_result(varsize_op, op.pos);
         st.record_result_mapping(op.pos, result);
 
-        // Initialize the array length field.
+        // rewrite.py:565 / rewrite.py:572 gen_initialize_len.
         if let Some(len_descr) = descr.len_descr() {
             self.gen_initialize_len(result, v_length, descr_ref.clone(), len_descr, st);
         }
 
-        // rewrite.py:592-608 emit ZERO_ARRAY now and remember it in
-        // last_zero_arrays for emit_pending_zeros to mutate-in-place.
-        if is_clear && !v_length.is_none() {
-            if let Some(length_val) = st.resolve_constant(v_length.0).map(|n| n as usize) {
-                if length_val > 0 {
-                    let scale = descr.item_size() as i64;
-                    let zero_one = st.const_int(0);
-                    let length_const = st.const_int(length_val as i64);
-                    let mut zero_op = Op::new(
-                        OpCode::ZeroArray,
-                        &[result, zero_one, length_const, zero_one, zero_one],
-                    );
-                    zero_op.descr = op.descr.clone();
-                    let out_index = st.out.len();
-                    st.emit(zero_op);
-                    st.pending_zeros.push(PendingZero {
-                        out_index,
-                        array_ref: result,
-                        length: length_val,
-                        scale,
-                    });
-                }
-            }
-        }
+        // rewrite.py:566-567 / rewrite.py:585-586 clear_varsize_gc_fields.
+        // Emits ZERO_ARRAY for NEW_ARRAY_CLEAR and a hash-field zeroing
+        // store for NEWSTR / NEWUNICODE, gated on !malloc_zero_filled.
+        self.clear_varsize_gc_fields(
+            kind,
+            descr_ref.clone(),
+            item_size as i64,
+            result,
+            v_length,
+            op.opcode,
+            st,
+        );
 
         // rewrite.py:551: if isinstance(v_length, ConstInt):
         //     self.remember_known_length(op, v_length.getint())
@@ -907,6 +908,125 @@ impl GcRewriterImpl {
 
         // Don't add to wb_applied: large young arrays may need card
         // marking, so the GC still relies on write barriers.
+    }
+
+    /// rewrite.py:520-535 `clear_varsize_gc_fields`.
+    ///
+    /// Short-circuits on `malloc_zero_filled=true` — pyre's production
+    /// nursery zero-fills payload bytes, so callers already observe a
+    /// zeroed array / hash field.  Under `malloc_zero_filled=false`
+    /// this fans out per `kind`:
+    ///   * FLAG_ARRAY + NEW_ARRAY_CLEAR → `handle_clear_array_contents`
+    ///   * FLAG_STR / FLAG_UNICODE → zero the `hash` field at offset 0
+    ///
+    /// The upstream hash-field store comes from
+    /// `gc_ll_descr.{str,unicode}_hash_descr`; rstr.STR and
+    /// rstr.UNICODE both keep `hash` as the first Signed field
+    /// (rstr.py:1226-1238), so a `GC_STORE(result, 0, 0, WORD)`
+    /// matches the upstream `emit_setfield(result, c_zero,
+    /// descr=hash_descr)` contract.
+    #[allow(clippy::too_many_arguments)]
+    fn clear_varsize_gc_fields(
+        &self,
+        kind: i64,
+        arraydescr: DescrRef,
+        ad_itemsize: i64,
+        result: OpRef,
+        v_length: OpRef,
+        opnum: OpCode,
+        st: &mut RewriteState,
+    ) {
+        if self.malloc_zero_filled {
+            return;
+        }
+        // rewrite.py:523-528 FLAG_ARRAY path.
+        if kind == 0 {
+            if opnum == OpCode::NewArrayClear {
+                self.handle_clear_array_contents(arraydescr, ad_itemsize, result, v_length, st);
+            }
+            return;
+        }
+        // rewrite.py:529-535 FLAG_STR / FLAG_UNICODE: zero the hash
+        // field at offset 0 with WORD size (hash is `Signed`).
+        if kind == 1 || kind == 2 {
+            let word = std::mem::size_of::<usize>() as i64;
+            let ofs_ref = st.const_int(0);
+            let zero_ref = st.const_int(0);
+            let word_ref = st.const_int(word);
+            let store = Op::new(OpCode::GcStore, &[result, ofs_ref, zero_ref, word_ref]);
+            st.emit(store);
+        }
+    }
+
+    /// rewrite.py:588-611 `handle_clear_array_contents`.
+    ///
+    /// Emits a `ZERO_ARRAY` covering the entire array, registering the
+    /// op in `pending_zeros` when `v_length` is a constant so
+    /// `emit_pending_zeros` can trim the range against subsequent
+    /// SETARRAYITEM_GC writes (rewrite.py:610-611).
+    fn handle_clear_array_contents(
+        &self,
+        arraydescr: DescrRef,
+        ad_itemsize: i64,
+        v_arr: OpRef,
+        v_length: OpRef,
+        st: &mut RewriteState,
+    ) {
+        // rewrite.py:589 assert v_length is not None.
+        if v_length.is_none() {
+            return;
+        }
+        // rewrite.py:590-591 constant zero-length short-circuit.
+        let length_const = st.resolve_constant(v_length.0);
+        if matches!(length_const, Some(0)) {
+            return;
+        }
+        // rewrite.py:598-602 cpu_simplify_scale for non-const length —
+        // pre-scale the length box when the backend's addressing mode
+        // cannot carry the itemsize as a factor.  Mirrors the shared
+        // `emit_gc_{load,store}_or_indexed` fast path
+        // (rewrite.py:1124-1134).
+        let mut scale = ad_itemsize;
+        let mut v_length_scaled = v_length;
+        if length_const.is_none() && scale != 1 && !self.load_supported_factors.contains(&scale) {
+            assert!(scale > 0, "cpu_simplify_scale: factor must be positive");
+            let mul_op = if (scale & (scale - 1)) == 0 {
+                let shift = (scale as u64).trailing_zeros() as i64;
+                let shift_ref = st.const_int(shift);
+                Op::new(OpCode::IntLshift, &[v_length, shift_ref])
+            } else {
+                let scale_ref = st.const_int(scale);
+                Op::new(OpCode::IntMul, &[v_length, scale_ref])
+            };
+            let scaled = st.emit_result(mul_op, OpRef::NONE);
+            st.result_types.insert(scaled.0, Type::Int);
+            v_length_scaled = scaled;
+            scale = 1;
+        }
+        // rewrite.py:603-609 emit ZERO_ARRAY with scale doubled into
+        // args[3] and args[4] (upstream puts both to `ConstInt(scale)`;
+        // emit_pending_zeros later rewrites both to 1 after byte-level
+        // trim for ConstInt lengths).
+        let c_zero = st.const_int(0);
+        let c_scale_a = st.const_int(scale);
+        let c_scale_b = st.const_int(scale);
+        let mut zero_op = Op::new(
+            OpCode::ZeroArray,
+            &[v_arr, c_zero, v_length_scaled, c_scale_a, c_scale_b],
+        );
+        zero_op.descr = Some(arraydescr);
+        let out_index = st.out.len();
+        st.emit(zero_op);
+        // rewrite.py:610-611 — register in last_zero_arrays only for
+        // ConstInt lengths so emit_pending_zeros can optimize the range.
+        if let Some(n) = length_const {
+            st.pending_zeros.push(PendingZero {
+                out_index,
+                array_ref: v_arr,
+                length: n as usize,
+                scale,
+            });
+        }
     }
 
     // ────────────────────────────────────────────────────────
@@ -3160,7 +3280,11 @@ mod tests {
         // pyre equivalent is an entry in the constant pool. OpRefs 10/11/12
         // hold the literal indices 0/1/2 so `resolve_constant` returns the
         // item number.
-        let rw = make_rewriter();
+        //
+        // malloc_zero_filled=false exercises the `clear_varsize_gc_fields`
+        // path (rewrite.py:521) that actually emits ZERO_ARRAY.
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
         let constants = const_pool(&[(3, 3), (10, 0), (11, 1), (12, 2)]);
@@ -3202,7 +3326,8 @@ mod tests {
         // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY trimmed to
         // start=2 items, length=2 items → byte_start=8, byte_len=8.
         // Index OpRefs 10/11 are ConstInt 0/1 per rewrite.py:514-518.
-        let rw = make_rewriter();
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(4)], array_descr_int());
         new_array.pos = OpRef(0);
         let constants = const_pool(&[(4, 4), (10, 0), (11, 1)]);
@@ -3240,7 +3365,8 @@ mod tests {
     #[test]
     fn test_pending_zero_flushed_at_guard() {
         // Guard forces pending zero flush even if no indices were SET.
-        let rw = make_rewriter();
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
         new_array.pos = OpRef(0);
         let constants = const_pool(&[(3, 3)]);
@@ -3279,7 +3405,8 @@ mod tests {
         // index 0), stop=4 (skip index 4), length=3.  Index 2 falls
         // inside the zero range and is re-zeroed before the SET.
         // Index OpRefs 10/12/14 hold ConstInt 0/2/4 per rewrite.py:514-518.
-        let rw = make_rewriter();
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
         let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(5)], array_descr_int());
         new_array.pos = OpRef(0);
         let constants = const_pool(&[(5, 5), (10, 0), (12, 2), (14, 4)]);
