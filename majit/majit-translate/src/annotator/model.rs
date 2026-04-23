@@ -2463,8 +2463,10 @@ impl AnnotatorError {
 
     /// upstream `annrpython.py:402-405`:
     ///
-    ///     if not hasattr(e, '__annotator_block'):
-    ///         setattr(e, '__annotator_block', block)
+    /// ```python
+    /// if not hasattr(e, '__annotator_block'):
+    ///     setattr(e, '__annotator_block', block)
+    /// ```
     ///
     /// Attaches the offending block to the error only on the first
     /// re-raise so the innermost `processblock` wins.
