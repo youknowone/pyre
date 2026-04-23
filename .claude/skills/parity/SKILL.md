@@ -36,7 +36,7 @@ Separate the invocation into:
 - The `/parity` flag itself (already consumed).
 - The **follow-up task** — everything the user wrote after `/parity`. This is the actual work to be done.
 
-If there is no follow-up task (just bare `/parity`), default to "run a full parity audit of the current diff, fix trivial deviations in-session, and report findings". A deviation is **trivial** when it fits in one session and does not change observable semantics — typical examples: adding an inline comment that cites the RPython file:line behind a PRE-EXISTING-ADAPTATION, renaming a local to match upstream identifier, re-ordering a match arm to mirror upstream's if/elif chain. Anything that touches cross-crate API shape, regenerates lockfiles, moves files between modules, or requires porting a missing dependency is **not** trivial — surface it as a finding and wait for user direction.
+If there is no follow-up task (just bare `/parity`), default to "run a full parity audit of the current diff, fix trivial deviations in-session, and report findings". A deviation is **trivial** when it fits in one session and does not change observable semantics — typical examples: adding an inline comment that cites the RPython file:line behind a ARCHITECTURAL-ADAPTATION, renaming a local to match upstream identifier, re-ordering a match arm to mirror upstream's if/elif chain. Anything that touches cross-crate API shape, regenerates lockfiles, moves files between modules, or requires porting a missing dependency is **not** trivial — surface it as a finding and wait for user direction.
 
 ### Step 2: Parity audit
 
@@ -64,7 +64,7 @@ Run the follow-up task with these constraints:
 
 - Read the relevant RPython source before writing code. Cite the file:line being ported in the code comment or in the summary to the user.
 - When removing pre-existing code, confirm with the RPython upstream that the removal agrees with the upstream. If RPython has the code in a different form, **replace** rather than **delete**.
-- When introducing anything new, check whether RPython has a counterpart. If so, port it. If not, either (a) port the RPython dependency that provides it, or (b) mark it clearly as a documented PRE-EXISTING-ADAPTATION with a comment citing the RPython decision point.
+- When introducing anything new, check whether RPython has a counterpart. If so, port it. If not, either (a) port the RPython dependency that provides it, or (b) mark it clearly as a documented ARCHITECTURAL-ADAPTATION with a comment citing the RPython decision point.
 - If the follow-up task's natural implementation would introduce a NEW-DEVIATION, push back: state the tradeoff, propose the RPython-aligned alternative, and let the user choose. Do not silently introduce new deviations.
 
 ### Step 4: Verify
@@ -113,7 +113,7 @@ External third-party crates (e.g. `rustpython-compiler-core` for CPython
 3.14 bytecode tables) are allowed as they play the role of RPython's
 host-stdlib imports (e.g. `from opcode import ...`).
 
-The following crates carry architectural divergences from upstream and their roots are PRE-EXISTING-ADAPTATIONs by design. Audit individual files against RPython as if the root were `rpython/jit/metainterp/`, and classify mismatches per the rules below.
+The following crates carry architectural divergences from upstream and their roots are ARCHITECTURAL-ADAPTATION by design. Audit individual files against RPython as if the root were `rpython/jit/metainterp/`, and classify mismatches per the rules below.
 
 - `majit/majit-ir/` — extracted-out IR / OpCode / Descr layer. In RPython these live inside `rpython/jit/metainterp/resoperation.py` + `history.py` + scattered descr files in `rpython/jit/backend/`. The crate split itself is a Rust adaptation; the file-level names inside still need to line up.
 - `pyre/pyre-jit-trace/` — pyre-specific layer for tracing Python bytecode. RPython's register-machine jitcode path lives in `rpython/jit/metainterp/pyjitpl.py` (opimpl_*), `blackhole.py`, and `codewriter/`. Auditors: the *logic* here must match `pyjitpl.py` opimpls file-by-file even though the directory is different.
@@ -155,7 +155,7 @@ If the derived path does not exist, **that is itself a parity finding**. Do not 
 
 3. **majit/pyre file at a different directory than upstream.** e.g. `majit-metainterp/src/jitcode/` whose upstream lives in `rpython/jit/codewriter/`. The crate boundary is wrong. Flag as structural deviation. When porting, keep the function-level parity to `rpython/jit/codewriter/` even if the directory cannot be moved in this change.
 
-4. **Upstream has no counterpart.** Could be (a) a Rust-specific adaptation that deserves PRE-EXISTING-ADAPTATION status (document which upstream decision it encodes), or (b) a NEW-DEVIATION that should never have been created. Determine which. A file named with pyre-specific domain vocabulary (e.g. `pyre_sym.rs`, `jit_state.rs`, `constant_pool.rs`) that has no upstream parallel is high-risk — those are often where NEW-DEVIATIONs live.
+4. **Upstream has no counterpart.** Could be (a) a Rust-specific adaptation that deserves ARCHITECTURAL-ADAPTATION status (document which upstream decision it encodes), or (b) a NEW-DEVIATION that should never have been created. Determine which. A file named with pyre-specific domain vocabulary (e.g. `pyre_sym.rs`, `jit_state.rs`, `constant_pool.rs`) that has no upstream parallel is high-risk — those are often where NEW-DEVIATIONs live.
 
 5. **Auto-generated files.** `target/release/build/*/out/*.rs`, proc-macro expansions, `.template.rs` files. Skip these in the audit; follow the template source instead.
 
@@ -196,9 +196,9 @@ None of these are automatically NEW-DEVIATION — check upstream first. But they
 When the skill is active and a response is being written:
 
 1. **Parity audit** (short section, file:line references):
-   - 3–10 lines max.
    - List each modified file with its mechanically-derived counterpart (or a "❌ mechanical transform failed: <reason>" note).
    - Cite each candidate NEW-DEVIATION as `<majit path>:<line> ↔ <rpython path>:<line> — <deviation summary>`.
+   - For each PRE-EXISTING-ADAPTATION surfaced during the audit and not fixed in-session, write a **TODO** — not a bare label. The TODO must include: (a) the pyre file:line to change, (b) the upstream file:line that defines the correct shape, (c) the concrete action (move X to module Y, rename Z to W, delete the Ptr/Ptr arm and add it to llannotation.rs, etc.), (d) the specific still-real blocker that justifies deferring (missing dependency, layout cascade, benchmark-gated port) — per principle #7, "it works today" is not a blocker. Do **not** output a bare "PRE-EXISTING-ADAPTATION" tag without the TODO body; the body is the whole point of surfacing it. If no genuine blocker can be cited, principle #7 says port it now rather than write the TODO.
    - If there is nothing to report, still include the section with `Clean — no new deviations in current diff`.
 
 2. **Follow-up task** (the bulk of the response):
@@ -219,4 +219,4 @@ Keep the tone direct and the citations concrete. No vague "I'll make sure this m
 
 - The user's `CLAUDE.md` already carries "majit ↔ RPython Parity Rules" (section 1–5). This skill is the stronger form of that: under `/parity`, there is no wiggle room for "Rust language adaptations" except where the RPython line is explicitly cited. If CLAUDE.md and this skill conflict, this skill wins for the duration of the `/parity` invocation.
 - `/commit` (the commit skill) is compatible — parity auditing should happen before committing, not after.
-- If the user invokes `/parity` inside a larger plan document (e.g. `jtransform_optimize_goto_if_not_port.md`), the plan's existing PRE-EXISTING-ADAPTATION annotations are respected; the audit focuses only on changes introduced since the plan was written.
+- If the user invokes `/parity` inside a larger plan document (e.g. `jtransform_optimize_goto_if_not_port.md`), the plan's existing ARCHITECTURAL-ADAPTATION annotations are respected; the audit focuses only on changes introduced since the plan was written.
