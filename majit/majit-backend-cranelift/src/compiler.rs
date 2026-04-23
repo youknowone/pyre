@@ -17324,7 +17324,7 @@ mod tests {
         let frame = backend.execute_token(&token, &[]);
         let obj = backend.get_ref_value(&frame, 0);
         assert!(!obj.is_null());
-        assert_eq!(unsafe { header_of(obj.0).type_id() }, 7);
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 7);
         assert_eq!(unsafe { *(obj.0 as *const u64) }, 0xDEAD);
     }
 
@@ -17369,8 +17369,8 @@ mod tests {
         assert!(!obj0.is_null());
         assert!(!obj1.is_null());
         assert_eq!(obj1.0, obj0.0 + 24);
-        assert_eq!(unsafe { header_of(obj0.0).type_id() }, 1);
-        assert_eq!(unsafe { header_of(obj1.0).type_id() }, 2);
+        assert_eq!(unsafe { (*header_of(obj0.0)).type_id() }, 1);
+        assert_eq!(unsafe { (*header_of(obj1.0)).type_id() }, 2);
     }
 
     #[test]
@@ -17433,7 +17433,7 @@ mod tests {
         let obj = GcRef(raw.as_mut_ptr() as usize + GcHeader::SIZE);
 
         backend.execute_token(&token, &[Value::Ref(obj)]);
-        assert!(!unsafe { header_of(obj.0).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(!unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
     }
 
     /// test_gc_integration.py:808 test_malloc_1:

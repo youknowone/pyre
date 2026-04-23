@@ -84,37 +84,54 @@ impl GcHeader {
         self.tid_and_flags == FORWARDED_MARKER
     }
 
-    /// Mark this header as forwarded and store the forwarding address
+    /// Mark the header at `hdr` as forwarded and store the forwarding address
     /// in the word immediately following the header.
     ///
+    /// Takes a raw pointer (rather than `&mut self`) because the write at
+    /// `hdr + SIZE` lies outside the single-field extent a `&mut GcHeader`
+    /// reference is allowed to touch under Rust's aliasing model.
+    ///
     /// # Safety
-    /// The caller must ensure that there is at least `size_of::<usize>()`
-    /// bytes of writable memory after this header.
+    /// `hdr` must point to a valid `GcHeader` followed by at least
+    /// `size_of::<usize>()` bytes of writable memory, and no other reference
+    /// into either range may be alive for the duration of the call.
     #[inline]
-    pub unsafe fn set_forwarding_address(&mut self, new_addr: usize) {
-        self.tid_and_flags = FORWARDED_MARKER;
-        let fwd_ptr = unsafe { (self as *mut GcHeader).add(1) as *mut usize };
-        unsafe { fwd_ptr.write(new_addr) };
+    pub unsafe fn set_forwarding_address(hdr: *mut GcHeader, new_addr: usize) {
+        unsafe {
+            (*hdr).tid_and_flags = FORWARDED_MARKER;
+            let fwd_ptr = hdr.add(1) as *mut usize;
+            fwd_ptr.write(new_addr);
+        }
     }
 
     /// Read the forwarding address from a forwarded object.
     ///
     /// # Safety
-    /// Must only be called when `is_forwarded()` returns true.
+    /// `hdr` must point to a valid forwarded `GcHeader`
+    /// (`(*hdr).is_forwarded()` must hold) and the word immediately
+    /// following must be readable.
     #[inline]
-    pub unsafe fn forwarding_address(&self) -> usize {
-        let fwd_ptr = unsafe { (self as *const GcHeader).add(1) as *const usize };
+    pub unsafe fn forwarding_address(hdr: *const GcHeader) -> usize {
+        let fwd_ptr = unsafe { hdr.add(1) as *const usize };
         unsafe { fwd_ptr.read() }
     }
 }
 
-/// Read the GcHeader for an object at the given address.
+/// Raw pointer to the `GcHeader` preceding `obj_addr`.
+///
+/// Returns a raw pointer rather than a reference: upgrading this to `&mut`
+/// at the call site creates a Unique retag, and any subsequent call through
+/// `header_of` to the same address would invalidate that tag under stacked
+/// borrows. Keeping the return raw lets callers re-derive a reference per
+/// access (or skip the reference entirely) without producing overlapping
+/// exclusive tags.
 ///
 /// # Safety
-/// `obj_addr` must point to valid memory with a GcHeader immediately before it.
+/// `obj_addr` must point to valid memory with a `GcHeader` immediately
+/// before it.
 #[inline]
-pub unsafe fn header_of(obj_addr: usize) -> &'static mut GcHeader {
-    unsafe { &mut *((obj_addr - GcHeader::SIZE) as *mut GcHeader) }
+pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
+    (obj_addr - GcHeader::SIZE) as *mut GcHeader
 }
 
 #[cfg(test)]
@@ -199,14 +216,19 @@ mod tests {
     fn test_forwarding_address() {
         // Allocate enough space for header + forwarding pointer
         let mut buf = [0u8; 16];
-        let hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut GcHeader) };
-        *hdr = GcHeader::new(42);
+        let hdr_ptr = buf.as_mut_ptr() as *mut GcHeader;
+        unsafe {
+            *hdr_ptr = GcHeader::new(42);
+        }
 
         let target_addr: usize = 0xCAFEBABE;
         unsafe {
-            hdr.set_forwarding_address(target_addr);
+            GcHeader::set_forwarding_address(hdr_ptr, target_addr);
         }
-        assert!(hdr.is_forwarded());
-        assert_eq!(unsafe { hdr.forwarding_address() }, target_addr);
+        assert!(unsafe { (*hdr_ptr).is_forwarded() });
+        assert_eq!(
+            unsafe { GcHeader::forwarding_address(hdr_ptr) },
+            target_addr
+        );
     }
 }

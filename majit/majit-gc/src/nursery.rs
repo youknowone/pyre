@@ -88,7 +88,11 @@ impl Nursery {
         let total_size = (total_size + 7) & !7;
 
         let result = self.ptrs.free;
-        let new_free = unsafe { result.add(total_size) };
+        // Use wrapping_add for the bound probe: when the nursery is already
+        // full `result` sits at `top` (one-past-end), so an in-bounds `.add`
+        // would be UB. RPython's integer arithmetic cannot hit this because
+        // it operates on untyped addresses.
+        let new_free = result.wrapping_add(total_size);
         if new_free as *const u8 > self.ptrs.top {
             return ptr::null_mut();
         }

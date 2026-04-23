@@ -145,7 +145,7 @@ impl OldGen {
     /// Mark an old-gen object as visited (for major collection).
     pub fn mark_visited(obj_addr: usize) {
         unsafe {
-            header_of(obj_addr).set_flag(flags::VISITED);
+            (*header_of(obj_addr)).set_flag(flags::VISITED);
         }
     }
 }
