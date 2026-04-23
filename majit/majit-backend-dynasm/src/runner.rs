@@ -189,6 +189,17 @@ pub struct DynasmBackend {
     done_descr_float: Option<majit_ir::DescrRef>,
     exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
     propagate_exception_descr: Option<majit_ir::DescrRef>,
+    /// ptr → Arc<DynasmFailDescr> registry enabling cross-token
+    /// resolution of guard fail descriptors. RPython resolves
+    /// `AbstractDescr.show(jf_descr)` via direct pointer dereference,
+    /// so the lookup naturally crosses loop/bridge boundaries. Pyre
+    /// wraps each descr in an Arc and stores them in per-token
+    /// `asmmemmgr_blocks`, so a bridge that JUMPs into another
+    /// compiled loop can leave the runtime holding a jf_descr whose
+    /// owning token is not the one currently executing. This registry
+    /// is the ptr-indexed view needed to complete that lookup.
+    fail_descr_registry:
+        Arc<std::sync::Mutex<std::collections::HashMap<usize, Arc<crate::guard::DynasmFailDescr>>>>,
 }
 
 impl DynasmBackend {
@@ -255,6 +266,7 @@ impl DynasmBackend {
             done_descr_float: None,
             exit_frame_with_exception_descr_ref: None,
             propagate_exception_descr: None,
+            fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -302,6 +314,20 @@ impl DynasmBackend {
                 &self.propagate_exception_descr,
                 crate::guard::propagate_exception_descr_ptr(),
             ),
+        }
+    }
+
+    /// Add a newly-compiled loop/bridge's fail_descrs to the ptr-indexed
+    /// registry. Called after every `compile_loop` / `compile_bridge`
+    /// returns so subsequent `resolve_latest_descr` lookups can cross
+    /// token boundaries — required when a bridge JUMPs into another
+    /// compiled loop and that loop's guard fires before control returns
+    /// to the bridge's owning token.
+    fn register_fail_descrs(&self, descrs: &[Arc<crate::guard::DynasmFailDescr>]) {
+        let mut reg = self.fail_descr_registry.lock().unwrap();
+        for descr in descrs {
+            let ptr = Arc::as_ptr(descr) as usize;
+            reg.entry(ptr).or_insert_with(|| Arc::clone(descr));
         }
     }
 
@@ -476,7 +502,7 @@ impl DynasmBackend {
     ///
     /// Panics if not found — RPython uses object identity, so lookup
     /// failure is impossible in well-formed execution.
-    fn find_descr_by_ptr(token: &JitCellToken, ptr: usize) -> Arc<DynasmFailDescr> {
+    fn find_descr_by_ptr(&self, token: &JitCellToken, ptr: usize) -> Arc<DynasmFailDescr> {
         // compile.py:618-669 done_with_this_frame_descr — check all 4 variants
         if crate::guard::is_done_with_this_frame_descr(ptr) {
             // Determine type from which variant matched
@@ -524,11 +550,24 @@ impl DynasmBackend {
                 }
             }
         }
+        drop(blocks);
+
+        // Cross-token fallback: a bridge attached to loop A may JUMP into
+        // loop B's body. When B's guard fires, the jf_descr ptr identifies
+        // a fail descr owned by B (or by a bridge attached to B), but the
+        // currently-executing `token` is still A. RPython's
+        // `AbstractDescr.show(jf_descr)` dereferences the pointer directly,
+        // so the lookup is inherently global; pyre emulates that with the
+        // per-backend ptr-indexed registry populated by `compile_loop` /
+        // `compile_bridge`.
+        if let Some(found) = self.fail_descr_registry.lock().unwrap().get(&ptr) {
+            return found.clone();
+        }
 
         panic!(
-            "find_descr_by_ptr: jf_descr {:#x} not found in root loop \
-             or any bridge — RPython equivalent (AbstractDescr.show) \
-             never fails",
+            "find_descr_by_ptr: jf_descr {:#x} not found in root loop, \
+             bridges, or ptr registry — RPython equivalent \
+             (AbstractDescr.show) never fails",
             ptr
         );
     }
@@ -671,6 +710,7 @@ impl Backend for DynasmBackend {
         let code_size = compiled.buffer.len();
         let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
         Self::register_call_assembler_target(token.number, code_addr);
+        self.register_fail_descrs(&compiled.fail_descrs);
 
         // `rpython/jit/backend/x86/assembler.py:513-526` initializes the
         // per-loop `CompiledLoopToken` fields at assemble_loop entry:
@@ -817,6 +857,7 @@ impl Backend for DynasmBackend {
         // dangling pointers when a bridge-internal guard fires.
         // RPython's asmmemmgr ties code blocks and their resume
         // descriptors to the same compiled_loop_token lifetime.
+        self.register_fail_descrs(&compiled.fail_descrs);
         original_token.asmmemmgr_blocks().push(Box::new(compiled));
 
         Ok(AsmInfo {
@@ -926,7 +967,7 @@ impl Backend for DynasmBackend {
 
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
+        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
@@ -1004,7 +1045,7 @@ impl Backend for DynasmBackend {
         let result_jf = unsafe { func(jf_ptr) };
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = Self::find_descr_by_ptr(token, jf_descr_raw as usize);
+        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize);
 
         let num_fail_args = descr.fail_arg_types.len();
         let mut outputs: Vec<i64> = Vec::with_capacity(num_slots);

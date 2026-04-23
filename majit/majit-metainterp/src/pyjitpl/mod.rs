@@ -873,6 +873,24 @@ impl<M: Clone> MetaInterp<M> {
             .map(|trace| (trace_id, trace))
     }
 
+    /// Find `(owning_green_key, trace_id, CompiledTrace)` for a
+    /// trace_id that may not belong to the currently-executing token.
+    /// Needed when a bridge attached to loop A JUMPs into loop B's body
+    /// and a guard in B fires: the descr's trace_id identifies B's
+    /// trace, but `self.compiled_loops.get(&A_key)` doesn't carry B's
+    /// traces. RPython never hits this because its per-trace exit
+    /// metadata is reached through the descr object directly
+    /// (`resumekey` chain).
+    fn trace_for_exit_any<'a>(&'a self, trace_id: u64) -> Option<(u64, u64, &'a CompiledTrace)> {
+        for (&owning_key, compiled) in &self.compiled_loops {
+            let resolved = Self::normalize_trace_id(compiled, trace_id);
+            if let Some(trace) = compiled.traces.get(&resolved) {
+                return Some((owning_key, resolved, trace));
+            }
+        }
+        None
+    }
+
     fn compiled_exit_layout_from_trace(
         trace: &CompiledTrace,
         owning_key: u64,
@@ -3552,16 +3570,23 @@ impl<M: Clone> MetaInterp<M> {
             Some((trace_id, fail_index)) => {
                 // compile.py:1082 — ResumeGuardDescr path: attach bridge
                 // to the existing guard that failed.
+                // The `green_key` parameter here is the JUMP TARGET's key
+                // (from CloseLoopWithArgs) when the bridge closes as a jump
+                // into another compiled loop, but the fail_descr belongs to
+                // the ORIGIN guard. RPython reaches the origin via
+                // `resumekey.rd_loop_token`; pyre stores it in
+                // `active_trace_session.bridge.green_key`.
+                let origin_key = self.bridge_info().map(|b| b.green_key).unwrap_or(green_key);
                 // Prevent double-compilation: if a bridge was already compiled
                 // and attached to this guard, skip. RPython's
                 // raise_continue_running_normally stops the trace entirely,
                 // so this path is never re-entered; pyre's trace may continue
                 // and re-enter, so guard explicitly.
-                let already = self.bridge_was_compiled(green_key, trace_id, fail_index);
+                let already = self.bridge_was_compiled(origin_key, trace_id, fail_index);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] bridge_was_compiled({}, {}, {}) = {}",
-                        green_key, trace_id, fail_index, already
+                        origin_key, trace_id, fail_index, already
                     );
                 }
                 if already {
@@ -3571,7 +3596,7 @@ impl<M: Clone> MetaInterp<M> {
                     };
                 }
                 let fail_descr = {
-                    let compiled = match self.compiled_loops.get(&green_key) {
+                    let compiled = match self.compiled_loops.get(&origin_key) {
                         Some(c) => c,
                         None => return CompileOutcome::Cancelled,
                     };
@@ -3589,7 +3614,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 };
                 let success = self.compile_bridge(
-                    green_key,
+                    origin_key,
                     fail_index,
                     &*fail_descr,
                     &bridge_ops,
@@ -5238,8 +5263,10 @@ impl<M: Clone> MetaInterp<M> {
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
-            .and_then(|(trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
+            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_any(trace_id))
+            .and_then(|(owning_key, resolved_id, trace)| {
+                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
                 rd_loop_token: green_key,
@@ -5357,8 +5384,10 @@ impl<M: Clone> MetaInterp<M> {
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
-            .and_then(|(trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
+            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_any(trace_id))
+            .and_then(|(owning_key, resolved_id, trace)| {
+                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
                 rd_loop_token: green_key,
