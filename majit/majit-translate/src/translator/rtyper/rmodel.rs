@@ -147,7 +147,38 @@ impl Default for ReprState {
 /// Repr>>` (future 3.2 commit) can store heterogeneous Repr instances.
 /// Most default methods match upstream's `Repr` base methods verbatim;
 /// only the required fields (`lowleveltype`, state) are abstract.
+
+/// Typed descriptor for RPython's ll helper function pointers.
+///
+/// Upstream `Repr.get_ll_hash_function` / `get_ll_eq_function` etc.
+/// return Python function objects pointing at `ll_hash_int`,
+/// `_hash_float`, `ll_eq_shortint`, `ll_none_hash`, … (scattered
+/// across `rpython/rtyper/*.py`). The Rust port returns a typed
+/// variant instead of a function pointer so the dispatch stays
+/// compile-time checked without pulling in runtime symbol tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LlHelper {
+    /// `rpython/rtyper/rint.py:619 ll_hash_int`.
+    HashInt,
+    /// `rpython/rtyper/rint.py:622 ll_hash_long_long`.
+    HashLongLong,
+    /// `rpython/rtyper/rint.py:625 ll_eq_shortint`.
+    EqShortInt,
+    /// `rpython/rtyper/rfloat.py:29 _hash_float`.
+    HashFloat,
+    /// `rpython/rtyper/rnone.py:42 ll_none_hash`.
+    HashNone,
+}
+
 pub trait Repr: Debug {
+    /// Erase to `&dyn Any` so `pairtype(Repr, Repr).convert_from_to`
+    /// (`rpython/rtyper/rmodel.py:298-348`) can dispatch on concrete
+    /// Repr class at runtime. RPython uses Python's built-in
+    /// `isinstance(r, IntegerRepr)` for the same purpose; Rust needs
+    /// an explicit erasure hook because trait objects do not expose
+    /// runtime type identity by default.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// RPython `Repr.lowleveltype` (`rmodel.py:26` + each subclass).
     fn lowleveltype(&self) -> &LowLevelType;
 
@@ -492,6 +523,10 @@ impl Default for VoidRepr {
 }
 
 impl Repr for VoidRepr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
     }
@@ -554,6 +589,10 @@ impl SimplePointerRepr {
 }
 
 impl Repr for SimplePointerRepr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
     }
@@ -603,6 +642,10 @@ impl PtrRepr {
 }
 
 impl Repr for PtrRepr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
     }
@@ -695,6 +738,10 @@ impl InteriorPtrRepr {
 }
 
 impl Repr for InteriorPtrRepr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
     }
@@ -737,6 +784,10 @@ impl LLADTMethRepr {
 }
 
 impl Repr for LLADTMethRepr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
     }
@@ -820,16 +871,34 @@ pub fn rtyper_makerepr(
         // structured MissingRTypeOperation with the expected target
         // module so follow-up cascading ports can anchor on the
         // surface without guessing.
-        SomeValue::Integer(_) => Err(TyperError::missing_rtype_operation(
-            "SomeInteger.rtyper_makerepr — port rpython/rtyper/rint.py IntegerRepr",
-        )),
-        SomeValue::Bool(_) => Err(TyperError::missing_rtype_operation(
-            "SomeBool.rtyper_makerepr — port rpython/rtyper/rbool.py BoolRepr",
-        )),
-        SomeValue::Float(_) | SomeValue::SingleFloat(_) | SomeValue::LongFloat(_) => {
-            Err(TyperError::missing_rtype_operation(
-                "SomeFloat.rtyper_makerepr — port rpython/rtyper/rfloat.py FloatRepr",
-            ))
+        // rint.py:186-188 `__extend__(annmodel.SomeInteger).rtyper_makerepr`:
+        //     lltype = build_number(None, self.knowntype)
+        //     return getintegerrepr(lltype)
+        SomeValue::Integer(si) => {
+            use crate::annotator::model::SomeObjectTrait;
+            let r = crate::translator::rtyper::rint::integer_repr_for_knowntype(si.knowntype())?;
+            Ok(r as std::sync::Arc<dyn Repr>)
+        }
+        // rbool.py:39-42: SomeBool.rtyper_makerepr returns the
+        // module-level bool_repr singleton.
+        SomeValue::Bool(_) => {
+            Ok(crate::translator::rtyper::rbool::bool_repr() as std::sync::Arc<dyn Repr>)
+        }
+        // rfloat.py:67-72 / :144-148 / :160-164 — the three SomeFloat
+        // subfamilies map to distinct Repr singletons.
+        SomeValue::Float(_) => {
+            Ok(crate::translator::rtyper::rfloat::float_repr() as std::sync::Arc<dyn Repr>)
+        }
+        SomeValue::SingleFloat(_) => {
+            Ok(crate::translator::rtyper::rfloat::single_float_repr() as std::sync::Arc<dyn Repr>)
+        }
+        SomeValue::LongFloat(_) => {
+            Ok(crate::translator::rtyper::rfloat::long_float_repr() as std::sync::Arc<dyn Repr>)
+        }
+        // rnone.py:35-37 `__extend__(SomeNone).rtyper_makerepr` returns
+        // the module-level `none_repr = NoneRepr()` singleton.
+        SomeValue::None_(_) => {
+            Ok(crate::translator::rtyper::rnone::none_repr() as std::sync::Arc<dyn Repr>)
         }
         SomeValue::String(_)
         | SomeValue::UnicodeString(_)
@@ -863,9 +932,6 @@ pub fn rtyper_makerepr(
                 "SomeBuiltin.rtyper_makerepr — port rpython/rtyper/rpbc.py FunctionRepr",
             ))
         }
-        SomeValue::None_(_) => Err(TyperError::missing_rtype_operation(
-            "SomeNone.rtyper_makerepr — port rpython/rtyper/rnone.py NoneRepr",
-        )),
         SomeValue::Object(_) | SomeValue::Type(_) => Err(TyperError::missing_rtype_operation(
             "SomeObject/SomeType.rtyper_makerepr — port rpython/rtyper/robject.py",
         )),

@@ -15,11 +15,14 @@
 //! ```
 //!
 //! Plus `rpython/rtyper/rmodel.py:397 BrokenReprTyperError(TyperError)`
-//! for the Repr.setup() BROKEN state. Rust collapses the three-class
-//! hierarchy into an enum so call sites can pattern-match on kind
-//! without downcasts; the `where` annotation (`rtyper.py:252
-//! gottypererror`) is carried on every variant as an optional trio
-//! matching upstream's (stage, block, op) tuple.
+//! for the Repr.setup() BROKEN state. Rust collapses the hierarchy into
+//! an enum so call sites can pattern-match on kind without downcasts;
+//! the carrier also transports the upstream `AssertionError` /
+//! `KeyError` control-flow paths used by `rmodel.py` / `rtyper.py` so
+//! the port can avoid process-aborting `panic!`. The `where`
+//! annotation (`rtyper.py:252 gottypererror`) is carried on every
+//! variant as an optional trio matching upstream's (stage, block, op)
+//! tuple.
 
 use std::fmt;
 
@@ -52,6 +55,20 @@ pub enum TyperError {
     /// Raised by `Repr.setup()` when the target Repr is already in
     /// `setupstate.BROKEN` state (rmodel.py:42-44).
     BrokenRepr {
+        text: String,
+        where_info: Option<TyperWhere>,
+    },
+    /// Upstream `AssertionError(...)` paths in `rmodel.py` /
+    /// `rtyper.py`, e.g. recursive `Repr.setup()` or recursive
+    /// `getrepr()` sentinels. Kept in the same Rust error carrier so
+    /// callers can propagate them without panicking.
+    AssertionError {
+        text: String,
+        where_info: Option<TyperWhere>,
+    },
+    /// Upstream `KeyError` path from `annrpython.py:282-287` /
+    /// `rtyper.py:170-172` when a variable has no binding yet.
+    KeyError {
         text: String,
         where_info: Option<TyperWhere>,
     },
@@ -96,6 +113,22 @@ impl TyperError {
         }
     }
 
+    /// Upstream `AssertionError(msg)` constructor.
+    pub fn assertion<S: Into<String>>(text: S) -> Self {
+        TyperError::AssertionError {
+            text: text.into(),
+            where_info: None,
+        }
+    }
+
+    /// Upstream `KeyError(msg)` constructor.
+    pub fn key_error<S: Into<String>>(text: S) -> Self {
+        TyperError::KeyError {
+            text: text.into(),
+            where_info: None,
+        }
+    }
+
     /// Returns `true` for `MissingRTypeOperation` instances. Mirrors
     /// `isinstance(e, MissingRTypeOperation)` in `rmodel.py:202` (the
     /// rtype_bool fallback).
@@ -114,7 +147,9 @@ impl TyperError {
         match &mut self {
             TyperError::Message { where_info: w, .. }
             | TyperError::MissingRTypeOperation { where_info: w, .. }
-            | TyperError::BrokenRepr { where_info: w, .. } => {
+            | TyperError::BrokenRepr { where_info: w, .. }
+            | TyperError::AssertionError { where_info: w, .. }
+            | TyperError::KeyError { where_info: w, .. } => {
                 *w = Some(where_info);
             }
         }
@@ -130,6 +165,10 @@ impl TyperError {
             TyperError::BrokenRepr { text, where_info } => {
                 ("BrokenReprTyperError", text, where_info.as_ref())
             }
+            TyperError::AssertionError { text, where_info } => {
+                ("AssertionError", text, where_info.as_ref())
+            }
+            TyperError::KeyError { text, where_info } => ("KeyError", text, where_info.as_ref()),
         }
     }
 }
@@ -144,8 +183,8 @@ impl fmt::Display for TyperError {
     /// return result
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (class_name, text, where_info) = self.parts();
-        write!(f, "{class_name}: {text}")?;
+        let (_class_name, text, where_info) = self.parts();
+        write!(f, "{text}")?;
         if let Some(w) = where_info {
             write!(f, "\n.. {}\n.. {}\n.. {}", w.stage, w.block, w.op)?;
         }
@@ -160,12 +199,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_variant_uses_class_name_prefix() {
+    fn message_variant_matches_upstream_without_class_name_prefix() {
         // upstream `TyperError.__str__` returns the Exception base's
-        // formatted message; pyre prefixes the class name so mixed
-        // logs disambiguate kinds at a glance.
+        // formatted message without a class-name prefix.
         let e = TyperError::message("bad cast");
-        assert_eq!(e.to_string(), "TyperError: bad cast");
+        assert_eq!(e.to_string(), "bad cast");
         assert!(!e.is_missing_rtype_operation());
         assert!(!e.is_broken_repr());
     }
@@ -176,7 +214,7 @@ mod tests {
         // callers check `.is_missing_rtype_operation()`.
         let e = TyperError::missing_rtype_operation("no iter() for Void");
         assert!(e.is_missing_rtype_operation());
-        assert_eq!(e.to_string(), "MissingRTypeOperation: no iter() for Void");
+        assert_eq!(e.to_string(), "no iter() for Void");
     }
 
     #[test]
@@ -186,7 +224,7 @@ mod tests {
         // detection via `.is_broken_repr()`.
         let e = TyperError::broken_repr("cannot setup already failed Repr: <FooRepr>");
         assert!(e.is_broken_repr());
-        assert!(e.to_string().starts_with("BrokenReprTyperError: "));
+        assert_eq!(e.to_string(), "cannot setup already failed Repr: <FooRepr>");
     }
 
     #[test]
@@ -203,5 +241,20 @@ mod tests {
         assert!(s.contains("\n.. block-entry"));
         assert!(s.contains("\n.. <block @123>"));
         assert!(s.contains("\n.. v0 = simple_call(v1)"));
+    }
+
+    #[test]
+    fn assertion_variant_formats_like_plain_exception_message() {
+        let e = TyperError::assertion("recursive invocation of Repr setup(): <FooRepr>");
+        assert_eq!(
+            e.to_string(),
+            "recursive invocation of Repr setup(): <FooRepr>"
+        );
+    }
+
+    #[test]
+    fn key_error_variant_preserves_payload() {
+        let e = TyperError::key_error("no binding");
+        assert_eq!(e.to_string(), "no binding");
     }
 }
