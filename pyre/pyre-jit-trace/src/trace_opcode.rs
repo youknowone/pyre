@@ -103,7 +103,15 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
     let cause = if raw_cause.is_null() {
         None
     } else {
-        match normalize_raise_cause(raw_cause) {
+        // pyopcode.py:706-707 — cause class-call must mirror the exc
+        // class-call (pyopcode.py:711-713) on compiled traces. Force
+        // both onto the plain interpreter path so the constructor
+        // cannot re-enter the tracer.
+        let result = {
+            let _plain_guard = pyre_interpreter::call::force_plain_eval();
+            normalize_raise_cause(raw_cause)
+        };
+        match result {
             Ok(cause) => Some(cause),
             Err(err) => {
                 pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
@@ -164,6 +172,7 @@ pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
 pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
 }
+use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function,
@@ -193,46 +202,6 @@ use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
 };
 use crate::helpers::TraceHelperAccess;
-
-/// `pyre/pyre-interpreter/src/eval.rs::normalize_raise_cause` parity —
-/// unwrap a `raise X from Y` cause operand: accept None/exception
-/// instances verbatim, and call exception classes to produce instances.
-fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    unsafe {
-        if cause.is_null() || pyre_object::is_none(cause) || pyre_object::is_exception(cause) {
-            return Ok(cause);
-        }
-        if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(cause) {
-            let result = call_function(cause, &[]);
-            if pyre_object::is_exception(result) {
-                return Ok(result);
-            }
-        }
-    }
-    Err(PyError::type_error(
-        "exception cause must be None or derive from BaseException",
-    ))
-}
-
-/// `pyre/pyre-interpreter/src/eval.rs::attach_raise_cause` parity —
-/// record `__cause__` / `__suppress_context__` on the exception so
-/// `raise X from Y` chains match the interpreter's observable state.
-fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
-    if let Some(cause_obj) = cause {
-        if !cause_obj.is_null() {
-            pyre_interpreter::baseobjspace::ATTR_TABLE.with(|table| {
-                let mut table = table.borrow_mut();
-                let attrs = table.entry(exc as usize).or_default();
-                attrs.insert("__cause__".to_string(), cause_obj);
-                attrs.insert(
-                    "__suppress_context__".to_string(),
-                    pyre_object::w_bool_from(true),
-                );
-            });
-        }
-    }
-    Ok(())
-}
 
 impl MIFrame {
     fn active_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
@@ -5637,7 +5606,13 @@ impl OpcodeStepExecutor for MIFrame {
             // each iteration instead of folding the trace-time heap
             // address into a `const_ref`.
             if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-                let result = call_function(exc, &[]);
+                // Mirror `normalize_raise_value` (pyopcode.py:707/:713): the
+                // trace-time constructor call must stay on the plain
+                // interpreter path so it does not re-enter the tracer.
+                let result = {
+                    let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                    call_function(exc, &[])
+                };
                 if !pyre_object::is_exception(result) {
                     return Err(PyError::type_error(
                         "exceptions must derive from BaseException",

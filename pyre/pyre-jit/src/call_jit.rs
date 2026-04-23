@@ -2923,7 +2923,15 @@ pub extern "C" fn bh_normalize_raise_varargs_fn(exc: i64, cause: i64) -> i64 {
     let cause = if raw_cause.is_null() {
         None
     } else {
-        match pyre_interpreter::eval::normalize_raise_cause(raw_cause, frame_ctx) {
+        // pyopcode.py:706-707 — cause class-call must mirror the exc
+        // class-call (pyopcode.py:711-713) on blackhole re-entry.
+        // Force both onto the plain interpreter path so the constructor
+        // cannot re-enter the tracer.
+        let result = {
+            let _plain_guard = pyre_interpreter::call::force_plain_eval();
+            pyre_interpreter::eval::normalize_raise_cause(raw_cause)
+        };
+        match result {
             Ok(cause) => Some(cause),
             Err(err) => {
                 pyre_interpreter::call::set_last_exec_ctx(saved_ctx);

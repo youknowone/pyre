@@ -74,44 +74,17 @@ pub fn set_current_exception(exc: PyObjectRef) {
     CURRENT_EXCEPTION.with(|current| current.set(exc));
 }
 
-fn builtin_base_exception_type(
-    execution_context: *const crate::PyExecutionContext,
-) -> Option<PyObjectRef> {
-    if execution_context.is_null() {
-        return None;
-    }
-    let builtins = unsafe { (*execution_context).fresh_dict_storage() };
-    crate::dict_storage_get(&builtins, "BaseException")
-}
-
-pub fn exception_is_valid_obj_as_class_w(
-    obj: PyObjectRef,
-    execution_context: *const crate::PyExecutionContext,
-) -> bool {
-    if obj.is_null() || !unsafe { pyre_object::is_type(obj) } {
-        return false;
-    }
-    let Some(w_base_exception) = builtin_base_exception_type(execution_context) else {
-        return false;
-    };
-    unsafe { crate::baseobjspace::issubtype_w(obj, w_base_exception) }
-}
-
-pub fn normalize_raise_value(
-    value: PyObjectRef,
-    execution_context: *const crate::PyExecutionContext,
-) -> PyObjectRef {
-    if exception_is_valid_obj_as_class_w(value, execution_context) {
-        return crate::call_function(value, &[]);
+pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if crate::baseobjspace::exception_is_valid_obj_as_class_w(value) {
+            return crate::call_function(value, &[]);
+        }
     }
     value
 }
 
-pub fn normalize_raise_cause(
-    cause: PyObjectRef,
-    execution_context: *const crate::PyExecutionContext,
-) -> Result<PyObjectRef, PyError> {
-    let cause = normalize_raise_value(cause, execution_context);
+pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let cause = normalize_raise_value(cause);
     unsafe {
         if cause.is_null() || pyre_object::is_none(cause) || pyre_object::is_exception(cause) {
             return Ok(cause);
@@ -1092,7 +1065,7 @@ impl OpcodeStepExecutor for PyFrame {
             2 => {
                 // pyopcode.py:704-722 — pop+normalize cause first, then exc.
                 let raw_cause = self.pop();
-                let cause = Some(normalize_raise_cause(raw_cause, self.execution_context)?);
+                let cause = Some(normalize_raise_cause(raw_cause)?);
                 let w_value = self.pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
@@ -2278,14 +2251,10 @@ mod tests {
         let good = *w_globals.get("good").expect("missing good");
         let bad = *w_globals.get("bad").expect("missing bad");
 
-        assert!(super::exception_is_valid_obj_as_class_w(
-            good,
-            frame.execution_context
-        ));
-        assert!(!super::exception_is_valid_obj_as_class_w(
-            bad,
-            frame.execution_context
-        ));
+        unsafe {
+            assert!(crate::baseobjspace::exception_is_valid_obj_as_class_w(good));
+            assert!(!crate::baseobjspace::exception_is_valid_obj_as_class_w(bad));
+        }
     }
 
     #[test]

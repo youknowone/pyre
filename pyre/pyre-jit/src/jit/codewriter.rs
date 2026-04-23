@@ -1612,24 +1612,46 @@ fn filter_liveness_in_place(
 
         let depth = depth_at_pc[py_pc];
         let stack_limit = stack_base as usize + depth as usize;
-        let mut seen: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        let mut seen_r: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        let mut seen_i: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        let mut seen_f: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
         let mut live_r: Vec<u16> = Vec::new();
+        let mut live_i: Vec<u16> = Vec::new();
+        let mut live_f: Vec<u16> = Vec::new();
+        // `liveness.py:67-75` `compute_liveness` adds every Register read
+        // to the alive set without a kind filter. Preserve Int/Float
+        // registers as-is; only Ref registers carry pyre's stack-base /
+        // in-range adaptation (PRE-EXISTING-ADAPTATION, see the vable
+        // locals/stack decoding contract below).
         for op in existing.iter() {
-            if let SsaOperand::Register(reg) = op {
-                if reg.kind != SsaKind::Ref {
-                    continue;
+            let SsaOperand::Register(reg) = op else {
+                continue;
+            };
+            match reg.kind {
+                SsaKind::Ref => {
+                    let idx = reg.index as usize;
+                    let in_locals = idx < nlocals;
+                    let in_stack = idx >= stack_base as usize && idx < stack_limit;
+                    if (in_locals || in_stack) && seen_r.insert(reg.index) {
+                        live_r.push(reg.index);
+                    }
                 }
-                let idx = reg.index as usize;
-                let in_locals = idx < nlocals;
-                let in_stack = idx >= stack_base as usize && idx < stack_limit;
-                if (in_locals || in_stack) && seen.insert(reg.index) {
-                    live_r.push(reg.index);
+                SsaKind::Int => {
+                    if seen_i.insert(reg.index) {
+                        live_i.push(reg.index);
+                    }
                 }
+                SsaKind::Float => {
+                    if seen_f.insert(reg.index) {
+                        live_f.push(reg.index);
+                    }
+                }
+                _ => {}
             }
         }
         for d in 0..depth {
             let idx = stack_base + d;
-            if seen.insert(idx) {
+            if seen_r.insert(idx) {
                 live_r.push(idx);
             }
         }
@@ -1646,9 +1668,21 @@ fn filter_liveness_in_place(
         live_r.retain(|idx| lv_live.contains(idx));
 
         existing.clear();
+        for &idx in &live_i {
+            existing.push(SsaOperand::Register(super::flatten::Register::new(
+                SsaKind::Int,
+                idx,
+            )));
+        }
         for &idx in &live_r {
             existing.push(SsaOperand::Register(super::flatten::Register::new(
                 SsaKind::Ref,
+                idx,
+            )));
+        }
+        for &idx in &live_f {
+            existing.push(SsaOperand::Register(super::flatten::Register::new(
+                SsaKind::Float,
                 idx,
             )));
         }
