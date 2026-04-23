@@ -31,7 +31,6 @@ use super::model::{
 };
 use crate::tool::pairtype::DoubleDispatchRegistry;
 use crate::translator::rtyper::llannotation;
-use crate::translator::rtyper::lltypesystem::lltype;
 
 /// RPython `BINARY_OPERATIONS` (binaryop.py:22-23).
 ///
@@ -665,7 +664,8 @@ fn dispatch_pair(
         let reg = cell.borrow();
         let entries = reg.get(&target).expect("target registry missing");
         match entries.get((tag1, tag2), tag1.mro(), tag2.mro()) {
-            Some(spec) => (spec.apply)(ann, hl),
+            Some(spec) => crate::flowspace::operation::apply_specialization(spec, ann, hl)
+                .unwrap_or_else(|err| std::panic::panic_any(err)),
             None => SomeValue::Impossible,
         }
     })
@@ -2912,8 +2912,11 @@ fn init_instance_object_transform(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::flowspace::argument::Signature;
     use super::super::super::flowspace::operation::{Dispatch, OpKind};
     use super::*;
+    use crate::annotator::description::{DescEntry, FunctionDesc};
+    use std::cell::RefCell;
 
     #[test]
     fn binary_operations_includes_add_sub_mul() {
@@ -2986,6 +2989,17 @@ mod tests {
 
     fn mk_ann() -> Rc<RPythonAnnotator> {
         RPythonAnnotator::new(None, None, None, false)
+    }
+
+    fn fake_function_entry(bk: &Rc<super::super::bookkeeper::Bookkeeper>, name: &str) -> DescEntry {
+        DescEntry::Function(Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            name,
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))))
     }
 
     fn hl_int_int(op: OpKind) -> (HLOperation, Rc<RPythonAnnotator>) {
@@ -3079,6 +3093,30 @@ mod tests {
         let (hl, ann) = hl_float_float(OpKind::Add);
         let r = hl.consider(&ann).unwrap();
         assert!(matches!(r, SomeValue::Float(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_inplace_add_reifies_nested_binary_dispatch_errors() {
+        let ann = mk_ann();
+        let mut v0 = Variable::named("pbc");
+        let mut v1 = Variable::named("s");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::PBC(super::super::model::SomePBC::new(
+                vec![fake_function_entry(&ann.bookkeeper, "f")],
+                false,
+            )),
+        );
+        ann.setbinding(&mut v1, SomeValue::String(SomeString::new(false, false)));
+        let hl = HLOperation::new(
+            OpKind::InplaceAdd,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+
+        let err = hl
+            .consider(&ann)
+            .expect_err("nested binary dispatch AnnotatorError must be reified");
+        assert!(err.msg.as_deref().unwrap_or("").contains("add on"));
     }
 
     fn hl_string_string_const(c1: &str, c2: &str) -> (HLOperation, Rc<RPythonAnnotator>) {
@@ -3399,7 +3437,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "getitem index not an int")]
     fn consider_ptr_object_getitem_rejects_non_integer_index() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             ArrayType, LowLevelType, Ptr, PtrTarget,
@@ -3419,7 +3456,15 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        let _ = hl.consider(&ann);
+        let err = hl
+            .consider(&ann)
+            .expect_err("ptr getitem with non-integer index must raise AnnotatorError");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("getitem index not an int")
+        );
     }
 
     #[test]

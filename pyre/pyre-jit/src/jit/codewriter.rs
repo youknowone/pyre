@@ -3227,9 +3227,17 @@ impl CodeWriter {
                             local_to_vable_slot(reg as usize) as i64
                         );
                         emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, stored_reg);
-                    } else {
-                        emit_ref_copy!(ssarepr, reg, stored_reg);
                     }
+                    // D.vable Phase 1 (2026-04-23): mirror the stored value
+                    // into reg_N so super-inst consumers
+                    // (LoadFastLoadFast / LoadFastBorrowLoadFastBorrow)
+                    // which read reg_N directly see the post-STORE_FAST
+                    // value. Portal frames previously skipped this step,
+                    // leaving reg_N stale after vable_setarrayitem_ref.
+                    // Establishing the reg==vable invariant here is the
+                    // foundation for the eventual LFLF vable flip — see
+                    // memo super_inst_candidate1_probe_scope_2026_04_23.
+                    emit_ref_copy!(ssarepr, reg, stored_reg);
                     if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                         *slot = Some(stored);
                     }
@@ -3356,6 +3364,9 @@ impl CodeWriter {
                             local_to_vable_slot(store_reg as usize) as i64
                         );
                         emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, stored_reg);
+                        // D.vable Phase 1: mirror STORE half into reg_N for
+                        // LFLF consumers. See Instruction::StoreFast arm.
+                        emit_ref_copy!(ssarepr, store_reg, stored_reg);
                         // LOAD_FAST half: read local, then pyframe.py:378-381
                         // pushvalue parity — mirror to the value-stack slot.
                         emit_load_const_i!(
@@ -4013,9 +4024,10 @@ impl CodeWriter {
                                 local_to_vable_slot(reg as usize) as i64,
                             );
                             emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, stored_reg);
-                        } else {
-                            emit_ref_copy!(ssarepr, reg, stored_reg);
                         }
+                        // D.vable Phase 1: mirror each store into reg_N for
+                        // LFLF consumers. See Instruction::StoreFast arm.
+                        emit_ref_copy!(ssarepr, reg, stored_reg);
                         if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                             *slot = Some(stored);
                         }

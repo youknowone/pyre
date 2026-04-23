@@ -557,7 +557,7 @@ impl RPythonAnnotator {
 
         // upstream: `return self.build_graph_types(flowgraph, inputs_s,
         //                                         complete_now=complete_now)`.
-        Ok(self.build_graph_types(&flowgraph.graph, &inputs_s, complete_now))
+        self.build_graph_types(&flowgraph.graph, &inputs_s, complete_now)
     }
 
     /// RPython `get_call_parameters(self, function, args_s)`
@@ -630,9 +630,9 @@ impl RPythonAnnotator {
         // upstream: `graph, inputcells = self.get_call_parameters(function, args_s)`.
         let (graph, inputcells) = self.get_call_parameters(function, args_s)?;
         // upstream: `self.build_graph_types(graph, inputcells, complete_now=False)`.
-        self.build_graph_types(&graph.graph, &inputcells, false);
+        self.build_graph_types(&graph.graph, &inputcells, false)?;
         // upstream: `self.complete_helpers()`.
-        self.complete_helpers();
+        self.complete_helpers()?;
         // upstream: `return graph`.
         Ok(graph)
     }
@@ -655,7 +655,7 @@ impl RPythonAnnotator {
         graph: &GraphRef,
         inputcells: &[SomeValue],
         complete_now: bool,
-    ) -> Option<SomeValue> {
+    ) -> Result<Option<SomeValue>, crate::annotator::model::AnnotatorError> {
         checkgraph(&graph.borrow());
         let nbarg = graph.borrow().getargs().len();
         assert_eq!(
@@ -667,10 +667,10 @@ impl RPythonAnnotator {
         );
         self.addpendinggraph(graph, inputcells);
         if complete_now {
-            self.complete();
+            self.complete()?;
         }
         let returnvar = graph.borrow().getreturnvar();
-        self.annotation(&returnvar)
+        Ok(self.annotation(&returnvar))
     }
 
     /// RPython `complete_helpers(self)` (annrpython.py:112-120).
@@ -688,13 +688,13 @@ impl RPythonAnnotator {
     ///     finally:
     ///         self.added_blocks = saved
     /// ```
-    pub fn complete_helpers(&self) {
+    pub fn complete_helpers(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
         let saved = self.added_blocks.borrow_mut().replace(HashMap::new());
         let _guard = AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
         };
-        self.complete();
+        self.complete()?;
         // upstream annrpython.py:118 passes `block_subset=self.added_blocks`
         // unconditionally (the dict we seeded at line 117), so simplify
         // only touches graphs reachable from blocks added during this
@@ -711,6 +711,7 @@ impl RPythonAnnotator {
             .cloned()
             .collect();
         self.simplify(Some(subset_blocks.as_slice()), None);
+        Ok(())
     }
 
     /// RPython `using_policy(self, policy)` (annrpython.py:122-128).
@@ -1076,13 +1077,12 @@ impl RPythonAnnotator {
     ///
     /// Drains every pending-block generation until fixpoint, then
     /// validates that every tracked graph has an annotated return
-    /// variable. Blocked blocks / failed blocks trigger an
-    /// `AnnotatorError` (panic here for now; Commit 7c surfaces the
-    /// `format_blocked_annotation_error` payload).
-    pub fn complete(&self) {
+    /// variable. Blocked blocks / failed blocks return an
+    /// `AnnotatorError`, matching upstream's `raise`.
+    pub fn complete(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
         use super::model::{SomeObjectTrait, s_impossible_value};
         loop {
-            self.complete_pending_blocks();
+            self.complete_pending_blocks()?;
             // upstream: `self.policy.no_more_blocks_to_annotate(self)`.
             self.policy.borrow().no_more_blocks_to_annotate(self);
             let any_pending = self.genpendingblocks.borrow().iter().any(|d| !d.is_empty());
@@ -1134,7 +1134,7 @@ impl RPythonAnnotator {
                     errors.join("\n-----")
                 )
             };
-            panic!("AnnotatorError: {}", text);
+            return Err(crate::annotator::model::AnnotatorError::new(text));
         }
 
         if got_blocked {
@@ -1148,7 +1148,7 @@ impl RPythonAnnotator {
             drop(bg);
             let blocked_blocks = self.blocked_blocks.borrow();
             let text = crate::tool::error::format_blocked_annotation_error(self, &blocked_blocks);
-            panic!("AnnotatorError: {}", text);
+            return Err(crate::annotator::model::AnnotatorError::new(text));
         }
 
         // Force every return-var annotation to exist.
@@ -1181,15 +1181,16 @@ impl RPythonAnnotator {
                 let annotation = v.annotation.borrow();
                 if let Some(rc) = annotation.as_ref() {
                     if rc.can_be_none() {
-                        panic!(
-                            "AnnotatorError: {:?} is found by annotation to possibly raise None, \
-                             but the None was not suppressed by the flow space",
+                        return Err(crate::annotator::model::AnnotatorError::new(format!(
+                            "{:?} is found by annotation to possibly raise None, but the None \
+                             was not suppressed by the flow space",
                             graph.borrow().name
-                        );
+                        )));
                     }
                 }
             }
         }
+        Ok(())
     }
 
     // ======================================================================
@@ -1302,7 +1303,7 @@ impl RPythonAnnotator {
     /// `processblock` can re-queue blocks into a later generation via
     /// `addpendingblock → schedulependingblock`, the outer loop keeps
     /// scanning until every dict is empty.
-    pub fn complete_pending_blocks(&self) {
+    pub fn complete_pending_blocks(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
         loop {
             // Find the first non-empty generation dict.
             let mut generation: usize = 0;
@@ -1312,7 +1313,7 @@ impl RPythonAnnotator {
                     generation += 1;
                 }
                 if generation == pending.len() {
-                    return; // all empty ⇒ done
+                    return Ok(()); // all empty ⇒ done
                 }
             }
 
@@ -1337,7 +1338,7 @@ impl RPythonAnnotator {
                 };
                 let Some((block, graph)) = entry else { break };
                 block.borrow_mut().generation = Some(next_generation_u32);
-                self.processblock(&graph, &block);
+                self.processblock(&graph, &block)?;
             }
         }
     }
@@ -1884,7 +1885,11 @@ impl RPythonAnnotator {
 
     /// Outcome of the flowin operations-side loop — determines which
     /// exits-side path runs next.
-    fn flowin_op_loop(&self, graph: &GraphRef, block: &BlockRef) -> OpLoopOutcome {
+    fn flowin_op_loop(
+        &self,
+        graph: &GraphRef,
+        block: &BlockRef,
+    ) -> Result<OpLoopOutcome, FlowinError> {
         let mut i = 0usize;
         // Re-read the length each iteration because upstream's
         // `new_ops = op.transform(self); block.operations[i:i+1] = new_ops`
@@ -2002,23 +2007,23 @@ impl RPythonAnnotator {
                     };
                     if is_raising_op {
                         e.opindex = Some(i);
-                        return OpLoopOutcome::BlockedOnRaisingOp;
+                        return Ok(OpLoopOutcome::BlockedOnRaisingOp);
                     }
                     match hlop.kind {
                         super::super::flowspace::operation::OpKind::SimpleCall
                         | super::super::flowspace::operation::OpKind::CallArgs
                         | super::super::flowspace::operation::OpKind::Next => {
-                            return OpLoopOutcome::HarmlesslySwallowed;
+                            return Ok(OpLoopOutcome::HarmlesslySwallowed);
                         }
                         _ => {
                             e.opindex = Some(i);
-                            return OpLoopOutcome::Blocked(e);
+                            return Ok(OpLoopOutcome::Blocked(e));
                         }
                     }
                 }
                 Err(FlowinError::Harmless(_)) => {
                     // upstream: `except annmodel.HarmlesslyBlocked: return`.
-                    return OpLoopOutcome::HarmlesslySwallowed;
+                    return Ok(OpLoopOutcome::HarmlesslySwallowed);
                 }
                 Err(FlowinError::Annotator(mut e)) => {
                     // upstream annrpython.py:531-537:
@@ -2035,12 +2040,9 @@ impl RPythonAnnotator {
                         self.failed_blocks
                             .borrow_mut()
                             .insert(BlockKey::of(block), Rc::clone(block));
-                        return OpLoopOutcome::HarmlesslySwallowed;
+                        return Ok(OpLoopOutcome::HarmlesslySwallowed);
                     }
-                    // upstream `raise` — no keepgoing safety net. Panic
-                    // with a structured message until the outer
-                    // AnnotatorError propagation lands.
-                    panic!("AnnotatorError (keepgoing off): {e}");
+                    return Err(e.into());
                 }
             };
 
@@ -2056,7 +2058,7 @@ impl RPythonAnnotator {
             i += 1;
         }
 
-        OpLoopOutcome::Normal
+        Ok(OpLoopOutcome::Normal)
     }
 
     /// RPython `flowin(self, graph, block)` (annrpython.py:488-576).
@@ -2071,7 +2073,7 @@ impl RPythonAnnotator {
     ///    - Otherwise → knowntypedata-driven `follow_link` per exit.
     /// 3. Notify reflow (annrpython.py:574-576): any position subscribed
     ///    to this block's updates is re-queued.
-    fn flowin(&self, graph: &GraphRef, block: &BlockRef) -> Result<(), BlockedInference> {
+    fn flowin(&self, graph: &GraphRef, block: &BlockRef) -> Result<(), FlowinError> {
         use super::super::flowspace::model::LinkRef;
         use super::model::{
             KnownTypeData, SomeException, SomeInstance, SomeObjectTrait, difference, intersection,
@@ -2079,7 +2081,7 @@ impl RPythonAnnotator {
         };
 
         // Phase 1 — op loop.
-        let outcome = self.flowin_op_loop(graph, block);
+        let outcome = self.flowin_op_loop(graph, block)?;
 
         // Phase 2 — determine `exits`.
         let exits: Vec<LinkRef> = match outcome {
@@ -2121,7 +2123,7 @@ impl RPythonAnnotator {
                 return Ok(());
             }
             OpLoopOutcome::Blocked(e) => {
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -2286,7 +2288,11 @@ impl RPythonAnnotator {
     /// cleanup, added_blocks tracking) that empty blocks already need.
     /// `BlockedInference` handling is also staged for Commit 8 when
     /// `flowin` actually throws.
-    pub fn processblock(&self, graph: &GraphRef, block: &BlockRef) {
+    pub fn processblock(
+        &self,
+        graph: &GraphRef,
+        block: &BlockRef,
+    ) -> Result<(), crate::annotator::model::AnnotatorError> {
         let bkey = BlockKey::of(block);
         // upstream: `self.annotated[block] = graph`.
         self.annotated
@@ -2297,7 +2303,7 @@ impl RPythonAnnotator {
             .insert(bkey.clone(), Rc::clone(block));
         // upstream: `if block in self.failed_blocks: return`.
         if self.failed_blocks.borrow().contains_key(&bkey) {
-            return;
+            return Ok(());
         }
         // upstream: `if block in self.blocked_blocks: del ...`.
         self.blocked_blocks.borrow_mut().remove(&bkey);
@@ -2313,12 +2319,16 @@ impl RPythonAnnotator {
         //         raise
         match self.flowin(graph, block) {
             Ok(()) => {}
-            Err(e) => {
+            Err(FlowinError::Blocked(e)) => {
                 self.annotated.borrow_mut().insert(bkey.clone(), None);
                 self.blocked_blocks.borrow_mut().insert(
                     bkey.clone(),
                     (Rc::clone(block), Rc::clone(graph), e.opindex),
                 );
+            }
+            Err(FlowinError::Annotator(e)) => return Err(e),
+            Err(FlowinError::Harmless(_)) => {
+                unreachable!("flowin() should swallow HarmlesslyBlocked before processblock()")
             }
         }
 
@@ -2327,6 +2337,7 @@ impl RPythonAnnotator {
         if let Some(added) = self.added_blocks.borrow_mut().as_mut() {
             added.insert(bkey, Rc::clone(block));
         }
+        Ok(())
     }
 }
 
@@ -2472,7 +2483,7 @@ mod tests {
             .borrow_mut()
             .replace(HashMap::from([(BlockKey::of(&block), block.clone())]));
 
-        ann.complete_helpers();
+        ann.complete_helpers().unwrap();
 
         let restored = ann.added_blocks.borrow();
         let restored = restored.as_ref().expect("added_blocks should be restored");
@@ -2494,7 +2505,7 @@ mod tests {
             .push(Box::new(|| panic!("boom from pending_specializations")));
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ann.complete_helpers();
+            ann.complete_helpers().unwrap();
         }));
         assert!(result.is_err(), "expected complete_helpers to panic");
 
@@ -2524,7 +2535,7 @@ mod tests {
         }
         translator.graphs.borrow_mut().push(Rc::clone(&graph));
         let ann = RPythonAnnotator::new(Some(translator), None, None, false);
-        let r = ann.build_graph_types(&graph, &[], true);
+        let r = ann.build_graph_types(&graph, &[], true).unwrap();
         assert!(matches!(r, Some(SomeValue::Integer(_))), "got {:?}", r);
     }
 
@@ -2535,7 +2546,7 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let graph = mk_graph("empty", 0);
         let startblock = graph.borrow().startblock.clone();
-        ann.processblock(&graph, &startblock);
+        ann.processblock(&graph, &startblock).unwrap();
         assert!(matches!(
             ann.annotated.borrow().get(&BlockKey::of(&startblock)),
             Some(Some(_))
@@ -2567,7 +2578,7 @@ mod tests {
                 ));
         }
 
-        ann.processblock(&graph, &startblock);
+        ann.processblock(&graph, &startblock).unwrap();
         // After flowin, block.operations[0].result should carry an
         // Integer binding (SomeInteger.pos on SomeInteger = SomeInteger).
         let blk = startblock.borrow();
@@ -2588,6 +2599,36 @@ mod tests {
                 .borrow()
                 .contains_key(&BlockKey::of(&startblock))
         );
+    }
+
+    #[test]
+    fn processblock_propagates_annotator_error_when_keepgoing_is_off() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("hash_object", 1);
+        let startblock = graph.borrow().startblock.clone();
+
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::object());
+            }
+            let arg = blk.inputargs[0].clone();
+            let result = Hlvalue::Variable(Variable::named("r"));
+            blk.operations
+                .push(super::super::super::flowspace::model::SpaceOperation::new(
+                    "hash",
+                    vec![arg],
+                    result,
+                ));
+        }
+
+        let err = ann
+            .processblock(&graph, &startblock)
+            .expect_err("keepgoing=false must propagate AnnotatorError");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(msg.contains("cannot use hash() in RPython"));
+        let source = err.source.as_deref().unwrap_or("");
+        assert!(source.contains("hash_object"));
     }
 
     #[test]
@@ -2721,11 +2762,10 @@ mod tests {
         // through the "all empty" branch and exit cleanly.
         let translator = super::super::super::translator::translator::TranslationContext::new();
         let ann = RPythonAnnotator::new(Some(translator), None, None, false);
-        ann.complete();
+        ann.complete().unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "complete: added_blocks entry missing from annotated")]
     fn complete_rejects_added_blocks_entries_missing_from_annotated() {
         let translator = super::super::super::translator::translator::TranslationContext::new();
         let ann = RPythonAnnotator::new(Some(translator), None, None, false);
@@ -2736,7 +2776,16 @@ mod tests {
             .borrow_mut()
             .replace(HashMap::from([(BlockKey::of(&block), block)]));
 
-        ann.complete();
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ann.complete()))
+            .expect_err("missing annotated entry should still panic");
+        let text = if let Some(text) = err.downcast_ref::<String>() {
+            text.as_str()
+        } else if let Some(text) = err.downcast_ref::<&'static str>() {
+            text
+        } else {
+            panic!("unexpected panic payload");
+        };
+        assert!(text.contains("complete: added_blocks entry missing from annotated"));
     }
 
     #[test]

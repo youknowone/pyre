@@ -1406,6 +1406,46 @@ pub struct Specialization {
     pub can_only_throw: CanOnlyThrow,
 }
 
+fn annotator_error_from_panic(
+    payload: &(dyn std::any::Any + Send),
+) -> Option<crate::annotator::model::AnnotatorError> {
+    fn parse_text(text: &str) -> Option<crate::annotator::model::AnnotatorError> {
+        let suffix = text.strip_prefix("AnnotatorError")?;
+        let msg = suffix.trim_start_matches([':', ' ']);
+        Some(crate::annotator::model::AnnotatorError::new(msg))
+    }
+
+    payload
+        .downcast_ref::<crate::annotator::model::AnnotatorError>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<String>()
+                .and_then(|text| parse_text(text))
+        })
+        .or_else(|| {
+            payload
+                .downcast_ref::<&'static str>()
+                .and_then(|text| parse_text(text))
+        })
+}
+
+pub(crate) fn apply_specialization(
+    spec: &Specialization,
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    hlop: &HLOperation,
+) -> Result<crate::annotator::model::SomeValue, crate::annotator::model::AnnotatorError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (spec.apply)(annotator, hlop)
+    })) {
+        Ok(value) => Ok(value),
+        Err(payload) => match annotator_error_from_panic(payload.as_ref()) {
+            Some(err) => Err(err),
+            None => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
 /// RPython `getattr(opimpl, 'can_only_throw', None)` polymorphism
 /// (model.py:837-841).
 ///
@@ -1632,7 +1672,7 @@ impl HLOperation {
                         // `type(s_arg).__mro__`.
                         for c in tag.mro() {
                             if let Some(spec) = entries.get(c) {
-                                return Ok((spec.apply)(annotator, self));
+                                return apply_specialization(spec, annotator, self);
                             }
                         }
                         Err(AnnotatorError::new(format!(
@@ -1671,7 +1711,7 @@ impl HLOperation {
                             ))
                         })?;
                         match entries.get((tag_l, tag_r), tag_l.mro(), tag_r.mro()) {
-                            Some(spec) => Ok((spec.apply)(annotator, self)),
+                            Some(spec) => apply_specialization(spec, annotator, self),
                             None => Err(AnnotatorError::new(format!(
                                 "consider: no binary spec for {:?}({:?}, {:?})",
                                 self.kind, tag_l, tag_r
@@ -1887,6 +1927,24 @@ mod tests {
         // variadic / manual-dispatch → None.
         assert_eq!(OpKind::NewTuple.arity(), None);
         assert_eq!(OpKind::SimpleCall.arity(), None);
+    }
+
+    #[test]
+    fn apply_specialization_reifies_typed_annotator_error_payload() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let hl = HLOperation::new(OpKind::Hash, vec![]);
+        let spec = Specialization {
+            apply: Box::new(|_, _| {
+                std::panic::panic_any(crate::annotator::model::AnnotatorError::new(
+                    "typed payload",
+                ))
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        };
+
+        let err = apply_specialization(&spec, &ann, &hl)
+            .expect_err("typed AnnotatorError panic must be reified");
+        assert_eq!(err.msg.as_deref(), Some("typed payload"));
     }
 
     #[test]
@@ -2119,7 +2177,7 @@ mod tests {
         // default (foldable() returns false for user instances). The
         // exercise here is `const_runtime_getattr` itself, so call the
         // helper directly. Upstream's
-        // w_obj.foldable() gate intentionally rejects user instances;
+        // `w_obj.foldable()` gate intentionally rejects user instances;
         // real folds hit this code path via `_freeze_` markers we
         // don't model. Verify the helper's correctness instead:
         let r = crate::flowspace::model::const_runtime_getattr(

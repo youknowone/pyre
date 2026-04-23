@@ -4369,6 +4369,20 @@ mod tests {
     }
 
     #[test]
+    fn consider_hash_reifies_annotator_error() {
+        let (hl, ann) = hl1(OpKind::Hash, SomeValue::object());
+        let err = hl
+            .consider(&ann)
+            .expect_err("hash() must return AnnotatorError");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot use hash() in RPython")
+        );
+    }
+
+    #[test]
     fn consider_sometuple_len_is_constant() {
         // unaryop.py:334-335 — len returns immutablevalue(len(items)).
         let (hl, ann) = hl1(
