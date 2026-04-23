@@ -7015,8 +7015,14 @@ impl<M: Clone> MetaInterp<M> {
         // RPython pyjitpl.py:2609 `create_history(max_num_inputargs)` — the
         // MetaInterp owns the history factory on the bridge path too.
         let recorder = crate::recorder::Trace::with_input_types(bridge_input_types);
-        self.force_finish_trace = false;
+        // pyjitpl.py:2411 force_finish_trace — consume the segmenting flag
+        // set by the previous too-long abort on this green_key, so the
+        // next bridge attempt closes the loop early instead of
+        // re-tracing until the limit fires again. `force_start_tracing`
+        // and `start_retrace` already do this; bridges must do it too.
+        self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key, self.staticdata.clone());
+        ctx.set_force_finish(self.force_finish_trace);
         // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot for bridge traces.
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
