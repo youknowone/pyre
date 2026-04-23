@@ -9,13 +9,27 @@
 /// - SETFIELD_GC with a Ref-typed value -> COND_CALL_GC_WB + SETFIELD_GC
 ///
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use majit_ir::Type;
-use majit_ir::descr::{DescrRef, FieldDescr};
+use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::resoperation::{Op, OpCode, OpRef};
 
 use crate::{GcRewriter, WriteBarrierDescr};
+
+unsafe extern "C" {
+    // rpython/jit/backend/llsupport/memcpy.py:3-5 — the `memcpy` host
+    // symbol that `gc.py:39 memcpy_fn` binds via `rffi.llexternal`.
+    // Used by `rewrite_copy_str_content` as the CALL_N target.
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
+
+/// Raw address of `memcpy`, embedded as a ConstInt into the lowered
+/// CALL_N emitted by `rewrite_copy_str_content`.  Mirrors
+/// `rewrite.py:1046-1047 cast_ptr_to_adr(memcpy_fn) / cast_adr_to_int`.
+fn memcpy_fn_addr() -> i64 {
+    memcpy as *const () as i64
+}
 
 /// Alignment for nursery allocations (8 bytes).
 const NURSERY_ALIGN: usize = 8;
@@ -126,6 +140,17 @@ pub struct GcRewriterImpl {
     /// whether a non-constant index's factor can be folded into the
     /// backend's addressing mode or must be pre-scaled in IR.
     pub load_supported_factors: &'static [i64],
+    /// llsupport/gc.py:30-34 `malloc_zero_filled` parity.
+    ///
+    /// `true` when the allocator zero-fills payload bytes on
+    /// allocation.  pyre's `Nursery` uses `alloc_zeroed` (nursery.rs:68)
+    /// and `reset()` memsets to zero on recycle (nursery.rs:105-110),
+    /// so production is always `true`.  Gates `clear_gc_fields` per
+    /// rewrite.py:499-500; a future non-zero-fill allocator path would
+    /// flip this to `false` and let the existing plumbing emit
+    /// explicit NULL-pointer stores at flush time
+    /// (rewrite.py:761-766).
+    pub malloc_zero_filled: bool,
 }
 
 /// JitFrame field descriptors for handle_call_assembler.
@@ -250,6 +275,16 @@ struct RewriteState {
     /// Tracks which array indices have been explicitly SET since the
     /// pending zero was recorded. Keyed by array OpRef index.
     initialized_indices: HashMap<u32, HashSet<usize>>,
+    /// rewrite.py:61 `_delayed_zero_setfields = {}`.
+    ///
+    /// Map from base OpRef → {byte-offset: ()} of zero-init
+    /// SETFIELD_GC stores deferred by `clear_gc_fields`.  An explicit
+    /// SETFIELD_GC that overwrites the same offset removes the entry
+    /// via `consider_setfield_gc` (rewrite.py:506-512); anything still
+    /// pending at the next can-collect / flush point is emitted as
+    /// `GC_STORE(ptr, ofs, 0, WORD)` by `emit_pending_zeros`
+    /// (rewrite.py:761-766).
+    _delayed_zero_setfields: HashMap<u32, BTreeMap<i64, ()>>,
 
     // ── INT_ADD/INT_SUB constant-fold tracking (rewrite.py:64) ──
     /// `_constant_additions[box]` = `(older_box, constant_add)` for an
@@ -314,6 +349,7 @@ impl RewriteState {
             known_lengths: HashMap::new(),
             pending_zeros: Vec::new(),
             initialized_indices: HashMap::new(),
+            _delayed_zero_setfields: HashMap::new(),
             _constant_additions: HashMap::new(),
             next_const_idx: 0,
             changed_ops: HashMap::new(),
@@ -544,6 +580,14 @@ impl RewriteState {
         }
     }
 
+    /// rewrite.py:84-91 `delayed_zero_setfields(op)` — get-or-create the
+    /// per-base byte-offset set, resolving `r` through the forwarding
+    /// map first (RPython calls `get_box_replacement(op)` here).
+    fn delayed_zero_setfields(&mut self, r: OpRef) -> &mut BTreeMap<i64, ()> {
+        let key = self.resolve(r).0;
+        self._delayed_zero_setfields.entry(key).or_default()
+    }
+
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
     /// so the pending zero for that slot can be skipped.
     fn record_setarrayitem_index(&mut self, array_ref: OpRef, index: usize) {
@@ -593,6 +637,28 @@ impl RewriteState {
             op.args[2] = scaled_len;
             op.args[3] = one;
             op.args[4] = one;
+        }
+
+        // rewrite.py:760-766 — NULL-pointer writes still pending for
+        // any zero-init fields not covered by a subsequent explicit
+        // SETFIELD_GC.  RPython uses `WORD` (architecture pointer
+        // size); pyre targets 64-bit exclusively so WORD == 8.
+        //
+        // The constant path inside `emit_gc_store_or_indexed`
+        // (rewrite.py:148-150) collapses (ConstInt(ofs), factor=1,
+        // offset=0) to a plain `GC_STORE(ptr, ConstInt(ofs),
+        // ConstInt(0), ConstInt(WORD))`, which is what we emit here
+        // directly.
+        let pending_zsf = std::mem::take(&mut self._delayed_zero_setfields);
+        for (key, entries) in pending_zsf {
+            let ptr = OpRef(key);
+            for ofs in entries.keys().copied() {
+                let ofs_ref = self.const_int(ofs);
+                let zero_ref = self.const_int(0);
+                let word_ref = self.const_int(8);
+                let store = Op::new(OpCode::GcStore, &[ptr, ofs_ref, zero_ref, word_ref]);
+                self.emit(store);
+            }
         }
     }
 }
@@ -742,6 +808,32 @@ impl GcRewriterImpl {
                 self.gen_initialize_vtable(obj_ref, vtable, st);
             }
         }
+
+        // rewrite.py:544 `self.clear_gc_fields(descr, op)` — record every
+        // GC-pointer field's byte offset so a pending NULL store is
+        // emitted at the next flush point, unless cleared first by an
+        // explicit SETFIELD_GC (rewrite.py:506-512).  No-op under pyre's
+        // default zero-fill nursery (see `malloc_zero_filled`).
+        self.clear_gc_fields(descr, obj_ref, st);
+    }
+
+    /// rewrite.py:498-504 `clear_gc_fields`.
+    ///
+    /// For every GC-pointer field on the fresh allocation, remember
+    /// that a NULL-pointer store is needed unless a subsequent
+    /// SETFIELD_GC overwrites it first.  Early-returns when the
+    /// allocator already zero-fills payload bytes
+    /// (`self.malloc_zero_filled`, rewrite.py:499-500).
+    fn clear_gc_fields(&self, descr: &dyn SizeDescr, result: OpRef, st: &mut RewriteState) {
+        if self.malloc_zero_filled {
+            return;
+        }
+        // rewrite.py:501-504 — populate `delayed_zero_setfields[result][ofs] = None`
+        // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
+        let entries = st.delayed_zero_setfields(result);
+        for fd in descr.gc_field_descrs() {
+            entries.insert(fd.offset() as i64, ());
+        }
     }
 
     // ────────────────────────────────────────────────────────
@@ -818,6 +910,118 @@ impl GcRewriterImpl {
     }
 
     // ────────────────────────────────────────────────────────
+    // COPYSTRCONTENT / COPYUNICODECONTENT → memcpy CALL_N
+    // ────────────────────────────────────────────────────────
+
+    /// rewrite.py:1045-1080 `rewrite_copy_str_content`.
+    ///
+    /// Lowers `COPYSTRCONTENT(src, dst, src_start, dst_start, length)` (and
+    /// the UNICODE variant) to:
+    ///
+    ///     i1 = LOAD_EFFECTIVE_ADDRESS(src_gcptr, src_start, basesize, shift)
+    ///     i2 = LOAD_EFFECTIVE_ADDRESS(dst_gcptr, dst_start, basesize, shift)
+    ///     CALL_N(memcpy_fn, i2, i1, count, descr=memcpy_descr)
+    ///
+    /// For UNICODE, `count` is `length << shift` (byte count); for STR the
+    /// basesize is additionally offset by `-1` to skip the STR
+    /// `extra_item_after_alloc` null terminator (rewrite.py:1051-1053;
+    /// rstr.py:1226 `extra_item_after_alloc=True`).
+    fn rewrite_copy_str_content(&self, op: &Op, st: &mut RewriteState) {
+        let descr = op
+            .descr
+            .as_ref()
+            .expect("COPY{STR,UNICODE}CONTENT must carry an ArrayDescr");
+        let ad = descr
+            .as_array_descr()
+            .expect("COPY{STR,UNICODE}CONTENT descr must be an ArrayDescr");
+
+        // rewrite.py:1049-1064 — pick basesize/itemscale per op kind.
+        let mut basesize = ad.base_size() as i64;
+        let itemscale: i64 = if op.opcode == OpCode::Copystrcontent {
+            // rewrite.py:1051-1053 — one extra null after the string buffer,
+            // so the `chars` array starts at `str_descr.basesize - 1`.
+            assert_eq!(
+                ad.item_size(),
+                1,
+                "rewrite.py:1054 COPYSTRCONTENT itemsize must be 1"
+            );
+            basesize -= 1;
+            0
+        } else {
+            let itemsize = ad.item_size() as i64;
+            match itemsize {
+                2 => 1,
+                4 => 2,
+                _ => {
+                    panic!("rewrite.py:1063 unknown unicode itemsize {itemsize} — expected 2 or 4")
+                }
+            }
+        };
+
+        // rewrite.py:1065-1068 — effective source / destination addresses.
+        let src_gcptr = st.resolve(op.arg(0));
+        let dst_gcptr = st.resolve(op.arg(1));
+        let src_index = st.resolve(op.arg(2));
+        let dst_index = st.resolve(op.arg(3));
+
+        let i1 = self.emit_load_effective_address(src_gcptr, src_index, basesize, itemscale, st);
+        let i2 = self.emit_load_effective_address(dst_gcptr, dst_index, basesize, itemscale, st);
+
+        // rewrite.py:1069-1078 — byte count.
+        //   STR:     arg = op.getarg(4)                         (itemscale=0)
+        //   UNICODE: arg = ConstInt(op.getarg(4).getint() << itemscale)
+        //            or INT_LSHIFT(op.getarg(4), ConstInt(itemscale))
+        let arg = if op.opcode == OpCode::Copystrcontent {
+            st.resolve(op.arg(4))
+        } else {
+            let v_length = st.resolve(op.arg(4));
+            if let Some(c) = st.resolve_constant(v_length.0) {
+                // rewrite.py:1073-1074 — constant-fold the shift.
+                st.const_int(c << itemscale)
+            } else {
+                // rewrite.py:1075-1078 — emit INT_LSHIFT.
+                let shift_ref = st.const_int(itemscale);
+                let lshift = Op::new(OpCode::IntLshift, &[v_length, shift_ref]);
+                let pos = st.emit_result(lshift, OpRef::NONE);
+                st.result_types.insert(pos.0, Type::Int);
+                pos
+            }
+        };
+
+        // rewrite.py:1079-1080 — CALL_N(memcpy_fn, i2, i1, arg, descr=memcpy_descr).
+        let memcpy_fn_const = st.const_int(memcpy_fn_addr());
+        let mut call_op = Op::new(OpCode::CallN, &[memcpy_fn_const, i2, i1, arg]);
+        call_op.descr = Some(majit_ir::make_memcpy_calldescr());
+        st.emit(call_op);
+    }
+
+    /// rewrite.py:1082-1098 `emit_load_effective_address`.
+    ///
+    /// Emits LOAD_EFFECTIVE_ADDRESS on CPUs that support it (pyre's x86
+    /// and aarch64 backends both do — llsupport `supports_load_effective_
+    /// address=True` equivalent).  The result op encodes upstream's
+    /// `[v_gcptr, v_index, c_baseofs, c_shift]` argument order
+    /// (resoperation.py:1052-1054).
+    fn emit_load_effective_address(
+        &self,
+        v_gcptr: OpRef,
+        v_index: OpRef,
+        base: i64,
+        itemscale: i64,
+        st: &mut RewriteState,
+    ) -> OpRef {
+        let base_ref = st.const_int(base);
+        let shift_ref = st.const_int(itemscale);
+        let lea = Op::new(
+            OpCode::LoadEffectiveAddress,
+            &[v_gcptr, v_index, base_ref, shift_ref],
+        );
+        let pos = st.emit_result(lea, OpRef::NONE);
+        st.result_types.insert(pos.0, Type::Int);
+        pos
+    }
+
+    // ────────────────────────────────────────────────────────
     // SETFIELD_GC  → maybe COND_CALL_GC_WB + SETFIELD_GC
     // ────────────────────────────────────────────────────────
 
@@ -873,25 +1077,26 @@ impl GcRewriterImpl {
 
     /// rewrite.py:506-512 `consider_setfield_gc`.
     ///
-    /// Upstream drops the (base, offset) entry from
-    /// `_delayed_zero_setfields` so the pending-zero flush at
-    /// `emit_pending_zeros` (rewrite.py:761-766) does not re-zero a slot
-    /// that the explicit SETFIELD_GC is about to overwrite.
+    /// Drops the `(base, offset)` entry from `_delayed_zero_setfields`
+    /// so the pending-zero flush at `emit_pending_zeros`
+    /// (rewrite.py:761-766) does not re-zero a slot that this explicit
+    /// SETFIELD_GC is about to overwrite.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `handle_new` above emits no
-    /// field-zeroing ops because the nursery allocator zero-fills the
-    /// payload bytes (`gen_malloc_nursery` → `alloc_nursery_no_collect`
-    /// returns zeroed memory).  With nothing pending, there is nothing
-    /// for the eventual `emit_pending_zeros` flush to skip, and
-    /// `_delayed_zero_setfields` itself has no data to carry — hence
-    /// the no-op body here.  The call site is kept for structural
-    /// parity with rewrite.py:394 so that when pyre's allocator gains a
-    /// non-zero-fill path and `handle_new` starts emitting explicit
-    /// zero-setfields, the body here can track the pending entries per
-    /// rewrite.py:507-512 without touching the caller.
-    fn consider_setfield_gc(&self, _op: &Op, _st: &mut RewriteState) {
-        // no-op: `handle_new` does not emit delayed-zero setfields in
-        // pyre's zero-fill nursery path, so there is nothing to clear.
+    /// Under pyre's default zero-fill nursery configuration
+    /// (`malloc_zero_filled = true`), `clear_gc_fields` skips its
+    /// insertion path, so this is effectively a no-op.  The body is
+    /// wired for parity so that a non-zero-fill allocator automatically
+    /// activates the delayed-zero tracking without further callsite
+    /// changes.
+    fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
+        let Some(fd) = op.descr.as_ref().and_then(|d| d.as_field_descr()) else {
+            return;
+        };
+        let offset = fd.offset() as i64;
+        let base = st.resolve(op.arg(0)).0;
+        if let Some(entries) = st._delayed_zero_setfields.get_mut(&base) {
+            entries.remove(&offset);
+        }
     }
 
     // ────────────────────────────────────────────────────────
@@ -1874,6 +2079,13 @@ impl GcRewriter for GcRewriterImpl {
                     self.handle_new_array(op, &mut st, 2); // FLAG_UNICODE
                 }
 
+                // ── COPYSTRCONTENT / COPYUNICODECONTENT → memcpy CALL_N ──
+                // rewrite.py:388-391 `rewrite_copy_str_content` replaces
+                // the copy op with LOAD_EFFECTIVE_ADDRESS × 2 + CALL_N.
+                OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
+                    self.rewrite_copy_str_content(op, &mut st);
+                }
+
                 // ── Stores that may need a write barrier ──
                 //
                 // rewrite.py:392-404 — the write-barrier section runs AFTER
@@ -2021,6 +2233,7 @@ mod tests {
         size: usize,
         type_id: u32,
         vtable: usize,
+        gc_fields: Vec<Arc<dyn FieldDescr>>,
     }
 
     impl Descr for TestSizeDescr {
@@ -2044,6 +2257,9 @@ mod tests {
         }
         fn vtable(&self) -> usize {
             self.vtable
+        }
+        fn gc_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.gc_fields
         }
     }
 
@@ -2122,6 +2338,10 @@ mod tests {
             // in tests written against it; per-backend overrides have dedicated
             // tests below.
             load_supported_factors: &[1],
+            // Match the production nursery's zero-fill behavior; the
+            // `clear_gc_fields` / `_delayed_zero_setfields` tests flip
+            // this to `false` per-test.
+            malloc_zero_filled: true,
         }
     }
 
@@ -2142,6 +2362,20 @@ mod tests {
             size,
             type_id,
             vtable: 0,
+            gc_fields: Vec::new(),
+        })
+    }
+
+    fn size_descr_with_gc_fields(
+        size: usize,
+        type_id: u32,
+        gc_fields: Vec<Arc<dyn FieldDescr>>,
+    ) -> DescrRef {
+        Arc::new(TestSizeDescr {
+            size,
+            type_id,
+            vtable: 0,
+            gc_fields,
         })
     }
 
@@ -2150,6 +2384,7 @@ mod tests {
             size,
             type_id,
             vtable,
+            gc_fields: Vec::new(),
         })
     }
 
@@ -2338,6 +2573,125 @@ mod tests {
         // Only the lowered GC_STORE — no WB for non-ref fields.
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::GcStore);
+    }
+
+    // ── Tests 4a-c: delayed_zero_setfields (rewrite.py:498-512, 761-766) ──
+
+    fn ref_field_descr_at(offset: usize) -> Arc<dyn FieldDescr> {
+        Arc::new(TestFieldDescr {
+            offset,
+            field_size: 8,
+            field_type: Type::Ref,
+        })
+    }
+
+    fn ref_field_descr_ref_at(offset: usize) -> DescrRef {
+        Arc::new(TestFieldDescr {
+            offset,
+            field_size: 8,
+            field_type: Type::Ref,
+        })
+    }
+
+    /// rewrite.py:499-500 + rewrite.py:761-766 — malloc_zero_filled=true
+    /// short-circuits `clear_gc_fields`, so NEW emits no pending NULL
+    /// stores at the next flush point.  Mirrors pyre's production
+    /// nursery (which `alloc_zeroed`s).
+    #[test]
+    fn test_clear_gc_fields_zero_filled_skips() {
+        let rw = make_rewriter(); // malloc_zero_filled = true
+        let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
+        let descr = size_descr_with_gc_fields(48, 42, gc_fields);
+        let ops = vec![
+            Op::with_descr(OpCode::New, &[], descr),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, _consts) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        // Allocation header stores only (CallMallocNursery + tid GcStore) + Jump.
+        // No delayed-zero NULL-pointer stores must be emitted because
+        // the allocator already zero-fills.
+        let gc_stores: Vec<_> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .collect();
+        assert_eq!(
+            gc_stores.len(),
+            1,
+            "malloc_zero_filled=true must emit only the tid init store, got {:?}",
+            result
+        );
+    }
+
+    /// rewrite.py:498-504 + rewrite.py:761-766 — when the allocator does
+    /// not zero-fill, every GC field's byte offset is remembered and
+    /// flushed as `GC_STORE(ptr, ofs, 0, 8)` at the next can-collect /
+    /// flush point.
+    #[test]
+    fn test_emit_pending_zeros_flushes_delayed_setfields() {
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
+        let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
+        let descr = size_descr_with_gc_fields(48, 42, gc_fields);
+        let ops = vec![
+            Op::with_descr(OpCode::New, &[], descr),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        // Collect the NULL-pointer stores emitted by the pending-zero flush.
+        let mut seen_offsets: Vec<i64> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            // skip the tid header store (ofs=0, value=type_id, itemsize=4).
+            .filter(|o| consts.get(&o.args[2].0).copied() == Some(0))
+            .map(|o| consts[&o.args[1].0])
+            .collect();
+        seen_offsets.sort();
+        assert_eq!(
+            seen_offsets,
+            vec![24, 32],
+            "pending-zero flush must emit one NULL store per zero-init GC field"
+        );
+    }
+
+    /// rewrite.py:506-512 — an explicit SETFIELD_GC at offset `ofs`
+    /// removes `ofs` from `_delayed_zero_setfields`, so the flush does
+    /// not re-zero the slot.
+    #[test]
+    fn test_consider_setfield_gc_drops_overwritten_offset() {
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
+        let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
+        let descr = size_descr_with_gc_fields(48, 42, gc_fields);
+        let val = OpRef::from_const(100);
+        let mut constants = HashMap::new();
+        constants.insert(val.0, 0x1234);
+        let ops = vec![
+            Op::with_descr(OpCode::New, &[], descr),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef(0), val],
+                ref_field_descr_ref_at(24),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+
+        let null_offsets: Vec<i64> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .filter(|o| consts.get(&o.args[2].0).copied() == Some(0))
+            .map(|o| consts[&o.args[1].0])
+            .collect();
+        assert_eq!(
+            null_offsets,
+            vec![32],
+            "SETFIELD_GC at ofs=24 must drop the pending-zero at ofs=24; only ofs=32 remains"
+        );
     }
 
     // ── Test 5: Non-GC ops pass through unchanged ──
@@ -3001,6 +3355,7 @@ mod tests {
             constant_types: HashMap::new(),
             call_assembler_callee_locs: None,
             load_supported_factors: &[1],
+            malloc_zero_filled: true,
         }
     }
 
@@ -3109,5 +3464,104 @@ mod tests {
             .filter(|o| o.opcode == OpCode::CondCallGcWb || o.opcode == OpCode::CondCallGcWbArray)
             .count();
         assert_eq!(any_wb, 0, "int store should not produce any WB");
+    }
+
+    fn str_array_descr() -> DescrRef {
+        // rstr.py:1226 `extra_item_after_alloc=True` → base_size = 17
+        // (16-byte GC header surrogate + 1 trailing null), itemsize = 1.
+        Arc::new(TestArrayDescr {
+            base_size: 17,
+            item_size: 1,
+            type_id: 7,
+            item_type: Type::Int,
+        })
+    }
+
+    fn unicode_array_descr() -> DescrRef {
+        // rstr.py UNICODE has no extra_item_after_alloc; itemsize = 4.
+        Arc::new(TestArrayDescr {
+            base_size: 16,
+            item_size: 4,
+            type_id: 8,
+            item_type: Type::Int,
+        })
+    }
+
+    // ── COPYSTRCONTENT → LEA × 2 + CALL_N(memcpy) ──
+    //
+    // rpython/jit/backend/llsupport/test/test_rewrite.py:1460-1469
+    // `test_rewrite_copystrcontents`.
+    #[test]
+    fn test_rewrite_copystrcontents() {
+        let rw = make_rewriter();
+        // [p0, p1, i0, i1, i_len]
+        let p0 = OpRef(0);
+        let p1 = OpRef(1);
+        let i0 = OpRef(2);
+        let i1 = OpRef(3);
+        let i_len = OpRef(4);
+        let ops = vec![Op::with_descr(
+            OpCode::Copystrcontent,
+            &[p0, p1, i0, i1, i_len],
+            str_array_descr(),
+        )];
+
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        assert_eq!(
+            result.len(),
+            3,
+            "expected LEA + LEA + CALL_N, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        // i_src = load_effective_address(p0, i0, basesize-1=16, shift=0)
+        assert_eq!(result[0].opcode, OpCode::LoadEffectiveAddress);
+        assert_eq!(result[0].arg(0), p0);
+        assert_eq!(result[0].arg(1), i0);
+        assert_eq!(constants[&result[0].arg(2).0], 16);
+        assert_eq!(constants[&result[0].arg(3).0], 0);
+        // i_dst = load_effective_address(p1, i1, 16, 0)
+        assert_eq!(result[1].opcode, OpCode::LoadEffectiveAddress);
+        assert_eq!(result[1].arg(0), p1);
+        assert_eq!(result[1].arg(1), i1);
+        assert_eq!(constants[&result[1].arg(2).0], 16);
+        assert_eq!(constants[&result[1].arg(3).0], 0);
+        // call_n(memcpy_fn, i_dst, i_src, i_len)
+        assert_eq!(result[2].opcode, OpCode::CallN);
+        assert_eq!(result[2].arg(1), result[1].pos); // dst
+        assert_eq!(result[2].arg(2), result[0].pos); // src
+        assert_eq!(result[2].arg(3), i_len);
+        assert!(result[2].descr.is_some(), "CALL_N must carry memcpy_descr");
+    }
+
+    // ── COPYUNICODECONTENT with non-constant length → LEA × 2 + LSHIFT + CALL_N ──
+    #[test]
+    fn test_rewrite_copyunicodecontents_dynamic_length() {
+        let rw = make_rewriter();
+        let p0 = OpRef(0);
+        let p1 = OpRef(1);
+        let i0 = OpRef(2);
+        let i1 = OpRef(3);
+        let i_len = OpRef(4);
+        let ops = vec![Op::with_descr(
+            OpCode::Copyunicodecontent,
+            &[p0, p1, i0, i1, i_len],
+            unicode_array_descr(),
+        )];
+
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        // Expect: LEA, LEA, INT_LSHIFT(i_len, 2), CALL_N
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].opcode, OpCode::LoadEffectiveAddress);
+        // basesize=16, shift=2 (itemsize=4 → itemscale=2)
+        assert_eq!(constants[&result[0].arg(2).0], 16);
+        assert_eq!(constants[&result[0].arg(3).0], 2);
+        assert_eq!(result[1].opcode, OpCode::LoadEffectiveAddress);
+        assert_eq!(result[2].opcode, OpCode::IntLshift);
+        assert_eq!(result[2].arg(0), i_len);
+        assert_eq!(constants[&result[2].arg(1).0], 2);
+        assert_eq!(result[3].opcode, OpCode::CallN);
+        assert_eq!(result[3].arg(3), result[2].pos);
     }
 }

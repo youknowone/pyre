@@ -2158,6 +2158,40 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
     ))
 }
 
+/// llsupport/gc.py:40-43 `GcLLDescr_framework.memcpy_descr`.
+///
+/// CallDescr used by `rewrite_copy_str_content` for the lowered
+/// CALL_N(memcpy_fn, dst, src, n) emitted in place of
+/// COPYSTRCONTENT / COPYUNICODECONTENT.  Upstream:
+///
+///     self.memcpy_descr = get_call_descr(self,
+///         [lltype.Signed, lltype.Signed, lltype.Signed], lltype.Void,
+///         EffectInfo([], [], [], [], [], [], EffectInfo.EF_CANNOT_RAISE,
+///             can_collect=False))
+pub fn make_memcpy_calldescr() -> DescrRef {
+    use std::sync::Arc;
+    static NEXT_IDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x5000_0000);
+    let idx = NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let effect = EffectInfo {
+        // EF_CANNOT_RAISE — memcpy is leaf; does not raise.
+        extraeffect: ExtraEffect::CannotRaise,
+        // can_collect=False — regalloc can skip saving GC-ref regs across
+        // the call (rewrite.rs `SAVE_DEFAULT_REGS` path).
+        can_collect: false,
+        ..EffectInfo::default()
+    };
+    // memcpy returns void.  `result_size=0` / `result_signed=false` are the
+    // SimpleCallDescr defaults for a Void return.
+    Arc::new(SimpleCallDescr::new(
+        idx,
+        vec![crate::Type::Int, crate::Type::Int, crate::Type::Int],
+        crate::Type::Void,
+        false,
+        0,
+        effect,
+    ))
+}
+
 /// Simple concrete FailDescr for guard failure descriptors.
 #[derive(Debug)]
 pub struct SimpleFailDescr {

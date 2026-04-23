@@ -5453,14 +5453,13 @@ impl Assembler386 {
     /// COPYSTRCONTENT / COPYUNICODECONTENT: copy substring.
     /// arg(0)=src, arg(1)=dst, arg(2)=src_start, arg(3)=dst_start, arg(4)=length.
     ///
-    /// PRE-EXISTING-ADAPTATION: upstream `rpython/jit/backend/llsupport/
-    /// rewrite.py:1045-1080` `rewrite_copy_str_content` lowers these ops
-    /// to a CALL_N(memcpy, effective_dst, effective_src, count) at the
-    /// rewriter stage.  pyre's GC rewriter does not yet emit that call
-    /// (the `memcpy_descr` / `emit_load_effective_address` infrastructure
-    /// is not ported), so the backend performs the effective-address
-    /// arithmetic and the memmove call itself.  Mirrors upstream's
-    /// basesize handling (`rewrite.py:1049-1053`).
+    /// Fallback emitter for the no-rewriter path.  When the GC rewriter is
+    /// present (production), `rewrite.py:1045-1080
+    /// rewrite_copy_str_content` replaces this op with
+    /// LOAD_EFFECTIVE_ADDRESS × 2 + CALL_N(memcpy, …) before assembly, so
+    /// this function is never reached.  Kept for tests that run the
+    /// backend directly on un-rewritten ops.  Mirrors upstream's basesize
+    /// handling (`rewrite.py:1049-1053`).
     fn genop_discard_copystrcontent(&mut self, op: &Op) {
         let (mut base_size, item_size) = op
             .descr
@@ -5624,21 +5623,22 @@ impl Assembler386 {
     // genop_* — address computation
     // ================================================================
 
-    /// LOAD_EFFECTIVE_ADDRESS: result = base + index * scale + offset.
-    /// arg(0)=base, arg(1)=index, arg(2)=scale, arg(3)=offset.
+    /// LOAD_EFFECTIVE_ADDRESS: result = base + (index << shift) + baseofs.
+    /// resoperation.py:1052-1054 — `[v_gcptr, v_index, c_baseofs, c_shift]`.
+    /// arg(0)=base, arg(1)=index, arg(2)=baseofs, arg(3)=shift.
     fn genop_load_effective_address(&mut self, op: &Op) {
-        let scale = self.resolve_const_or(op.arg(2), 1) as i32;
-        let offset = self.resolve_const_or(op.arg(3), 0) as i32;
+        let baseofs = self.resolve_const_or(op.arg(2), 0) as i32;
+        let shift = self.resolve_const_or(op.arg(3), 0) as i32;
 
         self.load_arg_to_rax(op.arg(0));
         self.load_arg_to_rcx(op.arg(1));
 
-        if scale != 1 {
-            dynasm!(self.mc ; .arch x64 ; imul rcx, rcx, scale);
+        if shift != 0 {
+            dynasm!(self.mc ; .arch x64 ; shl rcx, BYTE shift as i8);
         }
         dynasm!(self.mc ; .arch x64 ; add rax, rcx);
-        if offset != 0 {
-            dynasm!(self.mc ; .arch x64 ; add rax, offset);
+        if baseofs != 0 {
+            dynasm!(self.mc ; .arch x64 ; add rax, baseofs);
         }
 
         self.store_rax_to_result(op.pos);

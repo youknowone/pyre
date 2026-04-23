@@ -5920,6 +5920,11 @@ impl CraneliftBackend {
             // ISA scaled addressing mode, so we keep the rewriter in the
             // "pre-scale everything" contract that the lowering expects.
             load_supported_factors: &[1],
+            // nursery.rs:68 `alloc_zeroed` + nursery.rs:105-110 `reset`
+            // memset-to-zero on recycle mean the nursery payload is
+            // always zero-filled at allocation time; `clear_gc_fields`
+            // thus short-circuits per rewrite.py:499-500.
+            malloc_zero_filled: true,
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
             // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
             // both sourced directly from the CLT Arc on the target
@@ -10766,16 +10771,16 @@ impl CraneliftBackend {
                 }
 
                 // ── Load effective address ──
+                // resoperation.py:1052-1054 — `[v_gcptr, v_index, c_baseofs,
+                // c_shift]`, `res = arg0 + (arg1 << arg3) + arg2`.
                 OpCode::LoadEffectiveAddress => {
-                    // args[0] = base, args[1] = index, args[2] = scale, args[3] = offset
-                    // result = base + index * scale + offset
                     let base = resolve_opref(&mut builder, &constants, op.arg(0));
                     let index = resolve_opref(&mut builder, &constants, op.arg(1));
-                    let scale = resolve_opref(&mut builder, &constants, op.arg(2));
-                    let offset = resolve_opref(&mut builder, &constants, op.arg(3));
-                    let scaled_index = builder.ins().imul(index, scale);
-                    let addr = builder.ins().iadd(base, scaled_index);
-                    let result = builder.ins().iadd(addr, offset);
+                    let baseofs = resolve_opref(&mut builder, &constants, op.arg(2));
+                    let shift = resolve_opref(&mut builder, &constants, op.arg(3));
+                    let shifted_index = builder.ins().ishl(index, shift);
+                    let addr = builder.ins().iadd(base, shifted_index);
+                    let result = builder.ins().iadd(addr, baseofs);
                     builder.def_var(var(vi), result);
                 }
 

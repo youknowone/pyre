@@ -349,6 +349,11 @@ impl DynasmBackend {
                 // asserts boxes[3].getint() == 1 in its regalloc — see
                 // `consider_gc_store_indexed` cfg(target_arch = "aarch64")).
                 load_supported_factors: gc_store_supported_factors(),
+                // nursery.rs:68 `alloc_zeroed` + nursery.rs:105-110
+                // `reset` memset-to-zero on recycle mean the nursery
+                // payload is always zero-filled at allocation time;
+                // `clear_gc_fields` short-circuits per rewrite.py:499-500.
+                malloc_zero_filled: true,
             }
         })
     }
