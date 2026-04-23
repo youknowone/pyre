@@ -1675,6 +1675,7 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
         ConstantData::Boolean { value } => {
             pyre_object::intobject::w_int_new(if *value { 1 } else { 0 })
         }
+        ConstantData::Str { value } => pyre_object::w_str_new(value.as_str().unwrap_or("")),
         ConstantData::None => pyre_object::w_none(),
         ConstantData::Ellipsis => pyre_object::noneobject::w_ellipsis(),
         _ => pyre_object::w_none(),
