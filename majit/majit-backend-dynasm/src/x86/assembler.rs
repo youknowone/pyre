@@ -5542,13 +5542,31 @@ impl Assembler386 {
     }
 
     /// NEWSTR: allocate a byte string of given length.
+    /// `base_size` / `item_size` come from the injected ArrayDescr
+    /// (`builtin_string_array_descr` in `runner.rs`), which encodes
+    /// `get_array_token(rstr.STR, ...)` — basesize includes the +1
+    /// extra_item_after_alloc null terminator.
     fn genop_newstr(&mut self, op: &Op) {
-        self.genop_alloc_varsize(op, 16, 1);
+        let (base_size, item_size) = Self::array_token_from_descr(op, 16, 1);
+        self.genop_alloc_varsize(op, base_size, item_size);
     }
 
     /// NEWUNICODE: allocate a unicode string (4-byte chars).
+    /// Basesize = 16 (no extra_item_after_alloc), itemsize = 4.
     fn genop_newunicode(&mut self, op: &Op) {
-        self.genop_alloc_varsize(op, 16, 4);
+        let (base_size, item_size) = Self::array_token_from_descr(op, 16, 4);
+        self.genop_alloc_varsize(op, base_size, item_size);
+    }
+
+    /// Read `(base_size, item_size)` from the injected ArrayDescr.
+    /// Fallback used only when the descr is missing (should never happen
+    /// for NEWSTR/NEWUNICODE after `inject_builtin_string_descrs`).
+    fn array_token_from_descr(op: &Op, fallback_base: i64, fallback_item: i64) -> (i64, i64) {
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_array_descr())
+            .map(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+            .unwrap_or((fallback_base, fallback_item))
     }
 
     /// Shared implementation for NEWSTR / NEWUNICODE / NEW_ARRAY.
