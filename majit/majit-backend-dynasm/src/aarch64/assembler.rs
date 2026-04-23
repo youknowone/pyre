@@ -1654,14 +1654,30 @@ impl AssemblerARM64 {
                     }
                 }
             }
-            OpCode::FloatNeg => {
-                if let Some(Loc::Reg(r)) = result_loc {
-                    dynasm!(self.mc ; .arch aarch64 ; fneg D(r.value), D(r.value));
-                }
-            }
-            OpCode::FloatAbs => {
-                if let Some(Loc::Reg(r)) = result_loc {
-                    dynasm!(self.mc ; .arch aarch64 ; fabs D(r.value), D(r.value));
+            OpCode::FloatNeg | OpCode::FloatAbs => {
+                if let (Some(Loc::Reg(dst)), Some(src_loc)) = (result_loc, arglocs.first()) {
+                    // aarch64 fneg/fabs are 2-operand `fneg/fabs Dd, Dn`.
+                    // When regalloc chooses `dst != arg0`, reading `Dd` as
+                    // the source consumes a stale destination register
+                    // instead of the real input, so we must read from
+                    // `arglocs[0]` like the float-binop path above.
+                    let src_reg = match src_loc {
+                        Loc::Reg(r) => *r,
+                        _ => {
+                            let scratch = crate::regloc::RegLoc::new(15, true);
+                            self.regalloc_mov(src_loc, &Loc::Reg(scratch));
+                            scratch
+                        }
+                    };
+                    match op.opcode {
+                        OpCode::FloatNeg => {
+                            dynasm!(self.mc ; .arch aarch64 ; fneg D(dst.value), D(src_reg.value));
+                        }
+                        OpCode::FloatAbs => {
+                            dynasm!(self.mc ; .arch aarch64 ; fabs D(dst.value), D(src_reg.value));
+                        }
+                        _ => {}
+                    }
                 }
             }
             // ── Float comparisons ──
@@ -2239,7 +2255,7 @@ impl AssemblerARM64 {
                     2,
                     crate::runner::dynasm_nursery_slowpath as *const () as i64,
                 );
-                dynasm!(self.mc ; .arch aarch64 ; blr x2);
+                self.emit_malloc_slowpath_helper_call(2);
                 // pop_gcmap
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
                 if !op.pos.is_none() {
@@ -2281,7 +2297,7 @@ impl AssemblerARM64 {
                     3,
                     crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64,
                 );
-                dynasm!(self.mc ; .arch aarch64 ; blr x3);
+                self.emit_malloc_slowpath_helper_call(3);
                 // pop_gcmap
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
                 if !op.pos.is_none() {
@@ -4732,6 +4748,49 @@ impl AssemblerARM64 {
         );
     }
 
+    /// `_build_malloc_slowpath()` parity: preserve live state across the
+    /// helper call. RPython's JIT-generated slowpath explicitly preserves all
+    /// registers apart from the result convention registers; our Rust helper
+    /// call must do the same at the call site.
+    ///
+    /// The nursery slowpath helpers communicate through `x0` (result) and may
+    /// clobber `x1`, so we preserve `x2..x15` and `d0..d15` here.
+    fn emit_malloc_slowpath_helper_call(&mut self, helper_reg: u8) {
+        dynasm!(self.mc ; .arch aarch64
+            ; stp x2, x3, [sp, -240]!
+            ; stp x4, x5, [sp, 16]
+            ; stp x6, x7, [sp, 32]
+            ; stp x8, x9, [sp, 48]
+            ; stp x10, x11, [sp, 64]
+            ; stp x12, x13, [sp, 80]
+            ; stp x14, x15, [sp, 96]
+            ; stp d0, d1, [sp, 112]
+            ; stp d2, d3, [sp, 128]
+            ; stp d4, d5, [sp, 144]
+            ; stp d6, d7, [sp, 160]
+            ; stp d8, d9, [sp, 176]
+            ; stp d10, d11, [sp, 192]
+            ; stp d12, d13, [sp, 208]
+            ; stp d14, d15, [sp, 224]
+            ; blr X(helper_reg)
+            ; ldp d14, d15, [sp, 224]
+            ; ldp d12, d13, [sp, 208]
+            ; ldp d10, d11, [sp, 192]
+            ; ldp d8, d9, [sp, 176]
+            ; ldp d6, d7, [sp, 160]
+            ; ldp d4, d5, [sp, 144]
+            ; ldp d2, d3, [sp, 128]
+            ; ldp d0, d1, [sp, 112]
+            ; ldp x14, x15, [sp, 96]
+            ; ldp x12, x13, [sp, 80]
+            ; ldp x10, x11, [sp, 64]
+            ; ldp x8, x9, [sp, 48]
+            ; ldp x6, x7, [sp, 32]
+            ; ldp x4, x5, [sp, 16]
+            ; ldp x2, x3, [sp], 240
+        );
+    }
+
     /// aarch64/assembler.py:682 malloc_cond parity.
     ///
     /// Inline nursery bump allocation. total_size (from op.arg(0))
@@ -4754,7 +4813,7 @@ impl AssemblerARM64 {
                 2,
                 crate::runner::dynasm_nursery_slowpath as *const () as i64,
             );
-            dynasm!(self.mc ; .arch aarch64 ; blr x2);
+            self.emit_malloc_slowpath_helper_call(2);
             return;
         }
 
@@ -4808,7 +4867,7 @@ impl AssemblerARM64 {
             2,
             crate::runner::dynasm_nursery_slowpath as *const () as i64,
         );
-        dynasm!(self.mc ; .arch aarch64 ; blr x2);
+        self.emit_malloc_slowpath_helper_call(2);
         // pop_gcmap: clear jf_gcmap after collecting call
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
         dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
