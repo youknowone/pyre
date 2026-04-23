@@ -10,30 +10,8 @@
 //! fixpoint when Block.inputargs (Phi nodes) need widening.
 
 use crate::flowspace::model::ConstValue;
+use crate::jit_codewriter::annotation_state::AnnotationState;
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
-use std::collections::HashMap;
-
-/// Annotation state: maps ValueId → inferred ValueType.
-#[derive(Debug, Clone)]
-pub struct AnnotationState {
-    pub types: HashMap<ValueId, ValueType>,
-}
-
-impl AnnotationState {
-    pub fn new() -> Self {
-        Self {
-            types: HashMap::new(),
-        }
-    }
-
-    pub fn get(&self, id: ValueId) -> &ValueType {
-        self.types.get(&id).unwrap_or(&ValueType::Unknown)
-    }
-
-    pub fn set(&mut self, id: ValueId, ty: ValueType) {
-        self.types.insert(id, ty);
-    }
-}
 
 /// Run annotation propagation to fixpoint.
 ///
@@ -177,6 +155,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
         | ConstValue::Graphs(_)
+        | ConstValue::LowLevelType(_)
         | ConstValue::None
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)

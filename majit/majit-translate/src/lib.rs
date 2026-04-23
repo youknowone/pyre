@@ -31,7 +31,9 @@ pub mod hints;
 pub mod inline;
 pub mod layout;
 pub mod model;
+pub mod opcode_dispatch;
 mod parse;
+pub mod pipeline;
 #[cfg(test)]
 mod test_support;
 // Phase 0 P1 (roadmap: line-by-line port of rpython/{flowspace,annotator,rtyper}):
@@ -55,6 +57,8 @@ pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,
 };
+pub use jit_codewriter::annotation_state::AnnotationState;
+pub use jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,
     VirtualizableFieldDescriptor, rewrite_graph,
@@ -63,22 +67,21 @@ pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{
     Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueId, ValueType,
 };
+pub use opcode_dispatch::PipelineOpcodeArm;
 pub use parse::{
     CallPath, ExtractedHandlerCall, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,
     ReceiverTraitBindings, extract_opcode_dispatch_arms, extract_opcode_dispatch_receiver_traits,
     extract_trait_impls, find_opcode_dispatch_match, parse_source,
 };
-pub use translate_legacy::annotator::annrpython::{AnnotationState, annotate as annotate_graph};
-pub use translate_legacy::pipeline::{
-    PipelineConfig, PipelineOpcodeArm, PipelineResult, PortalSpec, ProgramPipelineResult,
-    analyze_function, analyze_program,
-};
-pub use translate_legacy::rtyper::rtyper::{ConcreteType, TypeResolutionState, resolve_types};
+pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
+pub use translate_legacy::annotator::annrpython::annotate as annotate_graph;
+pub use translate_legacy::pipeline::{analyze_function, analyze_program};
+pub use translate_legacy::rtyper::rtyper::resolve_types;
 
 use serde::{Deserialize, Serialize};
 
 use crate::translate_legacy::{
-    annotator::annrpython as annotate, pipeline, rtyper::rtyper as rtype,
+    annotator::annrpython as annotate, pipeline as legacy_pipeline, rtyper::rtyper as rtype,
 };
 
 /// Configuration for the canonical graph/pipeline analyzer.
@@ -307,7 +310,7 @@ fn analyze_pipeline_from_parsed(
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
     let program = front::build_semantic_program_from_parsed_files(parsed_files);
-    let mut pipeline = pipeline::analyze_program(&program, &config.pipeline);
+    let mut pipeline = legacy_pipeline::analyze_program(&program, &config.pipeline);
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
@@ -741,7 +744,7 @@ fn build_canonical_opcode_dispatch(
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
 ) -> (
-    Vec<pipeline::PipelineOpcodeArm>,
+    Vec<opcode_dispatch::PipelineOpcodeArm>,
     Vec<std::sync::Arc<jitcode::JitCode>>,
     std::collections::HashMap<String, u8>,
     Vec<jitcode::BhDescr>,
@@ -785,7 +788,8 @@ fn build_canonical_opcode_dispatch(
     // snapshot tests / debug dumps keep working. The orthodox pipeline inside
     // `drain_pending_graphs` will recompute its own SSARepr+JitCode below
     // and place the result at `jitcodes[entry_jitcode_index]`.
-    let mut dispatch: Vec<pipeline::PipelineOpcodeArm> = Vec::with_capacity(opcode_arms.len());
+    let mut dispatch: Vec<opcode_dispatch::PipelineOpcodeArm> =
+        Vec::with_capacity(opcode_arms.len());
     let mut dispatch_paths: Vec<Option<parse::CallPath>> = Vec::with_capacity(opcode_arms.len());
     for (arm_id, arm) in opcode_arms.into_iter().enumerate() {
         let _resolved_calls = resolve_handler_calls(
@@ -818,7 +822,7 @@ fn build_canonical_opcode_dispatch(
             let rewritten = transformer.transform(&handler_graph_owned);
             let rewritten_type_state = rtype::resolve_types(&rewritten.graph, &annotations);
             let value_kinds =
-                crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_type_state);
+                crate::jit_codewriter::type_state::build_value_kinds(&rewritten_type_state);
             let regallocs =
                 crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
             flatten::flatten_with_types(&rewritten.graph, &rewritten_type_state, &regallocs)
@@ -834,7 +838,7 @@ fn build_canonical_opcode_dispatch(
             synthetic_path
         });
 
-        dispatch.push(pipeline::PipelineOpcodeArm {
+        dispatch.push(opcode_dispatch::PipelineOpcodeArm {
             arm_id,
             selector: arm.selector,
             entry_jitcode_index: None,
@@ -1497,7 +1501,7 @@ mod tests {
 
         // Step 3: flatten the rewritten graph
         let types = resolve_types(&result.graph, &annotate_graph(&result.graph));
-        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&types);
+        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&types);
         let regallocs =
             crate::regalloc::perform_all_register_allocations(&result.graph, &value_kinds);
         let flattened = flatten_with_types(&result.graph, &types, &regallocs);

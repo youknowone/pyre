@@ -185,7 +185,7 @@ impl CodeWriter {
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
         let value_kinds =
-            crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_type_state);
+            crate::jit_codewriter::type_state::build_value_kinds(&rewritten_type_state);
         let regallocs =
             crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
 

@@ -4,6 +4,7 @@
 //! into `JitCode` consumed by `majit-metainterp`. Sibling modules in this
 //! directory mirror `rpython/jit/codewriter/*.py` one-to-one.
 
+pub mod annotation_state;
 pub mod assembler;
 pub mod call;
 pub mod codewriter;
@@ -15,3 +16,4 @@ pub mod liveness;
 pub mod policy;
 pub mod regalloc;
 pub mod support;
+pub mod type_state;

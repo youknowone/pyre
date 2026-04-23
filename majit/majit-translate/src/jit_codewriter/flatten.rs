@@ -417,11 +417,11 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
 /// Like `flatten()` but populates `value_kinds` from the TypeResolutionState.
 pub fn flatten_with_types(
     graph: &FunctionGraph,
-    types: &crate::translate_legacy::rtyper::rtyper::TypeResolutionState,
+    types: &crate::jit_codewriter::type_state::TypeResolutionState,
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> SSARepr {
     let mut result = flatten(graph, regallocs);
-    result.value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(types);
+    result.value_kinds = crate::jit_codewriter::type_state::build_value_kinds(types);
     // Seed canonical `exceptblock.inputargs` kinds if the rtyper pass
     // missed them — same contract as
     // `perform_all_register_allocations`.
@@ -638,6 +638,7 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::List(_)
         | ConstValue::Dict(_)
         | ConstValue::Graphs(_)
+        | ConstValue::LowLevelType(_)
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)
         | ConstValue::Function(_)

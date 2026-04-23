@@ -12,11 +12,13 @@
 //! PRE-EXISTING-ADAPTATION block on that variant in `model.rs`.
 
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
-// `TypeResolutionState` + `ConcreteType` still live under `translate_legacy`
-// until `majit-rtyper` (roadmap Phase 6) extracts them into a proper crate.
-// This is a temporary wiring bridge — the RPython-orthodox concepts in this
-// file (`rclass.py`, `rpbc.py`) live at the non-legacy path.
-use crate::translate_legacy::rtyper::rtyper::{ConcreteType, TypeResolutionState};
+// `TypeResolutionState` + `ConcreteType` live at
+// `jit_codewriter/type_state.rs` — a PRE-EXISTING-ADAPTATION side table
+// because pyre's jit_codewriter IR is value-id-based while RPython stores
+// `.concretetype` inline on `Variable`. The resolve_types / build_value_kinds
+// algorithms still live under translate_legacy until the real rtyper
+// replaces them end-to-end.
+use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
 
 /// Insert a `VtableMethodPtr` op at `(block_id, op_index)` and return the
 /// produced funcptr ValueId. Updates `type_state` so downstream passes

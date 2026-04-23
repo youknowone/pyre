@@ -9,45 +9,10 @@
 //! Transforms annotated ValueTypes into concrete low-level types
 //! and specializes operations accordingly.
 
-use std::collections::HashMap;
-
 use crate::flowspace::model::ConstValue;
+use crate::jit_codewriter::annotation_state::AnnotationState;
+use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueId, ValueType};
-use crate::translate_legacy::annotator::annrpython::AnnotationState;
-
-/// Concrete low-level type (RPython Repr.lowleveltype).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConcreteType {
-    /// Signed integer (RPython Signed / i64)
-    Signed,
-    /// GC reference (RPython Ptr(GcStruct))
-    GcRef,
-    /// Float (RPython Float / f64)
-    Float,
-    /// Void (RPython Void)
-    Void,
-    /// Unknown / unresolved
-    Unknown,
-}
-
-/// Type resolution state: maps ValueId → ConcreteType.
-pub struct TypeResolutionState {
-    pub concrete_types: HashMap<ValueId, ConcreteType>,
-}
-
-impl TypeResolutionState {
-    pub fn new() -> Self {
-        TypeResolutionState {
-            concrete_types: HashMap::new(),
-        }
-    }
-
-    pub fn get(&self, id: ValueId) -> &ConcreteType {
-        self.concrete_types
-            .get(&id)
-            .unwrap_or(&ConcreteType::Unknown)
-    }
-}
 
 /// Resolve annotations to concrete types.
 ///
@@ -287,6 +252,7 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
         | ConstValue::Graphs(_)
+        | ConstValue::LowLevelType(_)
         | ConstValue::None
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)
@@ -415,30 +381,6 @@ fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
         ValueType::Void => ConcreteType::Void,
         ValueType::State | ValueType::Unknown => ConcreteType::Unknown,
     }
-}
-
-/// Build value kind map from type resolution state.
-///
-/// RPython: `getkind(v.concretetype)` — in RPython, types live directly
-/// on variables. In majit, we extract them from TypeResolutionState.
-///
-/// Used by both `perform_all_register_allocations()` (before flatten)
-/// and `flatten_with_types()` (populates SSARepr.value_kinds).
-pub fn build_value_kinds(types: &TypeResolutionState) -> HashMap<ValueId, crate::flatten::RegKind> {
-    use crate::flatten::RegKind;
-    types
-        .concrete_types
-        .iter()
-        .filter_map(|(&vid, ct)| {
-            let kind = match ct {
-                ConcreteType::Signed => RegKind::Int,
-                ConcreteType::GcRef => RegKind::Ref,
-                ConcreteType::Float => RegKind::Float,
-                _ => return None,
-            };
-            Some((vid, kind))
-        })
-        .collect()
 }
 
 fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {

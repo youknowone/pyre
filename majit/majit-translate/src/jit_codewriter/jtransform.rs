@@ -201,7 +201,7 @@ pub struct Transformer<'a> {
     /// Type resolution state from the rtype pass.
     /// Used by `make_three_lists()` to split args by kind.
     /// RPython: types are on `Variable.concretetype` — we pass them explicitly.
-    type_state: Option<&'a crate::translate_legacy::rtyper::rtyper::TypeResolutionState>,
+    type_state: Option<&'a crate::jit_codewriter::type_state::TypeResolutionState>,
     /// RPython: `Transformer.vable_array_vars`.
     /// Stores (vable_base, array_index, itemsize, is_signed) per vable array variable.
     vable_array_vars: std::collections::HashMap<ValueId, (ValueId, usize, usize, bool)>,
@@ -297,7 +297,7 @@ impl<'a> Transformer<'a> {
     /// RPython: types live on `Variable.concretetype`.
     pub fn with_type_state(
         mut self,
-        ts: &'a crate::translate_legacy::rtyper::rtyper::TypeResolutionState,
+        ts: &'a crate::jit_codewriter::type_state::TypeResolutionState,
     ) -> Self {
         self.type_state = Some(ts);
         self
@@ -605,11 +605,11 @@ impl<'a> Transformer<'a> {
         if let Some(ts) = self.type_state {
             if let Some(ct) = ts.concrete_types.get(&v) {
                 return match ct {
-                    crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed => 'i',
-                    crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef => 'r',
-                    crate::translate_legacy::rtyper::rtyper::ConcreteType::Float => 'f',
-                    crate::translate_legacy::rtyper::rtyper::ConcreteType::Void => 'v',
-                    crate::translate_legacy::rtyper::rtyper::ConcreteType::Unknown => 'r',
+                    crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
+                    crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
+                    crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
+                    crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
+                    crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
                 };
             }
         }
@@ -620,11 +620,11 @@ impl<'a> Transformer<'a> {
         let ts = self.type_state?;
         let ct = ts.concrete_types.get(&v)?;
         match ct {
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed => Some(ValueType::Int),
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef => Some(ValueType::Ref),
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Float => Some(ValueType::Float),
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Void => Some(ValueType::Void),
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Unknown => None,
+            crate::jit_codewriter::type_state::ConcreteType::Signed => Some(ValueType::Int),
+            crate::jit_codewriter::type_state::ConcreteType::GcRef => Some(ValueType::Ref),
+            crate::jit_codewriter::type_state::ConcreteType::Float => Some(ValueType::Float),
+            crate::jit_codewriter::type_state::ConcreteType::Void => Some(ValueType::Void),
+            crate::jit_codewriter::type_state::ConcreteType::Unknown => None,
         }
     }
 
@@ -2065,18 +2065,18 @@ impl<'a> Transformer<'a> {
 /// Resolve the IR types of call arguments, skipping Void.
 fn resolve_non_void_arg_types(
     args: &[ValueId],
-    type_state: Option<&crate::translate_legacy::rtyper::rtyper::TypeResolutionState>,
+    type_state: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
 ) -> Vec<majit_ir::value::Type> {
     args.iter()
         .filter_map(|&v| {
             let kind = if let Some(ts) = type_state {
                 if let Some(ct) = ts.concrete_types.get(&v) {
                     match ct {
-                        crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed => 'i',
-                        crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef => 'r',
-                        crate::translate_legacy::rtyper::rtyper::ConcreteType::Float => 'f',
-                        crate::translate_legacy::rtyper::rtyper::ConcreteType::Void => 'v',
-                        crate::translate_legacy::rtyper::rtyper::ConcreteType::Unknown => 'r',
+                        crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
+                        crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
+                        crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
+                        crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
+                        crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
                     }
                 } else {
                     'r'
@@ -2825,10 +2825,10 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
         type_state.concrete_types.insert(
             value,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -2861,10 +2861,10 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
         type_state.concrete_types.insert(
             value,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -2896,10 +2896,10 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, Some(result));
 
-        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
         type_state.concrete_types.insert(
             result,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -2932,10 +2932,10 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, Some(result));
 
-        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
+        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
         type_state.concrete_types.insert(
             result,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();

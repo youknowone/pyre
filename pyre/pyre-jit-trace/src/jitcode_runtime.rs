@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use majit_translate::jitcode::{BhDescr, JitCode};
-use majit_translate::translate_legacy::pipeline::PipelineOpcodeArm;
+use majit_translate::opcode_dispatch::PipelineOpcodeArm;
 use majit_translate::{CallPath, OpcodeDispatchSelector};
 use pyre_interpreter::bytecode::Instruction;
 

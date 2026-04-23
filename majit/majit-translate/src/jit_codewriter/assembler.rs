@@ -1917,8 +1917,7 @@ mod tests {
             .with_type_state(&type_state);
         let rewritten = transformer.transform(&graph);
         let rewritten_types = resolve_types(&rewritten.graph, &annotations);
-        let value_kinds =
-            crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_types);
+        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
         let mut flat =
             crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types, &regallocs);
@@ -2007,8 +2006,7 @@ mod tests {
             .with_type_state(&type_state);
         let rewritten = transformer.transform(&graph);
         let rewritten_types = resolve_types(&rewritten.graph, &annotations);
-        let value_kinds =
-            crate::translate_legacy::rtyper::rtyper::build_value_kinds(&rewritten_types);
+        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
         let mut flat =
             crate::flatten::flatten_with_types(&rewritten.graph, &rewritten_types, &regallocs);
@@ -2191,18 +2189,17 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
-        type_state.concrete_types.insert(
-            base,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef,
-        );
+        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
+        type_state
+            .concrete_types
+            .insert(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
         type_state.concrete_types.insert(
             index,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
         type_state.concrete_types.insert(
             value,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -2210,7 +2207,7 @@ mod tests {
             .with_type_state(&type_state)
             .transform(&graph)
             .graph;
-        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
+        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
         let mut flat = flatten_graph(&rewritten, &regallocs);
 
@@ -2307,22 +2304,21 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, Some(array_result));
 
-        let mut type_state = crate::translate_legacy::rtyper::rtyper::TypeResolutionState::new();
-        type_state.concrete_types.insert(
-            base,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::GcRef,
-        );
+        let mut type_state = crate::jit_codewriter::type_state::TypeResolutionState::new();
+        type_state
+            .concrete_types
+            .insert(base, crate::jit_codewriter::type_state::ConcreteType::GcRef);
         type_state.concrete_types.insert(
             index,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
         type_state.concrete_types.insert(
             field_result,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
         type_state.concrete_types.insert(
             array_result,
-            crate::translate_legacy::rtyper::rtyper::ConcreteType::Signed,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -2330,7 +2326,7 @@ mod tests {
             .with_type_state(&type_state)
             .transform(&graph)
             .graph;
-        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
+        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
         let mut flat = flatten_graph(&rewritten, &regallocs);
 
@@ -2467,7 +2463,7 @@ mod tests {
         let annotations = crate::translate_legacy::annotator::annrpython::annotate(&graph);
         let type_state =
             crate::translate_legacy::rtyper::rtyper::resolve_types(&graph, &annotations);
-        let value_kinds = crate::translate_legacy::rtyper::rtyper::build_value_kinds(&type_state);
+        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
         let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
         let mut flat = flatten_graph(&graph, &regallocs);
 

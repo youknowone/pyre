@@ -35,9 +35,11 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType, PtrTarget};
 use crate::translator::rtyper::rclass;
 use crate::translator::rtyper::rtyper::RPythonTyper;
-// `TypeResolutionState` lives under `translate_legacy` until majit-rtyper
-// (roadmap Phase 6) extracts it into a proper crate. Wiring bridge only.
-use crate::translate_legacy::rtyper::rtyper::TypeResolutionState;
+// `TypeResolutionState` lives at `jit_codewriter/type_state.rs` — see the
+// PRE-EXISTING-ADAPTATION header there. `lower_indirect_calls` threads a
+// `&mut TypeResolutionState` so the inserted `VtableMethodPtr` funcptr
+// gets recorded as Signed for downstream regalloc / flatten.
+use crate::jit_codewriter::type_state::TypeResolutionState;
 
 /// RPython `ConcreteCallTableRow(dict)` (rpbc.py:71-82).
 #[derive(Clone, Debug)]
