@@ -955,6 +955,7 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         idx: usize,
         value: OpRef,
+        concrete_value: majit_ir::Value,
     ) -> Result<(), PyError> {
         // RPython `_opimpl_setarrayitem_vable` (pyjitpl.py:1242-1247)
         // writes the value's Ref box directly into
@@ -982,6 +983,15 @@ impl MIFrame {
             self.value_type(value),
             value,
         );
+        // Box-atomicity parity (RPython `pyjitpl.py:1245`
+        // `virtualizable_boxes[index] = valuebox` — Box carries both
+        // OpRef AND concrete Value atomically).  Pyre splits Box into
+        // two arrays (`virtualizable_boxes: Vec<OpRef>` +
+        // `virtualizable_values: Vec<Value>`), so we must write both to
+        // preserve Box semantics.  The concrete is an explicit parameter
+        // because `STORE_FAST_STORE_FAST` pops two operands before any
+        // store: reading from `concrete_stack[valuestackdepth - nlocals]`
+        // after the second pop would return the wrong operand's shadow.
         let (has_vable, frame_ref, nlocals) = {
             let s = self.sym_mut();
             if idx >= s.registers_r.len() {
@@ -999,12 +1009,6 @@ impl MIFrame {
         // RPython pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
         //     self.metainterp.synchronize_virtualizable()
-        //
-        // `virtualizable_boxes` is the RPython tracing-time mirror of
-        // the PyFrame's `locals_cells_stack_w` array. Keep it in sync
-        // with `registers_r` so `close_loop_args_at`'s
-        // `set_virtualizable_box_at` writes the current SSA opref (not
-        // the preamble InputArg) into every slot.
         if has_vable && idx < nlocals {
             let _ = frame_ref;
             // NUM_SCALAR_INPUTARGS - 1 = 6 (scalar fields excluding the
@@ -1012,7 +1016,7 @@ impl MIFrame {
             // virtualizable_boxes layout is [scalars.., array_items..,
             // vable_ref], so local idx maps to `(NUM_SCALARS - 1) + idx`.
             let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + idx;
-            ctx.set_virtualizable_box_at(flat_idx, value);
+            ctx.set_virtualizable_entry_at(flat_idx, value, concrete_value);
         }
         Ok(())
     }

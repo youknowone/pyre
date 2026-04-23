@@ -5583,7 +5583,14 @@ mod tests {
         };
 
         state
-            .with_ctx(|this, ctx| this.store_local_value(ctx, 0, ref_value))
+            .with_ctx(|this, ctx| {
+                this.store_local_value(
+                    ctx,
+                    0,
+                    ref_value,
+                    majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+                )
+            })
             .expect("store of pre-wrapped Ref should succeed");
         assert_eq!(
             state.sym().registers_r[0],
