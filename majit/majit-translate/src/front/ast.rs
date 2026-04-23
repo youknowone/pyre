@@ -876,6 +876,39 @@ pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stm
     );
 }
 
+/// Lower a sequence of statements whose final element may be a tail
+/// expression (Rust block-value form: `{ stmt; stmt; expr }`).
+///
+/// RPython flow-space guarantee: every source expression is walked
+/// exactly once (`rpython/flowspace/flowcontext.py::FlowContext.record`
+/// appends each bytecode op once). Rust `syn::Block` / `ExprBlock` /
+/// `ExprUnsafe` / `ExprIf.then_branch` all carry `Vec<Stmt>` with an
+/// optional `Stmt::Expr(_, None)` tail whose value becomes the block's
+/// value — lowering that tail via both `lower_stmt` (which delegates to
+/// `lower_expr`) and a second `lower_expr` call would emit the op
+/// twice and break the "walk once" invariant.
+fn lower_stmt_list_with_tail_value(
+    graph: &mut FunctionGraph,
+    block: &mut BlockId,
+    stmts: &[syn::Stmt],
+    options: &AstGraphOptions,
+    ctx: &mut GraphBuildContext,
+) -> Option<ValueId> {
+    let Some((last, prefix)) = stmts.split_last() else {
+        return None;
+    };
+    for stmt in prefix {
+        lower_stmt(graph, block, stmt, options, ctx);
+    }
+    match last {
+        syn::Stmt::Expr(expr, None) => lower_expr(graph, block, expr, options, ctx),
+        _ => {
+            lower_stmt(graph, block, last, options, ctx);
+            None
+        }
+    }
+}
+
 fn lower_stmt(
     graph: &mut FunctionGraph,
     block: &mut BlockId,
@@ -1177,16 +1210,13 @@ fn lower_expr(
             graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
 
             // Lower then branch — collect result value
-            let mut then_result = None;
-            for stmt in &if_expr.then_branch.stmts {
-                lower_stmt(graph, &mut then_block, stmt, options, ctx);
-            }
-            // Last expression in then_branch is the result (if no explicit return)
-            if let Some(last) = if_expr.then_branch.stmts.last() {
-                if let syn::Stmt::Expr(e, None) = last {
-                    then_result = lower_expr(graph, &mut then_block, e, options, ctx);
-                }
-            }
+            let then_result = lower_stmt_list_with_tail_value(
+                graph,
+                &mut then_block,
+                &if_expr.then_branch.stmts,
+                options,
+                ctx,
+            );
 
             // Lower else branch
             let mut else_result = None;
@@ -1232,14 +1262,7 @@ fn lower_expr(
 
         // ── block { stmts } ──
         syn::Expr::Block(blk) => {
-            let mut last = None;
-            for stmt in &blk.block.stmts {
-                lower_stmt(graph, block, stmt, options, ctx);
-                if let syn::Stmt::Expr(e, None) = stmt {
-                    last = lower_expr(graph, block, e, options, ctx);
-                }
-            }
-            last
+            lower_stmt_list_with_tail_value(graph, block, &blk.block.stmts, options, ctx)
         }
 
         // ── literals ──
@@ -1574,14 +1597,51 @@ fn lower_expr(
             Some(continuation_arg)
         }
 
+        // ── unsafe { stmts } ──
+        //
+        // RPython flow-space has no concept of `unsafe` — in Python every
+        // load/store already has the same aliasing model.  In the Rust
+        // port `unsafe { stmts }` wraps raw-pointer / transmute helpers
+        // whose **body** is still a regular Rust block; the `unsafe`
+        // keyword is a type-system marker, not runtime semantics.  Lower
+        // it by reusing the same `Block` path so the contained
+        // statements + tail expression flow through normally.
+        syn::Expr::Unsafe(u) => {
+            lower_stmt_list_with_tail_value(graph, block, &u.block.stmts, options, ctx)
+        }
+
         // ── fallback ──
-        _ => graph.push_op(
-            *block,
-            OpKind::Unknown {
-                kind: UnknownKind::UnsupportedExpr,
-            },
-            true,
-        ),
+        other => {
+            if std::env::var("MAJIT_UNKNOWN_DUMP").is_ok() {
+                let variant = match other {
+                    syn::Expr::Array(_) => "Array",
+                    syn::Expr::Async(_) => "Async",
+                    syn::Expr::Await(_) => "Await",
+                    syn::Expr::Const(_) => "Const",
+                    syn::Expr::Group(_) => "Group",
+                    syn::Expr::Infer(_) => "Infer",
+                    syn::Expr::Let(_) => "Let",
+                    syn::Expr::Macro(_) => "Macro",
+                    syn::Expr::Range(_) => "Range",
+                    syn::Expr::RawAddr(_) => "RawAddr",
+                    syn::Expr::Repeat(_) => "Repeat",
+                    syn::Expr::Struct(_) => "Struct",
+                    syn::Expr::TryBlock(_) => "TryBlock",
+                    syn::Expr::Unsafe(_) => "Unsafe",
+                    syn::Expr::Verbatim(_) => "Verbatim",
+                    syn::Expr::Yield(_) => "Yield",
+                    _ => "OtherExpr",
+                };
+                println!("cargo:warning=[UnsupportedExpr] variant={variant}");
+            }
+            graph.push_op(
+                *block,
+                OpKind::Unknown {
+                    kind: UnknownKind::UnsupportedExpr,
+                },
+                true,
+            )
+        }
     }
 }
 
@@ -2371,6 +2431,93 @@ mod tests {
             )),
             "expected FieldRead for 'x', got {:?}",
             ops
+        );
+    }
+
+    fn count_field_reads(graph: &FunctionGraph, field_name: &str) -> usize {
+        let mut n = 0;
+        for bid in 0..graph.blocks.len() {
+            for op in &graph.blocks[bid].operations {
+                if let OpKind::FieldRead { field, .. } = &op.kind {
+                    if field.name == field_name {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// Block tail expression must be lowered exactly once.
+    ///
+    /// RPython flow-space invariant: every source expression is walked
+    /// once. Before the `lower_stmt_list_with_tail_value` refactor, a
+    /// block's tail was lowered via `lower_stmt` (which dispatches to
+    /// `lower_expr`) AND a second explicit `lower_expr` call, emitting
+    /// the op twice.
+    #[test]
+    fn block_tail_expression_lowered_once() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct S { x: i64 }
+            fn read_once(s: S) -> i64 {
+                let y = { s.x };
+                y
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        assert_eq!(
+            count_field_reads(graph, "x"),
+            1,
+            "block tail `s.x` must produce exactly one FieldRead"
+        );
+    }
+
+    /// `unsafe { .. }` lowers through the same single-walk path as a
+    /// plain block — `unsafe` is a type-system marker, not a runtime
+    /// wrapper, so the tail expression is walked once.
+    #[test]
+    fn unsafe_tail_expression_lowered_once() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct S { x: i64 }
+            fn read_once(s: S) -> i64 {
+                let y = unsafe { s.x };
+                y
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        assert_eq!(
+            count_field_reads(graph, "x"),
+            1,
+            "unsafe tail `s.x` must produce exactly one FieldRead"
+        );
+    }
+
+    /// `if` then-branch tail expression is walked once. Counts
+    /// FieldReads of `s.x` across every block in the graph so the
+    /// assertion is independent of how the then/else blocks are laid
+    /// out.
+    #[test]
+    fn if_then_tail_expression_lowered_once() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct S { x: i64 }
+            fn read_once(s: S, c: bool) -> i64 {
+                if c { s.x } else { 0 }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed);
+        let graph = &program.functions[0].graph;
+        assert_eq!(
+            count_field_reads(graph, "x"),
+            1,
+            "if-then tail `s.x` must produce exactly one FieldRead"
         );
     }
 
