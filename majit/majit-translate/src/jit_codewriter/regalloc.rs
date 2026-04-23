@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
-use crate::model::{Block, FunctionGraph, ValueId};
+use crate::model::{Block, FunctionGraph, LinkArg, ValueId};
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 

@@ -26,19 +26,14 @@ use std::sync::Arc;
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::annotator::model::SomeValue;
 use crate::flowspace::model::{
-    BlockKey, BlockRef, ConstValue, Constant, Hlvalue, HostObject, LinkRef, SpaceOperation,
-    Variable,
+    BlockKey, BlockRef, ConstValue, Constant, Hlvalue, LinkRef, SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{_ptr, LowLevelType, getfunctionptr};
-use crate::translator::rtyper::rbool::BoolRepr;
-use crate::translator::rtyper::rfloat::FloatRepr;
-use crate::translator::rtyper::rint::{IntegerRepr, signed_repr};
 use crate::translator::rtyper::rmodel::{
     Repr, ReprKey, inputconst_from_lltype, rtyper_makekey, rtyper_makerepr,
 };
-use crate::translator::rtyper::rnone::NoneRepr;
 use crate::translator::rtyper::rpbc::LLCallTable;
 
 /// RPython `class RPythonTyper(object)` (rtyper.py:42+).
@@ -49,8 +44,9 @@ use crate::translator::rtyper::rpbc::LLCallTable;
 pub struct RPythonTyper {
     /// RPython `self.annotator`.
     ///
-    /// Rust uses `Weak` to avoid an Rc cycle with
-    /// `RPythonAnnotator.translator -> TranslationContext.rtyper`.
+    /// Rust stores this edge weakly to avoid the
+    /// `annotator -> translator -> rtyper -> annotator` cycle that
+    /// Python's GC handles upstream.
     pub annotator: Weak<RPythonAnnotator>,
     /// RPython `self.already_seen = {}` assigned in `specialize()`
     /// (rtyper.py:186). Membership is queried by `simplify.py`.
@@ -70,11 +66,6 @@ pub struct RPythonTyper {
     /// Pyre stores pointer-identity fingerprints so Arc-equal Reprs
     /// are deduped without requiring `Hash + Eq` on the trait object.
     pub seen_reprs_must_call_setup: RefCell<Vec<*const ()>>,
-    /// RPython `self.primitive_to_repr = {}` (`rtyper.py:60` — part of
-    /// the `__init__` field bundle). Cache keyed by lltype so
-    /// `getprimitiverepr(Signed)` returns the same Repr instance
-    /// across calls (rtyper.py:85-93).
-    pub primitive_to_repr: RefCell<HashMap<LowLevelType, Arc<dyn Repr>>>,
 }
 
 impl RPythonTyper {
@@ -91,7 +82,6 @@ impl RPythonTyper {
             reprs: RefCell::new(HashMap::new()),
             reprs_must_call_setup: RefCell::new(Vec::new()),
             seen_reprs_must_call_setup: RefCell::new(Vec::new()),
-            primitive_to_repr: RefCell::new(HashMap::new()),
         }
     }
 
@@ -129,14 +119,14 @@ impl RPythonTyper {
     ///     return s_obj
     /// ```
     ///
-    /// Surfaces upstream's `KeyError` as a recoverable Rust error.
-    pub fn binding(&self, var: &Hlvalue) -> Result<SomeValue, TyperError> {
+    /// Panics on missing binding (matching upstream's `KeyError`);
+    /// callers handle missing bindings with `annotation()` first.
+    pub fn binding(&self, var: &Hlvalue) -> SomeValue {
         let ann = self
             .annotator
             .upgrade()
             .expect("RPythonTyper.annotator weak reference dropped");
-        ann.annotation(var)
-            .ok_or_else(|| TyperError::key_error("no binding"))
+        ann.binding(var)
     }
 
     /// RPython `RPythonTyper.add_pendingsetup(self, repr)`
@@ -181,21 +171,12 @@ impl RPythonTyper {
         let key = rtyper_makekey(s_obj);
         // Fast-path hit: entry present and Some → return clone.
         if let Some(slot) = self.reprs.borrow().get(&key) {
-            // upstream `assert result is not None  # recursive getrepr()!`
-            // at rtyper.py:163 — this is an internal invariant, not a
-            // user-level typer failure. The only way the slot is None is
-            // if `rtyper_makerepr` re-entered `getrepr` on the same key
-            // while building the very Repr that should fill this slot.
-            // Mirror the upstream `AssertionError` path without
-            // aborting the Rust process.
-            match slot {
-                Some(repr) => return Ok(repr.clone()),
-                None => {
-                    return Err(TyperError::assertion(format!(
-                        "recursive getrepr() for {s_obj:?}"
-                    )));
-                }
-            }
+            return match slot {
+                Some(repr) => Ok(repr.clone()),
+                None => Err(TyperError::message(format!(
+                    "recursive getrepr() for {s_obj:?}"
+                ))),
+            };
         }
         // First time seeing this key: upstream pre-inserts None as the
         // recursion sentinel, then materialises the Repr.
@@ -213,7 +194,7 @@ impl RPythonTyper {
     ///     return self.getrepr(self.binding(var))
     /// ```
     pub fn bindingrepr(&self, var: &Hlvalue) -> Result<Arc<dyn Repr>, TyperError> {
-        let s_obj = self.binding(var)?;
+        let s_obj = self.binding(var);
         self.getrepr(&s_obj)
     }
 
@@ -255,61 +236,6 @@ impl RPythonTyper {
         self.reprs_must_call_setup.borrow_mut().extend(delayed);
         Ok(())
     }
-
-    /// RPython `RPythonTyper.getprimitiverepr(self, lltype)`
-    /// (rtyper.py:85-93).
-    ///
-    /// ```python
-    /// def getprimitiverepr(self, lltype):
-    ///     try:
-    ///         return self.primitive_to_repr[lltype]
-    ///     except KeyError:
-    ///         pass
-    ///     if isinstance(lltype, Primitive):
-    ///         repr = self.primitive_to_repr[lltype] = self.getrepr(lltype_to_annotation(lltype))
-    ///         return repr
-    ///     raise TyperError('There is no primitive repr for %r' % (lltype,))
-    /// ```
-    pub fn getprimitiverepr(&self, lltype: &LowLevelType) -> Result<Arc<dyn Repr>, TyperError> {
-        if let Some(r) = self.primitive_to_repr.borrow().get(lltype) {
-            return Ok(r.clone());
-        }
-        // upstream `isinstance(lltype, Primitive)` (rtyper.py:90).
-        // `Primitive` (`lltype.py:642`) covers `Number` (Signed,
-        // Unsigned, Signed/UnsignedLongLong, and upstream-only
-        // Signed/UnsignedLongLongLong which pyre has not yet
-        // imported as `LowLevelType` variants) plus `Float`,
-        // `SingleFloat`, `LongFloat`, `Char`, `Bool`, `Void`,
-        // `UniChar` (`lltype.py:704-718`). Container / pointer /
-        // function / opaque / forward-reference variants fall
-        // through to the `raise TyperError` path.
-        let is_primitive = matches!(
-            lltype,
-            LowLevelType::Void
-                | LowLevelType::Signed
-                | LowLevelType::Unsigned
-                | LowLevelType::SignedLongLong
-                | LowLevelType::UnsignedLongLong
-                | LowLevelType::Bool
-                | LowLevelType::Float
-                | LowLevelType::SingleFloat
-                | LowLevelType::LongFloat
-                | LowLevelType::Char
-                | LowLevelType::UniChar
-        );
-        if !is_primitive {
-            return Err(TyperError::message(format!(
-                "There is no primitive repr for {}",
-                lltype.short_name()
-            )));
-        }
-        let s_obj = crate::translator::rtyper::llannotation::lltype_to_annotation(lltype.clone());
-        let repr = self.getrepr(&s_obj)?;
-        self.primitive_to_repr
-            .borrow_mut()
-            .insert(lltype.clone(), repr.clone());
-        Ok(repr)
-    }
 }
 
 // ____________________________________________________________
@@ -331,7 +257,7 @@ impl RPythonTyper {
 ///   concrete types to be ported).
 pub struct HighLevelOp {
     /// RPython `self.rtyper = rtyper` (rtyper.py:620).
-    pub rtyper: Weak<RPythonTyper>,
+    pub rtyper: Rc<RPythonTyper>,
     /// RPython `self.spaceop = spaceop` (rtyper.py:621).
     pub spaceop: SpaceOperation,
     /// RPython `self.exceptionlinks = exceptionlinks` (rtyper.py:622).
@@ -370,7 +296,7 @@ impl HighLevelOp {
     /// RPython `HighLevelOp.__init__(self, rtyper, spaceop,
     /// exceptionlinks, llops)` (rtyper.py:619-623).
     pub fn new(
-        rtyper: Weak<RPythonTyper>,
+        rtyper: Rc<RPythonTyper>,
         spaceop: SpaceOperation,
         exceptionlinks: Vec<LinkRef>,
         llops: Rc<RefCell<LowLevelOpList>>,
@@ -413,18 +339,15 @@ impl HighLevelOp {
     /// the error surface know exactly which upstream module to land
     /// next.
     pub fn setup(&self) -> Result<(), TyperError> {
-        let rtyper = self
-            .rtyper
-            .upgrade()
-            .ok_or_else(|| TyperError::message("HighLevelOp.rtyper weak reference dropped"))?;
+        let rtyper = &self.rtyper;
         *self.args_v.borrow_mut() = self.spaceop.args.clone();
         let args_s: Vec<SomeValue> = self
             .spaceop
             .args
             .iter()
             .map(|a| rtyper.binding(a))
-            .collect::<Result<Vec<_>, _>>()?;
-        *self.s_result.borrow_mut() = Some(rtyper.binding(&self.spaceop.result)?);
+            .collect();
+        *self.s_result.borrow_mut() = Some(rtyper.binding(&self.spaceop.result));
         let mut args_r: Vec<Option<Arc<dyn Repr>>> = Vec::with_capacity(args_s.len());
         for s_a in &args_s {
             args_r.push(Some(rtyper.getrepr(s_a)?));
@@ -439,130 +362,6 @@ impl HighLevelOp {
         Ok(())
     }
 
-    /// RPython `HighLevelOp.inputarg(self, converted_to, arg)`
-    /// (rtyper.py:655-673).
-    ///
-    /// ```python
-    /// def inputarg(self, converted_to, arg):
-    ///     """Returns the arg'th input argument of the current operation,
-    ///     as a Variable or Constant converted to the requested type.
-    ///     'converted_to' should be a Repr instance or a Primitive low-level
-    ///     type.
-    ///     """
-    ///     if not isinstance(converted_to, Repr):
-    ///         converted_to = self.rtyper.getprimitiverepr(converted_to)
-    ///     v = self.args_v[arg]
-    ///     if isinstance(v, Constant):
-    ///         return inputconst(converted_to, v.value)
-    ///     assert hasattr(v, 'concretetype')
-    ///
-    ///     s_binding = self.args_s[arg]
-    ///     if s_binding.is_constant():
-    ///         return inputconst(converted_to, s_binding.const)
-    ///
-    ///     r_binding = self.args_r[arg]
-    ///     return self.llops.convertvar(v, r_binding, converted_to)
-    /// ```
-    ///
-    /// `converted_to` accepts either a `Repr` or a `LowLevelType`
-    /// through [`ReqType`]; upstream dispatches via Python duck
-    /// typing.
-    pub fn inputarg(&self, converted_to: ReqType, arg: usize) -> Result<Hlvalue, TyperError> {
-        let rtyper = self
-            .rtyper
-            .upgrade()
-            .ok_or_else(|| TyperError::message("HighLevelOp.rtyper weak reference dropped"))?;
-        // upstream: coerce LowLevelType primitives to Repr via
-        // `rtyper.getprimitiverepr`.
-        let r_converted: Arc<dyn Repr> = match converted_to {
-            ReqType::Repr(r) => r,
-            ReqType::LLType(lt) => rtyper.getprimitiverepr(&lt)?,
-        };
-        let v = self.args_v.borrow().get(arg).cloned().ok_or_else(|| {
-            TyperError::message(format!("inputarg: arg index {arg} out of range"))
-        })?;
-        // upstream `if isinstance(v, Constant)` — short-circuit via
-        // inputconst(converted_to, v.value).
-        if let Hlvalue::Constant(c) = &v {
-            let c_new = crate::translator::rtyper::rmodel::inputconst(&*r_converted, &c.value)?;
-            return Ok(Hlvalue::Constant(c_new));
-        }
-        // upstream `s_binding.is_constant() → inputconst(converted_to,
-        // s_binding.const)`.
-        let s_binding = self.args_s.borrow().get(arg).cloned().ok_or_else(|| {
-            TyperError::message(format!("inputarg: args_s index {arg} out of range"))
-        })?;
-        if let Some(const_value) = some_value_constant(&s_binding) {
-            let c_new = crate::translator::rtyper::rmodel::inputconst(&*r_converted, &const_value)?;
-            return Ok(Hlvalue::Constant(c_new));
-        }
-        // upstream `self.llops.convertvar(v, r_binding, converted_to)`.
-        let r_binding = self
-            .args_r
-            .borrow()
-            .get(arg)
-            .cloned()
-            .flatten()
-            .ok_or_else(|| {
-                TyperError::message(format!("inputarg: args_r index {arg} has no Repr yet"))
-            })?;
-        self.llops
-            .borrow_mut()
-            .convertvar(v, &r_binding, &r_converted)
-    }
-
-    /// RPython `HighLevelOp.inputargs(self, *converted_to)`
-    /// (rtyper.py:677-685).
-    ///
-    /// ```python
-    /// def inputargs(self, *converted_to):
-    ///     if len(converted_to) != self.nb_args:
-    ///         raise TyperError(...)
-    ///     vars = []
-    ///     for i in range(len(converted_to)):
-    ///         vars.append(self.inputarg(converted_to[i], i))
-    ///     return vars
-    /// ```
-    pub fn inputargs(&self, converted_to: Vec<ReqType>) -> Result<Vec<Hlvalue>, TyperError> {
-        if converted_to.len() != self.nb_args() {
-            return Err(TyperError::message(format!(
-                "operation argument count mismatch:\n\
-                 '{}' has {} arguments, rtyper wants {}",
-                self.spaceop.opname,
-                self.nb_args(),
-                converted_to.len()
-            )));
-        }
-        let mut vars = Vec::with_capacity(converted_to.len());
-        for (i, req) in converted_to.into_iter().enumerate() {
-            vars.push(self.inputarg(req, i)?);
-        }
-        Ok(vars)
-    }
-
-    /// RPython `HighLevelOp.inputconst = staticmethod(inputconst)`
-    /// (rtyper.py:675). Exposes the `rmodel.inputconst` free function
-    /// as an associated function on the hop for caller-convenience
-    /// parity.
-    pub fn inputconst<R: Repr + ?Sized>(
-        reqtype: &R,
-        value: &ConstValue,
-    ) -> Result<Constant, TyperError> {
-        crate::translator::rtyper::rmodel::inputconst(reqtype, value)
-    }
-
-    /// RPython `HighLevelOp.genop(self, opname, args_v, resulttype=None)`
-    /// (rtyper.py:687-688). Thin wrapper that defers to
-    /// [`LowLevelOpList::genop`].
-    pub fn genop(
-        &self,
-        opname: &str,
-        args_v: Vec<Hlvalue>,
-        resulttype: GenopResult,
-    ) -> Option<Variable> {
-        self.llops.borrow_mut().genop(opname, args_v, resulttype)
-    }
-
     /// RPython `HighLevelOp.has_implicit_exception(self, exc_cls)`
     /// (rtyper.py:713-729).
     ///
@@ -570,37 +369,10 @@ impl HighLevelOp {
     /// to resolve `exitcase.__subclasscheck__`. Scaffolded as a
     /// parity-marker for now; returns `false` until the exception
     /// subsystem is ported.
-    pub fn has_implicit_exception(&self, exc_cls: &HostObject) -> Result<bool, TyperError> {
-        let mut llops = self.llops.borrow_mut();
-        if llops.llop_raising_exceptions.is_some() {
-            return Err(TyperError::message(
-                "already generated the llop that raises the exception",
-            ));
-        }
-        if self.exceptionlinks.is_empty() {
-            return Ok(false);
-        }
-        let checked = llops
-            .implicit_exceptions_checked
-            .get_or_insert_with(Vec::new);
-        let mut result = false;
-        for link in &self.exceptionlinks {
-            let exitcase = link.borrow().exitcase.clone();
-            let Some(
-                ref exitcase_hl @ Hlvalue::Constant(Constant {
-                    value: ConstValue::HostObject(ref exit_obj),
-                    ..
-                }),
-            ) = exitcase
-            else {
-                continue;
-            };
-            if exc_cls.is_subclass_of(&exit_obj) {
-                checked.push(exitcase_hl.clone());
-                result = true;
-            }
-        }
-        Ok(result)
+    pub fn has_implicit_exception(&self, _exc_cls_name: &str) -> bool {
+        // TODO (cascading port): implement with
+        // `rpython/rtyper/exceptiondata.py ExceptionData`.
+        false
     }
 
     /// RPython `HighLevelOp.exception_is_here(self)` (rtyper.py:731-745).
@@ -617,28 +389,18 @@ impl HighLevelOp {
         if self.exceptionlinks.is_empty() {
             return Ok(()); // rtyper.py:735-736
         }
-        if let Some(checked) = &llops.implicit_exceptions_checked {
+        if let Some(_checked) = &llops.implicit_exceptions_checked {
             // upstream sanity check rtyper.py:737-744: every
             // exceptionlink.exitcase must appear in
-            // implicit_exceptions_checked.
-            for link in &self.exceptionlinks {
-                let exitcase = link.borrow().exitcase.clone();
-                let Some(exitcase) = exitcase else {
-                    continue;
-                };
-                if !checked.contains(&exitcase) {
-                    let exc_name = match &exitcase {
-                        Hlvalue::Constant(Constant {
-                            value: ConstValue::HostObject(obj),
-                            ..
-                        }) => obj.qualname().to_string(),
-                        other => format!("{other:?}"),
-                    };
-                    return Err(TyperError::message(format!(
-                        "the graph catches {exc_name}, but the rtyper did not explicitely handle it"
-                    )));
-                }
-            }
+            // implicit_exceptions_checked. Pyre's `Link.exitcase` is
+            // `Option<Hlvalue>` carrying the exception class as a
+            // host-object constant; DEFERRED until
+            // `rpython/rtyper/exceptiondata.py` ports so the lookup
+            // has a canonical `ExceptionData.lltype_of_exception_type`
+            // surface to compare against. Parity-marker left in the
+            // typed field so the follow-up commit finds the wiring
+            // spot.
+            let _ = &self.exceptionlinks;
         }
         llops.llop_raising_exceptions = Some(LlopRaisingExceptions::Index(llops.ops.len()));
         Ok(())
@@ -696,20 +458,18 @@ impl HighLevelOp {
     /// RPython `HighLevelOp.v_s_insertfirstarg(self, v_newfirstarg,
     /// s_newfirstarg)` (rtyper.py:702-706).
     ///
+    /// `r_newfirstarg` derives from `rtyper.getrepr(s_newfirstarg)` —
+    /// DEFERRED; callers must pass the already-computed repr until
+    /// `getrepr` lands.
     pub fn v_s_insertfirstarg(
         &self,
         v_newfirstarg: Hlvalue,
         s_newfirstarg: SomeValue,
-    ) -> Result<(), TyperError> {
-        let rtyper = self
-            .rtyper
-            .upgrade()
-            .ok_or_else(|| TyperError::message("HighLevelOp.rtyper weak reference dropped"))?;
-        let r_newfirstarg = rtyper.getrepr(&s_newfirstarg)?;
+        r_newfirstarg: Option<Arc<dyn Repr>>,
+    ) {
         self.args_v.borrow_mut().insert(0, v_newfirstarg);
         self.args_s.borrow_mut().insert(0, s_newfirstarg);
-        self.args_r.borrow_mut().insert(0, Some(r_newfirstarg));
-        Ok(())
+        self.args_r.borrow_mut().insert(0, r_newfirstarg);
     }
 }
 
@@ -723,7 +483,7 @@ impl HighLevelOp {
 /// exposes Vec-style operations explicitly.
 pub struct LowLevelOpList {
     /// RPython `self.rtyper = rtyper` (rtyper.py:794).
-    pub rtyper: Weak<RPythonTyper>,
+    pub rtyper: Rc<RPythonTyper>,
     /// RPython `self.originalblock = originalblock` (rtyper.py:795).
     pub originalblock: Option<BlockRef>,
     /// RPython `LowLevelOpList.llop_raising_exceptions = None` class
@@ -733,7 +493,7 @@ pub struct LowLevelOpList {
     /// RPython `LowLevelOpList.implicit_exceptions_checked = None`
     /// class attribute (rtyper.py:791), managed by
     /// `HighLevelOp.has_implicit_exception`.
-    pub implicit_exceptions_checked: Option<Vec<Hlvalue>>,
+    pub implicit_exceptions_checked: Option<Vec<String>>,
     /// Tracks whether the hop has run `exception_is_here` /
     /// `exception_cannot_occur` at least once — used by
     /// `rtyper.py:732,748` bookkeeping.
@@ -746,7 +506,7 @@ pub struct LowLevelOpList {
 impl LowLevelOpList {
     /// RPython `LowLevelOpList.__init__(self, rtyper=None,
     /// originalblock=None)` (rtyper.py:793-795).
-    pub fn new(rtyper: Weak<RPythonTyper>, originalblock: Option<BlockRef>) -> Self {
+    pub fn new(rtyper: Rc<RPythonTyper>, originalblock: Option<BlockRef>) -> Self {
         LowLevelOpList {
             rtyper,
             originalblock,
@@ -776,63 +536,6 @@ impl LowLevelOpList {
     /// RPython `LowLevelOpList.__bool__` via list base.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
-    }
-
-    /// RPython `LowLevelOpList.convertvar(self, orig_v, r_from, r_to)`
-    /// (rtyper.py:810-823).
-    ///
-    /// ```python
-    /// def convertvar(self, orig_v, r_from, r_to):
-    ///     assert isinstance(orig_v, (Variable, Constant))
-    ///     if r_from != r_to:
-    ///         v = pair(r_from, r_to).convert_from_to(orig_v, self)
-    ///         if v is NotImplemented:
-    ///             raise TyperError("don't know how to convert from %r to %r" %
-    ///                              (r_from, r_to))
-    ///         if v.concretetype != r_to.lowleveltype:
-    ///             raise TyperError(...)
-    ///     else:
-    ///         v = orig_v
-    ///     return v
-    /// ```
-    ///
-    /// Upstream's `r_from != r_to` at `rtyper.py:812` compares Repr
-    /// **object identity** — Python's default `__eq__` / `__ne__` falls
-    /// back to `is` when neither side overrides it. Pyre mirrors via
-    /// [`Arc::ptr_eq`] on the shared `Arc<dyn Repr>` handles that
-    /// `getrepr` / `getprimitiverepr` cache. Two Reprs that share the
-    /// same `lowleveltype` but have distinct identities (e.g. a
-    /// `IntegerRepr` vs a `BoolRepr` that both delegate arithmetic
-    /// through `lltype.Signed`) still take the pairtype conversion
-    /// branch, matching upstream.
-    ///
-    pub fn convertvar(
-        &mut self,
-        orig_v: Hlvalue,
-        r_from: &Arc<dyn Repr>,
-        r_to: &Arc<dyn Repr>,
-    ) -> Result<Hlvalue, TyperError> {
-        if Arc::ptr_eq(r_from, r_to) {
-            // upstream `r_from == r_to` identity branch — object
-            // identity, not lltype equality.
-            return Ok(orig_v);
-        }
-        let Some(v) = pair_convert_from_to(self, orig_v, r_from, r_to)? else {
-            return Err(TyperError::message(format!(
-                "don't know how to convert from {} to {}",
-                r_from.repr_string(),
-                r_to.repr_string()
-            )));
-        };
-        if hlvalue_concretetype(&v) != Some(r_to.lowleveltype()) {
-            return Err(TyperError::message(format!(
-                "bug in conversion from {} to {}: returned a {:?}",
-                r_from.repr_string(),
-                r_to.repr_string(),
-                hlvalue_concretetype(&v)
-            )));
-        }
-        Ok(v)
     }
 
     /// RPython `LowLevelOpList.genop(self, opname, args_v,
@@ -914,275 +617,6 @@ impl LowLevelOpList {
     }
 }
 
-fn hlvalue_concretetype(value: &Hlvalue) -> Option<&LowLevelType> {
-    match value {
-        Hlvalue::Variable(v) => v.concretetype.as_ref(),
-        Hlvalue::Constant(c) => c.concretetype.as_ref(),
-    }
-}
-
-fn genop_as_hlvalue(
-    llops: &mut LowLevelOpList,
-    opname: &str,
-    args_v: Vec<Hlvalue>,
-    resulttype: LowLevelType,
-) -> Option<Hlvalue> {
-    llops
-        .genop(opname, args_v, GenopResult::LLType(resulttype))
-        .map(Hlvalue::Variable)
-}
-
-fn pair_convert_from_to(
-    llops: &mut LowLevelOpList,
-    orig_v: Hlvalue,
-    r_from: &Arc<dyn Repr>,
-    r_to: &Arc<dyn Repr>,
-) -> Result<Option<Hlvalue>, TyperError> {
-    if r_to.as_any().is::<NoneRepr>() {
-        return Ok(Some(Hlvalue::Constant(inputconst_from_lltype(
-            &LowLevelType::Void,
-            &ConstValue::None,
-        )?)));
-    }
-    if r_from.as_any().is::<NoneRepr>() {
-        return Ok(Some(Hlvalue::Constant(
-            crate::translator::rtyper::rmodel::inputconst(&**r_to, &ConstValue::None)?,
-        )));
-    }
-
-    if r_from.as_any().is::<BoolRepr>() {
-        if r_to.as_any().is::<FloatRepr>() && r_to.lowleveltype() == &LowLevelType::Float {
-            return Ok(genop_as_hlvalue(
-                llops,
-                "cast_bool_to_float",
-                vec![orig_v.clone()],
-                LowLevelType::Float,
-            ));
-        }
-        if let Some(r_to_int) = r_to.as_any().downcast_ref::<IntegerRepr>() {
-            return Ok(match r_to_int.lowleveltype() {
-                LowLevelType::Unsigned => genop_as_hlvalue(
-                    llops,
-                    "cast_bool_to_uint",
-                    vec![orig_v.clone()],
-                    LowLevelType::Unsigned,
-                ),
-                LowLevelType::Signed => genop_as_hlvalue(
-                    llops,
-                    "cast_bool_to_int",
-                    vec![orig_v.clone()],
-                    LowLevelType::Signed,
-                ),
-                _ => {
-                    let Some(v_int) = genop_as_hlvalue(
-                        llops,
-                        "cast_bool_to_int",
-                        vec![orig_v.clone()],
-                        LowLevelType::Signed,
-                    ) else {
-                        unreachable!("cast_bool_to_int must produce a Variable");
-                    };
-                    let signed: Arc<dyn Repr> = signed_repr();
-                    Some(llops.convertvar(v_int, &signed, r_to)?)
-                }
-            });
-        }
-    }
-
-    if let Some(r_from_int) = r_from.as_any().downcast_ref::<IntegerRepr>() {
-        if r_to.as_any().is::<BoolRepr>() && r_to.lowleveltype() == &LowLevelType::Bool {
-            return Ok(match r_from_int.lowleveltype() {
-                LowLevelType::Unsigned => genop_as_hlvalue(
-                    llops,
-                    "uint_is_true",
-                    vec![orig_v.clone()],
-                    LowLevelType::Bool,
-                ),
-                LowLevelType::Signed => genop_as_hlvalue(
-                    llops,
-                    "int_is_true",
-                    vec![orig_v.clone()],
-                    LowLevelType::Bool,
-                ),
-                _ => None,
-            });
-        }
-        if r_to.as_any().is::<FloatRepr>() && r_to.lowleveltype() == &LowLevelType::Float {
-            return Ok(match r_from_int.lowleveltype() {
-                LowLevelType::Unsigned => genop_as_hlvalue(
-                    llops,
-                    "cast_uint_to_float",
-                    vec![orig_v.clone()],
-                    LowLevelType::Float,
-                ),
-                LowLevelType::Signed => genop_as_hlvalue(
-                    llops,
-                    "cast_int_to_float",
-                    vec![orig_v.clone()],
-                    LowLevelType::Float,
-                ),
-                LowLevelType::SignedLongLong => genop_as_hlvalue(
-                    llops,
-                    "cast_longlong_to_float",
-                    vec![orig_v.clone()],
-                    LowLevelType::Float,
-                ),
-                LowLevelType::UnsignedLongLong => genop_as_hlvalue(
-                    llops,
-                    "cast_ulonglong_to_float",
-                    vec![orig_v.clone()],
-                    LowLevelType::Float,
-                ),
-                _ => None,
-            });
-        }
-        if let Some(r_to_int) = r_to.as_any().downcast_ref::<IntegerRepr>() {
-            return Ok(match (r_from_int.lowleveltype(), r_to_int.lowleveltype()) {
-                (LowLevelType::Signed, LowLevelType::Unsigned) => genop_as_hlvalue(
-                    llops,
-                    "cast_int_to_uint",
-                    vec![orig_v.clone()],
-                    LowLevelType::Unsigned,
-                ),
-                (LowLevelType::Unsigned, LowLevelType::Signed) => genop_as_hlvalue(
-                    llops,
-                    "cast_uint_to_int",
-                    vec![orig_v.clone()],
-                    LowLevelType::Signed,
-                ),
-                (LowLevelType::Signed, LowLevelType::SignedLongLong) => genop_as_hlvalue(
-                    llops,
-                    "cast_int_to_longlong",
-                    vec![orig_v.clone()],
-                    LowLevelType::SignedLongLong,
-                ),
-                (LowLevelType::SignedLongLong, LowLevelType::Signed) => genop_as_hlvalue(
-                    llops,
-                    "truncate_longlong_to_int",
-                    vec![orig_v.clone()],
-                    LowLevelType::Signed,
-                ),
-                (_, target) => genop_as_hlvalue(
-                    llops,
-                    "cast_primitive",
-                    vec![orig_v.clone()],
-                    target.clone(),
-                ),
-            });
-        }
-    }
-
-    if r_from.as_any().is::<FloatRepr>() {
-        if let Some(r_to_int) = r_to.as_any().downcast_ref::<IntegerRepr>() {
-            return Ok(match r_to_int.lowleveltype() {
-                LowLevelType::Unsigned => genop_as_hlvalue(
-                    llops,
-                    "cast_float_to_uint",
-                    vec![orig_v.clone()],
-                    LowLevelType::Unsigned,
-                ),
-                LowLevelType::Signed => genop_as_hlvalue(
-                    llops,
-                    "cast_float_to_int",
-                    vec![orig_v.clone()],
-                    LowLevelType::Signed,
-                ),
-                LowLevelType::SignedLongLong => genop_as_hlvalue(
-                    llops,
-                    "cast_float_to_longlong",
-                    vec![orig_v.clone()],
-                    LowLevelType::SignedLongLong,
-                ),
-                LowLevelType::UnsignedLongLong => genop_as_hlvalue(
-                    llops,
-                    "cast_float_to_ulonglong",
-                    vec![orig_v.clone()],
-                    LowLevelType::UnsignedLongLong,
-                ),
-                _ => None,
-            });
-        }
-        if r_to.as_any().is::<BoolRepr>() && r_to.lowleveltype() == &LowLevelType::Bool {
-            return Ok(genop_as_hlvalue(
-                llops,
-                "float_is_true",
-                vec![orig_v.clone()],
-                LowLevelType::Bool,
-            ));
-        }
-    }
-
-    Ok(None)
-}
-
-/// RPython `converted_to` parameter in
-/// `HighLevelOp.inputarg(converted_to, arg)` (`rtyper.py:655-662`) —
-/// upstream accepts either a `Repr` instance or a `LowLevelType`
-/// (Primitive). Rust's explicit dispatch surfaces both through this
-/// tagged enum.
-pub enum ReqType {
-    /// upstream path `isinstance(converted_to, Repr)` — already a
-    /// Repr, no further coercion needed.
-    Repr(Arc<dyn Repr>),
-    /// upstream path `not isinstance(converted_to, Repr) →
-    /// self.rtyper.getprimitiverepr(converted_to)` — coerces the bare
-    /// lltype through [`RPythonTyper::getprimitiverepr`].
-    LLType(LowLevelType),
-}
-
-impl ReqType {
-    /// Ergonomic constructor for the common "repr-valued" path.
-    pub fn repr(r: Arc<dyn Repr>) -> Self {
-        ReqType::Repr(r)
-    }
-    /// Ergonomic constructor for the "primitive lltype" path.
-    pub fn lltype(lt: LowLevelType) -> Self {
-        ReqType::LLType(lt)
-    }
-}
-
-/// upstream `s_binding.is_constant() → s_binding.const` read
-/// (`rtyper.py:669-670`). Pyre's `SomeValue` stores the boxed
-/// constant via `SomeObjectBase.const_box` (populated through the
-/// Const access delegator in annotator/model.rs:39). Return the
-/// `ConstValue` if `s_binding` is a compile-time constant.
-fn some_value_constant(sv: &SomeValue) -> Option<ConstValue> {
-    let base = match sv {
-        SomeValue::Impossible => return None,
-        SomeValue::Object(b) => b,
-        SomeValue::Type(t) => &t.base,
-        SomeValue::Float(f) => &f.base,
-        SomeValue::SingleFloat(f) => &f.base,
-        SomeValue::LongFloat(f) => &f.base,
-        SomeValue::Ptr(p) => &p.base,
-        SomeValue::Integer(i) => &i.base,
-        SomeValue::Bool(b) => &b.base,
-        SomeValue::String(s) => &s.inner.base,
-        SomeValue::UnicodeString(s) => &s.inner.base,
-        SomeValue::ByteArray(s) => &s.inner.base,
-        SomeValue::Char(c) => &c.inner.base,
-        SomeValue::UnicodeCodePoint(c) => &c.inner.base,
-        SomeValue::List(l) => &l.base,
-        SomeValue::Tuple(t) => &t.base,
-        SomeValue::Dict(d) => &d.base,
-        SomeValue::Iterator(i) => &i.base,
-        SomeValue::Instance(i) => &i.base,
-        SomeValue::Exception(e) => &e.base,
-        SomeValue::PBC(p) => &p.base,
-        SomeValue::None_(n) => &n.base,
-        SomeValue::Property(p) => &p.base,
-        // `SomePtr` / `SomeInteriorPtr` / `SomeLLADTMeth` carry no
-        // constant lattice value (upstream RPython does not fold ptr
-        // literals into `SomeObject.const`); short-circuit to None.
-        SomeValue::InteriorPtr(_) | SomeValue::LLADTMeth(_) => return None,
-        SomeValue::Builtin(b) => &b.base,
-        SomeValue::BuiltinMethod(m) => &m.base,
-        SomeValue::WeakRef(w) => &w.base,
-        SomeValue::TypeOf(t) => &t.base,
-    };
-    base.const_box.as_ref().map(|c| c.value.clone())
-}
-
 /// RPython `resulttype=None | LowLevelType | Repr` overload type in
 /// `LowLevelOpList.genop` (rtyper.py:825-843). Rust needs an explicit
 /// enum because the Python overload uses isinstance().
@@ -1234,7 +668,7 @@ mod tests {
     fn mark_already_seen_records_block_key() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let block = ann.translator.borrow().entry_point_graph.borrow().clone();
+        let block = ann.translator.entry_point_graph.borrow().clone();
         assert!(block.is_none());
 
         let graph = crate::flowspace::model::FunctionGraph::new(
@@ -1286,13 +720,13 @@ mod tests {
             for arg in graph_borrow.startblock.borrow_mut().inputargs.iter_mut() {
                 if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
                     v.concretetype = Some(LowLevelType::Signed);
-                    v.annotation = Some(Rc::new(SomeValue::Impossible));
+                    v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
                 }
             }
             for arg in graph_borrow.returnblock.borrow_mut().inputargs.iter_mut() {
                 if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
                     v.concretetype = Some(LowLevelType::Void);
-                    v.annotation = Some(Rc::new(SomeValue::Impossible));
+                    v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
                 }
             }
         }
@@ -1309,10 +743,9 @@ mod tests {
         assert_eq!(func_obj.graph.is_some(), true);
     }
 
-    fn make_rtyper_weak() -> Weak<RPythonTyper> {
+    fn make_rtyper_rc() -> Rc<RPythonTyper> {
         let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        Rc::downgrade(&rtyper)
+        Rc::new(RPythonTyper::new(&ann))
     }
 
     fn empty_spaceop(opname: &str) -> SpaceOperation {
@@ -1329,7 +762,7 @@ mod tests {
         // args_v / args_s / args_r / s_result / r_result slots remain
         // empty until `setup()` runs (which pyre defers pending the
         // Repr-dispatch chain).
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(
             rtyper.clone(),
@@ -1350,7 +783,7 @@ mod tests {
     #[test]
     fn highlevelop_r_s_pop_removes_trailing_element() {
         // rtyper.py:693-696: pop from args_v + args_r + args_s in lockstep.
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(rtyper, empty_spaceop("nop"), Vec::new(), llops);
         hop.args_v
@@ -1373,7 +806,7 @@ mod tests {
     #[test]
     fn highlevelop_swap_fst_snd_args_swaps_all_three_parallel_vecs() {
         // rtyper.py:708-711.
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(rtyper, empty_spaceop("nop"), Vec::new(), llops);
         let a = Variable::new();
@@ -1402,22 +835,8 @@ mod tests {
     }
 
     #[test]
-    fn highlevelop_v_s_insertfirstarg_materializes_repr_from_rtyper() {
-        let ann_rc = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
-        let weak = Rc::downgrade(&rtyper);
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
-        let hop = HighLevelOp::new(weak, empty_spaceop("nop"), Vec::new(), llops);
-        hop.v_s_insertfirstarg(Hlvalue::Variable(Variable::new()), SomeValue::Impossible)
-            .unwrap();
-        assert_eq!(hop.args_v.borrow().len(), 1);
-        assert_eq!(hop.args_s.borrow().len(), 1);
-        assert!(hop.args_r.borrow()[0].is_some());
-    }
-
-    #[test]
     fn lowlevelop_append_and_len_track_ops_buffer() {
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
         assert!(llops.is_empty());
         llops.append(SpaceOperation::new(
@@ -1432,7 +851,7 @@ mod tests {
     #[test]
     fn lowlevelop_genop_void_emits_void_concretetype() {
         // rtyper.py:835-837: resulttype=None → Void + return None.
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
         let result = llops.genop("nop", Vec::new(), GenopResult::Void);
         assert!(result.is_none());
@@ -1448,7 +867,7 @@ mod tests {
     fn lowlevelop_genop_with_lltype_result_sets_concretetype() {
         // rtyper.py:839-843: resulttype=LowLevelType → Variable
         // carries that type.
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
         // Build a typed input arg so the concretetype assertion passes.
         let mut input = Variable::new();
@@ -1467,7 +886,7 @@ mod tests {
     fn lowlevelop_genop_with_repr_extracts_lowleveltype() {
         // rtyper.py:839-843: resulttype=Repr → upstream does
         // `resulttype = resulttype.lowleveltype`.
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
         let result = llops
             .genop(
@@ -1484,7 +903,7 @@ mod tests {
     fn lowlevelop_genop_rejects_args_without_concretetype() {
         // rtyper.py:826-832: `hop.args_v directly` mistake must
         // assertion-fail.
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
         let untyped = Variable::new();
         assert!(untyped.concretetype.is_none());
@@ -1498,7 +917,7 @@ mod tests {
     #[test]
     fn exception_cannot_occur_sets_removed_sentinel() {
         // rtyper.py:747-753.
-        let rtyper = make_rtyper_weak();
+        let rtyper = make_rtyper_rc();
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         // Build a dummy exceptionlink so the path executes (upstream
         // early-returns when exceptionlinks is empty).
@@ -1517,55 +936,6 @@ mod tests {
     }
 
     #[test]
-    fn has_implicit_exception_records_matching_exitcases() {
-        let rtyper = make_rtyper_weak();
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
-        let value_error = crate::flowspace::model::HOST_ENV
-            .lookup_exception_class("ValueError")
-            .unwrap();
-        let exception = crate::flowspace::model::HOST_ENV
-            .lookup_exception_class("Exception")
-            .unwrap();
-        let exitblock = Rc::new(RefCell::new(crate::flowspace::model::Block::new(vec![])));
-        let link = Rc::new(RefCell::new(crate::flowspace::model::Link::new(
-            vec![],
-            Some(exitblock),
-            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                exception.clone(),
-            )))),
-        )));
-        let hop = HighLevelOp::new(rtyper, empty_spaceop("nop"), vec![link], llops.clone());
-        assert!(hop.has_implicit_exception(&value_error).unwrap());
-        let checked = llops.borrow().implicit_exceptions_checked.clone().unwrap();
-        assert_eq!(checked.len(), 1);
-    }
-
-    #[test]
-    fn exception_is_here_rejects_unchecked_exception_link() {
-        let rtyper = make_rtyper_weak();
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
-        llops.borrow_mut().implicit_exceptions_checked = Some(Vec::new());
-        let exception = crate::flowspace::model::HOST_ENV
-            .lookup_exception_class("Exception")
-            .unwrap();
-        let exitblock = Rc::new(RefCell::new(crate::flowspace::model::Block::new(vec![])));
-        let link = Rc::new(RefCell::new(crate::flowspace::model::Link::new(
-            vec![],
-            Some(exitblock),
-            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                exception,
-            )))),
-        )));
-        let hop = HighLevelOp::new(rtyper, empty_spaceop("nop"), vec![link], llops);
-        let err = hop.exception_is_here().unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "the graph catches Exception, but the rtyper did not explicitely handle it"
-            )
-        );
-    }
-
-    #[test]
     fn rtyper_annotation_returns_none_without_binding() {
         // rtyper.py:166-168 `annotation(var)` returns the annotator's
         // bound value or None for unset variables — matches upstream.
@@ -1577,25 +947,28 @@ mod tests {
 
     #[test]
     fn rtyper_binding_passes_through_annotator_value() {
-        // rtyper.py:170-172 positive path.
+        // rtyper.py:170-172 `binding(var)` raises KeyError when unset;
+        // Rust panics via the underlying annotator. Exercise the
+        // positive path here by pre-seeding an annotation.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let mut var = Variable::new();
-        var.annotation = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        var.annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::default()))));
         let v = Hlvalue::Variable(var);
-        let binding = rtyper.binding(&v).unwrap();
+        let binding = rtyper.binding(&v);
         assert!(matches!(binding, SomeValue::Integer(_)));
     }
 
     #[test]
-    fn rtyper_binding_surfaces_key_error_on_missing_variable() {
+    #[should_panic(expected = "KeyError: no binding")]
+    fn rtyper_binding_panics_on_missing_variable() {
         // rtyper.py:170-172 — upstream raises KeyError when the
-        // annotator has no binding.
+        // annotator has no binding. Rust matches via panic.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let v = Hlvalue::Variable(Variable::new());
-        let err = rtyper.binding(&v).unwrap_err();
-        assert_eq!(err.to_string(), "no binding");
+        let _ = rtyper.binding(&v);
     }
 
     #[test]
@@ -1618,18 +991,14 @@ mod tests {
         // rtyper.py:157 — `s_obj.rtyper_makerepr(self)` raises when
         // the variant has no concrete Repr yet. Pyre surfaces
         // `MissingRTypeOperation` so cascading callers can anchor on
-        // the upstream module name in the error message. SomeString
-        // remains unported (`rstr.py` is next in the cascade order
-        // after rfloat / rint / rbool), so its error message still
-        // names the upstream module.
-        use crate::annotator::model::SomeString;
+        // the upstream module name in the error message.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let err = rtyper
-            .getrepr(&SomeValue::String(SomeString::default()))
+            .getrepr(&SomeValue::Integer(SomeInteger::default()))
             .unwrap_err();
         assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("rstr.py"));
+        assert!(err.to_string().contains("rint.py"));
     }
 
     #[test]
@@ -1638,7 +1007,7 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let mut var = Variable::new();
-        var.annotation = Some(Rc::new(SomeValue::Impossible));
+        var.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
         let v = Hlvalue::Variable(var);
         let repr = rtyper.bindingrepr(&v).unwrap();
         // impossible_repr lowleveltype is Void.
@@ -1680,17 +1049,20 @@ mod tests {
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
         let mut arg_var = Variable::new();
-        arg_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        arg_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
         let mut result_var = Variable::new();
-        result_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        result_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
         let spaceop = SpaceOperation::new(
             "simple_call".to_string(),
             vec![Hlvalue::Variable(arg_var)],
             Hlvalue::Variable(result_var),
         );
-        let weak = Rc::downgrade(&rtyper);
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
-        let hop = HighLevelOp::new(weak, spaceop, Vec::new(), llops);
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper, spaceop, Vec::new(), llops);
         hop.setup().unwrap();
         assert_eq!(hop.args_v.borrow().len(), 1);
         assert_eq!(hop.args_s.borrow().len(), 1);
@@ -1712,240 +1084,24 @@ mod tests {
         // SomeValue variant has no concrete Repr yet. Rather than
         // silently fail, the setup path returns the structured
         // TyperError so callers know which upstream module to land.
-        // SomeString remains unported (rstr.py is pending cascade
-        // step 3+).
-        use crate::annotator::model::SomeString;
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
         let mut arg_var = Variable::new();
-        arg_var.annotation = Some(Rc::new(SomeValue::String(SomeString::default())));
+        arg_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::default()))));
         let mut result_var = Variable::new();
-        result_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        result_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
         let spaceop = SpaceOperation::new(
             "simple_call".to_string(),
             vec![Hlvalue::Variable(arg_var)],
             Hlvalue::Variable(result_var),
         );
-        let weak = Rc::downgrade(&rtyper);
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
-        let hop = HighLevelOp::new(weak, spaceop, Vec::new(), llops);
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper, spaceop, Vec::new(), llops);
         let err = hop.setup().unwrap_err();
         assert!(err.is_missing_rtype_operation());
-    }
-
-    #[test]
-    fn getprimitiverepr_dispatches_primitives_to_matching_reprs() {
-        // rtyper.py:85-93 — primitive_to_repr cache feeds from
-        // `getrepr(lltype_to_annotation(lltype))`. Signed / Bool /
-        // Float are cascade-1-ported; verify the round-trip.
-        use crate::translator::rtyper::rbool::bool_repr;
-        use crate::translator::rtyper::rfloat::float_repr;
-        use crate::translator::rtyper::rint::signed_repr;
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = RPythonTyper::new(&ann);
-        let r_signed = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
-        assert!(Arc::ptr_eq(
-            &(r_signed.clone() as Arc<dyn Repr>),
-            &(signed_repr() as Arc<dyn Repr>)
-        ));
-        let r_bool = rtyper.getprimitiverepr(&LowLevelType::Bool).unwrap();
-        assert!(Arc::ptr_eq(
-            &(r_bool.clone() as Arc<dyn Repr>),
-            &(bool_repr() as Arc<dyn Repr>)
-        ));
-        let r_float = rtyper.getprimitiverepr(&LowLevelType::Float).unwrap();
-        assert!(Arc::ptr_eq(
-            &(r_float.clone() as Arc<dyn Repr>),
-            &(float_repr() as Arc<dyn Repr>)
-        ));
-    }
-
-    #[test]
-    fn getprimitiverepr_caches_result() {
-        // rtyper.py:85-93 `self.primitive_to_repr[lltype] = repr`.
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = RPythonTyper::new(&ann);
-        let r1 = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
-        let r2 = rtyper.getprimitiverepr(&LowLevelType::Signed).unwrap();
-        assert!(Arc::ptr_eq(&r1, &r2));
-        assert_eq!(rtyper.primitive_to_repr.borrow().len(), 1);
-    }
-
-    #[test]
-    fn getprimitiverepr_rejects_non_primitive_ptr() {
-        // rtyper.py:93 — only Primitive lltypes are accepted; Ptr
-        // surfaces the upstream TyperError phrase.
-        use crate::translator::rtyper::lltypesystem::lltype::FuncType;
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = RPythonTyper::new(&ann);
-        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
-        let ft = FuncType {
-            args: vec![],
-            result: LowLevelType::Void,
-        };
-        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Func(ft),
-        }));
-        let err = rtyper.getprimitiverepr(&ptr_ty).unwrap_err();
-        assert!(err.to_string().contains("There is no primitive repr"));
-    }
-
-    #[test]
-    fn lowlevelop_convertvar_identity_case_returns_argument_unchanged() {
-        // rtyper.py:821-822 — `r_from == r_to → v = orig_v`.
-        use crate::translator::rtyper::rint::signed_repr;
-        let rtyper = make_rtyper_weak();
-        let mut llops = LowLevelOpList::new(rtyper, None);
-        let r: Arc<dyn Repr> = signed_repr();
-        let mut v = Variable::new();
-        v.concretetype = Some(LowLevelType::Signed);
-        let h = Hlvalue::Variable(v);
-        let out = llops.convertvar(h.clone(), &r, &r).unwrap();
-        assert_eq!(format!("{out:?}"), format!("{h:?}"));
-    }
-
-    #[test]
-    fn lowlevelop_convertvar_integer_to_float_uses_pair_dispatch() {
-        // rint.py:645-650 `pairtype(IntegerRepr, FloatRepr)`.
-        use crate::translator::rtyper::rfloat::float_repr;
-        use crate::translator::rtyper::rint::signed_repr;
-        let rtyper = make_rtyper_weak();
-        let mut llops = LowLevelOpList::new(rtyper, None);
-        let r_int: Arc<dyn Repr> = signed_repr();
-        let r_flt: Arc<dyn Repr> = float_repr();
-        let mut v = Variable::new();
-        v.concretetype = Some(LowLevelType::Signed);
-        let out = llops
-            .convertvar(Hlvalue::Variable(v), &r_int, &r_flt)
-            .unwrap();
-        let Hlvalue::Variable(out) = out else {
-            panic!("expected Variable result");
-        };
-        assert_eq!(out.concretetype.as_ref(), Some(&LowLevelType::Float));
-        assert_eq!(llops.ops.last().unwrap().opname, "cast_int_to_float");
-    }
-
-    #[test]
-    fn lowlevelop_convertvar_same_lltype_different_reprs_take_cast_primitive_branch() {
-        // rtyper.py:812 — `r_from != r_to` tests Repr **object
-        // identity** (Python's default `__eq__` falls back to `is`).
-        // Two Reprs with the same lowleveltype but distinct identities
-        // must not short-circuit to the identity branch — pairtype
-        // dispatch runs. Before the A.5 parity fix pyre compared by
-        // `lowleveltype()` equality, so a pair like
-        // (signed_repr, ad-hoc IntegerRepr(Signed, None)) was wrongly
-        // treated as identity.
-        use crate::translator::rtyper::rint::{IntegerRepr, signed_repr};
-        let rtyper = make_rtyper_weak();
-        let mut llops = LowLevelOpList::new(rtyper, None);
-        let r_a: Arc<dyn Repr> = signed_repr();
-        let r_b: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, None));
-        assert_eq!(r_a.lowleveltype(), r_b.lowleveltype());
-        assert!(!Arc::ptr_eq(&r_a, &r_b));
-        let mut v = Variable::new();
-        v.concretetype = Some(LowLevelType::Signed);
-        let out = llops.convertvar(Hlvalue::Variable(v), &r_a, &r_b).unwrap();
-        let Hlvalue::Variable(out) = out else {
-            panic!("expected Variable result");
-        };
-        assert_eq!(out.concretetype.as_ref(), Some(&LowLevelType::Signed));
-        assert_eq!(llops.ops.last().unwrap().opname, "cast_primitive");
-    }
-
-    // `lowlevelop_convertvar_none_to_pointer_repr_uses_inputconst`
-    // deferred — it exercised the `pairtype(Repr, NoneRepr)` →
-    // `inputconst(r_to, None)` block at `rpython/rtyper/rnone.py:56-59`.
-    // Main's `convertvar` port has not landed that pairtype dispatch yet
-    // (Cascade 2c); until then the convertvar path returns
-    // TyperError("don't know how to convert...") for NoneRepr ↔ Ptr.
-    // Re-enable this test when the pairtype conversion table lands.
-
-    #[test]
-    fn hop_inputarg_lltype_path_coerces_via_getprimitiverepr() {
-        // rtyper.py:655-662 — non-Repr converted_to triggers
-        // getprimitiverepr(lltype). Setup a constant-carrying args_s
-        // so the inputconst fast-path fires (no convertvar needed).
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper_rc = Rc::new(RPythonTyper::new(&ann));
-        let weak = Rc::downgrade(&rtyper_rc);
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
-        let mut arg_var = Variable::new();
-        arg_var.concretetype = Some(LowLevelType::Signed);
-        arg_var.annotation = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
-        let spaceop = SpaceOperation::new(
-            "nop".to_string(),
-            vec![Hlvalue::Variable(arg_var.clone())],
-            Hlvalue::Variable(Variable::new()),
-        );
-        let hop = HighLevelOp::new(weak, spaceop, Vec::new(), llops);
-        // Pre-populate args_v / args_s / args_r as `setup()` would.
-        hop.args_v.replace(vec![Hlvalue::Variable(arg_var.clone())]);
-        hop.args_s
-            .replace(vec![SomeValue::Integer(SomeInteger::default())]);
-        hop.args_r.replace(vec![Some(
-            crate::translator::rtyper::rint::signed_repr() as Arc<dyn Repr>
-        )]);
-        let out = hop
-            .inputarg(ReqType::LLType(LowLevelType::Signed), 0)
-            .unwrap();
-        // Identity: same lltype Signed → Signed means convertvar's
-        // identity branch returns the Variable unchanged.
-        assert!(matches!(out, Hlvalue::Variable(_)));
-    }
-
-    #[test]
-    fn hop_inputargs_checks_count_matching_upstream_error() {
-        // rtyper.py:677-685 — count mismatch TyperError.
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper_rc = Rc::new(RPythonTyper::new(&ann));
-        let weak = Rc::downgrade(&rtyper_rc);
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
-        let hop = HighLevelOp::new(weak, empty_spaceop("nop"), Vec::new(), llops);
-        hop.args_v.replace(vec![]);
-        let err = hop
-            .inputargs(vec![ReqType::LLType(LowLevelType::Signed)])
-            .unwrap_err();
-        assert!(err.to_string().contains("argument count mismatch"));
-    }
-
-    #[test]
-    fn hop_genop_forwards_to_lowlevelop_genop() {
-        // rtyper.py:687-688 — hop.genop thin wrapper.
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper_rc = Rc::new(RPythonTyper::new(&ann));
-        let weak = Rc::downgrade(&rtyper_rc);
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(weak.clone(), None)));
-        let hop = HighLevelOp::new(weak, empty_spaceop("nop"), Vec::new(), llops.clone());
-        let out = hop.genop("int_neg", vec![], GenopResult::LLType(LowLevelType::Signed));
-        assert!(out.is_some());
-        assert_eq!(llops.borrow().ops.len(), 1);
-    }
-
-    #[test]
-    fn hop_inputconst_wraps_constant_with_repr_lowleveltype() {
-        // rtyper.py:675 `inputconst = staticmethod(inputconst)` —
-        // delegates to rmodel::inputconst. Validate via rint Bool
-        // primitive path.
-        use crate::translator::rtyper::rbool::bool_repr;
-        let r = bool_repr();
-        let c = HighLevelOp::inputconst(&*r, &ConstValue::Bool(true)).unwrap();
-        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Bool));
-    }
-
-    #[test]
-    fn reqtype_constructors_carry_correct_payload() {
-        use crate::translator::rtyper::rint::signed_repr;
-        let r = signed_repr();
-        match ReqType::repr(r.clone() as Arc<dyn Repr>) {
-            ReqType::Repr(rr) => assert!(Arc::ptr_eq(
-                &(rr as Arc<dyn Repr>),
-                &(r.clone() as Arc<dyn Repr>)
-            )),
-            _ => panic!("repr() should yield ReqType::Repr"),
-        }
-        match ReqType::lltype(LowLevelType::Signed) {
-            ReqType::LLType(lt) => assert_eq!(lt, LowLevelType::Signed),
-            _ => panic!("lltype() should yield ReqType::LLType"),
-        }
     }
 }

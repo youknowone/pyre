@@ -52,7 +52,6 @@ use super::super::flowspace::model::{ConstValue, Constant, HostObject, Variable}
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
 pub use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 // ---------------------------------------------------------------------------
 // State / TLS (model.py:44-49).
@@ -124,11 +123,9 @@ pub enum KnownType {
     /// `r_uint` — the RPython sister of `int`, set when
     /// `SomeInteger.unsigned` is true.
     Ruint,
-    /// `r_longlong` — RPython's signed 64-bit integer type
-    /// (`rarithmetic.py:183-185`).
+    /// `r_longlong` — RPython's signed 64-bit integer type.
     LongLong,
-    /// `r_ulonglong` — RPython's unsigned 64-bit integer type
-    /// (`rarithmetic.py:186-188`).
+    /// `r_ulonglong` — RPython's unsigned 64-bit integer type.
     ULongLong,
     /// `bool` — the RPython `SomeBool.knowntype = bool`.
     Bool,
@@ -1814,9 +1811,7 @@ impl SomeObjectTrait for SomeTypeOf {
 /// top of this file. A4.1 carries the primitive-family (Object /
 /// Type / Float / Integer / Bool / String / Char / UnicodeString /
 /// UnicodeCodePoint / ByteArray / SingleFloat / LongFloat) plus the
-/// `Impossible` variant that anchors the lattice bottom. `SomePtr`
-/// lands here as the minimal annotation carrier needed by
-/// `rtyper/llannotation.py`.
+/// `Impossible` variant that anchors the lattice bottom.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SomeValue {
     /// RPython `class SomeImpossibleValue(SomeObject)` (model.py:627 —
@@ -1907,7 +1902,6 @@ impl SomeValueTag {
             T::Float => &[T::Float, T::Object],
             T::SingleFloat => &[T::SingleFloat, T::Object],
             T::LongFloat => &[T::LongFloat, T::Object],
-            T::Ptr => &[T::Ptr, T::Object],
             // Type chain: SomeTypeOf < SomeType < SomeObject (model.py:146-149).
             T::TypeOf => &[T::TypeOf, T::Type, T::Object],
             T::Type => &[T::Type, T::Object],
@@ -1954,7 +1948,6 @@ impl SomeValue {
             SomeValue::Float(_) => T::Float,
             SomeValue::SingleFloat(_) => T::SingleFloat,
             SomeValue::LongFloat(_) => T::LongFloat,
-            SomeValue::Ptr(_) => T::Ptr,
             SomeValue::Integer(_) => T::Integer,
             SomeValue::Bool(_) => T::Bool,
             SomeValue::String(_) => T::String,
@@ -2085,7 +2078,6 @@ impl SomeValue {
             SomeValue::Float(s) => s.base.const_box.as_ref(),
             SomeValue::SingleFloat(s) => s.base.const_box.as_ref(),
             SomeValue::LongFloat(s) => s.base.const_box.as_ref(),
-            SomeValue::Ptr(s) => s.base.const_box.as_ref(),
             SomeValue::Integer(s) => s.base.const_box.as_ref(),
             SomeValue::Bool(s) => s.base.const_box.as_ref(),
             SomeValue::String(s) => s.inner.base.const_box.as_ref(),
@@ -2173,7 +2165,6 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Float(s) => s.knowntype(),
             SomeValue::SingleFloat(s) => s.knowntype(),
             SomeValue::LongFloat(s) => s.knowntype(),
-            SomeValue::Ptr(s) => s.knowntype(),
             SomeValue::Integer(s) => s.knowntype(),
             SomeValue::Bool(s) => s.knowntype(),
             SomeValue::String(s) => s.knowntype(),
@@ -2208,7 +2199,6 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Float(s) => s.immutable(),
             SomeValue::SingleFloat(s) => s.immutable(),
             SomeValue::LongFloat(s) => s.immutable(),
-            SomeValue::Ptr(s) => s.immutable(),
             SomeValue::Integer(s) => s.immutable(),
             SomeValue::Bool(s) => s.immutable(),
             SomeValue::String(s) => s.immutable(),
@@ -2243,7 +2233,6 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Float(s) => s.is_constant(),
             SomeValue::SingleFloat(s) => s.is_constant(),
             SomeValue::LongFloat(s) => s.is_constant(),
-            SomeValue::Ptr(s) => s.is_constant(),
             SomeValue::Integer(s) => s.is_constant(),
             SomeValue::Bool(s) => s.is_constant(),
             SomeValue::String(s) => s.is_constant(),
@@ -2283,7 +2272,6 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::Float(s) => s.can_be_none(),
             SomeValue::SingleFloat(s) => s.can_be_none(),
             SomeValue::LongFloat(s) => s.can_be_none(),
-            SomeValue::Ptr(s) => s.can_be_none(),
             SomeValue::Integer(s) => s.can_be_none(),
             SomeValue::Bool(s) => s.can_be_none(),
             SomeValue::String(s) => s.can_be_none(),
@@ -2580,15 +2568,6 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // handles NaN equality; the fallthrough here covers constants
         // that are not bit-equal but still "the same" float.
         (SomeValue::Float(_), SomeValue::Float(_)) => Ok(SomeValue::Float(SomeFloat::new())),
-        // binaryop.py:450-459 — distinct `r_singlefloat` /
-        // `r_longfloat` constants union to the unconstrained
-        // annotation of the same family.
-        (SomeValue::SingleFloat(_), SomeValue::SingleFloat(_)) => {
-            Ok(SomeValue::SingleFloat(SomeSingleFloat::new()))
-        }
-        (SomeValue::LongFloat(_), SomeValue::LongFloat(_)) => {
-            Ok(SomeValue::LongFloat(SomeLongFloat::new()))
-        }
 
         // SomeInteger ↔ SomeFloat: upstream's `TLS.allow_int_to_float`
         // defaults to True, so the union widens to SomeFloat.
@@ -2757,16 +2736,29 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             )))
         }
 
-        // `__extend__(pairtype(SomePtr, SomePtr)).union`
-        // (llannotation.py:94-98). Logic body lives in
-        // `translator::rtyper::llannotation` next to the other
-        // SomePtr-family helpers; the arm here is the pyre-side
-        // dispatch site (no `pair().union()` MRO in Rust).
+        // llannotation.py:84-88 — low-level pointers union only when
+        // they carry the same `ll_ptrtype`.
         (SomeValue::Ptr(a), SomeValue::Ptr(b)) => {
-            crate::translator::rtyper::llannotation::ptr_ptr_union(a, b, s1, s2)
+            if a.ll_ptrtype != b.ll_ptrtype {
+                return Err(UnionError {
+                    lhs: s1.clone(),
+                    rhs: s2.clone(),
+                    msg: "RPython cannot unify distinct low-level pointer types".into(),
+                });
+            }
+            Ok(SomeValue::Ptr(SomePtr::new(a.ll_ptrtype.clone())))
         }
         (SomeValue::InteriorPtr(a), SomeValue::InteriorPtr(b)) => {
-            crate::translator::rtyper::llannotation::interior_ptr_interior_ptr_union(a, b, s1, s2)
+            if a.ll_ptrtype != b.ll_ptrtype {
+                return Err(UnionError {
+                    lhs: s1.clone(),
+                    rhs: s2.clone(),
+                    msg: "RPython cannot unify distinct low-level pointer types".into(),
+                });
+            }
+            Ok(SomeValue::InteriorPtr(SomeInteriorPtr::new(
+                a.ll_ptrtype.clone(),
+            )))
         }
 
         // `pair(SomeBuiltinMethod, SomeBuiltinMethod).union()` in
@@ -2852,7 +2844,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
 
         // Default fallback — upstream's `pair(...).union()` would
         // consult binaryop.py; Phase 5 fills those arms (container
-        // key/value splicing, SomeByteArray ↔ string mixes,
+        // key/value splicing, SomeByteArray ↔ string mixes, SomePtr,
         // SomeAddress family, ...). Until then we raise UnionError
         // so the annotator surfaces the gap loudly.
         _ => Err(UnionError {
@@ -2895,7 +2887,6 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
         SomeValue::Float(v) => v.base.const_box = None,
         SomeValue::SingleFloat(v) => v.base.const_box = None,
         SomeValue::LongFloat(v) => v.base.const_box = None,
-        SomeValue::Ptr(v) => v.base.const_box = None,
         SomeValue::Integer(v) => v.base.const_box = None,
         SomeValue::Bool(v) => v.base.const_box = None,
         SomeValue::String(v) => v.inner.base.const_box = None,
@@ -3257,7 +3248,7 @@ pub fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flowspace::model::{ConstValue, GraphFunc};
+    use crate::flowspace::model::GraphFunc;
     use std::rc::Rc;
 
     /// `ListDef::new(None, s_item, false, false)` shortcut — matches
@@ -4164,27 +4155,6 @@ mod tests {
     }
 
     #[test]
-    fn union_singlefloat_and_longfloat_widen_to_their_unconstrained_annotations() {
-        let mut sf1 = SomeSingleFloat::new();
-        sf1.base.const_box = Some(Constant::new(ConstValue::single_float(1.0)));
-        let mut sf2 = SomeSingleFloat::new();
-        sf2.base.const_box = Some(Constant::new(ConstValue::single_float(2.0)));
-        assert!(matches!(
-            union(&SomeValue::SingleFloat(sf1), &SomeValue::SingleFloat(sf2)).unwrap(),
-            SomeValue::SingleFloat(_)
-        ));
-
-        let mut lf1 = SomeLongFloat::new();
-        lf1.base.const_box = Some(Constant::new(ConstValue::long_float(1.0)));
-        let mut lf2 = SomeLongFloat::new();
-        lf2.base.const_box = Some(Constant::new(ConstValue::long_float(2.0)));
-        assert!(matches!(
-            union(&SomeValue::LongFloat(lf1), &SomeValue::LongFloat(lf2)).unwrap(),
-            SomeValue::LongFloat(_)
-        ));
-    }
-
-    #[test]
     fn union_bool_and_int_widens_to_int() {
         let b = SomeValue::Bool(SomeBool::new());
         let i = SomeValue::Integer(SomeInteger::new(true, false));
@@ -4545,8 +4515,8 @@ mod tests {
         use std::rc::Rc;
         let mut v = Variable::named("x");
         let s = SomeValue::Integer(SomeInteger::default());
-        v.annotation = Some(Rc::new(s.clone()));
-        let got = v.annotation.as_ref().map(|rc| (**rc).clone());
+        v.annotation.replace(Some(Rc::new(s.clone())));
+        let got = v.annotation.borrow().as_ref().map(|rc| (**rc).clone());
         assert_eq!(got, Some(s));
     }
 }

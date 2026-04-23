@@ -8370,7 +8370,6 @@ impl CraneliftBackend {
                         ));
                     }
                     let info = &guard_infos[guard_idx];
-
                     // x86/assembler.py _store_force_index parity:
                     // Store the GUARD_NOT_FORCED fail descriptor pointer
                     // into jf_force_descr before the call. If the callee
@@ -12918,6 +12917,11 @@ mod tests {
         VALUES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
+    fn may_force_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     thread_local! {
         static TEST_EXCEPTION_VALUE: Cell<i64> = const { Cell::new(0) };
         static TEST_EXCEPTION_CALL_LOG: std::cell::RefCell<Vec<bool>> =
@@ -12972,7 +12976,9 @@ mod tests {
     extern "C" fn maybe_force_and_return_void(force_token: i64, flag: i64) {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
-            let mut values = may_force_void_values().lock().unwrap();
+            let mut values = may_force_void_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             values.push(
                 get_latest_descr_from_deadframe(&deadframe)
                     .unwrap()
@@ -12998,7 +13004,9 @@ mod tests {
     extern "C" fn maybe_force_and_return_int(force_token: i64, flag: i64) -> i64 {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
-            let mut values = may_force_int_values().lock().unwrap();
+            let mut values = may_force_int_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             values.push(get_int_from_deadframe(&deadframe, 0).unwrap());
             values.push(get_int_from_deadframe(&deadframe, 2).unwrap());
             drop(values);
@@ -13010,7 +13018,9 @@ mod tests {
     extern "C" fn maybe_force_and_return_float(force_token: i64, flag: i64) -> f64 {
         if flag != 0 {
             let deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
-            let mut values = may_force_float_values().lock().unwrap();
+            let mut values = may_force_float_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             values.push(get_int_from_deadframe(&deadframe, 0).unwrap() as u64);
             values.push(get_float_from_deadframe(&deadframe, 1).unwrap().to_bits());
             values.push(get_int_from_deadframe(&deadframe, 2).unwrap() as u64);
@@ -13032,7 +13042,9 @@ mod tests {
             let preview_result = get_ref_from_deadframe(&deadframe, 1).unwrap();
             let preview_live = get_ref_from_deadframe(&deadframe, 2).unwrap();
             let preview_return = get_ref_from_deadframe(&deadframe, 3).unwrap();
-            let mut values = may_force_ref_values().lock().unwrap();
+            let mut values = may_force_ref_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             values.push(preview_result.0);
             values.push(preview_live.0);
             values.push(preview_return.0);
@@ -16514,7 +16526,13 @@ mod tests {
 
     #[test]
     fn test_call_may_force_n_guard_not_forced_and_savedata() {
-        may_force_void_values().lock().unwrap().clear();
+        let _guard = may_force_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        may_force_void_values()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
@@ -16547,19 +16565,35 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 20);
-        assert!(may_force_void_values().lock().unwrap().is_empty());
+        assert!(
+            may_force_void_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty()
+        );
 
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.get_int_value(&frame, 1), 10);
-        assert_eq!(*may_force_void_values().lock().unwrap(), vec![0, 1, 10]);
+        assert_eq!(
+            *may_force_void_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+            vec![0, 1, 10]
+        );
         assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xDADA));
     }
 
     #[test]
     fn test_execute_token_ints_raw_preserves_savedata_and_layout_for_call_may_force() {
-        may_force_void_values().lock().unwrap().clear();
+        let _guard = may_force_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        may_force_void_values()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
@@ -16602,11 +16636,19 @@ mod tests {
         assert_eq!(layout.fail_index, 0);
         assert_eq!(layout.source_op_index, Some(3));
         assert!(layout.recovery_layout.is_some());
-        assert_eq!(*may_force_void_values().lock().unwrap(), vec![0, 1, 10]);
+        assert_eq!(
+            *may_force_void_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+            vec![0, 1, 10]
+        );
     }
 
     #[test]
     fn test_call_may_force_with_intervening_ops() {
+        let _guard = may_force_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         // RPython backend parity requires GUARD_NOT_FORCED to be the
         // immediate next operation after CALL_MAY_FORCE.
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
@@ -16655,7 +16697,13 @@ mod tests {
 
     #[test]
     fn test_call_may_force_i_guard_not_forced_uses_real_call_result() {
-        may_force_int_values().lock().unwrap().clear();
+        let _guard = may_force_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        may_force_int_values()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
@@ -16689,20 +16737,36 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 42);
-        assert!(may_force_int_values().lock().unwrap().is_empty());
+        assert!(
+            may_force_int_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty()
+        );
 
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.get_int_value(&frame, 1), 42);
         assert_eq!(backend.get_int_value(&frame, 2), 10);
-        assert_eq!(*may_force_int_values().lock().unwrap(), vec![1, 10]);
+        assert_eq!(
+            *may_force_int_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+            vec![1, 10]
+        );
         assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xBABA));
     }
 
     #[test]
     fn test_call_may_force_f_guard_not_forced_uses_real_call_result() {
-        may_force_float_values().lock().unwrap().clear();
+        let _guard = may_force_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        may_force_float_values()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Float);
@@ -16739,7 +16803,12 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_float_value(&frame, 0), 12.5);
-        assert!(may_force_float_values().lock().unwrap().is_empty());
+        assert!(
+            may_force_float_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty()
+        );
 
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
         assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
@@ -16747,7 +16816,9 @@ mod tests {
         assert_eq!(backend.get_float_value(&frame, 1), 12.5);
         assert_eq!(backend.get_int_value(&frame, 2), 10);
         assert_eq!(
-            *may_force_float_values().lock().unwrap(),
+            *may_force_float_values()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
             vec![1, 0.0f64.to_bits(), 10]
         );
     }

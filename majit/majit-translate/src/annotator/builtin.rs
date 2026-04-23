@@ -61,7 +61,7 @@ use std::sync::OnceLock;
 
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::{ClassDef, ClassDesc};
-use super::description::DescEntry;
+use super::description::{DescEntry, FrozenDesc};
 use super::model::{
     AnnotatorError, SomeBool, SomeByteArray, SomeChar, SomeDict, SomeFloat, SomeInstance,
     SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple, SomeUnicodeCodePoint,
@@ -570,16 +570,6 @@ pub fn builtin_bool(
             ConstValue::Bool(b) => *b,
             ConstValue::Int(n) => *n != 0,
             ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
-            ConstValue::SingleFloat(_) => {
-                return Err(AnnotatorError::new(
-                    "not supported on r_singlefloat instances",
-                ));
-            }
-            ConstValue::LongFloat(_) => {
-                return Err(AnnotatorError::new(
-                    "not supported on r_longfloat instances",
-                ));
-            }
             ConstValue::Str(s) => !s.is_empty(),
             ConstValue::None => false,
             ConstValue::Tuple(items) | ConstValue::List(items) => !items.is_empty(),
@@ -710,10 +700,6 @@ pub fn builtin_float(
             [ConstValue::Int(n)] => Some(ConstValue::float(*n as f64)),
             [ConstValue::Bool(b)] => Some(ConstValue::float(if *b { 1.0 } else { 0.0 })),
             [ConstValue::Float(bits)] => Some(ConstValue::Float(*bits)),
-            [ConstValue::SingleFloat(bits)] => {
-                Some(ConstValue::float(f32::from_bits(*bits) as f64))
-            }
-            [ConstValue::LongFloat(value)] => Some(ConstValue::float(value.as_f64())),
             [ConstValue::Str(s)] => s.trim().parse::<f64>().ok().map(ConstValue::float),
             _ => None,
         },
@@ -1842,52 +1828,6 @@ mod tests {
             },
             other => panic!("expected SomeBool, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn builtin_bool_rejects_singlefloat_and_longfloat_constants() {
-        let bk = bk();
-        let s_single = bk.immutablevalue(&ConstValue::single_float(1.0)).unwrap();
-        let err = builtin_bool(&bk, &[s_single], &no_kwds()).unwrap_err();
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap_or("")
-                .contains("not supported on r_singlefloat instances")
-        );
-
-        let s_long = bk.immutablevalue(&ConstValue::long_float(1.0)).unwrap();
-        let err = builtin_bool(&bk, &[s_long], &no_kwds()).unwrap_err();
-        assert!(
-            err.msg
-                .as_deref()
-                .unwrap_or("")
-                .contains("not supported on r_longfloat instances")
-        );
-    }
-
-    #[test]
-    fn builtin_float_accepts_singlefloat_and_longfloat_constants() {
-        let bk = bk();
-
-        let s_single = bk.immutablevalue(&ConstValue::single_float(2.1)).unwrap();
-        let SomeValue::Float(single_res) = builtin_float(&bk, &[s_single], &no_kwds()).unwrap()
-        else {
-            panic!("builtin_float(singlefloat) should return SomeFloat");
-        };
-        assert_eq!(
-            single_res.base.const_box.as_ref().map(|c| c.value.clone()),
-            Some(ConstValue::float(2.1_f32 as f64))
-        );
-
-        let s_long = bk.immutablevalue(&ConstValue::long_float(3.25)).unwrap();
-        let SomeValue::Float(long_res) = builtin_float(&bk, &[s_long], &no_kwds()).unwrap() else {
-            panic!("builtin_float(longfloat) should return SomeFloat");
-        };
-        assert_eq!(
-            long_res.base.const_box.as_ref().map(|c| c.value.clone()),
-            Some(ConstValue::float(3.25))
-        );
     }
 
     #[test]

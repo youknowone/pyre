@@ -39,12 +39,10 @@ pub struct RPythonAnnotator {
     /// ```
     ///
     /// Always populated; `new()` defaults it when `None` is supplied.
-    /// Upstream also installs a back-reference (`translator.annotator =
-    /// self`); Rust requires a `Weak<RPythonAnnotator>` round-trip to
-    /// avoid a refcount cycle — that wiring lands with the
-    /// bookkeeper/annotator backlink port (reviewer's "pre-existing"
-    /// item).
-    pub translator: RefCell<TranslationContext>,
+    /// Rust keeps a strong reference here and mirrors upstream's
+    /// `translator.annotator = self` only on the implicit-translator
+    /// path.
+    pub translator: Rc<TranslationContext>,
     /// RPython `self.genpendingblocks = [{}]` (annrpython.py:36).
     /// Per-generation list of `{block: graph-containing-it}`. The
     /// inner map pairs identity-keyed blocks with the owning graph
@@ -284,6 +282,21 @@ impl<'a> Drop for PolicyGuard<'a> {
     }
 }
 
+/// RAII guard for `self.added_blocks = {}; ...; finally:
+/// self.added_blocks = saved` in `complete_helpers()`.
+struct AddedBlocksGuard<'a> {
+    ann: &'a RPythonAnnotator,
+    saved: Option<Option<HashMap<BlockKey, BlockRef>>>,
+}
+
+impl<'a> Drop for AddedBlocksGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            *self.ann.added_blocks.borrow_mut() = saved;
+        }
+    }
+}
+
 impl RPythonAnnotator {
     /// RPython `RPythonAnnotator.__init__(self, translator=None,
     /// policy=None, bookkeeper=None, keepgoing=False)`
@@ -301,22 +314,41 @@ impl RPythonAnnotator {
         bookkeeper: Option<Rc<Bookkeeper>>,
         keepgoing: bool,
     ) -> Rc<Self> {
+        Self::new_with_translator_mode(translator.map(Rc::new), policy, bookkeeper, keepgoing)
+    }
+
+    /// Shared-identity constructor used by
+    /// `TranslationContext.buildannotator()`.
+    pub fn new_with_translator(
+        translator: Option<Rc<TranslationContext>>,
+        policy: Option<AnnotatorPolicy>,
+        bookkeeper: Option<Rc<Bookkeeper>>,
+        keepgoing: bool,
+    ) -> Rc<Self> {
+        Self::new_with_translator_mode(translator, policy, bookkeeper, keepgoing)
+    }
+
+    fn new_with_translator_mode(
+        translator: Option<Rc<TranslationContext>>,
+        policy: Option<AnnotatorPolicy>,
+        bookkeeper: Option<Rc<Bookkeeper>>,
+        keepgoing: bool,
+    ) -> Rc<Self> {
+        let translator_was_provided = translator.is_some();
         let policy = policy.unwrap_or_else(AnnotatorPolicy::new);
         let bookkeeper =
             bookkeeper.unwrap_or_else(|| Rc::new(Bookkeeper::new_with_policy(policy.clone())));
         // upstream annrpython.py:30-34 — default to a fresh
         // TranslationContext when caller passes None.
-        let translator = translator.unwrap_or_else(TranslationContext::new);
+        let translator = translator.unwrap_or_else(|| Rc::new(TranslationContext::new()));
         // Upstream `Bookkeeper.__init__(self, annotator)` stores
-        // `self.annotator = annotator` and `RPythonAnnotator.__init__`
-        // stores `translator.annotator = self`. Rust uses
-        // `Rc::new_cyclic` so both Weak back-references can be
-        // installed before any caller observes the final `Rc<Self>`.
-        Rc::new_cyclic(|weak: &std::rc::Weak<Self>| {
+        // `self.annotator = annotator`. The translator backlink is
+        // only installed for the implicit-translator path in
+        // annrpython.py.
+        let ann = Rc::new_cyclic(|weak: &std::rc::Weak<Self>| {
             bookkeeper.set_annotator(weak.clone());
-            translator.set_annotator(weak.clone());
             RPythonAnnotator {
-                translator: RefCell::new(translator),
+                translator: Rc::clone(&translator),
                 genpendingblocks: RefCell::new(vec![HashMap::new()]),
                 annotated: RefCell::new(HashMap::new()),
                 all_blocks: RefCell::new(HashMap::new()),
@@ -333,7 +365,11 @@ impl RPythonAnnotator {
                 failed_blocks: RefCell::new(HashMap::new()),
                 errors: RefCell::new(Vec::new()),
             }
-        })
+        });
+        if !translator_was_provided {
+            translator.set_annotator(Rc::clone(&ann));
+        }
+        ann
     }
 
     /// RPython `annotation(self, arg)` (annrpython.py:273-280).
@@ -357,7 +393,7 @@ impl RPythonAnnotator {
     /// emulating the upstream `try/except KeyError` style).
     pub fn annotation(&self, arg: &Hlvalue) -> Option<SomeValue> {
         match arg {
-            Hlvalue::Variable(v) => v.annotation.as_ref().map(|rc| (**rc).clone()),
+            Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
             Hlvalue::Constant(c) => match self.bookkeeper.immutableconstant(c) {
                 Ok(sv) => Some(sv),
                 Err(e) => panic!(
@@ -405,18 +441,21 @@ impl RPythonAnnotator {
     /// driver passes owned `Variable` references while processing a
     /// block, so this is called with `&mut v` there.
     pub fn setbinding(&self, arg: &mut Variable, s_value: SomeValue) {
-        if let Some(s_old) = arg.annotation.as_ref() {
-            if !s_value.contains(s_old) {
-                // upstream: `log.WARNING(...); assert False`.
-                // Lattice widening contract — a binding cannot move
-                // backwards.
-                panic!(
-                    "setbinding: new value does not contain old ({:?} ⊄ {:?})",
-                    s_value, **s_old
-                );
+        {
+            let annotation_ref = arg.annotation.borrow();
+            if let Some(s_old) = annotation_ref.as_ref() {
+                if !s_value.contains(s_old) {
+                    // upstream: `log.WARNING(...); assert False`.
+                    // Lattice widening contract — a binding cannot move
+                    // backwards.
+                    panic!(
+                        "setbinding: new value does not contain old ({:?} ⊄ {:?})",
+                        s_value, **s_old
+                    );
+                }
             }
         }
-        arg.annotation = Some(Rc::new(s_value));
+        *arg.annotation.borrow_mut() = Some(Rc::new(s_value));
     }
 
     /// RPython `warning(self, msg, pos=None)` (annrpython.py:301-...).
@@ -444,6 +483,159 @@ impl RPythonAnnotator {
     // RPython `convenience high-level interface` (annrpython.py:71-141) —
     // build_types / build_graph_types / annotate_helper entrypoints.
     // ======================================================================
+
+    /// RPython `build_types(self, function, input_arg_types,
+    /// complete_now=True, main_entry_point=False)` (annrpython.py:73-92).
+    ///
+    /// ```python
+    /// def build_types(self, function, input_arg_types, complete_now=True,
+    ///                 main_entry_point=False):
+    ///     """Recursively build annotations about the specific entry point."""
+    ///     assert isinstance(function, types.FunctionType), "fix that!"
+    ///
+    ///     from rpython.annotator.policy import AnnotatorPolicy
+    ///     policy = AnnotatorPolicy()
+    ///     # make input arguments and set their type
+    ///     args_s = [self.typeannotation(t) for t in input_arg_types]
+    ///
+    ///     # XXX hack
+    ///     annmodel.TLS.check_str_without_nul = (
+    ///         self.translator.config.translation.check_str_without_nul)
+    ///
+    ///     with self.using_policy(policy):
+    ///         flowgraph, inputs_s = self.get_call_parameters(function, args_s)
+    ///
+    ///     if main_entry_point:
+    ///         self.translator.entry_point_graph = flowgraph
+    ///     return self.build_graph_types(flowgraph, inputs_s, complete_now=complete_now)
+    /// ```
+    ///
+    /// Rust uses `HostObject::is_user_function()` for the same
+    /// precondition, but preserves the upstream failure mode by
+    /// panicking with the same `"fix that!"` message when the caller
+    /// passes a non-function.
+    pub fn build_types(
+        self: &Rc<Self>,
+        function: &crate::flowspace::model::HostObject,
+        input_arg_types: &[super::signature::AnnotationSpec],
+        complete_now: bool,
+        main_entry_point: bool,
+    ) -> Result<Option<SomeValue>, super::model::AnnotatorError> {
+        // upstream: `assert isinstance(function, types.FunctionType), "fix that!"`.
+        assert!(function.is_user_function(), "fix that!");
+
+        // upstream: `from rpython.annotator.policy import AnnotatorPolicy`
+        //           `policy = AnnotatorPolicy()`.
+        let policy = AnnotatorPolicy::new();
+
+        // upstream: `args_s = [self.typeannotation(t) for t in input_arg_types]`.
+        let mut args_s: Vec<SomeValue> = Vec::with_capacity(input_arg_types.len());
+        for spec in input_arg_types {
+            let sv = self
+                .typeannotation(spec)
+                .map_err(|e| -> super::model::AnnotatorError { e.into() })?;
+            args_s.push(sv);
+        }
+
+        // upstream: `# XXX hack`
+        //           `annmodel.TLS.check_str_without_nul = (
+        //               self.translator.config.translation.check_str_without_nul)`.
+        let check_str_without_nul = self.translator.config.translation.check_str_without_nul;
+        TLS.with(|state| state.borrow_mut().check_str_without_nul = check_str_without_nul);
+
+        // upstream: `with self.using_policy(policy):
+        //               flowgraph, inputs_s = self.get_call_parameters(function, args_s)`.
+        let (flowgraph, inputs_s) = {
+            let _guard = self.using_policy(policy);
+            self.get_call_parameters(function, args_s)?
+        };
+
+        // upstream: `if main_entry_point: self.translator.entry_point_graph = flowgraph`.
+        if main_entry_point {
+            *self.translator.entry_point_graph.borrow_mut() = Some(flowgraph.graph.clone());
+        }
+
+        // upstream: `return self.build_graph_types(flowgraph, inputs_s,
+        //                                         complete_now=complete_now)`.
+        Ok(self.build_graph_types(&flowgraph.graph, &inputs_s, complete_now))
+    }
+
+    /// RPython `get_call_parameters(self, function, args_s)`
+    /// (annrpython.py:94-97).
+    ///
+    /// ```python
+    /// def get_call_parameters(self, function, args_s):
+    ///     with self.bookkeeper.at_position(None):
+    ///         desc = self.bookkeeper.getdesc(function)
+    ///         return desc.get_call_parameters(args_s)
+    /// ```
+    pub fn get_call_parameters(
+        self: &Rc<Self>,
+        function: &crate::flowspace::model::HostObject,
+        args_s: Vec<SomeValue>,
+    ) -> Result<
+        (Rc<crate::flowspace::pygraph::PyGraph>, Vec<SomeValue>),
+        super::model::AnnotatorError,
+    > {
+        // upstream: `with self.bookkeeper.at_position(None):`.
+        let _guard = self.bookkeeper.at_position(None);
+        // upstream: `desc = self.bookkeeper.getdesc(function)`.
+        let desc = self.bookkeeper.getdesc(function)?;
+        // upstream: `return desc.get_call_parameters(args_s)`.
+        desc.get_call_parameters(args_s)
+    }
+
+    /// RPython `annotate_helper(self, function, args_s, policy=None)`
+    /// (annrpython.py:99-110).
+    ///
+    /// ```python
+    /// def annotate_helper(self, function, args_s, policy=None):
+    ///     if policy is None:
+    ///         from rpython.annotator.policy import AnnotatorPolicy
+    ///         policy = AnnotatorPolicy()
+    ///         # XXX hack
+    ///         annmodel.TLS.check_str_without_nul = (
+    ///             self.translator.config.translation.check_str_without_nul)
+    ///     with self.using_policy(policy):
+    ///         graph, inputcells = self.get_call_parameters(function, args_s)
+    ///         self.build_graph_types(graph, inputcells, complete_now=False)
+    ///         self.complete_helpers()
+    ///     return graph
+    /// ```
+    ///
+    /// Used by rtyper-time helper injection (e.g. `annlowlevel.py`);
+    /// the `None → default policy + TLS-hack` branch matches upstream's
+    /// short-circuit for un-configured callers.
+    pub fn annotate_helper(
+        self: &Rc<Self>,
+        function: &crate::flowspace::model::HostObject,
+        args_s: Vec<SomeValue>,
+        policy: Option<AnnotatorPolicy>,
+    ) -> Result<Rc<crate::flowspace::pygraph::PyGraph>, super::model::AnnotatorError> {
+        // upstream: `if policy is None: ...`.
+        let policy = match policy {
+            Some(p) => p,
+            None => {
+                let p = AnnotatorPolicy::new();
+                // upstream: `annmodel.TLS.check_str_without_nul = (
+                //     self.translator.config.translation.check_str_without_nul)`.
+                let check_str_without_nul =
+                    self.translator.config.translation.check_str_without_nul;
+                TLS.with(|state| state.borrow_mut().check_str_without_nul = check_str_without_nul);
+                p
+            }
+        };
+        // upstream: `with self.using_policy(policy): ...`.
+        let _guard = self.using_policy(policy);
+        // upstream: `graph, inputcells = self.get_call_parameters(function, args_s)`.
+        let (graph, inputcells) = self.get_call_parameters(function, args_s)?;
+        // upstream: `self.build_graph_types(graph, inputcells, complete_now=False)`.
+        self.build_graph_types(&graph.graph, &inputcells, false);
+        // upstream: `self.complete_helpers()`.
+        self.complete_helpers();
+        // upstream: `return graph`.
+        Ok(graph)
+    }
 
     /// RPython `build_graph_types(self, flowgraph, inputcells,
     /// complete_now=True)` (annrpython.py:130-141).
@@ -498,6 +690,10 @@ impl RPythonAnnotator {
     /// ```
     pub fn complete_helpers(&self) {
         let saved = self.added_blocks.borrow_mut().replace(HashMap::new());
+        let _guard = AddedBlocksGuard {
+            ann: self,
+            saved: Some(saved),
+        };
         self.complete();
         // upstream annrpython.py:118 passes `block_subset=self.added_blocks`
         // unconditionally (the dict we seeded at line 117), so simplify
@@ -515,7 +711,6 @@ impl RPythonAnnotator {
             .cloned()
             .collect();
         self.simplify(Some(subset_blocks.as_slice()), None);
-        *self.added_blocks.borrow_mut() = saved;
     }
 
     /// RPython `using_policy(self, policy)` (annrpython.py:122-128).
@@ -553,9 +748,7 @@ impl RPythonAnnotator {
         if let Some((parent_graph, parent_block, parent_index)) = whence.clone() {
             // upstream: `self.translator.update_call_graph(parent_graph, graph, tag)`.
             let tag = (BlockKey::of(&parent_block), parent_index);
-            self.translator
-                .borrow()
-                .update_call_graph(&parent_graph, graph, tag);
+            self.translator.update_call_graph(&parent_graph, graph, tag);
             // upstream: `returnpositions = self.notify.setdefault(graph.returnblock, set())`
             let returnblock = graph.borrow().returnblock.clone();
             // upstream: `position_key = (parent_graph, parent_block,
@@ -607,7 +800,7 @@ impl RPythonAnnotator {
     pub fn gettype(&self, arg: &Hlvalue) -> super::model::KnownType {
         use super::model::{KnownType, SomeObjectTrait};
         match arg {
-            Hlvalue::Variable(v) => match v.annotation.as_ref() {
+            Hlvalue::Variable(v) => match v.annotation.borrow().as_ref() {
                 Some(rc) => (**rc).knowntype(),
                 None => KnownType::Object,
             },
@@ -688,7 +881,7 @@ impl RPythonAnnotator {
                 }
                 // upstream: `if op.result.annotation is None: break`.
                 if let super::super::flowspace::model::Hlvalue::Variable(v) = &op.result {
-                    if v.annotation.is_none() {
+                    if v.annotation.borrow().is_none() {
                         break;
                     }
                 }
@@ -735,9 +928,9 @@ impl RPythonAnnotator {
     /// ```
     ///
     /// The Rust port routes the fixpoint call through the bookkeeper's
-    /// `compute_at_fixpoint` and invokes `eliminate_empty_blocks` over
-    /// the translator's graph set. `perform_normalizations` remains a
-    /// no-op placeholder until `rpython/rtyper/normalizecalls.py` lands.
+    /// `compute_at_fixpoint`, invokes `eliminate_empty_blocks` over the
+    /// translator's graph set, and calls the normalizecalls driver on
+    /// the full-graph path.
     pub fn simplify(
         &self,
         block_subset: Option<&[BlockRef]>,
@@ -755,7 +948,7 @@ impl RPythonAnnotator {
         //           if graph:
         //               graphs[graph] = True
         let graphs: Vec<GraphRef> = match block_subset {
-            None => self.translator.borrow().graphs.borrow().clone(),
+            None => self.translator.graphs.borrow().clone(),
             Some(blocks) => {
                 let mut seen: HashMap<GraphKey, GraphRef> = HashMap::new();
                 let annotated = self.annotated.borrow();
@@ -776,8 +969,10 @@ impl RPythonAnnotator {
         // upstream: `self.bookkeeper.compute_at_fixpoint()`.
         self.bookkeeper.compute_at_fixpoint();
         // upstream: `if block_subset is None: perform_normalizations(self)`
-        // — perform_normalizations is rtyper-phase; deferred.
-        let _ = block_subset;
+        if block_subset.is_none() {
+            super::super::translator::rtyper::normalizecalls::perform_normalizations(self)
+                .unwrap_or_else(|err| panic!("perform_normalizations failed: {err}"));
+        }
     }
 
     /// RPython `apply_renaming(self, s_out, renaming)`
@@ -922,7 +1117,7 @@ impl RPythonAnnotator {
             }
             None => {
                 let got_blocked = self.annotated.borrow().values().any(|g| g.is_none());
-                let graphs: Vec<GraphRef> = self.translator.borrow().graphs.borrow().clone();
+                let graphs: Vec<GraphRef> = self.translator.graphs.borrow().clone();
                 (graphs, got_blocked)
             }
         };
@@ -960,12 +1155,12 @@ impl RPythonAnnotator {
         for graph in newgraphs {
             let returnvar = graph.borrow().getreturnvar();
             if let Hlvalue::Variable(v) = &returnvar {
-                if v.annotation.is_none() {
+                if v.annotation.borrow().is_none() {
                     // upstream: `self.setbinding(v, s_ImpossibleValue)`.
                     // `setbinding` mutates the variable; reach through
                     // the graph's startblock to find the mutable slot.
                     let sv = s_impossible_value();
-                    let graph_mut = graph.borrow_mut();
+                    let mut graph_mut = graph.borrow_mut();
                     let mut rb = graph_mut.returnblock.borrow_mut();
                     if let Hlvalue::Variable(vm) = &mut rb.inputargs[0] {
                         self.setbinding(vm, sv);
@@ -983,7 +1178,8 @@ impl RPythonAnnotator {
                 eb.inputargs[1].clone()
             };
             if let Hlvalue::Variable(v) = excvar {
-                if let Some(rc) = v.annotation.as_ref() {
+                let annotation = v.annotation.borrow();
+                if let Some(rc) = annotation.as_ref() {
                     if rc.can_be_none() {
                         panic!(
                             "AnnotatorError: {:?} is found by annotation to possibly raise None, \
@@ -1035,6 +1231,7 @@ impl RPythonAnnotator {
                 let Hlvalue::Variable(v) = a else { continue };
                 let s_old = v
                     .annotation
+                    .borrow()
                     .as_ref()
                     .map(|rc| (**rc).clone())
                     .expect("addpendingblock: fixed graph's inputarg lacks annotation");
@@ -1444,7 +1641,8 @@ impl RPythonAnnotator {
                     }
                     Some(Hlvalue::Variable(v)) => {
                         // `elif v_last_exc_type.annotation.is_constant(): s_out.const = v_last_exc_type.annotation.const`.
-                        if let Some(ann) = v.annotation.as_ref() {
+                        let annotation = v.annotation.borrow();
+                        if let Some(ann) = annotation.as_ref() {
                             if let SomeValue::TypeOf(t_prev) = ann.as_ref() {
                                 if let Some(c) = t_prev.base.const_box.as_ref() {
                                     if let SomeValue::TypeOf(t) = &mut s_out {
@@ -1539,6 +1737,7 @@ impl RPythonAnnotator {
             .map(|a| match a {
                 Hlvalue::Variable(v) => v
                     .annotation
+                    .borrow()
                     .as_ref()
                     .map(|rc| (**rc).clone())
                     .expect("mergeinputargs: inputarg lacks annotation"),
@@ -2011,6 +2210,7 @@ impl RPythonAnnotator {
             let knowntypedata: KnownTypeData = match exitswitch {
                 Some(Hlvalue::Variable(ref v)) => v
                     .annotation
+                    .borrow()
                     .as_ref()
                     .and_then(|rc| match rc.as_ref() {
                         SomeValue::Bool(b) => b.knowntypedata.clone(),
@@ -2174,7 +2374,7 @@ mod tests {
         let bound = {
             let blk = startblock.borrow();
             match &blk.inputargs[0] {
-                Hlvalue::Variable(v) => v.annotation.as_ref().map(|rc| (**rc).clone()),
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
                 _ => None,
             }
         };
@@ -2199,7 +2399,7 @@ mod tests {
         let bound = {
             let blk = startblock.borrow();
             match &blk.inputargs[0] {
-                Hlvalue::Variable(v) => v.annotation.as_ref().map(|rc| (**rc).clone()),
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
                 _ => None,
             }
         };
@@ -2260,6 +2460,47 @@ mod tests {
         // guard has been dropped.
         let _g2 = ann.using_policy(AnnotatorPolicy::new());
         drop(_g2);
+    }
+
+    #[test]
+    fn complete_helpers_restores_added_blocks_on_success() {
+        let translator = super::super::super::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let graph = mk_graph("saved", 0);
+        let block = graph.borrow().startblock.clone();
+        ann.added_blocks
+            .borrow_mut()
+            .replace(HashMap::from([(BlockKey::of(&block), block.clone())]));
+
+        ann.complete_helpers();
+
+        let restored = ann.added_blocks.borrow();
+        let restored = restored.as_ref().expect("added_blocks should be restored");
+        assert!(restored.contains_key(&BlockKey::of(&block)));
+    }
+
+    #[test]
+    fn complete_helpers_restores_added_blocks_on_panic() {
+        let translator = super::super::super::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let graph = mk_graph("saved", 0);
+        let block = graph.borrow().startblock.clone();
+        ann.added_blocks
+            .borrow_mut()
+            .replace(HashMap::from([(BlockKey::of(&block), block.clone())]));
+        ann.bookkeeper
+            .pending_specializations
+            .borrow_mut()
+            .push(Box::new(|| panic!("boom from pending_specializations")));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ann.complete_helpers();
+        }));
+        assert!(result.is_err(), "expected complete_helpers to panic");
+
+        let restored = ann.added_blocks.borrow();
+        let restored = restored.as_ref().expect("added_blocks should be restored");
+        assert!(restored.contains_key(&BlockKey::of(&block)));
     }
 
     #[test]
@@ -2331,7 +2572,7 @@ mod tests {
         // Integer binding (SomeInteger.pos on SomeInteger = SomeInteger).
         let blk = startblock.borrow();
         if let Hlvalue::Variable(v) = &blk.operations[0].result {
-            let sv = v.annotation.as_ref().map(|rc| (**rc).clone());
+            let sv = v.annotation.borrow().as_ref().map(|rc| (**rc).clone());
             assert!(matches!(sv, Some(SomeValue::Integer(_))), "got {:?}", sv);
         } else {
             panic!("op.result is not Variable");
@@ -2388,7 +2629,7 @@ mod tests {
         let bound = {
             let t = target.borrow();
             match &t.inputargs[0] {
-                Hlvalue::Variable(v) => v.annotation.as_ref().map(|rc| (**rc).clone()),
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
                 _ => None,
             }
         };
@@ -2436,7 +2677,7 @@ mod tests {
         let bound = {
             let t = target.borrow();
             match &t.inputargs[0] {
-                Hlvalue::Variable(v) => v.annotation.as_ref().map(|rc| (**rc).clone()),
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
                 _ => None,
             }
         };
@@ -2687,5 +2928,68 @@ mod tests {
         assert!(matches!(harmless, FlowinError::Harmless(_)));
         let annerr: FlowinError = AnnotatorError::new("oops").into();
         assert!(matches!(annerr, FlowinError::Annotator(_)));
+    }
+
+    #[test]
+    fn build_types_rejects_non_user_function() {
+        // Upstream: `assert isinstance(function, types.FunctionType),
+        // "fix that!"` (annrpython.py:76). Passing a class object is
+        // the most common accidental mis-call.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let cls =
+            super::super::super::flowspace::model::HostObject::new_class("pkg.Foo", Vec::new());
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = ann.build_types(&cls, &[], true, false);
+        }));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn translation_config_check_str_without_nul_round_trips_through_translator() {
+        // Minimal scaffolding test: the `TranslationConfig.translation`
+        // subfield added to back `build_types` annrpython.py:84-85 must
+        // be settable at construction and readable through
+        // `self.translator.config.translation.*`.
+        use crate::translator::translator::TranslationContext;
+        let mut translator = TranslationContext::new();
+        translator.config.translation.check_str_without_nul = true;
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        assert!(ann.translator.config.translation.check_str_without_nul);
+    }
+
+    #[test]
+    fn explicit_translator_does_not_install_translator_annotator_backref() {
+        use crate::translator::translator::TranslationContext;
+        let translator = TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        assert!(ann.translator.annotator().is_none());
+    }
+
+    #[test]
+    fn implicit_translator_installs_translator_annotator_backref() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let translator_ann = ann
+            .translator
+            .annotator()
+            .expect("implicit translator should point back to annotator");
+        assert!(Rc::ptr_eq(&translator_ann, &ann));
+    }
+
+    #[test]
+    fn get_call_parameters_rejects_non_function_desc() {
+        // Upstream calls `desc.get_call_parameters(args_s)` directly.
+        // Passing a class HostObject routes through `getdesc -> ClassDesc`,
+        // which does not define that method.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let cls =
+            super::super::super::flowspace::model::HostObject::new_class("pkg.Foo", Vec::new());
+        let err = ann.get_call_parameters(&cls, Vec::new()).unwrap_err();
+        assert!(
+            err.msg
+                .as_ref()
+                .map_or(false, |m| m.contains("has no get_call_parameters")),
+            "expected missing `get_call_parameters`, got {:?}",
+            err.msg
+        );
     }
 }

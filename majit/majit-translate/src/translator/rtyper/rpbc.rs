@@ -47,6 +47,8 @@ pub struct ConcreteCallTableRow {
     pub attrname: Option<String>,
 }
 
+type ConcreteCallTableRowRef = Rc<RefCell<ConcreteCallTableRow>>;
+
 impl ConcreteCallTableRow {
     /// RPython `ConcreteCallTableRow.from_row(cls, rtyper, row)`.
     pub fn from_row(rtyper: &RPythonTyper, row: &CallTableRow) -> Result<Self, TyperError> {
@@ -86,9 +88,9 @@ impl Eq for ConcreteCallTableRow {}
 #[derive(Clone, Debug, Default)]
 pub struct LLCallTable {
     /// Upstream `self.table` keyed by `(shape, index)`.
-    pub table: HashMap<(CallShape, usize), Rc<RefCell<ConcreteCallTableRow>>>,
+    pub table: HashMap<(CallShape, usize), ConcreteCallTableRowRef>,
     /// Upstream `self.uniquerows`.
-    pub uniquerows: Vec<Rc<RefCell<ConcreteCallTableRow>>>,
+    pub uniquerows: Vec<ConcreteCallTableRowRef>,
 }
 
 impl LLCallTable {
@@ -159,12 +161,8 @@ pub fn build_concrete_calltable(
 
     for ((shape, index), row) in concreterows {
         let (existingindex, biggerrow) = llct.lookup(&row).expect("row must exist in LLCallTable");
-        let canonical_row = llct.uniquerows[existingindex].clone();
+        let canonical_row = Rc::clone(&llct.uniquerows[existingindex]);
         assert!(biggerrow == *canonical_row.borrow());
-        // Store the shared canonical row, not a snapshot clone: upstream
-        // `llct.table[(shape, index)] = row` aliases the same row object
-        // later decorated with `attrname`, so the Rust port must preserve
-        // that visibility through the `Rc<RefCell<_>>`.
         llct.table.insert((shape, index), canonical_row);
     }
 
@@ -410,12 +408,16 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut arg_var = FlowVariable::named("x");
         arg_var.concretetype = Some(LowLevelType::Signed);
-        arg_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        arg_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
         let arg = FlowHlvalue::Variable(arg_var);
         let startblock = FlowBlock::shared(vec![arg.clone()]);
         let mut ret_var = FlowVariable::new();
         ret_var.concretetype = Some(LowLevelType::Void);
-        ret_var.annotation = Some(Rc::new(SomeValue::Impossible));
+        ret_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Impossible)));
         let graph = FlowFunctionGraph::with_return_var(
             name,
             startblock.clone(),
@@ -495,6 +497,26 @@ mod tests {
         assert_eq!(merged.attrname, None);
         assert_eq!(llct.table.len(), 2);
         assert_eq!(llct.table.values().next().unwrap().borrow().row.len(), 3);
+    }
+
+    #[test]
+    fn build_concrete_calltable_table_rows_alias_uniquerows() {
+        let (_ann, rtyper) = make_rtyper();
+        let mut family = CallFamily::new(DescKey(1));
+        let mut row0 = CallTableRow::new();
+        row0.insert(DescKey(10), make_pygraph("a"));
+        family.calltables.insert(
+            CallShape {
+                shape_cnt: 1,
+                shape_keys: Vec::new(),
+                shape_star: false,
+            },
+            vec![row0],
+        );
+
+        let llct = build_concrete_calltable(&rtyper, &family).unwrap();
+        let shared = llct.table.values().next().expect("table row missing");
+        assert!(Rc::ptr_eq(shared, &llct.uniquerows[0]));
     }
 
     #[test]
@@ -605,10 +627,10 @@ mod tests {
             None,
         )));
         let cached_graph = make_pygraph("f_graph");
-        fd.borrow()
-            .cache
-            .borrow_mut()
-            .insert(String::new(), cached_graph.clone());
+        fd.borrow().cache.borrow_mut().insert(
+            crate::annotator::description::GraphCacheKey::None,
+            cached_graph.clone(),
+        );
         let args = ArgumentsForTranslation::new(
             vec![SomeValue::Integer(SomeInteger::default())],
             None,

@@ -178,11 +178,11 @@ impl LowLevelType {
             | LowLevelType::Unsigned
             | LowLevelType::SignedLongLong
             | LowLevelType::UnsignedLongLong => matches!(value, ConstValue::Int(_)),
-            // upstream `_contains_value()` checks `typeOf(value)`, so the
-            // three float widths remain distinct.
-            LowLevelType::Float => matches!(value, ConstValue::Float(_)),
-            LowLevelType::SingleFloat => matches!(value, ConstValue::SingleFloat(_)),
-            LowLevelType::LongFloat => matches!(value, ConstValue::LongFloat(_)),
+            // upstream `Float` / `SingleFloat` / `LongFloat` accept
+            // Python `float`.
+            LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
+                matches!(value, ConstValue::Float(_))
+            }
             // upstream `Char` accepts a single-byte Python str; pyre
             // represents both as `ConstValue::Str` so additional length
             // validation belongs to convert_const callers (rmodel.py
@@ -2426,12 +2426,11 @@ mod tests {
         assert!(LowLevelType::SignedLongLong.contains_value(&ConstValue::Int(42)));
         assert!(!LowLevelType::Signed.contains_value(&ConstValue::Bool(true)));
 
-        // RPython `_contains_value()` compares the primitive width coming
-        // back from `typeOf(value)`.
+        // RPython `Float` / `SingleFloat` / `LongFloat` accept Python float.
+        // pyre stores floats as u64 bit-patterns in ConstValue::Float.
         assert!(LowLevelType::Float.contains_value(&ConstValue::Float(0)));
-        assert!(LowLevelType::SingleFloat.contains_value(&ConstValue::single_float(0.0)));
-        assert!(LowLevelType::LongFloat.contains_value(&ConstValue::long_float(0.0)));
-        assert!(!LowLevelType::Float.contains_value(&ConstValue::single_float(0.0)));
+        assert!(LowLevelType::SingleFloat.contains_value(&ConstValue::Float(0)));
+        assert!(LowLevelType::LongFloat.contains_value(&ConstValue::Float(0)));
         assert!(!LowLevelType::Float.contains_value(&ConstValue::Int(0)));
     }
 

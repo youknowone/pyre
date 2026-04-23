@@ -2,11 +2,13 @@
 //!
 //! RPython upstream: `rpython/rtyper/normalizecalls.py` (414 LOC, of
 //! which lines 14-204 cover the normalize_* half that this module ports).
-//! The later halves (`merge_classpbc_getattr_into_classdef`,
+//! The later class/PBC halves (`merge_classpbc_getattr_into_classdef`,
 //! `create_class_constructors`, `create_instantiate_functions`,
-//! `assign_inheritance_ids`, `perform_normalizations`) land with the
-//! rtyper specialization epic; they depend on `rpython/rtyper/rclass.py`
-//! infrastructure that pyre still has as scaffolding only.
+//! `assign_inheritance_ids`) land with the rtyper specialization epic;
+//! they depend on `rpython/rtyper/rclass.py` infrastructure that pyre
+//! still has as scaffolding only. [`perform_normalizations`] is present
+//! as the driver entry point and runs the call-family half that is
+//! ported in this module.
 //!
 //! ## What is ported here (upstream lines 14-204)
 //!
@@ -94,6 +96,35 @@ pub fn normalize_call_familes(annotator: &RPythonAnnotator) -> Result<(), Annota
         cf.modified = false;
     }
     Ok(())
+}
+
+/// RPython `perform_normalizations(annotator)` (normalizecalls.py:404-413).
+///
+/// The current Rust port wires the driver entry point to the ported
+/// call-family normalization pass. The class-constructor, class-PBC,
+/// inheritance-id, and instantiate-function phases still depend on
+/// rclass infrastructure that is not in this tree yet.
+pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), AnnotatorError> {
+    struct FrozenGuard<'a> {
+        annotator: &'a RPythonAnnotator,
+        saved: bool,
+    }
+
+    impl<'a> Drop for FrozenGuard<'a> {
+        fn drop(&mut self) {
+            *self.annotator.frozen.borrow_mut() = self.saved;
+        }
+    }
+
+    // Upstream increments `annotator.frozen` around the middle
+    // normalization section and restores it in `finally`. Rust models
+    // the field as a bool, so preserve the old value for nested callers.
+    let old_frozen = std::mem::replace(&mut *annotator.frozen.borrow_mut(), true);
+    let _guard = FrozenGuard {
+        annotator,
+        saved: old_frozen,
+    };
+    normalize_call_familes(annotator)
 }
 
 /// RPython `normalize_calltable(annotator, callfamily)`
@@ -257,7 +288,6 @@ pub(crate) fn raise_call_table_too_complex_error(
                 .collect();
             let mut callers: Vec<String> = annotator
                 .translator
-                .borrow()
                 .callgraph
                 .borrow()
                 .values()
@@ -675,11 +705,8 @@ mod tests {
             Block::shared(vec![]),
         )));
         let caller_block = caller.borrow().startblock.clone();
-        ann.translator.borrow().update_call_graph(
-            &caller,
-            &callee.graph,
-            (BlockKey::of(&caller_block), 0),
-        );
+        ann.translator
+            .update_call_graph(&caller, &callee.graph, (BlockKey::of(&caller_block), 0));
 
         let fake_desc = DescKey(1);
         let mut fam = CallFamily::new(fake_desc);
@@ -696,6 +723,32 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("the callers of these functions are:"));
         assert!(msg.contains("    caller"));
+    }
+
+    #[test]
+    fn perform_normalizations_runs_call_family_pass_and_restores_frozen() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let desc = DescKey(123);
+        let family = {
+            let mut families = ann.bookkeeper.pbc_maximal_call_families.borrow_mut();
+            families.find_rep(desc);
+            families
+                .get_mut(&desc)
+                .expect("family should be materialized")
+                .clone()
+        };
+        {
+            let mut fam = family.borrow_mut();
+            fam.modified = true;
+            fam.normalized = false;
+        }
+
+        perform_normalizations(&ann).expect("normalization should succeed");
+
+        assert!(!*ann.frozen.borrow(), "frozen flag must be restored");
+        let fam = family.borrow();
+        assert!(fam.normalized);
+        assert!(!fam.modified);
     }
 
     #[test]

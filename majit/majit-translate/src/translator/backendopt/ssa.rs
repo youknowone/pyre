@@ -545,7 +545,7 @@ pub fn ssa_to_ssi(
         let variables_created = variables_created_in(&block);
         let mut seen: HashSet<Hlvalue> = variables_created.clone();
         let mut variables_used: Vec<Hlvalue> = Vec::new();
-        let record_used_var =
+        let mut record_used_var =
             |v: Option<&Hlvalue>, seen: &mut HashSet<Hlvalue>, used: &mut Vec<Hlvalue>| {
                 if let Some(vv) = v {
                     if !seen.contains(vv) {
@@ -655,6 +655,8 @@ mod tests {
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Link, SpaceOperation,
     };
+    use std::cell::RefCell;
+
     fn mk_graph_start_to_block(name: &str, block: BlockRef) -> FunctionGraph {
         FunctionGraph::new(name, block)
     }

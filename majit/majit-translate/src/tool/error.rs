@@ -185,9 +185,7 @@ fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
         ),
         SomeValue::None_(_) => "SomeNone()".into(),
         SomeValue::Property(_) => "SomeProperty()".into(),
-        // RPython `SomePtr(ll_ptrtype)` (`rpython/rtyper/llannotation.py:29`) —
-        // render as `SomePtr(T)` mirroring upstream.
-        SomeValue::Ptr(p) => format!("SomePtr({})", p.ll_ptrtype._to_short_name()),
+        SomeValue::Ptr(_) => "SomePtr(...)".into(),
         SomeValue::InteriorPtr(_) => "SomeInteriorPtr(...)".into(),
         SomeValue::LLADTMeth(_) => "SomeLLADTMeth(...)".into(),
         SomeValue::Builtin(_) => "SomeBuiltin()".into(),
@@ -747,7 +745,7 @@ mod tests {
         let desc = ann.bookkeeper.getdesc(&func_host).unwrap();
         let pbc = SomeValue::PBC(SomePBC::new(vec![desc], false));
         let mut v_func = Variable::named("v_func");
-        v_func.annotation = Some(Rc::new(pbc));
+        v_func.annotation.replace(Some(Rc::new(pbc)));
         let oper = crate::flowspace::model::SpaceOperation::new(
             "simple_call",
             vec![Hlvalue::Variable(v_func)],
@@ -771,9 +769,9 @@ mod tests {
     fn format_annotations_uses_upstream_style_somevalue_rendering() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let mut v = Variable::named("v0");
-        v.annotation = Some(Rc::new(SomeValue::Integer(
+        v.annotation.replace(Some(Rc::new(SomeValue::Integer(
             crate::annotator::model::SomeInteger::new(true, false),
-        )));
+        ))));
         let oper = crate::flowspace::model::SpaceOperation::new(
             "same_as",
             vec![Hlvalue::Variable(v.clone())],

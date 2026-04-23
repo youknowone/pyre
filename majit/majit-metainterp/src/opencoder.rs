@@ -3554,6 +3554,29 @@ mod tests {
         assert_eq!(unpacked, vec![expected_0, expected_1]);
     }
 
+    /// `_encode_smallint` must preserve the sign bit so TAGINT decode
+    /// through `ByteTraceIter::_untag` round-trips negative values like
+    /// Python's arithmetic shift in opencoder.py.
+    #[test]
+    fn test_encode_smallint_preserves_negative_sign() {
+        let mut buf = TraceRecordBuffer::new(1, empty_sd());
+        let _ = buf.record_input_arg(Type::Int);
+        let _ = buf.record_op2(OpCode::IntAdd, Box::ResOp(0), Box::ConstInt(-7), None);
+
+        let mut pool = crate::constant_pool::ConstantPool::new();
+        let mut it = ByteTraceIter::new_with_pool(
+            &buf,
+            buf._start as usize,
+            buf._pos,
+            buf.max_num_inputargs,
+            Some(&mut pool),
+        );
+        let op = it.next().expect("one op");
+        let const_arg = op.args[1];
+        drop(it);
+        assert_eq!(pool.get_value(const_arg), Some(majit_ir::Value::Int(-7)));
+    }
+
     /// Phase B11: `tracing_done()` returns `Err(AbortReason::TooLong)`
     /// iff `tag_overflow` was tripped while recording, and clears the
     /// dedup dictionaries on success (opencoder.py:546-562).

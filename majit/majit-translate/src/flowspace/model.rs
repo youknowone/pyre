@@ -1621,11 +1621,6 @@ pub enum ConstValue {
     /// `Eq`). Use `ConstValue::float(value)` / `ConstValue::as_float()`
     /// to convert.
     Float(u64),
-    /// RPython `r_singlefloat` constant, carried as IEEE754 `f32`
-    /// bit-pattern.
-    SingleFloat(u32),
-    /// RPython `r_longfloat` constant.
-    LongFloat(LongFloatValue),
     /// Python dict constant. Mirrors upstream `Constant(dict)` and is
     /// used both for `func.__globals__` and optimizer rewrites like
     /// `transform_list_contains`.
@@ -1686,8 +1681,6 @@ impl PartialEq for ConstValue {
             (ConstValue::Placeholder, ConstValue::Placeholder) => true,
             (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
-            (ConstValue::SingleFloat(a), ConstValue::SingleFloat(b)) => a == b,
-            (ConstValue::LongFloat(a), ConstValue::LongFloat(b)) => a == b,
             (ConstValue::Dict(a), ConstValue::Dict(b)) => a == b,
             (ConstValue::Str(a), ConstValue::Str(b)) => a == b,
             (ConstValue::Tuple(a), ConstValue::Tuple(b)) => a == b,
@@ -1713,68 +1706,6 @@ impl PartialEq for ConstValue {
 
 impl Eq for ConstValue {}
 
-/// RPython `class r_longfloat(object)` (`rarithmetic.py:674-699`).
-///
-/// Upstream `Constant.value` stores the wrapper object itself, not a raw
-/// primitive. Modeling `r_longfloat` as an identity-bearing heap object
-/// matters for Hashable-style constant/dict-key semantics: the same
-/// wrapper instance behaves like the same Python object, while two fresh
-/// `r_longfloat(float('nan'))` objects do not share dict-key behavior.
-#[derive(Debug)]
-struct LongFloatObject {
-    value: f64,
-}
-
-/// Flow-space carrier for upstream `r_longfloat` objects.
-#[derive(Clone, Debug)]
-pub struct LongFloatValue {
-    inner: Arc<LongFloatObject>,
-}
-
-impl LongFloatValue {
-    pub fn new(value: f64) -> Self {
-        LongFloatValue {
-            inner: Arc::new(LongFloatObject { value }),
-        }
-    }
-
-    pub fn as_f64(&self) -> f64 {
-        self.inner.value
-    }
-
-    fn hashable_value_bits(&self) -> Option<u64> {
-        let value = self.as_f64();
-        if value.is_nan() {
-            None
-        } else if value == 0.0 {
-            Some(0.0f64.to_bits())
-        } else {
-            Some(value.to_bits())
-        }
-    }
-
-    fn identity(&self) -> usize {
-        Arc::as_ptr(&self.inner) as usize
-    }
-}
-
-impl PartialEq for LongFloatValue {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner) || self.as_f64() == other.as_f64()
-    }
-}
-
-impl Eq for LongFloatValue {}
-
-impl Hash for LongFloatValue {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self.hashable_value_bits() {
-            Some(bits) => bits.hash(state),
-            None => self.identity().hash(state),
-        }
-    }
-}
-
 impl std::fmt::Display for ConstValue {
     /// RPython `Constant.__repr__` prints the wrapped Python value via
     /// `repr()`; pyre renders the simple leaf variants directly and
@@ -1785,8 +1716,6 @@ impl std::fmt::Display for ConstValue {
             ConstValue::Placeholder => f.write_str("<placeholder>"),
             ConstValue::Int(value) => write!(f, "{value}"),
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
-            ConstValue::SingleFloat(bits) => write!(f, "{}", f32::from_bits(*bits)),
-            ConstValue::LongFloat(value) => write!(f, "r_longfloat({})", value.as_f64()),
             ConstValue::Str(value) => write!(f, "{value:?}"),
             ConstValue::Bool(value) => write!(f, "{value}"),
             ConstValue::None => f.write_str("None"),
@@ -1811,8 +1740,6 @@ impl Hash for ConstValue {
             ConstValue::Placeholder => {}
             ConstValue::Int(value) => value.hash(state),
             ConstValue::Float(bits) => bits.hash(state),
-            ConstValue::SingleFloat(bits) => bits.hash(state),
-            ConstValue::LongFloat(value) => value.hash(state),
             ConstValue::Dict(items) => {
                 // HashMap iteration order is nondeterministic; hash
                 // each entry independently and sort the resulting
@@ -1903,18 +1830,40 @@ fn alloc_var_id() -> u64 {
 /// RPython `flowspace/model.py:279` — `class Variable`.
 ///
 /// `__slots__ = ["_name", "_nr", "annotation", "concretetype"]`.
+///
+/// Upstream Python relies on object-identity for mutable attribute
+/// sharing — setting `v.annotation = s` on one reference is observed
+/// by every other reference to the same Python object. The Rust port
+/// approximates this by wrapping the mutable-per-identity fields
+/// (`_nr`, `annotation`) in `Rc<_>` so `Variable::clone()` (which
+/// preserves identity, per upstream's "no language-level clone" model)
+/// Rc-shares them across clones. Fresh identities go through
+/// [`Variable::new`] / [`Variable::named`] / [`Variable::copy`], each
+/// of which allocates independent cells.
+///
+/// PRE-EXISTING-ADAPTATION: This Rc-sharing is a minimal Rust-language
+/// adaptation for the unavoidable gap between Python's attribute-on-
+/// object model and Rust's value-type struct. CLAUDE.md permits it
+/// because the alternative (lossy per-clone-slot `annotation`) breaks
+/// annotator correctness — see `test_variable_identity_diagnostic.rs`
+/// and plan `~/.claude/plans/annotator-monomorphization-tier1-abstract-
+/// lake.md` "Feasibility probe findings".
 #[derive(Debug)]
 pub struct Variable {
     /// Identity key. See `NEXT_VAR_ID` — RPython uses object
     /// identity; Rust approximates with a process-wide increment.
     id: u64,
     _name: String,
-    _nr: std::cell::Cell<i64>,
+    /// Lazy numbering counter (upstream `Variable._nr`). Shared
+    /// across clones so `name()` is stable per identity.
+    _nr: Rc<std::cell::Cell<i64>>,
     /// RPython `Variable.annotation` (set by the annotator). Holds a
     /// shared [`SomeValue`] handle once the annotator binds the
     /// variable — upstream Python uses reference semantics so one
-    /// lattice instance can back many `Variable`s.
-    pub annotation: Option<Rc<SomeValue>>,
+    /// lattice instance can back many `Variable`s. The
+    /// `Rc<RefCell<...>>` wrapper makes `setbinding(v1)` observable
+    /// via every clone `v2` with the same identity.
+    pub annotation: Rc<std::cell::RefCell<Option<Rc<SomeValue>>>>,
     /// RPython `Variable.concretetype` (set by the rtyper).
     pub concretetype: Option<ConcretetypePlaceholder>,
 }
@@ -1924,13 +1873,15 @@ impl Clone for Variable {
     // code that stores a `Variable` in a Vec and later reuses the
     // "same" Variable relies on identity being preserved. `clone`
     // in Rust therefore aliases the identity; use `copy()` for
-    // RPython `Variable.copy` semantics.
+    // RPython `Variable.copy` semantics (new identity). The
+    // `_nr` / `annotation` cells Rc-share across clones so they act
+    // as if attached to the upstream Python object.
     fn clone(&self) -> Self {
         Variable {
             id: self.id,
             _name: self._name.clone(),
-            _nr: std::cell::Cell::new(self._nr.get()),
-            annotation: self.annotation.clone(),
+            _nr: Rc::clone(&self._nr),
+            annotation: Rc::clone(&self.annotation),
             concretetype: self.concretetype.clone(),
         }
     }
@@ -1959,8 +1910,8 @@ impl Variable {
         Variable {
             id: alloc_var_id(),
             _name: DUMMYNAME.to_owned(),
-            _nr: std::cell::Cell::new(-1),
-            annotation: None,
+            _nr: Rc::new(std::cell::Cell::new(-1)),
+            annotation: Rc::new(std::cell::RefCell::new(None)),
             concretetype: None,
         }
     }
@@ -2079,13 +2030,16 @@ impl Variable {
     /// fresh identity, preserving name prefix, annotation, and
     /// concretetype.
     pub fn copy(&self) -> Self {
-        // `Variable::new()` allocates a fresh id; we then overwrite
-        // the prefix with the source's _name, matching RPython's
-        // `Variable(v)` path that copies the prefix via `rename`.
+        // `Variable::new()` allocates a fresh id *and* fresh _nr /
+        // annotation cells (new identity). We overwrite the prefix
+        // with the source's _name, matching RPython's `Variable(v)`
+        // path that copies the prefix via `rename`. Annotation is
+        // copied by VALUE into the new cell — sharing the source's
+        // Rc would alias mutable state across independent identities.
         let mut newvar = Variable::new();
         newvar._name = self._name.clone();
         newvar._nr.set(-1);
-        newvar.annotation = self.annotation.clone();
+        *newvar.annotation.borrow_mut() = self.annotation.borrow().clone();
         newvar.concretetype = self.concretetype.clone();
         newvar
     }
@@ -2209,8 +2163,6 @@ impl Constant {
         match value {
             ConstValue::Int(_)
             | ConstValue::Float(_)
-            | ConstValue::SingleFloat(_)
-            | ConstValue::LongFloat(_)
             | ConstValue::Bool(_)
             | ConstValue::Str(_)
             | ConstValue::None
@@ -2285,16 +2237,6 @@ impl ConstValue {
         ConstValue::Float(value.to_bits())
     }
 
-    /// Wrap an `f32` into the bit-preserving `SingleFloat` variant.
-    pub fn single_float(value: f32) -> Self {
-        ConstValue::SingleFloat(value.to_bits())
-    }
-
-    /// Wrap an `f64` into the `LongFloat` variant.
-    pub fn long_float(value: f64) -> Self {
-        ConstValue::LongFloat(LongFloatValue::new(value))
-    }
-
     /// Unwrap a `Float` variant back to `f64`. Returns `None` for
     /// other variants.
     pub fn as_float(&self) -> Option<f64> {
@@ -2313,7 +2255,6 @@ impl ConstValue {
             // Python `bool(float)` is `float != 0.0` (including -0.0
             // which equals 0.0 under IEEE 754).
             ConstValue::Float(bits) => Some(f64::from_bits(*bits) != 0.0),
-            ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => None,
             ConstValue::Dict(items) => Some(!items.is_empty()),
             ConstValue::Str(s) => Some(!s.is_empty()),
             ConstValue::Tuple(items) | ConstValue::List(items) => Some(!items.is_empty()),
@@ -2828,7 +2769,7 @@ impl Block {
     /// result).
     pub fn getvariables(&self) -> Vec<Variable> {
         let mut result: Vec<Variable> = Vec::new();
-        let push_var = |w: &Hlvalue, result: &mut Vec<Variable>| {
+        let mut push_var = |w: &Hlvalue, result: &mut Vec<Variable>| {
             if let Hlvalue::Variable(v) = w {
                 if !result.iter().any(|x| x == v) {
                     result.push(v.clone());
@@ -2851,7 +2792,7 @@ impl Block {
     /// in this block (inputargs + every op's args).
     pub fn getconstants(&self) -> Vec<Constant> {
         let mut result: Vec<Constant> = Vec::new();
-        let push_const = |w: &Hlvalue, result: &mut Vec<Constant>| {
+        let mut push_const = |w: &Hlvalue, result: &mut Vec<Constant>| {
             if let Hlvalue::Constant(c) = w {
                 if !result.iter().any(|x| x == c) {
                     result.push(c.clone());
@@ -3810,14 +3751,15 @@ mod tests {
         use crate::annotator::model::{SomeInteger, SomeValue};
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut v = Variable::new();
-        v.annotation = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        v.annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::default()))));
         v.concretetype = Some(LowLevelType::Signed);
         let c = v.copy();
-        let ca = c.annotation.as_ref().unwrap();
-        let va = v.annotation.as_ref().unwrap();
+        let ca = c.annotation.borrow().as_ref().unwrap().clone();
+        let va = v.annotation.borrow().as_ref().unwrap().clone();
         // Rc shares the same allocation — identity preserved per
         // RPython parity (copy keeps reference to the same SomeValue).
-        assert!(Rc::ptr_eq(ca, va));
+        assert!(Rc::ptr_eq(&ca, &va));
         assert_eq!(c.concretetype, v.concretetype);
     }
 
@@ -3894,41 +3836,6 @@ mod tests {
             ConstValue::LLPtr(Box::new(nonnull_ptr)).truthy(),
             Some(true)
         );
-    }
-
-    #[test]
-    fn singlefloat_and_longfloat_truthiness_are_not_folded() {
-        assert_eq!(ConstValue::single_float(1.0).truthy(), None);
-        assert_eq!(ConstValue::long_float(1.0).truthy(), None);
-    }
-
-    #[test]
-    fn longfloat_constants_compare_hash_like_wrapped_float_values() {
-        let pos_zero = ConstValue::long_float(0.0);
-        let neg_zero = ConstValue::long_float(-0.0);
-        let hash_of = |value: &ConstValue| {
-            let mut h = DefaultHasher::new();
-            value.hash(&mut h);
-            h.finish()
-        };
-        assert_eq!(pos_zero, neg_zero);
-        assert_eq!(hash_of(&pos_zero), hash_of(&neg_zero));
-    }
-
-    #[test]
-    fn longfloat_nan_constants_preserve_object_identity() {
-        let same = ConstValue::long_float(f64::NAN);
-        let same_clone = same.clone();
-        let fresh = ConstValue::long_float(f64::NAN);
-        let hash_of = |value: &ConstValue| {
-            let mut h = DefaultHasher::new();
-            value.hash(&mut h);
-            h.finish()
-        };
-
-        assert_eq!(same, same_clone);
-        assert_eq!(hash_of(&same), hash_of(&same_clone));
-        assert_ne!(same, fresh);
     }
 
     #[test]

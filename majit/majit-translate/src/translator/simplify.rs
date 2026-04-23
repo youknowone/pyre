@@ -645,6 +645,14 @@ pub fn transform_dead_op_vars_in_blocks(
             .expect("single-graph transform_dead_op_vars_in_blocks needs startblock");
         start_blocks.insert(BlockKey::of(&single_graph_startblock));
         start_blocks
+    } else if blocks.is_empty() {
+        // upstream: `{translator.annotator.annotated[block].startblock
+        // for block in blocks}` is a lazy set comprehension — when
+        // `blocks` is empty the comprehension never dereferences
+        // `translator.annotator`. `complete_helpers()` reaches this
+        // branch whenever `complete()` added no fresh blocks, so it
+        // must be a silent no-op instead of a panic.
+        HashSet::new()
     } else {
         let translator =
             translator.expect("multi-graph transform_dead_op_vars_in_blocks needs translator");
@@ -1988,6 +1996,526 @@ pub fn transform_ovfcheck(graph: &FunctionGraph) {
     }
 }
 
+fn is_stop_iteration_exitcase(exitcase: Option<&Hlvalue>) -> bool {
+    let stop_iteration = HOST_ENV
+        .lookup_builtin("StopIteration")
+        .expect("HOST_ENV missing StopIteration");
+    matches!(
+        exitcase,
+        Some(Hlvalue::Constant(Constant {
+            value: ConstValue::HostObject(obj),
+            ..
+        })) if obj == &stop_iteration
+    )
+}
+
+struct ListComprehensionDetector<'a> {
+    graph: &'a FunctionGraph,
+    loops: Vec<(BlockRef, BlockRef, Hlvalue)>,
+    newlist_v: HashMap<Hlvalue, BlockRef>,
+    variable_families: &'a mut crate::tool::algo::unionfind::UnionFind<Hlvalue, ()>,
+    reachable_cache: HashMap<(BlockKey, BlockKey, BlockKey), bool>,
+    vmeth: Hlvalue,
+    vlistfamily: Hlvalue,
+    vlistcone: HashMap<BlockKey, bool>,
+    escapes: HashMap<BlockKey, bool>,
+}
+
+impl<'a> ListComprehensionDetector<'a> {
+    fn enum_blocks_with_vlist_from(
+        &mut self,
+        fromblock: &BlockRef,
+        avoid: &BlockRef,
+    ) -> Vec<BlockRef> {
+        let mut found: HashSet<BlockKey> = HashSet::from([BlockKey::of(avoid)]);
+        let mut pending = vec![fromblock.clone()];
+        let mut result = Vec::new();
+        while let Some(block) = pending.pop() {
+            let block_key = BlockKey::of(&block);
+            if found.contains(&block_key) {
+                continue;
+            }
+            if !self.vlist_alive(&block) {
+                continue;
+            }
+            result.push(block.clone());
+            found.insert(block_key);
+            for exit in block.borrow().exits.iter() {
+                if let Some(target) = exit.borrow().target.clone() {
+                    pending.push(target);
+                }
+            }
+        }
+        result
+    }
+
+    fn enum_reachable_blocks(
+        &mut self,
+        fromblock: &BlockRef,
+        stop_at: &BlockRef,
+        stay_within: Option<&HashSet<BlockKey>>,
+    ) -> Vec<BlockRef> {
+        if BlockKey::of(fromblock) == BlockKey::of(stop_at) {
+            return Vec::new();
+        }
+        let mut found: HashSet<BlockKey> = HashSet::from([BlockKey::of(stop_at)]);
+        let mut pending = vec![fromblock.clone()];
+        let mut result = Vec::new();
+        while let Some(block) = pending.pop() {
+            let block_key = BlockKey::of(&block);
+            if found.contains(&block_key) {
+                continue;
+            }
+            found.insert(block_key);
+            for exit in block.borrow().exits.iter() {
+                let Some(target) = exit.borrow().target.clone() else {
+                    continue;
+                };
+                let target_key = BlockKey::of(&target);
+                if stay_within.is_none_or(|blocks| blocks.contains(&target_key)) {
+                    result.push(target.clone());
+                    pending.push(target);
+                }
+            }
+        }
+        result
+    }
+
+    fn reachable_within(
+        &mut self,
+        fromblock: &BlockRef,
+        toblock: &BlockRef,
+        avoid: &BlockRef,
+        stay_within: &HashSet<BlockKey>,
+    ) -> bool {
+        if BlockKey::of(toblock) == BlockKey::of(avoid) {
+            return false;
+        }
+        self.enum_reachable_blocks(fromblock, avoid, Some(stay_within))
+            .into_iter()
+            .any(|block| BlockKey::of(&block) == BlockKey::of(toblock))
+    }
+
+    fn reachable(&mut self, fromblock: &BlockRef, toblock: &BlockRef, avoid: &BlockRef) -> bool {
+        let to_key = BlockKey::of(toblock);
+        let avoid_key = BlockKey::of(avoid);
+        if to_key == avoid_key {
+            return false;
+        }
+        let from_key = BlockKey::of(fromblock);
+        if let Some(result) =
+            self.reachable_cache
+                .get(&(from_key.clone(), to_key.clone(), avoid_key.clone()))
+        {
+            return *result;
+        }
+        let mut future = vec![fromblock.clone()];
+        for block in self.enum_reachable_blocks(fromblock, avoid, None) {
+            self.reachable_cache.insert(
+                (from_key.clone(), BlockKey::of(&block), avoid_key.clone()),
+                true,
+            );
+            if BlockKey::of(&block) == to_key {
+                return true;
+            }
+            future.push(block);
+        }
+        for block in future {
+            self.reachable_cache.insert(
+                (BlockKey::of(&block), to_key.clone(), avoid_key.clone()),
+                false,
+            );
+        }
+        false
+    }
+
+    fn contains_vlist_values(&mut self, args: &[Hlvalue]) -> Option<Hlvalue> {
+        for arg in args {
+            if self.variable_families.find_rep(arg.clone()) == self.vlistfamily {
+                return Some(arg.clone());
+            }
+        }
+        None
+    }
+
+    fn contains_vlist_linkargs(&mut self, args: &[Option<Hlvalue>]) -> Option<Hlvalue> {
+        for arg in args {
+            let Some(arg) = arg else {
+                continue;
+            };
+            if self.variable_families.find_rep(arg.clone()) == self.vlistfamily {
+                return Some(arg.clone());
+            }
+        }
+        None
+    }
+
+    fn vlist_alive(&mut self, block: &BlockRef) -> bool {
+        let key = BlockKey::of(block);
+        if let Some(result) = self.vlistcone.get(&key) {
+            return *result;
+        }
+        let inputargs = block.borrow().inputargs.clone();
+        let result = self.contains_vlist_values(&inputargs).is_some();
+        self.vlistcone.insert(key, result);
+        result
+    }
+
+    fn vlist_escapes(&mut self, block: &BlockRef) -> bool {
+        let key = BlockKey::of(block);
+        if let Some(result) = self.escapes.get(&key) {
+            return *result;
+        }
+        let operations = block.borrow().operations.clone();
+        let result = operations.iter().any(|op| {
+            if op.result == self.vmeth {
+                return false;
+            }
+            if op.opname == "getitem" {
+                return false;
+            }
+            self.contains_vlist_values(&op.args).is_some()
+        });
+        self.escapes.insert(key, result);
+        result
+    }
+
+    fn run(&mut self, vlist: Hlvalue, vmeth: Hlvalue, appendblock: BlockRef) -> Result<(), ()> {
+        let append_ops = appendblock.borrow().operations.clone();
+        for hlop in &append_ops {
+            if hlop.opname == "simple_call" && hlop.args.first() == Some(&vmeth) {
+                continue;
+            }
+            if hlop.args.iter().any(|arg| arg == &vmeth) {
+                return Err(());
+            }
+        }
+        for link in appendblock.borrow().exits.iter() {
+            if link
+                .borrow()
+                .args
+                .iter()
+                .any(|arg| arg.as_ref() == Some(&vmeth))
+            {
+                return Err(());
+            }
+        }
+
+        self.vmeth = vmeth;
+        self.vlistfamily = self.variable_families.find_rep(vlist);
+        let newlistblock = self
+            .newlist_v
+            .get(&self.vlistfamily)
+            .cloned()
+            .expect("newlist family must exist");
+        self.vlistcone = HashMap::from([(BlockKey::of(&newlistblock), true)]);
+        self.escapes = HashMap::from([
+            (BlockKey::of(&self.graph.returnblock), true),
+            (BlockKey::of(&self.graph.exceptblock), true),
+        ]);
+
+        let (loopnextblock, iterblock, viterfamily, loopbody, stopblocks, exactlength) = {
+            let mut accepted = None;
+            let loops = self.loops.clone();
+            for (loopnextblock, iterblock, viterfamily) in loops {
+                if !self.vlist_alive(&loopnextblock) {
+                    continue;
+                }
+                if self.reachable(&newlistblock, &appendblock, &iterblock) {
+                    continue;
+                }
+                if self.reachable(&loopnextblock, &iterblock, &newlistblock) {
+                    continue;
+                }
+                if self.reachable(&appendblock, &appendblock, &loopnextblock) {
+                    continue;
+                }
+                let stopblocks: Vec<BlockRef> = loopnextblock
+                    .borrow()
+                    .exits
+                    .iter()
+                    .filter(|link| link.borrow().exitcase.is_some())
+                    .filter_map(|link| link.borrow().target.clone())
+                    .collect();
+                let mut stop_reaches_append = false;
+                for stopblock in &stopblocks {
+                    if self.reachable(stopblock, &appendblock, &newlistblock) {
+                        stop_reaches_append = true;
+                        break;
+                    }
+                }
+                if stop_reaches_append {
+                    continue;
+                }
+                let mut loopbody: HashMap<BlockKey, BlockRef> = HashMap::new();
+                for block in self.graph.iterblocks() {
+                    if self.vlist_alive(&block) && self.reachable(&block, &appendblock, &iterblock)
+                    {
+                        loopbody.insert(BlockKey::of(&block), block);
+                    }
+                }
+                if !loopbody.contains_key(&BlockKey::of(&appendblock)) {
+                    continue;
+                }
+                let loopheader = self.enum_blocks_with_vlist_from(&newlistblock, &loopnextblock);
+                assert_eq!(BlockKey::of(&loopheader[0]), BlockKey::of(&newlistblock));
+                let mut escapes = false;
+                for block in loopheader.iter().cloned().chain(loopbody.values().cloned()) {
+                    assert!(self.vlist_alive(&block));
+                    if self.vlist_escapes(&block) {
+                        escapes = true;
+                        break;
+                    }
+                }
+                if escapes {
+                    continue;
+                }
+                let loopbody_keys: HashSet<BlockKey> = loopbody.keys().cloned().collect();
+                let exactlength = !self.reachable_within(
+                    &loopnextblock,
+                    &loopnextblock,
+                    &appendblock,
+                    &loopbody_keys,
+                );
+                accepted = Some((
+                    loopnextblock,
+                    iterblock,
+                    viterfamily,
+                    loopbody,
+                    stopblocks,
+                    exactlength,
+                ));
+                break;
+            }
+            accepted.ok_or(())?
+        };
+
+        assert!(!loopbody.contains_key(&BlockKey::of(&iterblock)));
+        assert!(loopbody.contains_key(&BlockKey::of(&loopnextblock)));
+        for stopblock in &stopblocks {
+            assert!(!loopbody.contains_key(&BlockKey::of(stopblock)));
+        }
+
+        let iter_exit = iterblock
+            .borrow()
+            .exits
+            .first()
+            .cloned()
+            .expect("iterblock must have a single exit");
+        let vlist = self
+            .contains_vlist_linkargs(&iter_exit.borrow().args)
+            .expect("iterblock exit should carry the new list");
+        let iterable = {
+            let operations = iterblock.borrow().operations.clone();
+            let mut found = None;
+            for hlop in &operations {
+                let res = self.variable_families.find_rep(hlop.result.clone());
+                if res == viterfamily {
+                    found = hlop.args.first().cloned();
+                    break;
+                }
+            }
+            found.expect("lost 'iter' operation")
+        };
+        let mut hint_items = HashMap::new();
+        hint_items.insert(
+            ConstValue::Str(
+                if exactlength {
+                    "maxlength"
+                } else {
+                    "maxlength_inexact"
+                }
+                .to_string(),
+            ),
+            ConstValue::Bool(true),
+        );
+        let hint_result = match &vlist {
+            Hlvalue::Variable(v) => Hlvalue::Variable(v.copy()),
+            other => panic!("hint target must be a Variable, got {other:?}"),
+        };
+        let hint = SpaceOperation::new(
+            "hint",
+            vec![
+                vlist.clone(),
+                iterable,
+                Hlvalue::Constant(Constant::new(ConstValue::Dict(hint_items))),
+            ],
+            hint_result.clone(),
+        );
+        iterblock.borrow_mut().operations.push(hint);
+        {
+            let mut link = iter_exit.borrow_mut();
+            for arg in &mut link.args {
+                if arg.as_ref() == Some(&vlist) {
+                    *arg = Some(hint_result.clone());
+                }
+            }
+        }
+
+        for block in loopbody.values() {
+            let exits = block.borrow().exits.clone();
+            for link in exits {
+                let Some(target) = link.borrow().target.clone() else {
+                    continue;
+                };
+                if loopbody.contains_key(&BlockKey::of(&target)) {
+                    continue;
+                }
+                let Some(vlist) = self.contains_vlist_linkargs(&link.borrow().args) else {
+                    continue;
+                };
+                let mut hints =
+                    HashMap::from([(ConstValue::Str("fence".to_string()), ConstValue::Bool(true))]);
+                if exactlength
+                    && BlockKey::of(block) == BlockKey::of(&loopnextblock)
+                    && stopblocks
+                        .iter()
+                        .any(|stopblock| BlockKey::of(stopblock) == BlockKey::of(&target))
+                {
+                    hints.insert(
+                        ConstValue::Str("exactlength".to_string()),
+                        ConstValue::Bool(true),
+                    );
+                }
+                let newblock = crate::translator::unsimplify::insert_empty_block(&link, vec![]);
+                let index = link
+                    .borrow()
+                    .args
+                    .iter()
+                    .position(|arg| arg.as_ref() == Some(&vlist))
+                    .expect("vlist must stay on the rewritten link");
+                let vlist2 = newblock.borrow().inputargs[index].clone();
+                let vlist3 = match &vlist2 {
+                    Hlvalue::Variable(v) => Hlvalue::Variable(v.copy()),
+                    other => panic!("fence hint target must be a Variable, got {other:?}"),
+                };
+                newblock.borrow_mut().inputargs[index] = vlist3.clone();
+                let hint = SpaceOperation::new(
+                    "hint",
+                    vec![
+                        vlist3,
+                        Hlvalue::Constant(Constant::new(ConstValue::Dict(hints))),
+                    ],
+                    vlist2,
+                );
+                newblock.borrow_mut().operations.push(hint);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// RPython `detect_list_comprehension(graph)` (simplify.py:703-780).
+pub fn detect_list_comprehension(graph: &FunctionGraph) {
+    let mut variable_families = DataFlowFamilyBuilder::new(graph).into_variable_families();
+    let c_append = Constant::new(ConstValue::Str("append".to_string()));
+    let mut newlist_v: HashMap<Hlvalue, BlockRef> = HashMap::new();
+    let mut iter_v: HashMap<Hlvalue, BlockRef> = HashMap::new();
+    let mut append_v: Vec<(Hlvalue, Hlvalue, BlockRef)> = Vec::new();
+    let mut loopnextblocks: Vec<(BlockRef, Hlvalue)> = Vec::new();
+
+    for block in graph.iterblocks() {
+        let block_b = block.borrow();
+        if block_b.operations.len() == 1
+            && block_b.operations[0].opname == "next"
+            && block_b.canraise()
+            && block_b.exits.len() >= 2
+        {
+            let has_none_case = block_b
+                .exits
+                .iter()
+                .any(|link| link.borrow().exitcase.is_none());
+            let has_stop_iteration = block_b
+                .exits
+                .iter()
+                .any(|link| is_stop_iteration_exitcase(link.borrow().exitcase.as_ref()));
+            if has_none_case && has_stop_iteration {
+                loopnextblocks.push((block.clone(), block_b.operations[0].args[0].clone()));
+                continue;
+            }
+        }
+        for op in &block_b.operations {
+            if op.opname == "newlist" && op.args.is_empty() {
+                let vlist = variable_families.find_rep(op.result.clone());
+                newlist_v.insert(vlist, block.clone());
+            }
+            if op.opname == "iter" {
+                let viter = variable_families.find_rep(op.result.clone());
+                iter_v.insert(viter, block.clone());
+            }
+        }
+    }
+
+    let mut loops: Vec<(BlockRef, BlockRef, Hlvalue)> = Vec::new();
+    for (block, viter) in loopnextblocks {
+        let viterfamily = variable_families.find_rep(viter);
+        if let Some(iterblock) = iter_v.get(&viterfamily).cloned() {
+            let iterblock_b = iterblock.borrow();
+            if iterblock_b.exits.len() == 1
+                && iterblock_b.exitswitch.is_none()
+                && iterblock_b.exits[0]
+                    .borrow()
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| BlockKey::of(target) == BlockKey::of(&block))
+            {
+                loops.push((block, iterblock.clone(), viterfamily));
+            }
+        }
+    }
+    if newlist_v.is_empty() || loops.is_empty() {
+        return;
+    }
+
+    for block in graph.iterblocks() {
+        let ops = block.borrow().operations.clone();
+        for i in 0..ops.len().saturating_sub(1) {
+            let op = &ops[i];
+            if op.opname == "getattr"
+                && op.args.get(1) == Some(&Hlvalue::Constant(c_append.clone()))
+            {
+                let vlist = variable_families.find_rep(op.args[0].clone());
+                if newlist_v.contains_key(&vlist) {
+                    for op2 in ops.iter().skip(i + 1) {
+                        if op2.opname == "simple_call"
+                            && op2.args.len() == 2
+                            && op2.args[0] == op.result
+                        {
+                            append_v.push((op.args[0].clone(), op.result.clone(), block.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if append_v.is_empty() {
+        return;
+    }
+
+    let mut detector = ListComprehensionDetector {
+        graph,
+        loops,
+        newlist_v,
+        variable_families: &mut variable_families,
+        reachable_cache: HashMap::new(),
+        vmeth: Hlvalue::Constant(Constant::new(ConstValue::Placeholder)),
+        vlistfamily: Hlvalue::Constant(Constant::new(ConstValue::Placeholder)),
+        vlistcone: HashMap::new(),
+        escapes: HashMap::new(),
+    };
+    let mut graphmutated = false;
+    for (vlist, vmeth, block) in append_v {
+        if graphmutated {
+            detect_list_comprehension(graph);
+            return;
+        }
+        if detector.run(vlist, vmeth, block).is_ok() {
+            graphmutated = true;
+        }
+    }
+}
+
 /// RPython `all_passes = [...]` (simplify.py:1060-1073) + `simplify_graph`
 /// (simplify.py:1075-1081).
 ///
@@ -2379,7 +2907,8 @@ pub fn join_blocks(graph: &FunctionGraph) {
 mod tests {
     use super::*;
     use crate::flowspace::model::{
-        Block, ConstValue, Constant, FunctionGraph, GraphKey, GraphRef, Hlvalue, Link, Variable,
+        Block, ConstValue, Constant, FunctionGraph, GraphKey, GraphRef, Hlvalue, HostObject, Link,
+        Variable, c_last_exception,
     };
     use crate::translator::rtyper::lltypesystem::lltype;
     use crate::translator::translator::TranslationContext;
@@ -2444,6 +2973,246 @@ mod tests {
         ))));
 
         assert!(get_graph_for_call(&arg, &translator).is_none());
+    }
+
+    #[test]
+    fn detect_list_comprehension_inserts_maxlength_and_fence_hints() {
+        let iterable = Variable::named("iterable");
+        let start = Block::shared(vec![Hlvalue::Variable(iterable.clone())]);
+        let graph = FunctionGraph::new("lc", start.clone());
+
+        let vlist0 = Variable::named("vlist0");
+        let viter0 = Variable::named("viter0");
+        let loopnext = Block::shared(vec![
+            Hlvalue::Variable(vlist0.copy()),
+            Hlvalue::Variable(viter0.copy()),
+        ]);
+        let append = Block::shared(vec![
+            Hlvalue::Variable(vlist0.copy()),
+            Hlvalue::Variable(viter0.copy()),
+            Hlvalue::Variable(Variable::named("item")),
+        ]);
+        let after = Block::shared(vec![Hlvalue::Variable(vlist0.copy())]);
+
+        let vmeth = Variable::named("vmeth");
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![],
+            Hlvalue::Variable(vlist0.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "iter",
+            vec![Hlvalue::Variable(iterable.clone())],
+            Hlvalue::Variable(viter0.clone()),
+        ));
+        start.borrow_mut().closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(vlist0.clone()),
+                    Hlvalue::Variable(viter0.clone()),
+                ],
+                Some(loopnext.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let item_from_next = Variable::named("item_from_next");
+        let loop_iter_arg = loopnext.borrow().inputargs[1].clone();
+        loopnext.borrow_mut().operations.push(SpaceOperation::new(
+            "next",
+            vec![loop_iter_arg],
+            Hlvalue::Variable(item_from_next.clone()),
+        ));
+        loopnext.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        let stop_iteration = HOST_ENV
+            .lookup_builtin("StopIteration")
+            .expect("HOST_ENV missing StopIteration");
+        let loop_success_args = {
+            let loopnext_b = loopnext.borrow();
+            vec![
+                loopnext_b.inputargs[0].clone(),
+                loopnext_b.inputargs[1].clone(),
+                Hlvalue::Variable(item_from_next.clone()),
+            ]
+        };
+        let loop_stop_args = {
+            let loopnext_b = loopnext.borrow();
+            vec![loopnext_b.inputargs[0].clone()]
+        };
+        loopnext.borrow_mut().closeblock(vec![
+            Link::new(loop_success_args, Some(append.clone()), None).into_ref(),
+            Link::new(
+                loop_stop_args,
+                Some(after.clone()),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                    stop_iteration,
+                )))),
+            )
+            .into_ref(),
+        ]);
+
+        let append_inputargs = append.borrow().inputargs.clone();
+        let list_in_append = append_inputargs[0].clone();
+        let item_in_append = append_inputargs[2].clone();
+        let mul_result = Variable::named("mul_result");
+        append.borrow_mut().operations.push(SpaceOperation::new(
+            "getattr",
+            vec![
+                list_in_append.clone(),
+                Hlvalue::Constant(Constant::new(ConstValue::Str("append".to_string()))),
+            ],
+            Hlvalue::Variable(vmeth.clone()),
+        ));
+        append.borrow_mut().operations.push(SpaceOperation::new(
+            "mul",
+            vec![
+                item_in_append.clone(),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(17))),
+            ],
+            Hlvalue::Variable(mul_result.clone()),
+        ));
+        append.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![
+                Hlvalue::Variable(vmeth.clone()),
+                Hlvalue::Variable(mul_result.clone()),
+            ],
+            Hlvalue::Variable(Variable::named("append_res")),
+        ));
+        let append_backedge_args = {
+            let append_b = append.borrow();
+            vec![append_b.inputargs[0].clone(), append_b.inputargs[1].clone()]
+        };
+        append.borrow_mut().closeblock(vec![
+            Link::new(append_backedge_args, Some(loopnext.clone()), None).into_ref(),
+        ]);
+
+        let after_args = after.borrow().inputargs.clone();
+        after.borrow_mut().closeblock(vec![
+            Link::new(after_args, Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        detect_list_comprehension(&graph);
+
+        let summary = crate::flowspace::model::summary(&graph);
+        assert_eq!(summary.get("newlist"), Some(&1));
+        assert_eq!(summary.get("iter"), Some(&1));
+        assert_eq!(summary.get("next"), Some(&1));
+        assert_eq!(summary.get("getattr"), Some(&1));
+        assert_eq!(summary.get("simple_call"), Some(&1));
+        assert_eq!(summary.get("mul"), Some(&1));
+        assert_eq!(summary.get("hint"), Some(&2));
+    }
+
+    #[test]
+    fn detect_list_comprehension_ignores_non_builtin_stop_iteration_namesake() {
+        let iterable = Variable::named("iterable");
+        let start = Block::shared(vec![Hlvalue::Variable(iterable.clone())]);
+        let graph = FunctionGraph::new("lc_namesake", start.clone());
+
+        let vlist0 = Variable::named("vlist0");
+        let viter0 = Variable::named("viter0");
+        let loopnext = Block::shared(vec![
+            Hlvalue::Variable(vlist0.copy()),
+            Hlvalue::Variable(viter0.copy()),
+        ]);
+        let append = Block::shared(vec![
+            Hlvalue::Variable(vlist0.copy()),
+            Hlvalue::Variable(viter0.copy()),
+            Hlvalue::Variable(Variable::named("item")),
+        ]);
+        let after = Block::shared(vec![Hlvalue::Variable(vlist0.copy())]);
+
+        let vmeth = Variable::named("vmeth");
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            vec![],
+            Hlvalue::Variable(vlist0.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "iter",
+            vec![Hlvalue::Variable(iterable.clone())],
+            Hlvalue::Variable(viter0.clone()),
+        ));
+        start.borrow_mut().closeblock(vec![
+            Link::new(
+                vec![
+                    Hlvalue::Variable(vlist0.clone()),
+                    Hlvalue::Variable(viter0.clone()),
+                ],
+                Some(loopnext.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let item_from_next = Variable::named("item_from_next");
+        let loop_iter_arg = loopnext.borrow().inputargs[1].clone();
+        loopnext.borrow_mut().operations.push(SpaceOperation::new(
+            "next",
+            vec![loop_iter_arg],
+            Hlvalue::Variable(item_from_next.clone()),
+        ));
+        loopnext.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        let stop_iteration = HostObject::new_class("pkg.StopIteration", vec![]);
+        let loop_success_args = {
+            let loopnext_b = loopnext.borrow();
+            vec![
+                loopnext_b.inputargs[0].clone(),
+                loopnext_b.inputargs[1].clone(),
+                Hlvalue::Variable(item_from_next.clone()),
+            ]
+        };
+        let loop_stop_args = {
+            let loopnext_b = loopnext.borrow();
+            vec![loopnext_b.inputargs[0].clone()]
+        };
+        loopnext.borrow_mut().closeblock(vec![
+            Link::new(loop_success_args, Some(append.clone()), None).into_ref(),
+            Link::new(
+                loop_stop_args,
+                Some(after.clone()),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                    stop_iteration,
+                )))),
+            )
+            .into_ref(),
+        ]);
+
+        let append_inputargs = append.borrow().inputargs.clone();
+        let list_in_append = append_inputargs[0].clone();
+        let item_in_append = append_inputargs[2].clone();
+        append.borrow_mut().operations.push(SpaceOperation::new(
+            "getattr",
+            vec![
+                list_in_append.clone(),
+                Hlvalue::Constant(Constant::new(ConstValue::Str("append".to_string()))),
+            ],
+            Hlvalue::Variable(vmeth.clone()),
+        ));
+        append.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![Hlvalue::Variable(vmeth.clone()), item_in_append.clone()],
+            Hlvalue::Variable(Variable::named("append_res")),
+        ));
+        let append_backedge_args = {
+            let append_b = append.borrow();
+            vec![append_b.inputargs[0].clone(), append_b.inputargs[1].clone()]
+        };
+        append.borrow_mut().closeblock(vec![
+            Link::new(append_backedge_args, Some(loopnext.clone()), None).into_ref(),
+        ]);
+
+        let after_args = after.borrow().inputargs.clone();
+        after.borrow_mut().closeblock(vec![
+            Link::new(after_args, Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        detect_list_comprehension(&graph);
+
+        let summary = crate::flowspace::model::summary(&graph);
+        assert_eq!(summary.get("hint"), None);
     }
 
     #[test]
@@ -2967,7 +3736,7 @@ mod tests {
         use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
 
         let ann = RPythonAnnotator::new(None, None, None, false);
-        let translator = ann.translator.borrow();
+        let translator = &ann.translator;
 
         let callee_arg = signed_var();
         let callee_res = signed_var();
@@ -3045,7 +3814,7 @@ mod tests {
         use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
 
         let ann = RPythonAnnotator::new(None, None, None, false);
-        let translator = ann.translator.borrow();
+        let translator = &ann.translator;
 
         let rec_arg = signed_var();
         let rec_call_res = signed_var();
@@ -3129,7 +3898,7 @@ mod tests {
         use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
 
         let ann = RPythonAnnotator::new(None, None, None, false);
-        let translator = ann.translator.borrow();
+        let translator = &ann.translator;
 
         let mk_pure_graph = |name: &str, delta: i64| {
             let arg = signed_var();
@@ -3263,7 +4032,7 @@ mod tests {
         use crate::flowspace::model::{ConstValue as CV, Constant as C, SpaceOperation as SO};
 
         let ann = RPythonAnnotator::new(None, None, None, false);
-        let translator = ann.translator.borrow();
+        let translator = &ann.translator;
 
         let wrapper_arg = signed_var();
         let runtime_funcptr = fn_ptr_var();
@@ -3363,7 +4132,7 @@ mod tests {
         use crate::annotator::annrpython::RPythonAnnotator;
 
         let ann = RPythonAnnotator::new(None, None, None, false);
-        let translator = ann.translator.borrow();
+        let translator = &ann.translator;
 
         let graph_a = Rc::new(RefCell::new(FunctionGraph::new(
             "a",

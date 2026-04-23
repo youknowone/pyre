@@ -37,7 +37,7 @@ use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
-    SomeLongFloat, SomePBC, SomeSingleFloat, SomeString, SomeTuple, SomeValue, s_none,
+    SomePBC, SomeString, SomeTuple, SomeValue, s_none,
 };
 use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
@@ -1636,16 +1636,6 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Float(s))
             }
-            ConstValue::SingleFloat(_) => {
-                let mut s = SomeSingleFloat::new();
-                s.base.const_box = Some(Constant::new(x.clone()));
-                Ok(SomeValue::SingleFloat(s))
-            }
-            ConstValue::LongFloat(_) => {
-                let mut s = SomeLongFloat::new();
-                s.base.const_box = Some(Constant::new(x.clone()));
-                Ok(SomeValue::LongFloat(s))
-            }
             ConstValue::Str(s) => {
                 let no_nul = !s.contains('\x00');
                 let result = if s.chars().count() == 1 {
@@ -2336,18 +2326,6 @@ mod tests {
             other => panic!("expected SomeFloat, got {other:?}"),
         }
         let _ = SomeFloat::new();
-    }
-
-    #[test]
-    fn immutablevalue_singlefloat_and_longfloat_preserve_distinct_annotations() {
-        let bk = bk();
-        let sf = bk
-            .immutablevalue(&ConstValue::single_float(1.5_f32))
-            .unwrap();
-        assert!(matches!(sf, SomeValue::SingleFloat(_)));
-
-        let lf = bk.immutablevalue(&ConstValue::long_float(1.0)).unwrap();
-        assert!(matches!(lf, SomeValue::LongFloat(_)));
     }
 
     #[test]

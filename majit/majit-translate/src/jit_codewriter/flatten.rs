@@ -629,14 +629,8 @@ pub(crate) fn linkarg_kind(arg: &LinkArg, regallocs: &HashMap<RegKind, RegAllocR
 /// are gcref-bearing (kind `'r'`), `SpecTag` is a Signed wrapper.
 pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
     match cv {
-        ConstValue::Int(_)
-        | ConstValue::Bool(_)
-        | ConstValue::SpecTag(_)
-        | ConstValue::SingleFloat(_) => 'i',
-        // Upstream stores SingleFloat in an int box and treats
-        // LongFloat as unsupported here.
+        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => 'i',
         ConstValue::Float(_) => 'f',
-        ConstValue::LongFloat(_) => panic!("LongFloat constants are not supported by flatten"),
         ConstValue::None
         | ConstValue::Str(_)
         | ConstValue::HostObject(_)

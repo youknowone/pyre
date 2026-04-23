@@ -30,7 +30,7 @@ use crate::annotator::bookkeeper;
 use crate::annotator::model::{
     AnnotatorError, KnownType, SomeBool, SomeChar, SomeFloat, SomeInteger, SomeLongFloat,
     SomeObjectBase, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint, SomeValue,
-    SomeValueTag, UnionError, s_bool, s_none,
+    SomeValueTag, s_bool, s_none,
 };
 use crate::flowspace::model::{ConstValue, Constant};
 use crate::flowspace::operation::{CanOnlyThrow, HLOperation, OpKind, Specialization};
@@ -608,82 +608,6 @@ fn init_ptr_object_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-}
-
-// =====================================================================
-// llannotation.py:94-98 — pairtype(SomePtr, SomePtr).union
-// =====================================================================
-
-/// RPython `__extend__(pairtype(SomePtr, SomePtr)).union`
-/// (`llannotation.py:94-98`):
-///
-/// ```python
-/// class __extend__(pairtype(SomePtr, SomePtr)):
-///     def union((p1, p2)):
-///         if p1.ll_ptrtype != p2.ll_ptrtype:
-///             raise UnionError(p1, p2)
-///         return SomePtr(p1.ll_ptrtype)
-/// ```
-///
-/// Called from `annotator::model::union`'s fused match dispatch —
-/// pyre's Rust enums cannot express upstream's pairtype / `__extend__`
-/// double-dispatch as a module-import side effect, so the dispatch
-/// happens inline at the call site while the logic body (the part
-/// that must match upstream line-by-line) lives here next to
-/// `SomeInteriorPtr` and the other `SomePtr`-related helpers.
-pub fn ptr_ptr_union(
-    a: &SomePtr,
-    b: &SomePtr,
-    s1: &SomeValue,
-    s2: &SomeValue,
-) -> Result<SomeValue, UnionError> {
-    if a.ll_ptrtype != b.ll_ptrtype {
-        return Err(UnionError {
-            lhs: s1.clone(),
-            rhs: s2.clone(),
-            msg: "RPython cannot unify distinct low-level pointer types".into(),
-        });
-    }
-    Ok(SomeValue::Ptr(SomePtr::new(a.ll_ptrtype.clone())))
-}
-
-/// `(SomeInteriorPtr, SomeInteriorPtr).union` —
-/// ARCHITECTURAL-ADAPTATION.
-///
-/// Upstream has no explicit arm: Python MRO routes this case to
-/// `pair(SomePtr, SomePtr).union` because `SomeInteriorPtr(SomePtr)`
-/// (`llannotation.py:71-74`). That body (`llannotation.py:94-98`)
-/// ends with `return SomePtr(p1.ll_ptrtype)`, *but*
-/// `SomePtr.__init__` (`lltype.py:1524-1527`) asserts
-/// `isinstance(ll_ptrtype, Ptr)` — and `p1.ll_ptrtype` here is a
-/// `lltype.InteriorPtr`. The upstream code is therefore structurally
-/// unreachable (the assertion fires if hit); upstream never calls
-/// it in practice.
-///
-/// Pyre models `SomePtr.ll_ptrtype: lltype::Ptr` and
-/// `SomeInteriorPtr.ll_ptrtype: lltype::InteriorPtr` as distinct
-/// Rust types with no automatic conversion, so we cannot reproduce
-/// upstream's would-be widening even if we wanted to. Failing loudly
-/// is safer than inventing a successful union result that upstream
-/// does not have.
-pub fn interior_ptr_interior_ptr_union(
-    a: &SomeInteriorPtr,
-    b: &SomeInteriorPtr,
-    s1: &SomeValue,
-    s2: &SomeValue,
-) -> Result<SomeValue, UnionError> {
-    if a.ll_ptrtype != b.ll_ptrtype {
-        return Err(UnionError {
-            lhs: s1.clone(),
-            rhs: s2.clone(),
-            msg: "RPython cannot unify distinct low-level pointer types".into(),
-        });
-    }
-    Err(UnionError {
-        lhs: s1.clone(),
-        rhs: s2.clone(),
-        msg: "RPython does not support union() on SomeInteriorPtr annotations".into(),
-    })
 }
 
 #[cfg(test)]

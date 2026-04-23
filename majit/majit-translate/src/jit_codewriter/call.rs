@@ -44,7 +44,6 @@ pub enum CanRaise {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RaiseClass {
     No,
-    #[allow(dead_code)]
     MemoryErrorOnly,
     Yes,
 }
@@ -1901,12 +1900,10 @@ impl CallControl {
 
     /// Resolve a method call to a concrete impl graph.
     ///
-    /// RPython: method resolution happens at the type system level.
-    /// Here we resolve through the trait impl registry. If there's
-    /// exactly one impl for the method (across all declaring traits),
-    /// return it.  If the receiver is a generic parameter
-    /// (lowercase or single uppercase letter), we try all known impls
-    /// and return the unique one.
+    /// RPython: method resolution happens at the type system level; the
+    /// source-level Rust frontend falls back to receiver-root strings to
+    /// disambiguate impl graphs until the annotator folds bound-method
+    /// identities directly into stable call targets.
     pub fn resolve_method(
         &self,
         name: &str,
@@ -1954,7 +1951,6 @@ impl CallControl {
 
     /// Like `resolve_method`, but returns the impl type name instead of the graph.
     /// Used by `target_to_path` to build qualified CallPaths.
-    /// Like `resolve_method`, but returns the impl type name.
     /// All returned references borrow from `self`, not from `receiver_root`.
     fn resolve_method_impl_type<'b>(
         &'b self,

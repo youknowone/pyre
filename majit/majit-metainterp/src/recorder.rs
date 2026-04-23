@@ -195,6 +195,9 @@ impl Trace {
         op.pos = opref;
         self.ops.push(op);
         self.op_count += 1;
+        if opcode.result_type() != Type::Void {
+            self.box_count += 1;
+        }
         opref
     }
 
@@ -214,6 +217,9 @@ impl Trace {
         op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
         self.ops.push(op);
         self.op_count += 1;
+        if opcode.result_type() != Type::Void {
+            self.box_count += 1;
+        }
         opref
     }
 
@@ -248,6 +254,9 @@ impl Trace {
         op.pos = opref;
         self.ops.push(op);
         self.op_count += 1;
+        if OpCode::Jump.result_type() != Type::Void {
+            self.box_count += 1;
+        }
     }
 
     /// Finish the trace (non-looping): add a FINISH operation.
@@ -258,6 +267,9 @@ impl Trace {
         op.pos = opref;
         self.ops.push(op);
         self.op_count += 1;
+        if OpCode::Finish.result_type() != Type::Void {
+            self.box_count += 1;
+        }
     }
 
     /// Return the completed trace.
@@ -1192,11 +1204,15 @@ mod tests {
         let pos0 = rec.get_position();
         assert_eq!(pos0._pos, 0);
         assert_eq!(pos0._count, 2); // 2 inputargs
+        assert_eq!(pos0._index, 2);
+        assert_eq!(pos0.snapshot_data_len, 0);
+        assert_eq!(pos0.snapshot_array_data_len, 0);
 
         let _a = rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
         let pos1 = rec.get_position();
         assert_eq!(pos1._pos, 1);
         assert_eq!(pos1._count, 3);
+        assert_eq!(pos1._index, 3);
 
         let _b = rec.record_op(OpCode::IntSub, &[OpRef(0), OpRef(1)]);
         let _c = rec.record_op(OpCode::IntMul, &[OpRef(0), OpRef(1)]);
@@ -1215,5 +1231,23 @@ mod tests {
         // Cut back to pos0 — should discard everything
         rec.cut(pos0);
         assert_eq!(rec.num_ops(), 0);
+    }
+
+    #[test]
+    fn test_get_position_tracks_count_and_index_separately() {
+        let mut rec = Trace::with_num_inputs(1);
+        let i0 = OpRef(0);
+
+        let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        let pos_after_add = rec.get_position();
+        assert_eq!(pos_after_add._count, 2);
+        assert_eq!(pos_after_add._index, 2);
+
+        let descr = make_fail_descr(1);
+        rec.record_guard(OpCode::GuardTrue, &[OpRef(1)], descr);
+        let pos_after_guard = rec.get_position();
+        assert_eq!(pos_after_guard._pos, 2);
+        assert_eq!(pos_after_guard._count, 3);
+        assert_eq!(pos_after_guard._index, 2);
     }
 }

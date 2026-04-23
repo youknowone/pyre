@@ -625,8 +625,8 @@ fn perform_register_allocation(
 struct RegAllocator {
     depgraph: DependencyGraph,
     /// Union-find over register indices (RPython
-    /// `tool.algo.unionfind.UnionFind`). Created lazily; missing
-    /// nodes self-rep.
+    /// `tool.algo.unionfind.UnionFind.link_to_parent`). Created
+    /// lazily; missing nodes self-rep.
     unionfind: HashMap<u16, u16>,
     /// RPython `UnionFind.weight` — only roots carry entries.
     unionfind_weight: HashMap<u16, usize>,
@@ -666,8 +666,8 @@ impl RegAllocator {
     /// `unionfind.union` — weighted union, matching
     /// `rpython/tool/algo/unionfind.py:67-91`.
     fn union(&mut self, v0: u16, w0: u16) -> u16 {
-        let r1 = self.find_rep(v0);
-        let r2 = self.find_rep(w0);
+        let mut r1 = self.find_rep(v0);
+        let mut r2 = self.find_rep(w0);
         if r1 == r2 {
             return r1;
         }
@@ -1235,6 +1235,25 @@ mod tests {
         assert_eq!(result.num_regs.get(&Kind::Ref).copied(), Some(3));
         assert_eq!(result.num_regs.get(&Kind::Int).copied(), Some(1));
         assert_eq!(result.num_regs.get(&Kind::Float).copied(), Some(0));
+    }
+
+    #[test]
+    fn union_keeps_heavier_partition_as_representative() {
+        let mut alloc = RegAllocator::new();
+
+        assert_eq!(alloc.union(10, 11), 10);
+        assert_eq!(alloc.find_rep(10), 10);
+        assert_eq!(alloc.find_rep(11), 10);
+
+        assert_eq!(alloc.union(12, 13), 12);
+        assert_eq!(alloc.find_rep(12), 12);
+        assert_eq!(alloc.find_rep(13), 12);
+
+        assert_eq!(alloc.union(10, 12), 10);
+        assert_eq!(alloc.find_rep(10), 10);
+        assert_eq!(alloc.find_rep(11), 10);
+        assert_eq!(alloc.find_rep(12), 10);
+        assert_eq!(alloc.find_rep(13), 10);
     }
 
     /// (d) `coalesce_variables` unifies a `*_copy dst <- src` source

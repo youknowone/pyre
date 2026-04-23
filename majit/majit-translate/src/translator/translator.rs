@@ -9,20 +9,106 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
-use crate::flowspace::model::{BlockKey, GraphKey, GraphRef};
+use crate::annotator::policy::AnnotatorPolicy;
+use crate::flowspace::model::{BlockKey, GraphKey, GraphRef, HostObject, checkgraph};
+use crate::flowspace::objspace::build_flow;
+use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::rtyper::RPythonTyper;
+use crate::translator::simplify;
 
-#[derive(Clone, Debug, Default)]
+/// RPython `translator.config.translation` — subset of upstream's
+/// `rpython.config.translationoption.get_combined_translation_config`
+/// output that the annotator driver actually reads. Fields land
+/// incrementally as `self.translator.config.translation.*` accesses
+/// manifest — upstream's full `OptionDescription` tree lives in
+/// `rpython/config/translationoption.py` and is not yet ported.
+#[derive(Clone, Debug)]
 pub struct TranslationOptions {
+    /// RPython `config.translation.verbose` (FLOWING_FLAGS default
+    /// `False`).
+    pub verbose: bool,
+    /// RPython `config.translation.list_comprehension_operations`
+    /// (FLOWING_FLAGS default `False`).
+    pub list_comprehension_operations: bool,
+    /// RPython `config.translation.keepgoing` — consumed by
+    /// `TranslationContext.buildannotator()` upstream.
+    pub keepgoing: bool,
     pub sandbox: bool,
+    /// RPython `config.translation.check_str_without_nul` (upstream
+    /// default `False`). Copied into `TLS.check_str_without_nul` by
+    /// `RPythonAnnotator.build_types` (annrpython.py:84-85).
+    pub check_str_without_nul: bool,
 }
 
+impl Default for TranslationOptions {
+    fn default() -> Self {
+        Self {
+            verbose: false,
+            list_comprehension_operations: false,
+            keepgoing: false,
+            sandbox: false,
+            check_str_without_nul: false,
+        }
+    }
+}
+
+/// RPython `translator.config` — outer `Config` holder. The annotator
+/// driver reaches into it as `self.translator.config.translation.X`;
+/// the Rust port preserves that access path via nested structs.
 #[derive(Clone, Debug, Default)]
 pub struct TranslationConfig {
+    /// RPython root-level `config.translating` BoolOption installed by
+    /// `get_combined_translation_config(translating=...)` at
+    /// `rpython/config/translationoption.py:284-293`. Upstream's
+    /// `TranslationContext.__init__` (translator.py:30) passes
+    /// `translating=True`, so every `TranslationContext` created
+    /// without an explicit config observes
+    /// `config.translating == True`.
+    pub translating: bool,
+    /// RPython `config.translation` OptionGroup.
     pub translation: TranslationOptions,
+}
+
+/// Rust carrier for upstream `**flowing_flags` in
+/// `TranslationContext.__init__`. `None` means the caller did not pass
+/// the flag; `Some(bool)` means it should overwrite the matching
+/// `config.translation.*` field.
+#[derive(Clone, Debug, Default)]
+pub struct FlowingFlags {
+    pub verbose: Option<bool>,
+    pub list_comprehension_operations: Option<bool>,
+}
+
+// RPython `self.exceptiontransformer = None` (translator.py:33) and
+// `TranslationContext.getexceptiontransformer()` (translator.py:86-92)
+// are intentionally NOT ported here. Upstream constructs an
+// `ExceptionTransformer(self)` lazily from
+// `rpython/translator/exceptiontransform.py`, which this tree has not
+// yet ported. Re-introduce the slot + accessor alongside the real
+// `exceptiontransform.py` port rather than carrying a placeholder
+// surface that diverges from upstream semantics.
+
+/// RPython `get_combined_translation_config(translating=True)`
+/// (translationoption.py:284-293). The Rust port exposes the
+/// `translating=True` call that `TranslationContext.__init__` uses
+/// when `config is None`; upstream callers that need
+/// `translating=False` pre-construct a [`TranslationConfig`] and pass
+/// it explicitly.
+fn get_combined_translation_config() -> TranslationConfig {
+    TranslationConfig {
+        translating: true,
+        ..TranslationConfig::default()
+    }
+}
+
+/// RPython `rpython.config.translationoption.get_platform(config)`.
+/// The full platform registry is not ported yet; current config
+/// coverage only needs the default host platform marker.
+fn get_platform(_config: &TranslationConfig) -> String {
+    "host".to_string()
 }
 
 /// Key for [`TranslationContext::callgraph`]. Matches upstream's
@@ -52,51 +138,142 @@ pub struct CallGraphEdge {
 /// Held by [`RPythonAnnotator`]; fields land incrementally as the
 /// annotator driver's `self.translator.*` calls manifest.
 pub struct TranslationContext {
-    /// RPython `self.config`.
+    /// RPython `self.config`. Upstream defaults to
+    /// `get_combined_translation_config(translating=True)` when `None`
+    /// is passed to `__init__`; the Rust port mirrors that via
+    /// `get_combined_translation_config()`.
     pub config: TranslationConfig,
     /// RPython `self.annotator = None` (translator.py:31).
     ///
     /// Upstream stores a direct back-reference to the live
-    /// `RPythonAnnotator`. Rust uses `Weak` to avoid an Rc cycle with
-    /// `RPythonAnnotator.translator`.
-    pub annotator: RefCell<Option<Weak<RPythonAnnotator>>>,
+    /// `RPythonAnnotator`. Rust keeps the same strong ownership edge,
+    /// intentionally mirroring Python's `translator -> annotator ->
+    /// translator` driver cycle.
+    pub annotator: RefCell<Option<Rc<RPythonAnnotator>>>,
     /// RPython `self.rtyper = None` (translator.py:32).
     pub rtyper: RefCell<Option<Rc<RPythonTyper>>>,
+    /// RPython `self.platform = get_platform(config)` (translator.py:36).
+    pub platform: String,
+    // `self.exceptiontransformer = None` (translator.py:33) lands
+    // when `rpython/translator/exceptiontransform.py` is ported. See
+    // module header.
     /// RPython `self.graphs = []` — every flow graph known to the
     /// translator. `RPythonAnnotator.complete()` iterates this to force
     /// annotation of each return variable.
     pub graphs: RefCell<Vec<GraphRef>>,
-    /// RPython `self.entry_point_graph`. Set by
-    /// `RPythonAnnotator.build_types(main_entry_point=True)`.
-    pub entry_point_graph: RefCell<Option<GraphRef>>,
     /// RPython `self.callgraph = {}` (translator.py:41).
     /// `{opaque_tag: (caller-graph, callee-graph)}` — keyed by
     /// `(caller, callee, tag)` triple (translator.py:66). Populated
     /// every time the annotator's `recursivecall` records a non-None
     /// `whence` tag.
     pub callgraph: RefCell<HashMap<CallGraphKey, CallGraphEdge>>,
+    /// RPython `self._prebuilt_graphs = {}` (translator.py:39).
+    pub _prebuilt_graphs: RefCell<HashMap<HostObject, Rc<PyGraph>>>,
+    /// RPython `self.entry_point_graph`. Set by
+    /// `RPythonAnnotator.build_types(main_entry_point=True)`.
+    pub entry_point_graph: RefCell<Option<GraphRef>>,
 }
 
 impl TranslationContext {
     pub fn new() -> Self {
+        Self::with_config_and_flowing_flags(None, FlowingFlags::default())
+    }
+
+    /// RPython `TranslationContext.__init__(self, config=None,
+    /// **flowing_flags)` (translator.py:27-40).
+    pub fn with_config_and_flowing_flags(
+        config: Option<TranslationConfig>,
+        flowing_flags: FlowingFlags,
+    ) -> Self {
+        // upstream: `if config is None: config =
+        // get_combined_translation_config(translating=True)`.
+        let mut config = config.unwrap_or_else(get_combined_translation_config);
+        // upstream: `for attr in ['verbose',
+        // 'list_comprehension_operations']: if attr in flowing_flags:
+        // setattr(config.translation, attr, flowing_flags[attr])`.
+        if let Some(verbose) = flowing_flags.verbose {
+            config.translation.verbose = verbose;
+        }
+        if let Some(list_ops) = flowing_flags.list_comprehension_operations {
+            config.translation.list_comprehension_operations = list_ops;
+        }
+        let platform = get_platform(&config);
         TranslationContext {
-            config: TranslationConfig::default(),
+            platform,
+            config,
             annotator: RefCell::new(None),
             rtyper: RefCell::new(None),
             graphs: RefCell::new(Vec::new()),
-            entry_point_graph: RefCell::new(None),
             callgraph: RefCell::new(HashMap::new()),
+            _prebuilt_graphs: RefCell::new(HashMap::new()),
+            entry_point_graph: RefCell::new(None),
         }
     }
 
     /// RPython `translator.annotator = self` assignment performed in
-    /// `RPythonAnnotator.__init__` (annrpython.py:30-35).
-    pub fn set_annotator(&self, annotator: Weak<RPythonAnnotator>) {
+    /// `RPythonAnnotator.__init__` (annrpython.py:30-35) and
+    /// `TranslationContext.buildannotator()` (translator.py:73-75).
+    pub fn set_annotator(&self, annotator: Rc<RPythonAnnotator>) {
         *self.annotator.borrow_mut() = Some(annotator);
     }
 
     pub fn annotator(&self) -> Option<Rc<RPythonAnnotator>> {
-        self.annotator.borrow().as_ref().and_then(Weak::upgrade)
+        self.annotator.borrow().as_ref().cloned()
+    }
+
+    /// RPython `TranslationContext.buildannotator()` (translator.py:70-75).
+    pub fn buildannotator(
+        self: &Rc<Self>,
+        policy: Option<AnnotatorPolicy>,
+    ) -> Rc<RPythonAnnotator> {
+        if self.annotator().is_some() {
+            panic!("ValueError: we already have an annotator");
+        }
+        let annotator = RPythonAnnotator::new_with_translator(
+            Some(Rc::clone(self)),
+            policy,
+            None,
+            self.config.translation.keepgoing,
+        );
+        self.set_annotator(Rc::clone(&annotator));
+        annotator
+    }
+
+    /// RPython `TranslationContext.buildflowgraph()` (translator.py:43-62).
+    pub fn buildflowgraph(&self, func: HostObject, mute_dot: bool) -> Result<Rc<PyGraph>, String> {
+        let graph_func = func
+            .user_function()
+            .cloned()
+            .ok_or_else(|| format!("buildflowgraph() expects a function, got {:?}", func))?;
+
+        if let Some(pygraph) = self._prebuilt_graphs.borrow_mut().remove(&func) {
+            return Ok(pygraph);
+        }
+
+        let code = graph_func
+            .code
+            .as_ref()
+            .ok_or_else(|| format!("buildflowgraph({}): missing code object", graph_func.name))?;
+
+        let graph = build_flow(graph_func.clone()).map_err(|err| format!("{err:?}"))?;
+        simplify::simplify_graph(&graph, None);
+        if self.config.translation.list_comprehension_operations {
+            simplify::detect_list_comprehension(&graph);
+        }
+        if !self.config.translation.verbose && !mute_dot {
+            // upstream emits `log.dot()` here. The logger plumbing
+            // is not ported yet, so preserve only the control-flow
+            // gating.
+        }
+        let pygraph = Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph)),
+            func: graph_func.clone(),
+            signature: RefCell::new(code.signature.clone()),
+            defaults: RefCell::new(Some(graph_func.defaults.clone())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        self.graphs.borrow_mut().push(pygraph.graph.clone());
+        Ok(pygraph)
     }
 
     /// RPython `TranslationContext.buildrtyper()` (translator.py:77-84).
@@ -112,6 +289,16 @@ impl TranslationContext {
 
     pub fn rtyper(&self) -> Option<Rc<RPythonTyper>> {
         self.rtyper.borrow().as_ref().cloned()
+    }
+
+    // `getexceptiontransformer()` (translator.py:86-92) lands
+    // alongside the `rpython/translator/exceptiontransform.py` port.
+
+    /// RPython `TranslationContext.checkgraphs()` (translator.py:94-96).
+    pub fn checkgraphs(&self) {
+        for graph in self.graphs.borrow().iter() {
+            checkgraph(&graph.borrow());
+        }
     }
 
     /// RPython `TranslationContext.update_call_graph(caller_graph,
@@ -150,13 +337,49 @@ impl Default for TranslationContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flowspace::model::{Block, FunctionGraph};
+    use crate::flowspace::argument::Signature;
+    use crate::flowspace::bytecode::HostCode;
+    use crate::flowspace::model::{
+        Block, ConstValue, Constant, FunctionGraph, GraphFunc, HostObject,
+    };
     use std::cell::RefCell as StdRefCell;
     use std::rc::Rc;
 
     fn mk_graph(name: &'static str) -> GraphRef {
         let block = Rc::new(StdRefCell::new(Block::new(vec![])));
         Rc::new(StdRefCell::new(FunctionGraph::new(name, block)))
+    }
+
+    fn host_func(name: &str, argnames: &[&str]) -> HostObject {
+        let code = HostCode {
+            id: HostCode::fresh_identity(),
+            co_name: name.to_string(),
+            co_filename: "<test>".to_string(),
+            co_firstlineno: 1,
+            co_nlocals: argnames.len() as u32,
+            co_argcount: argnames.len() as u32,
+            co_stacksize: 0,
+            co_flags: crate::flowspace::objspace::CO_NEWLOCALS,
+            co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            co_varnames: argnames.iter().map(|arg| (*arg).to_string()).collect(),
+            co_freevars: Vec::new(),
+            co_cellvars: Vec::new(),
+            consts: Vec::new(),
+            names: Vec::new(),
+            co_lnotab: Vec::new(),
+            exceptiontable: Vec::new().into_boxed_slice(),
+            signature: Signature::new(
+                argnames.iter().map(|arg| (*arg).to_string()).collect(),
+                None,
+                None,
+            ),
+        };
+        let func = GraphFunc::from_host_code(
+            code,
+            Constant::new(ConstValue::Dict(Default::default())),
+            vec![],
+        );
+        HostObject::new_user_function(func)
     }
 
     #[test]
@@ -207,6 +430,61 @@ mod tests {
     }
 
     #[test]
+    fn buildannotator_records_shared_identity() {
+        let ctx = Rc::new(TranslationContext::new());
+        let ann = ctx.buildannotator(None);
+        let stored = ctx.annotator().expect("annotator should be installed");
+        assert!(Rc::ptr_eq(&ann, &stored));
+        assert!(Rc::ptr_eq(&ann.translator, &ctx));
+    }
+
+    #[test]
+    fn buildannotator_backlink_returns_same_annotator() {
+        let ctx = Rc::new(TranslationContext::new());
+        let ann = ctx.buildannotator(None);
+        assert!(ctx.annotator().is_some());
+        let stored = ctx.annotator().unwrap();
+        assert!(Rc::ptr_eq(&stored, &ann));
+    }
+
+    #[test]
+    fn implicit_annotator_backlink_is_strong_like_upstream() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let translator = ann.translator.clone();
+        assert!(translator.annotator().is_some());
+        drop(ann);
+        assert!(translator.annotator().is_some());
+    }
+
+    #[test]
+    fn buildannotator_backlink_retains_annotator_like_upstream() {
+        let ctx = Rc::new(TranslationContext::new());
+        {
+            let _ann = ctx.buildannotator(None);
+        }
+        assert!(ctx.annotator().is_some());
+    }
+
+    #[test]
+    fn buildannotator_uses_translation_keepgoing() {
+        let mut ctx = TranslationContext::new();
+        ctx.config.translation.keepgoing = true;
+        let ctx = Rc::new(ctx);
+        let ann = ctx.buildannotator(None);
+        assert!(ann.keepgoing);
+    }
+
+    #[test]
+    fn buildannotator_rejects_second_annotator() {
+        let ctx = Rc::new(TranslationContext::new());
+        let _ann = ctx.buildannotator(None);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = ctx.buildannotator(None);
+        }));
+        assert!(err.is_err());
+    }
+
+    #[test]
     fn new_context_starts_without_rtyper() {
         let ctx = TranslationContext::new();
         assert!(ctx.rtyper().is_none());
@@ -216,5 +494,131 @@ mod tests {
     fn new_context_starts_with_sandbox_disabled() {
         let ctx = TranslationContext::new();
         assert!(!ctx.config.translation.sandbox);
+    }
+
+    #[test]
+    fn new_context_initializes_prebuilt_graph_cache() {
+        // RPython `TranslationContext.__init__` (translator.py:27-40)
+        // seeds `self._prebuilt_graphs = {}`. Keep only the cache
+        // field that is actually consumed by the current Rust port.
+        let ctx = TranslationContext::new();
+        assert!(ctx._prebuilt_graphs.borrow().is_empty());
+    }
+
+    #[test]
+    fn new_context_sets_platform_on_context() {
+        let ctx = TranslationContext::new();
+        assert_eq!(ctx.platform, "host");
+    }
+
+    #[test]
+    fn default_construction_sets_translating_true() {
+        // Upstream `TranslationContext.__init__` (translator.py:30)
+        // calls `get_combined_translation_config(translating=True)`
+        // whenever `config is None`. The Rust port mirrors this via
+        // the `get_combined_translation_config` helper.
+        let ctx = TranslationContext::new();
+        assert!(ctx.config.translating);
+    }
+
+    #[test]
+    fn explicit_config_preserves_caller_provided_translating() {
+        // When the caller passes their own config,
+        // `TranslationContext.__init__` stores it verbatim. The Rust
+        // port mirrors this: `translating=false` survives the
+        // constructor.
+        let caller_config = TranslationConfig {
+            translating: false,
+            ..TranslationConfig::default()
+        };
+        let ctx = TranslationContext::with_config_and_flowing_flags(
+            Some(caller_config),
+            FlowingFlags::default(),
+        );
+        assert!(!ctx.config.translating);
+    }
+
+    #[test]
+    fn flowing_flags_override_translation_subfields() {
+        let ctx = TranslationContext::with_config_and_flowing_flags(
+            None,
+            FlowingFlags {
+                verbose: Some(true),
+                list_comprehension_operations: Some(true),
+            },
+        );
+        assert!(ctx.config.translation.verbose);
+        assert!(ctx.config.translation.list_comprehension_operations);
+    }
+
+    #[test]
+    fn checkgraphs_walks_registered_graphs() {
+        use crate::flowspace::model::{BlockRefExt, ConstValue, Constant, Hlvalue, Link};
+        let ctx = TranslationContext::new();
+        let graph = mk_graph("checked");
+        {
+            let g = graph.borrow();
+            let link = Rc::new(StdRefCell::new(Link::new(
+                vec![Hlvalue::Constant(Constant::new(ConstValue::Int(1)))],
+                Some(g.returnblock.clone()),
+                None,
+            )));
+            g.startblock.closeblock(vec![link]);
+        }
+        ctx.graphs.borrow_mut().push(graph);
+        ctx.checkgraphs();
+    }
+
+    #[test]
+    fn buildflowgraph_prebuilt_graph_is_not_registered() {
+        let ctx = TranslationContext::new();
+        let func = host_func("f", &[]);
+        let prebuilt = Rc::new(PyGraph {
+            graph: mk_graph("prebuilt"),
+            func: host_func("f", &[])
+                .user_function()
+                .cloned()
+                .expect("host_func should build a user function"),
+            signature: RefCell::new(Signature::new(Vec::new(), None, None)),
+            defaults: RefCell::new(None),
+            access_directly: std::cell::Cell::new(true),
+        });
+        ctx._prebuilt_graphs
+            .borrow_mut()
+            .insert(func.clone(), prebuilt.clone());
+
+        let pygraph = ctx.buildflowgraph(func, false).expect("prebuilt graph");
+
+        assert!(Rc::ptr_eq(&pygraph, &prebuilt));
+        assert!(ctx.graphs.borrow().is_empty());
+        assert!(pygraph.defaults.borrow().is_none());
+        assert!(pygraph.access_directly.get());
+    }
+
+    #[test]
+    fn buildflowgraph_rejects_non_function_before_prebuilt_cache_lookup() {
+        let ctx = TranslationContext::new();
+        let module = HostObject::new_module("pkg.not_a_function");
+        let prebuilt = Rc::new(PyGraph {
+            graph: mk_graph("prebuilt"),
+            func: host_func("f", &[])
+                .user_function()
+                .cloned()
+                .expect("host_func should build a user function"),
+            signature: RefCell::new(Signature::new(Vec::new(), None, None)),
+            defaults: RefCell::new(None),
+            access_directly: std::cell::Cell::new(true),
+        });
+        ctx._prebuilt_graphs
+            .borrow_mut()
+            .insert(module.clone(), prebuilt);
+
+        let err = match ctx.buildflowgraph(module.clone(), false) {
+            Ok(_) => panic!("non-functions must be rejected before cache lookup"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("buildflowgraph() expects a function"));
+        assert!(ctx._prebuilt_graphs.borrow().contains_key(&module));
     }
 }
