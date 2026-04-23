@@ -2164,10 +2164,12 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
 /// CALL_N(memcpy_fn, dst, src, n) emitted in place of
 /// COPYSTRCONTENT / COPYUNICODECONTENT.  Upstream:
 ///
-///     self.memcpy_descr = get_call_descr(self,
-///         [lltype.Signed, lltype.Signed, lltype.Signed], lltype.Void,
-///         EffectInfo([], [], [], [], [], [], EffectInfo.EF_CANNOT_RAISE,
-///             can_collect=False))
+/// ```text
+/// self.memcpy_descr = get_call_descr(self,
+///     [lltype.Signed, lltype.Signed, lltype.Signed], lltype.Void,
+///     EffectInfo([], [], [], [], [], [], EffectInfo.EF_CANNOT_RAISE,
+///         can_collect=False))
+/// ```
 pub fn make_memcpy_calldescr() -> DescrRef {
     use std::sync::Arc;
     static NEXT_IDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x5000_0000);

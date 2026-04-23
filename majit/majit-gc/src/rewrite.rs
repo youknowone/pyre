@@ -918,9 +918,11 @@ impl GcRewriterImpl {
     /// Lowers `COPYSTRCONTENT(src, dst, src_start, dst_start, length)` (and
     /// the UNICODE variant) to:
     ///
-    ///     i1 = LOAD_EFFECTIVE_ADDRESS(src_gcptr, src_start, basesize, shift)
-    ///     i2 = LOAD_EFFECTIVE_ADDRESS(dst_gcptr, dst_start, basesize, shift)
-    ///     CALL_N(memcpy_fn, i2, i1, count, descr=memcpy_descr)
+    /// ```text
+    /// i1 = LOAD_EFFECTIVE_ADDRESS(src_gcptr, src_start, basesize, shift)
+    /// i2 = LOAD_EFFECTIVE_ADDRESS(dst_gcptr, dst_start, basesize, shift)
+    /// CALL_N(memcpy_fn, i2, i1, count, descr=memcpy_descr)
+    /// ```
     ///
     /// For UNICODE, `count` is `length << shift` (byte count); for STR the
     /// basesize is additionally offset by `-1` to skip the STR

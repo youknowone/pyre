@@ -4979,15 +4979,20 @@ impl Assembler386 {
 
     /// STRGETITEM / UNICODEGETITEM: result = string[index]
     /// arg0 = string pointer, arg1 = index.
-    /// Characters are stored after the header. For RPython strings
-    /// (1 byte per char), address = base + base_size + index.
+    /// Address = base + (basesize - extra_null) + index * itemsize, per
+    /// `rewrite.py:295-306` — STR has `extra_item_after_alloc=1` so the
+    /// token basesize overshoots the first char by 1; UNICODE does not.
     fn genop_strgetitem(&mut self, op: &Op) {
-        let (base_size, item_size) = op
+        let (mut base_size, item_size) = op
             .descr
             .as_ref()
             .and_then(|d| d.as_array_descr())
             .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-            .unwrap_or((16, 1)); // Default for RPython rstr: 16-byte header, 1-byte items
+            .unwrap_or((17, 1)); // rstr.STR token defaults (basesize=17, itemsize=1)
+        if op.opcode == OpCode::Strgetitem {
+            debug_assert_eq!(item_size, 1, "STRGETITEM itemsize must be 1");
+            base_size -= 1; // rewrite.py:299 — skip the extra null character
+        }
 
         self.load_arg_to_rax(op.arg(0)); // string pointer
         self.load_arg_to_rcx(op.arg(1)); // index
@@ -5430,13 +5435,20 @@ impl Assembler386 {
     // ================================================================
 
     /// STRSETITEM / UNICODESETITEM: string[index] = value.
+    /// Address = base + (basesize - extra_null) + index * itemsize, per
+    /// `rewrite.py:307-318` — STR has `extra_item_after_alloc=1` so the
+    /// token basesize overshoots the first char by 1; UNICODE does not.
     fn genop_discard_strsetitem(&mut self, op: &Op) {
-        let (base_size, item_size) = op
+        let (mut base_size, item_size) = op
             .descr
             .as_ref()
             .and_then(|d| d.as_array_descr())
             .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-            .unwrap_or((16, 1));
+            .unwrap_or((17, 1));
+        if op.opcode == OpCode::Strsetitem {
+            debug_assert_eq!(item_size, 1, "STRSETITEM itemsize must be 1");
+            base_size -= 1; // rewrite.py:311 — skip the extra null character
+        }
 
         self.load_arg_to_rax(op.arg(0)); // string
         self.load_arg_to_rcx(op.arg(1)); // index
