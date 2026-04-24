@@ -1820,36 +1820,21 @@ fn register_helper_fn_pointers(
 /// `SSARepr` to find each Python PC's `-live-` marker instead of caching
 /// pre-rewrite insn indices.
 ///
-/// After the dataflow, pyre applies an in-place post-filter to each
-/// `-live-` marker so the args carry only the subset of registers
-/// the runtime contract is currently wired to consume (see rules
-/// below). `get_liveness_info` at assemble time
-/// (`assembler.rs:422-437`) partitions by kind and emits the
-/// `all_liveness` byte stream. Both the tracer's
-/// `get_list_of_active_boxes` and the blackhole's bridge-resume
-/// `consume_one_section` read `all_liveness` via `LivenessIterator`,
-/// so the single post-rename `-live-` marker is the sole source.
+/// After the dataflow, pyre rewrites each `-live-` marker so the
+/// args are split into live_i / live_r / live_f sequences, mirroring
+/// upstream `assembler.py:150-152`
+/// (`get_liveness_info(insn[1:], 'int'/'ref'/'float')`). The
+/// tracer (`trace_opcode.rs:670`) and the blackhole bridge-resume
+/// (`call_jit.rs:870-887`) read the three banks in order via
+/// `LivenessIterator`, so the post-rename `-live-` marker is the
+/// sole source.
 ///
-/// Post-filter rules (pyre-only adaptation on top of SSA output):
-///   - Only Ref-kind registers: pyre Int/Float regs are scratch
-///     tmps (int_tmp0/1, op_code_reg) or constant-as-reg encodings
-///     inside `jit_merge_point`; they never carry a Python box
-///     across py_pc boundaries. Leaving live_i / live_f empty keeps
-///     the tracer / blackhole (which index box arrays by raw
-///     register index at `trace_opcode.rs:229-263` /
-///     `call_jit.rs:965-982`) from pulling a Ref box through an
-///     Int/Float slot.
-///   - Only indices inside the Python-frame range: locals
-///     `0..nlocals` or in-depth stack slots
-///     `stack_base..stack_base+depth`. Helper Ref regs above that
-///     range (obj_tmp0/1, arg_regs_start, null_ref_reg,
-///     portal_{frame,ec}_reg) are correctly dead across py_pcs and
-///     would desynchronise box layout if leaked.
-///   - Every in-depth stack slot `stack_base + d` for
-///     `d in 0..depth_at_pc[py_pc]` is force-added even if SSA
-///     didn't mark it alive, because pyre's runtime invariant at
-///     every `-live-` marker is "all stack slots up to the current
-///     depth hold a live box".
+/// The Ref bank carries a pyre-specific PRE-EXISTING-ADAPTATION
+/// (Python-frame index range + force-add in-depth stack slots +
+/// LV∩SSA intersection) required because pyre's pre-regalloc
+/// register space conflates Python frame slots with scratch Ref
+/// tmps; see `filter_liveness_in_place` for the full rationale.
+/// Int/Float banks are emitted line-by-line parity with no filter.
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
 /// `LiveVars` analysis. The direct-dispatch walker emits one
@@ -1971,11 +1956,33 @@ fn filter_liveness_in_place(
         let mut live_r: Vec<u16> = Vec::new();
         let mut live_i: Vec<u16> = Vec::new();
         let mut live_f: Vec<u16> = Vec::new();
-        // `liveness.py:67-75` `compute_liveness` adds every Register read
-        // to the alive set without a kind filter. Preserve Int/Float
-        // registers as-is; only Ref registers carry pyre's stack-base /
-        // in-range adaptation (PRE-EXISTING-ADAPTATION, see the vable
-        // locals/stack decoding contract below).
+        // liveness.py:67-75 `compute_liveness` adds every Register to
+        // the alive set; assembler.py:150-152 splits the `-live-` args
+        // into live_i / live_r / live_f by kind via
+        // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`. The
+        // Int/Float banks mirror that shape exactly.
+        //
+        // PRE-EXISTING-ADAPTATION (Ref bank):
+        // upstream RPython registers are strictly post-regalloc SSA
+        // colors in `0..num_regs_r`, all carrying Python boxes.
+        // pyre's pre-regalloc register index space conflates Python
+        // frame slots (`0..nlocals` + `stack_base..stack_base+depth`)
+        // with scratch Ref tmps allocated at fixed offsets beyond
+        // `nlocals + max_stackdepth` (`obj_tmp0` / `arg_regs_start` /
+        // `null_ref_reg` / `portal_{frame,ec}_reg` — see
+        // `RegisterLayout::compute` at codewriter.rs:1670-1692). Those
+        // scratch registers appear in `compute_liveness`'s alive set
+        // but are NOT Python boxes; leaking them into live_r causes
+        // the blackhole consumer at `call_jit.rs:876-881` to call
+        // `setarg_r` with scratch contents, crashing on nbody /
+        // fannkuch / spectral_norm.
+        //
+        // Until pyre's register layout is refactored to a
+        // post-regalloc-color-only space matching RPython (Task #62
+        // scope, multi-session), constrain live_r to the Python-frame
+        // range and force-add in-depth stack slots so the "all stack
+        // slots up to current depth hold a live box" runtime contract
+        // holds at every `-live-` marker.
         for op in existing.iter() {
             let SsaOperand::Register(reg) = op else {
                 continue;
@@ -2008,6 +2015,13 @@ fn filter_liveness_in_place(
                 live_r.push(idx);
             }
         }
+        // PRE-EXISTING-ADAPTATION: pyre's tracer + blackhole are still
+        // wired to Python's per-bytecode LiveVars answer for locals
+        // (which omits function parameters at pc=0 and dead locals).
+        // Narrowing live_r to LV∩SSA restores that contract until
+        // SSA liveness becomes the sole authority — see
+        // `phase4_ssa_liveness_blocker_2026_04_18.md` for the rework
+        // required to drop this intersection (Task #62 scope).
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
@@ -4918,9 +4932,10 @@ impl CodeWriter {
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the
-        // post-rename colors. pyre's `filter_liveness_in_place` keeps
-        // that ordering and then applies the pyre-only runtime-contract
-        // filter (Ref-only, in-range, stack-complete, LiveVars-intersected).
+        // post-rename colors. `filter_liveness_in_place` then splits
+        // them into live_i/live_r/live_f per assembler.py:150-152,
+        // with a PRE-EXISTING-ADAPTATION narrowing live_r to Python
+        // boxes (see that function's header comment).
         filter_liveness_in_place(&mut ssarepr, code, nlocals, stack_base, &depth_at_pc);
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC

@@ -2297,20 +2297,38 @@ impl MIFrame {
             // `vable_ref` is at `virtualizable_boxes[-1]` and NEVER covers
             // an array slot — skip it via `.get()`.
             let shadow_entry = ctx.virtualizable_box_at(num_static + i);
-            let opref = match shadow_entry {
-                Some(op) if !op.is_none() => op,
-                _ => {
-                    // pyre stack temporaries live in the `registers_r` tail,
-                    // not the vable shadow — keep the legacy fallback for
-                    // those slots.
-                    if i < sym.registers_r.len() {
-                        sym.registers_r[i]
-                    } else {
-                        let stack_idx = i - sym.nlocals;
-                        if stack_idx < stack_values.len() {
-                            stack_values[stack_idx]
+            // PRE-EXISTING-ADAPTATION: for stack slots within the
+            // current symbolic stack depth (`valid_stack_only`), prefer
+            // `registers_r_view[i]` over the shadow.
+            // `seed_virtualizable_boxes` pads reserved stack slots with
+            // `const_ref(PY_NULL)` to mirror the heap state at portal
+            // entry, but pyre's `push_typed_value` updates only
+            // `sym.registers_r`, not the shadow. Upstream
+            // `_opimpl_setarrayitem_vable` (pyjitpl.py:1237-1247) would
+            // mirror every stack push into `virtualizable_boxes`, but
+            // pyre does not yet emit the `setarrayitem_vable` IR op for
+            // symbolic stack pushes (Task #135). Until that full port
+            // lands, compensate on the snapshot side so a stale PY_NULL
+            // pad cannot override a freshly pushed value.
+            let is_live_stack_slot = i >= sym.nlocals && i < sym.nlocals + valid_stack_only;
+            let opref = if is_live_stack_slot && i < registers_r_view.len() {
+                registers_r_view[i]
+            } else {
+                match shadow_entry {
+                    Some(op) if !op.is_none() => op,
+                    _ => {
+                        // pyre stack temporaries live in the `registers_r` tail,
+                        // not the vable shadow — keep the legacy fallback for
+                        // those slots.
+                        if i < sym.registers_r.len() {
+                            sym.registers_r[i]
                         } else {
-                            OpRef::NONE
+                            let stack_idx = i - sym.nlocals;
+                            if stack_idx < stack_values.len() {
+                                stack_values[stack_idx]
+                            } else {
+                                OpRef::NONE
+                            }
                         }
                     }
                 }
@@ -5568,6 +5586,14 @@ impl OpcodeStepExecutor for MIFrame {
             let cause = if raw_cause_obj.is_null() {
                 None
             } else {
+                // pyopcode.py:706 `w_cause = space.call_function(w_cause)`
+                // runs on the interpreter path; in pyre's tracer context
+                // the call must be forced onto the plain eval loop so it
+                // does not re-enter the tracer. Mirrors the exc-path
+                // guard at `call_function(exc, &[])` below (commit
+                // bef2ee2035 symmetrized JIT + blackhole helpers but
+                // missed this tracer-time site).
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 Some(normalize_raise_cause(raw_cause_obj)?)
             };
             (exc_val, cause, raw_cause.opref)
