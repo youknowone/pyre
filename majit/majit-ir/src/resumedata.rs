@@ -110,8 +110,8 @@ impl Snapshot {
     }
 
     /// Create a multi-frame snapshot from per-frame (jitcode_index, pc, boxes) tuples.
-    /// Used when a guard fires inside an inlined callee and the snapshot
-    /// contains [callee_section..., caller_section...].
+    /// RPython's read-side framestack order is outermost frame first,
+    /// innermost frame last.
     pub fn multi_frame(frames: Vec<(i32, i32, Vec<OpRef>)>) -> Self {
         Snapshot {
             vable_array: Vec::new(),

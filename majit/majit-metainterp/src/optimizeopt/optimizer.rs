@@ -533,7 +533,12 @@ impl Optimizer {
             head_load_descr_index: Option<u32>,
         }
         let mut entries: Vec<VirtualEntry> = Vec::new();
-        // Track leaf field positions that need SameAs (position, entry_idx, field_idx).
+        // Track leaf field positions that need SameAs (field_ref, entry_idx, field_idx).
+        // RPython parity: Box.type is intrinsic; the SameAs result type follows
+        // `box.type` (virtualstate.py:415 `box = get_box_replacement(box)` +
+        // `boxes[self.position_in_notvirtuals] = box`). value_types must already
+        // carry `field_ref`'s type from the upstream seed (trace_inputarg_types
+        // or prev_phase_value_types).
         let mut same_as_targets: Vec<(OpRef, usize, usize)> = Vec::new();
 
         // RPython parity: traverse ALL states in order (not just virtuals).
@@ -648,15 +653,17 @@ impl Optimizer {
             }
         }
         for (label_arg, entry_idx, field_idx) in &same_as_targets {
-            // RPython parity: Box.type carries the source type intrinsically.
-            // value_types[label_arg] is whatever the optimizer's emit() last
-            // recorded for that OpRef. A Type::Void here would be an upstream
-            // bookkeeping bug (a guard's pos collided with a Box position):
-            // letting it through reaches `same_as_for_type(Void)`, which is
-            // `unreachable!` and panics with a clear message.
-            let tp = ctx
-                .opref_type(*label_arg)
-                .expect("imported virtual leaf missing box.type");
+            // virtualstate.py:415 `box = get_box_replacement(box)` — Box.type is
+            // intrinsic, so the SameAs result type follows the source box's
+            // type. value_types must already carry it (seeded via
+            // trace_inputarg_types / prev_phase_value_types / op.result_type
+            // in optimizer.rs:1722-1758).
+            let tp = ctx.opref_type(*label_arg).expect(
+                "install_imported_virtuals: label_arg is missing a value type. \
+                 Box.type parity is broken — check the upstream seed at \
+                 optimizer.rs:1722-1758 (trace_inputarg_types / prev_phase_value_types / \
+                 ops' result_type).",
+            );
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
             op.pos = ctx.reserve_pos();
@@ -1542,14 +1549,23 @@ impl Optimizer {
     ) {
         let class_ptr = GcRef(class_value as usize);
         let resolved = ctx.get_box_replacement(opref);
-        // optimizer.py:139: isinstance(opinfo, info.InstancePtrInfo)
-        let is_instance = matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Instance(_)));
-        if is_instance {
-            // optimizer.py:140: opinfo._known_class = class_const
-            if let Some(PtrInfo::Instance(iinfo)) = ctx.get_ptr_info_mut(resolved) {
+        // optimizer.py:139: isinstance(opinfo, info.InstancePtrInfo).
+        // RPython's InstancePtrInfo covers both virtual and non-virtual
+        // instances (`is_virtual` is a field). Rust splits those states into
+        // PtrInfo::Instance and PtrInfo::Virtual, so both arms must preserve
+        // the existing object info and only update `_known_class`.
+        let updated_existing = match ctx.get_ptr_info_mut(resolved) {
+            Some(PtrInfo::Instance(iinfo)) => {
                 iinfo.known_class = Some(class_ptr);
+                true
             }
-        } else {
+            Some(PtrInfo::Virtual(vinfo)) => {
+                vinfo.known_class = Some(class_ptr);
+                true
+            }
+            _ => false,
+        };
+        if !updated_existing {
             // optimizer.py:142-148: preserve last_guard_pos from old info
             let old_guard_pos = ctx
                 .get_ptr_info(resolved)
@@ -3293,22 +3309,13 @@ impl Optimizer {
                 old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
             // optimizer.py:137-151 make_constant_class:
             //   opinfo._known_class = class_const
-            //   if update_last_guard: mark_last_guard → len(_newoperations) - 1
-            let new_guard_pos = if update_last_guard {
-                (ctx.new_operations.len() as i32) - 1 // NOW correct: guard is in new_operations
-            } else {
-                old_guard_pos
-            };
-            // optimizer.py:147 InstancePtrInfo(None, class_const) +
-            // last_guard_pos = new_guard_pos. The Rust port stores this as
-            // Instance(descr=None, known_class=Some(class)) via the
-            // `known_class` factory and then sets last_guard_pos.
-            let mut new_info = crate::optimizeopt::info::PtrInfo::known_class(
-                majit_ir::GcRef(pp.class_val as usize),
-                true,
+            //   if update_last_guard: mark_last_guard
+            crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                ctx,
+                pp.obj,
+                pp.class_val,
+                update_last_guard,
             );
-            new_info.set_last_guard_pos(new_guard_pos);
-            ctx.set_ptr_info(pp.obj, new_info);
         }
         ctx.in_final_emission = saved_in_final_emission;
     }

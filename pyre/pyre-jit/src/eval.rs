@@ -44,7 +44,7 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
 
 /// Bridge pyre-object's `GcAllocHookFn` to `majit_gc::alloc_nursery_typed`.
 /// pyre-object deliberately carries no majit-gc dep, so pyre-jit owns
-/// the `GcRef` → `*mut u8` conversion.
+/// the `GcRef` -> `*mut u8` conversion.
 fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
     majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
 }
@@ -290,7 +290,7 @@ thread_local! {
         // nursery. `set_gc_allocator` populated
         // `majit_gc::ACTIVE_ALLOC_NURSERY_TYPED` with the active
         // backend's trampoline; the one registered here converts
-        // `GcRef` → `*mut u8` for the pyre-object side. pyre-object
+        // `GcRef` -> `*mut u8` for the pyre-object side. pyre-object
         // deliberately does not depend on majit-gc, so the trampoline
         // lives here.
         pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
@@ -3175,6 +3175,27 @@ fn materialize_virtual_from_rd(
             }
         }
     }
+    // Constructors for container objects with embedded inline arrays repair
+    // self-referential `ptr` fields after field initialization. Virtual
+    // materialization must restore the same invariant for resumed virtuals.
+    if let VirtualKind::Instance { known_class, .. } = kind {
+        let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+        let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
+        if known_class == Some(list_type_addr) {
+            unsafe {
+                let list = &mut *(obj_ptr as *mut pyre_object::listobject::W_ListObject);
+                list.items.fix_ptr();
+                list.int_items.fix_ptr();
+                list.float_items.fix_ptr();
+            }
+        } else if known_class == Some(tuple_type_addr) {
+            unsafe {
+                let tuple = &mut *(obj_ptr as *mut pyre_object::tupleobject::W_TupleObject);
+                tuple.items.fix_ptr();
+            }
+        }
+    }
+
     obj_ref
 }
 

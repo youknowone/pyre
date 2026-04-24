@@ -391,7 +391,8 @@ impl RewriteState {
 
     /// Emit an op. Void ops do not consume a result id.
     fn emit(&mut self, mut op: Op) -> OpRef {
-        let pos = if op.result_type() == Type::Void {
+        let result_type = op.result_type();
+        let pos = if result_type == Type::Void {
             OpRef::NONE
         } else {
             let pos = OpRef(self.next_pos);
@@ -399,6 +400,9 @@ impl RewriteState {
             pos
         };
         op.pos = pos;
+        if result_type != Type::Void {
+            self.result_types.insert(pos.0, result_type);
+        }
         self.out.push(op);
         pos
     }
@@ -406,6 +410,7 @@ impl RewriteState {
     /// Emit a result-producing op, preserving the provided position when the
     /// source trace already assigned one.
     fn emit_result(&mut self, mut op: Op, preferred_pos: OpRef) -> OpRef {
+        let result_type = op.result_type();
         let pos = if preferred_pos.is_none() {
             let pos = OpRef(self.next_pos);
             self.next_pos += 1;
@@ -414,6 +419,9 @@ impl RewriteState {
             preferred_pos
         };
         op.pos = pos;
+        if result_type != Type::Void {
+            self.result_types.insert(pos.0, result_type);
+        }
         self.out.push(op);
         pos
     }
