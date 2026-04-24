@@ -265,8 +265,10 @@ fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::Code(_)
         | ConstValue::Function(_)
         | ConstValue::Graphs(_)
+        | ConstValue::FrozenDesc(_)
         | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
+        | ConstValue::LLAddress(_)
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_) => true,
     }
@@ -602,7 +604,7 @@ impl ClassRepr {
         r_parentcls: &Arc<ClassRepr>,
     ) -> Result<(), TyperError> {
         let classdesc = self.classdef.borrow().classdesc.clone();
-        let classdesc_key = crate::annotator::description::DescKey::from_rc(&classdesc);
+        let classdesc_key = classdesc.borrow().identity;
 
         // upstream: `for fldname in r_parentcls.clsfields`.
         let clsfields_snapshot: Vec<(String, (String, Arc<dyn Repr>))> = r_parentcls
@@ -1840,13 +1842,13 @@ mod tests {
 
     #[test]
     fn classrepr_setup_materializes_extra_access_sets() {
-        use crate::annotator::description::{ClassAttrFamily, DescKey};
+        use crate::annotator::description::ClassAttrFamily;
 
         let rtyper = fresh_rtyper();
         let classdef = ClassDef::new_standalone("pkg.C", None);
-        let access_set = Rc::new(RefCell::new(ClassAttrFamily::new(DescKey::from_rc(
-            &classdef.borrow().classdesc,
-        ))));
+        let access_set = Rc::new(RefCell::new(ClassAttrFamily::new(
+            classdef.borrow().classdesc.borrow().identity,
+        )));
         access_set.borrow_mut().s_value = SomeValue::Bool(crate::annotator::model::SomeBool::new());
         let access_key = class_attr_family_key(&access_set);
         classdef

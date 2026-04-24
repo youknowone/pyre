@@ -35,6 +35,13 @@ thread_local! {
     /// records the post-`_become` target by pointer identity here and
     /// routes read-side operations through the redirect.
     static PTR_BECOME_TARGETS: RefCell<HashMap<u64, _ptr>> = RefCell::new(HashMap::new());
+
+    /// RPython `TLS.nested_hash_level` (`lltype.py:136-156` —
+    /// `LowLevelType.__hash__`). Caps recursion in structurally-hashed
+    /// types: when the level reaches 3, the hash short-circuits to 0,
+    /// breaking infinite recursion through self-referential structs
+    /// like `Struct('pbc', ('peer', Ptr(ForwardReference(self))))`.
+    static NESTED_HASH_LEVEL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -324,14 +331,21 @@ pub enum LowLevelValue {
 /// RPython `_fakeaddress(self, ptr)` (`llmemory.py:441-570`).
 ///
 /// Upstream carries the underlying `_ptr` (or `None` for NULL) and
-/// exposes `_cast_to_ptr` / `_cast_to_int` / dereference helpers.
-/// Pyre lands only the NULL sentinel in this commit — the `Fake(_ptr)`
-/// arm will extend when the first consumer (MultipleUnrelatedFrozenPBCRepr
-/// `convert_pbc`) hits it.
+/// exposes `_cast_to_ptr` / `_cast_to_int` / dereference helpers. The
+/// Rust port models the two arms in use today — `Null` for upstream's
+/// `NULL = fakeaddress(None)` and `Fake(_ptr)` for upstream's
+/// `fakeaddress(pbcptr)` produced by
+/// `MultipleUnrelatedFrozenPBCRepr.convert_pbc`. Casting helpers will
+/// extend further variants as their consumers (`cast_ptr_to_adr` /
+/// `cast_adr_to_ptr` / `cast_int_to_adr` / `cast_adr_to_int`) land.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum _address {
     /// `NULL = fakeaddress(None)` (`llmemory.py:649`).
     Null,
+    /// `fakeaddress(ptr)` (`llmemory.py:441-570`). Carries the
+    /// underlying pointer; eq/hash/clone match `_ptr`'s redirect-aware
+    /// behaviour because they delegate to the boxed `_ptr` directly.
+    Fake(Box<_ptr>),
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +380,20 @@ pub enum LowLevelType {
 
 impl PartialEq for LowLevelType {
     fn eq(&self, other: &Self) -> bool {
+        // Identity short-circuit: two ForwardReference handles cloned
+        // from the same source share the underlying Arc<Mutex<>>.
+        // Without this, `LowLevelType::eq` on two
+        // `LowLevelType::ForwardReference` with shared targets would
+        // unwrap via `resolved()` and recurse on a self-referential
+        // struct (Struct('pbc', ("peer", Ptr(ForwardReference(self))))).
+        // PtrTarget::eq routes through `LowLevelType::from`, so this
+        // branch must fire BEFORE the `resolved()` unwrap below.
+        if let (LowLevelType::ForwardReference(left), LowLevelType::ForwardReference(right)) =
+            (self, other)
+            && Arc::ptr_eq(&left.target, &right.target)
+        {
+            return true;
+        }
         if let LowLevelType::ForwardReference(forward_ref) = self
             && let Some(real) = forward_ref.resolved()
         {
@@ -412,6 +440,26 @@ impl Eq for LowLevelType {}
 
 impl Hash for LowLevelType {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // upstream lltype.py:136-156 — `LowLevelType.__hash__` caps
+        // recursion at level 3. Self-referential structs (e.g.
+        // `Struct('pbc', ('peer', Ptr(ForwardReference(self))))`)
+        // would otherwise recurse forever through the Struct → Ptr →
+        // ForwardReference(resolved=self) → Struct chain.
+        let entry_level = NESTED_HASH_LEVEL.with(|cell| {
+            let level = cell.get();
+            cell.set(level + 1);
+            level
+        });
+        struct LevelGuard;
+        impl Drop for LevelGuard {
+            fn drop(&mut self) {
+                NESTED_HASH_LEVEL.with(|cell| cell.set(cell.get() - 1));
+            }
+        }
+        let _guard = LevelGuard;
+        if entry_level >= 3 {
+            return;
+        }
         match self {
             LowLevelType::Void => 0_u8.hash(state),
             LowLevelType::Signed => 1_u8.hash(state),
@@ -973,6 +1021,16 @@ impl PartialEq for _ptr {
 
 impl Eq for _ptr {}
 
+impl Hash for _ptr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Routes through `_hashable_identity` so the hash respects the
+        // `PTR_BECOME_TARGETS` redirect chain — placeholder and final
+        // pointers hash identically after `_become`. This is the same
+        // identity used by `ConstValue::LLPtr`.
+        self._hashable_identity().hash(state);
+    }
+}
+
 impl _ptr {
     pub fn new(_TYPE: Ptr, _obj0: Result<Option<_ptr_obj>, DelayedPointer>) -> Self {
         Self::new_with_solid(_TYPE, _obj0, false)
@@ -992,8 +1050,17 @@ impl _ptr {
         }
     }
 
+    /// Stable hashable identity for use in `ConstValue::LLPtr` eq/hash.
+    ///
+    /// Resolves through `PTR_BECOME_TARGETS` so a placeholder pointer
+    /// that has been `_become`'d to a final pointer hashes/eq-compares
+    /// identically to the final pointer. Without this redirect,
+    /// `MultipleFrozenPBCRepr.convert_desc` would produce two distinct
+    /// `ConstValue::LLPtr` Constants for the same logical pointer (the
+    /// placeholder snapshot captured by a recursive call vs. the
+    /// post-`_become` cache entry), violating Rust's Hash/Eq contract.
     pub fn _hashable_identity(&self) -> u64 {
-        self._identity
+        self._resolved_ptr()._identity
     }
 
     pub fn _togckind(&self) -> GcKind {
@@ -2309,6 +2376,15 @@ impl ForwardReference {
 
 impl PartialEq for ForwardReference {
     fn eq(&self, other: &Self) -> bool {
+        // Identity short-circuit: two ForwardReference handles cloned
+        // from the same source share the underlying `Arc<Mutex<>>`.
+        // Self-referential struct types (Struct('pbc',
+        // ("peer", Ptr(ForwardReference(self))))) would otherwise loop
+        // forever through `resolved() == resolved() → Struct == Struct
+        // → field == field → ForwardReference::eq …` here.
+        if Arc::ptr_eq(&self.target, &other.target) {
+            return true;
+        }
         match (self.resolved(), other.resolved()) {
             (Some(left), Some(right)) => left == right,
             (Some(_), None) | (None, Some(_)) => false,
@@ -2321,10 +2397,26 @@ impl Eq for ForwardReference {}
 
 impl Hash for ForwardReference {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self.resolved() {
-            Some(real) => real.hash(state),
-            None => panic!("ForwardReference object is not hashable"),
+        // upstream lltype.py:627-628 — `ForwardReference.__hash__`
+        // always raises. After `become()`, upstream rebinds
+        // `self.__class__` so subsequent hashes use the resolved
+        // container type's `__hash__` (i.e. `LowLevelType.__hash__`,
+        // structural). Rust cannot rebind enum variants, so the
+        // resolved structural hash lives on `LowLevelType::Hash` for
+        // `LowLevelType::ForwardReference(t)` and `ForwardReference`
+        // itself only ever gets hashed when callers reach for the
+        // raw struct directly — which always means an unresolved
+        // reference, hence the unconditional panic.
+        if self.target.lock().unwrap().is_none() {
+            panic!("ForwardReference object is not hashable");
         }
+        // Resolved fall-through: route through the resolved value's
+        // structural hash, matching upstream's class-rebind shim.
+        // The LowLevelType-level recursion guard (`NESTED_HASH_LEVEL`)
+        // protects against self-referential struct cycles.
+        self.resolved()
+            .expect("resolved() must be Some when target.lock() returned Some above")
+            .hash(state);
     }
 }
 
@@ -3827,6 +3919,33 @@ mod tests {
         let forward_ref = ForwardReference::new();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         forward_ref.hash(&mut hasher);
+    }
+
+    #[test]
+    fn self_referential_struct_hash_terminates() {
+        // upstream lltype.py:136-156 — `LowLevelType.__hash__` uses
+        // `TLS.nested_hash_level` to break recursion through
+        // self-referential structs like
+        // `Struct('pbc', ('peer', Ptr(ForwardReference(self))))`.
+        // The Rust port mirrors this with `NESTED_HASH_LEVEL`.
+        let forward_ref = ForwardReference::gc();
+        let self_ref_struct = StructType::gc(
+            "pbc",
+            vec![(
+                "peer".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(forward_ref.clone()),
+                })),
+            )],
+        );
+        forward_ref
+            .r#become(LowLevelType::Struct(Box::new(self_ref_struct.clone())))
+            .unwrap();
+
+        // Hash must terminate, not recurse forever.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        LowLevelType::Struct(Box::new(self_ref_struct)).hash(&mut hasher);
+        let _ = hasher.finish();
     }
 
     #[test]

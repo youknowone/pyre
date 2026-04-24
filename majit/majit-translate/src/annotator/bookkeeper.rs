@@ -286,7 +286,8 @@ impl std::fmt::Debug for Bookkeeper {
 /// name + flags.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MethodDescKey {
-    /// RPython `funcdesc` — pointer identity via [`DescKey::from_rc`].
+    /// RPython `funcdesc` — identity via `FunctionDesc.base.identity`
+    /// (same counter-allocated key used by every other Desc family).
     pub funcdesc_id: DescKey,
     /// RPython `originclassdef` — `ClassDefKey` already carries the
     /// pointer identity.
@@ -1102,7 +1103,7 @@ impl Bookkeeper {
     ) -> Rc<RefCell<MethodDesc>> {
         let flags_vec: Vec<(String, bool)> = flags.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let key = MethodDescKey {
-            funcdesc_id: DescKey::from_rc(funcdesc),
+            funcdesc_id: funcdesc.borrow().base.identity,
             originclassdef,
             selfclassdef,
             name: name.to_string(),
@@ -1734,15 +1735,18 @@ impl Bookkeeper {
             }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
+            | ConstValue::FrozenDesc(_)
             | ConstValue::LowLevelType(_)
+            | ConstValue::LLAddress(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder => {
-                // Code / Graphs / SpecTag / Atom / Placeholder cover
-                // internal flowspace / host-carrier values that
-                // upstream never feeds into immutablevalue. Keep the
-                // fail-fast stub so any unexpected call-site surfaces
-                // a clear error rather than silent stub-SomePBC.
+                // Code / Graphs / SpecTag / Atom / Placeholder /
+                // LLAddress cover internal flowspace / low-level
+                // carriers that upstream never feeds into
+                // immutablevalue. Keep the fail-fast stub so any
+                // unexpected call-site surfaces a clear error rather
+                // than silent stub-SomePBC.
                 Err(AnnotatorError::new(format!(
                     "Bookkeeper.immutablevalue({x:?}): internal ConstValue variant \
                      has no upstream immutablevalue branch"
@@ -2106,7 +2110,7 @@ fn check_no_flags_listitem(
     check_no_flags_value(&s_value, seen_classdefs, seen_listitems);
 }
 
-fn build_args_for_op(
+pub(crate) fn build_args_for_op(
     opname: &str,
     args_s: &[SomeValue],
 ) -> Result<ArgumentsForTranslation, AnnotatorError> {

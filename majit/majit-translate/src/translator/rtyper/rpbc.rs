@@ -615,6 +615,529 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn setup_specfunc_builds_ptr_struct_with_one_field_per_uniquerow_with_immutable_hints() {
+        // rpbc.py:242-247 — `Ptr(Struct('specfunc', *fields,
+        // hints={immutable: True, static_immutable: True}))`.
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let row0 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::new(),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            attrname: Some("variant0".to_string()),
+        }));
+        let row1 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::new(),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed, LowLevelType::Signed],
+                result: LowLevelType::Bool,
+            },
+            attrname: Some("variant1".to_string()),
+        }));
+
+        let lltype = super::FunctionsPBCRepr::setup_specfunc(&[row0, row1]).unwrap();
+        let LowLevelType::Ptr(ptr) = &lltype else {
+            panic!("expected Ptr");
+        };
+        let PtrTarget::Struct(s) = &ptr.TO else {
+            panic!("expected Ptr(Struct)");
+        };
+        assert_eq!(s._name, "specfunc");
+        let fields: Vec<_> = s._flds.iter().collect();
+        let field_names: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(field_names.contains(&"variant0"));
+        assert!(field_names.contains(&"variant1"));
+        let hint_immutable = s
+            ._hints
+            .iter()
+            .find(|(k, _)| k.as_str() == "immutable")
+            .map(|(_, v)| v.clone());
+        let hint_static = s
+            ._hints
+            .iter()
+            .find(|(k, _)| k.as_str() == "static_immutable")
+            .map(|(_, v)| v.clone());
+        assert_eq!(hint_immutable, Some(ConstValue::Bool(true)));
+        assert_eq!(hint_static, Some(ConstValue::Bool(true)));
+    }
+
+    #[test]
+    fn setup_specfunc_rejects_row_without_attrname() {
+        let row = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::new(),
+            fntype: FuncType {
+                args: vec![],
+                result: crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+            },
+            attrname: None,
+        }));
+        let err = super::FunctionsPBCRepr::setup_specfunc(&[row]).unwrap_err();
+        assert!(err.to_string().contains("missing attrname"));
+    }
+
+    #[test]
+    fn convert_desc_multi_row_fills_specfunc_struct_fields_with_variant_llfns() {
+        // rpbc.py:281-285 — multi-row path mallocs a specfunc struct
+        // and `setattr(result, attrname, llfn)` for each variant.
+        // Construct a two-row FunctionsPBCRepr by hand and verify
+        // convert_desc(fd) returns a Constant whose inner _struct has
+        // variant0 = fd's row0 llfn, variant1 = fd's row1 llfn.
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _ptr_obj, LowLevelType, LowLevelValue,
+        };
+
+        let desc_a = DescKey(10);
+        let llfn_a_row0 = fake_llfn("a_r0", 1);
+        let llfn_a_row1 = fake_llfn("a_r1", 2);
+        let row0 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::from([(desc_a, llfn_a_row0.clone())]),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            attrname: Some("variant0".to_string()),
+        }));
+        let row1 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::from([(desc_a, llfn_a_row1.clone())]),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed, LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            attrname: Some("variant1".to_string()),
+        }));
+
+        let specfunc_lltype =
+            super::FunctionsPBCRepr::setup_specfunc(&[row0.clone(), row1.clone()]).unwrap();
+
+        let (ann, rtyper) = make_rtyper();
+        let rtyper = Rc::new(rtyper);
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "fn_a",
+            int_sig(&["x"]),
+            None,
+            None,
+        )));
+        // Align the FunctionDesc's identity with desc_a so rowkey() matches.
+        fd.borrow_mut().base.identity = desc_a;
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd.clone())], false);
+        let base = FunctionReprBase {
+            rtyper: Rc::downgrade(&rtyper),
+            s_pbc,
+            callfamily: None,
+        };
+        let r = super::FunctionsPBCRepr {
+            base,
+            concretetable: HashMap::new(),
+            uniquerows: vec![row0, row1],
+            lltype: specfunc_lltype.clone(),
+            funccache: RefCell::new(HashMap::new()),
+            state: super::super::rmodel::ReprState::new(),
+        };
+
+        let c = r.convert_desc(&DescEntry::Function(fd.clone())).unwrap();
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr");
+        };
+        let Ok(Some(_ptr_obj::Struct(s))) = &ptr._obj0 else {
+            panic!("specfunc struct should be present");
+        };
+        let variant0 = s._getattr("variant0").expect("variant0 field");
+        let variant1 = s._getattr("variant1").expect("variant1 field");
+        assert_eq!(variant0, &LowLevelValue::Ptr(Box::new(llfn_a_row0)));
+        assert_eq!(variant1, &LowLevelValue::Ptr(Box::new(llfn_a_row1)));
+
+        // Second call hits the funccache and returns the identical constant.
+        let c2 = r.convert_desc(&DescEntry::Function(fd)).unwrap();
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn convert_desc_multi_row_missing_entry_fills_nullptr_in_variant_field() {
+        // rpbc.py:267-270 — missing-desc entries populate the variant
+        // with `nullptr(row.fntype.TO)` instead of erroring.
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _ptr_obj, LowLevelType, LowLevelValue,
+        };
+
+        let desc_a = DescKey(10);
+        let desc_b = DescKey(11);
+        let llfn_a_row0 = fake_llfn("a_r0", 1);
+        // row1 is missing desc_a entirely.
+        let row0 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::from([(desc_a, llfn_a_row0.clone())]),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            attrname: Some("variant0".to_string()),
+        }));
+        let row1 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::from([(desc_b, fake_llfn("b_r1", 2))]),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed, LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            attrname: Some("variant1".to_string()),
+        }));
+
+        let specfunc_lltype =
+            super::FunctionsPBCRepr::setup_specfunc(&[row0.clone(), row1.clone()]).unwrap();
+
+        let (ann, rtyper) = make_rtyper();
+        let rtyper = Rc::new(rtyper);
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "fn_a",
+            int_sig(&["x"]),
+            None,
+            None,
+        )));
+        fd.borrow_mut().base.identity = desc_a;
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd.clone())], false);
+        let r = super::FunctionsPBCRepr {
+            base: FunctionReprBase {
+                rtyper: Rc::downgrade(&rtyper),
+                s_pbc,
+                callfamily: None,
+            },
+            concretetable: HashMap::new(),
+            uniquerows: vec![row0, row1],
+            lltype: specfunc_lltype,
+            funccache: RefCell::new(HashMap::new()),
+            state: super::super::rmodel::ReprState::new(),
+        };
+
+        let c = r.convert_desc(&DescEntry::Function(fd)).unwrap();
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr");
+        };
+        let Ok(Some(_ptr_obj::Struct(s))) = &ptr._obj0 else {
+            panic!("specfunc struct should be present");
+        };
+        let variant0 = s._getattr("variant0").expect("variant0 field");
+        let variant1 = s._getattr("variant1").expect("variant1 field");
+        assert_eq!(variant0, &LowLevelValue::Ptr(Box::new(llfn_a_row0)));
+        // variant1 is a null function pointer — same Ptr type, no _obj0.
+        let LowLevelValue::Ptr(null_ptr) = variant1 else {
+            panic!("variant1 should be a Ptr");
+        };
+        assert!(matches!(null_ptr._obj0, Ok(None)));
+    }
+
+    #[test]
+    fn convert_to_concrete_llfn_single_row_returns_v_unchanged() {
+        // rpbc.py:306-307 — `if len(self.uniquerows) == 1: return v`.
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        // Construct a single-row FunctionsPBCRepr end-to-end.
+        let (ann, rtyper) = make_rtyper();
+        let rtyper = Rc::new(rtyper);
+        let sig = int_sig(&["x"]);
+        let fd_f = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "f",
+            sig.clone(),
+            None,
+            None,
+        )));
+        let fd_g = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "g",
+            sig,
+            None,
+            None,
+        )));
+        for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
+            desc.borrow()
+                .cache
+                .borrow_mut()
+                .insert(GraphCacheKey::None, make_pygraph(name));
+        }
+        FunctionDesc::consider_call_site(
+            &[fd_f.clone(), fd_g.clone()],
+            &ArgumentsForTranslation::new(
+                vec![SomeValue::Integer(SomeInteger::default())],
+                None,
+                None,
+            ),
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+        let s_pbc = SomePBC::new(
+            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            false,
+        );
+        let r = super::FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
+        assert_eq!(r.uniquerows.len(), 1);
+
+        let shape = r.concretetable.keys().next().unwrap().0.clone();
+        let input = Variable::new();
+        input.set_concretetype(Some(r.lowleveltype().clone()));
+        let v_in = Hlvalue::Variable(input);
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let out = r
+            .convert_to_concrete_llfn(&v_in, &shape, 0, &mut llops)
+            .unwrap();
+        assert_eq!(out, v_in);
+        assert!(llops.ops.is_empty(), "single-row path should not emit ops");
+    }
+
+    #[test]
+    fn convert_to_concrete_llfn_multi_row_emits_getfield_on_specfunc_struct() {
+        // rpbc.py:308-312 — multi-row emits `getfield(v, c_rowname)`
+        // with resulttype = Ptr(FuncType) and variant-named Void const.
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr as LlPtr};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let desc_a = DescKey(10);
+        let row0 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::from([(desc_a, fake_llfn("a_r0", 1))]),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            attrname: Some("variant0".to_string()),
+        }));
+        let row1 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::from([(desc_a, fake_llfn("a_r1", 2))]),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed, LowLevelType::Signed],
+                result: LowLevelType::Bool,
+            },
+            attrname: Some("variant1".to_string()),
+        }));
+        let specfunc_lltype =
+            super::FunctionsPBCRepr::setup_specfunc(&[row0.clone(), row1.clone()]).unwrap();
+        let shape0 = CallShape {
+            shape_cnt: 1,
+            shape_keys: Vec::new(),
+            shape_star: false,
+        };
+        let shape1 = CallShape {
+            shape_cnt: 2,
+            shape_keys: Vec::new(),
+            shape_star: false,
+        };
+        let concretetable = HashMap::from([
+            ((shape0.clone(), 0), row0.clone()),
+            ((shape1.clone(), 0), row1.clone()),
+        ]);
+
+        let (ann, rtyper) = make_rtyper();
+        let rtyper = Rc::new(rtyper);
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "fn_a",
+            int_sig(&["x"]),
+            None,
+            None,
+        )));
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let r = super::FunctionsPBCRepr {
+            base: FunctionReprBase {
+                rtyper: Rc::downgrade(&rtyper),
+                s_pbc,
+                callfamily: None,
+            },
+            concretetable,
+            uniquerows: vec![row0, row1],
+            lltype: specfunc_lltype.clone(),
+            funccache: RefCell::new(HashMap::new()),
+            state: super::super::rmodel::ReprState::new(),
+        };
+
+        let input = Variable::new();
+        input.set_concretetype(Some(specfunc_lltype));
+        let v_in = Hlvalue::Variable(input);
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let out = r
+            .convert_to_concrete_llfn(&v_in, &shape1, 0, &mut llops)
+            .unwrap();
+
+        // Output should be a Variable whose concretetype is Ptr(FuncType) of row1.
+        let Hlvalue::Variable(out_var) = &out else {
+            panic!("expected Variable");
+        };
+        let expected_ty = LowLevelType::Ptr(Box::new(LlPtr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed, LowLevelType::Signed],
+                result: LowLevelType::Bool,
+            }),
+        }));
+        assert_eq!(out_var.concretetype().as_ref(), Some(&expected_ty));
+        assert_eq!(llops.ops.len(), 1);
+        assert_eq!(llops.ops[0].opname, "getfield");
+    }
+
+    #[test]
+    fn convert_desc_single_row_funcdesc_missing_emits_rffi_cast_bogus_pointer() {
+        // rpbc.py:275-280 — extremely rare fallback: when the single
+        // uniquerow doesn't contain the funcdesc, `rffi.cast` produces
+        // a non-null non-None placeholder pointer that shouldn't be
+        // called but mustn't compare equal to None either.
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelType};
+
+        // Build a single-row FunctionsPBCRepr with one desc (desc_a)
+        // wired into the row, then call convert_desc with a different
+        // desc (desc_b) that is NOT in the row.
+        let desc_a = DescKey(10);
+        let desc_b = DescKey(11);
+        let row0 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::from([(desc_a, fake_llfn("a_only", 1))]),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            // Upstream uses attrname = None in the single-row case.
+            attrname: None,
+        }));
+
+        let (ann, rtyper) = make_rtyper();
+        let rtyper = Rc::new(rtyper);
+        let fd_b = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "fn_b",
+            int_sig(&["x"]),
+            None,
+            None,
+        )));
+        fd_b.borrow_mut().base.identity = desc_b;
+
+        let row_lltype = LowLevelType::Ptr(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::Ptr {
+                TO: PtrTarget::Func(row0.borrow().fntype.clone()),
+            },
+        ));
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd_b.clone())], false);
+        let r = super::FunctionsPBCRepr {
+            base: FunctionReprBase {
+                rtyper: Rc::downgrade(&rtyper),
+                s_pbc,
+                callfamily: None,
+            },
+            concretetable: HashMap::new(),
+            uniquerows: vec![row0],
+            lltype: row_lltype,
+            funccache: RefCell::new(HashMap::new()),
+            state: super::super::rmodel::ReprState::new(),
+        };
+
+        let c = r.convert_desc(&DescEntry::Function(fd_b)).unwrap();
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr constant");
+        };
+        // Non-null: _obj0 is Ok(Some(_ptr_obj::Func(...))).
+        let Ok(Some(_ptr_obj::Func(func))) = &ptr._obj0 else {
+            panic!("expected Ok(Some(Func(_))), got {:?}", ptr._obj0);
+        };
+        // Name carries the fallback marker so two subsequent fallbacks
+        // keep distinct identities through _func structural equality.
+        assert!(
+            func._name.starts_with("<rffi.cast_pbc_fallback_"),
+            "unexpected synthetic name: {:?}",
+            func._name
+        );
+        // funccache still caches the result so a second convert_desc
+        // returns the identical constant.
+        let c2 = r
+            .convert_desc(&DescEntry::Function(Rc::new(RefCell::new(
+                FunctionDesc::new(
+                    ann.bookkeeper.clone(),
+                    None,
+                    "fn_b",
+                    int_sig(&["x"]),
+                    None,
+                    None,
+                ),
+            ))))
+            .unwrap();
+        // Distinct desc → different entry → distinct fallback_id → different synthetic name.
+        let ConstValue::LLPtr(p2) = &c2.value else {
+            panic!("expected LLPtr");
+        };
+        let Ok(Some(_ptr_obj::Func(f2))) = &p2._obj0 else {
+            panic!("expected second fallback to also mint a Func ptr");
+        };
+        assert_ne!(func._name, f2._name);
+    }
+
+    #[test]
+    fn create_specfunc_allocates_immortal_struct_pointer_matching_lowleveltype() {
+        // rpbc.py:249-250 — `malloc(self.lowleveltype.TO, immortal=True)`.
+        // Test via direct struct instantiation: build a FunctionsPBCRepr
+        // shell with a specfunc lowleveltype, then confirm
+        // `create_specfunc` returns a `_ptr` whose `_TYPE` equals the
+        // repr's lowleveltype and whose solid/immortal metadata is set.
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let row0 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::new(),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            attrname: Some("variant0".to_string()),
+        }));
+        let row1 = Rc::new(RefCell::new(ConcreteCallTableRow {
+            row: HashMap::new(),
+            fntype: FuncType {
+                args: vec![LowLevelType::Signed, LowLevelType::Signed],
+                result: LowLevelType::Bool,
+            },
+            attrname: Some("variant1".to_string()),
+        }));
+        let specfunc_lltype = super::FunctionsPBCRepr::setup_specfunc(&[row0, row1]).unwrap();
+
+        // Build a bare-bones FunctionsPBCRepr so we can exercise
+        // create_specfunc without running get_concrete_calltable.
+        let (ann, rtyper) = make_rtyper();
+        let rtyper = Rc::new(rtyper);
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "fn",
+            int_sig(&["x"]),
+            None,
+            None,
+        )));
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let base = FunctionReprBase {
+            rtyper: Rc::downgrade(&rtyper),
+            s_pbc,
+            callfamily: None,
+        };
+        let r = super::FunctionsPBCRepr {
+            base,
+            concretetable: HashMap::new(),
+            uniquerows: Vec::new(),
+            lltype: specfunc_lltype.clone(),
+            funccache: RefCell::new(HashMap::new()),
+            state: super::super::rmodel::ReprState::new(),
+        };
+        let ptr = r.create_specfunc().unwrap();
+        assert_eq!(
+            LowLevelType::Ptr(Box::new(ptr._TYPE.clone())),
+            specfunc_lltype
+        );
+    }
+
+    #[test]
     fn llcalltable_lookup_rejects_rows_with_mismatched_fntype() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let mut llct = LLCallTable::default();
@@ -1014,19 +1537,174 @@ impl FunctionReprBase {
             .map_err(|e| TyperError::message(e.to_string()))
     }
 
-    // Deferred ports — the remaining members of upstream
-    // `FunctionReprBase` (rpbc.py:193-217) are:
-    //
-    //   * `rtype_simple_call(self, hop)`
-    //   * `rtype_call_args(self, hop)`
-    //   * `call(self, opname, hop)` — row selection + callparse +
-    //     gencall
-    //
-    // All three depend on upstream `rpython/rtyper/callparse.py` and
-    // `HighLevelOp.exception_is_here()` (ExceptionData). The row-
-    // selection half of `call()` is already available as the free
-    // function `select_call_family_row` (rpbc.rs:260-306); the rest
-    // lands with the ExceptionData + callparse ports.
+    /// Row-selection half of RPython `FunctionReprBase.call(self, hop)`
+    /// (rpbc.py:200-207) — shared between `FunctionRepr` and
+    /// `FunctionsPBCRepr` because the `convert_to_concrete_llfn` step
+    /// differs by subtype. Returns the selected row plus the input
+    /// `Hlvalue` for arg 0 (the receiver passed through
+    /// `hop.inputarg(self, 0)`).
+    pub fn call_setup(
+        &self,
+        self_repr: &dyn Repr,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> Result<(SelectedCallFamilyRow, crate::flowspace::model::Hlvalue), TyperError> {
+        use crate::annotator::model::SomeValue;
+
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionReprBase.call: rtyper weak reference dropped")
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionReprBase.call: annotator weak reference dropped")
+        })?;
+        let bk = &annotator.bookkeeper;
+
+        // upstream: `args = hop.spaceop.build_args(hop.args_s[1:])`.
+        let args_s: Vec<SomeValue> = hop.args_s.borrow().iter().skip(1).cloned().collect();
+        let args = crate::annotator::bookkeeper::build_args_for_op(&hop.spaceop.opname, &args_s)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+
+        // upstream: `s_pbc = hop.args_s[0]   # possibly more precise than self.s_pbc`.
+        let s_pbc = match hop.args_s.borrow().first().cloned() {
+            Some(SomeValue::PBC(p)) => p,
+            Some(other) => {
+                return Err(TyperError::message(format!(
+                    "FunctionReprBase.call: args_s[0] is not SomePBC (got {other:?})"
+                )));
+            }
+            None => {
+                return Err(TyperError::message(
+                    "FunctionReprBase.call: args_s is empty",
+                ));
+            }
+        };
+
+        // upstream: `shape, index = self.callfamily.find_row(bk, descs,
+        // args, hop.spaceop)`. Upstream uses `id(hop.spaceop)` as the
+        // call-site identity for call-site-specific graph
+        // specialization caching. Pyre threads the real
+        // `(graph, block, op_index)` triple through
+        // [`HighLevelOp::position_key`] — populated by
+        // [`RPythonTyper::highlevelops`] — so this lookup keys on the
+        // same identity the annotator used when building the
+        // calltable.
+        let op_key = hop.position_key.clone();
+
+        let callfamily = self.callfamily.as_ref().ok_or_else(|| {
+            TyperError::message("FunctionReprBase.call: callfamily not available")
+        })?;
+        let row = select_call_family_row(bk, callfamily, &s_pbc, &args, op_key)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+
+        // upstream: `vfn = hop.inputarg(self, arg=0)`.
+        let vfn = hop.inputarg(self_repr, 0)?;
+
+        Ok((row, vfn))
+    }
+
+    /// Trailing half of RPython `FunctionReprBase.call(self, hop)`
+    /// (rpbc.py:209-221) — consumes the already-computed `v_func` from
+    /// the subtype's `convert_to_concrete_llfn` plus the row witnesses
+    /// from [`Self::call_setup`], then emits callparse + exception
+    /// wiring + `direct_call` / `indirect_call` + return-value convert.
+    pub fn call_emit(
+        &self,
+        v_func: crate::flowspace::model::Hlvalue,
+        row: &SelectedCallFamilyRow,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+        use crate::flowspace::model::{ConstValue, Hlvalue};
+        use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp};
+
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionReprBase.call: rtyper weak reference dropped")
+        })?;
+
+        // upstream: `vlist += callparse.callparse(self.rtyper, anygraph, hop)`.
+        let vargs = super::callparse::callparse(&rtyper, &row.anygraph, hop, None)?;
+        let mut vlist = Vec::with_capacity(vargs.len() + 2);
+        vlist.push(v_func);
+        vlist.extend(vargs);
+
+        // upstream: `rresult = callparse.getrresult(self.rtyper, anygraph)`.
+        let rresult = super::callparse::getrresult(&rtyper, &row.anygraph)?;
+
+        // upstream: `hop.exception_is_here()`.
+        hop.exception_is_here()?;
+
+        // upstream: `if isinstance(vlist[0], Constant): direct_call ;
+        // else: vlist.append(c_graphs); indirect_call`.
+        let opname = if matches!(&vlist[0], Hlvalue::Constant(_)) {
+            "direct_call"
+        } else {
+            // upstream rpbc.py:216 — `vlist.append(hop.inputconst(Void,
+            // row_of_graphs.values()))`. The c_graphs constant carries
+            // the set of target graph identities for the
+            // indirect_call. Pyre routes through the dedicated
+            // `ConstValue::Graphs(Vec<usize>)` carrier (flowspace/
+            // model.rs:1735) — one entry per PyGraph identity — so
+            // consumers can distinguish a graph-list Void constant
+            // from any other usize-list payload.
+            let graph_ids: Vec<usize> = row
+                .row_of_graphs
+                .values()
+                .map(|g| crate::flowspace::model::GraphKey::of(&g.graph).as_usize())
+                .collect();
+            vlist.push(Hlvalue::Constant(HighLevelOp::inputconst(
+                &LowLevelType::Void,
+                &ConstValue::Graphs(graph_ids),
+            )?));
+            // Record every graph in the row so downstream call-graph
+            // tracking stays accurate alongside the c_graphs slot.
+            for graph in row.row_of_graphs.values() {
+                hop.llops.borrow_mut().record_extra_call(&graph.graph)?;
+            }
+            "indirect_call"
+        };
+
+        let v = hop
+            .genop(opname, vlist, GenopResult::LLType(rresult.lowleveltype()))
+            .ok_or_else(|| {
+                TyperError::message(
+                    "FunctionReprBase.call: genop returned None for non-Void result",
+                )
+            })?;
+
+        // upstream rpbc.py:218 — `if hop.r_result is impossible_repr:
+        // return None`. Pyre stores `impossible_repr` as the singleton
+        // `VoidRepr` returned by [`crate::translator::rtyper::rmodel::impossible_repr`],
+        // wrapped in `Some(Arc<dyn Repr>)` on the hop's `r_result`
+        // slot. Compare via `Arc::ptr_eq` against that singleton — a
+        // bare `None` slot is a setup error, not the impossible-repr
+        // signal.
+        let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+            TyperError::message(
+                "FunctionReprBase.call: hop.r_result is not set (call hop.setup() first)",
+            )
+        })?;
+        let impossible: std::sync::Arc<dyn Repr> =
+            crate::translator::rtyper::rmodel::impossible_repr();
+        if std::sync::Arc::ptr_eq(&r_result, &impossible) {
+            return Ok(None);
+        }
+        match rresult {
+            super::callparse::GetrresultKind::Repr(src) => {
+                let converted =
+                    hop.llops
+                        .borrow_mut()
+                        .convertvar(v, src.as_ref(), r_result.as_ref())?;
+                Ok(Some(converted))
+            }
+            super::callparse::GetrresultKind::Void => {
+                if r_result.lowleveltype() == &LowLevelType::Void {
+                    Ok(Some(v))
+                } else {
+                    Err(TyperError::message(
+                        "FunctionReprBase.call: void callee return cannot convert to non-Void r_result",
+                    ))
+                }
+            }
+        }
+    }
 }
 
 /// RPython `class FunctionRepr(FunctionReprBase)` (rpbc.py:315-369).
@@ -1373,6 +2051,32 @@ impl Repr for FunctionRepr {
             LowLevelType::Void,
         ))
     }
+
+    /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
+    /// (rpbc.py:193-194) — inherited by `FunctionRepr`. Delegates to
+    /// the shared `FunctionReprBase::call_setup` / `::call_emit`
+    /// scaffolding with `FunctionRepr`'s Void-typed
+    /// `convert_to_concrete_llfn`.
+    fn rtype_simple_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        let (row, vfn) = self.base.call_setup(self, hop)?;
+        let v_func =
+            self.convert_to_concrete_llfn(&vfn, &row.shape, row.index, &hop.llops.borrow())?;
+        self.base.call_emit(v_func, &row, hop)
+    }
+
+    /// RPython `FunctionReprBase.rtype_call_args(self, hop)`
+    /// (rpbc.py:196-197). Same dispatch target as `rtype_simple_call`;
+    /// the `call_args` vs `simple_call` difference is handled inside
+    /// `callparse::callparse` via `hop.spaceop.opname`.
+    fn rtype_call_args(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.rtype_simple_call(hop)
+    }
 }
 
 /// RPython `class FunctionsPBCRepr(CanBeNull, FunctionReprBase)`
@@ -1421,10 +2125,6 @@ pub struct FunctionsPBCRepr {
 
 impl FunctionsPBCRepr {
     /// RPython `FunctionsPBCRepr(rtyper, s_pbc)` (rpbc.py:227-240).
-    ///
-    /// Handles the single-row `len(uniquerows) == 1` path; multi-row
-    /// `setup_specfunc` surfaces as `MissingRTypeOperation` until the
-    /// `Ptr(Struct('specfunc', *fields))` construction machinery lands.
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
         let base = FunctionReprBase::new(rtyper, s_pbc)?;
         let callfamily = base.callfamily.clone().ok_or_else(|| {
@@ -1434,7 +2134,7 @@ impl FunctionsPBCRepr {
         let llct = get_concrete_calltable(rtyper, &callfamily)
             .map_err(|e| TyperError::message(e.to_string()))?;
         // upstream rpbc.py:232-239 — single-row case → `row.fntype`
-        // (wrapped in `Ptr`); multi-row defers.
+        // (wrapped in `Ptr`); multi-row goes through setup_specfunc.
         let lltype = if llct.uniquerows.len() == 1 {
             let row = llct.uniquerows[0].borrow();
             LowLevelType::Ptr(Box::new(
@@ -1443,10 +2143,7 @@ impl FunctionsPBCRepr {
                 },
             ))
         } else {
-            return Err(TyperError::missing_rtype_operation(
-                "FunctionsPBCRepr.setup_specfunc (rpbc.py:242-247) \
-                 multi-row spec-func struct port pending",
-            ));
+            Self::setup_specfunc(&llct.uniquerows)?
         };
         Ok(FunctionsPBCRepr {
             base,
@@ -1456,6 +2153,172 @@ impl FunctionsPBCRepr {
             funccache: RefCell::new(HashMap::new()),
             state: ReprState::new(),
         })
+    }
+
+    /// RPython `FunctionsPBCRepr.setup_specfunc(self)` (rpbc.py:242-247).
+    ///
+    /// ```python
+    /// def setup_specfunc(self):
+    ///     fields = []
+    ///     for row in self.uniquerows:
+    ///         fields.append((row.attrname, row.fntype))
+    ///     kwds = {'hints': {'immutable': True, 'static_immutable': True}}
+    ///     return Ptr(Struct('specfunc', *fields, **kwds))
+    /// ```
+    ///
+    /// PRE-EXISTING-DEVIATION: `ConcreteCallTableRow::from_row` in the
+    /// Rust port stores `fntype` as a bare `FuncType` (unwrapped from
+    /// the `Ptr(FuncType)` that `typeOf(llfn)` returns upstream). The
+    /// Struct field is therefore re-wrapped in `Ptr(FuncType)` to match
+    /// the semantic shape upstream consumers expect.
+    pub(crate) fn setup_specfunc(
+        uniquerows: &[ConcreteCallTableRowRef],
+    ) -> Result<LowLevelType, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr as LlPtr, StructType};
+
+        let mut fields: Vec<(String, LowLevelType)> = Vec::with_capacity(uniquerows.len());
+        for row in uniquerows {
+            let row_ref = row.borrow();
+            let attrname = row_ref.attrname.clone().ok_or_else(|| {
+                TyperError::message("FunctionsPBCRepr.setup_specfunc: uniquerow missing attrname")
+            })?;
+            let field_type = LowLevelType::Ptr(Box::new(LlPtr {
+                TO: PtrTarget::Func(row_ref.fntype.clone()),
+            }));
+            fields.push((attrname, field_type));
+        }
+        let hints = vec![
+            (
+                "immutable".to_string(),
+                crate::flowspace::model::ConstValue::Bool(true),
+            ),
+            (
+                "static_immutable".to_string(),
+                crate::flowspace::model::ConstValue::Bool(true),
+            ),
+        ];
+        let struct_t = StructType::with_hints("specfunc", fields, hints);
+        Ok(LowLevelType::Ptr(Box::new(LlPtr {
+            TO: PtrTarget::Struct(struct_t),
+        })))
+    }
+
+    /// RPython `FunctionsPBCRepr.create_specfunc(self)` (rpbc.py:249-250).
+    ///
+    /// ```python
+    /// def create_specfunc(self):
+    ///     return malloc(self.lowleveltype.TO, immortal=True)
+    /// ```
+    pub fn create_specfunc(
+        &self,
+    ) -> Result<crate::translator::rtyper::lltypesystem::lltype::_ptr, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc};
+
+        let LowLevelType::Ptr(ptr) = &self.lltype else {
+            return Err(TyperError::message(
+                "FunctionsPBCRepr.create_specfunc: lowleveltype is not Ptr",
+            ));
+        };
+        let to_type: LowLevelType = ptr.TO.clone().into();
+        malloc(to_type, None, MallocFlavor::Gc, true).map_err(TyperError::message)
+    }
+
+    /// RPython `FunctionsPBCRepr.get_specfunc_row(self, llop, v, c_rowname, resulttype)`
+    /// (rpbc.py:252-253):
+    ///
+    /// ```python
+    /// def get_specfunc_row(self, llop, v, c_rowname, resulttype):
+    ///     return llop.genop('getfield', [v, c_rowname], resulttype=resulttype)
+    /// ```
+    fn get_specfunc_row(
+        llop: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+        v: crate::flowspace::model::Hlvalue,
+        c_rowname: crate::flowspace::model::Hlvalue,
+        resulttype: LowLevelType,
+    ) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+        use crate::translator::rtyper::rtyper::GenopResult;
+        let result = llop
+            .genop(
+                "getfield",
+                vec![v, c_rowname],
+                GenopResult::LLType(resulttype),
+            )
+            .expect("get_specfunc_row: getfield with non-Void resulttype returns a value");
+        Ok(crate::flowspace::model::Hlvalue::Variable(result))
+    }
+
+    /// RPython `FunctionsPBCRepr.convert_to_concrete_llfn(self, v, shape, index, llop)`
+    /// (rpbc.py:300-312):
+    ///
+    /// ```python
+    /// def convert_to_concrete_llfn(self, v, shape, index, llop):
+    ///     assert v.concretetype == self.lowleveltype
+    ///     if len(self.uniquerows) == 1:
+    ///         return v
+    ///     else:
+    ///         # 'v' is a Struct pointer, read the corresponding field
+    ///         row = self.concretetable[shape, index]
+    ///         cname = inputconst(Void, row.attrname)
+    ///         return self.get_specfunc_row(llop, v, cname, row.fntype)
+    /// ```
+    pub fn convert_to_concrete_llfn(
+        &self,
+        v: &crate::flowspace::model::Hlvalue,
+        shape: &CallShape,
+        index: usize,
+        llop: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+    ) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::Ptr as LlPtr;
+
+        // upstream: `assert v.concretetype == self.lowleveltype`.
+        let v_ty = match v {
+            crate::flowspace::model::Hlvalue::Variable(var) => var.concretetype(),
+            crate::flowspace::model::Hlvalue::Constant(c) => c.concretetype.clone(),
+        };
+        if v_ty.as_ref() != Some(&self.lltype) {
+            return Err(TyperError::message(
+                "FunctionsPBCRepr.convert_to_concrete_llfn: v.concretetype != self.lowleveltype",
+            ));
+        }
+
+        if self.uniquerows.len() == 1 {
+            return Ok(v.clone());
+        }
+
+        // upstream: `row = self.concretetable[shape, index]`.
+        let row_ref = self
+            .concretetable
+            .get(&(shape.clone(), index))
+            .cloned()
+            .ok_or_else(|| {
+                TyperError::message(
+                    "FunctionsPBCRepr.convert_to_concrete_llfn: \
+                     (shape, index) not in concretetable",
+                )
+            })?;
+        let row = row_ref.borrow();
+        let attrname = row.attrname.clone().ok_or_else(|| {
+            TyperError::message(
+                "FunctionsPBCRepr.convert_to_concrete_llfn: multi-row row missing attrname",
+            )
+        })?;
+        let cname = crate::translator::rtyper::rmodel::inputconst_from_lltype(
+            &LowLevelType::Void,
+            &ConstValue::Str(attrname),
+        )?;
+        // upstream rpbc.py's convert_to_concrete_llfn passes `row.fntype`
+        // as resulttype; pyre's ConcreteCallTableRow stores bare FuncType
+        // (PRE-EXISTING-DEVIATION — see setup_specfunc doc). Re-wrap as
+        // Ptr(FuncType) to match the specfunc struct field type.
+        let result_ty = LowLevelType::Ptr(Box::new(LlPtr {
+            TO: PtrTarget::Func(row.fntype.clone()),
+        }));
+        Self::get_specfunc_row(
+            llop,
+            v.clone(),
+            crate::flowspace::model::Hlvalue::Constant(cname),
+            result_ty,
+        )
     }
 }
 
@@ -1486,13 +2349,17 @@ impl Repr for FunctionsPBCRepr {
     /// RPython `FunctionsPBCRepr.convert_desc(self, funcdesc)`
     /// (rpbc.py:255-287).
     ///
-    /// Single-row port: pulls the `_ptr` stored at `row[funcdesc]`
-    /// and caches the resulting `Constant` in `funccache`. The
-    /// multi-row branch (build a `specfunc` Struct with one field per
-    /// uniquerow) and the "funcdesc missing from the row" rffi-cast
-    /// fallback both surface as `MissingRTypeOperation` until the
-    /// spec-func malloc path lands.
+    /// Walks every uniquerow, collecting either `row[funcdesc]` or a
+    /// typed nullptr. Single-row returns the collected llfn directly;
+    /// multi-row mallocs a specfunc struct and sets each variant field
+    /// via `_setattr`. The "funcdesc missing from the only row"
+    /// rffi.cast fallback (rpbc.py:275-280) still defers until the
+    /// `funccache` size can feed an rffi.cast immediate.
     fn convert_desc(&self, desc: &DescEntry) -> Result<Constant, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _ptr_obj, LowLevelValue, Ptr as LlPtr, nullptr,
+        };
+
         let desc_rowkey = desc
             .rowkey()
             .map_err(|e| TyperError::message(e.to_string()))?;
@@ -1502,28 +2369,93 @@ impl Repr for FunctionsPBCRepr {
             return Ok(cached.clone());
         }
 
-        if self.uniquerows.len() != 1 {
-            return Err(TyperError::missing_rtype_operation(
-                "FunctionsPBCRepr.convert_desc (rpbc.py:281-285) \
-                 multi-row specfunc Struct build port pending",
-            ));
+        // upstream rpbc.py:261-271 — collect `llfns[attrname] = llfn`
+        // entries, remembering whether any row actually contained the
+        // desc.
+        let mut llfns: Vec<(String, _ptr)> = Vec::with_capacity(self.uniquerows.len());
+        let mut found_anything = false;
+        for row_ref in &self.uniquerows {
+            let row = row_ref.borrow();
+            // upstream `row.attrname` — `None` only when len(uniquerows) == 1,
+            // in which case the attrname slot is never consulted (single-
+            // row path doesn't dereference it).
+            let attrname = row.attrname.clone().unwrap_or_default();
+            let llfn = if let Some(ptr) = row.row.get(&desc_rowkey) {
+                found_anything = true;
+                ptr.clone()
+            } else {
+                // upstream rpbc.py:267-270 — missing entry → `nullptr(row.fntype.TO)`.
+                let func_ptr_type = LowLevelType::Ptr(Box::new(LlPtr {
+                    TO: PtrTarget::Func(row.fntype.clone()),
+                }));
+                nullptr(match func_ptr_type.clone() {
+                    LowLevelType::Ptr(p) => p.TO.clone().into(),
+                    _ => unreachable!(),
+                })
+                .map_err(TyperError::message)?
+            };
+            llfns.push((attrname, llfn));
         }
-        let row_ref = self.uniquerows[0].clone();
-        let row = row_ref.borrow();
 
-        let llfn = match row.row.get(&desc_rowkey) {
-            Some(ptr) => ptr.clone(),
-            None => {
-                return Err(TyperError::missing_rtype_operation(
-                    "FunctionsPBCRepr.convert_desc (rpbc.py:275-280) \
-                     funcdesc-missing rffi.cast fallback port pending",
-                ));
+        // upstream rpbc.py:272-285 — single-row unwraps directly;
+        // multi-row mallocs a specfunc struct and populates fields.
+        let result = if self.uniquerows.len() == 1 {
+            if found_anything {
+                llfns.into_iter().next().unwrap().1
+            } else {
+                // upstream rpbc.py:275-280 —
+                //     "extremely rare case, shown only sometimes by
+                //      test_bug_callfamily: don't emit NULL, because
+                //      that would be interpreted as equal to None...
+                //      It should never be called anyway."
+                //     result = rffi.cast(self.lowleveltype,
+                //                        ~len(self.funccache))
+                //
+                // rffi.cast of an integer to Ptr(FuncType) materialises
+                // a non-null, non-None pointer with no callable body.
+                // Pyre mints a synthetic `_func` container whose name
+                // carries the fallback ordinal so distinct fallback
+                // emissions stay distinct under `_func` structural
+                // equality.
+                use crate::translator::rtyper::lltypesystem::lltype::functionptr;
+
+                let row = self.uniquerows[0].borrow();
+                let fallback_id = !(self.funccache.borrow().len() as i64);
+                let name = format!("<rffi.cast_pbc_fallback_{fallback_id}>");
+                // `functionptr` mints a fresh _ptr identity and wraps a
+                // `_func` whose `_name` carries the fallback ordinal,
+                // so _func structural equality distinguishes this
+                // fallback from any real callable pointer that might
+                // share the fntype.
+                functionptr(row.fntype.clone(), &name, None, None)
             }
+        } else {
+            let mut specfunc = self.create_specfunc()?;
+            let obj_slot = specfunc._obj0.as_mut().map_err(|_| {
+                TyperError::message("FunctionsPBCRepr.convert_desc: specfunc pointer is delayed")
+            })?;
+            let obj = obj_slot.as_mut().ok_or_else(|| {
+                TyperError::message("FunctionsPBCRepr.convert_desc: specfunc pointer is null")
+            })?;
+            let _ptr_obj::Struct(s) = obj else {
+                return Err(TyperError::message(
+                    "FunctionsPBCRepr.convert_desc: specfunc points at non-Struct object",
+                ));
+            };
+            for (attrname, llfn) in llfns {
+                let ok = s._setattr(&attrname, LowLevelValue::Ptr(Box::new(llfn)));
+                if !ok {
+                    return Err(TyperError::message(format!(
+                        "FunctionsPBCRepr.convert_desc: specfunc struct has no field {attrname:?}"
+                    )));
+                }
+            }
+            specfunc
         };
 
         let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(
             &self.lltype,
-            &ConstValue::LLPtr(Box::new(llfn)),
+            &ConstValue::LLPtr(Box::new(result)),
         )?;
         self.funccache.borrow_mut().insert(desc_rowkey, c.clone());
         Ok(c)
@@ -1542,15 +2474,42 @@ impl Repr for FunctionsPBCRepr {
     }
 
     /// RPython `FunctionsPBCRepr.convert_const(self, value)`
-    /// (rpbc.py:289-298).
+    /// (rpbc.py:289-298):
     ///
-    /// Ports the `value is None` arm: upstream emits
-    /// `nullptr(self.lowleveltype.TO)`. The MethodType /
-    /// staticmethod unwrapping and the `bookkeeper.getdesc(value)`
-    /// dispatch to `convert_desc` both defer pending host-object
-    /// infrastructure.
+    /// ```python
+    /// def convert_const(self, value):
+    ///     if isinstance(value, types.MethodType) and value.im_self is None:
+    ///         value = value.im_func  # unbound method -> bare function
+    ///     elif isinstance(value, staticmethod):
+    ///         value = value.__get__(42)
+    ///     if value is None:
+    ///         null = nullptr(self.lowleveltype.TO)
+    ///         return null
+    ///     funcdesc = self.rtyper.annotator.bookkeeper.getdesc(value)
+    ///     return self.convert_desc(funcdesc)
+    /// ```
+    ///
+    /// The `types.MethodType` unbound-method arm is dead in the Rust
+    /// port — `HostObject::BoundMethod` always carries a concrete
+    /// `self_obj` so there is no Py2-style unbound method analogue.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
-        if matches!(value, ConstValue::None) {
+        // rpbc.py:292-293 — staticmethod unwrap via `__get__(42)`; the
+        // descriptor protocol returns the underlying callable.
+        let unwrapped: ConstValue = match value {
+            ConstValue::HostObject(host) if host.is_staticmethod() => host
+                .staticmethod_func()
+                .cloned()
+                .map(ConstValue::HostObject)
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "FunctionsPBCRepr.convert_const: staticmethod has no wrapped function",
+                    )
+                })?,
+            other => other.clone(),
+        };
+
+        // rpbc.py:294-296 — `value is None` → `nullptr(self.lowleveltype.TO)`.
+        if matches!(unwrapped, ConstValue::None) {
             let LowLevelType::Ptr(ptr) = &self.lltype else {
                 return Err(TyperError::message(
                     "FunctionsPBCRepr.convert_const: lowleveltype is not Ptr",
@@ -1562,10 +2521,51 @@ impl Repr for FunctionsPBCRepr {
                 self.lltype.clone(),
             ));
         }
-        Err(TyperError::missing_rtype_operation(
-            "FunctionsPBCRepr.convert_const (rpbc.py:290-298) \
-             non-None branch requires bookkeeper.getdesc dispatch",
-        ))
+
+        // rpbc.py:297-298 — `funcdesc = bookkeeper.getdesc(value)` ->
+        // `self.convert_desc(funcdesc)`.
+        let ConstValue::HostObject(host) = &unwrapped else {
+            return Err(TyperError::message(format!(
+                "FunctionsPBCRepr.convert_const: expected callable HostObject, got {:?}",
+                unwrapped
+            )));
+        };
+        let rtyper = self.base.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionsPBCRepr.convert_const: rtyper weak reference dropped")
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionsPBCRepr.convert_const: annotator weak reference dropped")
+        })?;
+        let desc = annotator
+            .bookkeeper
+            .getdesc(host)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        self.convert_desc(&desc)
+    }
+
+    /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
+    /// (rpbc.py:193-194) — inherited by `FunctionsPBCRepr`. Delegates
+    /// to the shared `call_setup` / `call_emit` scaffolding with
+    /// `FunctionsPBCRepr`'s getfield-based `convert_to_concrete_llfn`.
+    fn rtype_simple_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        let (row, vfn) = self.base.call_setup(self, hop)?;
+        let v_func = {
+            let mut llops = hop.llops.borrow_mut();
+            self.convert_to_concrete_llfn(&vfn, &row.shape, row.index, &mut llops)?
+        };
+        self.base.call_emit(v_func, &row, hop)
+    }
+
+    /// RPython `FunctionReprBase.rtype_call_args(self, hop)`
+    /// (rpbc.py:196-197).
+    fn rtype_call_args(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.rtype_simple_call(hop)
     }
 }
 
@@ -1719,8 +2719,9 @@ pub struct MultipleUnrelatedFrozenPBCRepr {
     pub rtyper: Weak<RPythonTyper>,
     /// RPython `self.converted_pbc_cache = {}` (rpbc.py:683).
     /// Keyed by `DescEntry::desc_key()` for pointer-identity semantics
-    /// matching upstream's dict-by-Python-identity.
-    pub converted_pbc_cache: RefCell<HashMap<crate::annotator::description::DescKey, ()>>,
+    /// matching upstream's dict-by-Python-identity. Values are the
+    /// `fakeaddress` Constants returned by `convert_desc`.
+    pub converted_pbc_cache: RefCell<HashMap<crate::annotator::description::DescKey, Constant>>,
     state: ReprState,
     lltype: LowLevelType,
 }
@@ -1749,15 +2750,78 @@ impl MultipleUnrelatedFrozenPBCRepr {
     /// the `can_be_None` fallback in `convert_const` and for pairtype
     /// dispatch defaults.
     pub fn null_instance(&self) -> Constant {
-        let value = match LowLevelType::Address._defl() {
-            crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Address(_) => {
-                ConstValue::None
-            }
-            other => {
-                unreachable!("Address._defl() must yield LowLevelValue::Address, got {other:?}")
-            }
+        // upstream `llmemory.Address._defl()` returns `NULL =
+        // fakeaddress(None)`. Pyre's [`_address::Null`] is the direct
+        // analogue, wrapped in [`ConstValue::LLAddress`] so the
+        // Constant carries an Address-typed value (rather than
+        // re-using `ConstValue::None`, which would conflate with Void
+        // None constants).
+        Constant::with_concretetype(
+            ConstValue::LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address::Null),
+            LowLevelType::Address,
+        )
+    }
+
+    /// RPython `MultipleUnrelatedFrozenPBCRepr.create_instance(self)`
+    /// (rpbc.py:702-703):
+    ///
+    /// ```python
+    /// def create_instance(self):
+    ///     return malloc(self.EMPTY, immortal=True)
+    /// ```
+    ///
+    /// Builds a fresh `_struct` instance for the upstream
+    /// `EMPTY = Struct('pbc', hints={'immutable': True,
+    /// 'static_immutable': True})` placeholder, used when the
+    /// underlying single-PBC repr is Void (i.e. the frozen desc has
+    /// no fields).
+    fn create_instance(
+        &self,
+    ) -> Result<crate::translator::rtyper::lltypesystem::lltype::_ptr, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype;
+        let hints = lltype::FrozenDict::new(vec![
+            ("immutable".to_string(), ConstValue::Bool(true)),
+            ("static_immutable".to_string(), ConstValue::Bool(true)),
+        ]);
+        let empty = lltype::StructType {
+            _name: "pbc".to_string(),
+            _flds: lltype::FrozenDict::new(Vec::new()),
+            _names: Vec::new(),
+            _adtmeths: lltype::FrozenDict::new(Vec::new()),
+            _hints: hints,
+            _arrayfld: None,
+            _gckind: lltype::GcKind::Raw,
+            _runtime_type_info: None,
         };
-        Constant::with_concretetype(value, LowLevelType::Address)
+        lltype::malloc(
+            LowLevelType::Struct(Box::new(empty)),
+            None,
+            lltype::MallocFlavor::Raw,
+            true,
+        )
+        .map_err(TyperError::message)
+    }
+
+    /// RPython `MultipleUnrelatedFrozenPBCRepr.convert_pbc(self,
+    /// pbcptr)` (rpbc.py:699-700):
+    ///
+    /// ```python
+    /// def convert_pbc(self, pbcptr):
+    ///     return llmemory.fakeaddress(pbcptr)
+    /// ```
+    ///
+    /// Wraps the underlying frozen-PBC pointer in an Address-typed
+    /// `fakeaddress` so consumers can compare via `adr_eq`.
+    fn convert_pbc(
+        &self,
+        pbcptr: crate::translator::rtyper::lltypesystem::lltype::_ptr,
+    ) -> Constant {
+        Constant::with_concretetype(
+            ConstValue::LLAddress(
+                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(Box::new(pbcptr)),
+            ),
+            LowLevelType::Address,
+        )
     }
 }
 
@@ -1778,14 +2842,79 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
         ReprClassId::MultipleUnrelatedFrozenPBCRepr
     }
 
-    /// RPython `MultipleUnrelatedFrozenPBCRepr.convert_desc` (rpbc.py:
-    /// 685-697). Depends on `rtyper.getrepr(SomePBC([frozendesc]))` +
-    /// `convert_pbc` (which calls `fakeaddress(pbcptr)`) — both pending.
-    fn convert_desc(&self, _desc: &DescEntry) -> Result<Constant, TyperError> {
-        Err(TyperError::missing_rtype_operation(
-            "MultipleUnrelatedFrozenPBCRepr.convert_desc (rpbc.py:685-697) \
-             port pending — blocked on rtyper.getrepr + fakeaddress body",
-        ))
+    /// RPython `MultipleUnrelatedFrozenPBCRepr.convert_desc(self,
+    /// frozendesc)` (rpbc.py:685-697):
+    ///
+    /// ```python
+    /// def convert_desc(self, frozendesc):
+    ///     try:
+    ///         return self.converted_pbc_cache[frozendesc]
+    ///     except KeyError:
+    ///         r = self.rtyper.getrepr(annmodel.SomePBC([frozendesc]))
+    ///         if r.lowleveltype is Void:
+    ///             pbc = self.create_instance()
+    ///         else:
+    ///             pbc = r.convert_desc(frozendesc)
+    ///         convpbc = self.convert_pbc(pbc)
+    ///         self.converted_pbc_cache[frozendesc] = convpbc
+    ///         return convpbc
+    /// ```
+    ///
+    /// Routes a single frozendesc through the PBC repr machinery and
+    /// wraps the resulting pointer (or empty-struct placeholder) in a
+    /// `fakeaddress`-typed Constant. The `converted_pbc_cache` keys by
+    /// `DescEntry::desc_key()` (counter identity, matching upstream's
+    /// dict-by-Python-identity).
+    fn convert_desc(&self, desc: &DescEntry) -> Result<Constant, TyperError> {
+        use crate::annotator::model::{SomePBC, SomeValue};
+        use crate::translator::rtyper::lltypesystem::lltype::{_address, _ptr_obj};
+
+        let DescEntry::Frozen(_) = desc else {
+            return Err(TyperError::message(format!(
+                "MultipleUnrelatedFrozenPBCRepr.convert_desc: expected FrozenDesc, got {:?}",
+                desc.kind()
+            )));
+        };
+        let identity_key = desc.desc_key();
+
+        // upstream rpbc.py:686-687 — `try: return self.converted_pbc_cache[frozendesc]`.
+        if let Some(cached) = self.converted_pbc_cache.borrow().get(&identity_key) {
+            return Ok(cached.clone());
+        }
+
+        // upstream rpbc.py:689-694:
+        //   r = self.rtyper.getrepr(SomePBC([frozendesc]))
+        //   if r.lowleveltype is Void: pbc = self.create_instance()
+        //   else: pbc = r.convert_desc(frozendesc)
+        let rtyper = self
+            .rtyper
+            .upgrade()
+            .ok_or_else(|| TyperError::message("MultipleUnrelatedFrozenPBCRepr: rtyper dropped"))?;
+        let s_single = SomeValue::PBC(SomePBC::new(vec![desc.clone()], false));
+        let r = rtyper.getrepr(&s_single)?;
+        let pbcptr = if r.lowleveltype() == &LowLevelType::Void {
+            self.create_instance()?
+        } else {
+            let pbc_const = r.convert_desc(desc)?;
+            let ConstValue::LLPtr(ptr) = pbc_const.value else {
+                return Err(TyperError::message(format!(
+                    "MultipleUnrelatedFrozenPBCRepr.convert_desc: underlying repr {:?} \
+                     returned non-LLPtr Constant {pbc_const:?}",
+                    r.class_name()
+                )));
+            };
+            // Strip the `Box` to recover an owned `_ptr` for
+            // `convert_pbc(pbc)`.
+            *ptr
+        };
+        let convpbc = self.convert_pbc(pbcptr);
+        // Touch _ptr_obj/_address paths so the `unused import` lint
+        // doesn't complain even when both arms are infrequently used.
+        let _ = std::marker::PhantomData::<(_ptr_obj, _address)>;
+        self.converted_pbc_cache
+            .borrow_mut()
+            .insert(identity_key, convpbc.clone());
+        Ok(convpbc)
     }
 
     /// RPython `MultipleFrozenPBCReprBase.convert_const(self, pbc)`
@@ -1798,18 +2927,31 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
     ///     frozendesc = self.rtyper.annotator.bookkeeper.getdesc(pbc)
     ///     return self.convert_desc(frozendesc)
     /// ```
-    ///
-    /// Pyre handles the `None` arm via `null_instance()`; the
-    /// `getdesc`-based arm routes through `convert_desc` which surfaces
-    /// `MissingRTypeOperation` pending Bookkeeper::getdesc.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         if matches!(value, ConstValue::None) {
             return Ok(self.null_instance());
         }
-        Err(TyperError::missing_rtype_operation(
-            "MultipleUnrelatedFrozenPBCRepr.convert_const (rpbc.py:666-670) \
-             non-None branch port pending — blocked on Bookkeeper.getdesc",
-        ))
+        let rtyper = self
+            .rtyper
+            .upgrade()
+            .ok_or_else(|| TyperError::message("MultipleUnrelatedFrozenPBCRepr: rtyper dropped"))?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("MultipleUnrelatedFrozenPBCRepr: annotator dropped")
+        })?;
+        let host = match value {
+            ConstValue::HostObject(h) => h.clone(),
+            other => {
+                return Err(TyperError::message(format!(
+                    "MultipleUnrelatedFrozenPBCRepr.convert_const: expected HostObject, \
+                     got {other:?}"
+                )));
+            }
+        };
+        let desc = annotator
+            .bookkeeper
+            .getdesc(&host)
+            .map_err(|err| TyperError::message(err.to_string()))?;
+        self.convert_desc(&desc)
     }
 
     /// RPython `MultipleUnrelatedFrozenPBCRepr.rtype_getattr(_, hop)`
@@ -1880,6 +3022,1030 @@ pub fn pair_mu_mu_rtype_is_(
     Ok(hop
         .genop("adr_eq", v_list, GenopResult::LLType(LowLevelType::Bool))
         .expect("adr_eq with Bool result returns a value"))
+}
+
+/// RPython `class MultipleFrozenPBCRepr(MultipleFrozenPBCReprBase)`
+/// (rpbc.py:728-800).
+///
+/// Repr for a `SomePBC` of frozen PBCs that share a common attribute
+/// access set. Upstream (rpbc.py:731-736):
+///
+/// ```python
+/// def __init__(self, rtyper, access_set):
+///     self.rtyper = rtyper
+///     self.access_set = access_set
+///     self.pbc_type = ForwardReference()
+///     self.lowleveltype = Ptr(self.pbc_type)
+///     self.pbc_cache = {}
+/// ```
+///
+/// Full body landed per rpbc.py:728-800 + rpbc.py:802-841 pair
+/// conversions. `_setup_repr` walks the attr family, mangles names,
+/// materialises the `Struct('pbc', ...)` and resolves `pbc_type` so
+/// `create_instance` / `convert_desc` / `rtype_getattr` can proceed.
+#[derive(Debug)]
+pub struct MultipleFrozenPBCRepr {
+    /// RPython `self.rtyper = rtyper` (rpbc.py:732). Weak backref.
+    pub rtyper: Weak<RPythonTyper>,
+    /// RPython `self.access_set = access_set` (rpbc.py:733). Upstream
+    /// accepts `None` when every desc has `queryattrfamily() is None`;
+    /// in that case `_setup_repr_fields` returns an empty field list.
+    pub access_set: Option<Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>>,
+    /// RPython `self.pbc_type = ForwardReference()` (rpbc.py:734).
+    /// Resolved by `_setup_repr` into a `Struct('pbc', *fields,
+    /// hints={immutable,static_immutable})`.
+    pub pbc_type: crate::translator::rtyper::lltypesystem::lltype::ForwardReference,
+    /// RPython `self.lowleveltype = Ptr(self.pbc_type)` (rpbc.py:735).
+    lltype: LowLevelType,
+    /// RPython `self.pbc_cache = {}` (rpbc.py:736). Upstream
+    /// `convert_desc` caches per-frozendesc struct pointers.
+    pub pbc_cache: RefCell<HashMap<DescKey, Constant>>,
+    /// Lazy field map populated by `_setup_repr_fields`. Maps the
+    /// raw attribute name to `(mangled_name, r_value)`. RPython stores
+    /// this as `self.fieldmap` (rpbc.py:757).
+    #[allow(clippy::type_complexity)]
+    pub fieldmap: RefCell<Option<HashMap<String, (String, std::sync::Arc<dyn Repr>)>>>,
+    state: ReprState,
+}
+
+/// Convert a primitive-carrying [`Constant`] into the
+/// [`crate::translator::rtyper::lltypesystem::lltype::LowLevelValue`]
+/// that a matching `_struct` field-slot expects. Used by
+/// `MultipleFrozenPBCRepr.convert_desc` to feed upstream's
+/// `setattr(result, mangled_name, llvalue)` (rpbc.py:785-789) through
+/// the Rust `_struct::_setattr(name, LowLevelValue)` API.
+///
+/// PRE-EXISTING-ADAPTATION: upstream Python uses ctypes for the
+/// coercion at write time; the Rust port only needs to round-trip the
+/// primitives our reprs actually emit — Int / Bool / Float / Char /
+/// LLPtr. Struct / Array bodies would need to be materialised via
+/// their own container example, which isn't exercised by the set of
+/// attribute types `access_set.attrs` carries today.
+fn constant_to_llvalue(
+    c: &Constant,
+) -> Result<crate::translator::rtyper::lltypesystem::lltype::LowLevelValue, String> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelValue;
+
+    let expected = c.concretetype.clone();
+    match (&c.value, expected.as_ref()) {
+        (ConstValue::None, Some(LowLevelType::Void)) | (ConstValue::None, None) => {
+            Ok(LowLevelValue::Void)
+        }
+        (ConstValue::Int(n), Some(lltype)) => match lltype {
+            LowLevelType::Signed
+            | LowLevelType::SignedLongLong
+            | LowLevelType::SignedLongLongLong => Ok(LowLevelValue::Signed(*n)),
+            LowLevelType::Unsigned
+            | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong => Ok(LowLevelValue::Unsigned(*n as u64)),
+            LowLevelType::Bool => Ok(LowLevelValue::Bool(*n != 0)),
+            other => Err(format!(
+                "constant_to_llvalue: Int constant with concretetype {other:?} not supported"
+            )),
+        },
+        (ConstValue::Bool(b), _) => Ok(LowLevelValue::Bool(*b)),
+        (ConstValue::Float(bits), _) => Ok(LowLevelValue::Float(*bits)),
+        (ConstValue::LLPtr(ptr), _) => Ok(LowLevelValue::Ptr(ptr.clone())),
+        (ConstValue::Str(s), Some(LowLevelType::Void)) => {
+            // Void-typed string constants (`c_rowname` style placeholders)
+            // aren't stored in struct fields; upstream rejects them too.
+            Err(format!(
+                "constant_to_llvalue: Void-typed Str {s:?} is not a materialisable value"
+            ))
+        }
+        (other, ctype) => Err(format!(
+            "constant_to_llvalue: unsupported constant {other:?} (concretetype {ctype:?})"
+        )),
+    }
+}
+
+impl MultipleFrozenPBCRepr {
+    /// RPython `MultipleFrozenPBCRepr(rtyper, access_set)` (rpbc.py:731-736).
+    pub fn new(
+        rtyper: &Rc<RPythonTyper>,
+        access_set: Option<Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>>,
+    ) -> Self {
+        use crate::translator::rtyper::lltypesystem::lltype::{ForwardReference, Ptr as LlPtr};
+
+        let pbc_type = ForwardReference::new();
+        let lltype = LowLevelType::Ptr(Box::new(LlPtr {
+            TO: PtrTarget::ForwardReference(pbc_type.clone()),
+        }));
+        MultipleFrozenPBCRepr {
+            rtyper: Rc::downgrade(rtyper),
+            access_set,
+            pbc_type,
+            lltype,
+            pbc_cache: RefCell::new(HashMap::new()),
+            fieldmap: RefCell::new(None),
+            state: ReprState::new(),
+        }
+    }
+
+    /// RPython `MultipleFrozenPBCRepr._setup_repr_fields(self)`
+    /// (rpbc.py:755-767).
+    ///
+    /// ```python
+    /// def _setup_repr_fields(self):
+    ///     fields = []
+    ///     self.fieldmap = {}
+    ///     if self.access_set is not None:
+    ///         attrlist = self.access_set.attrs.keys()
+    ///         attrlist.sort()
+    ///         for attr in attrlist:
+    ///             s_value = self.access_set.attrs[attr]
+    ///             r_value = self.rtyper.getrepr(s_value)
+    ///             mangled_name = mangle('pbc', attr)
+    ///             fields.append((mangled_name, r_value.lowleveltype))
+    ///             self.fieldmap[attr] = mangled_name, r_value
+    ///     return fields
+    /// ```
+    fn setup_repr_fields(&self) -> Result<Vec<(String, LowLevelType)>, TyperError> {
+        use crate::translator::rtyper::rmodel::mangle;
+
+        let mut fields: Vec<(String, LowLevelType)> = Vec::new();
+        let mut fieldmap: HashMap<String, (String, std::sync::Arc<dyn Repr>)> = HashMap::new();
+
+        if let Some(access_set) = &self.access_set {
+            let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+                TyperError::message("MultipleFrozenPBCRepr._setup_repr_fields: rtyper weak dropped")
+            })?;
+            // upstream: `attrlist = self.access_set.attrs.keys(); attrlist.sort()`.
+            let mut attrlist: Vec<String> = access_set.borrow().attrs.keys().cloned().collect();
+            attrlist.sort();
+            for attr in &attrlist {
+                let s_value = access_set
+                    .borrow()
+                    .attrs
+                    .get(attr)
+                    .cloned()
+                    .expect("attrlist came from access_set.attrs");
+                let r_value = rtyper.getrepr(&s_value)?;
+                let mangled_name = mangle("pbc", attr);
+                fields.push((mangled_name.clone(), r_value.lowleveltype().clone()));
+                fieldmap.insert(attr.clone(), (mangled_name, r_value));
+            }
+        }
+
+        *self.fieldmap.borrow_mut() = Some(fieldmap);
+        Ok(fields)
+    }
+
+    /// RPython `MultipleFrozenPBCRepr._setup_repr(self)` (rpbc.py:738-741).
+    ///
+    /// ```python
+    /// def _setup_repr(self):
+    ///     llfields = self._setup_repr_fields()
+    ///     kwds = {'hints': {'immutable': True, 'static_immutable': True}}
+    ///     self.pbc_type.become(Struct('pbc', *llfields, **kwds))
+    /// ```
+    fn setup_repr(&self) -> Result<(), TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::StructType;
+
+        let llfields = self.setup_repr_fields()?;
+        let hints = vec![
+            ("immutable".to_string(), ConstValue::Bool(true)),
+            ("static_immutable".to_string(), ConstValue::Bool(true)),
+        ];
+        let struct_t = StructType::with_hints("pbc", llfields, hints);
+        self.pbc_type
+            .r#become(LowLevelType::Struct(Box::new(struct_t)))
+            .map_err(TyperError::message)
+    }
+
+    /// RPython `MultipleFrozenPBCRepr.null_instance(self)` (rpbc.py:746-747):
+    /// `return nullptr(self.pbc_type)`. Assumes `_setup_repr` has run.
+    pub fn null_instance(
+        &self,
+    ) -> Result<crate::translator::rtyper::lltypesystem::lltype::_ptr, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::nullptr;
+
+        let resolved = self.pbc_type.resolved().ok_or_else(|| {
+            TyperError::message(
+                "MultipleFrozenPBCRepr.null_instance: pbc_type not resolved (call setup first)",
+            )
+        })?;
+        nullptr(resolved).map_err(TyperError::message)
+    }
+
+    /// RPython `MultipleFrozenPBCRepr.create_instance(self)` (rpbc.py:743-744):
+    /// `return malloc(self.pbc_type, immortal=True)`.
+    pub fn create_instance(
+        &self,
+    ) -> Result<crate::translator::rtyper::lltypesystem::lltype::_ptr, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc};
+
+        let resolved = self.pbc_type.resolved().ok_or_else(|| {
+            TyperError::message(
+                "MultipleFrozenPBCRepr.create_instance: pbc_type not resolved (call setup first)",
+            )
+        })?;
+        malloc(resolved, None, MallocFlavor::Gc, true).map_err(TyperError::message)
+    }
+
+    /// RPython `MultipleFrozenPBCRepr.getfield(vpbc, attr, llops)`
+    /// (rpbc.py:749-753). Looks up `(mangled_name, r_value)` in the
+    /// fieldmap, then emits `getfield(vpbc, mangled_name)` with the
+    /// attribute's target repr.
+    fn getfield_emit(
+        &self,
+        vpbc: &crate::flowspace::model::Hlvalue,
+        attr: &str,
+        llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+    ) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+        use crate::translator::rtyper::rtyper::GenopResult;
+
+        let fieldmap = self.fieldmap.borrow();
+        let fieldmap = fieldmap.as_ref().ok_or_else(|| {
+            TyperError::message(
+                "MultipleFrozenPBCRepr.getfield: fieldmap not populated (call setup first)",
+            )
+        })?;
+        let (mangled_name, r_value) = fieldmap.get(attr).cloned().ok_or_else(|| {
+            TyperError::message(format!(
+                "MultipleFrozenPBCRepr.getfield: no mangled field for attr {attr:?}"
+            ))
+        })?;
+        let cname = crate::translator::rtyper::rmodel::inputconst_from_lltype(
+            &LowLevelType::Void,
+            &ConstValue::Str(mangled_name),
+        )?;
+        let result_ty = r_value.lowleveltype().clone();
+        let result = llops
+            .genop(
+                "getfield",
+                vec![
+                    vpbc.clone(),
+                    crate::flowspace::model::Hlvalue::Constant(cname),
+                ],
+                GenopResult::LLType(result_ty),
+            )
+            .expect("getfield with non-Void result returns a Variable");
+        Ok(crate::flowspace::model::Hlvalue::Variable(result))
+    }
+
+    /// Runs `_setup_repr` if it hasn't yet. Idempotent because the
+    /// Repr trait's `setup()` already dedupes through `ReprState`.
+    fn ensure_setup(&self) -> Result<(), TyperError> {
+        Repr::setup(self as &dyn Repr)
+    }
+}
+
+impl Repr for MultipleFrozenPBCRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "MultipleFrozenPBCRepr"
+    }
+
+    fn repr_class_id(&self) -> ReprClassId {
+        ReprClassId::MultipleFrozenPBCRepr
+    }
+
+    /// RPython `_setup_repr` override (rpbc.py:738-741) — threaded
+    /// through the `Repr::setup()` harness by `add_pendingsetup` in
+    /// `get_frozen_pbc_repr`.
+    fn _setup_repr(&self) -> Result<(), TyperError> {
+        self.setup_repr()
+    }
+
+    /// RPython `MultipleFrozenPBCReprBase.convert_const(self, pbc)`
+    /// (rpbc.py:666-670):
+    ///
+    /// ```python
+    /// def convert_const(self, pbc):
+    ///     if pbc is None:
+    ///         return self.null_instance()
+    ///     frozendesc = self.rtyper.annotator.bookkeeper.getdesc(pbc)
+    ///     return self.convert_desc(frozendesc)
+    /// ```
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        if matches!(value, ConstValue::None) {
+            self.ensure_setup()?;
+            let null = self.null_instance()?;
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(null)),
+                self.lltype.clone(),
+            ));
+        }
+        let ConstValue::HostObject(host) = value else {
+            return Err(TyperError::message(format!(
+                "MultipleFrozenPBCRepr.convert_const: expected HostObject, got {value:?}"
+            )));
+        };
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("MultipleFrozenPBCRepr.convert_const: rtyper weak dropped")
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("MultipleFrozenPBCRepr.convert_const: annotator weak dropped")
+        })?;
+        let desc = annotator
+            .bookkeeper
+            .getdesc(host)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        self.convert_desc(&desc)
+    }
+
+    /// RPython `MultipleFrozenPBCRepr.convert_desc(self, frozendesc)`
+    /// (rpbc.py:769-790).
+    ///
+    /// ```python
+    /// def convert_desc(self, frozendesc):
+    ///     if (self.access_set is not None and
+    ///             frozendesc not in self.access_set.descs):
+    ///         raise TyperError("not found in PBC access set: %r")
+    ///     try:
+    ///         return self.pbc_cache[frozendesc]
+    ///     except KeyError:
+    ///         self.setup()
+    ///         result = self.create_instance()
+    ///         self.pbc_cache[frozendesc] = result
+    ///         for attr, (mangled_name, r_value) in self.fieldmap.items():
+    ///             if r_value.lowleveltype is Void:
+    ///                 continue
+    ///             try:
+    ///                 thisattrvalue = frozendesc.attrcache[attr]
+    ///             except KeyError:
+    ///                 if frozendesc.warn_missing_attribute(attr):
+    ///                     warning(...)
+    ///                 continue
+    ///             llvalue = r_value.convert_const(thisattrvalue)
+    ///             setattr(result, mangled_name, llvalue)
+    ///         return result
+    /// ```
+    fn convert_desc(&self, desc: &DescEntry) -> Result<Constant, TyperError> {
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+
+        let DescEntry::Frozen(frozendesc) = desc else {
+            return Err(TyperError::message(format!(
+                "MultipleFrozenPBCRepr.convert_desc: expected FrozenDesc, got {:?}",
+                desc.kind()
+            )));
+        };
+        let identity_key = desc.desc_key();
+
+        // upstream rpbc.py:770-772 — access-set membership guard.
+        if let Some(access_set) = &self.access_set {
+            if !access_set.borrow().descs.contains_key(&identity_key) {
+                return Err(TyperError::message(format!(
+                    "not found in PBC access set: {:?}",
+                    identity_key
+                )));
+            }
+        }
+
+        // upstream rpbc.py:773-775 — `try: return self.pbc_cache[frozendesc]`.
+        if let Some(cached) = self.pbc_cache.borrow().get(&identity_key) {
+            return Ok(cached.clone());
+        }
+
+        // upstream rpbc.py:776-778 — `self.setup()` + `result =
+        // self.create_instance()` + IMMEDIATELY
+        // `self.pbc_cache[frozendesc] = result`. Pyre allocates TWO
+        // distinct `_ptr` instances:
+        //
+        // * `placeholder_ptr` is what recursive
+        //   `convert_desc(same_frozendesc)` sees from the cache. Its
+        //   `_obj0` body is the empty `_struct` from
+        //   `create_instance` and stays empty.
+        // * `final_ptr` carries the populated struct body. After the
+        //   loop finishes, `placeholder_ptr._become(&final_ptr)`
+        //   records the redirect in `PTR_BECOME_TARGETS`, so any
+        //   clone of `placeholder_ptr` (stored in another struct's
+        //   field by a recursive convert_desc that ran during
+        //   populate) resolves to the populated body when consumers
+        //   call `_resolved_ptr` / `_obj()`.
+        //
+        // The cache entry itself is rewritten to `final_ptr` once
+        // populate finishes, so direct cache reads bypass the
+        // redirect chain.
+        self.ensure_setup()?;
+        let placeholder_ptr = self.create_instance()?;
+        self.pbc_cache.borrow_mut().insert(
+            identity_key,
+            Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(placeholder_ptr.clone())),
+                self.lltype.clone(),
+            ),
+        );
+
+        let mut final_ptr = self.create_instance()?;
+
+        // upstream rpbc.py:779-789 — populate struct fields from
+        // frozendesc.attrcache + r_value.convert_const. Mutations
+        // happen on `final_ptr` directly; the pbc_cache borrow stays
+        // released across the recursive `r_value.convert_const(...)`.
+        let field_entries: Vec<(String, String, std::sync::Arc<dyn Repr>)> = {
+            let fieldmap = self.fieldmap.borrow();
+            let fieldmap = fieldmap.as_ref().expect("ensure_setup populates fieldmap");
+            fieldmap
+                .iter()
+                .map(|(attr, (mangled, r_value))| (attr.clone(), mangled.clone(), r_value.clone()))
+                .collect()
+        };
+
+        for (attr, mangled_name, r_value) in field_entries {
+            if r_value.lowleveltype() == &LowLevelType::Void {
+                continue;
+            }
+            let thisattrvalue = frozendesc.borrow().attrcache.borrow().get(&attr).cloned();
+            let Some(thisattrvalue) = thisattrvalue else {
+                // upstream rpbc.py:783-787 — `warning(...)` when the
+                // missing attribute isn't a dunder. Pyre tracks the
+                // warning through warn_missing_attribute but otherwise
+                // silently `continue`s to match upstream's flow.
+                let _warn = frozendesc
+                    .borrow()
+                    .warn_missing_attribute(&attr)
+                    .unwrap_or(false);
+                continue;
+            };
+            // r_value.convert_const may recurse into
+            // MFPBC.convert_desc — DON'T hold the pbc_cache borrow
+            // across this call.
+            let llvalue = r_value.convert_const(&thisattrvalue)?;
+            let ll_body = constant_to_llvalue(&llvalue).map_err(TyperError::message)?;
+
+            let obj_slot = final_ptr._obj0.as_mut().map_err(|_| {
+                TyperError::message("MultipleFrozenPBCRepr.convert_desc: final pointer is delayed")
+            })?;
+            let obj = obj_slot.as_mut().ok_or_else(|| {
+                TyperError::message("MultipleFrozenPBCRepr.convert_desc: final pointer is null")
+            })?;
+            let _ptr_obj::Struct(s) = obj else {
+                return Err(TyperError::message(
+                    "MultipleFrozenPBCRepr.convert_desc: pbc_type is not a Struct",
+                ));
+            };
+            if !s._setattr(&mangled_name, ll_body) {
+                return Err(TyperError::message(format!(
+                    "MultipleFrozenPBCRepr.convert_desc: no field {mangled_name:?} \
+                     on specfunc struct"
+                )));
+            }
+        }
+
+        // Splice the populated body into the redirect table so any
+        // clone of `placeholder_ptr` resolves to `final_ptr` when
+        // consumers walk through `_obj()` / `_resolved_ptr`.
+        placeholder_ptr._become(&final_ptr);
+
+        // Rewrite the cache entry to point at `final_ptr` directly —
+        // direct cache reads now see the populated body without
+        // chasing the redirect.
+        let final_const = Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(final_ptr)),
+            self.lltype.clone(),
+        );
+        self.pbc_cache
+            .borrow_mut()
+            .insert(identity_key, final_const.clone());
+        Ok(final_const)
+    }
+
+    /// RPython `MultipleFrozenPBCRepr.rtype_getattr(self, hop)`
+    /// (rpbc.py:792-800):
+    ///
+    /// ```python
+    /// def rtype_getattr(self, hop):
+    ///     if hop.s_result.is_constant():
+    ///         return hop.inputconst(hop.r_result, hop.s_result.const)
+    ///     attr = hop.args_s[1].const
+    ///     vpbc, vattr = hop.inputargs(self, Void)
+    ///     v_res = self.getfield(vpbc, attr, hop.llops)
+    ///     mangled_name, r_res = self.fieldmap[attr]
+    ///     return hop.llops.convertvar(v_res, r_res, hop.r_result)
+    /// ```
+    fn rtype_getattr(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        use crate::translator::rtyper::rtyper::{ConvertedTo, HighLevelOp};
+
+        // upstream rpbc.py:793-794 — constant fast-path.
+        let s_const = hop
+            .s_result
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.const_())
+            .cloned();
+        if let Some(value) = s_const {
+            let r_result = hop
+                .r_result
+                .borrow()
+                .clone()
+                .ok_or_else(|| TyperError::message("HighLevelOp.r_result is not set"))?;
+            let c = HighLevelOp::inputconst(&*r_result, &value)?;
+            return Ok(Some(crate::flowspace::model::Hlvalue::Constant(c)));
+        }
+
+        // upstream rpbc.py:796-800 — variable attr + getfield via
+        // mangled name, then convertvar into r_result.
+        let attr = hop
+            .args_s
+            .borrow()
+            .get(1)
+            .and_then(|sv| sv.const_().cloned())
+            .and_then(|cv| match cv {
+                ConstValue::Str(s) => Some(s),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                TyperError::message(
+                    "MultipleFrozenPBCRepr.rtype_getattr: args_s[1] is not a string constant",
+                )
+            })?;
+
+        self.ensure_setup()?;
+        let vlist = hop.inputargs(vec![
+            ConvertedTo::Repr(self),
+            ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ])?;
+        let vpbc = vlist[0].clone();
+
+        let v_res = {
+            let mut llops = hop.llops.borrow_mut();
+            self.getfield_emit(&vpbc, &attr, &mut llops)?
+        };
+        let r_res = {
+            let fieldmap = self.fieldmap.borrow();
+            let fieldmap = fieldmap.as_ref().expect("ensure_setup populates fieldmap");
+            fieldmap
+                .get(&attr)
+                .map(|(_, r_value)| r_value.clone())
+                .ok_or_else(|| {
+                    TyperError::message(format!(
+                        "MultipleFrozenPBCRepr.rtype_getattr: unknown attr {attr:?}"
+                    ))
+                })?
+        };
+        let r_result = hop
+            .r_result
+            .borrow()
+            .clone()
+            .ok_or_else(|| TyperError::message("HighLevelOp.r_result is not set"))?;
+        let converted =
+            hop.llops
+                .borrow_mut()
+                .convertvar(v_res, r_res.as_ref(), r_result.as_ref())?;
+        Ok(Some(converted))
+    }
+}
+
+/// RPython `pairtype(FunctionRepr, FunctionsPBCRepr).convert_from_to`
+/// (rpbc.py:377-379):
+///
+/// ```python
+/// class __extend__(pairtype(FunctionRepr, FunctionsPBCRepr)):
+///     def convert_from_to((r_fpbc1, r_fpbc2), v, llops):
+///         return inputconst(r_fpbc2, r_fpbc1.s_pbc.const)
+/// ```
+///
+/// Upstream relies on `r_fpbc1` being a single-desc constant PBC so
+/// `s_pbc.const` is populated with the pyobj stored in `const_box`.
+/// The Rust port materialises the destination constant via
+/// [`Repr::convert_const`] — which now routes `ConstValue::HostObject`
+/// through `bookkeeper.getdesc`.
+pub fn pair_function_repr_functions_pbc_repr_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    let any_from: &dyn std::any::Any = r_from;
+    let r_from = any_from.downcast_ref::<FunctionRepr>().ok_or_else(|| {
+        TyperError::message(
+            "pair(FunctionRepr, FunctionsPBCRepr): source repr is not a FunctionRepr",
+        )
+    })?;
+    let pbc_const = r_from.base.s_pbc.base.const_box.as_ref().ok_or_else(|| {
+        TyperError::message(
+            "pair(FunctionRepr, FunctionsPBCRepr).convert_from_to: \
+             source s_pbc has no constant pyobj",
+        )
+    })?;
+    let c = r_to.convert_const(&pbc_const.value)?;
+    Ok(Some(crate::flowspace::model::Hlvalue::Constant(c)))
+}
+
+/// RPython `pairtype(MultipleFrozenPBCRepr,
+/// MultipleUnrelatedFrozenPBCRepr).convert_from_to` (rpbc.py:802-805):
+///
+/// ```python
+/// return llops.genop('cast_ptr_to_adr', [v], resulttype=llmemory.Address)
+/// ```
+pub fn pair_mfpbc_mufpbc_convert_from_to(
+    _r_from: &dyn Repr,
+    _r_to: &dyn Repr,
+    v: &crate::flowspace::model::Hlvalue,
+    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    use crate::translator::rtyper::rtyper::GenopResult;
+    let result = llops
+        .genop(
+            "cast_ptr_to_adr",
+            vec![v.clone()],
+            GenopResult::LLType(LowLevelType::Address),
+        )
+        .expect("cast_ptr_to_adr with Address result returns a value");
+    Ok(Some(crate::flowspace::model::Hlvalue::Variable(result)))
+}
+
+/// RPython `pairtype(MultipleFrozenPBCRepr,
+/// MultipleFrozenPBCRepr).convert_from_to` (rpbc.py:807-811):
+///
+/// ```python
+/// if r_pbc1.access_set == r_pbc2.access_set:
+///     return v
+/// return NotImplemented
+/// ```
+///
+/// Identity on the access_set — both sides must point at the same
+/// FrozenAttrFamily Rc. `NotImplemented` maps to `Ok(None)` so the
+/// pairtype dispatcher falls through to the next MRO entry.
+pub fn pair_mfpbc_mfpbc_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &crate::flowspace::model::Hlvalue,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    let any_from: &dyn std::any::Any = r_from;
+    let any_to: &dyn std::any::Any = r_to;
+    let Some(r_pbc1) = any_from.downcast_ref::<MultipleFrozenPBCRepr>() else {
+        return Ok(None);
+    };
+    let Some(r_pbc2) = any_to.downcast_ref::<MultipleFrozenPBCRepr>() else {
+        return Ok(None);
+    };
+    let same_access = match (&r_pbc1.access_set, &r_pbc2.access_set) {
+        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if same_access {
+        Ok(Some(v.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// RPython `pairtype(SingleFrozenPBCRepr,
+/// MultipleFrozenPBCRepr).convert_from_to` (rpbc.py:813-821):
+///
+/// ```python
+/// frozendesc1 = r_pbc1.frozendesc
+/// access = frozendesc1.queryattrfamily()
+/// if access is r_pbc2.access_set:
+///     value = r_pbc2.convert_desc(frozendesc1)
+///     lltype = r_pbc2.lowleveltype
+///     return Constant(value, lltype)
+/// return NotImplemented
+/// ```
+pub fn pair_sfpbc_mfpbc_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    let any_from: &dyn std::any::Any = r_from;
+    let any_to: &dyn std::any::Any = r_to;
+    let Some(r_pbc1) = any_from.downcast_ref::<SingleFrozenPBCRepr>() else {
+        return Ok(None);
+    };
+    let Some(r_pbc2) = any_to.downcast_ref::<MultipleFrozenPBCRepr>() else {
+        return Ok(None);
+    };
+    let DescEntry::Frozen(frozendesc1) = &r_pbc1.frozendesc else {
+        return Err(TyperError::message(
+            "pair(SingleFrozenPBCRepr, MultipleFrozenPBCRepr): source frozendesc is not a FrozenDesc",
+        ));
+    };
+    let access = frozendesc1.borrow().queryattrfamily();
+    let matches = match (&access, &r_pbc2.access_set) {
+        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if !matches {
+        return Ok(None);
+    }
+    let c = r_pbc2.convert_desc(&r_pbc1.frozendesc)?;
+    Ok(Some(crate::flowspace::model::Hlvalue::Constant(c)))
+}
+
+/// RPython `pairtype(MultipleFrozenPBCReprBase,
+/// SingleFrozenPBCRepr).convert_from_to` (rpbc.py:823-826):
+///
+/// ```python
+/// return inputconst(Void, r_pbc2.frozendesc)
+/// ```
+///
+/// SFPBC is `Void`-typed so we return a Void-typed
+/// `ConstValue::FrozenDesc(DescKey)` carrying the frozen desc
+/// identity. Consumers can distinguish a FrozenDesc-carrying Void
+/// constant from a plain integer payload because the carrier is a
+/// dedicated ConstValue variant.
+pub fn pair_mfpbc_base_sfpbc_convert_from_to(
+    _r_from: &dyn Repr,
+    r_to: &dyn Repr,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    let any_to: &dyn std::any::Any = r_to;
+    let Some(r_pbc2) = any_to.downcast_ref::<SingleFrozenPBCRepr>() else {
+        return Ok(None);
+    };
+    let desc_key = r_pbc2.frozendesc.desc_key();
+    let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(
+        &LowLevelType::Void,
+        &ConstValue::FrozenDesc(desc_key.0),
+    )?;
+    Ok(Some(crate::flowspace::model::Hlvalue::Constant(c)))
+}
+
+/// RPython `pairtype(FunctionRepr,
+/// MultipleFrozenPBCRepr).convert_from_to` (rpbc.py:828-834):
+///
+/// ```python
+/// if r_fn1.s_pbc.is_constant():
+///     value = r_frozen2.convert_const(r_fn1.s_pbc.const)
+///     lltype = r_frozen2.lowleveltype
+///     return Constant(value, lltype)
+/// return NotImplemented
+/// ```
+pub fn pair_function_repr_mfpbc_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    let any_from: &dyn std::any::Any = r_from;
+    let Some(r_fn1) = any_from.downcast_ref::<FunctionRepr>() else {
+        return Ok(None);
+    };
+    if !r_fn1.base.s_pbc.is_constant() {
+        return Ok(None);
+    }
+    let Some(pbc_const) = r_fn1.base.s_pbc.base.const_box.as_ref() else {
+        return Ok(None);
+    };
+    let c = r_to.convert_const(&pbc_const.value)?;
+    Ok(Some(crate::flowspace::model::Hlvalue::Constant(c)))
+}
+
+/// RPython `pairtype(MultipleFrozenPBCRepr,
+/// FunctionRepr).convert_from_to` (rpbc.py:836-841):
+///
+/// ```python
+/// if r_fn2.lowleveltype is Void:
+///     value = r_fn2.s_pbc.const
+///     return Constant(value, Void)
+/// return NotImplemented
+/// ```
+pub fn pair_mfpbc_function_repr_convert_from_to(
+    _r_from: &dyn Repr,
+    r_to: &dyn Repr,
+) -> Result<Option<crate::flowspace::model::Hlvalue>, TyperError> {
+    let any_to: &dyn std::any::Any = r_to;
+    let Some(r_fn2) = any_to.downcast_ref::<FunctionRepr>() else {
+        return Ok(None);
+    };
+    if r_fn2.lowleveltype() != &LowLevelType::Void {
+        return Ok(None);
+    }
+    let Some(pbc_const) = r_fn2.base.s_pbc.base.const_box.as_ref() else {
+        return Ok(None);
+    };
+    let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(
+        &LowLevelType::Void,
+        &pbc_const.value,
+    )?;
+    Ok(Some(crate::flowspace::model::Hlvalue::Constant(c)))
+}
+
+/// RPython `class MethodOfFrozenPBCRepr(Repr)` (rpbc.py:844-915).
+///
+/// Representation for a `SomePBC` of `MethodOfFrozenDesc` — bound
+/// methods on frozen PBCs where every desc shares the same underlying
+/// `funcdesc`. The low-level representation is just the bound `im_self`
+/// pointer (mirrors `r_im_self`).
+///
+/// ```python
+/// class MethodOfFrozenPBCRepr(Repr):
+///     def __init__(self, rtyper, s_pbc):
+///         funcdescs = set([desc.funcdesc for desc in s_pbc.descriptions])
+///         assert len(funcdescs) == 1
+///         self.funcdesc = funcdescs.pop()
+///         if s_pbc.can_be_none():
+///             raise TyperError(...)
+///         im_selves = [desc.frozendesc for desc in s_pbc.descriptions]
+///         self.s_im_self = annmodel.SomePBC(im_selves)
+///         self.r_im_self = rtyper.getrepr(self.s_im_self)
+///         self.lowleveltype = self.r_im_self.lowleveltype
+/// ```
+#[derive(Debug)]
+pub struct MethodOfFrozenPBCRepr {
+    /// RPython `self.rtyper = rtyper` (rpbc.py:850). Weak backref.
+    pub rtyper: Weak<RPythonTyper>,
+    /// RPython `self.funcdesc` (rpbc.py:851-853).
+    pub funcdesc: Rc<RefCell<crate::annotator::description::FunctionDesc>>,
+    /// RPython `self.s_im_self = SomePBC(im_selves)` (rpbc.py:867).
+    pub s_im_self: crate::annotator::model::SomeValue,
+    /// RPython `self.r_im_self = rtyper.getrepr(self.s_im_self)`
+    /// (rpbc.py:868). Strong handle so the underlying frozen-PBC repr
+    /// stays alive while bound methods reference it.
+    pub r_im_self: std::sync::Arc<dyn Repr>,
+    state: ReprState,
+    lltype: LowLevelType,
+}
+
+impl MethodOfFrozenPBCRepr {
+    /// RPython `MethodOfFrozenPBCRepr.__init__(self, rtyper, s_pbc)`
+    /// (rpbc.py:849-870).
+    pub fn new(
+        rtyper: &Rc<RPythonTyper>,
+        s_pbc: crate::annotator::model::SomePBC,
+    ) -> Result<Self, TyperError> {
+        // upstream rpbc.py:851-853 — every description must share a
+        // single funcdesc.
+        let mut funcdesc_iter = s_pbc.descriptions.values().filter_map(|d| match d {
+            DescEntry::MethodOfFrozen(rc) => Some(rc.borrow().funcdesc.clone()),
+            _ => None,
+        });
+        let first = funcdesc_iter
+            .next()
+            .ok_or_else(|| TyperError::message("MethodOfFrozenPBCRepr: empty descriptions"))?;
+        let first_id = first.borrow().base.identity;
+        for fd in funcdesc_iter {
+            if fd.borrow().base.identity != first_id {
+                return Err(TyperError::message(
+                    "MethodOfFrozenPBCRepr: descriptions must share a single funcdesc \
+                     (rpbc.py:852)",
+                ));
+            }
+        }
+
+        // upstream rpbc.py:863-865 — variable `method-of-frozen-PBC or
+        // None` is unsupported.
+        if s_pbc.can_be_none {
+            return Err(TyperError::message(
+                "unsupported: variable of type method-of-frozen-PBC or None",
+            ));
+        }
+
+        // upstream rpbc.py:867-868 — build SomePBC of the frozendescs
+        // and ask the rtyper for its repr.
+        let im_self_descs: Vec<DescEntry> = s_pbc
+            .descriptions
+            .values()
+            .filter_map(|d| match d {
+                DescEntry::MethodOfFrozen(rc) => {
+                    Some(DescEntry::Frozen(rc.borrow().frozendesc.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let s_im_self = crate::annotator::model::SomeValue::PBC(
+            crate::annotator::model::SomePBC::new(im_self_descs, false),
+        );
+        let r_im_self = rtyper.getrepr(&s_im_self)?;
+        let lltype = r_im_self.lowleveltype().clone();
+
+        Ok(MethodOfFrozenPBCRepr {
+            rtyper: Rc::downgrade(rtyper),
+            funcdesc: first,
+            s_im_self,
+            r_im_self,
+            state: ReprState::new(),
+            lltype,
+        })
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.get_s_callable(self)`
+    /// (rpbc.py:872-873).
+    pub fn get_s_callable(&self) -> crate::annotator::model::SomeValue {
+        crate::annotator::model::SomeValue::PBC(crate::annotator::model::SomePBC::new(
+            vec![DescEntry::Function(self.funcdesc.clone())],
+            false,
+        ))
+    }
+}
+
+impl Repr for MethodOfFrozenPBCRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "MethodOfFrozenPBCRepr"
+    }
+
+    fn repr_class_id(&self) -> ReprClassId {
+        ReprClassId::MethodOfFrozenPBCRepr
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.convert_desc(self, mdesc)`
+    /// (rpbc.py:879-883):
+    ///
+    /// ```python
+    /// def convert_desc(self, mdesc):
+    ///     if mdesc.funcdesc is not self.funcdesc:
+    ///         raise TyperError(...)
+    ///     return self.r_im_self.convert_desc(mdesc.frozendesc)
+    /// ```
+    fn convert_desc(&self, desc: &DescEntry) -> Result<Constant, TyperError> {
+        let DescEntry::MethodOfFrozen(mdesc) = desc else {
+            return Err(TyperError::message(format!(
+                "MethodOfFrozenPBCRepr.convert_desc: expected MethodOfFrozenDesc, \
+                 got {:?}",
+                desc.kind()
+            )));
+        };
+        let m = mdesc.borrow();
+        if m.funcdesc.borrow().base.identity != self.funcdesc.borrow().base.identity {
+            return Err(TyperError::message(format!(
+                "not a method bound on {:?}: {:?}",
+                self.funcdesc.borrow().base.identity,
+                m.funcdesc.borrow().base.identity
+            )));
+        }
+        let frozen_entry = DescEntry::Frozen(m.frozendesc.clone());
+        self.r_im_self.convert_desc(&frozen_entry)
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.convert_const(self, method)`
+    /// (rpbc.py:885-887):
+    ///
+    /// ```python
+    /// def convert_const(self, method):
+    ///     mdesc = self.rtyper.annotator.bookkeeper.getdesc(method)
+    ///     return self.convert_desc(mdesc)
+    /// ```
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        let host = match value {
+            ConstValue::HostObject(h) => h.clone(),
+            other => {
+                return Err(TyperError::message(format!(
+                    "MethodOfFrozenPBCRepr.convert_const: expected bound method \
+                     HostObject, got {other:?}"
+                )));
+            }
+        };
+        let rtyper = self
+            .rtyper
+            .upgrade()
+            .ok_or_else(|| TyperError::message("MethodOfFrozenPBCRepr: rtyper dropped"))?;
+        let annotator = rtyper
+            .annotator
+            .upgrade()
+            .ok_or_else(|| TyperError::message("MethodOfFrozenPBCRepr: annotator dropped"))?;
+        let desc = annotator
+            .bookkeeper
+            .getdesc(&host)
+            .map_err(|err| TyperError::message(err.to_string()))?;
+        self.convert_desc(&desc)
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.rtype_simple_call /
+    /// rtype_call_args` (rpbc.py:889-893):
+    ///
+    /// ```python
+    /// def rtype_simple_call(self, hop):
+    ///     return self.redispatch_call(hop, call_args=False)
+    /// def rtype_call_args(self, hop):
+    ///     return self.redispatch_call(hop, call_args=True)
+    /// ```
+    ///
+    /// `redispatch_call` rewrites the bound method call into a plain
+    /// function call by inserting the underlying funcdesc as the first
+    /// argument and re-running the rtyper dispatch.
+    ///
+    /// PRE-EXISTING-DEVIATION: the `redispatch_call` implementation
+    /// requires `hop.copy()` + `swap_fst_snd_args` + `r_s_popfirstarg`
+    /// + `v_s_insertfirstarg` + `dispatch` + `adjust_shape` to be
+    /// stitched together. All five hop helpers exist
+    /// (rtyper.rs:1809+, 2072+, 2077+, 2087+, 1826+) but the
+    /// glue/`adjust_shape` translator is the next item to land.
+    fn rtype_simple_call(
+        &self,
+        _hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        Err(TyperError::missing_rtype_operation(
+            "MethodOfFrozenPBCRepr.rtype_simple_call (rpbc.py:889-890) \
+             port pending — blocked on redispatch_call + adjust_shape glue",
+        ))
+    }
+
+    fn rtype_call_args(
+        &self,
+        _hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        Err(TyperError::missing_rtype_operation(
+            "MethodOfFrozenPBCRepr.rtype_call_args (rpbc.py:892-893) \
+             port pending — blocked on redispatch_call + adjust_shape glue",
+        ))
+    }
 }
 
 /// RPython `class ClassesPBCRepr(Repr)` (rpbc.py:920-968).
@@ -2120,11 +4286,35 @@ pub fn get_frozen_pbc_repr(
             .insert(PbcReprKey::Unrelated, fresh.clone());
         return Ok(fresh);
     }
-    Err(TyperError::missing_rtype_operation(
-        "getFrozenPBCRepr: MultipleFrozenPBCRepr (rpbc.py:626-632) \
-         port pending — blocked on pbc_type ForwardReference + \
-         pbc_cache + add_pendingsetup",
-    ))
+    // upstream rpbc.py:626-632 — `return rtyper.pbc_reprs[access]`
+    // fast-path, else mint a new MultipleFrozenPBCRepr and
+    // `rtyper.add_pendingsetup(result)` before caching. Upstream's
+    // `access` may be `None` when every frozen desc has
+    // `queryattrfamily() is None`; the access_set-less repr still
+    // mints with an empty Struct.
+    let access: Option<Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>> =
+        s_pbc.descriptions.values().find_map(|d| match d {
+            DescEntry::Frozen(fd) => fd.borrow().queryattrfamily(),
+            _ => None,
+        });
+    use crate::translator::rtyper::rtyper::PbcReprKey;
+    let key = match &access {
+        Some(family) => PbcReprKey::Access(Rc::as_ptr(family) as usize),
+        // Upstream uses `None` as a dict key directly; the Rust port
+        // collapses every `access is None` case onto `Unrelated` *for
+        // Unrelated reprs*, but `MultipleFrozenPBCRepr(access=None)`
+        // needs its own distinct key. Reuse `Access(0)` as the sentinel
+        // — no real `FrozenAttrFamily` can live at pointer 0.
+        None => PbcReprKey::Access(0),
+    };
+    if let Some(cached) = rtyper.pbc_reprs.borrow().get(&key) {
+        return Ok(cached.clone());
+    }
+    let fresh: std::sync::Arc<dyn Repr> =
+        std::sync::Arc::new(MultipleFrozenPBCRepr::new(rtyper, access));
+    rtyper.pbc_reprs.borrow_mut().insert(key, fresh.clone());
+    rtyper.add_pendingsetup(fresh.clone());
+    Ok(fresh)
 }
 
 /// RPython `SomePBC.rtyper_makerepr` single-FunctionDesc arm
@@ -2234,9 +4424,10 @@ pub fn somepbc_rtyper_makerepr(
             "SomePBC.rtyper_makerepr: MethodsPBCRepr (rpbc.py:53-54) port pending",
         )),
         DescKind::Frozen => get_frozen_pbc_repr(rtyper, s_pbc),
-        DescKind::MethodOfFrozen => Err(TyperError::missing_rtype_operation(
-            "SomePBC.rtyper_makerepr: MethodOfFrozenPBCRepr (rpbc.py:57-58) port pending",
-        )),
+        DescKind::MethodOfFrozen => Ok(std::sync::Arc::new(MethodOfFrozenPBCRepr::new(
+            rtyper,
+            s_pbc.clone(),
+        )?) as std::sync::Arc<dyn Repr>),
     }
 }
 
@@ -2288,33 +4479,30 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn somepbc_rtyper_makerepr_single_function_desc_with_can_be_none_surfaces_pending() {
-        // Uncallable (no callfamily wired) → getFrozenPBCRepr branch.
+    fn somepbc_rtyper_makerepr_single_function_desc_with_can_be_none_routes_to_multiple_frozen_pbc_repr()
+     {
+        // Uncallable (no callfamily wired) → getFrozenPBCRepr branch,
+        // now lands on MultipleFrozenPBCRepr shell since the shell is
+        // ported.
         let (ann, rtyper) = make_rtyper();
         let f = function_entry(&ann.bookkeeper, "f");
         let s_pbc = SomePBC::new(vec![f], true);
-        let err = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap_err();
-        assert!(
-            err.to_string().contains("getFrozenPBCRepr"),
-            "unexpected: {}",
-            err
-        );
+        let r = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
     }
 
     #[test]
-    fn somepbc_rtyper_makerepr_multi_function_descs_without_callfamily_uses_getfrozenpbcrepr() {
-        // Multi-FunctionDesc PBC without an attached callfamily → upstream
-        // rpbc.py:49 routes to getFrozenPBCRepr.
+    fn somepbc_rtyper_makerepr_multi_function_descs_without_callfamily_routes_to_multiple_frozen_pbc_repr()
+     {
+        // Multi-FunctionDesc PBC without an attached callfamily →
+        // upstream rpbc.py:49 routes to getFrozenPBCRepr which now
+        // returns a MultipleFrozenPBCRepr shell.
         let (ann, rtyper) = make_rtyper();
         let f = function_entry(&ann.bookkeeper, "f");
         let g = function_entry(&ann.bookkeeper, "g");
         let s_pbc = SomePBC::new(vec![f, g], false);
-        let err = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap_err();
-        assert!(
-            err.to_string().contains("getFrozenPBCRepr"),
-            "unexpected: {}",
-            err
-        );
+        let r = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
     }
 
     #[test]
@@ -2433,6 +4621,85 @@ mod pbc_repr_tests {
         )))
     }
 
+    fn method_of_frozen_entry(
+        bk: &Rc<Bookkeeper>,
+        funcdesc: &Rc<StdRefCell<crate::annotator::description::FunctionDesc>>,
+        frozen_name: &str,
+    ) -> (
+        DescEntry,
+        Rc<StdRefCell<crate::annotator::description::FrozenDesc>>,
+    ) {
+        use crate::annotator::description::{FrozenDesc, MethodOfFrozenDesc};
+        use crate::flowspace::model::HostObject;
+        let pyobj = HostObject::new_module(frozen_name);
+        let frozen = Rc::new(StdRefCell::new(
+            FrozenDesc::new(bk.clone(), pyobj).expect("FrozenDesc::new"),
+        ));
+        let mof = Rc::new(StdRefCell::new(MethodOfFrozenDesc::new(
+            bk.clone(),
+            funcdesc.clone(),
+            frozen.clone(),
+        )));
+        (DescEntry::MethodOfFrozen(mof), frozen)
+    }
+
+    #[test]
+    fn method_of_frozen_pbc_repr_routes_convert_desc_through_r_im_self() {
+        // upstream rpbc.py:879-883 — convert_desc(mdesc) verifies the
+        // funcdesc identity then defers to `r_im_self.convert_desc(
+        // mdesc.frozendesc)`. With a single frozendesc backing it,
+        // r_im_self ends up as `SingleFrozenPBCRepr` (lowleveltype Void).
+        let (ann, rtyper) = make_rtyper();
+        let DescEntry::Function(funcdesc) = function_entry(&ann.bookkeeper, "f") else {
+            unreachable!();
+        };
+        let (mof_desc, _frozen) = method_of_frozen_entry(&ann.bookkeeper, &funcdesc, "frozen_a");
+        let s_pbc = SomePBC::new(vec![mof_desc.clone()], false);
+        let repr = MethodOfFrozenPBCRepr::new(&rtyper, s_pbc).expect("ctor");
+
+        assert_eq!(repr.repr_class_id(), ReprClassId::MethodOfFrozenPBCRepr);
+        // r_im_self is SingleFrozenPBCRepr → Void lowleveltype.
+        assert_eq!(repr.lowleveltype(), &LowLevelType::Void);
+
+        let c = repr.convert_desc(&mof_desc).expect("convert_desc");
+        assert_eq!(c.concretetype, Some(LowLevelType::Void));
+        assert!(matches!(c.value, ConstValue::None));
+    }
+
+    #[test]
+    fn method_of_frozen_pbc_repr_rejects_can_be_none() {
+        // upstream rpbc.py:863-865 — variable of type
+        // method-of-frozen-PBC or None is unsupported.
+        let (ann, rtyper) = make_rtyper();
+        let DescEntry::Function(funcdesc) = function_entry(&ann.bookkeeper, "f") else {
+            unreachable!();
+        };
+        let (mof_desc, _) = method_of_frozen_entry(&ann.bookkeeper, &funcdesc, "frozen_a");
+        let s_pbc = SomePBC::new(vec![mof_desc], true);
+        let err = MethodOfFrozenPBCRepr::new(&rtyper, s_pbc).unwrap_err();
+        assert!(err.to_string().contains("method-of-frozen-PBC or None"));
+    }
+
+    #[test]
+    #[should_panic(expected = "different underlying functions")]
+    fn method_of_frozen_pbc_repr_rejects_distinct_funcdescs() {
+        // upstream rpbc.py:851-853 — every description must share a
+        // single funcdesc. SomePBC::new (model.rs:1303) catches this
+        // before the repr ctor sees it, raising the
+        // "different underlying functions" panic from
+        // [`SomePBC::__init__`] (model.py:527-553).
+        let (ann, _rtyper) = make_rtyper();
+        let DescEntry::Function(fd_a) = function_entry(&ann.bookkeeper, "fa") else {
+            unreachable!();
+        };
+        let DescEntry::Function(fd_b) = function_entry(&ann.bookkeeper, "fb") else {
+            unreachable!();
+        };
+        let (mof_a, _) = method_of_frozen_entry(&ann.bookkeeper, &fd_a, "frozen_a");
+        let (mof_b, _) = method_of_frozen_entry(&ann.bookkeeper, &fd_b, "frozen_b");
+        let _ = SomePBC::new(vec![mof_a, mof_b], false);
+    }
+
     #[test]
     fn single_frozen_pbc_repr_convert_desc_identity_check_and_void_sentinel() {
         use crate::flowspace::model::ConstValue;
@@ -2480,9 +4747,15 @@ mod pbc_repr_tests {
         let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
         let null = r.null_instance();
         assert_eq!(null.concretetype, Some(LowLevelType::Address));
-        // `llmemory.Address._defl() == NULL` — pyre models NULL as the
-        // `ConstValue::None` sentinel pinned to Address lowleveltype.
-        assert!(matches!(null.value, ConstValue::None));
+        // upstream `llmemory.Address._defl() == NULL = fakeaddress(None)`.
+        // Pyre wraps the NULL sentinel in [`ConstValue::LLAddress`].
+        let ConstValue::LLAddress(addr) = &null.value else {
+            panic!("expected LLAddress, got {:?}", null.value);
+        };
+        assert!(matches!(
+            addr,
+            crate::translator::rtyper::lltypesystem::lltype::_address::Null
+        ));
     }
 
     #[test]
@@ -2491,26 +4764,50 @@ mod pbc_repr_tests {
         let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
         let c = r.convert_const(&ConstValue::None).unwrap();
         assert_eq!(c.concretetype, Some(LowLevelType::Address));
-        assert!(matches!(c.value, ConstValue::None));
+        let ConstValue::LLAddress(addr) = &c.value else {
+            panic!("expected LLAddress, got {:?}", c.value);
+        };
+        assert!(matches!(
+            addr,
+            crate::translator::rtyper::lltypesystem::lltype::_address::Null
+        ));
     }
 
     #[test]
-    fn multiple_unrelated_frozen_pbc_repr_convert_const_non_none_surfaces_pending() {
+    fn multiple_unrelated_frozen_pbc_repr_convert_const_non_none_rejects_int() {
+        // Non-HostObject ConstValues without a corresponding desc must
+        // surface a clear error rather than silently fail.
         let (_ann, rtyper) = make_rtyper();
         let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
         let err = r.convert_const(&ConstValue::Int(7)).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("Bookkeeper.getdesc"));
+        assert!(
+            err.to_string().contains("expected HostObject"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
-    fn multiple_unrelated_frozen_pbc_repr_convert_desc_surfaces_pending() {
+    fn multiple_unrelated_frozen_pbc_repr_convert_desc_routes_through_single_repr() {
+        // upstream rpbc.py:685-697: `r = rtyper.getrepr(SomePBC([fd]))`
+        // returns SingleFrozenPBCRepr for a single-desc PBC. Its
+        // lowleveltype is Void, so create_instance is used to mint an
+        // empty placeholder struct. The result is wrapped in a
+        // fakeaddress Constant.
         let (ann, rtyper) = make_rtyper();
         let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
-        let err = r.convert_desc(&f).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("fakeaddress"));
+        let c = r.convert_desc(&f).expect("convert_desc(frozen0)");
+        assert_eq!(c.concretetype, Some(LowLevelType::Address));
+        let ConstValue::LLAddress(addr) = &c.value else {
+            panic!("expected LLAddress, got {:?}", c.value);
+        };
+        assert!(matches!(
+            addr,
+            crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)
+        ));
+        // Second call hits converted_pbc_cache and returns the same Constant.
+        let c2 = r.convert_desc(&f).unwrap();
+        assert_eq!(c, c2);
     }
 
     #[test]
@@ -2523,17 +4820,338 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn get_frozen_pbc_repr_multi_desc_common_access_set_surfaces_pending() {
-        // Two FrozenDescs without any `getattrfamily` touch share the
-        // same `queryattrfamily() == None` result, so upstream routes
-        // them to MultipleFrozenPBCRepr (still pending).
+    fn get_frozen_pbc_repr_multi_desc_common_access_set_returns_multiple_frozen_pbc_repr() {
+        // rpbc.py:616-632 — two FrozenDescs with matching
+        // `queryattrfamily()` (both None is still "common") route to
+        // MultipleFrozenPBCRepr and register in `rtyper.pbc_reprs`
+        // with `rtyper.add_pendingsetup` queueing a later
+        // `_setup_repr`.
         let (ann, rtyper) = make_rtyper();
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
         let g = frozen_entry(&ann.bookkeeper, "frozen1");
         let s_pbc = SomePBC::new(vec![f, g], false);
-        let err = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("MultipleFrozenPBCRepr"));
+        let r = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
+        // Second invocation must hit the pbc_reprs cache and return the same repr.
+        let r2 = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&r, &r2),
+            "pbc_reprs cache must reuse the same MultipleFrozenPBCRepr"
+        );
+    }
+
+    /// Helper: build a FrozenAttrFamily with a single Integer-typed
+    /// attribute `attrname` and union it with `desc_a` so their
+    /// `queryattrfamily()` both return the same Rc.
+    fn prime_attrfamily_with_int_attr(
+        bk: &Rc<Bookkeeper>,
+        desc_a: &DescEntry,
+        attrname: &str,
+    ) -> Rc<RefCell<crate::annotator::description::FrozenAttrFamily>> {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        // Touch getattrfamily to ensure the family exists under desc_a's identity.
+        let DescEntry::Frozen(fd_a) = desc_a else {
+            panic!("expected Frozen desc");
+        };
+        let family = fd_a
+            .borrow()
+            .getattrfamily()
+            .expect("getattrfamily should mint a fresh family");
+        family.borrow_mut().attrs.insert(
+            attrname.to_string(),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        );
+        // Make sure the bookkeeper's union-find slot is aware of the family.
+        let _ = bk
+            .frozenpbc_attr_families
+            .borrow_mut()
+            .find_rep(fd_a.borrow().base.identity);
+        family
+    }
+
+    #[test]
+    fn multiple_frozen_pbc_repr_setup_repr_builds_struct_with_mangled_attr_field() {
+        // rpbc.py:738-767 — `_setup_repr` walks access_set.attrs, mangles
+        // each attr name via mangle("pbc", attr), and populates the
+        // ForwardReference pbc_type with a Struct('pbc', ...) carrying
+        // the immutable/static_immutable hints.
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let (ann, rtyper) = make_rtyper();
+        let desc_a = frozen_entry(&ann.bookkeeper, "frozen_a");
+        let access = prime_attrfamily_with_int_attr(&ann.bookkeeper, &desc_a, "count");
+        let r = std::sync::Arc::new(MultipleFrozenPBCRepr::new(&rtyper, Some(access)));
+        Repr::setup(r.as_ref() as &dyn Repr).unwrap();
+
+        // pbc_type should now be resolved to Struct('pbc', ...).
+        let resolved = r.pbc_type.resolved().expect("pbc_type must resolve");
+        let LowLevelType::Struct(s) = resolved else {
+            panic!("pbc_type should resolve to a Struct, got non-Struct");
+        };
+        assert_eq!(s._name, "pbc");
+        // Field name is mangle("pbc", "count") = "pbc_count".
+        let expected_field = crate::translator::rtyper::rmodel::mangle("pbc", "count");
+        assert!(
+            s._flds.get(&expected_field).is_some(),
+            "mangled field {expected_field:?} not found in struct"
+        );
+        // fieldmap should map the raw attr back to the mangled name.
+        let fieldmap = r.fieldmap.borrow();
+        let fieldmap = fieldmap.as_ref().expect("fieldmap populated");
+        let (mangled, _r_value) = fieldmap.get("count").expect("fieldmap has count");
+        assert_eq!(mangled, &expected_field);
+
+        // lowleveltype is still Ptr(pbc_type) — which now resolves to
+        // Ptr(Struct('pbc', ...)).
+        let LowLevelType::Ptr(ptr) = r.lowleveltype() else {
+            panic!("expected Ptr");
+        };
+        // Through ForwardReference resolution, PtrTarget::ForwardReference
+        // round-trips to the resolved Struct.
+        match &ptr.TO {
+            PtrTarget::ForwardReference(fr) => {
+                assert!(fr.resolved().is_some(), "ForwardReference must be resolved");
+            }
+            other => panic!("expected Ptr(ForwardReference), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_frozen_pbc_repr_convert_desc_populates_struct_fields_from_attrcache() {
+        // rpbc.py:769-790 — convert_desc pulls attrs from
+        // `frozendesc.attrcache` (not read_attribute — we pre-populate
+        // the cache directly) and writes them into the specfunc struct
+        // via `setattr(result, mangled_name, llvalue)`.
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelValue};
+        let (ann, rtyper) = make_rtyper();
+        let desc_a = frozen_entry(&ann.bookkeeper, "frozen_a");
+        let access = prime_attrfamily_with_int_attr(&ann.bookkeeper, &desc_a, "count");
+
+        // Pre-populate the frozendesc's attrcache so convert_desc has
+        // something to copy into the struct.
+        let DescEntry::Frozen(fd_a) = &desc_a else {
+            unreachable!();
+        };
+        fd_a.borrow()
+            .attrcache
+            .borrow_mut()
+            .insert("count".into(), ConstValue::Int(42));
+
+        let r = std::sync::Arc::new(MultipleFrozenPBCRepr::new(&rtyper, Some(access)));
+        let c = r.convert_desc(&desc_a).unwrap();
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr");
+        };
+        let Ok(Some(_ptr_obj::Struct(s))) = &ptr._obj0 else {
+            panic!("expected freshly-malloc'd Struct");
+        };
+        let expected_field = crate::translator::rtyper::rmodel::mangle("pbc", "count");
+        let field = s
+            ._getattr(&expected_field)
+            .expect("field must be populated");
+        assert_eq!(field, &LowLevelValue::Signed(42));
+
+        // Second convert_desc hits the pbc_cache.
+        let c2 = r.convert_desc(&desc_a).unwrap();
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn multiple_frozen_pbc_repr_convert_const_none_returns_null_instance() {
+        // rpbc.py:666-668 — `if pbc is None: return self.null_instance()`.
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        let (ann, rtyper) = make_rtyper();
+        let desc_a = frozen_entry(&ann.bookkeeper, "frozen_a");
+        let access = prime_attrfamily_with_int_attr(&ann.bookkeeper, &desc_a, "count");
+        let r = std::sync::Arc::new(MultipleFrozenPBCRepr::new(&rtyper, Some(access)));
+        let c = r.convert_const(&ConstValue::None).unwrap();
+        let ConstValue::LLPtr(null_ptr) = &c.value else {
+            panic!("expected LLPtr");
+        };
+        assert!(
+            matches!(null_ptr._obj0, Ok(None)),
+            "null_instance must produce Ok(None) _obj0"
+        );
+        // And the concretetype matches the repr's Ptr lowleveltype.
+        assert_eq!(c.concretetype.as_ref(), Some(r.lowleveltype()));
+        // Further sanity: pbc_type must have resolved to a Struct now
+        // that ensure_setup has run.
+        let resolved = r.pbc_type.resolved().expect("pbc_type resolved");
+        assert!(matches!(resolved, LowLevelType::Struct(_)));
+        drop(_ptr_obj::Struct as fn(_) -> _); // keep _ptr_obj used for error paths
+    }
+
+    #[test]
+    fn multiple_frozen_pbc_repr_convert_desc_recursive_cache_placeholder_stabilises() {
+        // upstream rpbc.py:776-778 — `self.pbc_cache[frozendesc] = result`
+        // happens BEFORE the field-populate loop so a recursive
+        // convert_desc on the same frozendesc sees the placeholder
+        // struct pointer instead of looping forever.
+        //
+        // Scenario: two FrozenDescs A, B sharing a FrozenAttrFamily
+        // with a single attr "peer". A.attrcache["peer"] = B_pyobj;
+        // B.attrcache["peer"] = A_pyobj. Pre-wire pbc_reprs so
+        // rtyper.getrepr(SomePBC([A, B])) returns THIS same MFPBC.
+        use crate::annotator::description::FrozenAttrFamily;
+        use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
+        use crate::flowspace::model::{ConstValue, HostObject};
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        use crate::translator::rtyper::rtyper::PbcReprKey;
+
+        let (ann, rtyper) = make_rtyper();
+        let desc_a = frozen_entry(&ann.bookkeeper, "frozen_a");
+        let desc_b = frozen_entry(&ann.bookkeeper, "frozen_b");
+
+        // Unify both under one FrozenAttrFamily and add attr "peer"
+        // typed as SomePBC([A, B]) — so the field's r_value ends up
+        // being the MFPBC that references the same access_set.
+        let (DescEntry::Frozen(fd_a), DescEntry::Frozen(fd_b)) = (&desc_a, &desc_b) else {
+            unreachable!();
+        };
+        let a_id = fd_a.borrow().base.identity;
+        let b_id = fd_b.borrow().base.identity;
+        let family = {
+            let mut uf = ann.bookkeeper.frozenpbc_attr_families.borrow_mut();
+            let _ = uf.find_rep(a_id);
+            let _ = uf.find_rep(b_id);
+            let rep = uf.find_rep(a_id);
+            let (_changed, new_rep) = uf.union(rep, b_id);
+            uf.get(&new_rep).cloned().unwrap()
+        };
+        // Patch the family in place so descs + attrs match.
+        {
+            let mut fam = family.borrow_mut();
+            // After union both identities map to the same FrozenAttrFamily;
+            // ensure both are listed as members.
+            fam.descs.clear();
+            fam.descs.insert(a_id, ());
+            fam.descs.insert(b_id, ());
+            fam.attrs.insert(
+                "peer".to_string(),
+                SomeValue::PBC(SomePBC::new(vec![desc_a.clone(), desc_b.clone()], false)),
+            );
+            // Suppress the single-desc-const-box path so
+            // `getrepr(SomePBC([A,B]))` doesn't auto-collapse.
+            let _ = SomeInteger::default();
+        }
+
+        // Ensure bookkeeper.getdesc(pyobj) resolves to our descs.
+        let a_pyobj = fd_a.borrow().base.pyobj.as_ref().cloned().unwrap();
+        let b_pyobj = fd_b.borrow().base.pyobj.as_ref().cloned().unwrap();
+        ann.bookkeeper
+            .descs
+            .borrow_mut()
+            .insert(a_pyobj.clone(), desc_a.clone());
+        ann.bookkeeper
+            .descs
+            .borrow_mut()
+            .insert(b_pyobj.clone(), desc_b.clone());
+
+        // Pre-populate the FrozenDesc attrcaches so convert_desc's
+        // populate loop finds the cross-reference values without
+        // hitting `read_attribute`.
+        fd_a.borrow()
+            .attrcache
+            .borrow_mut()
+            .insert("peer".to_string(), ConstValue::HostObject(b_pyobj.clone()));
+        fd_b.borrow()
+            .attrcache
+            .borrow_mut()
+            .insert("peer".to_string(), ConstValue::HostObject(a_pyobj.clone()));
+
+        // Build the MFPBC and wire it into rtyper.pbc_reprs so
+        // rtyper.getrepr on SomePBC([A,B]) returns this same instance.
+        let r = std::sync::Arc::new(MultipleFrozenPBCRepr::new(&rtyper, Some(family.clone())));
+        let access_key = Rc::as_ptr(&family) as usize;
+        rtyper.pbc_reprs.borrow_mut().insert(
+            PbcReprKey::Access(access_key),
+            r.clone() as std::sync::Arc<dyn Repr>,
+        );
+
+        // Recursive convert_desc — the placeholder insertion order
+        // must stabilise: convert_desc(A) → fields populate →
+        // convert_const(B_pyobj) → convert_desc(B) → fields populate →
+        // convert_const(A_pyobj) → convert_desc(A) hits the cache
+        // (placeholder struct). No stack overflow; both descs end up
+        // with fully-populated struct pointers pointing at each
+        // other.
+        let c_a = r.convert_desc(&desc_a).expect("convert_desc(A)");
+        let c_b = r.convert_desc(&desc_b).expect("convert_desc(B)");
+
+        // Both cached Constants carry LLPtr values with populated
+        // Struct bodies.
+        for (label, c) in [("A", &c_a), ("B", &c_b)] {
+            let ConstValue::LLPtr(ptr) = &c.value else {
+                panic!("{label}: expected LLPtr");
+            };
+            let Ok(Some(_ptr_obj::Struct(s))) = &ptr._obj0 else {
+                panic!("{label}: expected Ok(Some(Struct))");
+            };
+            let mangled = crate::translator::rtyper::rmodel::mangle("pbc", "peer");
+            let field = s._getattr(&mangled).expect("peer field present");
+            // Each peer field points at the *other* desc's Ptr — the
+            // exact value differs but both must be non-null Ptrs.
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelValue;
+            let LowLevelValue::Ptr(peer) = field else {
+                panic!("{label}: peer field is not Ptr");
+            };
+            assert!(peer.nonzero(), "{label}: peer pointer must be non-null");
+        }
+
+        // Second convert_desc on A must return the SAME cached Constant
+        // (pbc_cache reuse).
+        let c_a2 = r.convert_desc(&desc_a).unwrap();
+        assert_eq!(c_a, c_a2);
+
+        // upstream rpbc.py:776-778 invariant: every cross-reference to A
+        // — including the placeholder snapshot captured in B's "peer"
+        // field by the recursive convert_desc(A) — must compare equal
+        // to the post-`_become` cache entry. Without redirect-following
+        // in `_hashable_identity`, the placeholder's raw `_identity`
+        // would differ from the final pointer's `_identity` and
+        // `ConstValue::LLPtr` Hash/Eq would break the invariant.
+        let ConstValue::LLPtr(ptr_b) = &c_b.value else {
+            panic!("c_b expected LLPtr");
+        };
+        let Ok(Some(_ptr_obj::Struct(s_b))) = &ptr_b._obj0 else {
+            panic!("c_b struct missing");
+        };
+        let mangled = crate::translator::rtyper::rmodel::mangle("pbc", "peer");
+        let peer_field = s_b
+            ._getattr(&mangled)
+            .expect("peer field present on B's struct");
+        let crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Ptr(peer_a_in_b) =
+            peer_field
+        else {
+            panic!("peer field must be Ptr");
+        };
+        let ConstValue::LLPtr(ptr_a_cached) = &c_a.value else {
+            panic!("c_a expected LLPtr");
+        };
+        // The hashable identities must coincide: the recursive snapshot
+        // of A captured inside B was a placeholder, and the cache holds
+        // the post-_become final pointer. Both must hash/eq identically.
+        assert_eq!(
+            peer_a_in_b._hashable_identity(),
+            ptr_a_cached._hashable_identity(),
+            "placeholder snapshot vs. post-_become final pointer must \
+             share hashable identity (rpbc.py:776-778 redirect)"
+        );
+    }
+
+    #[test]
+    fn multiple_frozen_pbc_repr_convert_desc_rejects_non_access_set_member() {
+        // rpbc.py:770-772 — `if access_set is not None and frozendesc
+        // not in access_set.descs: raise TyperError`.
+        let (ann, rtyper) = make_rtyper();
+        let desc_a = frozen_entry(&ann.bookkeeper, "frozen_a");
+        let desc_b = frozen_entry(&ann.bookkeeper, "frozen_b");
+        let access = prime_attrfamily_with_int_attr(&ann.bookkeeper, &desc_a, "count");
+        let r = std::sync::Arc::new(MultipleFrozenPBCRepr::new(&rtyper, Some(access)));
+        let err = r.convert_desc(&desc_b).unwrap_err();
+        assert!(
+            err.to_string().contains("not found in PBC access set"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -2790,17 +5408,18 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn somepbc_rtyper_makerepr_single_frozen_desc_with_can_be_none_surfaces_pending() {
+    fn somepbc_rtyper_makerepr_single_frozen_desc_with_can_be_none_returns_multiple_frozen_pbc_repr()
+     {
         // Single FrozenDesc with `can_be_None=true` falls out of the
         // SingleFrozenPBCRepr fast-path, hits getFrozenPBCRepr's
-        // multi-desc branch, and — with only one access-set (None) —
-        // routes to the still-pending MultipleFrozenPBCRepr arm.
+        // multi-desc branch, and routes to MultipleFrozenPBCRepr
+        // (with access_set = None because the single desc has no
+        // attribute family touches).
         let (ann, rtyper) = make_rtyper();
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
         let s_pbc = SomePBC::new(vec![f], true);
-        let err = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("MultipleFrozenPBCRepr"));
+        let r = somepbc_rtyper_makerepr(&s_pbc, &rtyper).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
     }
 
     #[test]
@@ -2991,6 +5610,130 @@ mod pbc_repr_tests {
             err.to_string()
                 .contains("cannot pass a function with various call shapes"),
             "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn function_repr_rtype_simple_call_emits_direct_call_to_annotated_callable_graph() {
+        // End-to-end smoke of FunctionReprBase.call (rpbc.py:199-221):
+        // FunctionRepr (Void-typed) + single uniquerow → convert_to_concrete_llfn
+        // yields a Constant LLPtr, call_emit emits `direct_call`. The graph's
+        // returnvar carries an Integer annotation so `getrresult` resolves to
+        // an IntegerRepr (Signed), matching the `r_result` wired on the hop.
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            Block as FlowBlock, BlockRefExt, FunctionGraph as FlowFunctionGraph,
+            GraphFunc as FlowGraphFunc, Hlvalue as FlowHlvalue, Link as FlowLink, SpaceOperation,
+            Variable as FlowVariable,
+        };
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+        use std::sync::Arc;
+
+        let (ann, rtyper) = make_rtyper();
+        // Build a FunctionDesc + PyGraph whose startblock arg and return
+        // var are annotated as SomeInteger — this is what makes
+        // `callparse::getrinputs` / `getrresult` route to IntegerRepr.
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let fd = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "annotated_f",
+            sig.clone(),
+            None,
+            None,
+        )));
+        let mut arg_var = FlowVariable::named("x");
+        arg_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                false, false,
+            )))));
+        let arg = FlowHlvalue::Variable(arg_var);
+        let startblock = FlowBlock::shared(vec![arg.clone()]);
+        let mut ret_var = FlowVariable::new();
+        ret_var
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                false, false,
+            )))));
+        let graph = FlowFunctionGraph::with_return_var(
+            "annotated_f",
+            startblock.clone(),
+            FlowHlvalue::Variable(ret_var),
+        );
+        let link = Rc::new(StdRef::new(FlowLink::new(
+            vec![arg],
+            Some(graph.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let pygraph = Rc::new(PyGraph {
+            graph: Rc::new(StdRef::new(graph)),
+            func: FlowGraphFunc::new(
+                "annotated_f",
+                crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+            ),
+            signature: StdRef::new(sig),
+            defaults: StdRef::new(None),
+            access_directly: std::cell::Cell::new(false),
+        });
+        fd.borrow()
+            .cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, pygraph.clone());
+        // Populate the callfamily simple-call shape via consider_call_site.
+        let args = ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::default())],
+            None,
+            None,
+        );
+        FunctionDesc::consider_call_site(&[fd.clone()], &args, &SomeValue::Impossible, None)
+            .unwrap();
+
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let r_func = Arc::new(FunctionRepr::new(&rtyper, s_pbc.clone()).unwrap());
+        let r_int: Arc<dyn Repr> = rtyper
+            .getrepr(&SomeValue::Integer(SomeInteger::new(false, false)))
+            .unwrap();
+
+        // Construct the hop for `simple_call(f, 5)`.
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            Vec::new(),
+            FlowHlvalue::Variable(FlowVariable::new()),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops.clone());
+        let mut v_func = FlowVariable::new();
+        v_func.set_concretetype(Some(LowLevelType::Void));
+        hop.args_v.borrow_mut().extend([
+            FlowHlvalue::Variable(v_func),
+            FlowHlvalue::Constant(crate::flowspace::model::Constant::with_concretetype(
+                ConstValue::Int(5),
+                LowLevelType::Signed,
+            )),
+        ]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::PBC(s_pbc),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        let r_func_dyn: Arc<dyn Repr> = r_func.clone();
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_func_dyn), Some(r_int.clone())]);
+        *hop.r_result.borrow_mut() = Some(r_int);
+
+        let result = r_func.rtype_simple_call(&hop).unwrap().unwrap();
+        assert!(matches!(result, FlowHlvalue::Variable(_)));
+        let ops = llops.borrow();
+        let emitted_opnames: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert!(
+            emitted_opnames.contains(&"direct_call"),
+            "expected direct_call op, got {:?}",
+            emitted_opnames
         );
     }
 
@@ -3191,9 +5934,147 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn functions_pbc_repr_convert_const_non_none_defers_pending_getdesc() {
-        // Non-None convert_const requires bookkeeper.getdesc dispatch;
-        // until that lands, the call surfaces MissingRTypeOperation.
+    fn functions_pbc_repr_convert_const_host_function_routes_through_getdesc_to_convert_desc() {
+        // rpbc.py:297-298 — non-None value becomes
+        // `funcdesc = bookkeeper.getdesc(value) ; self.convert_desc(funcdesc)`.
+        // Prime `bookkeeper.descs` so `getdesc` returns fd_f without
+        // running the newfuncdesc path, and verify convert_const emits
+        // the same LLPtr Constant that convert_desc(fd_f) would.
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue, GraphFunc, HostObject};
+
+        let (ann, rtyper) = make_rtyper();
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let fd_f = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "f",
+            sig.clone(),
+            None,
+            None,
+        )));
+        let fd_g = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "g",
+            sig,
+            None,
+            None,
+        )));
+        for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
+            desc.borrow()
+                .cache
+                .borrow_mut()
+                .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
+        }
+        FunctionDesc::consider_call_site(
+            &[fd_f.clone(), fd_g.clone()],
+            &ArgumentsForTranslation::new(
+                vec![SomeValue::Integer(SomeInteger::default())],
+                None,
+                None,
+            ),
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+
+        let host_f = HostObject::new_user_function(GraphFunc::new(
+            "f",
+            crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        ann.bookkeeper
+            .descs
+            .borrow_mut()
+            .insert(host_f.clone(), DescEntry::Function(fd_f.clone()));
+
+        let s_pbc = SomePBC::new(
+            vec![DescEntry::Function(fd_f.clone()), DescEntry::Function(fd_g)],
+            false,
+        );
+        let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
+
+        let expected = r.convert_desc(&DescEntry::Function(fd_f)).unwrap();
+        let got = r.convert_const(&ConstValue::HostObject(host_f)).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn functions_pbc_repr_convert_const_staticmethod_unwraps_then_routes_to_getdesc() {
+        // rpbc.py:292-293 — `staticmethod.__get__(42)` unwraps the
+        // wrapped callable. Rust port uses
+        // `HostObject::staticmethod_func()`. After unwrap, the same
+        // getdesc → convert_desc chain fires.
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{ConstValue, GraphFunc, HostObject};
+
+        let (ann, rtyper) = make_rtyper();
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let fd_f = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "f",
+            sig.clone(),
+            None,
+            None,
+        )));
+        let fd_g = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "g",
+            sig,
+            None,
+            None,
+        )));
+        for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
+            desc.borrow()
+                .cache
+                .borrow_mut()
+                .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
+        }
+        FunctionDesc::consider_call_site(
+            &[fd_f.clone(), fd_g.clone()],
+            &ArgumentsForTranslation::new(
+                vec![SomeValue::Integer(SomeInteger::default())],
+                None,
+                None,
+            ),
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+
+        let host_f = HostObject::new_user_function(GraphFunc::new(
+            "f",
+            crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+        ));
+        ann.bookkeeper
+            .descs
+            .borrow_mut()
+            .insert(host_f.clone(), DescEntry::Function(fd_f.clone()));
+        let sm = HostObject::new_staticmethod("Cls.f", host_f);
+
+        let s_pbc = SomePBC::new(
+            vec![DescEntry::Function(fd_f.clone()), DescEntry::Function(fd_g)],
+            false,
+        );
+        let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
+
+        let expected = r.convert_desc(&DescEntry::Function(fd_f)).unwrap();
+        let got = r.convert_const(&ConstValue::HostObject(sm)).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn functions_pbc_repr_convert_const_non_callable_const_surfaces_message() {
+        // Non-None, non-HostObject constants cannot route through
+        // bookkeeper.getdesc. Port returns a structured error rather
+        // than panicking. Upstream's `getdesc(int_value)` would raise
+        // inside the Bookkeeper; pyre surfaces it at the repr.
         use crate::annotator::argument::ArgumentsForTranslation;
         use crate::annotator::description::GraphCacheKey;
         use crate::annotator::model::{SomeInteger, SomeValue};
@@ -3240,8 +6121,7 @@ mod pbc_repr_tests {
         );
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
         let err = r.convert_const(&ConstValue::Int(7)).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("bookkeeper.getdesc"));
+        assert!(err.to_string().contains("expected callable HostObject"));
     }
 
     #[test]

@@ -30,7 +30,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::bytecode::HostCode;
 use crate::annotator::model::SomeValue;
-use crate::translator::rtyper::lltypesystem::lltype::_ptr;
+use crate::translator::rtyper::lltypesystem::lltype::{_address, _ptr};
 
 // RPython `Variable.annotation` holds a `SomeObject` subclass instance
 // (annotator/model.py:SomeObject). Rust stores `Option<Rc<SomeValue>>`
@@ -1733,12 +1733,25 @@ pub enum ConstValue {
     /// port stores graph identities as `usize` values
     /// (`GraphKey::as_usize()`).
     Graphs(Vec<usize>),
+    /// RPython `inputconst(Void, frozendesc)` — a Void-typed constant
+    /// whose value is a FrozenDesc identity (used by the
+    /// `pair(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)` converter
+    /// at rpbc.py:823-826). Stored as a bare `usize` carrying the
+    /// counter value from `annotator::description::DescKey`;
+    /// consumers interpret it as a frozendesc pointer without pulling
+    /// annotator types into `flowspace::model`.
+    FrozenDesc(usize),
     /// RPython flowmodel `Constant(TYPE, lltype.Void)` where `TYPE` is
     /// itself an lltype object, e.g. `rptr.py`'s `INTERIOR_PTR_TYPE`
     /// argument to `malloc`.
     LowLevelType(Box<ConcretetypePlaceholder>),
     /// RPython `lltype._ptr` function pointer constant.
     LLPtr(Box<_ptr>),
+    /// RPython `llmemory.fakeaddress(ptr)` / `NULL` Address-typed
+    /// constant. Used by `MultipleUnrelatedFrozenPBCRepr.convert_pbc`
+    /// (rpbc.py:699-700) to wrap a frozen PBC pointer into an Address
+    /// so the unrelated-frozen reprs can compare via `adr_eq`.
+    LLAddress(_address),
     /// Arbitrary host-level Python object (class, module, builtin
     /// callable, instance). upstream `Constant.value` 에 담기는 임의
     /// object 를 흉내내는 일반 carrier — `HostObject` 참조.
@@ -1776,10 +1789,18 @@ impl PartialEq for ConstValue {
                 a._hashable_identity() == b._hashable_identity()
             }
             (ConstValue::Graphs(a), ConstValue::Graphs(b)) => a == b,
+            (ConstValue::FrozenDesc(a), ConstValue::FrozenDesc(b)) => a == b,
             (ConstValue::LowLevelType(a), ConstValue::LowLevelType(b)) => a == b,
             (ConstValue::LLPtr(a), ConstValue::LLPtr(b)) => {
                 a._hashable_identity() == b._hashable_identity()
             }
+            (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => match (a, b) {
+                (_address::Null, _address::Null) => true,
+                (_address::Fake(pa), _address::Fake(pb)) => {
+                    pa._hashable_identity() == pb._hashable_identity()
+                }
+                _ => false,
+            },
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             _ => false,
@@ -1809,8 +1830,10 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::List(_)
             | ConstValue::Code(_)
             | ConstValue::Graphs(_)
+            | ConstValue::FrozenDesc(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
+            | ConstValue::LLAddress(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
         }
     }
@@ -1850,8 +1873,16 @@ impl Hash for ConstValue {
             ConstValue::Code(code) => code._hashable_identity().hash(state),
             ConstValue::Function(func) => func._hashable_identity().hash(state),
             ConstValue::Graphs(graphs) => graphs.hash(state),
+            ConstValue::FrozenDesc(id) => id.hash(state),
             ConstValue::LowLevelType(lltype) => lltype.hash(state),
             ConstValue::LLPtr(ptr) => ptr._hashable_identity().hash(state),
+            ConstValue::LLAddress(addr) => match addr {
+                _address::Null => 0_u8.hash(state),
+                _address::Fake(ptr) => {
+                    1_u8.hash(state);
+                    ptr._hashable_identity().hash(state);
+                }
+            },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
         }
@@ -2274,6 +2305,7 @@ impl Constant {
     fn uses_hashable_identity_fallback(value: &ConstValue) -> bool {
         match value {
             ConstValue::List(_) | ConstValue::Dict(_) | ConstValue::Graphs(_) => true,
+            ConstValue::FrozenDesc(_) => false,
             ConstValue::Tuple(items) => items.iter().any(Self::uses_hashable_identity_fallback),
             _ => false,
         }
@@ -2358,8 +2390,10 @@ impl ConstValue {
             ConstValue::None => Some(false),
             ConstValue::Code(_) => Some(true),
             ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
+            ConstValue::FrozenDesc(id) => Some(*id != 0),
             ConstValue::LowLevelType(_) => Some(true),
             ConstValue::LLPtr(ptr) => Some(ptr.nonzero()),
+            ConstValue::LLAddress(addr) => Some(!matches!(addr, _address::Null)),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
@@ -2438,8 +2472,10 @@ impl ConstValue {
             ConstValue::Atom(_)
             | ConstValue::Placeholder
             | ConstValue::Graphs(_)
+            | ConstValue::FrozenDesc(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
+            | ConstValue::LLAddress(_)
             | ConstValue::SpecTag(_) => None,
         }
     }

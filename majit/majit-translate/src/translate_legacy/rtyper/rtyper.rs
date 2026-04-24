@@ -252,10 +252,12 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
         | ConstValue::Graphs(_)
+        | ConstValue::FrozenDesc(_)
         | ConstValue::LowLevelType(_)
         | ConstValue::None
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)
+        | ConstValue::LLAddress(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_) => ConcreteType::GcRef,
     }

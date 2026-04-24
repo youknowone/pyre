@@ -53,9 +53,13 @@ type GraphBuilder<'a> = Box<
 
 /// Opaque identity handle for a `Desc` instance.
 ///
-/// Upstream uses Python object identity; the Rust port stores a
-/// `usize` derived from `Rc::as_ptr(&desc)`. Commits 2-3 add a
-/// helper constructor once the `Desc` struct lands.
+/// Upstream uses Python object identity. The Rust port stores a
+/// counter-allocated `usize` assigned by [`alloc_desc_key`] at
+/// `Desc::new` / `ClassDesc::new_shell` / `ClassDesc::new` time; every
+/// family storage slot (`CallFamily.descs`, `FrozenAttrFamily.descs`,
+/// `ClassAttrFamily.descs`, `UnionFind` reps) keys on the same
+/// counter identity so `DescEntry::desc_key()` stays observationally
+/// identical to the family-side key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DescKey(pub usize);
 
@@ -73,7 +77,7 @@ impl DescKey {
     }
 }
 
-fn alloc_desc_key() -> DescKey {
+pub(crate) fn alloc_desc_key() -> DescKey {
     static NEXT_DESC_KEY: AtomicUsize = AtomicUsize::new(1);
     DescKey(NEXT_DESC_KEY.fetch_add(1, Ordering::Relaxed))
 }
@@ -482,11 +486,13 @@ impl Desc {
         None
     }
 
-    /// Pointer-identity key for [`CallFamily`] / `FrozenAttrFamily` /
+    /// Identity key for [`CallFamily`] / `FrozenAttrFamily` /
     /// `ClassAttrFamily` storage. Upstream uses `desc` itself as the
-    /// key (dict-by-identity).
+    /// dict-by-identity key; Rust routes through the counter-allocated
+    /// `identity` field so every family lookup and every `DescEntry::
+    /// desc_key()` consumer agrees.
     pub fn desc_key(self_rc: &Rc<RefCell<Desc>>) -> DescKey {
-        DescKey::from_rc(self_rc)
+        self_rc.borrow().identity
     }
 }
 
@@ -536,16 +542,24 @@ pub enum DescEntry {
 }
 
 impl DescEntry {
-    /// RPython `id(desc)` — pointer-identity handle. Used as the dict
-    /// key by `CallFamily.descs`, `FrozenAttrFamily.descs`, and
-    /// `ClassAttrFamily.descs`.
+    /// RPython `id(desc)` handle. Used as the dict key by
+    /// `CallFamily.descs`, `FrozenAttrFamily.descs`,
+    /// `ClassAttrFamily.descs`, and by the `SomePBC.descriptions`
+    /// dedup map.
+    ///
+    /// The key is the desc's structural identity, NOT its Rc pointer
+    /// address. Upstream Python uses `id(desc)` directly; the Rust
+    /// port threads a counter-allocated `DescKey` through
+    /// [`Desc::new`] / [`super::classdesc::ClassDesc::new_shell`] so
+    /// every family storage slot (counter-based) and every repr-side
+    /// `desc.desc_key()` lookup agree on the same value.
     pub fn desc_key(&self) -> DescKey {
         match self {
-            DescEntry::Function(rc) => DescKey::from_rc(rc),
-            DescEntry::Method(rc) => DescKey::from_rc(rc),
-            DescEntry::Frozen(rc) => DescKey::from_rc(rc),
-            DescEntry::MethodOfFrozen(rc) => DescKey::from_rc(rc),
-            DescEntry::Class(rc) => DescKey::from_rc(rc),
+            DescEntry::Function(rc) => rc.borrow().base.identity,
+            DescEntry::Method(rc) => rc.borrow().base.identity,
+            DescEntry::Frozen(rc) => rc.borrow().base.identity,
+            DescEntry::MethodOfFrozen(rc) => rc.borrow().base.identity,
+            DescEntry::Class(rc) => rc.borrow().identity,
         }
     }
 
@@ -2278,7 +2292,7 @@ impl MethodDesc {
                     &borrowed.name,
                     commonflags.clone(),
                 );
-                replacements.push((DescKey::from_rc(desc), DescEntry::Method(newdesc)));
+                replacements.push((desc.borrow().base.identity, DescEntry::Method(newdesc)));
             }
         }
         for (old_key, new_entry) in replacements {
@@ -2301,7 +2315,7 @@ impl MethodDesc {
             }
             groups
                 .entry((
-                    DescKey::from_rc(&borrowed.funcdesc),
+                    borrowed.funcdesc.borrow().base.identity,
                     borrowed.originclassdef,
                     borrowed.name.clone(),
                 ))
@@ -2333,7 +2347,7 @@ impl MethodDesc {
                         continue;
                     };
                     if classdef1.borrow().issubclass(&classdef2) {
-                        remove.push(DescKey::from_rc(desc1));
+                        remove.push(desc1.borrow().base.identity);
                         break;
                     }
                 }
@@ -3525,8 +3539,10 @@ mod tests {
         );
 
         let mut descs = std::collections::BTreeMap::new();
-        descs.insert(DescKey::from_rc(&base_md), DescEntry::Method(base_md));
-        descs.insert(DescKey::from_rc(&child_md), DescEntry::Method(child_md));
+        let base_key = base_md.borrow().base.identity;
+        let child_key = child_md.borrow().base.identity;
+        descs.insert(base_key, DescEntry::Method(base_md));
+        descs.insert(child_key, DescEntry::Method(child_md));
 
         MethodDesc::simplify_desc_set(&mut descs);
 
