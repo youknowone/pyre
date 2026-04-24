@@ -1,16 +1,16 @@
 //! Call-family signature / annotation normalization.
 //!
 //! RPython upstream: `rpython/rtyper/normalizecalls.py` (414 LOC, of
-//! which lines 14-204 cover the normalize_* half that this module ports).
-//! The later class/PBC halves (`merge_classpbc_getattr_into_classdef`,
-//! `create_class_constructors`, `create_instantiate_functions`,
-//! `assign_inheritance_ids`) land with the rtyper specialization epic;
-//! they depend on `rpython/rtyper/rclass.py` infrastructure that pyre
-//! still has as scaffolding only. [`perform_normalizations`] is present
-//! as the driver entry point and runs the call-family half that is
+//! which lines 14-204 + 373-389 cover the pieces this module ports).
+//! The remaining class/PBC halves (`merge_classpbc_getattr_into_classdef`,
+//! `create_class_constructors`, `create_instantiate_functions`) land
+//! with the rtyper specialization epic; they depend on
+//! `rpython/rtyper/rclass.py` infrastructure that pyre still has as
+//! scaffolding only. [`perform_normalizations`] is the driver entry
+//! point and runs the call-family + inheritance-id halves that are
 //! ported in this module.
 //!
-//! ## What is ported here (upstream lines 14-204)
+//! ## What is ported here (upstream lines 14-204 + 373-389)
 //!
 //! - [`normalize_call_familes`] — outer loop over
 //!   `bookkeeper.pbc_maximal_call_families.infos()` (upstream line 14-21).
@@ -22,6 +22,9 @@
 //!   normalization across a row (upstream line 78-154).
 //! - [`normalize_calltable_row_annotation`] — annotation-union
 //!   generalization across a row (upstream line 156-204).
+//! - [`assign_inheritance_ids`] — reversed-MRO witness ordering for the
+//!   `classdef.minid` / `classdef.maxid` subclass-range brackets
+//!   consumed by `rclass.py:ll_issubclass_const` (upstream line 373-389).
 //!
 //! ## Upstream call-family clarification
 //!
@@ -41,6 +44,7 @@
 //! Commit 4 target.
 
 use crate::annotator::annrpython::RPythonAnnotator;
+use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{CallFamily, CallTableRow};
 use crate::annotator::model::AnnotatorError;
 use crate::flowspace::argument::{CallShape, Signature};
@@ -50,7 +54,9 @@ use crate::flowspace::model::{
 };
 use crate::flowspace::pygraph::PyGraph;
 
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// RPython `normalize_call_familes(annotator)` (normalizecalls.py:14-21).
 ///
@@ -101,9 +107,9 @@ pub fn normalize_call_familes(annotator: &RPythonAnnotator) -> Result<(), Annota
 /// RPython `perform_normalizations(annotator)` (normalizecalls.py:404-413).
 ///
 /// The current Rust port wires the driver entry point to the ported
-/// call-family normalization pass. The class-constructor, class-PBC,
-/// inheritance-id, and instantiate-function phases still depend on
-/// rclass infrastructure that is not in this tree yet.
+/// call-family normalization pass + [`assign_inheritance_ids`]. The
+/// class-constructor, class-PBC, and instantiate-function phases still
+/// depend on rclass infrastructure that is not in this tree yet.
 pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), AnnotatorError> {
     struct FrozenGuard<'a> {
         annotator: &'a RPythonAnnotator,
@@ -124,7 +130,111 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
         annotator,
         saved: old_frozen,
     };
-    normalize_call_familes(annotator)
+    normalize_call_familes(annotator)?;
+    assign_inheritance_ids(annotator);
+    Ok(())
+}
+
+/// RPython `assign_inheritance_ids(annotator)` (normalizecalls.py:373-389).
+///
+/// ```python
+/// def assign_inheritance_ids(annotator):
+///     bk = annotator.bookkeeper
+///     try:
+///         lst = bk._inheritance_id_symbolics
+///     except AttributeError:
+///         lst = bk._inheritance_id_symbolics = []
+///     for classdef in annotator.bookkeeper.classdefs:
+///         if not hasattr(classdef, 'minid'):
+///             witness = [get_unique_cdef_id(cdef) for cdef in classdef.getmro()]
+///             witness.reverse()
+///             classdef.minid = TotalOrderSymbolic(witness, lst)
+///             classdef.maxid = TotalOrderSymbolic(witness + [MAX], lst)
+/// ```
+///
+/// Upstream stores `TotalOrderSymbolic` objects, not eager integers. A
+/// later numeric comparison sorts all start/end markers by the reversed
+/// MRO witness `([root_id, ..., self_id], [root_id, ..., self_id, MAX])`.
+///
+/// The Rust port still stores plain `i64`s on `ClassDef`, but it keeps
+/// the upstream ordering rule: assign a stable per-classdef unique id,
+/// build the reversed-MRO witness for every classdef in the current
+/// snapshot, sort all start/end markers lexicographically, then write
+/// the resulting integer positions back to `minid` / `maxid`. This
+/// preserves the bracket invariant `c.minid <= d.minid <= d.maxid <=
+/// c.maxid` for every descendant `d` of `c`, including when a later run
+/// adds a new subclass under an already-seen parent.
+pub fn assign_inheritance_ids(annotator: &RPythonAnnotator) {
+    let snapshot: Vec<Rc<RefCell<ClassDef>>> = annotator
+        .bookkeeper
+        .classdefs
+        .borrow()
+        .iter()
+        .cloned()
+        .collect();
+
+    if snapshot.is_empty() {
+        return;
+    }
+
+    let mut markers: Vec<InheritanceMarker> = Vec::with_capacity(snapshot.len() * 2);
+    for classdef in &snapshot {
+        let mut witness = classdef_order_witness(classdef);
+        markers.push(InheritanceMarker {
+            orderwitness: witness.clone(),
+            classdef: classdef.clone(),
+            is_max: false,
+        });
+        witness.push(OrderWitnessAtom::Max);
+        markers.push(InheritanceMarker {
+            orderwitness: witness,
+            classdef: classdef.clone(),
+            is_max: true,
+        });
+    }
+    markers.sort_by(|left, right| left.orderwitness.cmp(&right.orderwitness));
+
+    for (index, marker) in markers.into_iter().enumerate() {
+        let mut classdef = marker.classdef.borrow_mut();
+        if marker.is_max {
+            classdef.maxid = Some(index as i64);
+        } else {
+            classdef.minid = Some(index as i64);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum OrderWitnessAtom {
+    Id(usize),
+    Max,
+}
+
+#[derive(Clone)]
+struct InheritanceMarker {
+    orderwitness: Vec<OrderWitnessAtom>,
+    classdef: Rc<RefCell<ClassDef>>,
+    is_max: bool,
+}
+
+fn classdef_order_witness(classdef: &Rc<RefCell<ClassDef>>) -> Vec<OrderWitnessAtom> {
+    let mut witness: Vec<OrderWitnessAtom> = ClassDef::getmro(classdef)
+        .into_iter()
+        .map(|cdef| OrderWitnessAtom::Id(get_unique_cdef_id(&cdef)))
+        .collect();
+    witness.reverse();
+    witness
+}
+
+fn get_unique_cdef_id(classdef: &Rc<RefCell<ClassDef>>) -> usize {
+    static NEXT_CLASSDEF_ID: AtomicUsize = AtomicUsize::new(0);
+
+    if let Some(existing) = classdef.borrow().unique_cdef_id {
+        return existing;
+    }
+    let fresh = NEXT_CLASSDEF_ID.fetch_add(1, Ordering::Relaxed);
+    classdef.borrow_mut().unique_cdef_id = Some(fresh);
+    fresh
 }
 
 /// RPython `normalize_calltable(annotator, callfamily)`
@@ -591,9 +701,10 @@ pub(crate) fn normalize_calltable_row_annotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::classdesc::ClassDesc;
     use crate::annotator::description::DescKey;
     use crate::annotator::model::{SomeInteger, SomeValue};
-    use crate::flowspace::model::{FunctionGraph, GraphFunc};
+    use crate::flowspace::model::{FunctionGraph, GraphFunc, HostObject};
 
     fn empty_shape() -> CallShape {
         CallShape {
@@ -836,5 +947,137 @@ mod tests {
         assert!(matches!(ann.binding(&arg), SomeValue::Integer(_)));
         let ret = graph_int.graph.borrow().getreturnvar();
         assert!(matches!(ann.binding(&ret), SomeValue::Integer(_)));
+    }
+
+    fn register_classdef(
+        ann: &RPythonAnnotator,
+        name: &str,
+        base: Option<&Rc<RefCell<ClassDef>>>,
+    ) -> Rc<RefCell<ClassDef>> {
+        let base_desc = base.map(|b| b.borrow().classdesc.clone());
+        let base_host_list = base_desc
+            .as_ref()
+            .map(|cd| vec![cd.borrow().pyobj.clone()])
+            .unwrap_or_default();
+        let pyobj = HostObject::new_class(name, base_host_list);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &ann.bookkeeper,
+            pyobj,
+            name.to_string(),
+        )));
+        desc.borrow_mut().basedesc = base_desc;
+        let cd = ClassDef::new(&ann.bookkeeper, &desc);
+        ann.bookkeeper.classdefs.borrow_mut().push(cd.clone());
+        cd
+    }
+
+    #[test]
+    fn assign_inheritance_ids_single_root_brackets_children_in_witness_order() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let root = register_classdef(&ann, "pkg.Root", None);
+        let left = register_classdef(&ann, "pkg.Left", Some(&root));
+        let right = register_classdef(&ann, "pkg.Right", Some(&root));
+
+        assign_inheritance_ids(&ann);
+
+        let root_min = root.borrow().minid.unwrap();
+        let root_max = root.borrow().maxid.unwrap();
+        let left_min = left.borrow().minid.unwrap();
+        let left_max = left.borrow().maxid.unwrap();
+        let right_min = right.borrow().minid.unwrap();
+        let right_max = right.borrow().maxid.unwrap();
+
+        // subclass-range invariant: parent brackets every descendant.
+        assert!(root_min <= left_min && left_max <= root_max);
+        assert!(root_min <= right_min && right_max <= root_max);
+        // children do not overlap.
+        assert!(left_max < right_min || right_max < left_min);
+        // Reversed-MRO witness order follows stable unique classdef ids;
+        // `register_classdef()` created Left before Right.
+        assert!(left_min < right_min);
+    }
+
+    #[test]
+    fn assign_inheritance_ids_repeat_run_is_idempotent_without_new_classes() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let root = register_classdef(&ann, "pkg.Root", None);
+
+        assign_inheritance_ids(&ann);
+        let first_min = root.borrow().minid;
+        let first_max = root.borrow().maxid;
+
+        assign_inheritance_ids(&ann);
+
+        assert_eq!(root.borrow().minid, first_min);
+        assert_eq!(root.borrow().maxid, first_max);
+    }
+
+    #[test]
+    fn assign_inheritance_ids_deep_chain_produces_nested_range_encoding() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let a = register_classdef(&ann, "pkg.A", None);
+        let b = register_classdef(&ann, "pkg.B", Some(&a));
+        let c = register_classdef(&ann, "pkg.C", Some(&b));
+
+        assign_inheritance_ids(&ann);
+
+        let a_min = a.borrow().minid.unwrap();
+        let a_max = a.borrow().maxid.unwrap();
+        let b_min = b.borrow().minid.unwrap();
+        let b_max = b.borrow().maxid.unwrap();
+        let c_min = c.borrow().minid.unwrap();
+        let c_max = c.borrow().maxid.unwrap();
+
+        assert!(a_min < b_min && b_max < a_max);
+        assert!(b_min < c_min && c_max < b_max);
+        // minid of C is inside B's range (ll_issubclass_const invariant).
+        assert!(b_min <= c_min && c_min <= b_max);
+        assert!(a_min <= c_min && c_min <= a_max);
+    }
+
+    #[test]
+    fn assign_inheritance_ids_no_op_when_bookkeeper_has_no_classdefs() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        assign_inheritance_ids(&ann);
+        // no-op; assert we didn't panic and classdefs stays empty.
+        assert!(ann.bookkeeper.classdefs.borrow().is_empty());
+    }
+
+    #[test]
+    fn assign_inheritance_ids_later_root_sorts_after_existing_root_range() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let existing = register_classdef(&ann, "pkg.Existing", None);
+        assign_inheritance_ids(&ann);
+        let existing_max = existing.borrow().maxid.unwrap();
+
+        let fresh = register_classdef(&ann, "pkg.Fresh", None);
+
+        assign_inheritance_ids(&ann);
+
+        let fresh_min = fresh.borrow().minid.unwrap();
+        let fresh_max = fresh.borrow().maxid.unwrap();
+        assert!(
+            fresh_min > existing_max,
+            "fresh minid {fresh_min} must sort after existing maxid {existing_max}"
+        );
+        assert!(fresh_min < fresh_max);
+    }
+
+    #[test]
+    fn assign_inheritance_ids_later_subclass_stays_inside_existing_parent_range() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let root = register_classdef(&ann, "pkg.Root", None);
+
+        assign_inheritance_ids(&ann);
+
+        let child = register_classdef(&ann, "pkg.Child", Some(&root));
+        assign_inheritance_ids(&ann);
+
+        let root_min = root.borrow().minid.unwrap();
+        let root_max = root.borrow().maxid.unwrap();
+        let child_min = child.borrow().minid.unwrap();
+        let child_max = child.borrow().maxid.unwrap();
+
+        assert!(root_min <= child_min && child_max <= root_max);
     }
 }

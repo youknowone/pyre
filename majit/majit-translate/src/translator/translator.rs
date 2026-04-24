@@ -41,6 +41,11 @@ pub struct TranslationOptions {
     /// default `False`). Copied into `TLS.check_str_without_nul` by
     /// `RPythonAnnotator.build_types` (annrpython.py:84-85).
     pub check_str_without_nul: bool,
+    /// RPython `config.translation.taggedpointers` (upstream default
+    /// `False`). Consumed by `rclass.buildinstancerepr`
+    /// (`rpython/rtyper/rclass.py:103`) to gate the
+    /// `TaggedInstanceRepr` path for `UnboxedValue` subclasses.
+    pub taggedpointers: bool,
 }
 
 impl Default for TranslationOptions {
@@ -51,6 +56,7 @@ impl Default for TranslationOptions {
             keepgoing: false,
             sandbox: false,
             check_str_without_nul: false,
+            taggedpointers: false,
         }
     }
 }

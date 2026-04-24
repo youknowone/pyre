@@ -1723,6 +1723,18 @@ pub enum ReprKey {
     /// RPython `SomeLongFloat.rtyper_makekey = (self.__class__,)`
     /// (`rfloat.py:163-164`).
     LongFloat,
+    /// RPython `SomeInstance.rtyper_makekey = (self.__class__,
+    /// self.classdef)` (rclass.py:449-450). `None` mirrors the
+    /// `SomeInstance(classdef=None)` sentinel.
+    Instance(Option<crate::annotator::description::ClassDefKey>),
+    /// RPython `SomeException.rtyper_makekey = (self.__class__,
+    /// frozenset(self.classdefs))` (rclass.py:456-457). Stored as a
+    /// sorted+deduped `Vec<ClassDefKey>` so the frozenset-equality
+    /// semantics carry through `HashMap` lookups.
+    Exception(Vec<crate::annotator::description::ClassDefKey>),
+    /// RPython `SomeType.rtyper_makekey = (self.__class__,)`
+    /// (rclass.py:463-464).
+    Type,
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -1750,6 +1762,25 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         SomeValue::SingleFloat(_) => ReprKey::SingleFloat,
         // rfloat.py:163-164: SomeLongFloat.rtyper_makekey = (self.__class__,).
         SomeValue::LongFloat(_) => ReprKey::LongFloat,
+        // rclass.py:449-450: SomeInstance.rtyper_makekey = (self.__class__, self.classdef).
+        SomeValue::Instance(s) => ReprKey::Instance(
+            s.classdef
+                .as_ref()
+                .map(crate::annotator::description::ClassDefKey::from_classdef),
+        ),
+        // rclass.py:456-457: SomeException.rtyper_makekey = (self.__class__, frozenset(self.classdefs)).
+        SomeValue::Exception(s) => {
+            let mut keys: Vec<crate::annotator::description::ClassDefKey> = s
+                .classdefs
+                .iter()
+                .map(crate::annotator::description::ClassDefKey::from_classdef)
+                .collect();
+            keys.sort_by_key(|k| k.0);
+            keys.dedup();
+            ReprKey::Exception(keys)
+        }
+        // rclass.py:463-464: SomeType.rtyper_makekey = (self.__class__,).
+        SomeValue::Type(_) => ReprKey::Type,
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical
@@ -1812,10 +1843,21 @@ pub fn rtyper_makerepr(
         | SomeValue::UnicodeCodePoint(_) => Err(TyperError::missing_rtype_operation(
             "SomeString/ByteArray/Char.rtyper_makerepr — port rpython/rtyper/rstr.py",
         )),
-        SomeValue::Instance(_) | SomeValue::Exception(_) => {
-            Err(TyperError::missing_rtype_operation(
-                "SomeInstance.rtyper_makerepr — port rpython/rtyper/rclass.py InstanceRepr",
-            ))
+        // rclass.py:445-447 — SomeInstance.rtyper_makerepr.
+        SomeValue::Instance(s) => {
+            let rtyper_rc = rtyper.self_rc()?;
+            let r_inst = crate::translator::rtyper::rclass::getinstancerepr(
+                &rtyper_rc,
+                s.classdef.as_ref(),
+                crate::translator::rtyper::rclass::Flavor::Gc,
+            )?;
+            Ok(r_inst as std::sync::Arc<dyn Repr>)
+        }
+        // rclass.py:452-454 — SomeException.rtyper_makerepr:
+        // `return self.as_SomeInstance().rtyper_makerepr(rtyper)`.
+        SomeValue::Exception(s) => {
+            let as_instance = s.as_some_instance();
+            rtyper_makerepr(&as_instance, rtyper)
         }
         SomeValue::Tuple(_) => Err(TyperError::missing_rtype_operation(
             "SomeTuple.rtyper_makerepr — port rpython/rtyper/rtuple.py TupleRepr",
@@ -1842,8 +1884,11 @@ pub fn rtyper_makerepr(
         SomeValue::None_(_) => {
             Ok(crate::translator::rtyper::rnone::none_repr() as std::sync::Arc<dyn Repr>)
         }
-        SomeValue::Object(_) | SomeValue::Type(_) => Err(TyperError::missing_rtype_operation(
-            "SomeObject/SomeType.rtyper_makerepr — port rpython/rtyper/robject.py",
+        // rclass.py:459-461 — SomeType.rtyper_makerepr returns
+        // `get_type_repr(rtyper)`.
+        SomeValue::Type(_) => crate::translator::rtyper::rclass::get_type_repr(rtyper),
+        SomeValue::Object(_) => Err(TyperError::missing_rtype_operation(
+            "SomeObject.rtyper_makerepr — port rpython/rtyper/robject.py",
         )),
         SomeValue::Property(_) => Err(TyperError::missing_rtype_operation(
             "SomeProperty.rtyper_makerepr — port rpython/rtyper/rproperty.py",
@@ -2698,5 +2743,93 @@ mod tests {
         assert!(r.freeze());
         assert!(r.special_uninitialized_value().is_none());
         assert!(r.can_ll_be_null());
+    }
+
+    // -----------------------------------------------------------------
+    // R5 — SomeInstance / SomeException / SomeType rtyper_make{key,repr}.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rtyper_makekey_someinstance_uses_classdef_identity() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::description::ClassDefKey;
+        use crate::annotator::model::SomeInstance;
+        let classdef = ClassDef::new_standalone("pkg.C", None);
+        let s1 = SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s2 = SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        assert_eq!(rtyper_makekey(&s1), rtyper_makekey(&s2));
+        assert_eq!(
+            rtyper_makekey(&s1),
+            ReprKey::Instance(Some(ClassDefKey::from_classdef(&classdef)))
+        );
+
+        let other = ClassDef::new_standalone("pkg.D", None);
+        let s3 = SomeValue::Instance(SomeInstance::new(
+            Some(other),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        assert_ne!(rtyper_makekey(&s1), rtyper_makekey(&s3));
+    }
+
+    #[test]
+    fn rtyper_makekey_sometype_is_variant_singleton() {
+        use crate::annotator::model::SomeType;
+        let s = SomeValue::Type(SomeType::new());
+        assert_eq!(rtyper_makekey(&s), ReprKey::Type);
+    }
+
+    #[test]
+    fn rtyper_makerepr_someinstance_returns_instance_repr_when_initialized() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeInstance;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("init");
+
+        let classdef = ClassDef::new_standalone("pkg.C", None);
+        let sv = SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert_eq!(repr.class_name(), "InstanceRepr");
+    }
+
+    #[test]
+    fn rtyper_makerepr_sometype_returns_rootclass_repr_when_initialized() {
+        use crate::annotator::model::SomeType;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("init");
+
+        let sv = SomeValue::Type(SomeType::new());
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert_eq!(repr.class_name(), "RootClassRepr");
+    }
+
+    #[test]
+    fn rtyper_makerepr_someinstance_without_init_surfaces_self_rc_error() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeInstance;
+        // No initialize_exceptiondata — self_weak stays empty.
+        let rtyper = rtyper_for_tests();
+        let classdef = ClassDef::new_standalone("pkg.C", None);
+        let sv = SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let err = rtyper_makerepr(&sv, &rtyper).expect_err("should surface self-weak error");
+        assert!(err.to_string().contains("self-weak"));
     }
 }

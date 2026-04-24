@@ -55,13 +55,16 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
+use super::description::ClassAttrFamily;
 use super::model::{AnnotatorError, DescKind, SomeInteger, SomeString, SomeValue, union};
 use crate::flowspace::model::{
     ConstValue, Constant, HOST_ENV, HostGetAttrError, HostObject, host_getattr,
 };
 use crate::tool::flattenrec::FlattenRecursion;
+use crate::translator::rtyper::rclass::ClassRepr;
 
 thread_local! {
     /// RPython `ClassDef._see_instance_flattenrec = FlattenRecursion()`
@@ -1289,6 +1292,23 @@ impl ClassDesc {
         }
     }
 
+    /// RPython `ClassDesc.get_param(self, name, default=None, inherit=True)`
+    /// (classdesc.py:758-763).
+    pub fn get_param(&self, name: &str, default: Option<ConstValue>, inherit: bool) -> ConstValue {
+        if inherit {
+            match host_getattr(&self.pyobj, name) {
+                Ok(value) => value,
+                Err(HostGetAttrError::Missing) | Err(HostGetAttrError::Unsupported) => {
+                    default.unwrap_or(ConstValue::None)
+                }
+            }
+        } else {
+            self.pyobj
+                .class_get(name)
+                .unwrap_or_else(|| default.unwrap_or(ConstValue::None))
+        }
+    }
+
     /// RPython `ClassDesc.getallbases(self)` (classdesc.py:900-904).
     ///
     /// Walks `basedesc` chain from `self` outward and yields every
@@ -1975,15 +1995,15 @@ pub struct ClassDef {
     pub attr_sources: HashMap<String, Vec<AttrSource>>,
     /// RPython `self.read_locations_of__class__ = {}`.
     pub read_locations_of_class: HashMap<PositionKey, bool>,
-    /// RPython `self.repr = None`. Populated by rtyper; stays `None`
-    /// at annotator time.
-    pub repr_ready: bool,
+    /// RPython `self.repr = None`. Populated by `rclass.getclassrepr()`
+    /// with the cached `ClassRepr` for this classdef.
+    pub repr: Option<Arc<ClassRepr>>,
     /// RPython `self.extra_access_sets = {}`.
     ///
-    /// Keyed on attribute name; values are opaque tags in c1 (real
-    /// access-set machinery lands with classdesc c3's
-    /// `getattrfamily`).
-    pub extra_access_sets: HashMap<String, ()>,
+    /// Keyed by access-set identity; values carry the original family
+    /// object alongside the `(attrname, counter)` payload stored
+    /// upstream.
+    pub extra_access_sets: HashMap<usize, (Rc<RefCell<ClassAttrFamily>>, String, usize)>,
     /// RPython `self.instances_seen = set()`. Identity hashes of the
     /// prebuilt instances already absorbed by `see_instance`.
     pub instances_seen: HashSet<usize>,
@@ -1993,6 +2013,24 @@ pub struct ClassDef {
     /// RPython `self.parentdefs = dict.fromkeys(self.getmro())`. Stored
     /// as identity pointers so `.contains` works with `Rc::as_ptr`.
     pub parentdefs: HashSet<usize>,
+    /// Stable classdef identity used by
+    /// `normalizecalls.get_unique_cdef_id()` (normalizecalls.py:393-399)
+    /// to build reversed-MRO inheritance-order witnesses.
+    pub unique_cdef_id: Option<usize>,
+    /// RPython `classdef.minid = TotalOrderSymbolic(witness, lst)` set by
+    /// `rpython.rtyper.normalizecalls.assign_inheritance_ids`
+    /// (normalizecalls.py:385-389). Bracketing ID for this classdef's
+    /// subtree: `self.minid < desc.minid < self.maxid` for every proper
+    /// descendant `desc`. Upstream is a deferred `TotalOrderSymbolic`;
+    /// the Rust port stores the computed integer position of the
+    /// classdef's start marker in the current reversed-MRO witness
+    /// ordering. `None` until `assign_inheritance_ids` runs.
+    pub minid: Option<i64>,
+    /// RPython `classdef.maxid = TotalOrderSymbolic(witness + [MAX], lst)`
+    /// (normalizecalls.py:389). Upper bracket of this classdef's subtree
+    /// — strictly greater than every descendant's `minid`. `None` until
+    /// `assign_inheritance_ids` runs.
+    pub maxid: Option<i64>,
 }
 
 impl ClassDef {
@@ -2014,15 +2052,13 @@ impl ClassDef {
 
         // upstream: if classdesc.basedesc: basedef = basedesc.getuniqueclassdef()
         let basedef = basedesc_opt.as_ref().map(|base| {
-            let weak = base.borrow().classdef.clone();
-            match weak.and_then(|w| w.upgrade()) {
-                Some(cd) => cd,
-                None => panic!(
-                    "ClassDef::new requires basedesc.classdef to upgrade to a \
-                     live ClassDef; ClassDesc.getuniqueclassdef lazy-init \
-                     lands with classdesc c2 (classdesc.py:699-702)."
-                ),
-            }
+            ClassDesc::getuniqueclassdef(base).unwrap_or_else(|err| {
+                panic!(
+                    "ClassDef::new: basedesc.getuniqueclassdef() failed for {:?}: {}",
+                    base.borrow().name,
+                    err
+                )
+            })
         });
 
         let me = Rc::new(RefCell::new(ClassDef {
@@ -2034,11 +2070,14 @@ impl ClassDef {
             subdefs: Vec::new(),
             attr_sources: HashMap::new(),
             read_locations_of_class: HashMap::new(),
-            repr_ready: false,
+            repr: None,
             extra_access_sets: HashMap::new(),
             instances_seen: HashSet::new(),
             basedef: basedef.clone(),
             parentdefs: HashSet::new(),
+            unique_cdef_id: None,
+            minid: None,
+            maxid: None,
         }));
 
         if let Some(base) = basedef.as_ref() {
@@ -2870,6 +2909,7 @@ mod tests {
         assert_eq!(r.name, "pkg.Sub.Foo");
         assert_eq!(r.shortname, "Foo");
         assert!(r.basedef.is_none());
+        assert!(r.repr.is_none());
     }
 
     #[test]

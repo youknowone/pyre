@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::annotator::model::KnownType;
 use crate::flowspace::model::{ConcretetypePlaceholder, ConstValue, GraphKey, GraphRef, Hlvalue};
@@ -440,6 +440,14 @@ pub struct StructType {
     pub _hints: FrozenDict<ConstValue>,
     pub _arrayfld: Option<String>,
     pub _gckind: GcKind,
+    /// RPython `RttiStruct._runtime_type_info` (`lltype.py:382-389`).
+    /// `None` for plain `Struct`/`GcStruct` without rtti; populated by
+    /// `StructType::gc_rtti` (or a later `_install_extras(rtti=True)`
+    /// port) with a freshly-minted opaque whose identity distinguishes
+    /// two structurally-equal `GcStruct(..., rtti=True)` builds — the
+    /// same distinction upstream Python makes via per-instance
+    /// `_runtime_type_info` attrs.
+    pub _runtime_type_info: Option<Box<_opaque>>,
 }
 
 /// RPython `Array`/`GcArray` (`lltype.py:420-489`).
@@ -632,6 +640,18 @@ pub enum _ptr_obj {
 pub struct _opaque {
     pub _identity: usize,
     pub TYPE: OpaqueType,
+    /// Optional human-readable name — `_opaque(TYPE, _name=name, **attrs)`
+    /// kwarg upstream (used by `opaqueptr` to mint named containers such
+    /// as `GCSTRUCT._runtime_type_info`). Plain `_opaque(TYPE)` defaults
+    /// to the upstream `"?"` marker.
+    pub _name: Option<String>,
+    /// Upstream `opaqueptr(..., about=self)` stores the source type on
+    /// the opaque itself (`lltype.py:387-389`).
+    pub about: Option<LowLevelType>,
+    /// Upstream `_attach_runtime_type_info_funcptr()` stores validated
+    /// helper pointers directly on the RTTI opaque (`lltype.py:405-415`).
+    pub query_funcptr: Option<Box<_ptr>>,
+    pub destructor_funcptr: Option<Box<_ptr>>,
 }
 
 #[derive(Clone, Debug)]
@@ -875,6 +895,7 @@ impl Hash for _func {
 pub struct _ptr {
     pub _identity: u64,
     pub _TYPE: Ptr,
+    pub _solid: bool,
     pub _obj0: Result<Option<_ptr_obj>, DelayedPointer>,
 }
 
@@ -901,9 +922,18 @@ impl Eq for _ptr {}
 
 impl _ptr {
     pub fn new(_TYPE: Ptr, _obj0: Result<Option<_ptr_obj>, DelayedPointer>) -> Self {
+        Self::new_with_solid(_TYPE, _obj0, false)
+    }
+
+    pub fn new_with_solid(
+        _TYPE: Ptr,
+        _obj0: Result<Option<_ptr_obj>, DelayedPointer>,
+        _solid: bool,
+    ) -> Self {
         _ptr {
             _identity: fresh_low_level_pointer_identity(),
             _TYPE,
+            _solid,
             _obj0,
         }
     }
@@ -1026,11 +1056,12 @@ impl _ptr {
                         _offsets: vec![offset],
                     }))
                 } else {
-                    LowLevelValue::Ptr(Box::new(_ptr::new(
+                    LowLevelValue::Ptr(Box::new(_ptr::new_with_solid(
                         Ptr {
                             TO: PtrTarget::Struct(obj.TYPE.clone()),
                         },
                         Ok(Some(_ptr_obj::Struct(*obj))),
+                        self._solid,
                     )))
                 }
             }
@@ -1048,17 +1079,19 @@ impl _ptr {
                         _offsets: vec![offset],
                     }))
                 } else {
-                    LowLevelValue::Ptr(Box::new(_ptr::new(
+                    LowLevelValue::Ptr(Box::new(_ptr::new_with_solid(
                         Ptr { TO: target },
                         Ok(Some(_ptr_obj::Array(*obj))),
+                        self._solid,
                     )))
                 }
             }
-            LowLevelValue::Opaque(obj) => LowLevelValue::Ptr(Box::new(_ptr::new(
+            LowLevelValue::Opaque(obj) => LowLevelValue::Ptr(Box::new(_ptr::new_with_solid(
                 Ptr {
                     TO: PtrTarget::Opaque(obj.TYPE.clone()),
                 },
                 Ok(Some(_ptr_obj::Opaque(*obj))),
+                self._solid,
             ))),
             other => other,
         }
@@ -1547,6 +1580,63 @@ impl StructType {
         Self::_build(name, fields, GcKind::Raw, adtmeths, vec![])
     }
 
+    /// Raw `Struct(name, *fields, hints={...})`. Upstream
+    /// `rpython/rtyper/lltypesystem/lltype.py:258-294 Struct.__init__`
+    /// forwards the `hints` kwarg through `_install_extras`.
+    pub fn with_hints(
+        name: &str,
+        fields: Vec<(String, ConcretetypePlaceholder)>,
+        hints: Vec<(String, ConstValue)>,
+    ) -> Self {
+        Self::_build(name, fields, GcKind::Raw, vec![], hints)
+    }
+
+    /// `GcStruct(name, *fields, hints={...})`. Same as
+    /// [`StructType::gc`] plus the `hints` dict upstream passes through
+    /// `Struct.__init__` kwargs.
+    pub fn gc_with_hints(
+        name: &str,
+        fields: Vec<(String, ConcretetypePlaceholder)>,
+        hints: Vec<(String, ConstValue)>,
+    ) -> Self {
+        Self::_build(name, fields, GcKind::Gc, vec![], hints)
+    }
+
+    /// `GcStruct(name, *fields, rtti=True)` — upstream
+    /// `RttiStruct._install_extras(rtti=True)` (`lltype.py:385-389`) mints
+    /// an `_opaque` of type `RuntimeTypeInfo` with `_name` = the struct
+    /// name and stores it under `_runtime_type_info`. `getRuntimeTypeInfo`
+    /// / `attachRuntimeTypeInfo` later surface it wrapped in
+    /// `Ptr(RuntimeTypeInfo)`. Must be called on a fresh struct-type —
+    /// the opaque's `_identity` is per-call and therefore per struct.
+    pub fn gc_rtti(name: &str, fields: Vec<(String, ConcretetypePlaceholder)>) -> Self {
+        Self::gc_rtti_with_hints(name, fields, vec![])
+    }
+
+    /// `GcStruct(name, *fields, hints=hints, rtti=True)` — upstream
+    /// funnels both options through `Struct.__init__(**kwds)` so they
+    /// compose freely (`lltype.py:261-294`). Used e.g. for
+    /// `OBJECT = GcStruct('object', ('typeptr', CLASSTYPE),
+    /// hints={...}, rtti=True)` (`rclass.py:162-165`).
+    pub fn gc_rtti_with_hints(
+        name: &str,
+        fields: Vec<(String, ConcretetypePlaceholder)>,
+        hints: Vec<(String, ConstValue)>,
+    ) -> Self {
+        let mut result = Self::_build(name, fields, GcKind::Gc, vec![], hints);
+        let rtti_ptr = opaqueptr_with_attrs(
+            RUNTIME_TYPE_INFO.clone(),
+            &result._name,
+            Some(LowLevelType::Struct(Box::new(result.clone()))),
+        )
+        .expect("opaqueptr(RuntimeTypeInfo, ...) must succeed for gc_rtti()");
+        let Ok(Some(_ptr_obj::Opaque(rtti_opaque))) = rtti_ptr._obj0 else {
+            panic!("opaqueptr(RuntimeTypeInfo, ...) must yield an opaque container");
+        };
+        result._runtime_type_info = Some(Box::new(rtti_opaque));
+        result
+    }
+
     /// Unified constructor mirroring RPython `Struct.__init__` /
     /// `Struct._install_extras` (`lltype.py:261-294, 208-210`). Enforces:
     /// * field names must not begin with `_` (`NameError` upstream);
@@ -1606,6 +1696,7 @@ impl StructType {
             _hints: FrozenDict::new(hints),
             _arrayfld,
             _gckind: gckind,
+            _runtime_type_info: None,
         };
         let parent = LowLevelType::Struct(Box::new(result.clone()));
         for (i, (_, typ)) in result._flds.iter().enumerate() {
@@ -1917,6 +2008,10 @@ impl OpaqueType {
         _opaque {
             _identity: fresh_low_level_container_identity(),
             TYPE: self.clone(),
+            _name: Some("?".to_string()),
+            about: None,
+            query_funcptr: None,
+            destructor_funcptr: None,
         }
     }
 
@@ -1941,6 +2036,129 @@ impl OpaqueType {
     }
 }
 
+/// RPython `RuntimeTypeInfo = OpaqueType("RuntimeTypeInfo")` (lltype.py:607).
+///
+/// Module-level singleton opaque type token used as the target of
+/// `Ptr(RuntimeTypeInfo)` for GC-tracked instances. R3 helpers
+/// (`attachRuntimeTypeInfo`, `getRuntimeTypeInfo`, `ClassRepr::fill_vtable_root`'s
+/// `rtti` slot) consume this as the well-known opaque type.
+pub static RUNTIME_TYPE_INFO: LazyLock<LowLevelType> =
+    LazyLock::new(|| LowLevelType::Opaque(Box::new(OpaqueType::new("RuntimeTypeInfo"))));
+
+fn new_opaque_container(TYPE: OpaqueType, name: &str, about: Option<LowLevelType>) -> _opaque {
+    _opaque {
+        _identity: fresh_low_level_container_identity(),
+        TYPE,
+        _name: Some(name.to_string()),
+        about,
+        query_funcptr: None,
+        destructor_funcptr: None,
+    }
+}
+
+fn expect_rtti_struct(T: &LowLevelType) -> Result<&StructType, String> {
+    match T {
+        LowLevelType::Struct(struct_t) if struct_t._gckind == GcKind::Gc => Ok(struct_t.as_ref()),
+        _ => Err(format!("expected a RttiStruct: {}", T.short_name())),
+    }
+}
+
+fn expect_rtti_struct_mut(T: &mut LowLevelType) -> Result<&mut StructType, String> {
+    let short_name = T.short_name();
+    match T {
+        LowLevelType::Struct(struct_t) if struct_t._gckind == GcKind::Gc => Ok(struct_t.as_mut()),
+        _ => Err(format!("expected a RttiStruct: {}", short_name)),
+    }
+}
+
+fn attach_runtime_type_info_missing_error(struct_t: &StructType) -> String {
+    format!(
+        "attachRuntimeTypeInfo: {} must have been built with the rtti=True argument",
+        struct_t._short_name()
+    )
+}
+
+fn castdepth(outside: &StructType, inside: &StructType) -> i32 {
+    if outside == inside {
+        return 0;
+    }
+    let mut dwn = 0;
+    let mut current = outside;
+    loop {
+        let Some((_, first_type)) = current._first_struct() else {
+            break;
+        };
+        dwn += 1;
+        if first_type == inside {
+            return dwn;
+        }
+        current = first_type;
+    }
+    -1
+}
+
+fn castable_ptr_types(ptrtype: &Ptr, curtype: &Ptr) -> Result<i32, String> {
+    if curtype._gckind() != ptrtype._gckind() {
+        return Err(format!(
+            "cast_pointer() cannot change the gc status: {:?} to {:?}",
+            curtype, ptrtype
+        ));
+    }
+    if curtype == ptrtype {
+        return Ok(0);
+    }
+    let (PtrTarget::Struct(curstruc), PtrTarget::Struct(ptrstruc)) = (&curtype.TO, &ptrtype.TO)
+    else {
+        return Err(format!(
+            "invalid cast between {:?} and {:?}",
+            curtype, ptrtype
+        ));
+    };
+    let d = castdepth(curstruc, ptrstruc);
+    if d >= 0 {
+        return Ok(d);
+    }
+    let u = castdepth(ptrstruc, curstruc);
+    if u == -1 {
+        return Err(format!(
+            "invalid cast between {:?} and {:?}",
+            curtype, ptrtype
+        ));
+    }
+    Ok(-u)
+}
+
+fn validate_rtti_helper_ptr(
+    funcptr: &_ptr,
+    gcstruct: &StructType,
+    result_type: &LowLevelType,
+    error_label: &str,
+) -> Result<(), String> {
+    let T = typeOf(funcptr);
+    let PtrTarget::Func(func_t) = &T.TO else {
+        return Err(format!(
+            "expected a {} function implementation, got: {:?}",
+            error_label, funcptr
+        ));
+    };
+    let expected_self_ptr =
+        Ptr::from_container_type(LowLevelType::Struct(Box::new(gcstruct.clone())))
+            .expect("Ptr(GcStruct) must be constructible for RTTI helper validation");
+    let arg_ok = func_t.args.len() == 1
+        && matches!(
+            func_t.args.first(),
+            Some(LowLevelType::Ptr(arg_ptr))
+                if matches!(castable_ptr_types(arg_ptr, &expected_self_ptr), Ok(depth) if depth >= 0)
+        );
+    if !(arg_ok && func_t.result == *result_type) {
+        return Err(format!(
+            "expected a {} function implementation, got: {:?}",
+            error_label, funcptr
+        ));
+    }
+    Ok(())
+}
+
 impl ForwardReference {
     pub fn new() -> Self {
         ForwardReference {
@@ -1963,7 +2181,7 @@ impl ForwardReference {
         }
     }
 
-    pub fn r#become(&mut self, realcontainertype: LowLevelType) -> Result<(), String> {
+    pub fn r#become(&self, realcontainertype: LowLevelType) -> Result<(), String> {
         if !realcontainertype.is_container_type() {
             return Err(format!(
                 "ForwardReference can only be to a container, not {realcontainertype:?}"
@@ -2114,6 +2332,29 @@ impl Ptr {
         _ptr::new(self.clone(), Ok(None))
     }
 
+    /// RPython `Ptr.__new__(cls, TO)` validation + construction
+    /// (`lltype.py:725-739`). Takes a container-kind `LowLevelType`
+    /// variant and packs it into the matching `PtrTarget` arm. The
+    /// upstream `WeakValueDictionary` cache is omitted — Rust
+    /// `PartialEq` derives structural equality that covers the identity
+    /// role of the cache.
+    pub fn from_container_type(T: LowLevelType) -> Result<Self, String> {
+        let TO = match T {
+            LowLevelType::Func(t) => PtrTarget::Func(*t),
+            LowLevelType::Struct(t) => PtrTarget::Struct(*t),
+            LowLevelType::Array(t) => PtrTarget::Array(*t),
+            LowLevelType::FixedSizeArray(t) => PtrTarget::FixedSizeArray(*t),
+            LowLevelType::Opaque(t) => PtrTarget::Opaque(*t),
+            LowLevelType::ForwardReference(t) => PtrTarget::ForwardReference(*t),
+            other => {
+                return Err(format!(
+                    "can only point to a Container type, not to {other:?}"
+                ));
+            }
+        };
+        Ok(Ptr { TO })
+    }
+
     /// Short-name of the pointer's target container type. Called by
     /// `LowLevelType::short_name` for `"Ptr %s"` formatting (upstream
     /// `lltype.py:748`).
@@ -2131,7 +2372,7 @@ impl Ptr {
     }
 
     pub fn _example(&self) -> _ptr {
-        _ptr::new(
+        _ptr::new_with_solid(
             self.clone(),
             Ok(Some(match &self.TO {
                 PtrTarget::Func(func_t) => _ptr_obj::Func(func_t._container_example()),
@@ -2180,6 +2421,7 @@ impl Ptr {
                     }
                 }
             })),
+            true,
         )
     }
 
@@ -2234,6 +2476,234 @@ impl Ptr {
             hints,
         )
     }
+}
+
+/// RPython `nullptr(T)` (`lltype.py:2347-2348`):
+///
+/// ```python
+/// def nullptr(T):
+///     return Ptr(T)._defl()
+/// ```
+///
+/// Returns a null pointer value whose `Ptr` type wraps the given container
+/// `T`. Upstream uses `_ptr(self, None)` directly in `Ptr._defl`; the Rust
+/// port follows the same two-step `Ptr::from_container_type(T)?._defl()`.
+pub fn nullptr(T: LowLevelType) -> Result<_ptr, String> {
+    Ok(Ptr::from_container_type(T)?._defl())
+}
+
+/// RPython `getRuntimeTypeInfo(GCSTRUCT)` (`lltype.py:2391-2397`):
+///
+/// ```python
+/// def getRuntimeTypeInfo(GCSTRUCT):
+///     if not isinstance(GCSTRUCT, RttiStruct):
+///         raise TypeError(...)
+///     if GCSTRUCT._runtime_type_info is None:
+///         raise ValueError("no attached runtime type info for GcStruct %s" % GCSTRUCT._name)
+///     return _ptr(Ptr(RuntimeTypeInfo), GCSTRUCT._runtime_type_info)
+/// ```
+///
+/// Returns a `Ptr(RuntimeTypeInfo)` pointing at the struct's pre-attached
+/// opaque. Errors if the struct was built without `gc_rtti` (no opaque)
+/// or if a non-Struct `LowLevelType` is passed. Both conditions match
+/// upstream's `TypeError` / `ValueError`.
+pub fn getRuntimeTypeInfo(T: &LowLevelType) -> Result<_ptr, String> {
+    let struct_t = expect_rtti_struct(T)?;
+    let Some(rtti_opaque) = &struct_t._runtime_type_info else {
+        return Err(format!(
+            "no attached runtime type info for GcStruct {}",
+            struct_t._name
+        ));
+    };
+    let ptr_t = Ptr::from_container_type(RUNTIME_TYPE_INFO.clone())?;
+    Ok(_ptr::new(
+        ptr_t,
+        Ok(Some(_ptr_obj::Opaque((**rtti_opaque).clone()))),
+    ))
+}
+
+/// RPython `attachRuntimeTypeInfo(GCSTRUCT, funcptr=None, destrptr=None)`
+/// (`lltype.py:2385-2389`):
+///
+/// ```python
+/// def attachRuntimeTypeInfo(GCSTRUCT, funcptr=None, destrptr=None):
+///     if not isinstance(GCSTRUCT, RttiStruct):
+///         raise TypeError(...)
+///     GCSTRUCT._attach_runtime_type_info_funcptr(funcptr, destrptr)
+///     return _ptr(Ptr(RuntimeTypeInfo), GCSTRUCT._runtime_type_info)
+/// ```
+///
+/// Rust keeps the no-extra-args wrapper for existing call sites and
+/// exposes the full mutable port in
+/// [`attachRuntimeTypeInfo_with_ptrs`], which stores helper pointers on
+/// the `_runtime_type_info` opaque just like upstream.
+pub fn attachRuntimeTypeInfo(T: &LowLevelType) -> Result<_ptr, String> {
+    let struct_t = expect_rtti_struct(T)?;
+    let Some(rtti_opaque) = &struct_t._runtime_type_info else {
+        return Err(attach_runtime_type_info_missing_error(struct_t));
+    };
+    let ptr_t = Ptr::from_container_type(RUNTIME_TYPE_INFO.clone())?;
+    Ok(_ptr::new(
+        ptr_t,
+        Ok(Some(_ptr_obj::Opaque((**rtti_opaque).clone()))),
+    ))
+}
+
+pub fn attachRuntimeTypeInfo_with_ptrs(
+    T: &mut LowLevelType,
+    funcptr: Option<_ptr>,
+    destrptr: Option<_ptr>,
+) -> Result<_ptr, String> {
+    let struct_t = expect_rtti_struct_mut(T)?;
+    let struct_snapshot = struct_t.clone();
+    if struct_t._runtime_type_info.is_none() {
+        return Err(attach_runtime_type_info_missing_error(&struct_snapshot));
+    }
+    let runtime_type_info_ptr = LowLevelType::Ptr(Box::new(Ptr::from_container_type(
+        RUNTIME_TYPE_INFO.clone(),
+    )?));
+    if let Some(funcptr) = funcptr.as_ref() {
+        validate_rtti_helper_ptr(
+            funcptr,
+            &struct_snapshot,
+            &runtime_type_info_ptr,
+            "runtime type info",
+        )?;
+    }
+    if let Some(destrptr) = destrptr.as_ref() {
+        validate_rtti_helper_ptr(
+            destrptr,
+            &struct_snapshot,
+            &LowLevelType::Void,
+            "destructor",
+        )?;
+    }
+    let rtti_opaque = struct_t._runtime_type_info.as_mut().expect("checked above");
+    if let Some(funcptr) = funcptr {
+        rtti_opaque.query_funcptr = Some(Box::new(funcptr));
+    }
+    if let Some(destrptr) = destrptr {
+        rtti_opaque.destructor_funcptr = Some(Box::new(destrptr));
+    }
+    let ptr_t = Ptr::from_container_type(RUNTIME_TYPE_INFO.clone())?;
+    Ok(_ptr::new(
+        ptr_t,
+        Ok(Some(_ptr_obj::Opaque((**rtti_opaque).clone()))),
+    ))
+}
+
+/// RPython `opaqueptr(TYPE, name, **attrs)` (`lltype.py:2357-2361`):
+///
+/// ```python
+/// def opaqueptr(TYPE, name, **attrs):
+///     if not isinstance(TYPE, OpaqueType):
+///         raise TypeError("opaqueptr() for OpaqueTypes only")
+///     o = _opaque(TYPE, _name=name, **attrs)
+///     return _ptr(Ptr(TYPE), o, solid=True)
+/// ```
+///
+/// Mints a pointer to a freshly-constructed `_opaque` container stamped
+/// with the given human-readable `name`. Used by
+/// `RttiStruct._install_extras(rtti=True)` to register the struct's
+/// `_runtime_type_info` opaque (`lltype.py:385-389`). The helper keeps
+/// the public two-arg surface for existing Rust callers and routes the
+/// actual construction through a private attrs-aware helper.
+pub fn opaqueptr(TYPE: LowLevelType, name: &str) -> Result<_ptr, String> {
+    opaqueptr_with_attrs(TYPE, name, None)
+}
+
+fn opaqueptr_with_attrs(
+    TYPE: LowLevelType,
+    name: &str,
+    about: Option<LowLevelType>,
+) -> Result<_ptr, String> {
+    let LowLevelType::Opaque(opaque_t) = &TYPE else {
+        return Err(format!("opaqueptr() for OpaqueTypes only, got {TYPE:?}"));
+    };
+    let obj = new_opaque_container((**opaque_t).clone(), name, about);
+    let ptr_t = Ptr::from_container_type(TYPE)?;
+    Ok(_ptr::new_with_solid(
+        ptr_t,
+        Ok(Some(_ptr_obj::Opaque(obj))),
+        true,
+    ))
+}
+
+/// Allocation flavor for `malloc(T, ..., flavor=...)`, mirroring upstream
+/// `lltype.py:2192-2216` string kwarg (`'gc'` | `'raw'`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MallocFlavor {
+    Gc,
+    Raw,
+}
+
+/// RPython `lltype.malloc(T, n=None, flavor='gc', immortal=False, ...)`
+/// (`lltype.py:2192-2216`).
+///
+/// ```python
+/// def malloc(T, n=None, flavor='gc', immortal=False, zero=False, ...):
+///     ...
+///     if isinstance(T, Struct):
+///         o = _struct(T, n, initialization=initialization)
+///     elif isinstance(T, Array):
+///         o = _array(T, n, initialization=initialization)
+///     elif isinstance(T, OpaqueType):
+///         assert n is None
+///         o = _opaque(T, initialization=initialization)
+///     ...
+///     return _ptr(Ptr(T), o, solid)
+/// ```
+///
+/// This port covers only the subset R3 (`ClassRepr::init_vtable`) needs:
+/// `flavor='gc'` or `'raw'` × `immortal=True/False` × `n=None` × non-varsize
+/// Struct / Array / OpaqueType. Varsize `n`, `zero`, `track_allocation`,
+/// `add_memory_pressure`, `nonmovable` upstream kwargs are not accepted —
+/// upstream's `_uninitialized` abstraction is the prerequisite for them
+/// and remains unported, so keeping a narrow surface matches parity rule
+/// #1 (no API expansion without its matching semantics). The `solid`
+/// kwarg threaded through upstream `_ptr(Ptr(T), o, solid)` is still
+/// tracked on `_ptr._solid` (upstream lltype.py:2221 `immortal or
+/// flavor == 'raw'`).
+pub fn malloc(
+    T: LowLevelType,
+    n: Option<usize>,
+    flavor: MallocFlavor,
+    immortal: bool,
+) -> Result<_ptr, String> {
+    if n.is_some() {
+        return Err(format!(
+            "malloc: varsize n={n:?} not yet ported (R3 subset)"
+        ));
+    }
+    let obj: _ptr_obj = match &T {
+        LowLevelType::Struct(struct_t) => {
+            if struct_t._arrayfld.is_some() {
+                return Err(format!(
+                    "malloc: varsize struct {:?} requires n (not yet ported)",
+                    struct_t._name
+                ));
+            }
+            _ptr_obj::Struct(struct_t._container_example())
+        }
+        LowLevelType::Array(array_t) => _ptr_obj::Array(array_t._container_example()),
+        LowLevelType::Opaque(opaque_t) => _ptr_obj::Opaque(opaque_t._container_example()),
+        other => {
+            return Err(format!("malloc: unmallocable type {other:?}"));
+        }
+    };
+    // upstream lltype.py:2211-2212 — gc flavor on non-gc, non-immortal
+    // struct/array/opaque is rejected. We only enforce it when !immortal
+    // because the init_vtable call site is immortal and can target
+    // either a gc or non-gc prototype container.
+    if flavor == MallocFlavor::Gc && !immortal && T._gckind() != GcKind::Gc {
+        return Err(format!(
+            "gc flavor malloc of a non-GC non-immortal structure {:?}",
+            T.short_name()
+        ));
+    }
+    let solid = immortal || flavor == MallocFlavor::Raw;
+    let ptr_t = Ptr::from_container_type(T)?;
+    Ok(_ptr::new_with_solid(ptr_t, Ok(Some(obj)), solid))
 }
 
 impl InteriorPtr {
@@ -2423,6 +2893,299 @@ mod tests {
     use crate::flowspace::model::{Block, Constant, FunctionGraph, GraphFunc, Variable};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn runtime_type_info_singleton_is_raw_opaque_with_upstream_tag() {
+        let LowLevelType::Opaque(inner) = &*RUNTIME_TYPE_INFO else {
+            panic!("RUNTIME_TYPE_INFO must resolve to LowLevelType::Opaque");
+        };
+        assert_eq!(inner.tag, "RuntimeTypeInfo");
+        assert_eq!(inner._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn runtime_type_info_is_stable_across_lookups() {
+        let first: *const LowLevelType = &*RUNTIME_TYPE_INFO;
+        let second: *const LowLevelType = &*RUNTIME_TYPE_INFO;
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn ptr_from_container_type_packs_struct_into_ptr_target_struct() {
+        let s = StructType::_build(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let T = LowLevelType::Struct(Box::new(s));
+        let p = Ptr::from_container_type(T).unwrap();
+        assert!(matches!(p.TO, PtrTarget::Struct(_)));
+    }
+
+    #[test]
+    fn ptr_from_container_type_rejects_primitive_types() {
+        let err = Ptr::from_container_type(LowLevelType::Signed).unwrap_err();
+        assert!(
+            err.contains("can only point to a Container type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nullptr_of_runtime_type_info_is_null_ptr_to_opaque_target() {
+        let p = nullptr(RUNTIME_TYPE_INFO.clone()).unwrap();
+        assert!(matches!(p._TYPE.TO, PtrTarget::Opaque(_)));
+        assert!(matches!(&p._obj0, Ok(None)));
+    }
+
+    #[test]
+    fn nullptr_rejects_non_container_type() {
+        let err = nullptr(LowLevelType::Float).unwrap_err();
+        assert!(
+            err.contains("can only point to a Container type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn malloc_immortal_gc_struct_produces_live_struct_container() {
+        let s = StructType::_build(
+            "vtable",
+            vec![("super".into(), LowLevelType::Signed)],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let T = LowLevelType::Struct(Box::new(s));
+        let p = malloc(T, None, MallocFlavor::Gc, true).unwrap();
+        let Ok(Some(_ptr_obj::Struct(inner))) = &p._obj0 else {
+            panic!("malloc(Struct, immortal=true) must produce Struct container");
+        };
+        assert_eq!(inner.TYPE._name, "vtable");
+        assert!(inner._getattr("super").is_some());
+    }
+
+    #[test]
+    fn malloc_immortal_gc_opaque_allocates_opaque_container() {
+        let T = RUNTIME_TYPE_INFO.clone();
+        let p = malloc(T, None, MallocFlavor::Gc, true).unwrap();
+        assert!(matches!(&p._obj0, Ok(Some(_ptr_obj::Opaque(_)))));
+        assert!(p._solid);
+    }
+
+    #[test]
+    fn malloc_rejects_non_container_type() {
+        let err = malloc(LowLevelType::Signed, None, MallocFlavor::Gc, true).unwrap_err();
+        assert!(err.contains("unmallocable type"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn malloc_rejects_varsize_n_kwarg_as_unported() {
+        let s = StructType::_build(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let err = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            Some(3),
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("not yet ported"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn malloc_rejects_gc_flavor_non_immortal_on_non_gc_struct() {
+        let s = StructType::_build(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+            GcKind::Raw,
+            vec![],
+            vec![],
+        );
+        let err = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Gc,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("gc flavor malloc of a non-GC"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn opaqueptr_mints_named_opaque_container_and_wraps_in_ptr() {
+        let p = opaqueptr(RUNTIME_TYPE_INFO.clone(), "ExceptionFoo").unwrap();
+        let Ok(Some(_ptr_obj::Opaque(inner))) = &p._obj0 else {
+            panic!("opaqueptr must produce an Opaque container");
+        };
+        assert_eq!(inner._name.as_deref(), Some("ExceptionFoo"));
+        assert!(inner.about.is_none());
+        assert_eq!(inner.TYPE.tag, "RuntimeTypeInfo");
+        assert!(matches!(p._TYPE.TO, PtrTarget::Opaque(_)));
+        assert!(p._solid);
+    }
+
+    #[test]
+    fn opaqueptr_rejects_non_opaque_type() {
+        let err = opaqueptr(LowLevelType::Signed, "x").unwrap_err();
+        assert!(
+            err.contains("opaqueptr() for OpaqueTypes only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn gc_rtti_struct_has_runtime_type_info_opaque_named_after_struct() {
+        let s = StructType::gc_rtti("ExceptionFoo", vec![("msg".into(), LowLevelType::Signed)]);
+        let rtti = s
+            ._runtime_type_info
+            .as_ref()
+            .expect("gc_rtti must attach _runtime_type_info");
+        assert_eq!(rtti.TYPE.tag, "RuntimeTypeInfo");
+        assert_eq!(rtti._name.as_deref(), Some("ExceptionFoo"));
+        let Some(LowLevelType::Struct(about)) = rtti.about.as_ref() else {
+            panic!("gc_rtti must record about=self on the opaque");
+        };
+        assert_eq!(about._name, "ExceptionFoo");
+    }
+
+    #[test]
+    fn gc_struct_without_rtti_leaves_runtime_type_info_none() {
+        let s = StructType::gc("PlainStruct", vec![("x".into(), LowLevelType::Signed)]);
+        assert!(s._runtime_type_info.is_none());
+    }
+
+    #[test]
+    fn get_runtime_type_info_returns_ptr_to_attached_opaque() {
+        let s = StructType::gc_rtti("ExceptionBar", vec![("msg".into(), LowLevelType::Signed)]);
+        let T = LowLevelType::Struct(Box::new(s));
+        let p = getRuntimeTypeInfo(&T).unwrap();
+        assert!(matches!(p._TYPE.TO, PtrTarget::Opaque(_)));
+        let Ok(Some(_ptr_obj::Opaque(inner))) = &p._obj0 else {
+            panic!("getRuntimeTypeInfo must produce an Opaque container");
+        };
+        assert_eq!(inner._name.as_deref(), Some("ExceptionBar"));
+    }
+
+    #[test]
+    fn get_runtime_type_info_errors_when_struct_lacks_rtti() {
+        let s = StructType::gc("NoRttiStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let err = getRuntimeTypeInfo(&LowLevelType::Struct(Box::new(s))).unwrap_err();
+        assert!(
+            err.contains("no attached runtime type info"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn get_runtime_type_info_rejects_raw_structs() {
+        let s = StructType::new("RawStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let err = getRuntimeTypeInfo(&LowLevelType::Struct(Box::new(s))).unwrap_err();
+        assert!(
+            err.contains("expected a RttiStruct"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn get_runtime_type_info_errors_on_non_struct_type() {
+        let err = getRuntimeTypeInfo(&LowLevelType::Signed).unwrap_err();
+        assert!(
+            err.contains("expected a RttiStruct"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_runtime_type_info_returns_same_opaque_as_get() {
+        let s = StructType::gc_rtti("AttachedStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let T = LowLevelType::Struct(Box::new(s));
+        let from_attach = attachRuntimeTypeInfo(&T).unwrap();
+        let from_get = getRuntimeTypeInfo(&T).unwrap();
+        let (Ok(Some(_ptr_obj::Opaque(a))), Ok(Some(_ptr_obj::Opaque(b)))) =
+            (&from_attach._obj0, &from_get._obj0)
+        else {
+            panic!("both helpers must produce Opaque containers");
+        };
+        assert_eq!(a._identity, b._identity);
+        assert_eq!(a._name, b._name);
+    }
+
+    #[test]
+    fn attach_runtime_type_info_errors_when_gc_struct_lacks_rtti() {
+        let s = StructType::gc("AttachedStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let T = LowLevelType::Struct(Box::new(s));
+        let err = attachRuntimeTypeInfo(&T).unwrap_err();
+        assert!(
+            err.contains("must have been built with the rtti=True argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_runtime_type_info_with_ptrs_stores_query_and_destructor() {
+        let mut T = LowLevelType::Struct(Box::new(StructType::gc_rtti(
+            "AttachedStruct",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let self_ptr_t = Ptr::from_container_type(T.clone()).unwrap();
+        let rtti_ptr_t = Ptr::from_container_type(RUNTIME_TYPE_INFO.clone()).unwrap();
+        let query = functionptr(
+            FuncType {
+                args: vec![LowLevelType::Ptr(Box::new(self_ptr_t.clone()))],
+                result: LowLevelType::Ptr(Box::new(rtti_ptr_t)),
+            },
+            "query",
+            None,
+            Some("<query>".into()),
+        );
+        let destr = functionptr(
+            FuncType {
+                args: vec![LowLevelType::Ptr(Box::new(self_ptr_t))],
+                result: LowLevelType::Void,
+            },
+            "destr",
+            None,
+            Some("<destr>".into()),
+        );
+        let attached =
+            attachRuntimeTypeInfo_with_ptrs(&mut T, Some(query.clone()), Some(destr.clone()))
+                .unwrap();
+        let LowLevelType::Struct(struct_t) = &T else {
+            panic!("attachRuntimeTypeInfo_with_ptrs must keep T as a struct");
+        };
+        let rtti = struct_t
+            ._runtime_type_info
+            .as_ref()
+            .expect("rtti opaque must still be present");
+        assert_eq!(
+            rtti.query_funcptr
+                .as_ref()
+                .map(|ptr| ptr._hashable_identity()),
+            Some(query._hashable_identity())
+        );
+        assert_eq!(
+            rtti.destructor_funcptr
+                .as_ref()
+                .map(|ptr| ptr._hashable_identity()),
+            Some(destr._hashable_identity())
+        );
+        let Ok(Some(_ptr_obj::Opaque(attached_rtti))) = &attached._obj0 else {
+            panic!("attachRuntimeTypeInfo_with_ptrs must return the RTTI opaque pointer");
+        };
+        assert!(attached_rtti.query_funcptr.is_some());
+        assert!(attached_rtti.destructor_funcptr.is_some());
+    }
 
     #[test]
     fn functionptr_keeps_graph_on_funcobj() {
@@ -2710,6 +3473,7 @@ mod tests {
         let ptr2 = _ptr {
             _identity: ptr1._identity,
             _TYPE: ptr1._TYPE.clone(),
+            _solid: ptr1._solid,
             _obj0: ptr1._obj0.clone(),
         };
         let ptr3 = Ptr {

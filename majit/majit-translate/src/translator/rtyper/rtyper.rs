@@ -35,6 +35,9 @@ use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, PtrTarget, getfunctionptr,
 };
+use crate::translator::rtyper::rclass::{
+    CLASSTYPE, Flavor, InstanceRepr, InstanceReprKey, OBJECTPTR, RootClassRepr, getinstancerepr,
+};
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprKey, inputconst, inputconst_from_lltype, rtyper_makekey, rtyper_makerepr,
 };
@@ -55,7 +58,7 @@ use crate::translator::unsimplify::insert_empty_block;
 /// `getinstancerepr(rtyper, None)` port which has not landed, so until
 /// then the `RPythonTyper.exceptiondata` slot stays `None` and callers
 /// receive a structured `TyperError` pointing at that dependency.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExceptionData {
     /// RPython `self.r_exception_type = rtyper.rootclass_repr` — the
     /// class repr used for every exception vtable pointer.
@@ -67,6 +70,48 @@ pub struct ExceptionData {
     pub lltype_of_exception_type: LowLevelType,
     /// RPython `self.lltype_of_exception_value = r_instance.lowleveltype`.
     pub lltype_of_exception_value: LowLevelType,
+    /// RPython `self.fn_exception_match` assigned by
+    /// `ExceptionData.make_helpers()`.
+    pub fn_exception_match: RefCell<Option<LowLevelFunction>>,
+    /// RPython `self.fn_type_of_exc_inst` assigned by
+    /// `ExceptionData.make_helpers()`.
+    pub fn_type_of_exc_inst: RefCell<Option<LowLevelFunction>>,
+}
+
+impl ExceptionData {
+    /// RPython `ExceptionData.make_helpers(self, rtyper)`
+    /// (`exceptiondata.py:47-50`).
+    pub fn make_helpers(&self, rtyper: &RPythonTyper) -> Result<(), TyperError> {
+        *self.fn_exception_match.borrow_mut() = Some(self.make_exception_matcher(rtyper)?);
+        *self.fn_type_of_exc_inst.borrow_mut() = Some(self.make_type_of_exc_inst(rtyper)?);
+        Ok(())
+    }
+
+    /// RPython `ExceptionData.make_exception_matcher(self, rtyper)`
+    /// (`exceptiondata.py:52-56`).
+    fn make_exception_matcher(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<LowLevelFunction, TyperError> {
+        rtyper.lowlevel_helper_function(
+            "ll_issubclass",
+            vec![
+                self.lltype_of_exception_type.clone(),
+                self.lltype_of_exception_type.clone(),
+            ],
+            LowLevelType::Bool,
+        )
+    }
+
+    /// RPython `ExceptionData.make_type_of_exc_inst(self, rtyper)`
+    /// (`exceptiondata.py:58-62`).
+    fn make_type_of_exc_inst(&self, rtyper: &RPythonTyper) -> Result<LowLevelFunction, TyperError> {
+        rtyper.lowlevel_helper_function(
+            "ll_type",
+            vec![self.lltype_of_exception_value.clone()],
+            self.lltype_of_exception_type.clone(),
+        )
+    }
 }
 
 pub struct RPythonTyper {
@@ -76,12 +121,39 @@ pub struct RPythonTyper {
     /// `annotator -> translator -> rtyper -> annotator` cycle that
     /// Python's GC handles upstream.
     pub annotator: Weak<RPythonAnnotator>,
+    /// RPython `self.rootclass_repr = RootClassRepr(self)` assigned at
+    /// `__init__` line 57 (rtyper.py:57). The `.setup()` call at
+    /// `__init__` line 58 is replayed inside
+    /// [`RPythonTyper::initialize_exceptiondata`].
+    ///
+    /// `RefCell<Option<_>>` instead of eagerly initialising in
+    /// [`RPythonTyper::new`] is a PRE-EXISTING-ADAPTATION (option 1A
+    /// from the porting plan): `RootClassRepr::new` does not need
+    /// `self`, but `ExceptionData::new` consumes the populated
+    /// `rootclass_repr` at rtyper.py:71, and that write lands after
+    /// the rtyper is wrapped in `Rc<Self>` so we cannot inline it into
+    /// `new()`. The `__init__` invariant that `rootclass_repr` is
+    /// `Some` on completion is still honoured by callers invoking
+    /// `initialize_exceptiondata` once at construction-time.
+    pub rootclass_repr: RefCell<Option<Arc<RootClassRepr>>>,
+    /// RPython `self.instance_reprs = {}` assigned at `__init__` line 59
+    /// (rtyper.py:59). `None` classdef mirrors upstream Python's ability
+    /// to use `None` as a dict key (option 3A from the porting plan).
+    pub instance_reprs: RefCell<HashMap<InstanceReprKey, Arc<InstanceRepr>>>,
     /// RPython `self.exceptiondata = ExceptionData(self)` assigned in
-    /// `__init__` (rtyper.py:86). Stays `None` until
-    /// `exceptiondata.py:16` `rootclass_repr` + `getinstancerepr(None)`
-    /// land; callers read through [`RPythonTyper::exceptiondata`] which
-    /// returns a structured `TyperError` in the meantime.
+    /// `__init__` (rtyper.py:71). Stays `None` until
+    /// [`RPythonTyper::initialize_exceptiondata`] runs.
     pub exceptiondata: RefCell<Option<Rc<ExceptionData>>>,
+    /// Self-weak backref populated by
+    /// [`RPythonTyper::initialize_exceptiondata`]. Exists so repr
+    /// dispatchers that only receive `&RPythonTyper` (notably
+    /// [`rmodel::rtyper_makerepr`] arms that route to
+    /// [`rclass::getinstancerepr`]) can upgrade back into
+    /// `Rc<RPythonTyper>` without plumbing a new parameter through
+    /// every `getrepr` call site. PRE-EXISTING-ADAPTATION; upstream
+    /// Python sidesteps this by storing `rtyper` on every Repr's
+    /// `self.rtyper` directly.
+    self_weak: RefCell<Weak<Self>>,
     /// RPython `self.already_seen = {}` assigned in `specialize()`
     /// (rtyper.py:186). Membership is queried by `simplify.py`.
     pub already_seen: RefCell<HashMap<BlockKey, bool>>,
@@ -137,7 +209,10 @@ impl RPythonTyper {
     pub fn new(annotator: &Rc<RPythonAnnotator>) -> Self {
         RPythonTyper {
             annotator: Rc::downgrade(annotator),
+            rootclass_repr: RefCell::new(None),
+            instance_reprs: RefCell::new(HashMap::new()),
             exceptiondata: RefCell::new(None),
+            self_weak: RefCell::new(Weak::new()),
             already_seen: RefCell::new(HashMap::new()),
             concrete_calltables: RefCell::new(HashMap::new()),
             reprs: RefCell::new(HashMap::new()),
@@ -148,17 +223,115 @@ impl RPythonTyper {
         }
     }
 
+    /// RPython inlined segment of `RPythonTyper.__init__` (rtyper.py:57-58,71):
+    ///
+    /// ```python
+    /// self.rootclass_repr = RootClassRepr(self)
+    /// self.rootclass_repr.setup()
+    /// ...
+    /// self.exceptiondata = ExceptionData(self)
+    /// ```
+    ///
+    /// Split off from [`RPythonTyper::new`] because `ExceptionData::new`
+    /// consumes the populated `self.rootclass_repr` / `self.instance_reprs`
+    /// state — that read has to happen after the typer is already
+    /// reachable via `Rc`, which `new()` cannot observe. The dual-phase
+    /// shape is a PRE-EXISTING-ADAPTATION documented on the field
+    /// declarations; callers must invoke this exactly once after
+    /// `new()` so the `__init__`-complete invariant (`rootclass_repr`
+    /// and `exceptiondata` are both `Some`) is restored.
+    pub fn initialize_exceptiondata(self: &Rc<Self>) -> Result<(), TyperError> {
+        // Populate the self-weak backref first so any downstream
+        // `rtyper_makerepr` arm that needs `Rc<Self>` (e.g.
+        // `SomeInstance.rtyper_makerepr -> getinstancerepr`) sees a
+        // live handle even before `rootclass_repr` is installed.
+        *self.self_weak.borrow_mut() = Rc::downgrade(self);
+        // rtyper.py:57 — `self.rootclass_repr = RootClassRepr(self)`.
+        let root = Arc::new(RootClassRepr::new());
+        // rtyper.py:58 — `self.rootclass_repr.setup()`.
+        Repr::setup(root.as_ref())?;
+        *self.rootclass_repr.borrow_mut() = Some(root.clone());
+        // rtyper.py:71 — `self.exceptiondata = ExceptionData(self)`.
+        //
+        // Inlining exceptiondata.py:17-26 because `ExceptionData::new`
+        // upstream takes `rtyper` and directly reads back the state
+        // this method just installed. We keep that single-shot body
+        // here rather than add a `Rc<RPythonTyper>` ctor parameter to
+        // `ExceptionData`.
+        let r_type: Arc<dyn Repr> = root.clone();
+        let r_instance = getinstancerepr(self, None, Flavor::Gc)?;
+        // exceptiondata.py:20-21 — `r_type.setup(); r_instance.setup()`.
+        Repr::setup(r_type.as_ref())?;
+        Repr::setup(r_instance.as_ref() as &dyn Repr)?;
+        let r_instance_as_repr: Arc<dyn Repr> = r_instance.clone();
+        let lltype_of_exception_type = r_type.lowleveltype().clone();
+        let lltype_of_exception_value = r_instance_as_repr.lowleveltype().clone();
+        let ed = ExceptionData {
+            r_exception_type: r_type,
+            r_exception_value: r_instance_as_repr,
+            lltype_of_exception_type,
+            lltype_of_exception_value,
+            fn_exception_match: RefCell::new(None),
+            fn_type_of_exc_inst: RefCell::new(None),
+        };
+        *self.exceptiondata.borrow_mut() = Some(Rc::new(ed));
+        Ok(())
+    }
+
+    /// Upgrade the stored self-weak (populated by
+    /// [`RPythonTyper::initialize_exceptiondata`]) back into
+    /// `Rc<Self>`. Surfaces a structured `TyperError` when the typer
+    /// was never wrapped in `Rc` or `initialize_exceptiondata` never
+    /// ran — both paths violate the invariant that R5 repr dispatch
+    /// requires.
+    pub fn self_rc(&self) -> Result<Rc<Self>, TyperError> {
+        self.self_weak.borrow().upgrade().ok_or_else(|| {
+            TyperError::message(
+                "RPythonTyper self-weak not set — call \
+                 initialize_exceptiondata() on an Rc<RPythonTyper> \
+                 before dispatching SomeInstance / SomeException / \
+                 SomeType reprs",
+            )
+        })
+    }
+
     /// Read access to the `ExceptionData` surface. Returns a structured
-    /// `TyperError` when `exceptiondata.py` initialisation has not yet
-    /// been ported (`rootclass_repr` / `getinstancerepr(None)` are the
-    /// missing dependencies).
+    /// `TyperError` when [`RPythonTyper::initialize_exceptiondata`] has
+    /// not yet been invoked for this typer instance.
     pub fn exceptiondata(&self) -> Result<Rc<ExceptionData>, TyperError> {
         self.exceptiondata.borrow().clone().ok_or_else(|| {
             TyperError::message(
-                "ExceptionData not initialised — port exceptiondata.py:16 \
-                 (requires rclass.rootclass_repr + getinstancerepr(rtyper, None))",
+                "ExceptionData not initialised — call \
+                 RPythonTyper::initialize_exceptiondata() after construction",
             )
         })
+    }
+
+    /// RPython `ExceptionData.finish(rtyper)`
+    /// (`rpython/rtyper/exceptiondata.py:28-32`):
+    ///
+    /// ```python
+    /// def finish(self, rtyper):
+    ///     bk = rtyper.annotator.bookkeeper
+    ///     for cls in self.standardexceptions:
+    ///         classdef = bk.getuniqueclassdef(cls)
+    ///         getclassrepr(rtyper, classdef).setup()
+    /// ```
+    ///
+    pub fn finish_exceptiondata(self: &Rc<Self>) -> Result<(), TyperError> {
+        let _ = self.exceptiondata()?;
+        let annotator = self
+            .annotator
+            .upgrade()
+            .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
+        let classdefs =
+            crate::annotator::exception::standard_exception_classdefs(&annotator.bookkeeper)
+                .map_err(|err| TyperError::message(err.to_string()))?;
+        for classdef in classdefs {
+            let repr = crate::translator::rtyper::rclass::getclassrepr(self, Some(&classdef))?;
+            Repr::setup(repr.as_ref())?;
+        }
+        Ok(())
     }
 
     /// RPython `RPythonTyper.getprimitiverepr(self, lltype)`
@@ -1056,6 +1229,55 @@ impl RPythonTyper {
             self.insert_link_conversions(extrablock.as_ref().unwrap(), 0)?;
         }
 
+        Ok(())
+    }
+
+    /// RPython `RPythonTyper.specialize(self, dont_simplify_again=False)`
+    /// (rtyper.py:177-189).
+    ///
+    /// ```python
+    /// def specialize(self, dont_simplify_again=False):
+    ///     if not dont_simplify_again:
+    ///         self.annotator.simplify()
+    ///     self.exceptiondata.finish(self)
+    ///     self.already_seen = {}
+    ///     self.specialize_more_blocks()
+    ///     self.exceptiondata.make_helpers(self)
+    ///     self.specialize_more_blocks()   # for the helpers just made
+    /// ```
+    ///
+    /// Scope deviation: `exceptiondata.make_helpers(self)` is blocked
+    /// on R4 (`MixLevelHelperAnnotator` + `ll_issubclass` / `ll_type`);
+    /// documented on the module header of
+    /// `translator/rtyper/rclass.rs`. Until that lands the call site
+    /// below is a no-op and the second `specialize_more_blocks()` pass
+    /// is redundant (no new helper graphs are generated). Both lines
+    /// remain in code shape so the future port is a swap-in of the
+    /// make_helpers body rather than a call-site audit.
+    pub fn specialize(self: &Rc<Self>, dont_simplify_again: bool) -> Result<(), TyperError> {
+        // rtyper.py:180-181 — optional annotator.simplify pass.
+        if !dont_simplify_again {
+            let ann = self.annotator.upgrade().ok_or_else(|| {
+                TyperError::message(
+                    "RPythonTyper.specialize: RPythonAnnotator weak reference dropped",
+                )
+            })?;
+            ann.simplify(None, None);
+        }
+        // rtyper.py:182 — `self.exceptiondata.finish(self)`.
+        self.finish_exceptiondata()?;
+        // rtyper.py:186 — `self.already_seen = {}`. Upstream resets the
+        // specialize visitation set so a second pass can retrace the
+        // newly-created helper blocks; pyre mirrors this with a
+        // RefCell-scoped clear.
+        self.already_seen.borrow_mut().clear();
+        // rtyper.py:187 — first `specialize_more_blocks()` pass.
+        self.specialize_more_blocks()?;
+        // rtyper.py:188 — `self.exceptiondata.make_helpers(self)`.
+        self.exceptiondata()?.make_helpers(self)?;
+        // rtyper.py:189 — second `specialize_more_blocks()` pass for
+        // the helpers just made.
+        self.specialize_more_blocks()?;
         Ok(())
     }
 
@@ -2081,6 +2303,8 @@ fn lowlevel_helper_graph(
             LowLevelType::SignedLongLongLong,
             "lllong_eq",
         ),
+        "ll_issubclass" => lowlevel_issubclass_helper_graph(name, args, result),
+        "ll_type" => lowlevel_type_helper_graph(name, args, result),
         _ => Ok(synthetic_lowlevel_helper_graph(name, args, result)),
     }
 }
@@ -2109,6 +2333,139 @@ fn helper_pygraph_from_graph(
         defaults: RefCell::new(Some(Vec::new())),
         access_directly: Cell::new(false),
     }
+}
+
+fn void_field_const(name: &str) -> Hlvalue {
+    constant_with_lltype(ConstValue::Str(name.to_string()), LowLevelType::Void)
+}
+
+fn lowlevel_issubclass_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if args != [CLASSTYPE.clone(), CLASSTYPE.clone()] || result != &LowLevelType::Bool {
+        return Err(TyperError::message(format!(
+            "{name} expects (CLASSTYPE, CLASSTYPE) -> Bool, got ({args:?}) -> {result:?}"
+        )));
+    }
+
+    let argnames = vec!["arg0".to_string(), "arg1".to_string()];
+    let subcls = variable_with_lltype("arg0", CLASSTYPE.clone());
+    let cls = variable_with_lltype("arg1", CLASSTYPE.clone());
+    let cls_min = variable_with_lltype("cls_min", LowLevelType::Signed);
+    let subcls_min = variable_with_lltype("subcls_min", LowLevelType::Signed);
+    let cls_max = variable_with_lltype("cls_max", LowLevelType::Signed);
+    let is_subclass = variable_with_lltype("result", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(subcls.clone()),
+        Hlvalue::Variable(cls.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(cls.clone()),
+            void_field_const("subclassrange_min"),
+        ],
+        Hlvalue::Variable(cls_min.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(subcls.clone()),
+            void_field_const("subclassrange_min"),
+        ],
+        Hlvalue::Variable(subcls_min.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(cls),
+            void_field_const("subclassrange_max"),
+        ],
+        Hlvalue::Variable(cls_max.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_between",
+        vec![
+            Hlvalue::Variable(cls_min),
+            Hlvalue::Variable(subcls_min),
+            Hlvalue::Variable(cls_max),
+        ],
+        Hlvalue::Variable(is_subclass.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(is_subclass)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+fn lowlevel_type_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if args != [OBJECTPTR.clone()] || result != &CLASSTYPE.clone() {
+        return Err(TyperError::message(format!(
+            "{name} expects (OBJECTPTR) -> CLASSTYPE, got ({args:?}) -> {result:?}"
+        )));
+    }
+
+    let argnames = vec!["arg0".to_string()];
+    let excinst = variable_with_lltype("arg0", OBJECTPTR.clone());
+    let obj = variable_with_lltype("obj", OBJECTPTR.clone());
+    let typeptr = variable_with_lltype("result", CLASSTYPE.clone());
+    let return_var = variable_with_lltype("result", CLASSTYPE.clone());
+
+    let startblock = Block::shared(vec![Hlvalue::Variable(excinst.clone())]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_pointer",
+        vec![Hlvalue::Variable(excinst)],
+        Hlvalue::Variable(obj.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(obj), void_field_const("typeptr")],
+        Hlvalue::Variable(typeptr.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(typeptr)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
 fn exception_args(exc_name: &str) -> Result<Vec<Hlvalue>, TyperError> {
@@ -3894,6 +4251,89 @@ mod tests {
         assert!(rtyper.already_seen.borrow().is_empty());
         assert!(rtyper.concrete_calltables.borrow().is_empty());
         assert!(rtyper.primitive_to_repr.borrow().is_empty());
+        assert!(rtyper.rootclass_repr.borrow().is_none());
+        assert!(rtyper.instance_reprs.borrow().is_empty());
+    }
+
+    #[test]
+    fn initialize_exceptiondata_populates_rootclass_repr_and_instance_reprs() {
+        use crate::translator::rtyper::rclass::{Flavor, OBJECT, OBJECTPTR};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // rtyper.py:57-58 — rootclass_repr set + setup.
+        let root = rtyper
+            .rootclass_repr
+            .borrow()
+            .clone()
+            .expect("rootclass_repr should be Some after initialize");
+        assert_eq!(
+            root.lowleveltype(),
+            &crate::translator::rtyper::rclass::CLASSTYPE.clone()
+        );
+
+        // rtyper.py:59 / rclass.py:76-88 — instance_reprs cache now
+        // contains a `(None, Flavor::Gc)` entry.
+        let cache = rtyper.instance_reprs.borrow();
+        let inst = cache
+            .get(&(None, Flavor::Gc))
+            .expect("(None, Gc) entry should be present");
+        assert!(inst.classdef().is_none());
+        assert_eq!(inst.gcflavor(), Flavor::Gc);
+        assert_eq!(inst.object_type(), &OBJECT.clone());
+        drop(cache);
+
+        // rtyper.py:71 / exceptiondata.py:22-25 — ExceptionData fields.
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+        assert_eq!(
+            ed.lltype_of_exception_type,
+            crate::translator::rtyper::rclass::CLASSTYPE.clone()
+        );
+        assert_eq!(ed.lltype_of_exception_value, OBJECTPTR.clone());
+    }
+
+    #[test]
+    fn exceptiondata_without_initialize_returns_structured_typererror() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let err = rtyper
+            .exceptiondata()
+            .expect_err("exceptiondata before initialize_exceptiondata should fail");
+        assert!(format!("{err:?}").contains("initialize_exceptiondata"));
+    }
+
+    #[test]
+    fn finish_exceptiondata_sets_up_class_reprs_for_every_standard_exception() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper
+            .finish_exceptiondata()
+            .expect("finish_exceptiondata must succeed after initialize");
+
+        let classdefs =
+            crate::annotator::exception::standard_exception_classdefs(&ann.bookkeeper).unwrap();
+        assert!(
+            classdefs
+                .iter()
+                .all(|classdef| classdef.borrow().repr.is_some())
+        );
+    }
+
+    #[test]
+    fn finish_exceptiondata_without_initialize_surfaces_typererror() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let err = rtyper
+            .finish_exceptiondata()
+            .expect_err("finish without initialize must error");
+        assert!(err.to_string().contains("ExceptionData not initialised"));
     }
 
     #[test]
@@ -4965,17 +5405,16 @@ mod tests {
     }
 
     #[test]
-    fn convert_link_canraise_branch_defers_to_exceptiondata() {
+    fn convert_link_canraise_branch_defers_without_rootclass_repr() {
         // rtyper.py:358-359 — non-Variable exitswitch on a canraise
-        // block needs `rclass.get_type_repr(self)`, which depends on
-        // ExceptionData. Port defers with a TyperError.
+        // block reads `rclass.get_type_repr(self)`, which pulls
+        // `rtyper.rootclass_repr`. Without a prior
+        // `initialize_exceptiondata()` call the port surfaces a
+        // structured TyperError pointing at that missing init step.
         use crate::flowspace::model::c_last_exception;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let block = Block::shared(vec![]);
-        // c_last_exception sentinel makes canraise() return true
-        // without needing an operation; upstream uses this for the
-        // exception-edge guard.
         block.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
         assert!(block.borrow().canraise());
         let target = Block::shared(vec![]);
@@ -4985,8 +5424,8 @@ mod tests {
         let link = Link::new(vec![], Some(target), exitcase).into_ref();
         let err = rtyper._convert_link(&block, &link).unwrap_err();
         assert!(
-            err.to_string().contains("ExceptionData"),
-            "expected ExceptionData defer; got {err}",
+            err.to_string().contains("initialize_exceptiondata"),
+            "expected initialize_exceptiondata defer; got {err}",
         );
     }
 
@@ -5210,6 +5649,54 @@ mod tests {
             rendered.contains("block-entry"),
             "expected 'block-entry' position in where-op: {rendered}",
         );
+    }
+
+    #[test]
+    fn specialize_top_driver_runs_simplify_finish_and_two_more_blocks_passes() {
+        // rtyper.py:177-189 — smoke test that the end-to-end driver
+        // runs cleanly on an empty annotator (simplify no-op, finish
+        // populates classdef.repr for standard exceptions, both
+        // specialize_more_blocks calls exit via the empty-pending
+        // break).
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper.specialize(false).expect("specialize");
+        let classdefs =
+            crate::annotator::exception::standard_exception_classdefs(&ann.bookkeeper).unwrap();
+        assert!(
+            classdefs
+                .iter()
+                .all(|classdef| classdef.borrow().repr.is_some()),
+            "specialize must run finish_exceptiondata, populating classdef.repr"
+        );
+    }
+
+    #[test]
+    fn specialize_without_initialize_surfaces_typererror() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let err = rtyper
+            .specialize(false)
+            .expect_err("specialize before initialize must fail");
+        assert!(err.to_string().contains("ExceptionData not initialised"));
+    }
+
+    #[test]
+    fn specialize_dont_simplify_again_skips_annotator_simplify() {
+        // The dont_simplify_again=True path must still succeed even
+        // without the annotator.simplify() call (upstream's
+        // --no-simplify / caller-owns-simplify use case).
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper
+            .specialize(true)
+            .expect("specialize(dont_simplify_again=true)");
     }
 
     #[test]
