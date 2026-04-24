@@ -883,6 +883,18 @@ pub fn w_int_size_descr() -> DescrRef {
     W_INT_DESCR_GROUP.size_descr.clone()
 }
 
+/// Size descriptor for W_BoolObject allocation via NewWithVtable.
+/// vtable = &BOOL_TYPE; type_id = 0 (bool reuses the OBJECT root id).
+pub fn w_bool_size_descr() -> DescrRef {
+    W_BOOL_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for W_RangeIterator allocation via NewWithVtable.
+/// vtable = &RANGE_ITER_TYPE; type_id = 0.
+pub fn w_range_iter_size_descr() -> DescrRef {
+    RANGE_ITER_DESCR_GROUP.size_descr.clone()
+}
+
 /// Size descriptor for W_FloatObject allocation via NewWithVtable.
 /// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {

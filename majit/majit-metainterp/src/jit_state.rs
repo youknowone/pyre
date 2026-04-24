@@ -1287,11 +1287,13 @@ mod tests {
 
         let virtuals_session1 = vec![
             MaterializedVirtual::Obj {
+                descr: None,
                 type_id: 1,
                 descr_index: 0,
                 fields: vec![(0, MaterializedValue::Value(100))],
             },
             MaterializedVirtual::Obj {
+                descr: None,
                 type_id: 2,
                 descr_index: 1,
                 fields: vec![(0, MaterializedValue::Value(200))],
@@ -1326,11 +1328,13 @@ mod tests {
 
         let virtuals_first = vec![
             MaterializedVirtual::Obj {
+                descr: None,
                 type_id: 1,
                 descr_index: 0,
                 fields: vec![(0, MaterializedValue::Value(100))],
             },
             MaterializedVirtual::Obj {
+                descr: None,
                 type_id: 2,
                 descr_index: 1,
                 fields: vec![(0, MaterializedValue::Value(200))],
@@ -1345,16 +1349,19 @@ mod tests {
         // Second deopt adds virtual C
         let virtuals_second = vec![
             MaterializedVirtual::Obj {
+                descr: None,
                 type_id: 1,
                 descr_index: 0,
                 fields: vec![(0, MaterializedValue::Value(100))],
             },
             MaterializedVirtual::Obj {
+                descr: None,
                 type_id: 2,
                 descr_index: 1,
                 fields: vec![(0, MaterializedValue::Value(200))],
             },
             MaterializedVirtual::Obj {
+                descr: None,
                 type_id: 3,
                 descr_index: 2,
                 fields: vec![(0, MaterializedValue::Value(300))],
@@ -1376,6 +1383,7 @@ mod tests {
         let mut cache = DeoptMaterializationCache::new();
 
         let virt = MaterializedVirtual::Obj {
+            descr: None,
             type_id: 1,
             descr_index: 0,
             fields: vec![(0, MaterializedValue::Value(42))],

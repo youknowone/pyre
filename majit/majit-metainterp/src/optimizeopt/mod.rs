@@ -781,13 +781,17 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         _fielddescr_indices: &[u32],
         fielddescrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
+        // `FieldDescrInfo.index` must carry the stable descriptor index
+        // (tagged offset) so resume-data readers can identify the field by
+        // byte offset. Previously stored `fi as u32` (iteration counter),
+        // which made `extract_pyre_field_offset` always fail for virtuals
+        // being materialized on bridge entry.
         let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescrs
             .iter()
-            .enumerate()
-            .map(|(fi, descr)| {
+            .map(|descr| {
                 let fd = descr.as_field_descr();
                 majit_ir::FieldDescrInfo {
-                    index: fi as u32,
+                    index: descr.index(),
                     offset: fd.map(|f| f.offset()).unwrap_or(0),
                     field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
                     field_size: fd.map(|f| f.field_size()).unwrap_or(8),
@@ -816,13 +820,14 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         _fielddescr_indices: &[u32],
         fielddescrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
+        // See `visit_virtual` — index must be the stable descriptor index,
+        // not the iteration counter.
         let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescrs
             .iter()
-            .enumerate()
-            .map(|(fi, descr)| {
+            .map(|descr| {
                 let fd = descr.as_field_descr();
                 majit_ir::FieldDescrInfo {
-                    index: fi as u32,
+                    index: descr.index(),
                     offset: fd.map(|f| f.offset()).unwrap_or(0),
                     field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
                     field_size: fd.map(|f| f.field_size()).unwrap_or(8),
@@ -5275,6 +5280,112 @@ mod ensure_ptr_info_arg0_tests {
             Some(PtrInfo::Instance(_)) => {} // unchanged
             other => panic!("expected Instance preserved, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod rd_virtual_info_builder_tests {
+    use super::*;
+    use crate::walkvirtual::VirtualVisitor;
+    use majit_ir::{Descr, DescrRef, FieldDescr, SizeDescr, Type};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct TestSizeDescr {
+        index: u32,
+        type_id: u32,
+        is_object: bool,
+    }
+
+    impl Descr for TestSizeDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+
+        fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl SizeDescr for TestSizeDescr {
+        fn size(&self) -> usize {
+            16
+        }
+
+        fn type_id(&self) -> u32 {
+            self.type_id
+        }
+
+        fn is_immutable(&self) -> bool {
+            false
+        }
+
+        fn is_object(&self) -> bool {
+            self.is_object
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestFieldDescr {
+        index: u32,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+    }
+
+    impl Descr for TestFieldDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestFieldDescr {
+        fn offset(&self) -> usize {
+            self.offset
+        }
+
+        fn field_size(&self) -> usize {
+            self.field_size
+        }
+
+        fn field_type(&self) -> Type {
+            self.field_type
+        }
+    }
+
+    #[test]
+    fn visit_virtual_preserves_field_descr_indices() {
+        let mut builder = RdVirtualInfoBuilder;
+        let size_descr: DescrRef = Arc::new(TestSizeDescr {
+            index: 0x3000_0001,
+            type_id: 7,
+            is_object: true,
+        });
+        let field0: DescrRef = Arc::new(TestFieldDescr {
+            index: 0x1000_0123,
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Int,
+        });
+        let field1: DescrRef = Arc::new(TestFieldDescr {
+            index: 0x1000_0456,
+            offset: 24,
+            field_size: 8,
+            field_type: Type::Ref,
+        });
+
+        let Some(majit_ir::RdVirtualInfo::VirtualInfo { fielddescrs, .. }) =
+            builder.visit_virtual(&size_descr, &[], &[field0.clone(), field1.clone()])
+        else {
+            panic!("expected VirtualInfo");
+        };
+
+        assert_eq!(fielddescrs[0].index, field0.index());
+        assert_eq!(fielddescrs[1].index, field1.index());
     }
 }
 

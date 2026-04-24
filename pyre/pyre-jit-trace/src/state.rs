@@ -142,6 +142,7 @@ struct MetaInterpStaticData {
     canonical: majit_metainterp::MetaInterpStaticData,
 }
 
+#[allow(dead_code)]
 impl MetaInterpStaticData {
     fn new() -> Self {
         Self {
@@ -220,7 +221,6 @@ pub(crate) fn publish_liveness_info(bytes: Vec<u8>) {
     METAINTERP_SD.with(|r| r.borrow_mut().set_liveness_info(bytes));
 }
 
-#[allow(dead_code)]
 impl MetaInterpStaticData {
     #[inline]
     fn canonical_code_key(code: *const ()) -> usize {
@@ -4367,10 +4367,20 @@ impl PyreJitState {
         use majit_metainterp::resume::MaterializedVirtual;
 
         match materialized {
-            MaterializedVirtual::Struct { fields, .. }
-            | MaterializedVirtual::Obj { fields, .. } => {
-                self.materialize_virtual_object(fields, materialized_refs)
-            }
+            // resume.py:618-620 VirtualInfo.allocate — `allocate_with_vtable(descr=self.descr)`
+            // followed by `setfields`. descr carries both vtable and obj_size.
+            MaterializedVirtual::Obj {
+                descr: Some(descr),
+                fields,
+                ..
+            } => materialize_virtual_object(descr, fields, materialized_refs),
+            // resume.py:633-636 VStructInfo.allocate — `allocate_struct(self.typedescr)`
+            // + `setfields`. No vtable write.
+            MaterializedVirtual::Struct {
+                descr: Some(descr),
+                fields,
+                ..
+            } => materialize_virtual_struct(descr, fields, materialized_refs),
             MaterializedVirtual::RawBuffer {
                 func,
                 size,
@@ -4388,79 +4398,154 @@ impl PyreJitState {
             _ => None,
         }
     }
+}
 
-    /// resume.py:597-602 AbstractVirtualStructInfo.setfields parity:
-    /// ALL traced fields are restored, including w_class.
-    fn materialize_virtual_object(
-        &mut self,
-        fields: &[(u32, majit_metainterp::resume::MaterializedValue)],
-        materialized_refs: &[Option<majit_ir::GcRef>],
-    ) -> Option<majit_ir::GcRef> {
-        let mut ob_type: usize = 0;
-        let mut w_class: usize = 0;
-        let mut int_payload: i64 = 0;
-        let mut list_items_ptr: usize = 0;
-        let mut list_items_len: usize = 0;
+/// resume.py:618-621 VirtualInfo.allocate parity — `allocate_with_vtable(descr)`
+/// then `setfields`.
+///
+/// Allocates `descr.size()` bytes aligned to 8, seeds the PyObject header
+/// (`ob_type = descr.vtable()`, `w_class = get_instantiate(vtable)`), then
+/// replays each traced field using the FieldDescr's byte offset/size/type
+/// from the SizeDescr's `all_field_descrs()` table (resume.py:597-603
+/// setfields loop — `decoder.setfield(struct, num, descr)`).
+///
+/// The vtable source is the descr itself — there is no `type_id` special-casing,
+/// so bool (type_id=0, vtable=&BOOL_TYPE), range-iter (type_id=0,
+/// vtable=&RANGE_ITER_TYPE) and custom classes all dispatch uniformly.
+fn materialize_virtual_object(
+    descr: &DescrRef,
+    fields: &[(u32, majit_metainterp::resume::MaterializedValue)],
+    materialized_refs: &[Option<majit_ir::GcRef>],
+) -> Option<majit_ir::GcRef> {
+    use pyre_object::pyobject::{
+        OB_TYPE_OFFSET, PyObject, PyType, W_CLASS_OFFSET, get_instantiate,
+    };
 
-        use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
-        // PyObject layout: [ob_type @ 0, w_class @ 8]
-        // Payload fields start at sizeof(PyObject) = 16.
-        const PAYLOAD_0: usize = std::mem::size_of::<pyre_object::pyobject::PyObject>();
-        const PAYLOAD_1: usize = PAYLOAD_0 + 8;
+    let size_descr = descr.as_size_descr()?;
+    let vtable = size_descr.vtable();
+    let obj_size = size_descr.size();
+    if vtable == 0 || obj_size < std::mem::size_of::<PyObject>() {
+        return None;
+    }
 
-        for (field_idx, value) in fields {
-            let offset = extract_pyre_field_offset(*field_idx);
-            let concrete = value.resolve_with_refs(materialized_refs)?;
-            match offset {
-                Some(o) if o == OB_TYPE_OFFSET => ob_type = concrete as usize,
-                // resume.py:598-602: restore ALL fields, including w_class.
-                Some(o) if o == W_CLASS_OFFSET => w_class = concrete as usize,
-                Some(o) if o == PAYLOAD_0 => {
-                    if ob_type == &LIST_TYPE as *const _ as usize {
-                        list_items_ptr = concrete as usize;
-                    } else {
-                        int_payload = concrete;
-                    }
-                }
-                Some(o) if o == PAYLOAD_1 && ob_type == &LIST_TYPE as *const _ as usize => {
-                    list_items_len = concrete as usize;
-                }
-                _ => {}
-            }
-        }
+    // resume.py:619 allocate_with_vtable — raw heap allocation that
+    // matches `Box::leak(Box::new(...))` for pyre's existing W_*Object
+    // builders. 8-byte alignment matches the natural alignment of
+    // `#[repr(C)]` structs whose first field is an 8-byte pointer.
+    let layout = std::alloc::Layout::from_size_align(obj_size, 8).ok()?;
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return None;
+    }
 
-        let ptr = if ob_type == &INT_TYPE as *const _ as usize {
-            pyre_object::intobject::w_int_new(int_payload)
-        } else if ob_type == &FLOAT_TYPE as *const _ as usize {
-            pyre_object::floatobject::w_float_new(f64::from_bits(int_payload as u64))
-        } else if ob_type == &LIST_TYPE as *const _ as usize {
-            let items = if list_items_len == 0 {
-                Vec::new()
-            } else {
-                if list_items_ptr == 0 {
-                    return None;
-                }
-                unsafe {
-                    std::slice::from_raw_parts(list_items_ptr as *const PyObjectRef, list_items_len)
-                        .to_vec()
-                }
-            };
-            w_list_new(items)
-        } else {
-            return None;
+    unsafe {
+        let ptr = raw as *mut PyObject;
+        (*ptr).ob_type = vtable as *const PyType;
+        // rclass.py:739-743 set `w_class` from the cached instantiate
+        // pointer on the PyType. Tracing may later overwrite this via
+        // an explicit `SetfieldGc(w_class)`; the field replay below
+        // takes precedence for that case (heaptracker.py:66-style
+        // "typeptr" filter does NOT apply to w_class in pyre).
+        (*ptr).w_class = get_instantiate(&*(vtable as *const PyType));
+    }
+
+    // resume.py:597-603 setfields parity: for each traced field,
+    // look up the FieldDescr from the SizeDescr table and write the
+    // value at descr.offset() with descr.field_size() bytes.
+    for (field_idx, value) in fields {
+        let Some(field_descr) = size_descr
+            .all_field_descrs()
+            .iter()
+            .find(|fd| fd.index() == *field_idx)
+        else {
+            // Field not in the SizeDescr table — skip (ob_type handled
+            // above; anything else is a tracer bug we just log-silently
+            // drop rather than corrupt memory).
+            continue;
         };
-
-        // resume.py:602 setfields parity: restore traced w_class if recorded.
-        // Without this, builtin subclasses or __class__-mutated objects would
-        // revert to the default builtin type after guard failure.
-        if w_class != 0 {
+        let offset = field_descr.offset();
+        let field_size = field_descr.field_size();
+        if offset == OB_TYPE_OFFSET && field_size == std::mem::size_of::<*const PyType>() {
+            // ob_type already written from vtable; honour explicit override.
+            let concrete = value.resolve_with_refs(materialized_refs)?;
             unsafe {
-                (*(ptr as *mut pyre_object::pyobject::PyObject)).w_class =
-                    w_class as *mut pyre_object::pyobject::PyObject;
+                (raw.add(offset) as *mut usize).write(concrete as usize);
+            }
+            continue;
+        }
+        if offset == W_CLASS_OFFSET && field_size == std::mem::size_of::<*mut PyObject>() {
+            let concrete = value.resolve_with_refs(materialized_refs)?;
+            unsafe {
+                (raw.add(offset) as *mut usize).write(concrete as usize);
+            }
+            continue;
+        }
+        let concrete = value.resolve_with_refs(materialized_refs)?;
+        unsafe {
+            write_field_bytes(raw, offset, field_size, concrete);
+        }
+    }
+
+    Some(majit_ir::GcRef(raw as usize))
+}
+
+/// resume.py:633-636 VStructInfo.allocate parity — `allocate_struct(typedescr)`
+/// (no vtable) + `setfields`.
+fn materialize_virtual_struct(
+    descr: &DescrRef,
+    fields: &[(u32, majit_metainterp::resume::MaterializedValue)],
+    materialized_refs: &[Option<majit_ir::GcRef>],
+) -> Option<majit_ir::GcRef> {
+    let size_descr = descr.as_size_descr()?;
+    let obj_size = size_descr.size();
+    if obj_size == 0 {
+        return None;
+    }
+    let layout = std::alloc::Layout::from_size_align(obj_size, 8).ok()?;
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return None;
+    }
+    for (field_idx, value) in fields {
+        let Some(field_descr) = size_descr
+            .all_field_descrs()
+            .iter()
+            .find(|fd| fd.index() == *field_idx)
+        else {
+            continue;
+        };
+        let offset = field_descr.offset();
+        let field_size = field_descr.field_size();
+        let concrete = value.resolve_with_refs(materialized_refs)?;
+        unsafe {
+            write_field_bytes(raw, offset, field_size, concrete);
+        }
+    }
+    Some(majit_ir::GcRef(raw as usize))
+}
+
+/// Write an i64 value into a byte-size field at `offset` inside `raw`.
+/// Supports 1/2/4/8 byte widths. 8-byte write also handles Ref/Float
+/// (Float arrives as `value.to_bits() as i64`; raw bytes reinterpret).
+///
+/// # Safety
+/// Caller guarantees `raw + offset + field_size` is within the object allocation.
+unsafe fn write_field_bytes(raw: *mut u8, offset: usize, field_size: usize, value: i64) {
+    unsafe {
+        let dst = raw.add(offset);
+        match field_size {
+            1 => (dst as *mut u8).write(value as u8),
+            2 => (dst as *mut u16).write(value as u16),
+            4 => (dst as *mut u32).write(value as u32),
+            8 => (dst as *mut u64).write(value as u64),
+            _ => {
+                // Fallback: write as raw bytes LE, truncated.
+                let bytes = value.to_le_bytes();
+                for i in 0..field_size.min(bytes.len()) {
+                    dst.add(i).write(bytes[i]);
+                }
             }
         }
-
-        Some(majit_ir::GcRef(ptr as usize))
     }
 }
 
@@ -4522,16 +4607,6 @@ fn value_to_usize(value: &Value) -> usize {
         Value::Int(n) => *n as usize,
         _ => 0,
     }
-}
-
-/// Extract byte offset from a pyre field descriptor index.
-/// Mirrors `extract_field_offset` in majit-opt/virtualize.rs.
-fn extract_pyre_field_offset(descr_idx: u32) -> Option<usize> {
-    const FIELD_DESCR_TAG: u32 = 0x1000_0000;
-    if descr_idx & 0xF000_0000 != FIELD_DESCR_TAG {
-        return None;
-    }
-    Some(((descr_idx >> 4) & 0x000f_ffff) as usize)
 }
 
 #[cfg(test)]
@@ -5394,19 +5469,15 @@ mod tests {
         let mut state = empty_state();
         let meta = empty_meta();
         let value = 3.25f64;
+        let descr = crate::descr::w_float_size_descr();
         let materialized = MaterializedVirtual::Obj {
-            type_id: 0,
-            descr_index: crate::descr::w_float_size_descr().index(),
-            fields: vec![
-                (
-                    crate::descr::ob_type_descr().index(),
-                    MaterializedValue::Value(&FLOAT_TYPE as *const PyType as usize as i64),
-                ),
-                (
-                    crate::descr::float_floatval_descr().index(),
-                    MaterializedValue::Value(value.to_bits() as i64),
-                ),
-            ],
+            descr: Some(descr.clone()),
+            type_id: crate::descr::W_FLOAT_GC_TYPE_ID,
+            descr_index: descr.index(),
+            fields: vec![(
+                crate::descr::float_floatval_descr().index(),
+                MaterializedValue::Value(value.to_bits() as i64),
+            )],
         };
 
         let ptr = <PyreJitState as JitState>::materialize_virtual_ref_with_refs(
@@ -5421,6 +5492,86 @@ mod tests {
         unsafe {
             assert!(is_float(ptr.0 as PyObjectRef));
             assert_eq!(w_float_get_value(ptr.0 as PyObjectRef), value);
+        }
+    }
+
+    /// type_id=0 case: W_BoolObject has no dedicated GC type id but a
+    /// distinct vtable (`&BOOL_TYPE`). The orthodox materializer must
+    /// dispatch on `descr.vtable()` rather than `type_id`.
+    #[test]
+    fn test_materialize_virtual_ref_reconstructs_bool_object() {
+        use pyre_object::boolobject::w_bool_get_value;
+        let mut state = empty_state();
+        let meta = empty_meta();
+        let descr = crate::descr::w_bool_size_descr();
+        let materialized = MaterializedVirtual::Obj {
+            descr: Some(descr.clone()),
+            type_id: 0,
+            descr_index: descr.index(),
+            fields: vec![(
+                crate::descr::bool_boolval_descr().index(),
+                MaterializedValue::Value(1),
+            )],
+        };
+
+        let ptr = <PyreJitState as JitState>::materialize_virtual_ref_with_refs(
+            &mut state,
+            &meta,
+            0,
+            &materialized,
+            &[],
+        )
+        .expect("bool virtual should materialize");
+
+        unsafe {
+            assert!(is_bool(ptr.0 as PyObjectRef));
+            assert!(w_bool_get_value(ptr.0 as PyObjectRef));
+        }
+    }
+
+    /// Second type_id=0 case: W_RangeIterator has three i64 fields.
+    /// Verifies generic field replay at different offsets (no
+    /// hard-coded PAYLOAD_0/PAYLOAD_1 dispatch).
+    #[test]
+    fn test_materialize_virtual_ref_reconstructs_range_iterator() {
+        use pyre_object::rangeobject::W_RangeIterator;
+        let mut state = empty_state();
+        let meta = empty_meta();
+        let descr = crate::descr::w_range_iter_size_descr();
+        let materialized = MaterializedVirtual::Obj {
+            descr: Some(descr.clone()),
+            type_id: 0,
+            descr_index: descr.index(),
+            fields: vec![
+                (
+                    crate::descr::range_iter_current_descr().index(),
+                    MaterializedValue::Value(7),
+                ),
+                (
+                    crate::descr::range_iter_stop_descr().index(),
+                    MaterializedValue::Value(42),
+                ),
+                (
+                    crate::descr::range_iter_step_descr().index(),
+                    MaterializedValue::Value(3),
+                ),
+            ],
+        };
+
+        let ptr = <PyreJitState as JitState>::materialize_virtual_ref_with_refs(
+            &mut state,
+            &meta,
+            0,
+            &materialized,
+            &[],
+        )
+        .expect("range-iter virtual should materialize");
+
+        unsafe {
+            let iter = &*(ptr.0 as *const W_RangeIterator);
+            assert_eq!(iter.current, 7);
+            assert_eq!(iter.stop, 42);
+            assert_eq!(iter.step, 3);
         }
     }
 
@@ -5474,6 +5625,7 @@ mod tests {
         .expect("raw items buffer should materialize");
 
         let list_virtual = MaterializedVirtual::Obj {
+            descr: None,
             type_id: 0,
             descr_index: 0,
             fields: vec![

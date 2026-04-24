@@ -2451,17 +2451,24 @@ impl MaterializedValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum MaterializedVirtual {
-    /// Object with vtable.
+    /// Object with vtable — resume.py:612 VirtualInfo.
+    /// Carries `descr` (resume.py:615 self.descr) so the deopt path can
+    /// `allocate_with_vtable(descr=self.descr)` and replay fields generically,
+    /// without special-casing the vtable at the JIT-state layer.
     Obj {
+        /// SizeDescr for allocation (exposes vtable + obj_size).
+        descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         /// (field_descr_index, concrete_value).
         fields: Vec<(u32, MaterializedValue)>,
     },
-    /// Plain struct.
+    /// Plain struct — resume.py:628 VStructInfo.
     Struct {
+        /// resume.py:631 self.typedescr.
+        descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         descr_index: u32,
         fields: Vec<(u32, MaterializedValue)>,
@@ -2492,19 +2499,23 @@ impl MaterializedVirtual {
     fn from_info(info: &VirtualInfo) -> Self {
         match info {
             VirtualInfo::VirtualObj {
+                descr,
                 type_id,
                 descr_index,
                 ..
             } => MaterializedVirtual::Obj {
+                descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: Vec::new(),
             },
             VirtualInfo::VStruct {
+                typedescr,
                 type_id,
                 descr_index,
                 ..
             } => MaterializedVirtual::Struct {
+                descr: typedescr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: Vec::new(),
@@ -2541,6 +2552,7 @@ impl MaterializedVirtual {
                 values: vec![MaterializedValue::Value(0); offsets.len()],
             },
             VirtualInfo::VRawSlice { .. } => MaterializedVirtual::Struct {
+                descr: None,
                 type_id: 0,
                 descr_index: 0,
                 fields: Vec::new(),
@@ -2556,6 +2568,7 @@ impl MaterializedVirtual {
             | VirtualInfo::VUniPlain { .. }
             | VirtualInfo::VUniConcat { .. }
             | VirtualInfo::VUniSlice { .. } => MaterializedVirtual::Struct {
+                descr: None,
                 type_id: 0,
                 descr_index: 0,
                 fields: Vec::new(),
@@ -2642,10 +2655,12 @@ impl MaterializedVirtual {
     ) -> Option<MaterializedVirtual> {
         match self {
             MaterializedVirtual::Obj {
+                descr,
                 type_id,
                 descr_index,
                 fields,
             } => Some(MaterializedVirtual::Obj {
+                descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -2659,10 +2674,12 @@ impl MaterializedVirtual {
                     .collect::<Option<Vec<_>>>()?,
             }),
             MaterializedVirtual::Struct {
+                descr,
                 type_id,
                 descr_index,
                 fields,
             } => Some(MaterializedVirtual::Struct {
+                descr: descr.clone(),
                 type_id: *type_id,
                 descr_index: *descr_index,
                 fields: fields
@@ -5633,9 +5650,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
-                if vable_size > 0 {
-                    self.consume_vable_info(vi, vable_size);
-                }
+                self.consume_vable_info(vi, vable_size);
             }
             // resume.py:1429-1430
             if ginfo.is_some() {

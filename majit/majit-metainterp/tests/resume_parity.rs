@@ -113,17 +113,25 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             item_index: Some(2),
         }]
     );
-    assert_eq!(
-        state.virtuals[0],
+    match &state.virtuals[0] {
         majit_metainterp::resume::MaterializedVirtual::Obj {
-            type_id: 1,
-            descr_index: 3,
-            fields: vec![
-                (0, majit_metainterp::resume::MaterializedValue::Value(88)),
-                (1, majit_metainterp::resume::MaterializedValue::Value(99)),
-            ],
+            type_id,
+            descr_index,
+            fields,
+            ..
+        } => {
+            assert_eq!(*type_id, 1);
+            assert_eq!(*descr_index, 3);
+            assert_eq!(
+                fields,
+                &vec![
+                    (0, majit_metainterp::resume::MaterializedValue::Value(88)),
+                    (1, majit_metainterp::resume::MaterializedValue::Value(99)),
+                ]
+            );
         }
-    );
+        other => panic!("expected Obj, got {:?}", other),
+    }
 }
 
 /// resume.py:199-226 _number_boxes: count includes ALL liveboxes

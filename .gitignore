@@ -76,3 +76,4 @@ Cargo.lock
 .claude/settings.local.json
 .claude/stop-hook.sh
 aheui/
+CLAUDE.md

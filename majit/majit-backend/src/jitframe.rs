@@ -279,16 +279,15 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
         if gcmap_raw.is_null() {
             return; // done
         }
-        let gcmap_bytes = gcmap_raw as *const u8;
 
         // jitframe.py:118 — gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
-        let gcmap_lgt = *(gcmap_bytes.add(GCMAPLENGTHOFS) as *const isize);
+        let gcmap_lgt = *(gcmap_raw.add(GCMAPLENGTHOFS) as *const isize);
 
         // jitframe.py:119-135
         let mut no: isize = 0;
         while no < gcmap_lgt {
             // jitframe.py:121 — cur = (gcmap + GCMAPBASEOFS + UNSIGN_SIZE * no).unsigned[0]
-            let cur = *(gcmap_bytes.add(GCMAPBASEOFS + UNSIGN_SIZE * no as usize) as *const usize);
+            let cur = *(gcmap_raw.add(GCMAPBASEOFS + UNSIGN_SIZE * no as usize) as *const usize);
             let mut bitindex: usize = 0;
             while bitindex < max {
                 if cur & (1usize << bitindex) != 0 {
