@@ -878,42 +878,38 @@ impl MIFrame {
             }
             let value = s.registers_r[reg_idx];
             s.valuestackdepth -= 1;
-            // Task #136 partial: gating on `vable_array_base.is_some()`
-            // intentionally does NOT cover bridges here. Unlike the other
-            // four mirror sites (push_typed_value / swap_values /
-            // store_local_value / finishframe_exception, all flipped to
-            // `owns_virtualizable_shadow()`), clearing the bridge shadow
-            // to NULL on every pop triggers a severe perf regression on
-            // fib_recursive (~50x slowdown: 0.88s → 47s; answer remains
-            // correct).
+            // Task #136 full flip + Task #138 bounds guard: the gate
+            // mirrors the other four vable mirror sites
+            // (push_typed_value / swap_values / store_local_value /
+            // finishframe_exception) via `owns_virtualizable_shadow()`,
+            // covering portal and bridge traces uniformly.
             //
-            // Root cause (Task #138 probe): the pop-clear writes
-            // `const_ref(PY_NULL)` into the vable shadow. When a bridge
-            // subsequently inherits that shadow state and its IR
-            // references the cleared slot (e.g. a later `SetfieldGc`
-            // whose base operand resolves to the shadow entry), the
-            // bridge optimizer's `ConstPtrInfo._get_info` rejects the
-            // null constant with `InvalidLoop("null constant base
+            // The original Task #138 flip caused a 50x perf regression
+            // on fib_recursive (0.88s → 47s; answer stayed correct) —
+            // `MAJIT_LOG + MAJIT_STATS` probe traced it to
+            // `InvalidLoop("ConstPtrInfo._get_info: null constant base
             // pointer")` (optimizeopt/mod.rs:4021, info.py:720-721
-            // parity). Every bridge attempt aborts the same way, so
-            // guard failures fall through to the blackhole and immediately
-            // re-attempt compilation — trace-abort storm (~1.5k
-            // InvalidLoops + 92k aborted trace attempts on
-            // fib_recursive in 20s, from MAJIT_LOG + MAJIT_STATS
-            // probe).
+            // parity). Root cause was NOT the stack-in-vable adaptation
+            // per se — it was the `flat_idx = (NUM_SCALAR_INPUTARGS -
+            // 1) + reg_idx` formula overshooting into
+            // `virtualizable_boxes[-1]` (the standard-virtualizable
+            // identity slot) when `reg_idx >= array_sum`. Once the
+            // identity was null-clobbered,
+            // `store_token_in_vable_setfield` (trace_ctx.rs:1680)
+            // read that slot as its SetfieldGc base and emitted
+            // `SetfieldGc(0, token, vable_token_descr)`, which the
+            // bridge optimizer rejects. Every subsequent bridge
+            // attempt aborted the same way — trace-abort storm (~1.5k
+            // InvalidLoops + 92k aborted trace attempts in 20s).
             //
-            // Upstream `pyframe.py:411 popvalue_maybe_none` clears the
-            // popped slot to `None` without this consequence, because
-            // RPython's virtualizable layout does NOT include the
-            // Python stack — the shadow has no stack-pop story. pyre's
-            // stack-in-vable PRE-EXISTING-ADAPTATION puts the popped
-            // slots in a structure the bridge optimizer reads as heap
-            // bases, so the None-clear pattern does not translate.
-            // Resolving this requires either removing the stack from
-            // the vable shadow (multi-session) or teaching the bridge
-            // optimizer to recognise cleared-stack-slot sentinels
-            // separately from real null heap bases.
-            (value, s.vable_array_base.is_some(), reg_idx)
+            // The bounds guard below (`flat_idx + 1 >= shadow_len`)
+            // skips the clear when reg_idx would land on or past the
+            // identity. Overshoot is semantically a "pop of a slot
+            // outside the vable's covered array range" — the slot
+            // does not need a shadow clear in the first place. With
+            // the guard, fib_recursive runs at baseline speed with
+            // the shadow-clear semantics preserved for in-range pops.
+            (value, s.owns_virtualizable_shadow(), reg_idx)
         };
         // pyframe.py:411-417 `popvalue_maybe_none` parity: the popped slot
         // is cleared to None in `locals_cells_stack_w`. Upstream lowers
@@ -925,10 +921,29 @@ impl MIFrame {
         // the current stack depth, then sync the slot to heap.
         if has_vable {
             let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_idx;
-            let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
-            let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
-            ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
-            ctx.synchronize_virtualizable_slot(flat_idx);
+            // Guard against writing into `virtualizable_boxes[-1]`, the
+            // standard-virtualizable identity slot. `store_token_in_vable`
+            // reads that slot as the ForceToken target; a null-clear here
+            // turns its SetfieldGc into `SetfieldGc(0, token, vable_token)`,
+            // which the bridge optimizer rejects with
+            // `InvalidLoop("null constant base pointer")`.
+            let shadow_len = ctx.virtualizable_boxes_len().unwrap_or(0);
+            if shadow_len == 0 || flat_idx + 1 >= shadow_len {
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[jit][pop_value] skipping shadow clear at flat_idx={} (shadow_len={}, identity slot {})",
+                        flat_idx,
+                        shadow_len,
+                        shadow_len.saturating_sub(1),
+                    );
+                }
+            } else {
+                let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
+                let null_value =
+                    majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
+                ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+                ctx.synchronize_virtualizable_slot(flat_idx);
+            }
         }
         Ok(value)
     }

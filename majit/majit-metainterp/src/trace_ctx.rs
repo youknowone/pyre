@@ -1504,6 +1504,13 @@ impl TraceCtx {
             .and_then(|boxes| boxes.last().copied())
     }
 
+    /// Length of the shadow `virtualizable_boxes` vector (includes the
+    /// trailing identity slot). Returns `None` when no virtualizable is
+    /// active on the ctx.
+    pub fn virtualizable_boxes_len(&self) -> Option<usize> {
+        self.virtualizable_boxes.as_ref().map(|boxes| boxes.len())
+    }
+
     /// Concrete shadow of the standard virtualizable — the raw heap pointer
     /// `standard_virtualizable_box` refers to. Parallels
     /// `MetaInterp.virtualizable_boxes[-1].getref_base()` at runtime; pyre
