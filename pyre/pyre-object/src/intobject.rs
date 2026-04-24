@@ -20,6 +20,14 @@ pub struct W_IntObject {
 /// Field offset of `intval` within `W_IntObject`, for JIT field access.
 pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 
+/// GC type id assigned to `W_IntObject` at JitDriver init time. Held
+/// as a constant here (rather than runtime-queried) so the allocation
+/// hook can reach it without a back-channel. `pyre-jit/src/eval.rs`
+/// asserts the same id is returned by `gc.register_type(...)` so any
+/// mismatch panics on startup instead of silently misclassifying the
+/// type at collection time.
+pub const W_INT_GC_TYPE_ID: u32 = 1;
+
 // ── Small-int cache ──────────────────────────────────────────────────
 //
 // Pre-allocate W_IntObject for values -5..=256 (262 entries, matching
@@ -46,7 +54,15 @@ static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
 /// Create or retrieve a W_IntObject for the given value.
 ///
 /// Values in -5..=256 are returned from a pre-allocated cache (no heap
-/// allocation). Values outside this range are heap-allocated via Box::leak.
+/// allocation). Values outside this range are heap-allocated via
+/// `Box::into_raw` (Phase 1 leak). A future phase routes the
+/// non-cached path through `crate::gc_hook::try_gc_alloc`, but a
+/// direct substitution is unsafe today: the caller holds the returned
+/// `PyObjectRef` on the Rust stack without registering it as a GC
+/// root, so a minor-collection-driven nursery copy between
+/// `w_int_new` returning and the caller writing into a tracked slot
+/// leaves a dangling pointer. See Task #140 memory for the
+/// SIGSEGV reproduced when attempting the migration.
 #[inline]
 pub fn w_int_new(value: i64) -> PyObjectRef {
     if value >= SMALL_INT_MIN && value <= SMALL_INT_MAX {
@@ -168,5 +184,13 @@ mod tests {
             drop(Box::from_raw(a as *mut W_IntObject));
             drop(Box::from_raw(b as *mut W_IntObject));
         }
+    }
+
+    #[test]
+    fn test_w_int_gc_type_id_matches_descr() {
+        // Guard against drift between the constant colocated with
+        // `W_IntObject` and the id that `pyre-jit/src/eval.rs`
+        // asserts at JitDriver init. See `descr.rs` re-export.
+        assert_eq!(W_INT_GC_TYPE_ID, 1);
     }
 }

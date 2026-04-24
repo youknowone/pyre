@@ -697,3 +697,39 @@ pub fn typeid_is_object(typeid: u32) -> Option<bool> {
 pub fn supports_guard_gc_type() -> bool {
     ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.get())
 }
+
+// ── Host-side nursery allocation hook ───────────────────────────────
+//
+// Separate from `ActiveGcGuardHooks` because allocation is not a
+// guard-time concern. The backend installs one function pointer here
+// so host-side allocators (pyre-object's `w_int_new`, `w_float_new`,
+// …) can route through the real GC without taking a backend-specific
+// dependency. Mirrors how RPython host code reaches `gc.malloc(TYPE)`
+// through the global GC instance.
+
+/// Thread-local callback that performs a nursery allocation for the
+/// currently active backend. The callback returns `GcRef(0)` (i.e.
+/// null) on allocation failure so callers can fall back to a
+/// non-GC allocator.
+pub type AllocNurseryTypedFn = fn(type_id: u32, payload_size: usize) -> GcRef;
+
+thread_local! {
+    static ACTIVE_ALLOC_NURSERY_TYPED: Cell<Option<AllocNurseryTypedFn>> =
+        const { Cell::new(None) };
+}
+
+/// Install the active backend's nursery allocator callback. Pass
+/// `None` to clear.
+pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
+    ACTIVE_ALLOC_NURSERY_TYPED.with(|c| c.set(hook));
+}
+
+/// Allocate through the active backend's GC. Returns `GcRef(0)` when
+/// no backend is installed on this thread (callers treat this as a
+/// null pointer and fall back to their non-GC path).
+pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
+    ACTIVE_ALLOC_NURSERY_TYPED.with(|c| match c.get() {
+        Some(f) => f(type_id, payload_size),
+        None => GcRef(0),
+    })
+}

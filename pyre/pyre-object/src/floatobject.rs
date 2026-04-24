@@ -15,6 +15,11 @@ pub struct W_FloatObject {
 /// Field offset of `floatval` within `W_FloatObject`, for JIT field access.
 pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, floatval);
 
+/// GC type id assigned to `W_FloatObject` at JitDriver init time.
+/// Held as a constant here (rather than runtime-queried) so the
+/// allocation hook can reach it without a back-channel.
+pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
+
 /// Allocate a new W_FloatObject on the heap.
 ///
 /// Phase 1: uses `Box::leak` for simplicity (objects are never freed).

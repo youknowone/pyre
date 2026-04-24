@@ -61,6 +61,23 @@ fn wasm_typeid_is_object(typeid: u32) -> Option<bool> {
     with_wasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
 }
 
+/// Host-side nursery allocation trampoline. Published via
+/// `majit_gc::set_active_alloc_nursery_typed` so backend-agnostic
+/// callers (pyre-object `w_int_new`, …) can route through the
+/// wasm-owned GC.
+fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
+    // See cranelift/dynasm counterparts: host-side allocation must not
+    // trigger collection because the caller holds a raw pointer that
+    // is not a registered GC root.
+    WASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(gc) => gc.alloc_nursery_no_collect_typed(type_id, size),
+            None => GcRef(0),
+        }
+    })
+}
+
 pub struct WasmBackend {
     trace_counter: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
@@ -110,6 +127,7 @@ impl WasmBackend {
             typeid_is_object: Some(wasm_typeid_is_object),
             supports_guard_gc_type,
         });
+        majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.

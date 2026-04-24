@@ -1186,6 +1186,29 @@ fn typeid_is_object_via_active_runtime(typeid: u32) -> Option<bool> {
     })
 }
 
+/// `majit_gc::AllocNurseryTypedFn` installed by `set_gc_allocator`.
+/// Routes host-side allocations (pyre-object `w_int_new`, …) through
+/// the active cranelift-owned GC. Returns `GcRef(0)` when no active
+/// runtime is set on this thread.
+///
+/// Uses `alloc_nursery_no_collect_typed`: host callers hold a raw
+/// `*mut u8` on the Rust stack that is NOT a registered GC root.
+/// Triggering a minor collection here would move the nursery object
+/// we just returned, leaving the caller dangling. `no_collect` falls
+/// back to old-gen on nursery full instead.
+fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
+    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
+        return GcRef(0);
+    };
+    GC_RUNTIMES.with(|r| {
+        let mut guard = r.borrow_mut();
+        match guard.get_mut(&id) {
+            Some(runtime) => runtime.alloc_nursery_no_collect_typed(type_id, size),
+            None => GcRef(0),
+        }
+    })
+}
+
 pub(crate) fn register_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
     if roots.is_empty() {
         return;
@@ -5872,6 +5895,7 @@ impl CraneliftBackend {
             typeid_is_object: Some(typeid_is_object_via_active_runtime),
             supports_guard_gc_type,
         });
+        majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
     }
 
     // `set_constants`, `set_constant_types`, `set_next_trace_id`,

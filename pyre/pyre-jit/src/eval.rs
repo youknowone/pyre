@@ -42,6 +42,13 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
     }
 }
 
+/// Bridge pyre-object's `GcAllocHookFn` to `majit_gc::alloc_nursery_typed`.
+/// pyre-object deliberately carries no majit-gc dep, so pyre-jit owns
+/// the `GcRef` → `*mut u8` conversion.
+fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
+    majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity: preserve per-frame
 /// resume data from the last guard failure. rd_numb provides frame
 /// boundaries (jitcode_index, pc); values are resolved from deadframe.
@@ -279,6 +286,14 @@ thread_local! {
             }
         }
         d.set_gc_allocator(Box::new(gc));
+        // Route pyre-object host-side allocators through the backend's
+        // nursery. `set_gc_allocator` populated
+        // `majit_gc::ACTIVE_ALLOC_NURSERY_TYPED` with the active
+        // backend's trampoline; the one registered here converts
+        // `GcRef` → `*mut u8` for the pyre-object side. pyre-object
+        // deliberately does not depend on majit-gc, so the trampoline
+        // lives here.
+        pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
         // llmodel.py:67-69 self.vtable_offset, _ = symbolic.get_field_token(
         //     rclass.OBJECT, 'typeptr', translate_support_code)
         // pyre's PyObject.ob_type is the equivalent of RPython's typeptr.

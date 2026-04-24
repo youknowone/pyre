@@ -292,8 +292,12 @@ struct PyreObjectDescrGroup {
 /// for any `is_object` instance via `int_between(root.min, obj_typeid.min,
 /// root.max)` (rclass.py:1133-1137 `ll_issubclass`).
 pub const OBJECT_GC_TYPE_ID: u32 = 0;
-pub const W_INT_GC_TYPE_ID: u32 = 1;
-pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
+// `W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID` live in `pyre-object`
+// alongside the `W_IntObject` / `W_FloatObject` structs they describe,
+// so `pyre-object`'s host-side allocators can reach them without a
+// back-channel. Re-exported here for existing call sites.
+pub use pyre_object::floatobject::W_FLOAT_GC_TYPE_ID;
+pub use pyre_object::intobject::W_INT_GC_TYPE_ID;
 /// GC type id for JitFrame (jitframe.py:49 register_custom_trace_hook).
 pub const JITFRAME_GC_TYPE_ID: u32 = 3;
 /// GC type id for JitVirtualRef (virtualref.py — JIT_VIRTUAL_REF).

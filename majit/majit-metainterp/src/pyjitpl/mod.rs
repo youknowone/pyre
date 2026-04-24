@@ -6700,14 +6700,11 @@ impl<M: Clone> MetaInterp<M> {
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
             Ok(result) => result,
             Err(payload) => {
-                if payload
-                    .downcast_ref::<crate::optimize::InvalidLoop>()
-                    .is_some()
-                {
+                if let Some(inv) = payload.downcast_ref::<crate::optimize::InvalidLoop>() {
                     if crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit] compile_bridge: InvalidLoop at key={} fail_index={}",
-                            green_key, fail_index
+                            "[jit] compile_bridge: InvalidLoop(\"{}\") at key={} fail_index={}",
+                            inv.0, green_key, fail_index
                         );
                     }
                     return false;

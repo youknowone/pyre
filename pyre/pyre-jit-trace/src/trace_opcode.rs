@@ -883,14 +883,36 @@ impl MIFrame {
             // four mirror sites (push_typed_value / swap_values /
             // store_local_value / finishframe_exception, all flipped to
             // `owns_virtualizable_shadow()`), clearing the bridge shadow
-            // to NULL on every pop exposes a pre-existing BH resume
-            // consumer gap: `consume_one_section` + downstream BH opcode
-            // dispatch trust the shadow's OpRef/concrete halves without
-            // NULL validation. Bench repro: fib_recursive dynasm + cranelift
-            // TIMEOUT (>5s) with bridges populating fail_args NULLs that
-            // the BH then reads back into registers_r and operates on.
-            // Blocked on Task #137 B (BH concrete-consumer audit) before
-            // flipping this to `owns_virtualizable_shadow()`.
+            // to NULL on every pop triggers a severe perf regression on
+            // fib_recursive (~50x slowdown: 0.88s → 47s; answer remains
+            // correct).
+            //
+            // Root cause (Task #138 probe): the pop-clear writes
+            // `const_ref(PY_NULL)` into the vable shadow. When a bridge
+            // subsequently inherits that shadow state and its IR
+            // references the cleared slot (e.g. a later `SetfieldGc`
+            // whose base operand resolves to the shadow entry), the
+            // bridge optimizer's `ConstPtrInfo._get_info` rejects the
+            // null constant with `InvalidLoop("null constant base
+            // pointer")` (optimizeopt/mod.rs:4021, info.py:720-721
+            // parity). Every bridge attempt aborts the same way, so
+            // guard failures fall through to the blackhole and immediately
+            // re-attempt compilation — trace-abort storm (~1.5k
+            // InvalidLoops + 92k aborted trace attempts on
+            // fib_recursive in 20s, from MAJIT_LOG + MAJIT_STATS
+            // probe).
+            //
+            // Upstream `pyframe.py:411 popvalue_maybe_none` clears the
+            // popped slot to `None` without this consequence, because
+            // RPython's virtualizable layout does NOT include the
+            // Python stack — the shadow has no stack-pop story. pyre's
+            // stack-in-vable PRE-EXISTING-ADAPTATION puts the popped
+            // slots in a structure the bridge optimizer reads as heap
+            // bases, so the None-clear pattern does not translate.
+            // Resolving this requires either removing the stack from
+            // the vable shadow (multi-session) or teaching the bridge
+            // optimizer to recognise cleared-stack-slot sentinels
+            // separately from real null heap bases.
             (value, s.vable_array_base.is_some(), reg_idx)
         };
         // pyframe.py:411-417 `popvalue_maybe_none` parity: the popped slot
