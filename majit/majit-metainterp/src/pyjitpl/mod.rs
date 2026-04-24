@@ -4341,14 +4341,8 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
-        let final_num_inputs = optimizer.final_num_inputs();
+        // compile.py:233 `loop.inputargs = loop_info.inputargs`.
         let mut inputargs = trace.inputargs.clone();
-        while inputargs.len() < final_num_inputs {
-            inputargs.push(majit_ir::InputArg {
-                tp: majit_ir::Type::Int,
-                index: inputargs.len() as u32,
-            });
-        }
         // Reconcile inputarg types with optimizer's post-unbox types.
         // Pyre starts tracing with Ref values (all Python objects), but
         // the optimizer may unbox Int-typed locals. Read the first guard's
@@ -4390,7 +4384,6 @@ impl<M: Clone> MetaInterp<M> {
             &mut constant_types,
             driver_descriptor.as_ref(),
         );
-        let _ = final_num_inputs;
 
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -4668,14 +4661,8 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
-        let final_num_inputs = optimizer.final_num_inputs();
+        // compile.py:233 `loop.inputargs = loop_info.inputargs`.
         let mut inputargs = trace.inputargs.clone();
-        while inputargs.len() < final_num_inputs {
-            inputargs.push(majit_ir::InputArg {
-                tp: majit_ir::Type::Int,
-                index: inputargs.len() as u32,
-            });
-        }
 
         // compile.py:236-245 parity: simple-loop compilation owns a real
         // TargetToken, prepends LABEL(descr=target_token), and patches the

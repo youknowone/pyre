@@ -1412,8 +1412,20 @@ impl BlackholeInterpreter {
             }
         }
 
-        // blackhole.py:1621 — run the bytecode
-        self.run();
+        // blackhole.py:1621 — run the bytecode.
+        // blackhole.py:1612 `_resume_mainloop` does not catch
+        // ContinueRunningNormally; it propagates out to `_run_forever`
+        // and then to `handle_jitexception` (warmspot.py:961).
+        if let Some(args) = self.run() {
+            return Err(JitException::ContinueRunningNormally {
+                green_int: args.green_int,
+                green_ref: args.green_ref,
+                green_float: args.green_float,
+                red_int: args.red_int,
+                red_ref: args.red_ref,
+                red_float: args.red_float,
+            });
+        }
 
         // Check for exception during execution
         if self.got_exception {

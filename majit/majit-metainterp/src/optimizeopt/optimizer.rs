@@ -756,6 +756,8 @@ impl Optimizer {
                 field_descrs,
             } => {
                 let opref = ctx.alloc_op_position();
+                // unroll.py:454 Box carries its type. Virtual heads are Ref.
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_fields: Vec<(u32, OpRef)> = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -800,6 +802,8 @@ impl Optimizer {
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let opref = ctx.alloc_op_position();
+                // unroll.py:454 Box carries its type. VArray heads are Ref.
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
                     .map(|item_info| {
@@ -832,6 +836,8 @@ impl Optimizer {
                 field_descrs,
             } => {
                 let opref = ctx.alloc_op_position();
+                // unroll.py:454 Box carries its type. VStruct heads are Ref.
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_fields = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -867,6 +873,8 @@ impl Optimizer {
                 element_fields,
             } => {
                 let opref = ctx.alloc_op_position();
+                // unroll.py:454 Box carries its type. VArrayStruct heads are Ref.
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_elements = element_fields
                     .iter()
                     .map(|fields| {

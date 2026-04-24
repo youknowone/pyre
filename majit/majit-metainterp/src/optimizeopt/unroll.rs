@@ -360,19 +360,8 @@ impl UnrollOptimizer {
 
             match opt_p1.exported_loop_state.take() {
                 Some(mut state) => {
-                    // Determine types of end_args from Phase 1's output ops.
-                    {
-                        let op_types: HashMap<OpRef, Type> = p1_ops
-                            .iter()
-                            .filter(|op| !op.pos.is_none())
-                            .map(|op| (op.pos, op.opcode.result_type()))
-                            .collect();
-                        state.end_arg_types = state
-                            .end_args
-                            .iter()
-                            .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
-                            .collect();
-                    }
+                    // unroll.py:454 end_args carry type via Box; export_state
+                    // already populated `state.end_arg_types` from ctx.
                     // RPython Phase 1 → Phase 2 heap cache transfer:
                     // RPython does NOT serialize heap cache in ExportedState.
                     // HeapOps in the short preamble are replayed during Phase 2's
@@ -450,19 +439,8 @@ impl UnrollOptimizer {
                 }
             }
         };
-        // Determine types of end_args from Phase 1's output ops.
-        {
-            let op_types: HashMap<OpRef, Type> = p1_ops
-                .iter()
-                .filter(|op| !op.pos.is_none())
-                .map(|op| (op.pos, op.opcode.result_type()))
-                .collect();
-            exported_state.end_arg_types = exported_state
-                .end_args
-                .iter()
-                .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
-                .collect();
-        }
+        // unroll.py:454 end_args carry type via Box; export_state already
+        // populated `exported_state.end_arg_types` from ctx.
         // RPython parity: Phase 2 needs patchguardop from Phase 1's
         // GuardFutureCondition (unroll.py:333). Extract before dropping opt_p1.
         let p1_patchguardop = exported_state.patchguardop.clone();
@@ -2063,8 +2041,13 @@ impl OptUnroll {
         // RPython unroll.py:467: next_iteration_args = end_args (post-force).
         // Aliased boxes (same resolved OpRef) are handled by export_state's
         // create_state cache + make_inputargs' position_in_notvirtuals dedup.
-        // Types are populated by the caller from Optimizer.trace_inputarg_types
-        // after export_state returns. Initialize empty here.
+        // unroll.py:454 `end_args` are typed Boxes — port reads each arg's
+        // authoritative type from `ctx` at export time so downstream consumers
+        // never have to reconstruct types from op result shape.
+        let end_arg_types: Vec<Type> = end_args
+            .iter()
+            .map(|&arg| ctx.opref_type(arg).unwrap_or(Type::Ref))
+            .collect();
         ExportedState::new(
             label_args.clone(),
             end_args,
@@ -2073,7 +2056,7 @@ impl OptUnroll {
             exported_short_ops,
             exported_short_boxes,
             renamed_inputargs.to_vec(),
-            Vec::new(), // populated by caller
+            end_arg_types,
             short_args,
         )
     }
@@ -3110,13 +3093,15 @@ impl OptUnroll {
             if let Some(&opref) = imported_constants.get(&source) {
                 return opref;
             }
-            // Preserve the exported constant's source OpRef identity across
-            // import. RPython keeps the same Const object reachable from the
-            // short preamble; using the original source position here lets
-            // dependency chains and tests observe the same stable constant box.
-            ctx.seed_constant(source, value.clone());
-            imported_constants.insert(source, source);
-            source
+            // unroll.py:454 short preamble reuses the same `Const` object.
+            // majit's OpRef is a trace-local const-pool slot index, not a
+            // Python identity; reusing the producer trace's slot number
+            // would alias two different const pools. Allocate a fresh slot
+            // in the current trace's const pool and seed the same value.
+            let opref = ctx.reserve_const_ref();
+            ctx.seed_constant(opref, value.clone());
+            imported_constants.insert(source, opref);
+            opref
         }
 
         fn resolve_exported_short_result(
@@ -5403,10 +5388,14 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(8, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
-        assert_eq!(
-            ctx2.get_constant(OpRef::from_const(23)),
-            Some(&Value::Ref(ptr))
-        );
+        // unroll.py:454: the imported constant must land in a fresh
+        // const-pool slot in the consumer trace, not reuse the producer
+        // trace's slot index — majit OpRef is a trace-local index, not
+        // a Python identity. The fresh slot is the first one allocated
+        // by `reserve_const_ref` in ctx2.
+        let fresh_const = OpRef::from_const(0);
+        assert_eq!(ctx2.get_constant(fresh_const), Some(&Value::Ref(ptr)));
+        assert_eq!(ctx2.get_constant(OpRef::from_const(23)), None);
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp::new(
@@ -5414,7 +5403,7 @@ mod tests {
                 Some(field_descr.clone()),
                 vec![crate::optimizeopt::ImportedShortPureArg::Const(
                     Value::Ref(ptr),
-                    OpRef::from_const(23)
+                    fresh_const,
                 )],
                 OpRef(11),
                 OpRef(11),
