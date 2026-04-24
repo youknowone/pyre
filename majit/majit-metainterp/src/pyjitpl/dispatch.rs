@@ -246,6 +246,27 @@ where
         }
     }
 
+    /// PRE-EXISTING-ADAPTATION (diverges from pyjitpl.py:2558 `MetaInterp.
+    /// generate_guard` snapshot path): `record_state_guard` is the
+    /// `JitState`-generic branch-guard helper used by the 7 `BC_GOTO_IF_NOT_*`
+    /// dispatch sites (`dispatch.rs:876-1029`). It encodes the frontend's
+    /// live state through `sym.fail_args_with_ctx(ctx)` / `sym.fail_args_types()`
+    /// + the `_guard_fail_args` side-table, without walking
+    /// `MetaInterp::framestack`.
+    ///
+    /// Reason this does not route through `MetaInterp::generate_guard`
+    /// (added 2026-04-24 at `pyjitpl/mod.rs:~8855`): pyre frontends keep
+    /// their live-variable model inside `S::Sym` (pyre-jit-trace's
+    /// `PyreSym` registers + pre-opcode vable snapshot). When a branch
+    /// guard is recorded mid-opcode, `MetaInterp::framestack` is empty
+    /// or stale, so `capture_resumedata` would emit an
+    /// `create_empty_top_snapshot` and the bridge retrace path would
+    /// have no frame data to rehydrate from.
+    ///
+    /// Convergence path: lift pyre's `Sym` state into a
+    /// `MetaInterpStaticData`-indexed `MIFrame` population during
+    /// trace_fn, so `MetaInterp::framestack` becomes the single source
+    /// of truth at guard points. Tracked in Task #84 follow-up.
     fn record_state_guard(
         ctx: &mut TraceCtx,
         sym: &mut S,
@@ -285,16 +306,23 @@ where
         Some((vable_opref, descr))
     }
 
-    /// pyjitpl.py: standard virtualizable → (vable_box, array_field_descr).
-    /// Converts a bytecode array_idx to the cached array field DescrRef.
+    /// pyjitpl.py:1219 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)`
+    /// — the opcode takes two descriptors: `fdescr` (the array-pointer
+    /// field on the vable struct, used for `getfield_gc_r` on the
+    /// nonstandard path and for `_get_arrayitem_vable_index` on the
+    /// standard path) and `adescr` (the array-element descriptor, used
+    /// for the inner `getarrayitem_gc_{i,r,f}` / `setarrayitem_gc` /
+    /// `arraylen_gc`). Return both so BC dispatch sites can thread them
+    /// through without re-derivation.
     fn standard_vable_array_field_descr(
         ctx: &TraceCtx,
         array_idx: usize,
-    ) -> Option<(OpRef, majit_ir::DescrRef)> {
+    ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?;
-        let descr = info.array_field_descrs().get(array_idx)?.clone();
-        Some((vable_opref, descr))
+        let fdescr = info.array_field_descrs().get(array_idx)?.clone();
+        let adescr = info.array_item_descr(array_idx);
+        Some((vable_opref, fdescr, adescr))
     }
 
     /// Construct a `JitCodeMachine` over an existing framestack borrow.
@@ -656,49 +684,64 @@ where
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr)) =
+                let Some((vable_opref, fdescr, adescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (opref, value) =
-                    ctx.vable_getarrayitem_int_indexed(vable_opref, index, index_value, fdescr);
+                let (opref, value) = ctx.vable_getarrayitem_int_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    adescr,
+                );
                 self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_R => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr)) =
+                let Some((vable_opref, fdescr, adescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (opref, value) =
-                    ctx.vable_getarrayitem_ref_indexed(vable_opref, index, index_value, fdescr);
+                let (opref, value) = ctx.vable_getarrayitem_ref_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    adescr,
+                );
                 self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_F => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr)) =
+                let Some((vable_opref, fdescr, adescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (opref, value) =
-                    ctx.vable_getarrayitem_float_indexed(vable_opref, index, index_value, fdescr);
+                let (opref, value) = ctx.vable_getarrayitem_float_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    adescr,
+                );
                 self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::BC_SETARRAYITEM_VABLE_I => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr)) =
+                let Some((vable_opref, fdescr, adescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
@@ -710,6 +753,7 @@ where
                     index,
                     index_value,
                     fdescr,
+                    adescr,
                     value,
                     Value::Int(concrete),
                 );
@@ -718,7 +762,7 @@ where
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr)) =
+                let Some((vable_opref, fdescr, adescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
@@ -730,6 +774,7 @@ where
                     index,
                     index_value,
                     fdescr,
+                    adescr,
                     value,
                     Value::Ref(majit_ir::GcRef(concrete as usize)),
                 );
@@ -738,7 +783,7 @@ where
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let index_reg = self.frames.current_mut().next_u16() as usize;
                 let src = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr)) =
+                let Some((vable_opref, fdescr, adescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
@@ -750,6 +795,7 @@ where
                     index,
                     index_value,
                     fdescr,
+                    adescr,
                     value,
                     Value::Float(f64::from_bits(concrete as u64)),
                 );
@@ -757,12 +803,12 @@ where
             jitcode::BC_ARRAYLEN_VABLE => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_u16() as usize;
-                let Some((vable_opref, fdescr)) =
+                let Some((vable_opref, fdescr, adescr)) =
                     Self::standard_vable_array_field_descr(ctx, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_arraylen_vable(vable_opref, fdescr);
+                let result = ctx.vable_arraylen_vable(vable_opref, fdescr, adescr);
                 self.set_int_reg(dest, Some(result), Some(0));
             }
             jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {
@@ -2526,8 +2572,7 @@ mod tests {
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
 
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 0);
+        assert_eq!(ctx.num_ops(), 0);
     }
 
     #[test]
@@ -2559,26 +2604,16 @@ mod tests {
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0, "tracing side must restore TOKEN_NONE");
 
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
-            OpCode::ForceToken
-        );
-        let set_token = recorder.get_op_by_pos(OpRef(1)).unwrap();
+        assert_eq!(ctx.num_ops(), 4);
+        assert_eq!(ctx.ops()[0].clone().opcode, OpCode::ForceToken);
+        let set_token = ctx.ops()[1].clone();
         assert_eq!(set_token.opcode, OpCode::SetfieldGc);
         assert_eq!(
             set_token.descr.as_ref().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
-            OpCode::CallMayForceN
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
-            OpCode::GuardNotForced
-        );
+        assert_eq!(ctx.ops()[2].clone().opcode, OpCode::CallMayForceN);
+        assert_eq!(ctx.ops()[3].clone().opcode, OpCode::GuardNotForced);
     }
 
     #[test]
@@ -2610,20 +2645,10 @@ mod tests {
         assert!(matches!(action, TraceAction::Abort));
         assert_eq!(obj.token, 0, "forced residual call must clear the token");
 
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 3);
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
-            OpCode::ForceToken
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
-            OpCode::SetfieldGc
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
-            OpCode::CallMayForceN
-        );
+        assert_eq!(ctx.num_ops(), 3);
+        assert_eq!(ctx.ops()[0].clone().opcode, OpCode::ForceToken);
+        assert_eq!(ctx.ops()[1].clone().opcode, OpCode::SetfieldGc);
+        assert_eq!(ctx.ops()[2].clone().opcode, OpCode::CallMayForceN);
     }
 
     #[test]
@@ -2655,24 +2680,11 @@ mod tests {
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
-            OpCode::ForceToken
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
-            OpCode::SetfieldGc
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
-            OpCode::CallMayForceI
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
-            OpCode::GuardNotForced
-        );
+        assert_eq!(ctx.num_ops(), 4);
+        assert_eq!(ctx.ops()[0].clone().opcode, OpCode::ForceToken);
+        assert_eq!(ctx.ops()[1].clone().opcode, OpCode::SetfieldGc);
+        assert_eq!(ctx.ops()[2].clone().opcode, OpCode::CallMayForceI);
+        assert_eq!(ctx.ops()[3].clone().opcode, OpCode::GuardNotForced);
     }
 
     #[test]
@@ -2704,24 +2716,11 @@ mod tests {
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
-            OpCode::ForceToken
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
-            OpCode::SetfieldGc
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
-            OpCode::CallMayForceR
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
-            OpCode::GuardNotForced
-        );
+        assert_eq!(ctx.num_ops(), 4);
+        assert_eq!(ctx.ops()[0].clone().opcode, OpCode::ForceToken);
+        assert_eq!(ctx.ops()[1].clone().opcode, OpCode::SetfieldGc);
+        assert_eq!(ctx.ops()[2].clone().opcode, OpCode::CallMayForceR);
+        assert_eq!(ctx.ops()[3].clone().opcode, OpCode::GuardNotForced);
     }
 
     #[test]
@@ -2753,24 +2752,11 @@ mod tests {
         assert!(matches!(action, TraceAction::Continue));
         assert_eq!(obj.token, 0);
 
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
-            OpCode::ForceToken
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
-            OpCode::SetfieldGc
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
-            OpCode::CallMayForceF
-        );
-        assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
-            OpCode::GuardNotForced
-        );
+        assert_eq!(ctx.num_ops(), 4);
+        assert_eq!(ctx.ops()[0].clone().opcode, OpCode::ForceToken);
+        assert_eq!(ctx.ops()[1].clone().opcode, OpCode::SetfieldGc);
+        assert_eq!(ctx.ops()[2].clone().opcode, OpCode::CallMayForceF);
+        assert_eq!(ctx.ops()[3].clone().opcode, OpCode::GuardNotForced);
     }
 
     #[test]
@@ -2788,16 +2774,12 @@ mod tests {
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
 
-        let recorder = ctx.into_recorder();
         assert!(
-            recorder.ops().iter().any(|op| op.opcode == OpCode::IntLt),
+            ctx.ops().iter().any(|op| op.opcode == OpCode::IntLt),
             "goto_if_not_int_lt must record the fused comparison",
         );
         assert!(
-            recorder
-                .ops()
-                .iter()
-                .any(|op| op.opcode == OpCode::GuardFalse),
+            ctx.ops().iter().any(|op| op.opcode == OpCode::GuardFalse),
             "false branch must guard on the failed comparison",
         );
     }
@@ -2824,12 +2806,8 @@ mod tests {
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
 
-        let recorder = ctx.into_recorder();
         assert!(
-            recorder
-                .ops()
-                .iter()
-                .any(|op| op.opcode == OpCode::GuardValue),
+            ctx.ops().iter().any(|op| op.opcode == OpCode::GuardValue),
             "handler must see last_exc_value and be able to promote it",
         );
     }
@@ -2856,12 +2834,8 @@ mod tests {
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
 
-        let recorder = ctx.into_recorder();
         assert!(
-            recorder
-                .ops()
-                .iter()
-                .any(|op| op.opcode == OpCode::GuardValue),
+            ctx.ops().iter().any(|op| op.opcode == OpCode::GuardValue),
             "handler must see last_exception and be able to promote it",
         );
     }

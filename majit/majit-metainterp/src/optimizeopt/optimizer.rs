@@ -3448,7 +3448,10 @@ impl Optimizer {
             .last_guard_op
             .as_ref()
             .expect("_copy_resume_data_from requires last_guard_op");
-        op.descr = last.descr.clone();
+        op.descr = Some(crate::fail_descr::invent_fail_descr_for_op(
+            op.opcode,
+            last.descr.as_ref(),
+        ));
         op.fail_args = last.fail_args.clone();
         op.rd_resume_position = last.rd_resume_position;
         // Copy complete resume data so store_final_boxes_in_guard is a no-op.

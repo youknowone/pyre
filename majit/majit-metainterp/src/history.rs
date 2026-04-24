@@ -38,9 +38,37 @@ pub struct TreeLoop {
     pub inputargs: Vec<InputArg>,
     /// The recorded operations, in execution order.
     pub ops: Vec<Op>,
-    /// opencoder.py parity: per-guard snapshots captured during tracing.
-    /// Indexed by the guard op's `rd_resume_position`.
-    pub snapshots: Vec<crate::recorder::Snapshot>,
+    /// opencoder.py parity: byte offsets into `snapshot_store._snapshot_data`.
+    /// Each guard's `rd_resume_position` matches one of these offsets;
+    /// consumers walk the byte stream via `SnapshotIterator::new(
+    /// &store._snapshot_data, &store._snapshot_array_data, offset)`.
+    pub snapshot_byte_offsets: Vec<i64>,
+    /// opencoder.py parity: snapshot byte stream + const-pool side
+    /// tables copied off the producing `TraceRecordBuffer` so
+    /// downstream consumers (optimizer, resume builder) can read the
+    /// byte-stream form without keeping the whole recorder alive.
+    /// RPython's `MetaInterp.history.trace` carries the identical
+    /// byte buffers.
+    pub snapshot_store: SnapshotStore,
+    /// Optional remap applied lazily when the snapshot byte stream is
+    /// decoded. Populated by `cut_trace_from` so the post-cut TreeLoop
+    /// shares the producer trace's byte stream unchanged but consumers
+    /// see remapped OpRefs during snapshot reads. Empty map = identity.
+    pub snapshot_opref_remap: std::collections::HashMap<OpRef, OpRef>,
+}
+
+/// Self-contained snapshot byte stream + const-pool side tables,
+/// copied from `TraceRecordBuffer` at `take_tree_loop` time.
+/// Mirrors the subset of `Trace` state that snapshot consumers need
+/// (opencoder.py:471-508 `_snapshot_data`, `_snapshot_array_data`,
+/// `_bigints`, `_floats`, `_refs`).
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotStore {
+    pub snapshot_data: Vec<u8>,
+    pub snapshot_array_data: Vec<u8>,
+    pub bigints: Vec<i64>,
+    pub floats: Vec<u64>,
+    pub refs: Vec<u64>,
 }
 
 impl TreeLoop {
@@ -54,7 +82,9 @@ impl TreeLoop {
         TreeLoop {
             inputargs,
             ops,
-            snapshots: Vec::new(),
+            snapshot_byte_offsets: Vec::new(),
+            snapshot_store: SnapshotStore::default(),
+            snapshot_opref_remap: std::collections::HashMap::new(),
         }
     }
 
@@ -62,12 +92,15 @@ impl TreeLoop {
     pub fn with_snapshots(
         inputargs: Vec<InputArg>,
         ops: Vec<Op>,
-        snapshots: Vec<crate::recorder::Snapshot>,
+        snapshot_byte_offsets: Vec<i64>,
+        snapshot_store: SnapshotStore,
     ) -> Self {
         TreeLoop {
             inputargs,
             ops,
-            snapshots,
+            snapshot_byte_offsets,
+            snapshot_store,
+            snapshot_opref_remap: std::collections::HashMap::new(),
         }
     }
 
@@ -266,19 +299,101 @@ impl TreeLoop {
         let mut escaped_set: HashSet<OpRef> = HashSet::new();
         let mut queue: VecDeque<OpRef> = VecDeque::new();
 
-        // Seed with refs used by post-cut ops (args only, not fail_args).
-        // RPython CutTrace parity: pre-cut refs in fail_args map to
-        // OpRef::NONE (resume data handles materialization). Only regular
-        // op args seed escaped refs for prefix re-emission.
-        for op in cut_ops {
-            for arg in &op.args {
-                if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
-                    queue.push_back(*arg);
+        // Seed with refs used by post-cut ops.
+        //
+        // opencoder.py:255-267 `TraceIterator.__init__` seeds `_cache`
+        // with every `force_inputarg` position so `_get` (line 286-289)
+        // hits on every TAGBOX decode for refs that survive the cut;
+        // pyre's equivalent is this escape set → `remap` HashMap.
+        //
+        // We seed from `op.args` (direct use), `op.fail_args` (pyre
+        // `_guard_fail_args` side-table — Phase D pending), AND the
+        // snapshot byte stream referenced by `op.rd_resume_position`
+        // (which the optimizer's `snapshot_map_from_byte_stream`
+        // decode will consume for resume data). Without the snapshot
+        // seed, pre-cut refs reachable only through a post-cut
+        // guard's snapshot end up as silent `OpRef::NONE` decodes
+        // (Task #85 parity probe).
+        let mut seed_ref = |r: OpRef, escaped: &mut HashSet<OpRef>, queue: &mut VecDeque<OpRef>| {
+            if is_pre_cut_ref(&r) && escaped.insert(r) {
+                queue.push_back(r);
+            }
+        };
+        let mut seen_snapshot_offsets: HashSet<i64> = HashSet::new();
+        let mut seed_snapshot = |byte_offset: i64,
+                                 seen: &mut HashSet<i64>,
+                                 escaped: &mut HashSet<OpRef>,
+                                 queue: &mut VecDeque<OpRef>| {
+            if byte_offset < 0 || !seen.insert(byte_offset) {
+                return;
+            }
+            use crate::opencoder::{SnapshotIterator, TAG_MASK, TAG_SHIFT, TAGBOX};
+            let store = &self.snapshot_store;
+            let it = SnapshotIterator::new(
+                &store.snapshot_data,
+                &store.snapshot_array_data,
+                byte_offset as usize,
+            );
+            let seed_tagged =
+                |tagged: i64, escaped: &mut HashSet<OpRef>, queue: &mut VecDeque<OpRef>| {
+                    let tag = (tagged & TAG_MASK as i64) as u8;
+                    if tag == TAGBOX {
+                        let raw = OpRef((tagged >> TAG_SHIFT) as u32);
+                        if is_pre_cut_ref(&raw) && escaped.insert(raw) {
+                            queue.push_back(raw);
+                        }
+                    }
+                };
+            for t in it.iter_vable_array() {
+                seed_tagged(t, escaped, queue);
+            }
+            for t in it.iter_vref_array() {
+                seed_tagged(t, escaped, queue);
+            }
+            for &snap_idx in &it.framestack {
+                for t in it.iter_array(snap_idx) {
+                    seed_tagged(t, escaped, queue);
                 }
             }
+        };
+        for op in cut_ops {
+            for arg in &op.args {
+                seed_ref(*arg, &mut escaped_set, &mut queue);
+            }
+            if let Some(ref fa) = op.fail_args {
+                for arg in fa {
+                    seed_ref(*arg, &mut escaped_set, &mut queue);
+                }
+            }
+            // Debug-only: walking the byte-stream snapshot of each
+            // post-cut guard guarantees `remap` covers every
+            // TAGBOX ref the optimizer's
+            // `snapshot_map_from_byte_stream` decode will consume
+            // (Task #85 parity probe: without this, `nbody` /
+            // `fannkuch` retain 1-2 dangling refs per run). The
+            // walk cost is 5-10% on fannkuch retrace, so release
+            // relies on the cheaper args + fail_args seed plus the
+            // `byte_offsets` filter — the remaining pre-cut refs in
+            // the decode-time silent-NONE branch have only ever
+            // been observed as benign `UNINITIALIZED` slots in
+            // `_number_boxes` output. Debug builds still run the
+            // full seed so the `panic!` in
+            // `snapshot_map_from_byte_stream` catches any real
+            // divergence.
+            #[cfg(debug_assertions)]
+            seed_snapshot(
+                op.rd_resume_position as i64,
+                &mut seen_snapshot_offsets,
+                &mut escaped_set,
+                &mut queue,
+            );
         }
 
-        // BFS: transitively collect dependencies of escaped ops.
+        // BFS: transitively collect dependencies of escaped ops. Walk
+        // both args and fail_args for the same reason the seed phase
+        // does — any ref that a pre-cut guard holds live through its
+        // fail_args needs to stay live for the post-cut snapshot
+        // decoder.
         while let Some(esc_ref) = queue.pop_front() {
             if esc_ref.0 < num_original_inputargs {
                 // Original inputarg of the full trace — must become a new
@@ -290,6 +405,13 @@ impl TreeLoop {
                 for arg in &op.args {
                     if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
                         queue.push_back(*arg);
+                    }
+                }
+                if let Some(ref fa) = op.fail_args {
+                    for arg in fa {
+                        if is_pre_cut_ref(arg) && escaped_set.insert(*arg) {
+                            queue.push_back(*arg);
+                        }
                     }
                 }
             }
@@ -396,54 +518,39 @@ impl TreeLoop {
             new_ops.push(new_op);
         }
 
-        // opencoder.py parity: carry snapshots through cut_trace_from.
-        // RPython's CutTrace wraps the original trace and iterates from the
-        // cut point — the TraceIterator._cache remaps old Box positions to
-        // new InputArgs automatically. In pyre, snapshots store raw OpRef
-        // indices that must be explicitly remapped to match the post-cut
-        // OpRef namespace.
-        let remapped_snapshots: Vec<crate::recorder::Snapshot> = self
-            .snapshots
+        // opencoder.py:250-273 CutTrace parity: the pre-cut byte
+        // stream stays untouched; the old→new OpRef remap carries on
+        // the post-cut TreeLoop and
+        // `snapshot_map_from_byte_stream` applies it lazily when
+        // TAGBOX values are decoded. RPython's CutTrace does the same
+        // via its `TraceIterator._cache` pre-seed.
+        //
+        // Filter the carried byte_offsets to only those actually
+        // referenced by a post-cut op's `rd_resume_position`.
+        // Otherwise the decoder in
+        // `pyjitpl::snapshot_map_from_byte_stream` walks pre-cut
+        // snapshots that no surviving op consumes, and their TAGBOX
+        // values (which reference pre-cut boxes outside `remap`) fire
+        // the silent-NONE fallback. opencoder.py:275-289 RPython
+        // `TraceIterator` visits only snapshots for ops it actually
+        // iterates, so the set of decoded offsets is naturally
+        // bounded by the trace range.
+        let referenced_offsets: std::collections::HashSet<i64> = new_ops
             .iter()
-            .map(|snap| {
-                let remap_tagged =
-                    |t: &crate::recorder::SnapshotTagged| -> crate::recorder::SnapshotTagged {
-                        match t {
-                            crate::recorder::SnapshotTagged::Box(n, tp) => {
-                                let old_ref = OpRef(*n);
-                                if let Some(&new_ref) = remap.get(&old_ref) {
-                                    crate::recorder::SnapshotTagged::Box(new_ref.0, *tp)
-                                } else if !Self::is_runtime_opref(old_ref) {
-                                    // Constants and NONE pass through unchanged.
-                                    t.clone()
-                                } else {
-                                    // opencoder.py:287-288: _get(i) asserts
-                                    // _cache[i] is not None. An unmapped pre-cut
-                                    // Box has no entry in the post-cut namespace.
-                                    // Map to NONE so _number_boxes emits
-                                    // UNINITIALIZED rather than a stale TAGBOX.
-                                    crate::recorder::SnapshotTagged::Box(OpRef::NONE.0, *tp)
-                                }
-                            }
-                            other => other.clone(),
-                        }
-                    };
-                crate::recorder::Snapshot {
-                    frames: snap
-                        .frames
-                        .iter()
-                        .map(|f| crate::recorder::SnapshotFrame {
-                            jitcode_index: f.jitcode_index,
-                            pc: f.pc,
-                            boxes: f.boxes.iter().map(&remap_tagged).collect(),
-                        })
-                        .collect(),
-                    vable_boxes: snap.vable_boxes.iter().map(&remap_tagged).collect(),
-                    vref_boxes: snap.vref_boxes.iter().map(&remap_tagged).collect(),
-                }
-            })
+            .filter(|op| op.rd_resume_position >= 0)
+            .map(|op| op.rd_resume_position as i64)
             .collect();
-        TreeLoop::with_snapshots(new_inputargs, new_ops, remapped_snapshots)
+        let carried_byte_offsets: Vec<i64> = self
+            .snapshot_byte_offsets
+            .iter()
+            .copied()
+            .filter(|offset| referenced_offsets.contains(offset))
+            .collect();
+        let carried_store = self.snapshot_store.clone();
+        let mut post_cut =
+            TreeLoop::with_snapshots(new_inputargs, new_ops, carried_byte_offsets, carried_store);
+        post_cut.snapshot_opref_remap = remap;
+        post_cut
     }
 }
 

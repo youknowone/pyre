@@ -223,11 +223,17 @@ impl Trace {
         opref
     }
 
-    /// Set rd_resume_position on the last recorded op.
-    /// Called after record_guard* to associate a snapshot.
-    pub fn set_last_op_resume_position(&mut self, snapshot_id: i32) {
+    /// opencoder.py:688-690 `patch_last_guard_descr_slot(snapshot_index)`
+    /// — attach a snapshot index to the most recently recorded guard.
+    ///
+    /// TRB writes the snapshot index into a 2-byte placeholder emitted
+    /// by `record_guard*`; `recorder::Trace` instead stores it on the
+    /// last Op's `rd_resume_position` field. Parameter is `i64` to
+    /// match TRB so the caller site stays stable across the atomic
+    /// field swap.
+    pub fn patch_last_guard_descr_slot(&mut self, snapshot_index: i64) {
         if let Some(op) = self.ops.last_mut() {
-            op.rd_resume_position = snapshot_id;
+            op.rd_resume_position = snapshot_index as i32;
         }
     }
 
@@ -287,7 +293,7 @@ impl Trace {
     /// from `TraceCtx` (which owns the pyre-only Vec<Snapshot> side
     /// table); callers should use `TraceCtx::get_trace_position` for a
     /// fully-populated position.
-    pub fn get_position(&self) -> TracePosition {
+    pub fn cut_point(&self) -> TracePosition {
         TracePosition {
             _pos: self.ops.len(),
             _count: self.op_count,
@@ -300,13 +306,13 @@ impl Trace {
     /// opencoder.py:570-575 `cut_at(end)` — restore the recorder to a
     /// previously saved position.
     ///
-    /// Discards all operations recorded after `pos`. Used to undo a
+    /// Discards all operations recorded after `end`. Used to undo a
     /// tentative JUMP after compile_trace succeeds or fails
     /// (pyjitpl.py:3195 finally: `self.history.cut(cut_at)`).
-    pub fn cut(&mut self, pos: TracePosition) {
-        self.ops.truncate(pos._pos);
-        self.op_count = pos._count;
-        self.box_count = pos._index;
+    pub fn cut_at(&mut self, end: TracePosition) {
+        self.ops.truncate(end._pos);
+        self.op_count = end._count;
+        self.box_count = end._index;
     }
 
     /// history.py:725 `length`: number of non-inputarg ops recorded so far.
@@ -750,7 +756,7 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        let before_guard = rec.get_position();
+        let before_guard = rec.cut_point();
         assert_eq!(before_guard._count, 2);
         assert_eq!(before_guard._index, 2);
 
@@ -759,7 +765,7 @@ mod tests {
         rec.close_loop(&[i1]);
         rec.finish(&[i1], make_fail_descr(1));
 
-        let pos = rec.get_position();
+        let pos = rec.cut_point();
         assert_eq!(pos._count, 5);
         assert_eq!(pos._index, 2);
     }
@@ -1199,9 +1205,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_position_and_cut() {
+    fn test_cut_point_and_cut_at() {
         let mut rec = Trace::with_num_inputs(2);
-        let pos0 = rec.get_position();
+        let pos0 = rec.cut_point();
         assert_eq!(pos0._pos, 0);
         assert_eq!(pos0._count, 2); // 2 inputargs
         assert_eq!(pos0._index, 2);
@@ -1209,7 +1215,7 @@ mod tests {
         assert_eq!(pos0.snapshot_array_data_len, 0);
 
         let _a = rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
-        let pos1 = rec.get_position();
+        let pos1 = rec.cut_point();
         assert_eq!(pos1._pos, 1);
         assert_eq!(pos1._count, 3);
         assert_eq!(pos1._index, 3);
@@ -1219,9 +1225,9 @@ mod tests {
         assert_eq!(rec.num_ops(), 3);
 
         // Cut back to pos1 — should discard IntSub and IntMul
-        rec.cut(pos1);
+        rec.cut_at(pos1);
         assert_eq!(rec.num_ops(), 1);
-        assert_eq!(rec.get_position(), pos1);
+        assert_eq!(rec.cut_point(), pos1);
 
         // Can record more ops after cut
         let d = rec.record_op(OpCode::IntNeg, &[OpRef(0)]);
@@ -1229,23 +1235,23 @@ mod tests {
         assert_eq!(rec.num_ops(), 2);
 
         // Cut back to pos0 — should discard everything
-        rec.cut(pos0);
+        rec.cut_at(pos0);
         assert_eq!(rec.num_ops(), 0);
     }
 
     #[test]
-    fn test_get_position_tracks_count_and_index_separately() {
+    fn test_cut_point_tracks_count_and_index_separately() {
         let mut rec = Trace::with_num_inputs(1);
         let i0 = OpRef(0);
 
         let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        let pos_after_add = rec.get_position();
+        let pos_after_add = rec.cut_point();
         assert_eq!(pos_after_add._count, 2);
         assert_eq!(pos_after_add._index, 2);
 
         let descr = make_fail_descr(1);
         rec.record_guard(OpCode::GuardTrue, &[OpRef(1)], descr);
-        let pos_after_guard = rec.get_position();
+        let pos_after_guard = rec.cut_point();
         assert_eq!(pos_after_guard._pos, 2);
         assert_eq!(pos_after_guard._count, 3);
         assert_eq!(pos_after_guard._index, 2);

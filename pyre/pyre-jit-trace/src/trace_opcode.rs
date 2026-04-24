@@ -2157,10 +2157,10 @@ impl MIFrame {
                 callee_fail_args,
                 callee_snapshot_types_full,
             );
-            let snapshot_id = ctx.capture_resumedata(snapshot);
-
-            ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
-            ctx.set_last_guard_resume_position(snapshot_id);
+            // pyjitpl.py:2568-2579 generate_guard: record guard with
+            // a 0-placeholder descr slot, then capture_resumedata
+            // patches the slot atomically.
+            ctx.generate_guard(opcode, args, types, &fail_args, snapshot);
             return;
         }
 
@@ -2211,66 +2211,38 @@ impl MIFrame {
             fa
         };
 
-        ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
-
-        // pyjitpl.py:2579: self.capture_resumedata(resumepc, after_residual_call)
-        self.capture_resumedata(
-            ctx,
-            resume_pc,
-            after_residual_call,
-            &active_boxes,
-            &snapshot_full_types,
-        );
-    }
-
-    /// pyjitpl.py:2586-2602 capture_resumedata parity.
-    ///
-    /// Temporarily sets frame.pc = resumepc, captures the full framestack
-    /// ([self as top/callee] + self.parent_frames as parents) plus
-    /// virtualizable_boxes + virtualref_boxes into a snapshot, then
-    /// restores frame.pc.  Matches opencoder.py:819-832
-    /// `capture_resumedata(framestack, virtualizable_boxes,
-    /// virtualref_boxes, after_residual_call=False)` which walks the full
-    /// `self.framestack` to build one SnapshotFrame per live frame.
-    fn capture_resumedata(
-        &mut self,
-        ctx: &mut TraceCtx,
-        resume_pc: usize,
-        after_residual_call: bool,
-        active_boxes: &[OpRef],
-        snapshot_full_types: &[Type],
-    ) {
-        // pyjitpl.py:2594-2596: saved_pc = frame.pc; frame.pc = resumepc
+        // pyjitpl.py:2594-2596: saved_pc = frame.pc; frame.pc = resumepc.
+        // The snapshot's frame.pc must match the liveness PC used by
+        // get_list_of_active_boxes (fallthrough_pc for after_residual_call,
+        // orgpc=resume_pc otherwise). Build the snapshot here under the
+        // swapped pc, then restore before returning.
         let saved_orgpc = self.orgpc;
         let saved_ni = self.sym().vable_last_instr;
         let saved_vsd = self.sym().vable_valuestackdepth;
         self.orgpc = resume_pc;
-
-        // The snapshot's frame.pc must match the liveness PC used by
-        // get_list_of_active_boxes.
         let snapshot_live_pc = if after_residual_call {
             self.fallthrough_pc
         } else {
             self.orgpc
         };
-
-        // pyjitpl.py:2597-2600: history.trace.capture_resumedata(
-        //     self.framestack, virtualizable_boxes, self.virtualref_boxes,
-        //     after_residual_call)
         let snapshot = self.build_framestack_snapshot(
             ctx,
             snapshot_live_pc,
-            active_boxes,
-            snapshot_full_types,
+            &active_boxes,
+            &snapshot_full_types,
         );
-        let snapshot_id = ctx.capture_resumedata(snapshot);
-        ctx.set_last_guard_resume_position(snapshot_id);
-
-        // pyjitpl.py:2602: frame.pc = saved_pc (restore)
+        // pyjitpl.py:2602: frame.pc = saved_pc (restore).
         self.orgpc = saved_orgpc;
-        let s = self.sym_mut();
-        s.vable_last_instr = saved_ni;
-        s.vable_valuestackdepth = saved_vsd;
+        {
+            let s = self.sym_mut();
+            s.vable_last_instr = saved_ni;
+            s.vable_valuestackdepth = saved_vsd;
+        }
+
+        // pyjitpl.py:2568-2579 generate_guard: record guard + capture
+        // atomically. The guard's 0-placeholder descr slot is patched
+        // with the snapshot id by capture_resumedata in one call.
+        ctx.generate_guard(opcode, args, fail_arg_types, &fail_args, snapshot);
     }
 
     /// Extend a single-frame callee's `(fail_args, fail_arg_types)` with
@@ -2833,10 +2805,10 @@ impl MIFrame {
             callee_fail_args,
             callee_snapshot_types_full,
         );
-        let snapshot_id = ctx.capture_resumedata(snapshot);
-
-        ctx.record_guard_typed_with_fail_args(opcode, &[truth], types, &fail_args);
-        ctx.set_last_guard_resume_position(snapshot_id);
+        // pyjitpl.py:2568-2579 generate_guard: record guard + capture
+        // atomically (the guard's descr placeholder is patched with
+        // the snapshot id in one call).
+        ctx.generate_guard(opcode, &[truth], types, &fail_args, snapshot);
 
         // pyjitpl.py:2602: frame.pc = saved_pc (restore all, generate_guard_core parity)
         self.orgpc = saved_orgpc;
@@ -4848,16 +4820,17 @@ impl MIFrame {
                     callee_fail_args,
                     fail_arg_types,
                 );
-                let snapshot_id = ctx.capture_resumedata(snapshot);
-
                 let exc_type_const = ctx.const_int(exc_type_ptr);
-                let op = ctx.record_guard_typed_with_fail_args(
+                // pyjitpl.py:2568-2579 generate_guard: record + capture
+                // atomically for GUARD_EXCEPTION (the after_residual_call
+                // guard class at pyjitpl.py:2575-2578).
+                let op = ctx.generate_guard(
                     majit_ir::OpCode::GuardException,
                     &[exc_type_const],
                     all_types,
                     &all_fail_args,
+                    snapshot,
                 );
-                ctx.set_last_guard_resume_position(snapshot_id);
 
                 this.orgpc = saved_orgpc;
                 op

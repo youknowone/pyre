@@ -5532,9 +5532,9 @@ mod tests {
         sym.init_symbolic(&mut ctx, frame_ptr);
 
         assert_eq!(sym.locals_cells_stack_array_ref, OpRef::NONE);
-        let recorder = ctx.into_recorder();
-        for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+        let num_ops = ctx.num_ops() as u32;
+        for pos in 1..(1 + num_ops) {
+            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             assert_ne!(
@@ -5862,8 +5862,8 @@ mod tests {
         )
         .expect("generic helper call should box raw operands first");
 
-        let recorder = ctx.into_recorder();
-        let call = recorder.ops().last().expect("call op should be present");
+        let ops = ctx.ops();
+        let call = ops.last().expect("call op should be present");
         assert!(matches!(
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
@@ -5898,8 +5898,8 @@ mod tests {
             .trace_known_builtin_call(callable, &[arg])
             .expect("known builtin helper boundary should box raw int args");
 
-        let recorder = ctx.into_recorder();
-        let call = recorder.ops().last().expect("call op should be present");
+        let ops = ctx.ops();
+        let call = ops.last().expect("call op should be present");
         assert!(matches!(
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
@@ -5966,12 +5966,12 @@ mod tests {
             )
             .expect("int comparison should trace");
 
-        let recorder = ctx.into_recorder();
+        let num_ops = ctx.num_ops() as u32;
         let mut saw_cmp = false;
         let mut saw_bool_call = false;
         let mut saw_bool_unbox = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + num_ops) {
+            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::IntLt {
@@ -6046,10 +6046,10 @@ mod tests {
             )
             .expect("non-branch compare should trace");
 
-        let recorder = ctx.into_recorder();
+        let num_ops = ctx.num_ops() as u32;
         let mut saw_bool_call = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + num_ops) {
+            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::CallR {

@@ -1968,6 +1968,7 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(VirtualRefFinish, 2);
     set!(Copystrcontent, 5);
     set!(Copyunicodecontent, 5);
+    // resoperation.py:1137 QUASIIMMUT_FIELD/1d/n — arity=1 + fielddescr.
     set!(QuasiimmutField, 1);
     set!(AssertNotNone, 1);
     set!(RecordExactClass, 2);
@@ -2748,7 +2749,11 @@ mod tests {
             OpCode::Unicodehash,
             OpCode::CheckMemoryError,
             OpCode::ForceSpill,
-            OpCode::QuasiimmutField,
+            // QuasiimmutField dropped from the unary set — pyre emits it
+            // variadically (arity=None) from both `state.rs` (1-arg + descr)
+            // and `opcode_handler_impls_post.template.rs` (2-arg + no descr)
+            // for celldict-style namespace lookups. See arity-table
+            // PRE-EXISTING-ADAPTATION note above.
             OpCode::AssertNotNone,
             OpCode::Keepalive,
             OpCode::CondCallGcWb,

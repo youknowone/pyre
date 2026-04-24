@@ -4896,16 +4896,16 @@ mod tests {
                     .expect("local should load");
             assert_eq!(loaded.opref, local);
 
-            let recorder = ctx.into_recorder();
+            let ops = ctx.ops();
             match expected_guard {
                 Some(opcode) => {
                     assert!(
-                        recorder.ops().iter().any(|op| op.opcode == opcode),
+                        ops.iter().any(|op| op.opcode == opcode),
                         "expected guard opcode {opcode:?} in {:?}",
-                        recorder.ops()
+                        ops
                     );
                 }
-                None => assert_eq!(recorder.num_guards(), 0),
+                None => assert_eq!(ops.iter().filter(|op| op.opcode.is_guard()).count(), 0),
             }
         };
 
@@ -4968,8 +4968,8 @@ mod tests {
 
         state.capture_guard_class(obj, &INT_TYPE as *const _);
 
-        let recorder = ctx.into_recorder();
-        let op = recorder.ops().last().expect("guard op should be present");
+        let ops = ctx.ops();
+        let op = ops.last().expect("guard op should be present");
         assert_eq!(op.opcode, OpCode::GuardNonnullClass);
         assert_eq!(op.args[0], obj);
     }
@@ -5030,15 +5030,12 @@ mod tests {
 
         let _ = state.capture_trace_guarded_int_payload(int_obj);
 
-        let recorder = ctx.into_recorder();
+        let ops = ctx.ops();
         let mut saw_guard_nonnull_class = false;
         let mut saw_pure_payload = false;
-        let recorded_ops: Vec<(OpCode, Vec<OpRef>)> = recorder
-            .ops()
-            .iter()
-            .map(|op| (op.opcode, op.args.to_vec()))
-            .collect();
-        for op in recorder.ops() {
+        let recorded_ops: Vec<(OpCode, Vec<OpRef>)> =
+            ops.iter().map(|op| (op.opcode, op.args.to_vec())).collect();
+        for op in &ops {
             if op.opcode == OpCode::GuardNonnullClass {
                 saw_guard_nonnull_class = true;
             }
@@ -5118,11 +5115,8 @@ mod tests {
                 state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
             }
 
-            let recorder = ctx.into_recorder();
-            let guard = recorder
-                .ops()
-                .last()
-                .expect("branch guard should be recorded");
+            let ops = ctx.ops();
+            let guard = ops.last().expect("branch guard should be recorded");
             let fail_args = guard
                 .fail_args
                 .as_ref()
@@ -5208,8 +5202,8 @@ mod tests {
         );
         <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
 
-        let recorder = ctx.into_recorder();
-        let guard = recorder.ops().last().expect("guard op should be present");
+        let ops = ctx.ops();
+        let guard = ops.last().expect("guard op should be present");
         let fail_args = guard
             .fail_args
             .as_ref()
@@ -5321,23 +5315,19 @@ mod tests {
         let raw_index = state.capture_trace_dynamic_list_index(key, len, 2);
         assert_eq!(raw_index, key);
 
-        let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_guards(), 2);
+        let ops = ctx.ops();
+        assert_eq!(ops.iter().filter(|op| op.opcode.is_guard()).count(), 2);
         assert!(
-            recorder
-                .ops()
-                .iter()
+            ops.iter()
                 .all(|op| op.opcode != majit_ir::OpCode::GuardNonnullClass),
             "typed-int index should not guard object class for an unbox fast path: {:?}",
-            recorder.ops()
+            ops
         );
         assert!(
-            recorder
-                .ops()
-                .iter()
+            ops.iter()
                 .all(|op| op.opcode != majit_ir::OpCode::GetfieldGcPureI),
             "typed-int index should not read boxed int payloads: {:?}",
-            recorder.ops()
+            ops
         );
     }
 
@@ -5381,15 +5371,12 @@ mod tests {
             .expect("integer-list len fast path should trace");
         assert_eq!(state.capture_value_type(len), Type::Int);
 
-        let recorder = ctx.into_recorder();
-        assert_ne!(
-            recorder.ops().last().map(|op| op.opcode),
-            Some(OpCode::CallI)
-        );
+        let num_ops = ctx.num_ops() as u32;
+        assert_ne!(ctx.ops().last().map(|op| op.opcode), Some(OpCode::CallI));
         let mut saw_len_field = false;
         let mut saw_new = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + num_ops) {
+            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::New {
@@ -5450,12 +5437,12 @@ mod tests {
         let result = state.capture_generated_list_getitem_by_strategy(list, key, 2, 2);
         assert_eq!(state.capture_value_type(result), Type::Float);
 
-        let recorder = ctx.into_recorder();
+        let num_ops = ctx.num_ops() as u32;
         let mut saw_gc_field = false;
         let mut saw_raw_field = false;
         let mut saw_raw_array = false;
-        for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + num_ops) {
+            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             match op.opcode {
@@ -5509,15 +5496,11 @@ mod tests {
                 .capture_list_append_value(list, value, concrete_list, concrete_value)
                 .expect("raw-storage append fast path should trace");
 
-            let recorder = ctx.into_recorder();
             let mut saw_raw_setitem = false;
             let mut saw_len_update = false;
             let mut saw_call = false;
             let mut saw_new = false;
-            for pos in 2..(2 + recorder.num_ops() as u32) {
-                let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                    continue;
-                };
+            for op in ctx.ops() {
                 if matches!(
                     op.opcode,
                     OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
@@ -5618,17 +5601,13 @@ mod tests {
         <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
             .expect("typed range next should not need optional guard");
 
-        let recorder = ctx.into_recorder();
         let mut saw_getfield_gc = false;
         let mut saw_setfield_gc = false;
         let mut saw_setfield_raw = false;
         let mut saw_getfield_raw = false;
         let mut saw_new = false;
         let mut saw_optional_guard = false;
-        for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
-                continue;
-            };
+        for op in ctx.ops() {
             match op.opcode {
                 OpCode::GetfieldGcI if op.args.first().copied() == Some(iter) => {
                     saw_getfield_gc = true

@@ -648,7 +648,24 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 let opref = self.with_ctx(|_this, ctx| {
                     let ns_const = ctx.const_ref(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
-                    ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+                    // resoperation.py:1137 `QUASIIMMUT_FIELD/1d/n` — arity=1
+                    // + fielddescr. celldict mints a synthetic FieldDescr
+                    // whose `index()` carries the namespace slot so
+                    // heap.py:781 `optimize_QUASIIMMUT_FIELD` can register
+                    // the per-slot dep through `descr.index()` uniformly
+                    // with regular quasi-immutable fields.
+                    let slot_descr = majit_ir::descr::make_field_descr_full(
+                        slot as u32,
+                        0,
+                        0,
+                        majit_ir::Type::Ref,
+                        true,
+                    );
+                    ctx.record_op_with_descr(
+                        majit_ir::OpCode::QuasiimmutField,
+                        &[ns_const],
+                        slot_descr,
+                    );
                     let result_const = ctx.const_ref(concrete_value as i64);
                     ctx.record_op(
                         majit_ir::OpCode::RecordKnownResult,

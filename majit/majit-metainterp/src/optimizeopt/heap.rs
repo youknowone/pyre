@@ -2837,23 +2837,13 @@ impl OptHeap {
             // The optimizer replaces the field read with the cached value and
             // emits GUARD_NOT_INVALIDATED to ensure validity.
             OpCode::QuasiimmutField => {
-                // RPython optimize_QUASIIMMUT_FIELD (heap.py:781):
-                // Does NOT create a new GUARD_NOT_INVALIDATED — the tracer
-                // already emitted one via generate_guard (pyjitpl.py:1087).
-                // Records quasi_immutable_deps for invalidation tracking.
+                // heap.py:781 optimize_QUASIIMMUT_FIELD: does NOT create a
+                // new GUARD_NOT_INVALIDATED — the tracer already emitted
+                // one via generate_guard (pyjitpl.py:1087). Records
+                // (obj_ptr, field_idx) in `quasi_immutable_deps` for per-
+                // slot watcher registration after compilation.
                 let obj = op.arg(0);
-                // RPython optimize_QUASIIMMUT_FIELD: collect quasi-immutable
-                // dependencies. Add (obj_ptr, field_idx) to quasi_immutable_deps
-                // for per-slot watcher registration after compilation.
-                // field_idx comes from descr (GC object fields) or arg(1)
-                // (namespace slot index).
-                let field_idx = if let Some(descr) = &op.descr {
-                    Some(descr.index())
-                } else if op.args.len() > 1 {
-                    ctx.get_constant_int(op.arg(1)).map(|v| v as u32)
-                } else {
-                    None
-                };
+                let field_idx = op.descr.as_ref().map(|d| d.index());
                 if let Some(idx) = field_idx {
                     if let Some(dep_ptr) = ctx.get_constant_int(obj) {
                         ctx.add_quasi_immutable_dep((dep_ptr as u64, idx));

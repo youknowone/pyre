@@ -3056,8 +3056,9 @@ impl OptContext {
         }
 
         // optimizer.py:672: `self._last_guard_op and guard_op.getdescr() is None`
-        // getdescr() is None only for optimizer-created guards (no descr
-        // from tracing, no ResumeAtPositionDescr from unroll).
+        // Traced guards also arrive here with `descr=None`: opencoder.py
+        // records only the patched resume-position slot, and the optimizer
+        // invents the real fail descr from opcode + resumedata.
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
         let can_share = self.last_guard_idx.is_some()
@@ -3068,6 +3069,10 @@ impl OptContext {
         if can_share {
             let idx = self.last_guard_idx.unwrap();
             // _copy_resume_data_from: share resume data from last guard.
+            op.descr = Some(crate::fail_descr::invent_fail_descr_for_op(
+                op.opcode,
+                self.new_operations[idx].descr.as_ref(),
+            ));
             op.rd_numb = self.new_operations[idx].rd_numb.clone();
             op.rd_consts = self.new_operations[idx].rd_consts.clone();
             op.rd_virtuals = self.new_operations[idx].rd_virtuals.clone();
@@ -3389,6 +3394,11 @@ impl OptContext {
             })
             .collect();
 
+        op.descr = Some(crate::fail_descr::finalize_guard_descr_for_op(
+            op.opcode,
+            op.descr.as_ref(),
+            new_types.clone(),
+        ));
         op.store_final_boxes(liveboxes);
         op.fail_arg_types = Some(new_types);
         if !rd_virtuals.is_empty() {

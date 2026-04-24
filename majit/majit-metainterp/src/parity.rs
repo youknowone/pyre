@@ -138,13 +138,12 @@ mod tests {
 
     #[test]
     fn trace_ctx_constants_match_parity_case() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
+        let mut ctx = TraceCtx::new_with_input_types(
+            &[Type::Int],
             0,
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
+        let i0 = OpRef(0);
 
         let one = ctx.const_int(1);
         let two = ctx.const_int(2);
@@ -162,13 +161,12 @@ mod tests {
 
     #[test]
     fn guard_fail_args_are_part_of_normalized_trace() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
+        let mut ctx = TraceCtx::new_with_input_types(
+            &[Type::Int],
             0,
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
+        let i0 = OpRef(0);
         let zero = ctx.const_int(0);
         let cond = ctx.record_op(OpCode::IntGt, &[i0, zero]);
         ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[cond], 1, &[i0]);
@@ -188,14 +186,13 @@ mod tests {
 
     #[test]
     fn unary_bitwise_and_comparison_ops_normalize_stably() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let i1 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
+        let mut ctx = TraceCtx::new_with_input_types(
+            &[Type::Int, Type::Int],
             0,
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
 
         let neg = ctx.record_op(OpCode::IntNeg, &[i0]);
         let anded = ctx.record_op(OpCode::IntAnd, &[neg, i1]);
@@ -223,13 +220,12 @@ mod tests {
 
     #[test]
     fn div_and_mod_ops_match_expected_trace_shape() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
+        let mut ctx = TraceCtx::new_with_input_types(
+            &[Type::Int],
             0,
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
+        let i0 = OpRef(0);
 
         let three = ctx.const_int(3);
         let div = ctx.record_op(OpCode::IntFloorDiv, &[i0, three]);
@@ -252,14 +248,13 @@ mod tests {
 
     #[test]
     fn shift_ops_match_expected_trace_shape() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let i1 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
+        let mut ctx = TraceCtx::new_with_input_types(
+            &[Type::Int, Type::Int],
             0,
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
 
         let one = ctx.const_int(1);
         let two = ctx.const_int(2);
