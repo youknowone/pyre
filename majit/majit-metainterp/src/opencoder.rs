@@ -328,9 +328,19 @@ impl<'a> TraceIterator<'a> {
 
     /// opencoder.py:286-289 _get(self, i).
     fn _get(&self, i: usize) -> OpRef {
-        let res = self._cache[i];
-        debug_assert!(res.is_some(), "TraceIterator._get cache miss at {i}");
-        res.unwrap()
+        match self._cache.get(i).copied().flatten() {
+            Some(res) => res,
+            None => panic!(
+                "TraceIterator._get cache miss at {i} (cache_len={}, pos={}, start={}, end={}, index={}, start_index={}, fresh={})",
+                self._cache.len(),
+                self.pos,
+                self.start,
+                self.end,
+                self._index,
+                self.start_index,
+                self._fresh,
+            ),
+        }
     }
 
     /// opencoder.py:291-292 done().

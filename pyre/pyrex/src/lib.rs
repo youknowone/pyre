@@ -87,10 +87,6 @@ pub fn main_entry(binary_name: &'static str) {
 }
 
 fn real_main(binary_name: &str) {
-    // Capture the topmost interpreter SP so stack_check measures
-    // recursion depth from a stable base.
-    pyre_interpreter::stack_check::reset_stack_base();
-
     // Suppress panic messages for InvalidLoop — these are caught by
     // catch_unwind in the JIT optimizer but the default panic hook still
     // prints to stderr, making it look like a crash.
@@ -113,6 +109,14 @@ fn real_main(binary_name: &str) {
             std::process::exit(2);
         }
     };
+
+    // pypy/interpreter/app_main.py:824-825 parity for the standalone
+    // launcher: untranslated hosts need a higher startup recursion limit
+    // than translated PyPy's default 1000 because each host-language
+    // frame is larger. Pyre is likewise running on Rust frames here, so
+    // raise the startup budget before executing user code.
+    pyre_interpreter::stack_check::set_recursion_limit(5000)
+        .expect("startup recursion limit must be applicable");
 
     match mode {
         RunMode::Command(cmd) => {

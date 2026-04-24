@@ -108,6 +108,11 @@ impl DictStorage {
         self.values.as_slice().get(idx).copied()
     }
 
+    #[inline]
+    pub fn values_mut(&mut self) -> &mut [PyObjectRef] {
+        self.values.as_mut_slice()
+    }
+
     pub fn get_or_insert_with(
         &mut self,
         name: &str,

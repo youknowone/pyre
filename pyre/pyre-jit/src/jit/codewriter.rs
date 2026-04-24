@@ -4947,6 +4947,23 @@ impl CodeWriter {
         }
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
+        // `flatten.py:88-100` `enforce_input_args` may rotate the
+        // portal `(frame, ec)` inputargs into new colors. Keep the
+        // pyre-side metadata aligned with the post-regalloc SSA/JitCode
+        // slots the assembler will actually emit; the blackhole fill
+        // path must write the colored portal registers, not the
+        // pre-color layout placeholders.
+        let portal_frame_reg = alloc_result
+            .rename
+            .get(&(Kind::Ref, portal_frame_reg))
+            .copied()
+            .unwrap_or(portal_frame_reg);
+        let portal_ec_reg = alloc_result
+            .rename
+            .get(&(Kind::Ref, portal_ec_reg))
+            .copied()
+            .unwrap_or(portal_ec_reg);
+
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the

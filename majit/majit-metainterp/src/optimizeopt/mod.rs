@@ -222,6 +222,11 @@ pub struct OptContext {
     /// rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard.
     /// Deferred until emit adds the guard to new_operations.
     pub(crate) pending_mark_last_guard: Option<OpRef>,
+    /// virtualize.py:84-90 postprocess_FINISH queues the stashed
+    /// GUARD_NOT_FORCED_2 here so the outer optimizer can insert it at
+    /// `len(_newoperations) - 1` with full `store_final_boxes_in_guard`
+    /// semantics.
+    pub(crate) pending_finish_guard_postprocess: Option<Op>,
     // ptr_info merged into forwarded (Forwarded::Info variant)
     //
     // RPython parity: per-OpRef IntBound storage lives ENTIRELY on
@@ -1079,6 +1084,7 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
+            pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_virtual_args: None,
@@ -1157,6 +1163,7 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
+            pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_virtual_args: None,
@@ -4354,11 +4361,20 @@ impl OptContext {
                 .and_then(|d| d.as_field_descr())
                 .expect("ensure_ptr_info_arg0: field op without FieldDescr");
             // optimizer.py:479-484: parent_descr.is_object() decides Instance vs Struct.
-            let parent_descr = field_descr.get_parent_descr().expect(
-                "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() returned None — \
-                 the FieldDescr implementation must override get_parent_descr() \
-                 for parity with optimizer.py:478",
-            );
+            let parent_descr = field_descr.get_parent_descr().unwrap_or_else(|| {
+                panic!(
+                    "ensure_ptr_info_arg0: FieldDescr.get_parent_descr() returned None \
+                     for opcode={:?} descr={:?} field_name={:?} index_in_parent={} \
+                     offset={} field_type={:?}; the FieldDescr implementation must \
+                     override get_parent_descr() for parity with optimizer.py:478",
+                    op.opcode,
+                    op.descr,
+                    field_descr.field_name(),
+                    field_descr.index_in_parent(),
+                    field_descr.offset(),
+                    field_descr.field_type(),
+                )
+            });
             let is_object = parent_descr
                 .as_size_descr()
                 .expect(

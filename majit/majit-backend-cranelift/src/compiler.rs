@@ -6700,6 +6700,7 @@ impl CraneliftBackend {
             }
         }
 
+        let mut first_label_entered_at_entry = false;
         if let Some(&(entry_label_idx, entry_label_block)) = label_blocks.first() {
             if body_direct_num_inputs > 0 && label_blocks.len() >= 2 {
                 // Dual entry: branch on entry_mode (last input slot).
@@ -6726,16 +6727,9 @@ impl CraneliftBackend {
                         builder.def_var(var(arg_ref.0), param);
                     }
                 }
-            } else {
-                let vals: Vec<CValue> = if has_entry_label {
-                    entry_input_vals.clone()
-                } else {
-                    ops[entry_label_idx]
-                        .args
-                        .iter()
-                        .map(|&r| resolve_opref(&mut builder, &constants, r))
-                        .collect()
-                };
+                first_label_entered_at_entry = true;
+            } else if has_entry_label {
+                let vals: Vec<CValue> = entry_input_vals.clone();
                 builder.ins().jump(entry_label_block, &block_args(&vals));
                 builder.switch_to_block(entry_label_block);
                 for (i, &arg_ref) in ops[entry_label_idx].args.iter().enumerate() {
@@ -6744,6 +6738,7 @@ impl CraneliftBackend {
                         builder.def_var(var(arg_ref.0), param);
                     }
                 }
+                first_label_entered_at_entry = true;
             }
         } else if has_jump && loop_block != entry_block {
             let zero = builder.ins().iconst(cl_types::I64, 0);
@@ -6770,9 +6765,15 @@ impl CraneliftBackend {
                 .iter()
                 .find(|(label_idx, _)| *label_idx == op_idx)
             {
-                // The first LABEL is already the current block. Later LABELs
-                // are explicit jump targets inside the same compiled loop.
-                if Some(op_idx) != label_blocks.first().map(|(label_idx, _)| *label_idx) {
+                // The first LABEL is already the current block only when
+                // trace entry jumped there above. Bridge/retrace fragments can
+                // have real ops before their first LABEL; those ops must run
+                // before the LABEL args are bound, matching RPython's linear
+                // trace order.
+                let first_label_idx = label_blocks.first().map(|(label_idx, _)| *label_idx);
+                let label_already_current =
+                    Some(op_idx) == first_label_idx && first_label_entered_at_entry;
+                if !label_already_current {
                     let prev_terminated = op_idx
                         .checked_sub(1)
                         .and_then(|prev_idx| ops.get(prev_idx))

@@ -273,6 +273,19 @@ impl UnrollOptimizer {
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
         phase1_out: Option<&mut Option<(Vec<Op>, ExportedState)>>,
     ) -> (Vec<Op>, usize) {
+        // unroll.py:112 / 156 / 171 / 238-242 parity:
+        // `jump_to_preamble(celltoken, end_jump)` retargets the ORIGINAL
+        // end-jump arglist captured from the trace iterator. The body
+        // optimization path may temporarily rewrite the detached terminal
+        // JUMP into Phase-2-local OpRefs, but when we fall back to the
+        // preamble we must restore the trace's original jump contract
+        // instead of reusing the mangled Phase-2 arglist.
+        let pre_opt_jump_args: Vec<OpRef> = ops
+            .iter()
+            .rfind(|op| op.opcode == OpCode::Jump)
+            .map(|jump| jump.args.to_vec())
+            .unwrap_or_default();
+
         // compile.py:362: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
         let (mut exported_state, consts_p1, p1_ops) = if let Some(pre_imported) =
@@ -1140,6 +1153,21 @@ impl UnrollOptimizer {
                 );
             }
             if let Some(mut end_jump) = body_terminal_op {
+                if let Some(final_ctx) = opt_p2.final_ctx.as_ref() {
+                    // unroll.py:238-242 retargets the live end_jump after
+                    // force_box_for_end_of_preamble/get_box_replacement have
+                    // updated forwarding. Keep the detached terminal clone in
+                    // the same canonicalized state before swapping it back in.
+                    apply_box_replacements(&mut end_jump, final_ctx);
+                    if !pre_opt_jump_args.is_empty() {
+                        end_jump.args = pre_opt_jump_args
+                            .iter()
+                            .map(|&arg| final_ctx.get_box_replacement(arg))
+                            .collect();
+                    }
+                } else if !pre_opt_jump_args.is_empty() {
+                    end_jump.args = pre_opt_jump_args.clone().into();
+                }
                 end_jump.descr = Some(preamble_target.as_jump_target_descr());
                 // compile.py:320/327 parity: start_label uses
                 // start_state.renamed_inputargs, while unroll.py:238-242
@@ -4442,6 +4470,17 @@ fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[O
     }
     while jump_args.len() < preamble_args.len() {
         jump_args.push(preamble_args[jump_args.len()]);
+    }
+}
+
+fn apply_box_replacements(op: &mut Op, ctx: &crate::optimizeopt::OptContext) {
+    for arg in op.args.iter_mut() {
+        *arg = ctx.get_box_replacement(*arg);
+    }
+    if let Some(fail_args) = op.fail_args.as_mut() {
+        for arg in fail_args.iter_mut() {
+            *arg = ctx.get_box_replacement(*arg);
+        }
     }
 }
 

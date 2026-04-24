@@ -901,6 +901,17 @@ pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
 }
 
+/// Cached SizeDescr for the host PyFrame virtualizable.
+///
+/// RPython's `GcCache.get_size_descr()` returns a stable descriptor
+/// object for a given struct. Pyre keeps the PyFrame descriptors in the
+/// `PYFRAME_DESCR_GROUP` singleton, so callers that need the parent
+/// SizeDescr for `VirtualizableInfo::finalize_arc` must reuse that
+/// cached Arc instead of allocating a fresh ephemeral `SizeDescr`.
+pub fn pyframe_size_descr() -> DescrRef {
+    PYFRAME_DESCR_GROUP.size_descr.clone()
+}
+
 pub fn pyframe_locals_cells_stack_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 0)
 }

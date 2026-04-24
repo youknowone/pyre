@@ -4681,6 +4681,46 @@ mod tests {
         assert_eq!(bh.position, 0);
         assert_eq!(bh.registers_i, vec![0, 321]);
     }
+
+    struct TestVirtualizableInfo;
+
+    impl VirtualizableInfo for TestVirtualizableInfo {
+        fn get_total_size(&self, _virtualizable: i64) -> usize {
+            0
+        }
+
+        fn reset_token_gcref(&self, _virtualizable: i64) {}
+
+        fn write_from_resume_data_partial(
+            &self,
+            _virtualizable: i64,
+            _reader: &mut ResumeDataDirectReader,
+        ) {
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "vable_size > 0")]
+    fn test_consume_vref_and_vable_asserts_zero_vable_size_when_vinfo_present() {
+        let mut writer = crate::resumecode::Writer::new(3);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count
+        writer.append_int(0); // vable_size
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        let mut reader =
+            ResumeDataDirectReader::new(&rd_numb, &[], &[], &[], None, None, &NullAllocator);
+        reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "load_next_value_of_type: unexpected type Void")]
+    fn test_next_value_of_type_rejects_void() {
+        let mut reader =
+            ResumeDataDirectReader::new(&[0, 0], &[], &[], &[], None, None, &NullAllocator);
+        let _ = reader.next_value_of_type(majit_ir::Type::Void);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -5409,7 +5449,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             majit_ir::Type::Int => self.next_int(),
             majit_ir::Type::Ref => self.next_ref(),
             majit_ir::Type::Float => self.next_float(),
-            _ => self.next_int(),
+            other => panic!("load_next_value_of_type: unexpected type {other:?}"),
         }
     }
 
