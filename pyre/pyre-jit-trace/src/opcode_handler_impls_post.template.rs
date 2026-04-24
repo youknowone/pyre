@@ -146,11 +146,26 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         let ns = self.sym().concrete_namespace;
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             let opref = self.trace_load_name(name)?;
-            return Ok(crate::state::FrontendOp::opref_only(opref));
+            // runtime_ops::jit_load_name_from_namespace parity — read the
+            // concrete namespace so the OpRef carries the real W_Object
+            // pointer as its Box shadow (RPython `FrontendOp._resref`
+            // parity).  Producers must attach concrete here, else the
+            // consumer (store_local_value → vable mirror) has no safe
+            // way to update virtualizable_values.
+            let result_concrete = if ns.is_null() {
+                crate::state::ConcreteValue::Null
+            } else {
+                unsafe {
+                    let obj = pyre_interpreter::dict_storage_get(&*ns, name)
+                        .unwrap_or(std::ptr::null_mut());
+                    crate::state::ConcreteValue::ref_of(obj)
+                }
+            };
+            return Ok(crate::state::FrontendOp::new(opref, result_concrete));
         };
         let concrete_cv = crate::state::dict_storage_value_direct(ns, slot);
         let result_concrete = concrete_cv
-            .map(crate::state::ConcreteValue::from_pyobj)
+            .map(crate::state::ConcreteValue::ref_of)
             .unwrap_or(crate::state::ConcreteValue::Null);
         if let Some(concrete_value) = concrete_cv {
             if !concrete_value.is_null() {

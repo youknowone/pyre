@@ -728,10 +728,18 @@ impl MIFrame {
     ///
     /// Parity: the operand stack for virtualizable portal frames lives
     /// inside `locals_cells_stack_w` (virtualizable.py:86-98), a W_Root
-    /// array, so every pushed slot is a Ref box. `value_type` is kept
-    /// as a declared type hint but the stored OpRef is always boxed
-    /// here. Callers that want to keep a raw Int/Float payload must
-    /// unbox at the op site, not at push time.
+    /// array declared as `list[W_Object]` (pyframe.py:84), so every
+    /// pushed slot must be a Ref box — both halves of the Box. The
+    /// OpRef half is wrapped here via `wrapint` / `wrapfloat` for
+    /// Int/Float producers; the concrete half is wrapped in parallel
+    /// via `ConcreteValue::to_pyobj` so an unboxed scalar concrete
+    /// cannot reach `concrete_stack`.  RPython `BoxPtr` carries a
+    /// `GCREF`, never a raw int (history.py:203), and the interpreter
+    /// allocates a real W_IntObject / W_FloatObject before the value
+    /// lands on the stack.  Without parallel boxing here, `STORE_FAST`
+    /// would flush a raw-scalar `Value` into `virtualizable_values`,
+    /// poisoning the `locals_cells_stack_w` shadow used by
+    /// `synchronize_virtualizable()` (trace_ctx.rs:1299).
     fn push_typed_value(
         &mut self,
         ctx: &mut TraceCtx,
@@ -739,10 +747,29 @@ impl MIFrame {
         value_type: Type,
         concrete: ConcreteValue,
     ) {
-        let boxed = match value_type {
+        // OpRef half: wrap raw Int/Float producers into a Ref-typed
+        // W_IntObject / W_FloatObject (wrapint / wrapfloat IR ops)
+        // so the SSA identity matches locals_cells_stack_w's GCREF
+        // declaration (virtualizable.py:86-98).
+        let boxed_opref = match value_type {
             Type::Int => wrapint(ctx, value),
             Type::Float => wrapfloat(ctx, value),
             _ => value,
+        };
+        // Concrete half: match the Ref-slot requirement regardless of
+        // the producer's opref type.  A Ref-typed opref can still carry
+        // an unboxed Int/Float concrete when the shadow came from an
+        // unboxing site (e.g. `ConcreteValue::from_pyobj` at inline
+        // call return, which splits a W_IntObject/W_FloatObject result
+        // into Int(v)/Float(v)).  Box via `to_pyobj()` — for
+        // ConcreteValue::Int/Float it allocates a fresh W_*Object via
+        // intobject::w_int_new / w_float_new; for ConcreteValue::Ref
+        // it is an identity passthrough.
+        let boxed_concrete = match concrete {
+            ConcreteValue::Int(_) | ConcreteValue::Float(_) => {
+                ConcreteValue::Ref(concrete.to_pyobj())
+            }
+            _ => concrete,
         };
         let (has_vable, reg_idx) = {
             let s = self.sym_mut();
@@ -751,7 +778,7 @@ impl MIFrame {
             if reg_idx >= s.registers_r.len() {
                 s.registers_r.resize(reg_idx + 1, OpRef::NONE);
             }
-            s.registers_r[reg_idx] = boxed;
+            s.registers_r[reg_idx] = boxed_opref;
             if stack_idx >= s.symbolic_stack_types.len() {
                 s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
             }
@@ -759,12 +786,13 @@ impl MIFrame {
             if stack_idx >= s.concrete_stack.len() {
                 s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
             }
-            s.concrete_stack[stack_idx] = concrete;
+            s.concrete_stack[stack_idx] = boxed_concrete;
             s.valuestackdepth += 1;
             (s.owns_virtualizable_shadow(), reg_idx)
         };
         // pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
+        //     self.metainterp.synchronize_virtualizable()
         // The symbolic stack slice of `locals_cells_stack_w` must stay in
         // lock-step with the virtualizable_boxes shadow — the shadow is
         // the single source of truth for `build_virtualizable_boxes`
@@ -774,8 +802,49 @@ impl MIFrame {
         // `(NUM_SCALAR_INPUTARGS - 1) + reg_idx` in virtualizable_boxes.
         if has_vable {
             let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_idx;
-            let concrete_value = ctx.concrete_of_opref(boxed);
-            ctx.set_virtualizable_entry_at(flat_idx, boxed, concrete_value);
+            // Derive the concrete half from `boxed_concrete` directly —
+            // NEVER via `ctx.concrete_of_opref(boxed_opref)`.  The
+            // opref was just produced by `wrapint`/`wrapfloat` (a
+            // fresh `NewWithVtable`), which `concrete_of_opref`
+            // cannot resolve: it only knows constants and the
+            // standard-vable identity, and otherwise returns the
+            // sentinel `Value::Ref(GcRef(usize::MAX))` (trace_ctx.rs:1558).
+            // Feeding that sentinel into `set_virtualizable_entry_at`
+            // would let the next `synchronize_virtualizable_slot`
+            // flush `usize::MAX` as a GCREF into the live
+            // virtualizable.  After the Phase 5 boxing above,
+            // `boxed_concrete` is always Ref/Null, so we can lift it
+            // straight into `Value::Ref(...)`.
+            let concrete_value = match boxed_concrete {
+                ConcreteValue::Ref(obj) => majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)),
+                ConcreteValue::Null => majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+                ConcreteValue::Int(_) | ConcreteValue::Float(_) => unreachable!(
+                    "push_typed_value: Int/Float concrete unreachable after \
+                     Phase 5 to_pyobj boxing (line 768)"
+                ),
+            };
+            ctx.set_virtualizable_entry_at(flat_idx, boxed_opref, concrete_value);
+            // ARCHITECTURE NOTE — upstream
+            // `_opimpl_setarrayitem_vable` (pyjitpl.py:1246) follows
+            // every shadow write with `synchronize_virtualizable()`
+            // because the metainterp is the SOLE writer of
+            // `virtualizable_boxes[i] = ...` while it interprets the
+            // recorded opcode stream; without the sync, the live
+            // frame would never see the update.
+            //
+            // pyre's tracer is a parallel observer: the interpreter's
+            // `PyFrame::pushvalue()` (pyframe.rs:827 `push()` →
+            // `locals_w_mut()[depth] = value`) already writes the
+            // live heap before this tracer-side hook runs, so a
+            // per-push `synchronize_virtualizable_slot` would be a
+            // duplicate store.  It is therefore NOT parity-mandated
+            // in pyre — only bridge resume, virtual materialization,
+            // and similar tracer-only shadow writers (where the
+            // interpreter did not run the corresponding write) need
+            // to sync.  Empirically landing the per-push sync
+            // regresses fannkuch on both backends from 2.58s to >5s
+            // TIMEOUT because the duplicate write traffic dominates
+            // the inner loop.
         }
     }
 
@@ -828,14 +897,16 @@ impl MIFrame {
         // is cleared to None in `locals_cells_stack_w`. Upstream lowers
         // this via `setarrayitem_vable_r(locals_cells_stack_w, depth,
         // None)`, which `_opimpl_setarrayitem_vable` mirrors into
-        // `virtualizable_boxes`. Mirror the clear into the shadow so
+        // `virtualizable_boxes` AND calls `synchronize_virtualizable()`
+        // (pyjitpl.py:1245-1246).  Mirror the clear into the shadow so
         // subsequent snapshots do not pick up a stale pushed OpRef above
-        // the current stack depth.
+        // the current stack depth, then sync the slot to heap.
         if has_vable {
             let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_idx;
             let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
             let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
             ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+            ctx.synchronize_virtualizable_slot(flat_idx);
         }
         Ok(value)
     }
@@ -935,6 +1006,20 @@ impl MIFrame {
         // atomically via `virtualizable_entry_at`; reading each half
         // separately and reconstructing concrete via `concrete_of_opref`
         // would drop non-const Box identity into the sentinel fallback.
+        //
+        // ARCHITECTURE NOTE — no per-swap
+        // `synchronize_virtualizable_slot` here.  upstream
+        // `_opimpl_setarrayitem_vable` (pyjitpl.py:1246) syncs after
+        // every shadow write because the metainterp is the sole
+        // writer during retracing.  pyre's tracer runs alongside the
+        // interpreter, and the interpreter's ROT_TWO/ROT_* lowers
+        // to `self.locals_w_mut().swap(top_idx, other_idx)`
+        // (eval.rs:448) which updates the live heap directly — the
+        // shadow swap below is a parallel bookkeeping update, not
+        // the authoritative heap write.  Syncing here would
+        // duplicate the interpreter's swap (same 2 stores to the
+        // same heap slots) and regresses stack-intensive benches
+        // (cf. push_typed_value note above).
         if has_vable {
             let flat_top = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_top;
             let flat_other = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_other;
@@ -1020,7 +1105,7 @@ impl MIFrame {
         &mut self,
         ctx: &mut TraceCtx,
         idx: usize,
-        value: OpRef,
+        value: FrontendOp,
     ) -> Result<(), PyError> {
         // RPython `_opimpl_setarrayitem_vable` (pyjitpl.py:1242-1247)
         // writes the value's Ref box directly into
@@ -1039,21 +1124,60 @@ impl MIFrame {
         // (RPython Box.type parity — the fix belongs at the producer,
         // not the consumer).
         debug_assert_eq!(
-            self.value_type(value),
+            self.value_type(value.opref),
             Type::Ref,
             "store_local_value: expected Ref-typed box (locals_cells_stack_w \
              is W_Root), got {:?} for {:?}. Producer must emit \
              wrapint/wrapfloat before the value reaches the symbolic \
              stack / local slot.",
-            self.value_type(value),
-            value,
+            self.value_type(value.opref),
+            value.opref,
         );
+        // Phase 5 audit (2026-04-24): all concrete_stack writers
+        // (push_typed_value, metainterp.rs:490 inline-call return,
+        // trace_opcode.rs:4803 exception push, metainterp.rs:650
+        // exception push) produce Ref or Null concretes.  Int/Float
+        // are boxed at push_typed_value (Phase 5a, commit e2fb53191e),
+        // so they never reach STORE_FAST via pop_value.  If this
+        // assert ever fires, a new producer has leaked an unboxed
+        // scalar — box it at the producer, not here
+        // (pyframe.py:84 `list[W_Object]` invariant).
+        debug_assert!(
+            !matches!(
+                value.concrete,
+                ConcreteValue::Int(_) | ConcreteValue::Float(_)
+            ),
+            "store_local_value: unboxed Int/Float concrete reached Ref-typed \
+             locals_cells_stack_w slot at idx={} (value.concrete={:?}). \
+             Phase 5a push_typed_value should have boxed this.",
+            idx,
+            value.concrete,
+        );
+        // concrete_locals update: preserve the ConcreteValue exactly as
+        // producers handed it. RPython `pyjitpl.py:1245
+        // virtualizable_boxes[index] = valuebox` copies the whole Box;
+        // we must not synthesize a fake concrete from the OpRef type.
+        if idx < self.sym().concrete_locals.len() {
+            self.sym_mut().concrete_locals[idx] = value.concrete;
+        }
+        // Box-atomicity parity (RPython `pyjitpl.py:1245`
+        // `virtualizable_boxes[index] = valuebox` — Box carries both
+        // OpRef AND concrete Value atomically).  Pyre splits Box into
+        // two arrays (`virtualizable_boxes: Vec<OpRef>` +
+        // `virtualizable_values: Vec<Value>`).  The concrete half of
+        // the Box is only safe to write when the producer attached a
+        // real W_Object pointer (ConcreteValue::Ref) — Null (untracked)
+        // and Int/Float (unboxed scalar) are NOT valid concretes for a
+        // Ref-typed `locals_cells_stack_w` slot
+        // (virtualizable.py:86-98: `list[W_Object]`; see also
+        // `ConcreteValue::Null` vs `ConcreteValue::Ref(PY_NULL)`
+        // distinction at state.rs:897).
         let (has_vable, frame_ref, nlocals) = {
             let s = self.sym_mut();
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            s.registers_r[idx] = value;
+            s.registers_r[idx] = value.opref;
             if idx >= s.symbolic_local_types.len() {
                 s.symbolic_local_types.resize(idx + 1, Type::Ref);
             }
@@ -1066,19 +1190,58 @@ impl MIFrame {
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
         //     self.metainterp.synchronize_virtualizable()
         //
-        // `virtualizable_boxes` is the RPython tracing-time mirror of
-        // the PyFrame's `locals_cells_stack_w` array. Keep it in sync
-        // with `registers_r` so `close_loop_args_at`'s
-        // `set_virtualizable_box_at` writes the current SSA opref (not
-        // the preamble InputArg) into every slot.
+        // Box-atomic shadow write + immediate per-slot heap sync
+        // (virtualizable.py:101 `write_boxes` → `write_box_at_flat`
+        // O(1) variant via TraceCtx::synchronize_virtualizable_slot;
+        // pyjitpl.py:1247 `# XXX only the index'th field needs to be
+        // synchronized, really` predicts exactly this optimization).
+        //
+        // The generic `vable_setarrayitem_indexed` helper supports the
+        // full `_opimpl_setarrayitem_vable` contract — `box`, `fdescr`,
+        // `indexbox` are all runtime values there, so it emits a
+        // `_nonstandard_virtualizable` dispatch branch + a
+        // `_get_arrayitem_vable_index` lookup before the two write ops.
+        // STORE_FAST does NOT need that preamble: the target array is
+        // statically `PyFrame.locals_cells_stack_w` (well-known descr)
+        // and the local `idx` is a bytecode-time constant, so
+        // `_nonstandard_virtualizable` is statically False and the slot
+        // index reduces to `(NUM_SCALAR_INPUTARGS - 1) + idx`.  The
+        // helper's preamble is therefore dead IR emit for this caller.
+        //
+        // Observed consequence: routing STORE_FAST through the helper
+        // regressed fib_loop + inline_helper correctness because the
+        // dead preamble's nonstandard-fallback IR-op mutations leaked
+        // into the live trace (memo
+        // `super_inst_candidate1_probe_scope_2026_04_23` Session 6/7).
+        // The inlined two-step form below has no such side-effects.
         if has_vable && idx < nlocals {
             let _ = frame_ref;
+            let _ = nlocals;
             // NUM_SCALAR_INPUTARGS - 1 = 6 (scalar fields excluding the
             // frame-identity slot at index 0 of the inputarg stream).
             // virtualizable_boxes layout is [scalars.., array_items..,
             // vable_ref], so local idx maps to `(NUM_SCALARS - 1) + idx`.
             let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + idx;
-            ctx.set_virtualizable_box_at(flat_idx, value);
+            // Phase 6 unified Ref+Null branch: write the whole Box
+            // (OpRef + concrete as Ref) and sync to heap.  Null
+            // concretes become Value::Ref(GcRef::NULL), the canonical
+            // "unset local" heap value per pyframe.py:84
+            // `list[W_Object]` (PY_NULL at uninitialized slots).
+            // Int/Float concretes cannot reach here — the debug_assert
+            // at the function top enforces the Phase 5 audit invariant
+            // (all 7 concrete_stack/concrete_locals writers produce
+            // Ref/Null; push_typed_value boxes raw scalars via
+            // wrapint/wrapfloat + to_pyobj at Phase 5a).
+            let concrete_value = match value.concrete {
+                ConcreteValue::Ref(obj) => majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)),
+                ConcreteValue::Null => majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+                ConcreteValue::Int(_) | ConcreteValue::Float(_) => unreachable!(
+                    "store_local_value: Int/Float concrete unreachable \
+                     (Phase 5 audit invariant; push_typed_value boxes at producer)"
+                ),
+            };
+            ctx.set_virtualizable_entry_at(flat_idx, value.opref, concrete_value);
+            ctx.synchronize_virtualizable_slot(flat_idx);
         }
         Ok(())
     }
@@ -2953,7 +3116,7 @@ impl MIFrame {
                 let cv = concrete_items
                     .get(i)
                     .copied()
-                    .map(ConcreteValue::from_pyobj)
+                    .map(ConcreteValue::ref_of)
                     .unwrap_or(ConcreteValue::Null);
                 FrontendOp::new(opref, cv)
             })
@@ -2971,7 +3134,7 @@ impl MIFrame {
         let subscr_concrete = if !concrete_obj.is_null() && !concrete_key.is_null() {
             if let Ok(result) = pyre_interpreter::baseobjspace::getitem(concrete_obj, concrete_key)
             {
-                ConcreteValue::from_pyobj(result)
+                ConcreteValue::ref_of(result)
             } else {
                 ConcreteValue::Null
             }
@@ -3975,7 +4138,7 @@ impl MIFrame {
             // MIFrame Box tracking: set concrete metadata for callee
             sym.concrete_locals = concrete_args
                 .iter()
-                .map(|&a| ConcreteValue::from_pyobj(a))
+                .map(|&a| ConcreteValue::ref_of(a))
                 .collect();
             sym.concrete_locals
                 .resize(callee_nlocals, ConcreteValue::Null);
@@ -4053,7 +4216,7 @@ impl MIFrame {
             // MIFrame Box tracking: set concrete metadata for callee
             sym.concrete_locals = concrete_args
                 .iter()
-                .map(|&a| ConcreteValue::from_pyobj(a))
+                .map(|&a| ConcreteValue::ref_of(a))
                 .collect();
             sym.concrete_locals
                 .resize(callee_nlocals, ConcreteValue::Null);
@@ -4331,8 +4494,19 @@ impl MIFrame {
         if let Some((opref, cv)) = gen_result {
             return Ok(FrontendOp::new(opref, ConcreteValue::Int(cv)));
         }
+        // Slow path: `generated_iter_next_value` returned None only when
+        // `concrete_continues && concrete_current + concrete_step` would
+        // overflow (codegen.rs:2072-2074).  The residual-call IR we emit
+        // below performs the actual runtime advance via
+        // `range_iter_next_or_null`.  At trace time the advance has not
+        // yet happened — `concrete_current` holds the pre-advance value
+        // that `w_range_iter_next` (rangeobject.rs:63) would return.
+        // Attach it as concrete so the FrontendOp carries a real Box
+        // shadow (RPython FrontendOp._resint parity) rather than
+        // falling back to `opref_only` (which feeds into
+        // store_local_value as ConcreteValue::Null).
         let opref = self.trace_iter_next_value(iter)?;
-        Ok(FrontendOp::opref_only(opref))
+        Ok(FrontendOp::new(opref, ConcreteValue::Int(concrete_current)))
     }
 
     pub(crate) fn concrete_branch_truth_for_value(
@@ -4802,7 +4976,12 @@ impl MIFrame {
             // snapshot reads only `virtualizable_boxes`, so the unwind
             // must also mirror onto the shadow. Clear truncated slots to
             // PY_NULL (pyframe.py:411 popvalue_maybe_none) and write the
-            // push_lasti / exc_box slots to match registers_r.
+            // push_lasti / exc_box slots to match registers_r.  Each
+            // shadow write is followed by a per-slot sync —
+            // `_opimpl_setarrayitem_vable` (pyjitpl.py:1245-1246) calls
+            // `synchronize_virtualizable()` after every shadow update;
+            // the unwind is a multi-slot virtualizable write so mirror
+            // that contract per-slot.
             if has_vable {
                 let null_opref =
                     self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::PY_NULL as i64));
@@ -4816,6 +4995,7 @@ impl MIFrame {
                     for reg_idx in lo..hi {
                         let flat_idx = static_offset + reg_idx;
                         ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+                        ctx.synchronize_virtualizable_slot(flat_idx);
                     }
                     if let Some(idx) = lasti_reg_idx {
                         // registers_r stored OpRef::NONE for the lasti
@@ -4825,10 +5005,12 @@ impl MIFrame {
                         // without an OpRef.
                         let flat_idx = static_offset + idx;
                         ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+                        ctx.synchronize_virtualizable_slot(flat_idx);
                     }
                     let flat_idx = static_offset + exc_reg_idx;
                     let exc_concrete = majit_ir::Value::Ref(majit_ir::GcRef(exc_obj as usize));
                     ctx.set_virtualizable_entry_at(flat_idx, exc_opref, exc_concrete);
+                    ctx.synchronize_virtualizable_slot(flat_idx);
                 });
             }
             // Sync concrete frame.

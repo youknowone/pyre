@@ -1296,6 +1296,44 @@ impl TraceCtx {
         self.virtualizable_heap_ptr = if ptr.is_null() { None } else { Some(ptr) };
     }
 
+    /// Sync a single `virtualizable_values` slot back to the live
+    /// virtualizable.  O(1) variant of `synchronize_virtualizable`
+    /// used by callers that know which slot they just updated
+    /// (e.g. `vable_setarrayitem_indexed` after
+    /// `set_virtualizable_entry_at`).  Avoids the
+    /// `write_all_boxes` O(num_locals) walk + the two transient Vec
+    /// allocations on the hot STORE_FAST path.
+    ///
+    /// pyjitpl.py:3446-3450 `synchronize_virtualizable()` parity: the
+    /// trailing identity slot at `virtualizable_boxes[-1]` is outside
+    /// the array-lengths range and is never written (RPython
+    /// `virtualizable.py:113` `assert len(boxes) == i + 1`).
+    pub fn synchronize_virtualizable_slot(&self, flat_idx: usize) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(values) = self.virtualizable_values.as_ref() else {
+            return;
+        };
+        let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
+            return;
+        };
+        let Some(&value) = values.get(flat_idx) else {
+            return;
+        };
+        let raw = value_to_raw_bits(value);
+        // Safety: `heap_ptr` is cached at trace/bridge entry from
+        // `MetaInterp::vable_ptr`, pinned for the trace session.
+        // `write_box_at_flat` uses the same typed offsets as the
+        // matching heap read.
+        unsafe {
+            info.write_box_at_flat(heap_ptr as *mut u8, flat_idx, raw, lengths);
+        }
+    }
+
     /// pyjitpl.py:3446-3450 `synchronize_virtualizable()`.
     ///
     /// Writes the concrete half of `virtualizable_boxes` (the
@@ -1436,14 +1474,15 @@ impl TraceCtx {
     /// (`virtualizable_slot_type(index)`); RPython guarantees this at the
     /// source level by emitting `NEW_W_INT` / `NEW_W_FLOAT` before any
     /// STORE into a Ref-typed `locals_cells_stack_w` slot
-    /// (pypy/interpreter/pyframe.py:84 `list[W_Object]`).  Pyre's codewriter
-    /// does not yet mirror that boxing at STORE_FAST → vable (Phase 4-5 of
-    /// the portal-locals lowering plan); until it does, non-Phase-D paths
-    /// like `pyre::trace_opcode::store_local_value` may write a pyre-unboxed
-    /// `Value::Int`/`Value::Float` into a Ref slot and a later
-    /// `BC_GETARRAYITEM_VABLE_R` read will decode 0 via `value_as_ref_bits`.
-    /// That null is a pyre-upstream parity gap, not a shadow bug — the
-    /// shadow faithfully reflects the caller's Box.
+    /// (pypy/interpreter/pyframe.py:84 `list[W_Object]`).  Pyre achieves
+    /// the same invariant at `push_typed_value` (Phase 5a, trace_opcode.rs
+    /// :754-772): raw Int/Float concretes produced by arithmetic are boxed
+    /// via `wrapint`/`wrapfloat` (OpRef half) and `ConcreteValue::to_pyobj`
+    /// (concrete half) before landing on the stack, so every pop reaching
+    /// `pyre::trace_opcode::store_local_value` carries a Ref (or Null)
+    /// concrete.  A debug_assert at that consumer (trace_opcode.rs:1020)
+    /// enforces the invariant and catches producer-side leaks in debug
+    /// builds.
     pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) -> bool {
         let have_boxes = self
             .virtualizable_boxes
@@ -2344,6 +2383,12 @@ impl TraceCtx {
     /// Standard virtualizable array item write.
     /// `array_field_offset` identifies which array field, `item_index` is the element index.
     /// If standard boxes are active, writes to the flat box array directly.
+    ///
+    /// pyjitpl.py:1245-1246 `_opimpl_setarrayitem_vable` parity: each
+    /// shadow write is followed by `synchronize_virtualizable()` so the
+    /// live virtualizable stays in lock-step.  Mirrors
+    /// `vable_setarrayitem_indexed` (trace_ctx.rs:2430) which already
+    /// does this for the indexed-dispatch variant.
     pub fn vable_setarrayitem_vable(
         &mut self,
         array_opref: OpRef,
@@ -2355,6 +2400,7 @@ impl TraceCtx {
         let flat_idx = self.vable_array_flat_index(fdescr, item_index);
         if let Some(idx) = flat_idx {
             if self.set_virtualizable_entry_at(idx, value, concrete) {
+                self.synchronize_virtualizable_slot(idx);
                 return;
             }
         }
@@ -2385,7 +2431,10 @@ impl TraceCtx {
             if self.set_virtualizable_entry_at(flat_idx, value, concrete) {
                 // pyjitpl.py:3446 write_boxes parity: mirror the updated
                 // shadow slot back into the live virtualizable.
-                self.synchronize_virtualizable();
+                // Use the O(1) slot variant so per-STORE_FAST syncs don't
+                // walk every `virtualizable_values` entry (full
+                // `write_all_boxes` is reserved for trace-boundary sync).
+                self.synchronize_virtualizable_slot(flat_idx);
                 return;
             }
         }

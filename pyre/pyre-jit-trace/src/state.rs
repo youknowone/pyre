@@ -923,6 +923,18 @@ pub(crate) fn concrete_value_from_slot(obj: PyObjectRef) -> ConcreteValue {
 impl ConcreteValue {
     /// Convert from PyObjectRef (unbox if possible).
     /// Null pointers become ConcreteValue::Null ("untracked").
+    ///
+    /// NOTE — for producer sites that feed the operand stack (push_value
+    /// / push_typed_value) or a virtualizable local slot, use
+    /// `ConcreteValue::ref_of` instead.  `from_pyobj` unboxes W_IntObject
+    /// / W_FloatObject into `Int(v)` / `Float(v)`, which
+    /// `push_typed_value` would then re-box by allocating a FRESH
+    /// W_IntObject via the small-int cache or `w_int_new` — different
+    /// pointer than the producer returned.  The resulting
+    /// `virtualizable_values` shadow then disagrees with the live
+    /// `PyFrame.locals_cells_stack_w` pointer identity
+    /// (pyframe.py:84 `list[W_Object]`), breaking Box-atomicity when
+    /// `synchronize_virtualizable()` writes shadow back to heap.
     pub fn from_pyobj(obj: PyObjectRef) -> Self {
         if obj.is_null() {
             return ConcreteValue::Null;
@@ -935,6 +947,20 @@ impl ConcreteValue {
             } else {
                 ConcreteValue::Ref(obj)
             }
+        }
+    }
+
+    /// Ref-passthrough shadow for a PyObjectRef.  Preserves the
+    /// producer's pointer identity (no unbox-rebox roundtrip); null
+    /// pointers collapse to `Null` ("no concrete produced").  Use this
+    /// at sites that feed the operand stack / virtualizable shadow so
+    /// the `push_typed_value` parallel-box invariant keeps the same
+    /// W_*Object instance the interpreter side observed.
+    pub fn ref_of(obj: PyObjectRef) -> Self {
+        if obj.is_null() {
+            ConcreteValue::Null
+        } else {
+            ConcreteValue::Ref(obj)
         }
     }
 
@@ -952,19 +978,41 @@ impl ConcreteValue {
         matches!(self, ConcreteValue::Null)
     }
 
-    /// RPython box.getint() parity.
+    /// RPython box.getint() parity.  After the `push_typed_value`
+    /// parallel-box change (pyframe.py:84 `list[W_Object]` parity),
+    /// concrete shadows that reach the operand stack are always Ref
+    /// boxes; transparently unbox a `Ref(W_IntObject)` so downstream
+    /// executors (bhimpl_int_*) and the optimizer stay unchanged.
     pub fn getint(&self) -> Option<i64> {
         match self {
             ConcreteValue::Int(v) => Some(*v),
+            ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
+                if is_int(*obj) {
+                    Some(w_int_get_value(*obj))
+                } else {
+                    None
+                }
+            },
             _ => None,
         }
     }
 
-    /// RPython box.getfloatstorage() parity.
+    /// RPython box.getfloatstorage() parity.  See `getint` — also
+    /// unboxes `Ref(W_FloatObject)` and `Ref(W_IntObject)` (int→float
+    /// coercion parity with the previous `ConcreteValue::Int` arm).
     pub fn getfloat(&self) -> Option<f64> {
         match self {
             ConcreteValue::Float(v) => Some(*v),
             ConcreteValue::Int(v) => Some(*v as f64),
+            ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
+                if is_float(*obj) {
+                    Some(w_float_get_value(*obj))
+                } else if is_int(*obj) {
+                    Some(w_int_get_value(*obj) as f64)
+                } else {
+                    None
+                }
+            },
             _ => None,
         }
     }
@@ -5768,7 +5816,13 @@ mod tests {
         };
 
         state
-            .with_ctx(|this, ctx| this.store_local_value(ctx, 0, ref_value))
+            .with_ctx(|this, ctx| {
+                this.store_local_value(
+                    ctx,
+                    0,
+                    FrontendOp::new(ref_value, ConcreteValue::Ref(pyre_object::PY_NULL)),
+                )
+            })
             .expect("store of pre-wrapped Ref should succeed");
         assert_eq!(
             state.sym().registers_r[0],
