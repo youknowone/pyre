@@ -26,13 +26,15 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use syn::{
-    Arm, BinOp, Block as SynBlock, Expr, ExprBinary, ExprIf, ExprLit, ExprMatch, ExprParen,
-    ExprPath, ExprReturn, ItemFn, Lit, Local, LocalInit, Pat, PatIdent, Stmt,
+    Arm, BinOp, Block as SynBlock, Expr, ExprArray, ExprBinary, ExprBreak, ExprCall, ExprCast,
+    ExprContinue, ExprField, ExprForLoop, ExprIf, ExprIndex, ExprLit, ExprLoop, ExprMatch,
+    ExprMethodCall, ExprParen, ExprPath, ExprReturn, ExprTry, ExprTuple, ExprUnary, ExprWhile,
+    ItemFn, Lit, Local, LocalInit, Member, Pat, PatIdent, Stmt, UnOp,
 };
 
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link,
-    SpaceOperation, Variable,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue, Link,
+    SpaceOperation, Variable, c_last_exception,
 };
 
 /// Reasons the adapter rejects the input. Every variant carries a
@@ -88,6 +90,8 @@ pub fn build_flow_from_rust(func: &ItemFn) -> Result<FunctionGraph, AdapterError
             locals,
         },
         returnblock: graph.returnblock.clone(),
+        exceptblock: graph.exceptblock.clone(),
+        loop_stack: Vec::new(),
     };
 
     let tail = lower_block(&mut builder, &func.block)?;
@@ -118,15 +122,24 @@ fn validate_signature(func: &ItemFn) -> Result<(), AdapterError> {
             reason: "unsafe fn not supported (M2.5a)".into(),
         });
     }
-    if !sig.generics.params.is_empty() {
-        return Err(AdapterError::InvalidSignature {
-            reason: "generic fn not supported (trait dispatch lands in M2.5c)".into(),
-        });
-    }
-    if sig.generics.where_clause.is_some() {
-        return Err(AdapterError::InvalidSignature {
-            reason: "where-clause not supported (trait dispatch lands in M2.5c)".into(),
-        });
+    // Generic type / lifetime parameters and where-clauses are
+    // accepted as signature-level markers. The adapter does not
+    // track trait-bound constraints directly; the annotator's
+    // `FunctionDesc.specialize` / `cachedgraph`
+    // (`description.py:272-281`, `:228-249`) reads the concrete
+    // `args_s` at `build_types` call time and monomorphizes the
+    // generics into a classdef-keyed specialized graph. Const
+    // generic parameters still reject pending value-carrying
+    // const-param support.
+    for p in &sig.generics.params {
+        match p {
+            syn::GenericParam::Type(_) | syn::GenericParam::Lifetime(_) => {}
+            syn::GenericParam::Const(_) => {
+                return Err(AdapterError::InvalidSignature {
+                    reason: "const generic parameter not supported (lands in M2.5d)".into(),
+                });
+            }
+        }
     }
     if sig.variadic.is_some() {
         return Err(AdapterError::InvalidSignature {
@@ -140,26 +153,27 @@ fn collect_params(func: &ItemFn) -> Result<(Vec<Hlvalue>, HashMap<String, Hlvalu
     let mut inputargs: Vec<Hlvalue> = Vec::new();
     let mut locals: HashMap<String, Hlvalue> = HashMap::new();
     for input in &func.sig.inputs {
-        let fn_arg = match input {
-            syn::FnArg::Receiver(_) => {
-                return Err(AdapterError::InvalidSignature {
-                    reason: "self receiver not supported (method dispatch lands in M2.5c)".into(),
-                });
-            }
-            syn::FnArg::Typed(pat_type) => pat_type,
-        };
-        let ident = match &*fn_arg.pat {
-            Pat::Ident(PatIdent {
-                ident,
-                by_ref: None,
-                subpat: None,
-                ..
-            }) => ident.to_string(),
-            _ => {
-                return Err(AdapterError::InvalidSignature {
-                    reason: "parameter pattern must be a plain identifier".into(),
-                });
-            }
+        let ident = match input {
+            // `self` / `&self` / `&mut self` — the method dispatch
+            // case. Upstream RPython binds `self` as the first local
+            // after `FunctionDesc.bind_self` has annotated it with
+            // the concrete classdef (`description.py:350-355`); the
+            // adapter just exposes it as a Variable named `self`,
+            // matching the Python source convention.
+            syn::FnArg::Receiver(_) => "self".to_string(),
+            syn::FnArg::Typed(pat_type) => match &*pat_type.pat {
+                Pat::Ident(PatIdent {
+                    ident,
+                    by_ref: None,
+                    subpat: None,
+                    ..
+                }) => ident.to_string(),
+                _ => {
+                    return Err(AdapterError::InvalidSignature {
+                        reason: "parameter pattern must be a plain identifier".into(),
+                    });
+                }
+            },
         };
         let var = Hlvalue::Variable(Variable::named(&ident));
         locals.insert(ident, var.clone());
@@ -184,9 +198,43 @@ struct BlockBuilder {
     locals: HashMap<String, Hlvalue>,
 }
 
+/// Enclosing loop context — one entry per `while`/`loop` open on the
+/// statement stack. `break` lowers a Link into `exit_block`; `continue`
+/// into `header_block`. `merged_names` pins the locals set the loop
+/// entry agreed on, so `break`/`continue` carry every entry-visible
+/// local on the outgoing Link regardless of which body-local rebinds
+/// happened at the jump point.
+///
+/// Upstream analogue: `flowcontext.py:794 SETUP_LOOP` pushes a
+/// `LoopBlock` onto `self.blockstack`, and `BREAK_LOOP` / `CONTINUE_LOOP`
+/// (`:525-529`) raise Break/Continue exceptions that the surrounding
+/// LoopBlock turns into the corresponding bytecode-target jumps. The
+/// Rust adapter does not have Python's blockstack abstraction; the
+/// `loop_stack` here is the minimal equivalent for tracking
+/// "which break target is live".
+struct LoopCtx {
+    header_block: BlockRef,
+    exit_block: BlockRef,
+    /// Names carried through the loop's back-edge + body inputargs.
+    /// Includes any internal iter sidecar.
+    merged_names: Vec<String>,
+    /// Names carried through `break` / loop-exit exits — a subset of
+    /// `merged_names` with internal iter sidecars removed. For
+    /// `while` / `loop` the two sets are identical; `for` filters
+    /// out its synthetic iterator slot so it does NOT leak into the
+    /// exit block's inputargs (upstream `flowcontext.py:787, :1355,
+    /// :1383` — iterator lives on the value stack and is popped at
+    /// loop exit, never visible to post-loop code).
+    exit_merged_names: Vec<String>,
+}
+
 struct Builder {
     current: BlockBuilder,
     returnblock: BlockRef,
+    /// The graph's canonical exception exit — `Block([etype, evalue])`
+    /// per `model.py:22-25`. `?` exception links target this.
+    exceptblock: BlockRef,
+    loop_stack: Vec<LoopCtx>,
 }
 
 impl Builder {
@@ -240,6 +288,43 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<Hlvalue, AdapterErro
                 lower_let(b, local)?;
             }
             Stmt::Expr(expr, semi) => {
+                // `while` / `loop` are statement-only in the M2.5b
+                // slice-3 subset — they produce upstream's bytecode
+                // `SETUP_LOOP` + back-edge shape but carry no tail
+                // value, so they are accepted with or without the
+                // trailing `;` (Rust allows omitting it after a
+                // block-tailed expression).
+                match expr {
+                    Expr::While(while_expr) => {
+                        lower_while(b, while_expr)?;
+                        continue;
+                    }
+                    Expr::Loop(loop_expr) => {
+                        lower_loop(b, loop_expr)?;
+                        continue;
+                    }
+                    Expr::ForLoop(for_expr) => {
+                        lower_for(b, for_expr)?;
+                        continue;
+                    }
+                    // `break` / `continue` appearing at the statement
+                    // level of a non-loop block is unconditionally an
+                    // error — `lower_loop_body` intercepts these
+                    // inside actual loop bodies so the only way to
+                    // reach `lower_block` with a break/continue stmt
+                    // is outside any `loop_stack` entry.
+                    Expr::Break(_) => {
+                        return Err(AdapterError::Unsupported {
+                            reason: "`break` outside of a loop".into(),
+                        });
+                    }
+                    Expr::Continue(_) => {
+                        return Err(AdapterError::Unsupported {
+                            reason: "`continue` outside of a loop".into(),
+                        });
+                    }
+                    _ => {}
+                }
                 if semi.is_some() {
                     if let Expr::Return(ret) = expr {
                         if !is_last {
@@ -250,12 +335,12 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<Hlvalue, AdapterErro
                         }
                         tail = Some(lower_return(b, ret)?);
                     } else {
-                        return Err(AdapterError::Unsupported {
-                            reason:
-                                "expression-with-semicolon statement (side-effecting statement \
-                                    lands with method calls in M2.5c)"
-                                    .into(),
-                        });
+                        // Expression statement: lower for side effect,
+                        // discard the result. Upstream CPython emits
+                        // `POP_TOP` after a stack-producing op —
+                        // `flowcontext.py:488` covers the same
+                        // semantic at the bytecode level.
+                        let _ = lower_expr(b, expr)?;
                     }
                 } else {
                     if !is_last {
@@ -372,31 +457,36 @@ fn lower_expr(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
         }
         Expr::Match(match_expr) => lower_match(b, match_expr),
         Expr::ForLoop(_) | Expr::While(_) | Expr::Loop(_) => Err(AdapterError::Unsupported {
-            reason: "loop construct (lands in next M2.5b slice)".into(),
+            reason: "loop construct in expression position produces `()` — use it as a statement \
+                (trailing `;` or non-last position) instead"
+                .into(),
         }),
-        Expr::Try(_) => Err(AdapterError::Unsupported {
-            reason: "? operator (exception edges land in next M2.5b slice)".into(),
-        }),
+        Expr::Try(try_expr) => lower_try(b, try_expr),
         Expr::Break(_) | Expr::Continue(_) => Err(AdapterError::Unsupported {
             reason: "break/continue (lands with loops in M2.5b)".into(),
         }),
-        Expr::MethodCall(_) => Err(AdapterError::Unsupported {
-            reason: "method call (trait dispatch lands in M2.5c)".into(),
-        }),
-        Expr::Call(_) => Err(AdapterError::Unsupported {
-            reason: "function call (call lowering lands in M2.5c)".into(),
-        }),
-        Expr::Struct(_) | Expr::Tuple(_) | Expr::Array(_) => Err(AdapterError::Unsupported {
-            reason: "composite literal (struct/tuple/array land in M2.5d)".into(),
+        Expr::MethodCall(method_call) => lower_method_call(b, method_call),
+        Expr::Call(call) => lower_call(b, call),
+        Expr::Tuple(tup) => lower_tuple(b, tup),
+        Expr::Array(arr) => lower_array(b, arr),
+        Expr::Struct(_) => Err(AdapterError::Unsupported {
+            reason: "struct literal (user-type resolution lands in M2.5e — the annotator needs a \
+                `ClassDesc` lookup path that `HOST_ENV` doesn't bootstrap on its own)"
+                .into(),
         }),
         Expr::Closure(_) => Err(AdapterError::Unsupported {
             reason: "closure (not in roadmap scope)".into(),
         }),
-        Expr::Reference(_) | Expr::Unary(_) | Expr::Cast(_) | Expr::Field(_) | Expr::Index(_) => {
-            Err(AdapterError::Unsupported {
-                reason: "operator / field / index (later M2.5 slices)".into(),
-            })
+        Expr::Reference(r) => {
+            // Rust borrow `&x` / `&mut x` — upstream Python has no
+            // ownership model, so the annotator tracks value identity
+            // + type only. Pass-through the operand.
+            lower_expr(b, &r.expr)
         }
+        Expr::Unary(u) => lower_unary(b, u),
+        Expr::Cast(c) => lower_cast(b, c),
+        Expr::Field(f) => lower_field(b, f),
+        Expr::Index(i) => lower_index(b, i),
         _ => Err(AdapterError::Unsupported {
             reason: format!("unrecognised expression kind: {}", discriminant(expr)),
         }),
@@ -412,11 +502,22 @@ fn lower_literal(lit: &Lit) -> Result<Hlvalue, AdapterError> {
             Ok(Hlvalue::Constant(Constant::new(ConstValue::Int(value))))
         }
         Lit::Bool(bl) => Ok(Hlvalue::Constant(Constant::new(ConstValue::Bool(bl.value)))),
-        Lit::Str(_) | Lit::ByteStr(_) | Lit::Byte(_) | Lit::Char(_) | Lit::Float(_) => {
-            Err(AdapterError::Unsupported {
-                reason: "non-integer/bool literal (string/float/char land in M2.5d)".into(),
-            })
+        Lit::Str(s) => Ok(Hlvalue::Constant(Constant::new(ConstValue::Str(s.value())))),
+        Lit::Float(f) => {
+            // `ConstValue::Float` stores `f64::to_bits()` so the
+            // enum keeps `Eq + Hash` — see model.rs:1696-1701. The
+            // adapter round-trips through `base10_parse::<f64>()` to
+            // preserve the exact literal the user wrote.
+            let value: f64 = f.base10_parse().map_err(|e| AdapterError::Unsupported {
+                reason: format!("float literal out of f64 range: {e}"),
+            })?;
+            Ok(Hlvalue::Constant(Constant::new(ConstValue::Float(
+                value.to_bits(),
+            ))))
         }
+        Lit::ByteStr(_) | Lit::Byte(_) | Lit::Char(_) => Err(AdapterError::Unsupported {
+            reason: "byte / bytestring / char literal — upstream has no direct analogue".into(),
+        }),
         _ => Err(AdapterError::Unsupported {
             reason: "unrecognised literal kind".into(),
         }),
@@ -507,8 +608,14 @@ fn binop_opname(op: BinOp) -> Result<&'static str, AdapterError> {
 // `FrameState` union.
 
 fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<Hlvalue, AdapterError> {
-    // 1. Evaluate condition into the current block.
-    let cond = lower_expr(b, &if_expr.cond)?;
+    // 1. Evaluate condition into the current block, then coerce via
+    //    `bool(cond)` — mirrors upstream POP_JUMP_IF_FALSE at
+    //    `flowcontext.py:756` which always emits `op.bool(w_value)`
+    //    before the guessbool test. The `bool` op is in upstream's
+    //    `operation.py:467 add_operator('bool', 1)` registry.
+    let cond_raw = lower_expr(b, &if_expr.cond)?;
+    let cond = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new("bool", vec![cond_raw], cond.clone()));
 
     // `if` without `else` in tail position produces `()`, which is
     // outside the integer/bool subset. Defer to the M2.5d literal
@@ -705,29 +812,68 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<Hlvalue, Adapt
     }
 
     // 2. Validate every arm up-front so the fork block is only closed
-    //    once we know every branch can be lowered. `exitcase = None`
-    //    marks a wildcard — upstream `model.py:652` requires such a
-    //    case to be the last exit.
-    let mut arm_exitcases: Vec<Option<Hlvalue>> = Vec::with_capacity(match_expr.arms.len());
+    //    once we know every branch can be lowered. Or-patterns
+    //    (`A | B | C => body`) expand into multiple sub-patterns per
+    //    arm — each sub-pattern classifies independently, and at step
+    //    5 each sub-pattern contributes one Link targeting the ONE
+    //    branch block allocated for the original arm (upstream
+    //    `model.py:648-692` admits multiple Links with distinct
+    //    exitcases pointing to the same target block). `exitcase =
+    //    None` marks a wildcard — upstream `model.py:652` requires
+    //    such a case to be the last exit of the match, and forbids it
+    //    inside an or-pattern.
+    let mut arm_sub_exitcases: Vec<Vec<Option<Hlvalue>>> =
+        Vec::with_capacity(match_expr.arms.len());
     for (idx, arm) in match_expr.arms.iter().enumerate() {
         validate_arm(arm)?;
-        let is_last = idx + 1 == match_expr.arms.len();
-        let exitcase = classify_pattern(&arm.pat, is_last)?;
-        arm_exitcases.push(exitcase);
+        let is_last_arm = idx + 1 == match_expr.arms.len();
+        let mut sub_pats: Vec<&Pat> = Vec::new();
+        flatten_or_pattern(&arm.pat, &mut sub_pats);
+        let sub_pat_count = sub_pats.len();
+        // Pre-check: upstream `model.py:652` reserves the wildcard
+        // for a standalone default arm at match level; embedding it
+        // inside an or-pattern duplicates the catch-all intent. Flag
+        // it here before `classify_pattern` (whose own `is_last`
+        // check would otherwise surface a misleading "wildcard must
+        // be last" message).
+        if sub_pat_count > 1 {
+            for sub_pat in &sub_pats {
+                if matches!(sub_pat, Pat::Wild(_)) {
+                    return Err(AdapterError::Unsupported {
+                        reason: "wildcard sub-pattern inside or-pattern — upstream \
+                            `model.py:652` reserves the wildcard for a standalone \
+                            default arm at match-level"
+                            .into(),
+                    });
+                }
+            }
+        }
+        let mut sub_exitcases: Vec<Option<Hlvalue>> = Vec::with_capacity(sub_pat_count);
+        for (sub_idx, sub_pat) in sub_pats.iter().enumerate() {
+            let is_last = is_last_arm && (sub_idx + 1 == sub_pat_count);
+            let exitcase = classify_pattern(sub_pat, is_last)?;
+            sub_exitcases.push(exitcase);
+        }
+        arm_sub_exitcases.push(sub_exitcases);
     }
 
     // 3. Enforce upstream's uniqueness invariant
-    //    (`model.py:692 allexitcases[link.exitcase] = True`).
+    //    (`model.py:692 allexitcases[link.exitcase] = True`). Check
+    //    across all sub-exitcases of every arm — two or-pattern
+    //    sub-cases on the same value would collide just like two arms
+    //    with the same case.
     let mut seen: Vec<&Hlvalue> = Vec::new();
-    for exitcase in arm_exitcases.iter().flatten() {
-        if seen.iter().any(|s| *s == exitcase) {
-            return Err(AdapterError::Unsupported {
-                reason: "match arm exitcase repeated — upstream forbids duplicate jump-table \
-                    cases"
-                    .into(),
-            });
+    for arm_ex in &arm_sub_exitcases {
+        for exitcase in arm_ex.iter().flatten() {
+            if seen.iter().any(|s| *s == exitcase) {
+                return Err(AdapterError::Unsupported {
+                    reason: "match arm exitcase repeated — upstream forbids duplicate \
+                        jump-table cases"
+                        .into(),
+                });
+            }
+            seen.push(exitcase);
         }
-        seen.push(exitcase);
     }
 
     // 4. Snapshot locals for the fork (same discipline as `lower_if`).
@@ -739,31 +885,35 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<Hlvalue, Adapt
         .map(|name| pre_fork_locals[name].clone())
         .collect();
 
-    // 5. Allocate one branch block per arm, bundle the exit-case into a
-    //    Link from the fork.
+    // 5. Allocate one branch block per ORIGINAL arm; each arm emits
+    //    one Link per sub-pattern pointing at that shared block.
     let mut branch_blocks: Vec<(BlockRef, HashMap<String, Hlvalue>)> =
         Vec::with_capacity(match_expr.arms.len());
-    let mut fork_exits: Vec<Rc<RefCell<Link>>> = Vec::with_capacity(match_expr.arms.len());
-    for exitcase in &arm_exitcases {
+    let mut fork_exits: Vec<Rc<RefCell<Link>>> = Vec::new();
+    for arm_ex in &arm_sub_exitcases {
         let (branch_block, branch_locals) = branch_block_with_inputargs(&merged_names);
-        let link_exitcase = match exitcase {
-            Some(v) => Some(v.clone()),
-            None => Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
-                "default".into(),
-            )))),
-        };
-        let link = Rc::new(RefCell::new(Link::new(
-            fork_args.clone(),
-            Some(branch_block.clone()),
-            link_exitcase,
-        )));
-        fork_exits.push(link);
+        for exitcase in arm_ex {
+            let link_exitcase = match exitcase {
+                Some(v) => Some(v.clone()),
+                None => Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
+                    "default".into(),
+                )))),
+            };
+            let link = Rc::new(RefCell::new(Link::new(
+                fork_args.clone(),
+                Some(branch_block.clone()),
+                link_exitcase,
+            )));
+            fork_exits.push(link);
+        }
         branch_blocks.push((branch_block, branch_locals));
     }
     b.finalize_current(fork_exits, Some(scrutinee));
 
     // 6. Lower each arm's body. Record the exit block / ops / locals /
-    //    tail for the later join-block wiring.
+    //    tail for the later join-block wiring. ONE body per original
+    //    arm, regardless of how many sub-patterns (Links) fed into the
+    //    branch block.
     struct ArmExit {
         block: BlockRef,
         ops: Vec<SpaceOperation>,
@@ -822,6 +972,1078 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<Hlvalue, Adapt
     Ok(tail_var)
 }
 
+// ____________________________________________________________
+// `while` / `loop` — header + back-edge with `break` / `continue`.
+//
+// Upstream basis: `rpython/flowspace/flowcontext.py:794 SETUP_LOOP`
+// pushes a LoopBlock; `:718 JUMP_ABSOLUTE` returns the back-edge target
+// that the pending-block scheduler merges against the header; `:525
+// BREAK_LOOP` / `:528 CONTINUE_LOOP` raise Break/Continue which the
+// enclosing LoopBlock turns into the corresponding jumps.
+//
+// The graph-level shape upstream produces for
+//
+//   while cond:                header:  cond, exitswitch=cond,
+//     body                              [false → exit, true → body]
+//                              body:    body-ops, Link(→ header)
+//                              exit:    (continue from here)
+//
+// is what `lower_while` emits directly. `lower_loop` is the same shape
+// without the `cond` fork — the header is entered unconditionally and
+// the only way out is via `break` (or fallthrough through a
+// body-tail that happens to not exist in our subset, since `loop`
+// bodies end at the `}` with an implicit back-edge).
+//
+// Body subset (slice 3): a flat sequence of `let` bindings, optionally
+// terminated by a single `break;` / `continue;`. If the body falls
+// through to the closing `}`, the adapter emits the back-edge
+// automatically. Dead code after an explicit terminator rejects via
+// `AdapterError::Unsupported`. Loops nested inside `if`/`match`
+// branches work because those lower into independent BlockBuilders
+// before hitting the terminator check.
+
+/// Outcome of a loop body lowering:
+/// - `FallThrough` — body reached its closing `}` naturally, the caller
+///   emits the back-edge Link.
+/// - `Terminated` — body finalized its current block via `break;` /
+///   `continue;`; no further emission required from the caller.
+enum LoopBodyExit {
+    FallThrough,
+    Terminated,
+}
+
+fn lower_while(b: &mut Builder, while_expr: &ExprWhile) -> Result<(), AdapterError> {
+    // 1. Snapshot pre-loop locals and fix the merged name ordering.
+    //    This is what both the header's inputargs and the back-edge
+    //    Link args agree on.
+    let pre_fork_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+    merged_names.sort();
+    let pre_args: Vec<Hlvalue> = merged_names
+        .iter()
+        .map(|n| pre_fork_locals[n].clone())
+        .collect();
+
+    // 2. Allocate the header + exit blocks. Both carry one fresh
+    //    inputarg per merged local; the header becomes the back-edge
+    //    target, the exit block is where execution resumes after the
+    //    loop.
+    let (header_block, header_locals) = branch_block_with_inputargs(&merged_names);
+    let (exit_block, exit_locals) = branch_block_with_inputargs(&merged_names);
+
+    // 3. Close the pre-loop block with an unconditional Link into the
+    //    header.
+    let pre_link = Rc::new(RefCell::new(Link::new(
+        pre_args,
+        Some(header_block.clone()),
+        None,
+    )));
+    b.finalize_current(vec![pre_link], None);
+
+    // 4. Open the header, lower the condition, and allocate the body
+    //    block. The header's locals at fork time are identical to the
+    //    header's inputargs — no rebinding happens between the entry
+    //    and the condition evaluation.
+    b.open_new_block(BlockBuilder {
+        block: header_block.clone(),
+        ops: Vec::new(),
+        locals: header_locals,
+    });
+    // Upstream POP_JUMP_IF_FALSE (`flowcontext.py:756`) always wraps
+    // the predicate in `op.bool(w_value)` before the fork. Emit the
+    // `bool` op explicitly so the exitswitch carries the coerced
+    // result — the annotator / optimizer can fold it away when the
+    // input is already `SomeBool`.
+    let cond_raw = lower_expr(b, &while_expr.cond)?;
+    let cond = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new("bool", vec![cond_raw], cond.clone()));
+    let header_locals_at_fork: Vec<Hlvalue> = merged_names
+        .iter()
+        .map(|n| b.current.locals[n].clone())
+        .collect();
+
+    let (body_block, body_locals) = branch_block_with_inputargs(&merged_names);
+    let false_link = Rc::new(RefCell::new(Link::new(
+        header_locals_at_fork.clone(),
+        Some(exit_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+    )));
+    let true_link = Rc::new(RefCell::new(Link::new(
+        header_locals_at_fork,
+        Some(body_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+    )));
+    b.finalize_current(vec![false_link, true_link], Some(cond));
+
+    // 5. Push the loop context before lowering the body so nested
+    //    `break` / `continue` resolve against *this* loop.
+    b.loop_stack.push(LoopCtx {
+        header_block: header_block.clone(),
+        exit_block: exit_block.clone(),
+        merged_names: merged_names.clone(),
+        // while/loop have no synthetic sidecar — exit set == full set.
+        exit_merged_names: merged_names.clone(),
+    });
+    b.open_new_block(BlockBuilder {
+        block: body_block,
+        ops: Vec::new(),
+        locals: body_locals,
+    });
+    let body_exit = lower_loop_body(b, &while_expr.body)?;
+
+    // 6. If the body fell through, emit the back-edge. Body-local
+    //    rebinds that ended up in `current.locals` flow back into the
+    //    header via the new Link's args.
+    if matches!(body_exit, LoopBodyExit::FallThrough) {
+        let back_args: Vec<Hlvalue> = merged_names
+            .iter()
+            .map(|n| b.current.locals[n].clone())
+            .collect();
+        let back_link = Rc::new(RefCell::new(Link::new(back_args, Some(header_block), None)));
+        b.finalize_current(vec![back_link], None);
+    }
+    b.loop_stack.pop();
+
+    // 7. Execution after the loop resumes in the exit block, with its
+    //    inputargs bound as the new `locals`.
+    b.open_new_block(BlockBuilder {
+        block: exit_block,
+        ops: Vec::new(),
+        locals: exit_locals,
+    });
+    Ok(())
+}
+
+fn lower_loop(b: &mut Builder, loop_expr: &ExprLoop) -> Result<(), AdapterError> {
+    // `loop { body }` is `while true { body }` without the cond fork.
+    // The header is entered unconditionally and doubles as the body
+    // start; `break` jumps to the exit block; fallthrough loops back.
+    let pre_fork_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+    merged_names.sort();
+    let pre_args: Vec<Hlvalue> = merged_names
+        .iter()
+        .map(|n| pre_fork_locals[n].clone())
+        .collect();
+
+    let (header_block, header_locals) = branch_block_with_inputargs(&merged_names);
+    let (exit_block, exit_locals) = branch_block_with_inputargs(&merged_names);
+
+    let pre_link = Rc::new(RefCell::new(Link::new(
+        pre_args,
+        Some(header_block.clone()),
+        None,
+    )));
+    b.finalize_current(vec![pre_link], None);
+
+    b.loop_stack.push(LoopCtx {
+        header_block: header_block.clone(),
+        exit_block: exit_block.clone(),
+        merged_names: merged_names.clone(),
+        // while/loop have no synthetic sidecar — exit set == full set.
+        exit_merged_names: merged_names.clone(),
+    });
+    b.open_new_block(BlockBuilder {
+        block: header_block.clone(),
+        ops: Vec::new(),
+        locals: header_locals,
+    });
+    let body_exit = lower_loop_body(b, &loop_expr.body)?;
+
+    if matches!(body_exit, LoopBodyExit::FallThrough) {
+        let back_args: Vec<Hlvalue> = merged_names
+            .iter()
+            .map(|n| b.current.locals[n].clone())
+            .collect();
+        let back_link = Rc::new(RefCell::new(Link::new(back_args, Some(header_block), None)));
+        b.finalize_current(vec![back_link], None);
+    }
+    b.loop_stack.pop();
+
+    b.open_new_block(BlockBuilder {
+        block: exit_block,
+        ops: Vec::new(),
+        locals: exit_locals,
+    });
+    Ok(())
+}
+
+// ____________________________________________________________
+// `for item in iter { body }` — iter protocol with a StopIteration
+// exception exit that catches at the loop boundary (not at
+// graph.exceptblock).
+//
+// Upstream basis: `rpython/flowspace/flowcontext.py:782 GET_ITER`
+// emits `op.iter(iterable)`; `:787 FOR_ITER` pushes an IterBlock
+// exception handler that catches StopIteration and jumps to the
+// post-loop pc, then emits `op.next(iterator)` which may raise
+// StopIteration. In graph form the header block ends in
+// `next(iter)` with `exitswitch = c_last_exception`, exit[0] is the
+// normal fall-through into the body with the freshly-yielded
+// element, and exit[1] carries `exitcase = StopIteration` targeting
+// the loop-exit block (not graph.exceptblock — StopIteration is
+// silently caught by the IterBlock handler). `operation.py:596-599`
+// confirms `next` is arity=1 with `canraise = [StopIteration,
+// RuntimeError]`.
+//
+// Exception exit shape (post-simplify-equivalent):
+// - StopIteration exit: link.args carry the exit-visible merged
+//   locals, target = loop exit_block, exitcase = Constant(StopIteration
+//   class). link.extravars.last_exception = `Constant(StopIteration)`
+//   per upstream `flowcontext.py:127` — class-specific guessexception
+//   exits use a Constant for `last_exc`; only the generic `Exception`
+//   case uses a Variable. link.extravars.last_exc_value = fresh
+//   Variable named `last_exc_value`.
+// - RuntimeError exit: no outer handler in the adapter's simplified
+//   model, so the egg's `RaiseImplicit.nomoreblocks`
+//   (`flowcontext.py:1271-1284`) runs immediately — its closing link
+//   carries `[Constant(AssertionError_class), Constant(AssertionError(
+//   "implicit RuntimeError shouldn't occur"))]` straight to
+//   `graph.exceptblock`. After `eliminate_empty_blocks` the trivial
+//   RaiseImplicit egg folds away and the header link lands directly
+//   on the exceptblock with those AssertionError constants — that is
+//   the shape the adapter emits.
+//
+// PRE-EXISTING-ADAPTATION (value-stack vs locals-map). Upstream
+// `flowcontext.py:782 GET_ITER` leaves the iterator on the Python
+// value stack, and `:787 FOR_ITER` pops it via IterBlock.handle
+// after StopIteration. The adapter lacks a stack model — its frame
+// state is a name-keyed locals map. We stash the iterator in a
+// reserved local slot named `#for_iter_{depth}` (the `#` character
+// cannot appear in any `syn::Ident::to_string()` output, ruling out
+// user-source collisions) and strip it from every post-loop visible-
+// name set. Cited as unavoidable per CLAUDE.md "smallest possible
+// change from RPython structure" — a full value-stack port is an
+// M2.5e scope item.
+//
+// Scope (slice 5):
+// - Pattern: `Pat::Ident` only (simple `for item in iter`, no
+//   destructuring).
+// - Iterator expression: whatever `lower_expr` accepts (locals,
+//   literals, binops).
+// - Body: the `lower_loop_body` subset — `let` bindings, nested
+//   while/loop/for, optionally terminated by `break;` / `continue;`.
+// - `break;`, StopIteration exit, `continue;`, fall-through back-edge
+//   all route through the standard merged-locals machinery — the
+//   iterator sits in the `#for_iter_{depth}` slot that participates
+//   in the merged-names set, so nested loops thread it through their
+//   own merged-name machinery without special-casing.
+
+fn lower_for(b: &mut Builder, for_expr: &ExprForLoop) -> Result<(), AdapterError> {
+    // 1. `for item in iter` — only a plain identifier pattern is
+    //    accepted. Destructuring / tuple-patterns land with composite
+    //    literals in M2.5d.
+    let item_name = match &*for_expr.pat {
+        Pat::Ident(PatIdent {
+            ident,
+            by_ref: None,
+            subpat: None,
+            ..
+        }) => ident.to_string(),
+        _ => {
+            return Err(AdapterError::Unsupported {
+                reason: "`for` pattern must be a plain identifier (destructuring lands in M2.5d)"
+                    .into(),
+            });
+        }
+    };
+
+    // 2. Lower the iterable into the current block and emit
+    //    `iter(iterable) -> v_iter` — flowcontext's GET_ITER
+    //    sequence. Store `v_iter` into a reserved internal slot so
+    //    the standard merged-names machinery carries it through
+    //    every enclosed nested loop / conditional without special
+    //    casing.
+    //
+    //    The slot name is `#for_iter_{depth}` indexed by
+    //    `loop_stack.len()` at entry, so nested for-loops pick
+    //    distinct names. `#` is not a legal Rust identifier
+    //    character, so `syn::Ident::to_string()` can never produce
+    //    a name that collides with the slot.
+    let iterable = lower_expr(b, &for_expr.expr)?;
+    let v_iter = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new("iter", vec![iterable], v_iter.clone()));
+    let iter_slot = format!("#for_iter_{}", b.loop_stack.len());
+    b.set_local(iter_slot.clone(), v_iter);
+
+    // 3. Snapshot the pre-loop locals (now including the iter slot)
+    //    and fix the merged ordering.
+    let pre_fork_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+    merged_names.sort();
+    let pre_args: Vec<Hlvalue> = merged_names
+        .iter()
+        .map(|n| pre_fork_locals[n].clone())
+        .collect();
+
+    // 4. Pre-compute the exit-block's visible name set: full
+    //    merged_names MINUS the synthetic iter slot. Upstream
+    //    `flowcontext.py:787, :1355, :1383` — the iterator lives on
+    //    the value stack for the loop's lifetime and is popped at
+    //    loop exit, so post-loop code must NOT see it.
+    let exit_merged_names: Vec<String> = merged_names
+        .iter()
+        .filter(|n| *n != &iter_slot)
+        .cloned()
+        .collect();
+
+    // 5. Allocate header (threads the iter slot via merged_names) and
+    //    exit blocks (uses the filtered exit_merged_names so the
+    //    iter slot does NOT appear in post-loop inputargs or locals).
+    let (header_block, header_locals) = branch_block_with_inputargs(&merged_names);
+    let (exit_block, exit_locals) = branch_block_with_inputargs(&exit_merged_names);
+
+    // 5. Close the pre-loop block with a plain Link into the header.
+    let pre_link = Rc::new(RefCell::new(Link::new(
+        pre_args,
+        Some(header_block.clone()),
+        None,
+    )));
+    b.finalize_current(vec![pre_link], None);
+
+    // 6. Open the header block and emit the raising `next(iter_h)`
+    //    op reading from the header's own iter-slot binding.
+    b.open_new_block(BlockBuilder {
+        block: header_block.clone(),
+        ops: Vec::new(),
+        locals: header_locals,
+    });
+    let iter_h = b.current.locals[&iter_slot].clone();
+    let v_next = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new("next", vec![iter_h], v_next.clone()));
+
+    // 7. Body block. Upstream STORE_FAST
+    //    (`flowcontext.py:878-884`) rebinds the loop-variable slot in
+    //    place — after FOR_ITER pops the new item and STORE_FAST
+    //    writes it, `locals_w[i_item]` IS the new item and no
+    //    separate channel exists for the pre-loop value of that slot.
+    //    Mirror that by walking `merged_names` once and emitting a
+    //    single inputarg per slot: for `item_name` the inputarg IS
+    //    `body_item_var`; for every other slot the inputarg is a
+    //    fresh `Variable::named(name)`. No double channels.
+    let body_item_var = Hlvalue::Variable(Variable::named(&item_name));
+    let mut body_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len());
+    let mut body_locals: HashMap<String, Hlvalue> = HashMap::new();
+    let mut item_in_merged = false;
+    for name in &merged_names {
+        if name == &item_name {
+            body_inputargs.push(body_item_var.clone());
+            body_locals.insert(name.clone(), body_item_var.clone());
+            item_in_merged = true;
+        } else {
+            let fresh = Hlvalue::Variable(Variable::named(name));
+            body_inputargs.push(fresh.clone());
+            body_locals.insert(name.clone(), fresh);
+        }
+    }
+    // If `item_name` wasn't pre-existing in merged_names, the
+    // STORE_FAST creates a new slot: append body_item_var as the
+    // last inputarg and record it under its name.
+    if !item_in_merged {
+        body_inputargs.push(body_item_var.clone());
+        body_locals.insert(item_name.clone(), body_item_var);
+    }
+    let body_block = Block::shared(body_inputargs);
+
+    // 8. Close the header with the canraise shape. Upstream
+    //    `operation.py:595-599` — `Next.canraise = [StopIteration,
+    //    RuntimeError]`. The flowcontext's implicit IterBlock
+    //    (`flowcontext.py:1378`) catches StopIteration and routes it
+    //    to the loop's exit; every other canraise exception is
+    //    unrolled as `RaiseImplicit` (`flowcontext.py:176`) which,
+    //    with no outer handler, closes via
+    //    `RaiseImplicit.nomoreblocks` (`:1271-1284`) — that pathway
+    //    rewrites the exception into `AssertionError("implicit <CLS>
+    //    shouldn't occur")` and links straight to
+    //    `graph.exceptblock` with those constants as the link args.
+    //
+    //    Emission order matches upstream guessexception
+    //    (`flowcontext.py:124-148` — `[None] + list(cases)`):
+    //    normal → body, StopIteration → loop exit,
+    //    RuntimeError → graph.exceptblock (via AssertionError
+    //    rewrite).
+    //
+    //    Normal link.args align positionally with body_inputargs:
+    //    item_name's slot carries `v_next`, every other merged slot
+    //    carries the header's current binding. If `item_name` is
+    //    NOT in merged_names, `v_next` is appended last (mirroring
+    //    STORE_FAST creating a new slot).
+    let mut normal_args: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    for name in &merged_names {
+        if name == &item_name {
+            normal_args.push(v_next.clone());
+        } else {
+            normal_args.push(b.current.locals[name].clone());
+        }
+    }
+    if !item_in_merged {
+        normal_args.push(v_next);
+    }
+    let normal_link = Rc::new(RefCell::new(Link::new(
+        normal_args,
+        Some(body_block.clone()),
+        None,
+    )));
+
+    // StopIteration exit → loop's own exit_block. Link.args carry
+    // only the exit-visible names (iter slot filtered out).
+    // Extravars mirror `guessexception` at `flowcontext.py:127-134`
+    // for a class-specific case: `last_exception = Constant(case)`,
+    // `last_exc_value = Variable('last_exc_value')` (fresh).
+    let stopiter_exit_args: Vec<Hlvalue> = exit_merged_names
+        .iter()
+        .map(|n| b.current.locals[n].clone())
+        .collect();
+    let stopiter_cls = HOST_ENV
+        .lookup_exception_class("StopIteration")
+        .expect("HOST_ENV bootstrap must register `StopIteration` — model.rs:1426 ensures it");
+    let stopiter_const = Hlvalue::Constant(Constant::new(ConstValue::HostObject(stopiter_cls)));
+    let stopiter_last_exc_value = Variable::named("last_exc_value");
+    let mut stopiter_link_inner = Link::new(
+        stopiter_exit_args,
+        Some(exit_block.clone()),
+        Some(stopiter_const.clone()),
+    );
+    stopiter_link_inner.extravars(
+        Some(stopiter_const),
+        Some(Hlvalue::Variable(stopiter_last_exc_value)),
+    );
+    let stopiter_link = Rc::new(RefCell::new(stopiter_link_inner));
+
+    // RuntimeError exit → graph.exceptblock via the RaiseImplicit
+    // rewrite. `flowcontext.py:1271-1284 RaiseImplicit.nomoreblocks`
+    // fires when no outer handler catches the `Constant(RuntimeError)`
+    // raise: it closes the current block with
+    // `Link([Constant(AssertionError_class), Constant(AssertionError(msg))],
+    // graph.exceptblock)`. After `eliminate_empty_blocks` the
+    // intervening egg folds away, leaving the header linked directly
+    // to `graph.exceptblock` with those AssertionError constants.
+    //
+    // The link's own extravars still reflect the original
+    // guessexception class-specific case — `last_exception =
+    // Constant(RuntimeError)`, `last_exc_value =
+    // Variable('last_exc_value')` — matching upstream
+    // `flowcontext.py:127-143`.
+    let runtime_cls = HOST_ENV
+        .lookup_exception_class("RuntimeError")
+        .expect("HOST_ENV bootstrap must register `RuntimeError` — model.rs:1419 ensures it");
+    let runtime_const = Hlvalue::Constant(Constant::new(ConstValue::HostObject(runtime_cls)));
+    let assertion_cls = HOST_ENV
+        .lookup_exception_class("AssertionError")
+        .expect("HOST_ENV bootstrap must register `AssertionError` — model.rs:1424 ensures it");
+    let assertion_cls_const =
+        Hlvalue::Constant(Constant::new(ConstValue::HostObject(assertion_cls.clone())));
+    let assertion_msg = "implicit RuntimeError shouldn't occur".to_string();
+    let assertion_instance = crate::flowspace::model::HostObject::new_instance(
+        assertion_cls,
+        vec![ConstValue::Str(assertion_msg)],
+    );
+    let assertion_instance_const =
+        Hlvalue::Constant(Constant::new(ConstValue::HostObject(assertion_instance)));
+    let runtime_last_exc_value = Variable::named("last_exc_value");
+    let mut runtime_link_inner = Link::new(
+        vec![assertion_cls_const, assertion_instance_const],
+        Some(b.exceptblock.clone()),
+        Some(runtime_const.clone()),
+    );
+    runtime_link_inner.extravars(
+        Some(runtime_const),
+        Some(Hlvalue::Variable(runtime_last_exc_value)),
+    );
+    let runtime_link = Rc::new(RefCell::new(runtime_link_inner));
+
+    b.finalize_current(
+        vec![normal_link, stopiter_link, runtime_link],
+        Some(Hlvalue::Constant(c_last_exception())),
+    );
+
+    // 9. Push the LoopCtx and lower the body. Break / continue /
+    //    fall-through all use the standard merged-locals shape;
+    //    because the iter slot is in `merged_names` their Links
+    //    automatically carry it. `break` / loop-exit Links use
+    //    `exit_merged_names` which excludes the internal iter slot
+    //    so the post-loop block never sees it.
+    let exit_merged_names: Vec<String> = merged_names
+        .iter()
+        .filter(|n| *n != &iter_slot)
+        .cloned()
+        .collect();
+    b.loop_stack.push(LoopCtx {
+        header_block: header_block.clone(),
+        exit_block: exit_block.clone(),
+        merged_names: merged_names.clone(),
+        exit_merged_names: exit_merged_names.clone(),
+    });
+    b.open_new_block(BlockBuilder {
+        block: body_block,
+        ops: Vec::new(),
+        locals: body_locals,
+    });
+    let body_exit = lower_loop_body(b, &for_expr.body)?;
+    if matches!(body_exit, LoopBodyExit::FallThrough) {
+        let back_args: Vec<Hlvalue> = merged_names
+            .iter()
+            .map(|n| b.current.locals[n].clone())
+            .collect();
+        let back_link = Rc::new(RefCell::new(Link::new(back_args, Some(header_block), None)));
+        b.finalize_current(vec![back_link], None);
+    }
+    b.loop_stack.pop();
+
+    // 10. Continue lowering in the exit block. `exit_locals` has
+    //     had the internal iter slot stripped so user source can't
+    //     reference it.
+    b.open_new_block(BlockBuilder {
+        block: exit_block,
+        ops: Vec::new(),
+        locals: exit_locals,
+    });
+    Ok(())
+}
+
+/// Lower a `while`/`loop` body. Upstream SETUP_LOOP
+/// (`flowcontext.py:488, :794`) wraps arbitrary bytecode flow — the
+/// loop body is not a separate dispatch subset. The adapter follows
+/// suit: any statement accepted by top-level lowering is accepted
+/// here, with two additions specific to loops:
+/// - `break;` and `continue;` are terminator statements that
+///   finalize the current block with a Link into the loop's
+///   exit_block / header_block.
+/// - the loop body has no tail value (Rust loop body returns `()`),
+///   so any trailing expression is discarded as a POP_TOP.
+fn lower_loop_body(b: &mut Builder, body: &SynBlock) -> Result<LoopBodyExit, AdapterError> {
+    let n = body.stmts.len();
+    for (idx, stmt) in body.stmts.iter().enumerate() {
+        let is_last = idx + 1 == n;
+        match stmt {
+            Stmt::Local(local) => lower_let(b, local)?,
+            Stmt::Expr(Expr::Break(brk), _) => {
+                if !is_last {
+                    return Err(AdapterError::Unsupported {
+                        reason: "dead code after `break;` — the terminator must be the last \
+                            statement in the loop body"
+                            .into(),
+                    });
+                }
+                lower_break(b, brk)?;
+                return Ok(LoopBodyExit::Terminated);
+            }
+            Stmt::Expr(Expr::Continue(cont), _) => {
+                if !is_last {
+                    return Err(AdapterError::Unsupported {
+                        reason: "dead code after `continue;` — the terminator must be the last \
+                            statement in the loop body"
+                            .into(),
+                    });
+                }
+                lower_continue(b, cont)?;
+                return Ok(LoopBodyExit::Terminated);
+            }
+            Stmt::Expr(Expr::While(while_expr), _) => {
+                lower_while(b, while_expr)?;
+            }
+            Stmt::Expr(Expr::Loop(loop_expr), _) => {
+                lower_loop(b, loop_expr)?;
+            }
+            Stmt::Expr(Expr::ForLoop(for_expr), _) => {
+                lower_for(b, for_expr)?;
+            }
+            // Any other expression statement: lower for side effect
+            // and discard the result (upstream POP_TOP after a
+            // stack-producing instruction). Covers call / method_call
+            // / if-else / match / attribute access / etc. — matches
+            // SETUP_LOOP's "arbitrary bytecode inside the loop"
+            // semantic at flowcontext.py:488.
+            Stmt::Expr(expr, _) => {
+                let _ = lower_expr(b, expr)?;
+            }
+            Stmt::Item(_) => {
+                return Err(AdapterError::Unsupported {
+                    reason: "nested item (fn/struct/impl inside loop body)".into(),
+                });
+            }
+            Stmt::Macro(_) => {
+                return Err(AdapterError::Unsupported {
+                    reason: "macro invocation in statement position".into(),
+                });
+            }
+        }
+    }
+    Ok(LoopBodyExit::FallThrough)
+}
+
+fn lower_break(b: &mut Builder, brk: &ExprBreak) -> Result<(), AdapterError> {
+    if brk.expr.is_some() {
+        return Err(AdapterError::Unsupported {
+            reason: "`break VALUE` — loop-as-expression value is out of M2.5b slice-3 scope".into(),
+        });
+    }
+    if brk.label.is_some() {
+        return Err(AdapterError::Unsupported {
+            reason: "labeled `break 'label` is out of M2.5b scope".into(),
+        });
+    }
+    let ctx = b
+        .loop_stack
+        .last()
+        .cloned_ctx()
+        .ok_or_else(|| AdapterError::Unsupported {
+            reason: "`break` outside of a loop".into(),
+        })?;
+    // Break jumps to the loop's exit block, which uses
+    // `exit_merged_names` — the set excluding internal iter sidecars.
+    let args: Vec<Hlvalue> = ctx
+        .exit_merged_names
+        .iter()
+        .map(|n| b.current.locals[n].clone())
+        .collect();
+    let link = Rc::new(RefCell::new(Link::new(args, Some(ctx.exit_block), None)));
+    b.finalize_current(vec![link], None);
+    Ok(())
+}
+
+fn lower_continue(b: &mut Builder, cont: &ExprContinue) -> Result<(), AdapterError> {
+    if cont.label.is_some() {
+        return Err(AdapterError::Unsupported {
+            reason: "labeled `continue 'label` is out of M2.5b scope".into(),
+        });
+    }
+    let ctx = b
+        .loop_stack
+        .last()
+        .cloned_ctx()
+        .ok_or_else(|| AdapterError::Unsupported {
+            reason: "`continue` outside of a loop".into(),
+        })?;
+    let args: Vec<Hlvalue> = ctx
+        .merged_names
+        .iter()
+        .map(|n| b.current.locals[n].clone())
+        .collect();
+    let link = Rc::new(RefCell::new(Link::new(args, Some(ctx.header_block), None)));
+    b.finalize_current(vec![link], None);
+    Ok(())
+}
+
+// ____________________________________________________________
+// `?` operator — raising operation + exception edge to
+// `graph.exceptblock`.
+//
+// Upstream basis: `rpython/flowspace/model.py:469-470`
+// (`c_last_exception`), `:214-221` (`Block.canraise` /
+// `Block.raising_op` properties), and the `graph.exceptblock`
+// constructor at `:22-25`. A canraise block's last operation is the
+// raising op, `exitswitch` is set to `c_last_exception`, `exits[0]`
+// is the normal fall-through (exitcase=None, carrying the op's
+// result), and `exits[1..]` are exception exits whose `exitcase` is
+// an exception-class `Constant` and whose `last_exception` /
+// `last_exc_value` carry the caught exception's type and value
+// Variables. The RPython parser emits this shape when it encounters
+// any opcode marked `canraise` in `operation.py:536-611`.
+//
+// Rust-specific adaptation: Rust's `?` expands to
+//   match operand { Ok(v) => v, Err(e) => return Err(e.into()) }
+// — an early-return on `Err`. We mirror this via the canraise shape
+// rather than a direct match so the exception signal flows through
+// `graph.exceptblock`, matching upstream's "uncaught exception
+// propagates through the graph's exception exit" invariant.
+// `HOST_ENV.lookup_exception_class("Exception")` provides the
+// bootstrap exception-class HostObject required by
+// `is_exception_exitcase` in `model.rs` `checkgraph`.
+
+fn lower_try(b: &mut Builder, try_expr: &ExprTry) -> Result<Hlvalue, AdapterError> {
+    // Upstream canraise sites are ops emitted by `ctx.do_op(op)` that
+    // carry `canraise != []` (operation.py:475-611). The fork comes
+    // from `guessexception` at flowcontext.py:124 / :379 / :385 —
+    // attached to THAT real op, not a synthetic wrapper.
+    //
+    // Rust's `?` has no upstream counterpart, so the line-by-line-
+    // orthodox mapping is: the `?` operand must itself be a call
+    // whose lowered SpaceOperation IS the raising site. Any other
+    // operand (bare variable, arithmetic, literal) has no call op
+    // to hang canraise on.
+    match &*try_expr.expr {
+        Expr::Call(_) | Expr::MethodCall(_) => {}
+        _ => {
+            return Err(AdapterError::Unsupported {
+                reason: "`?` operand must be a direct call / method call — upstream \
+                    canraise sites are the ops themselves (flowcontext.py:124, :379), \
+                    not wrappers over arbitrary values"
+                    .into(),
+            });
+        }
+    }
+
+    // Lower the operand. `lower_call` / `lower_method_call` emit their
+    // SpaceOperation into `b.current.ops` and return its result
+    // Variable. That last op is the raising site — no synthetic
+    // wrapper.
+    let unwrapped = lower_expr(b, &try_expr.expr)?;
+
+    // Snapshot the locals set so the normal-exit Link can carry
+    // them into the continuation block. The exception exit is only
+    // [etype, evalue] — `graph.exceptblock.inputargs.len() == 2` per
+    // the constructor at `model.py:22-25`; no caller locals survive
+    // the exception edge.
+    let pre_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_locals.keys().cloned().collect();
+    merged_names.sort();
+
+    // Allocate the continuation block — inputargs =
+    // [unwrapped_var, local_var_0, …]. The first inputarg is the
+    // result of the raising op flowing through the normal exit.
+    let cont_unwrapped_var = Hlvalue::Variable(Variable::new());
+    let mut cont_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    cont_inputargs.push(cont_unwrapped_var.clone());
+    let mut cont_locals: HashMap<String, Hlvalue> = HashMap::new();
+    for name in &merged_names {
+        let fresh = Hlvalue::Variable(Variable::named(name));
+        cont_inputargs.push(fresh.clone());
+        cont_locals.insert(name.clone(), fresh);
+    }
+    let cont_block = Block::shared(cont_inputargs);
+
+    // Build the normal-exit Link (exitcase=None). Args carry
+    // [unwrapped, ...current-locals] — the call's result flows
+    // into `cont_unwrapped_var`.
+    let mut normal_args: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+    normal_args.push(unwrapped.clone());
+    for name in &merged_names {
+        normal_args.push(pre_locals[name].clone());
+    }
+    let normal_link = Rc::new(RefCell::new(Link::new(
+        normal_args,
+        Some(cont_block.clone()),
+        None,
+    )));
+
+    // 6. Build the exception-exit Link. The target is
+    //    `graph.exceptblock` (retrieved via Builder's reference), the
+    //    exitcase is an exception-class Constant per
+    //    `is_exception_exitcase`. `last_exception` / `last_exc_value`
+    //    are fresh Variables defined exclusively on this link
+    //    (checkgraph at `model.rs:3780-3785`).
+    let etype = Variable::new();
+    let evalue = Variable::new();
+    let exc_class = HOST_ENV.lookup_exception_class("Exception").expect(
+        "HOST_ENV bootstrap must register the builtin `Exception` class — \
+            model.rs:1418 ensures it",
+    );
+    let exc_class_const = Hlvalue::Constant(Constant::new(ConstValue::HostObject(exc_class)));
+    let mut exc_link_inner = Link::new(
+        vec![
+            Hlvalue::Variable(etype.clone()),
+            Hlvalue::Variable(evalue.clone()),
+        ],
+        Some(b.exceptblock.clone()),
+        Some(exc_class_const),
+    );
+    exc_link_inner.extravars(
+        Some(Hlvalue::Variable(etype)),
+        Some(Hlvalue::Variable(evalue)),
+    );
+    let exc_link = Rc::new(RefCell::new(exc_link_inner));
+
+    // 7. Close the current block with the canraise shape. The
+    //    exitswitch sentinel is `c_last_exception()` which
+    //    `Block::canraise` detects via its Atom identity.
+    let switch = Hlvalue::Constant(c_last_exception());
+    b.finalize_current(vec![normal_link, exc_link], Some(switch));
+
+    // 8. Open the continuation block. Subsequent reads of any local
+    //    see the continuation's fresh inputarg; subsequent reads of
+    //    the expression's value (the `?` unwrap result) see
+    //    `cont_unwrapped_var`.
+    b.open_new_block(BlockBuilder {
+        block: cont_block,
+        ops: Vec::new(),
+        locals: cont_locals,
+    });
+    Ok(cont_unwrapped_var)
+}
+
+// ____________________________________________________________
+// Method calls + function calls.
+//
+// Upstream basis:
+// - `rpython/flowspace/operation.py:617-622` — `GetAttr(obj, name)`:
+//   `arity=2`, `canraise=[]`, `pyfunc = staticmethod(getattr)`.
+//   Emission convention is `getattr(obj, name_as_constant_str)`.
+// - `rpython/flowspace/operation.py:663-679` — `SimpleCall(f, *args)`:
+//   variable arity, no canraise at the op layer. Dispatched through
+//   `SPECIAL_CASES` at annotator time if the callable is a
+//   `Constant`; otherwise falls through to `ctx.do_op(self)`.
+// - `rpython/flowspace/flowcontext.py` `LOAD_METHOD` + `CALL_METHOD`
+//   (aliased at `:1000 CALL_METHOD = CALL_FUNCTION`): the bytecode
+//   sequence emits `getattr(obj, name)` then `simple_call(bound,
+//   *args)`, matching this lowering exactly.
+//
+// Trait dispatch is *not* emitted as a separate kind of op. The
+// annotator downstream (`FunctionDesc.specialize` /
+// `MethodDesc.bind_self`, `description.py:272-281` / `:1805-1819`)
+// reads the receiver's `SomeInstance.classdef` and threads the
+// concrete impl's `FunctionDesc` into the `simple_call` site. The
+// adapter's job is to emit the structural `getattr + simple_call`
+// pair so the annotator has something to rewrite.
+
+fn lower_method_call(
+    b: &mut Builder,
+    method_call: &ExprMethodCall,
+) -> Result<Hlvalue, AdapterError> {
+    if method_call.turbofish.is_some() {
+        return Err(AdapterError::Unsupported {
+            reason: "method turbofish `obj.method::<T>(…)` (explicit method generics land in \
+                M2.5d alongside struct/enum literal typing)"
+                .into(),
+        });
+    }
+    let receiver = lower_expr(b, &method_call.receiver)?;
+
+    // `getattr(receiver, "method")` — the method name is a Python
+    // string constant (upstream `ConstValue::Str`).
+    let method_name = method_call.method.to_string();
+    let bound = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "getattr",
+        vec![
+            receiver,
+            Hlvalue::Constant(Constant::new(ConstValue::Str(method_name))),
+        ],
+        bound.clone(),
+    ));
+
+    // `simple_call(bound, *args)` — arg list starts with the bound
+    // method (which carries the receiver after upstream's
+    // `FunctionDesc.bind_self`), matching upstream
+    // `operation.py:663-679 SimpleCall` convention.
+    let mut call_args: Vec<Hlvalue> = Vec::with_capacity(method_call.args.len() + 1);
+    call_args.push(bound);
+    for arg in &method_call.args {
+        call_args.push(lower_expr(b, arg)?);
+    }
+    let result = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "simple_call",
+        call_args,
+        result.clone(),
+    ));
+    Ok(result)
+}
+
+fn lower_call(b: &mut Builder, call: &ExprCall) -> Result<Hlvalue, AdapterError> {
+    // Callee must be a simple identifier path. Qualified paths
+    // (`module::fn`) would need module-resolved HostObject lookup
+    // which the adapter does not perform — M2.5g registers adapter
+    // -produced HostObjects by name, so those will land later.
+    match &*call.func {
+        Expr::Path(_) => {}
+        _ => {
+            return Err(AdapterError::Unsupported {
+                reason: "call callee must be a simple identifier path (closures, method-returned \
+                    callables, etc. land in M2.5d/g)"
+                    .into(),
+            });
+        }
+    }
+    let callee = lower_expr(b, &call.func)?;
+
+    let mut call_args: Vec<Hlvalue> = Vec::with_capacity(call.args.len() + 1);
+    call_args.push(callee);
+    for arg in &call.args {
+        call_args.push(lower_expr(b, arg)?);
+    }
+    let result = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "simple_call",
+        call_args,
+        result.clone(),
+    ));
+    Ok(result)
+}
+
+// ____________________________________________________________
+// Tuple / array literals.
+//
+// Upstream basis:
+// - `rpython/flowspace/operation.py:543-546` — `newtuple(*items)`:
+//   variable arity, the annotator's `bookkeeper.newtuple` builds a
+//   `SomeTuple` whose item types come from the arg annotations.
+// - `rpython/flowspace/operation.py:552-559` — `newlist(*items)`:
+//   variable arity, `bookkeeper.newlist` produces a `SomeList` whose
+//   element type is the union of the arg types.
+// - `rpython/flowspace/flowcontext.py:1163-1166` — `BUILD_TUPLE`
+//   emits `op.newtuple(*items).eval(self)`.
+// - `rpython/flowspace/flowcontext.py:1168-1171` — `BUILD_LIST`
+//   emits `op.newlist(*items).eval(self)`.
+
+fn lower_tuple(b: &mut Builder, tup: &ExprTuple) -> Result<Hlvalue, AdapterError> {
+    let mut args: Vec<Hlvalue> = Vec::with_capacity(tup.elems.len());
+    for elem in &tup.elems {
+        args.push(lower_expr(b, elem)?);
+    }
+    let result = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new("newtuple", args, result.clone()));
+    Ok(result)
+}
+
+fn lower_array(b: &mut Builder, arr: &ExprArray) -> Result<Hlvalue, AdapterError> {
+    let mut args: Vec<Hlvalue> = Vec::with_capacity(arr.elems.len());
+    for elem in &arr.elems {
+        args.push(lower_expr(b, elem)?);
+    }
+    let result = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new("newlist", args, result.clone()));
+    Ok(result)
+}
+
+// ____________________________________________________________
+// Unary operators, field access, index, cast — the "small surface"
+// expression kinds that Rust source uses frequently.
+//
+// Upstream basis (all from `operation.py` `add_operator` registry):
+// - `neg` arity=1 (:466)           — unary `-x`.
+// - `pos` arity=1 (:465)           — unary `+x`.
+// - `invert` arity=1 (:474)        — bitwise `~x`.
+// - `getattr` arity=2 (:618)       — field access.
+// - `getitem` arity=2 (:457)       — index access.
+// - `int` / `float` / `bool` (:488/:490/:467) — type coercion.
+
+fn lower_unary(b: &mut Builder, u: &ExprUnary) -> Result<Hlvalue, AdapterError> {
+    // Upstream unary operators covered here are only those with a
+    // direct 1-to-1 mapping into the `operation.py` `add_operator`
+    // registry. `UnOp::Not` is deliberately NOT mapped — see the
+    // match arm for rationale.
+    match u.op {
+        // `*x` — Rust deref. No upstream counterpart (Python has no
+        // explicit deref). The annotator tracks identity + type
+        // regardless of borrow form; pass-through is safe.
+        UnOp::Deref(_) => lower_expr(b, &u.expr),
+        // `-x` — upstream `operation.py:466 neg` arity=1.
+        UnOp::Neg(_) => {
+            let arg = lower_expr(b, &u.expr)?;
+            let result = Hlvalue::Variable(Variable::new());
+            b.emit_op(SpaceOperation::new("neg", vec![arg], result.clone()));
+            Ok(result)
+        }
+        // `!x` — Rust overloads this for bitwise (ints) AND logical
+        // (bools). Upstream handles the two paths *differently*:
+        // - `UNARY_INVERT` (flowcontext.py:194) emits `op.invert`.
+        // - `UNARY_NOT` (flowcontext.py:531) emits `op.bool` then
+        //   forks on `guessbool` — `bool(x)` is a runtime
+        //   conversion, the true-branch yields `Constant(False)`
+        //   and the false-branch yields `Constant(True)`. There is
+        //   no direct `not_` op in the registry.
+        //
+        // The adapter cannot pick bitwise-vs-logical without type
+        // info, and has no `guessbool` facility to replicate the
+        // upstream logical path. Rejecting keeps the lowering
+        // honest — users who need bitwise NOT can write the
+        // explicit helper call.
+        UnOp::Not(_) => Err(AdapterError::Unsupported {
+            reason: "unary `!` has no line-by-line upstream mapping (UNARY_NOT uses \
+                `bool` + guessbool fork; UNARY_INVERT emits `invert`) — reject to keep \
+                adapter orthodox"
+                .into(),
+        }),
+        _ => Err(AdapterError::Unsupported {
+            reason: "unrecognised unary operator".into(),
+        }),
+    }
+}
+
+fn lower_field(b: &mut Builder, f: &ExprField) -> Result<Hlvalue, AdapterError> {
+    let base = lower_expr(b, &f.base)?;
+    let attr_name = match &f.member {
+        Member::Named(id) => id.to_string(),
+        Member::Unnamed(idx) => {
+            // `x.0` / `x.1` — tuple-struct index access. Upstream
+            // Python has `tup[0]` which lowers to `getitem(tup,
+            // 0)`; Rust tuple-struct / tuple field access has no
+            // direct equivalent. Emit `getitem` with an integer
+            // Constant index — the annotator can distinguish by
+            // receiver type (Tuple vs user struct).
+            let int_index = idx.index as i64;
+            let result = Hlvalue::Variable(Variable::new());
+            b.emit_op(SpaceOperation::new(
+                "getitem",
+                vec![
+                    base,
+                    Hlvalue::Constant(Constant::new(ConstValue::Int(int_index))),
+                ],
+                result.clone(),
+            ));
+            return Ok(result);
+        }
+    };
+    let result = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "getattr",
+        vec![
+            base,
+            Hlvalue::Constant(Constant::new(ConstValue::Str(attr_name))),
+        ],
+        result.clone(),
+    ));
+    Ok(result)
+}
+
+fn lower_index(b: &mut Builder, idx: &ExprIndex) -> Result<Hlvalue, AdapterError> {
+    let base = lower_expr(b, &idx.expr)?;
+    let key = lower_expr(b, &idx.index)?;
+    let result = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "getitem",
+        vec![base, key],
+        result.clone(),
+    ));
+    Ok(result)
+}
+
+fn lower_cast(_b: &mut Builder, _c: &ExprCast) -> Result<Hlvalue, AdapterError> {
+    // `x as T` — Rust compile-time numeric conversion. Upstream has
+    // no direct counterpart:
+    //
+    // - `operation.py:347 do_int(x)` → calls `x.__int__()`, not a
+    //   numeric cast. It is a Python-method dispatch with its own
+    //   method-resolution path.
+    // - `operation.py:490 float(x)` → same shape, calls `__float__`.
+    // - `operation.py:467 bool(x)` → calls `__bool__`.
+    //
+    // Mapping Rust `as` to these would silently inject a dunder call
+    // the user never wrote, diverging semantically. Users who need
+    // conversion can invoke the helper explicitly (e.g. `x.to_i64()`
+    // or a registered function) and let the adapter lower that as a
+    // method / function call.
+    Err(AdapterError::Unsupported {
+        reason: "`x as T` has no line-by-line upstream mapping — upstream `do_int` / \
+            `do_float` / `bool` are __int__/__float__/__bool__ dunder dispatches, \
+            not numeric coercions. Use an explicit helper call instead."
+            .into(),
+    })
+}
+
+/// Private helper trait — lets `lower_break`/`lower_continue` snapshot
+/// the top-of-stack [`LoopCtx`] through an Option without tangling
+/// borrow regions (the body then calls `b.finalize_current`, a
+/// `&mut self` borrow on the Builder). Clones the small fields only;
+/// it is not a hot path.
+trait LoopCtxSnapshot {
+    fn cloned_ctx(self) -> Option<LoopCtx>;
+}
+
+impl LoopCtxSnapshot for Option<&LoopCtx> {
+    fn cloned_ctx(self) -> Option<LoopCtx> {
+        self.map(|ctx| LoopCtx {
+            header_block: ctx.header_block.clone(),
+            exit_block: ctx.exit_block.clone(),
+            merged_names: ctx.merged_names.clone(),
+            exit_merged_names: ctx.exit_merged_names.clone(),
+        })
+    }
+}
+
+// ____________________________________________________________
+
 fn validate_arm(arm: &Arm) -> Result<(), AdapterError> {
     if arm.guard.is_some() {
         return Err(AdapterError::Unsupported {
@@ -829,6 +2051,27 @@ fn validate_arm(arm: &Arm) -> Result<(), AdapterError> {
         });
     }
     Ok(())
+}
+
+/// Flatten a `Pat::Or` into its constituent sub-patterns, recursing so
+/// nested or-patterns (`A | (B | C)`) reduce to a flat list.
+/// Parenthesised patterns are transparent — `(X)` is grouping-only in
+/// syn, and upstream semantics treat the inner pattern identically —
+/// so we unwrap them before deciding whether to recurse. Non-or
+/// patterns contribute a single entry. No direct upstream analogue
+/// (Python source produces `if-elif` chains, not or-patterns) but the
+/// resulting list maps onto a standard fan-out of Links all pointing
+/// at the same target block, which `model.py:648-692` admits directly.
+fn flatten_or_pattern<'a>(pat: &'a Pat, out: &mut Vec<&'a Pat>) {
+    match pat {
+        Pat::Or(or_pat) => {
+            for case in &or_pat.cases {
+                flatten_or_pattern(case, out);
+            }
+        }
+        Pat::Paren(paren) => flatten_or_pattern(&paren.pat, out),
+        other => out.push(other),
+    }
 }
 
 /// Map a `syn::Pat` to the `Link.exitcase` upstream expects. Returns
@@ -865,9 +2108,18 @@ fn classify_pattern(pat: &Pat, is_last: bool) -> Result<Option<Hlvalue>, Adapter
                 })
             }
         },
-        Pat::Or(_) => Err(AdapterError::Unsupported {
-            reason: "match arm `|` pattern (or-pattern)".into(),
-        }),
+        Pat::Or(_) => {
+            // Unreachable under `lower_match` which pre-flattens
+            // or-patterns via `flatten_or_pattern` before calling
+            // `classify_pattern`. Keep this arm as a defensive
+            // contract so a future caller that forgets the flatten
+            // step fails loudly instead of silently mis-classifying.
+            Err(AdapterError::Unsupported {
+                reason: "or-pattern reached classify_pattern without flattening — \
+                    caller must pre-expand via `flatten_or_pattern`"
+                    .into(),
+            })
+        }
         Pat::Range(_) => Err(AdapterError::Unsupported {
             reason: "match arm range pattern (`a..b`)".into(),
         }),
@@ -1080,12 +2332,14 @@ mod tests {
         .unwrap();
         checkgraph(&g);
 
-        // startblock: [x] → emits `x > 0`, exitswitch = that var, 2
-        // exits.
+        // startblock: [x] → emits `x > 0` then `bool(gt_result)`
+        // (upstream POP_JUMP_IF_FALSE wraps cond in `op.bool`), so
+        // exitswitch = the bool-op result, 2 exits.
         let start = g.startblock.borrow();
-        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations.len(), 2);
         assert_eq!(start.operations[0].opname, "gt");
-        let switch_var = start.operations[0].result.clone();
+        assert_eq!(start.operations[1].opname, "bool");
+        let switch_var = start.operations[1].result.clone();
         assert_eq!(start.exitswitch.as_ref(), Some(&switch_var));
         assert_eq!(start.exits.len(), 2);
 
@@ -1310,15 +2564,9 @@ mod tests {
 
     // ---- reject paths ---------------------------------------------
 
-    #[test]
-    fn rejects_generic_fn() {
-        match lower("fn f<T>(x: T) -> T { x }").unwrap_err() {
-            AdapterError::InvalidSignature { reason } => {
-                assert!(reason.contains("generic"), "reason: {reason}");
-            }
-            other => panic!("expected InvalidSignature, got {other:?}"),
-        }
-    }
+    // NOTE: generic fns are now accepted (slice M2.5c). The
+    // annotator layer monomorphizes via `FunctionDesc.specialize`.
+    // See `generic_fn_identity` below.
 
     #[test]
     fn rejects_async_fn() {
@@ -1336,15 +2584,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_self_receiver() {
-        match lower("fn f(&self) -> i64 { 1 }").unwrap_err() {
-            AdapterError::InvalidSignature { reason } => {
-                assert!(reason.contains("self"), "reason: {reason}");
-            }
-            other => panic!("expected InvalidSignature (self), got {other:?}"),
-        }
-    }
+    // NOTE: `self` receivers are now accepted (slice M2.5c) as a
+    // local named `"self"`. See `self_receiver_is_local_named_self`
+    // below.
 
     #[test]
     fn rejects_if_without_else() {
@@ -1376,12 +2618,113 @@ mod tests {
     }
 
     #[test]
-    fn rejects_match_or_pattern() {
-        match lower("fn f(x: i64) -> i64 { match x { 1 | 2 => 1, _ => 0 } }").unwrap_err() {
+    fn or_pattern_emits_multiple_links_sharing_one_branch_block() {
+        // `match x { 1 | 2 => 1, _ => 0 }` — or-pattern `1 | 2`
+        // lowers into TWO Links from the fork block (one per
+        // sub-pattern) both targeting the SAME branch block; then one
+        // wildcard-default Link for the `_` arm. Upstream
+        // `model.py:648-692` admits multiple Links with distinct
+        // exitcases pointing at the same target block.
+        let g = lower("fn f(x: i64) -> i64 { match x { 1 | 2 => 1, _ => 0 } }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 3, "two or-sub-cases + one default");
+        let target_0 = start.exits[0]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("fork exit has target")
+            .clone();
+        let target_1 = start.exits[1]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("fork exit has target")
+            .clone();
+        let target_2 = start.exits[2]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("fork exit has target")
+            .clone();
+        assert!(
+            Rc::ptr_eq(&target_0, &target_1),
+            "or-pattern sub-cases must share one branch block"
+        );
+        assert!(
+            !Rc::ptr_eq(&target_0, &target_2),
+            "default arm must reach a distinct branch block"
+        );
+        // Exitcases: Int(1), Int(2), Str("default").
+        let ec_0 = start.exits[0].borrow().exitcase.clone().unwrap();
+        let ec_1 = start.exits[1].borrow().exitcase.clone().unwrap();
+        let ec_2 = start.exits[2].borrow().exitcase.clone().unwrap();
+        assert!(
+            matches!(
+                ec_0,
+                Hlvalue::Constant(ref c) if matches!(c.value, ConstValue::Int(1))
+            ),
+            "first or-sub-case should be Int(1)"
+        );
+        assert!(
+            matches!(
+                ec_1,
+                Hlvalue::Constant(ref c) if matches!(c.value, ConstValue::Int(2))
+            ),
+            "second or-sub-case should be Int(2)"
+        );
+        assert!(
+            matches!(
+                ec_2,
+                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "default")
+            ),
+            "default arm should carry Str(\"default\")"
+        );
+    }
+
+    #[test]
+    fn or_pattern_nested_flattens_to_siblings() {
+        // `A | (B | C)` — nested or-pattern. `flatten_or_pattern`
+        // recurses so three Links come out of the fork.
+        let g = lower("fn f(x: i64) -> i64 { match x { 1 | (2 | 3) => 1, _ => 0 } }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 4, "three or-sub-cases + one default");
+        let t0 = start.exits[0].borrow().target.as_ref().unwrap().clone();
+        let t1 = start.exits[1].borrow().target.as_ref().unwrap().clone();
+        let t2 = start.exits[2].borrow().target.as_ref().unwrap().clone();
+        assert!(
+            Rc::ptr_eq(&t0, &t1) && Rc::ptr_eq(&t1, &t2),
+            "all three or-sub-cases must share the same branch block"
+        );
+    }
+
+    #[test]
+    fn rejects_wildcard_inside_or_pattern() {
+        // Upstream `model.py:652` reserves wildcard for the
+        // standalone default arm; embedding it inside an or-pattern
+        // would duplicate the "catch-all" intent.
+        match lower("fn f(x: i64) -> i64 { match x { 1 | _ => 1, _ => 0 } }").unwrap_err() {
             AdapterError::Unsupported { reason } => {
-                assert!(reason.contains("or-pattern"), "reason: {reason}");
+                assert!(
+                    reason.contains("wildcard sub-pattern inside or-pattern"),
+                    "reason: {reason}"
+                );
             }
-            other => panic!("expected Unsupported(or), got {other:?}"),
+            other => panic!("expected Unsupported(wildcard-in-or), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_or_pattern_with_duplicate_case() {
+        // `1 | 1` or `1 | 2` crossing into another arm that reuses 2
+        // both violate the uniqueness invariant
+        // (`model.py:692 allexitcases`).
+        match lower("fn f(x: i64) -> i64 { match x { 1 | 2 => 1, 2 => 2, _ => 0 } }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("repeated"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(repeated), got {other:?}"),
         }
     }
 
@@ -1405,15 +2748,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_method_call() {
-        match lower("fn f(x: i64) -> i64 { x.abs() }").unwrap_err() {
-            AdapterError::Unsupported { reason } => {
-                assert!(reason.contains("method"), "reason: {reason}");
-            }
-            other => panic!("expected Unsupported(method), got {other:?}"),
-        }
-    }
+    // NOTE: method calls are now accepted (slice M2.5c). See
+    // `method_call_emits_getattr_plus_simple_call` below.
 
     #[test]
     fn rejects_unbound_local() {
@@ -1433,25 +2769,1120 @@ mod tests {
         }
     }
 
+    // NOTE: `?` operator is now accepted (slice 4). See the
+    // `try_op_*` tests below for coverage.
+
+    // NOTE: tuple literals are now accepted (slice M2.5d). See
+    // `tuple_literal_emits_newtuple_op`.
+
+    // ---- M2.5b while/loop/break/continue accept tests -------------
+
     #[test]
-    fn rejects_try_op() {
-        match lower("fn f(x: Result<i64, ()>) -> i64 { x? }").unwrap_err() {
+    fn while_loop_emits_header_body_back_edge_exit() {
+        // The canonical shape: a header block with exitswitch=cond and
+        // two exits (false → exit, true → body), a body block that
+        // Links back to the header, and an exit block that continues
+        // into the returnblock.
+        let g = lower(
+            "fn f(n: i64) -> i64 {
+                let i = 0;
+                while i < n {
+                    let i = i + 1;
+                }
+                i
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let blocks = g.iterblocks();
+        // startblock + header + body + exit + returnblock = 5.
+        assert_eq!(blocks.len(), 5);
+
+        // startblock has no ops (i = 0 is a constant rebind, no op)
+        // and closes with a single Link into the header.
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 0);
+        assert_eq!(start.exits.len(), 1);
+
+        // The header is reached from startblock and from the body
+        // (2 incoming Links = the test oracle). Identify it via its
+        // operations — `i < n` emits `lt` then `bool` (upstream
+        // POP_JUMP_IF_FALSE wraps cond in `op.bool`); exitswitch
+        // references the bool-op result and the block has 2 exits.
+        let header = blocks
+            .iter()
+            .find(|b| {
+                let br = b.borrow();
+                br.operations.len() == 2
+                    && br.operations[0].opname == "lt"
+                    && br.operations[1].opname == "bool"
+                    && br.exitswitch.is_some()
+                    && br.exits.len() == 2
+            })
+            .expect("expected header block with `lt` + `bool` ops + 2 exits");
+        let header_ref = header.borrow();
+        let false_exit = header_ref.exits[0].borrow();
+        let true_exit = header_ref.exits[1].borrow();
+        assert_eq!(
+            false_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+        );
+        assert_eq!(
+            true_exit.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+        );
+
+        // Body block emits `i + 1` and back-edges to header.
+        let body_target = true_exit.target.as_ref().unwrap();
+        let body_ref = body_target.borrow();
+        assert_eq!(body_ref.operations.len(), 1);
+        assert_eq!(body_ref.operations[0].opname, "add");
+        assert_eq!(body_ref.exits.len(), 1);
+        // Back-edge target is `header`.
+        let back_link = body_ref.exits[0].borrow();
+        let back_target = back_link.target.as_ref().unwrap();
+        assert!(Rc::ptr_eq(back_target, header));
+    }
+
+    #[test]
+    fn while_loop_no_rebinds_in_body() {
+        // Body has no let — body's back-edge args are exactly the
+        // inputargs forwarded through.
+        let g = lower(
+            "fn f(n: i64) -> i64 {
+                let i = 0;
+                while i < n {}
+                i
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn loop_with_break_reaches_exit() {
+        // `loop { break; }` — no condition, body's only stmt is `break;`.
+        // Header and body are the same block; the body's only exit is
+        // the Link into the exit block.
+        let g = lower(
+            "fn f() -> i64 {
+                loop { break; }
+                42
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // startblock → header/body (break-only) → exit → returnblock.
+        // The startblock has no ops.
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 0);
+        assert_eq!(start.exits.len(), 1);
+        // Exit block tail emits the constant 42 and Links into return.
+        let blocks = g.iterblocks();
+        // start + header(=body) + exit + return = 4.
+        assert_eq!(blocks.len(), 4);
+    }
+
+    #[test]
+    fn continue_back_edges_to_header() {
+        let g = lower(
+            "fn f(n: i64) -> i64 {
+                let i = 0;
+                while i < n {
+                    continue;
+                }
+                i
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let blocks = g.iterblocks();
+        // start + header + body + exit + return = 5. The body's only
+        // exit is a Link back to the header via `continue`.
+        assert_eq!(blocks.len(), 5);
+        let header = blocks
+            .iter()
+            .find(|b| b.borrow().exitswitch.is_some())
+            .expect("expected header with exitswitch");
+        let header_true_exit = header.borrow().exits[1].clone();
+        let body = header_true_exit.borrow().target.clone().unwrap();
+        let body_exit = body.borrow().exits[0].clone();
+        let body_target = body_exit.borrow().target.clone().unwrap();
+        assert!(Rc::ptr_eq(&body_target, header));
+    }
+
+    #[test]
+    fn nested_loops_break_resolves_to_innermost() {
+        // `break;` inside the inner loop exits only that loop.
+        let g = lower(
+            "fn f(n: i64, m: i64) -> i64 {
+                let i = 0;
+                while i < n {
+                    let j = 0;
+                    while j < m {
+                        break;
+                    }
+                    let i = i + 1;
+                }
+                i
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn loop_with_let_rebind_before_break() {
+        let g = lower(
+            "fn f() -> i64 {
+                let x = 0;
+                loop {
+                    let x = x + 1;
+                    break;
+                }
+                x
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    // ---- M2.5b while/loop/break/continue reject tests -------------
+
+    #[test]
+    fn rejects_break_outside_loop() {
+        match lower("fn f() -> i64 { break; 0 }").unwrap_err() {
             AdapterError::Unsupported { reason } => assert!(
-                reason.contains("?") || reason.contains("exception"),
+                reason.contains("break") || reason.contains("outside"),
                 "reason: {reason}"
             ),
-            other => panic!("expected Unsupported(?), got {other:?}"),
+            other => panic!("expected Unsupported(break outside), got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_tuple_literal() {
-        match lower("fn f() -> (i64, i64) { (1, 2) }").unwrap_err() {
+    fn rejects_continue_outside_loop() {
+        match lower("fn f() -> i64 { continue; 0 }").unwrap_err() {
             AdapterError::Unsupported { reason } => assert!(
-                reason.contains("composite") || reason.contains("tuple"),
+                reason.contains("continue") || reason.contains("outside"),
                 "reason: {reason}"
             ),
-            other => panic!("expected Unsupported(tuple), got {other:?}"),
+            other => panic!("expected Unsupported(continue outside), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_break_with_value() {
+        match lower("fn f() -> i64 { loop { break 1; } }").unwrap_err() {
+            AdapterError::Unsupported { reason } => assert!(
+                reason.contains("break VALUE")
+                    || reason.contains("value")
+                    || reason.contains("loop-as-expression"),
+                "reason: {reason}"
+            ),
+            other => panic!("expected Unsupported(break with value), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_dead_code_after_break() {
+        match lower(
+            "fn f() -> i64 {
+                loop { break; let _x = 1; }
+                0
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("dead code"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(dead code after break), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_labeled_break() {
+        match lower("fn f() -> i64 { 'outer: loop { break 'outer; } }").unwrap_err() {
+            AdapterError::Unsupported { reason } => assert!(
+                reason.contains("label") || reason.contains("VALUE") || reason.contains("value"),
+                "reason: {reason}"
+            ),
+            other => panic!("expected Unsupported(labeled break), got {other:?}"),
+        }
+    }
+
+    // ---- M2.5b `?` operator accept tests --------------------------
+
+    #[test]
+    fn try_op_emits_canraise_block_with_exception_edge() {
+        // The canonical shape: the startblock emits the operand's own
+        // call op as the raising op (no synthetic wrapper), sets
+        // exitswitch = c_last_exception, and exits with
+        // (exit[0]=normal→continuation, exit[1]=exception
+        // →graph.exceptblock with exitcase=Exception class).
+        // Operand must be a direct call; bare variables reject.
+        let g = lower("fn f(h: Handler) -> i64 { h.read()? }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        // getattr('read') + simple_call(bound) — the simple_call is
+        // the raising op.
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "simple_call");
+        assert!(start.canraise(), "startblock must canraise");
+        assert_eq!(start.exits.len(), 2);
+
+        let normal = start.exits[0].borrow();
+        assert!(normal.exitcase.is_none());
+        assert!(normal.last_exception.is_none());
+        assert!(normal.last_exc_value.is_none());
+
+        let exc = start.exits[1].borrow();
+        match exc.exitcase.as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_class(), "exitcase must be a class HostObject");
+                    assert_eq!(obj.qualname(), "Exception");
+                }
+                other => panic!("expected HostObject exitcase, got {other:?}"),
+            },
+            other => panic!("expected Constant exitcase, got {other:?}"),
+        }
+        let target = exc.target.as_ref().unwrap();
+        assert!(Rc::ptr_eq(target, &g.exceptblock));
+        assert!(exc.last_exception.is_some());
+        assert!(exc.last_exc_value.is_some());
+    }
+
+    #[test]
+    fn try_op_continuation_produces_unwrapped_value() {
+        // `h.read()? + 1` — the continuation block picks up the
+        // unwrapped value via its inputargs[0] and emits
+        // `add(unwrapped, 1)`.
+        let g = lower("fn f(h: Handler) -> i64 { h.read()? + 1 }").unwrap();
+        checkgraph(&g);
+        let blocks = g.iterblocks();
+        // startblock (canraise) + continuation + returnblock +
+        // exceptblock = 4.
+        assert_eq!(blocks.len(), 4);
+
+        let cont = blocks
+            .iter()
+            .find(|b| {
+                let br = b.borrow();
+                br.operations.len() == 1 && br.operations[0].opname == "add"
+            })
+            .expect("expected continuation block with `add` op");
+        let cont_ref = cont.borrow();
+        assert_eq!(cont_ref.operations[0].args[0], cont_ref.inputargs[0]);
+    }
+
+    #[test]
+    fn try_op_let_binding_continues_locals() {
+        // `let y = h.read()?; y + 1` — pre-try local `h` survives
+        // via the continuation's inputargs.
+        let g = lower(
+            "fn f(h: Handler) -> i64 {
+                let y = h.read()?;
+                y + 1
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn try_op_twice_chains_two_canraise_blocks() {
+        // Two call-? in sequence — two canraise blocks. checkgraph
+        // enforces both exception exits target the single
+        // graph.exceptblock.
+        let g = lower(
+            "fn f(h: Handler) -> i64 {
+                let y = h.read()?;
+                h.write(y)?
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let blocks = g.iterblocks();
+        let canraise_count = blocks.iter().filter(|b| b.borrow().canraise()).count();
+        assert_eq!(canraise_count, 2);
+    }
+
+    #[test]
+    fn try_op_rejects_non_call_operand() {
+        // `x?` where `x` is a bare variable — no call op to hang
+        // canraise on, so reject.
+        match lower("fn f(x: i64) -> i64 { x? }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("direct call"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(? non-call), got {other:?}"),
+        }
+    }
+
+    // ---- M2.5b `for` loop accept tests ----------------------------
+
+    #[test]
+    fn for_loop_emits_iter_next_canraise_with_stopiter_exit() {
+        // The canonical shape: startblock emits `iter(iter_expr)`,
+        // unconditional Link to header; header emits
+        // `next(iter_h)` with exitswitch = c_last_exception,
+        // exits[0] normal → body, exits[1] → exit_block with
+        // exitcase = StopIteration class.
+        let g = lower(
+            "fn f(it: i64) -> i64 {
+                for item in it {
+                    let _x = item;
+                }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+
+        // startblock has one op `iter(it)`.
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "iter");
+
+        // Locate the header block — it has op `next` + canraise.
+        let blocks = g.iterblocks();
+        let header = blocks
+            .iter()
+            .find(|b| {
+                let br = b.borrow();
+                br.operations.len() == 1 && br.operations[0].opname == "next" && br.canraise()
+            })
+            .expect("expected header block with `next` op + canraise");
+        let header_ref = header.borrow();
+        // 3 exits: normal → body, StopIteration → loop exit,
+        // RuntimeError → graph.exceptblock. Matches upstream
+        // `operation.py:595-599 Next.canraise = [StopIteration,
+        // RuntimeError]`.
+        assert_eq!(header_ref.exits.len(), 3);
+
+        // exit[0]: normal → body.
+        let normal = header_ref.exits[0].borrow();
+        assert!(normal.exitcase.is_none());
+
+        // exit[1]: StopIteration → exit block.
+        let stopiter_exit = header_ref.exits[1].borrow();
+        match stopiter_exit.exitcase.as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_class());
+                    assert_eq!(obj.qualname(), "StopIteration");
+                }
+                other => panic!("expected HostObject exitcase, got {other:?}"),
+            },
+            other => panic!("expected Constant exitcase, got {other:?}"),
+        }
+        // `guessexception` class-specific exit: last_exception is a
+        // Constant(case) per `flowcontext.py:131-132`, not a Variable.
+        match stopiter_exit.last_exception.as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_class());
+                    assert_eq!(obj.qualname(), "StopIteration");
+                }
+                other => panic!("expected StopIteration HostObject, got {other:?}"),
+            },
+            other => panic!(
+                "StopIteration exit's last_exception must be a \
+                 Constant(StopIteration) per upstream guessexception \
+                 (flowcontext.py:127-132), got {other:?}"
+            ),
+        }
+        match stopiter_exit.last_exc_value.as_ref().unwrap() {
+            Hlvalue::Variable(_) => {}
+            other => panic!(
+                "StopIteration exit's last_exc_value must be a \
+                 fresh Variable('last_exc_value') per upstream \
+                 (flowcontext.py:133), got {other:?}"
+            ),
+        }
+
+        // exit[2]: RuntimeError → graph.exceptblock. Per upstream
+        // `RaiseImplicit.nomoreblocks` (flowcontext.py:1271-1284)
+        // the link args carry [Constant(AssertionError class),
+        // Constant(AssertionError("implicit RuntimeError …"))],
+        // NOT the original RuntimeError class/value pair.
+        let runtime_exit = header_ref.exits[2].borrow();
+        match runtime_exit.exitcase.as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_class());
+                    assert_eq!(obj.qualname(), "RuntimeError");
+                }
+                other => panic!("expected HostObject exitcase, got {other:?}"),
+            },
+            other => panic!("expected Constant exitcase, got {other:?}"),
+        }
+        let runtime_target = runtime_exit.target.as_ref().unwrap();
+        assert!(
+            Rc::ptr_eq(runtime_target, &g.exceptblock),
+            "RuntimeError exit must target graph.exceptblock"
+        );
+        // link.args == [Constant(AssertionError class), Constant(AE instance)]
+        assert_eq!(runtime_exit.args.len(), 2);
+        let arg0 = runtime_exit.args[0]
+            .as_ref()
+            .expect("RuntimeError link.args[0] cannot be undefined-local sentinel");
+        match arg0 {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_class());
+                    assert_eq!(obj.qualname(), "AssertionError");
+                }
+                other => panic!("expected AssertionError class HostObject, got {other:?}"),
+            },
+            other => panic!(
+                "RuntimeError link.args[0] must be Constant(AssertionError \
+                 class) per RaiseImplicit.nomoreblocks, got {other:?}"
+            ),
+        }
+        let arg1 = runtime_exit.args[1]
+            .as_ref()
+            .expect("RuntimeError link.args[1] cannot be undefined-local sentinel");
+        match arg1 {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_instance());
+                    let cls = obj.instance_class().expect("instance class");
+                    assert_eq!(cls.qualname(), "AssertionError");
+                }
+                other => panic!("expected AssertionError instance HostObject, got {other:?}"),
+            },
+            other => panic!(
+                "RuntimeError link.args[1] must be Constant(AssertionError \
+                 instance) per RaiseImplicit.nomoreblocks, got {other:?}"
+            ),
+        }
+        // last_exception on the RuntimeError link remains the original
+        // class-specific Constant(RuntimeError) per `guessexception`,
+        // even though the args were rewritten by `nomoreblocks`.
+        match runtime_exit.last_exception.as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_class());
+                    assert_eq!(obj.qualname(), "RuntimeError");
+                }
+                other => panic!("expected RuntimeError HostObject, got {other:?}"),
+            },
+            other => panic!(
+                "RuntimeError exit's last_exception must be a \
+                 Constant(RuntimeError) per upstream guessexception, \
+                 got {other:?}"
+            ),
+        }
+        match runtime_exit.last_exc_value.as_ref().unwrap() {
+            Hlvalue::Variable(_) => {}
+            other => panic!(
+                "RuntimeError exit's last_exc_value must be a fresh \
+                 Variable('last_exc_value'), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn for_loop_body_shadows_preloop_local_single_channel() {
+        // `for x in xs { … }` where `x` is also a parameter — upstream
+        // STORE_FAST (flowcontext.py:878-884) rebinds the same local
+        // slot in place. The body block must therefore expose exactly
+        // ONE inputarg for the `x` slot, not two, and the header's
+        // normal Link must route `v_next` into that slot.
+        let g = lower(
+            "fn f(x: i64, xs: i64) -> i64 {
+                for x in xs {
+                    let _y = x;
+                }
+                x
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+
+        // Header block (has `next` op + canraise).
+        let blocks = g.iterblocks();
+        let header = blocks
+            .iter()
+            .find(|b| {
+                let br = b.borrow();
+                br.operations.len() == 1 && br.operations[0].opname == "next" && br.canraise()
+            })
+            .expect("expected header block");
+        let header_ref = header.borrow();
+
+        // Body block = target of header.exits[0].
+        let body = header_ref.exits[0]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("normal exit must have a target")
+            .clone();
+        let body_ref = body.borrow();
+
+        // Count how many body inputargs carry the Variable::named("x")
+        // prefix. `rename()` canonicalises `"x"` to `"x_"` (see
+        // `model.rs:2050-2082`). Upstream STORE_FAST makes it exactly
+        // one channel; a `body_inputargs = [item_body_var, fresh_x,
+        // ...]` shape would be "two channels for the same slot" — the
+        // bug this test guards against.
+        let x_slots: usize = body_ref
+            .inputargs
+            .iter()
+            .filter(|h| match h {
+                Hlvalue::Variable(v) => v.name_prefix() == "x_",
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            x_slots, 1,
+            "body inputargs must have exactly one channel for the `x` \
+             slot (upstream STORE_FAST rebinds in place — \
+             flowcontext.py:878-884), got {x_slots}"
+        );
+    }
+
+    #[test]
+    fn for_loop_body_back_edges_to_header_with_iter_slot() {
+        // Body's fall-through back-edge carries [iter_var, ...locals]
+        // into header whose inputargs are [iter_h, ...locals].
+        let g = lower(
+            "fn f(it: i64, a: i64) -> i64 {
+                for item in it {
+                    let a = a + 1;
+                }
+                a
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn for_loop_with_break_exits_past_loop() {
+        let g = lower(
+            "fn f(it: i64) -> i64 {
+                for _item in it {
+                    break;
+                }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn for_loop_with_continue_back_edges_to_header() {
+        let g = lower(
+            "fn f(it: i64) -> i64 {
+                for _item in it {
+                    continue;
+                }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn nested_for_loops() {
+        let g = lower(
+            "fn f(it1: i64, it2: i64) -> i64 {
+                for _a in it1 {
+                    for _b in it2 {
+                        let _x = 1;
+                    }
+                }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    // ---- M2.5b `for` loop reject tests ----------------------------
+
+    #[test]
+    fn rejects_for_tuple_pattern() {
+        match lower(
+            "fn f(it: i64) -> i64 {
+                for (a, b) in it {}
+                0
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("identifier") || reason.contains("destructuring"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(destructuring), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_for_in_expr_position() {
+        // `let x = for ... { ... };` — loop as expression produces `()`
+        // which is out of scope.
+        match lower(
+            "fn f(it: i64) -> i64 {
+                let _x = for _i in it {};
+                0
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("loop construct") || reason.contains("statement"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(for-in-expr), got {other:?}"),
+        }
+    }
+
+    // ---- M2.5c method calls + function calls + generics ----------
+
+    #[test]
+    fn method_call_emits_getattr_plus_simple_call() {
+        // `x.abs()` → [getattr(x, "abs") → v_bound, simple_call(v_bound) → v_result].
+        let g = lower("fn f(x: i64) -> i64 { x.abs() }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Str(s) => assert_eq!(s, "abs"),
+                other => panic!("expected Str method name, got {other:?}"),
+            },
+            other => panic!("expected Constant method name, got {other:?}"),
+        }
+        assert_eq!(start.operations[1].opname, "simple_call");
+        // simple_call's first arg is the bound method (getattr result).
+        assert_eq!(start.operations[1].args[0], start.operations[0].result);
+        // And the call has no extra args (abs is nullary beyond receiver).
+        assert_eq!(start.operations[1].args.len(), 1);
+    }
+
+    #[test]
+    fn method_call_with_args_threads_args_into_simple_call() {
+        // `x.add(y, z)` → [getattr(x, "add"), simple_call(bound, y, z)].
+        let g = lower("fn f(x: i64, y: i64, z: i64) -> i64 { x.add(y, z) }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 2);
+        let sc = &start.operations[1];
+        assert_eq!(sc.opname, "simple_call");
+        assert_eq!(sc.args.len(), 3);
+    }
+
+    #[test]
+    fn function_call_emits_simple_call_with_callee_first() {
+        // `g(x, 1)` where `g` is a local → simple_call(g, x, 1).
+        // Synthetic: the adapter doesn't know `g` is callable, just
+        // that it resolves as a local identifier.
+        let g = lower("fn f(x: i64, g: i64) -> i64 { g(x, 1) }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "simple_call");
+        assert_eq!(start.operations[0].args.len(), 3);
+    }
+
+    #[test]
+    fn method_call_chained() {
+        // `x.a().b()` → 4 ops: getattr/simple_call for each.
+        let g = lower("fn f(x: i64) -> i64 { x.a().b() }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 4);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "simple_call");
+        assert_eq!(start.operations[2].opname, "getattr");
+        assert_eq!(start.operations[3].opname, "simple_call");
+    }
+
+    #[test]
+    fn method_call_on_binop_result() {
+        // `(x + 1).abs()` — receiver is an op result, not a local.
+        let g = lower("fn f(x: i64) -> i64 { (x + 1).abs() }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 3);
+        assert_eq!(start.operations[0].opname, "add");
+        assert_eq!(start.operations[1].opname, "getattr");
+        // The getattr receiver is the add's result Variable.
+        assert_eq!(start.operations[1].args[0], start.operations[0].result);
+        assert_eq!(start.operations[2].opname, "simple_call");
+    }
+
+    #[test]
+    fn self_receiver_is_local_named_self() {
+        // `fn m(&self) -> i64 { self.x() }` — `self` becomes a
+        // Variable named "self" in `locals`, and `self.x()` lowers
+        // like any other method call.
+        let g = lower("fn m(&self) -> i64 { self.x() }").unwrap();
+        checkgraph(&g);
+        // One inputarg named by the adapter's `Variable::named("self")`
+        // path, one getattr/simple_call pair.
+        let start = g.startblock.borrow();
+        assert_eq!(start.inputargs.len(), 1);
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+    }
+
+    #[test]
+    fn generic_fn_identity() {
+        // `fn id<T>(x: T) -> T { x }` — accepted post-slice-M2.5c.
+        // The adapter does not track T; the annotator's
+        // FunctionDesc.specialize monomorphizes at the call site.
+        let g = lower("fn id<T>(x: T) -> T { x }").unwrap();
+        checkgraph(&g);
+        assert_eq!(g.getargs().len(), 1);
+    }
+
+    #[test]
+    fn generic_fn_with_trait_bound() {
+        // `<E: Trait>` — trait-bound markers are parsed but not
+        // inspected by the adapter; downstream annotator reads the
+        // `args_s` classdef set.
+        let g = lower(
+            "fn step<E: StepExecutor>(e: E) -> i64 {
+                e.execute()
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        assert_eq!(g.getargs().len(), 1);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+    }
+
+    #[test]
+    fn generic_fn_with_where_clause() {
+        let g = lower(
+            "fn step<E>(e: E) -> i64 where E: StepExecutor {
+                e.execute()
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn method_call_chained_with_let_rebinds() {
+        // Ensure chained method calls interact properly with the
+        // locals map: `let t = x.a(); t.b()` — the method-call
+        // result is stored into a local and re-read.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                let t = x.a();
+                t.b()
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 4);
+    }
+
+    // ---- M2.5c reject tests --------------------------------------
+
+    #[test]
+    fn rejects_method_turbofish() {
+        match lower("fn f(x: i64) -> i64 { x.convert::<i64>() }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("turbofish"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(turbofish), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_call_with_non_identifier_callee() {
+        // `(x + 1)(y)` — callee is not a simple path.
+        match lower("fn f(x: i64, y: i64) -> i64 { (x + 1)(y) }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("identifier") || reason.contains("path"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(non-ident-callee), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_const_generic_param() {
+        match lower("fn f<const N: usize>(x: i64) -> i64 { x }").unwrap_err() {
+            AdapterError::InvalidSignature { reason } => {
+                assert!(reason.contains("const generic"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidSignature(const generic), got {other:?}"),
+        }
+    }
+
+    // ---- M2.5d literals + tuple/array ops ------------------------
+
+    #[test]
+    fn string_literal_lowers_to_constant_str() {
+        // `fn f() -> i64 { let _s = "hello"; 0 }` — the string is
+        // stored as a ConstValue::Str attached to a let binding,
+        // then the tail emits 0. No op emitted for the literal
+        // itself (it's a Constant, not a SpaceOperation result).
+        let g = lower(r#"fn f() -> i64 { let _s = "hello"; 0 }"#).unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn float_literal_lowers_to_constant_float() {
+        let g = lower("fn f() -> i64 { let _x = 3.14; 0 }").unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn tuple_literal_emits_newtuple_op() {
+        let g = lower("fn f() -> i64 { let _t = (1, 2, 3); 0 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "newtuple");
+        assert_eq!(start.operations[0].args.len(), 3);
+    }
+
+    #[test]
+    fn array_literal_emits_newlist_op() {
+        let g = lower("fn f() -> i64 { let _a = [1, 2, 3]; 0 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "newlist");
+        assert_eq!(start.operations[0].args.len(), 3);
+    }
+
+    #[test]
+    fn nested_tuple_of_tuples() {
+        let g = lower("fn f(x: i64) -> i64 { let _t = ((x, 1), (2, x)); 0 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        // Two inner newtuple + one outer newtuple = 3 ops.
+        assert_eq!(start.operations.len(), 3);
+        assert_eq!(start.operations[0].opname, "newtuple");
+        assert_eq!(start.operations[1].opname, "newtuple");
+        assert_eq!(start.operations[2].opname, "newtuple");
+    }
+
+    #[test]
+    fn tuple_as_method_argument() {
+        // The tuple flows into a method call — checks that
+        // `lower_tuple`'s result is re-readable downstream.
+        // Emission order is receiver → getattr → args → simple_call.
+        let g = lower("fn f(x: i64) -> i64 { x.fold((1, 2)) }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 3);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "newtuple");
+        assert_eq!(start.operations[2].opname, "simple_call");
+        // simple_call's second arg = newtuple result.
+        assert_eq!(start.operations[2].args[1], start.operations[1].result);
+    }
+
+    #[test]
+    fn empty_tuple_emits_newtuple_with_no_args() {
+        let g = lower("fn f() -> i64 { let _u = (); 0 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "newtuple");
+        assert_eq!(start.operations[0].args.len(), 0);
+    }
+
+    // ---- M2.5d reject tests --------------------------------------
+
+    #[test]
+    fn rejects_struct_literal() {
+        match lower("fn f() -> i64 { let _s = Point { x: 1, y: 2 }; 0 }").unwrap_err() {
+            AdapterError::Unsupported { reason } => assert!(
+                reason.contains("struct") || reason.contains("user-type"),
+                "reason: {reason}"
+            ),
+            other => panic!("expected Unsupported(struct), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_char_literal() {
+        match lower("fn f() -> i64 { let _c = 'a'; 0 }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("char"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(char), got {other:?}"),
+        }
+    }
+
+    // ---- small-surface operator tests ---------------------------
+
+    #[test]
+    fn unary_neg_emits_neg_op() {
+        let g = lower("fn f(x: i64) -> i64 { -x }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "neg");
+        assert_eq!(start.operations[0].args.len(), 1);
+    }
+
+    #[test]
+    fn rejects_unary_not() {
+        // `!x` has no 1-to-1 upstream mapping — UNARY_NOT is a
+        // `bool` + guessbool fork, UNARY_INVERT emits `invert`. The
+        // adapter can't distinguish without type info.
+        match lower("fn f(x: i64) -> i64 { !x }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("unary `!`"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(unary !), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_is_passthrough() {
+        // `&x` and `*x` emit no ops — they preserve the SSA value.
+        let g = lower("fn f(x: i64) -> i64 { *&x }").unwrap();
+        checkgraph(&g);
+        assert_eq!(g.startblock.borrow().operations.len(), 0);
+    }
+
+    #[test]
+    fn field_access_emits_getattr() {
+        let g = lower("fn f(p: i64) -> i64 { p.x }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "getattr");
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Str(s) => assert_eq!(s, "x"),
+                other => panic!("expected Str, got {other:?}"),
+            },
+            other => panic!("expected Constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_field_access_emits_getitem() {
+        let g = lower("fn f(t: i64) -> i64 { t.0 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations[0].opname, "getitem");
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Int(0) => {}
+                other => panic!("expected Int(0), got {other:?}"),
+            },
+            other => panic!("expected Constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_emits_getitem() {
+        let g = lower("fn f(a: i64, i: i64) -> i64 { a[i] }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations[0].opname, "getitem");
+        assert_eq!(start.operations[0].args.len(), 2);
+    }
+
+    #[test]
+    fn rejects_numeric_cast() {
+        // `x as T` has no 1-to-1 upstream mapping — upstream's
+        // `do_int`/`do_float`/`bool` are dunder-method dispatches,
+        // not numeric coercions. Users who need conversion should
+        // call an explicit helper.
+        match lower("fn f(x: i64) -> i64 { x as i32 }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("`x as T`"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(x as T), got {other:?}"),
+        }
+    }
+
+    // ---- loop body can carry general expression statements -------
+
+    #[test]
+    fn loop_body_accepts_method_call_statement() {
+        // `while cond { h.step(); }` — method call as a side-effect
+        // inside the body. Upstream SETUP_LOOP (`flowcontext.py:488,
+        // :794`) wraps arbitrary bytecode, not a subset.
+        let g = lower(
+            "fn f(h: Handler, cond: bool) -> i64 {
+                while cond {
+                    h.step();
+                }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Body emits getattr('step') + simple_call(bound) — evidence
+        // that the statement-position expression is lowered.
+        let has_getattr = g.iterblocks().iter().any(|blk| {
+            blk.borrow()
+                .operations
+                .iter()
+                .any(|o| o.opname == "getattr")
+        });
+        assert!(has_getattr, "loop body must lower method call");
+    }
+
+    #[test]
+    fn loop_body_accepts_field_access_statement() {
+        // `while cond { let _ = h.field; }` — field access as a
+        // side-effect in a let pattern. Verifies loop body delegates
+        // to the same expression lowering path.
+        let g = lower(
+            "fn f(h: Handler, cond: bool) -> i64 {
+                while cond {
+                    let _ignore = h.field;
+                }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn top_level_expression_statement_discards_result() {
+        // `fn f(h) { h.step(); 0 }` — method call as a statement at
+        // top level. Same POP_TOP semantic as inside loop body; the
+        // call's ops still emit but the result Variable is discarded.
+        let g = lower(
+            "fn f(h: Handler) -> i64 {
+                h.step();
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let has_getattr = g.iterblocks().iter().any(|blk| {
+            blk.borrow()
+                .operations
+                .iter()
+                .any(|o| o.opname == "getattr")
+        });
+        assert!(has_getattr, "top-level expression statement must lower");
     }
 }

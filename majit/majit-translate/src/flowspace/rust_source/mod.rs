@@ -50,5 +50,7 @@
 //! construction idioms for straight-line functions.
 
 pub mod build_flow;
+pub mod register;
 
 pub use build_flow::{AdapterError, build_flow_from_rust};
+pub use register::build_host_function_from_rust;
