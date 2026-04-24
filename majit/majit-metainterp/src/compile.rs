@@ -1682,28 +1682,15 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
 // `majit-metainterp` side so `compile_tmp_callback` and
 // `finish_setup` can reference the same singletons RPython does.
 //
-// Identity follow-up (`pyjitpl.py:2222` passes `[self, cpu]`, not
-// `[self]`):  RPython attaches a *single* `DoneWithThisFrameDescr*`
-// object to both `MetaInterpStaticData` and the CPU, so the FINISH
-// descr pointer the backend observes is the same Arc the metainterp
-// reads back in `handle_fail`.  pyre currently keeps the backend copy
-// as a separate `LazyLock<Arc<DynasmFailDescr>>` / cranelift
-// `RegisteredLoopTarget` singleton; the production consumers are
-//    - `majit-backend-dynasm/src/guard.rs:195-204`
-//    - `majit-backend-cranelift/src/compiler.rs` (RegisteredLoopTarget
-//      finish-descr caches)
-//    - `majit-metainterp/src/pyjitpl/mod.rs:10226`
-//      (`make_and_attach_done_descrs(&mut [&mut sd])`)
-// Unification means (a) storing these Arcs on `Backend` via a
-// `set_done_with_this_frame_descr_*` setter, (b) having the backend's
-// runtime pointer check (`jf_descr == done_with_this_frame_descr_int_ptr`)
-// read `Arc::as_ptr` of the stored Arc, and (c) extending the same
-// setter set to `PropagateExceptionDescr`.  All 5 files need to move
-// together so the fast path never sees a stale backend-only instance.
-//
-// All items in this block carry `#[allow(dead_code)]` during Steps 2-4
-// of the `compile_tmp_callback` port; they go live together when
-// `compile_tmp_callback` replaces `Backend::register_pending_target`.
+// `pyjitpl.py:2222` `compile.make_and_attach_done_descrs([self, cpu])` —
+// RPython attaches a *single* `DoneWithThisFrameDescr*` object to both
+// `MetaInterpStaticData` and the CPU so the FINISH descr pointer the
+// backend observes is the same Arc the metainterp reads back in
+// `handle_fail`. pyre mirrors the same shape through the
+// `DescrContainer` trait implemented on both `MetaInterpStaticData`
+// (pyjitpl/mod.rs) and `Backend` (majit-backend/lib.rs via the blanket
+// impl below), so `MetaInterp::new` installs a single `Arc` on both
+// halves; `attach_descrs_to_cpu` forwards the clones to the backend.
 // ──────────────────────────────────────────────────────────────────────
 
 /// `compile.py:623-624` `class _DoneWithThisFrameDescr(AbstractFailDescr):
@@ -1712,7 +1699,6 @@ impl majit_ir::FailDescr for BridgeFailDescrProxy {
 /// Shared base fields for the four `DoneWithThisFrame*` subclasses —
 /// a stable `fail_arg_types` vector plus the `final_descr = True`
 /// marker exposed through `FailDescr::is_finish()`.
-#[allow(dead_code)]
 #[derive(Debug)]
 struct DoneWithThisFrameDescrBase {
     /// `history.py:122` `index = -1`.  For this descriptor family
@@ -1735,7 +1721,6 @@ impl DoneWithThisFrameDescrBase {
 }
 
 /// `compile.py:626-629` `class DoneWithThisFrameDescrVoid(_DoneWithThisFrameDescr)`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrVoid(DoneWithThisFrameDescrBase);
 
@@ -1781,7 +1766,6 @@ impl FailDescr for DoneWithThisFrameDescrVoid {
 }
 
 /// `compile.py:631-638` `class DoneWithThisFrameDescrInt(_DoneWithThisFrameDescr)`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrInt(DoneWithThisFrameDescrBase);
 
@@ -1826,7 +1810,6 @@ impl FailDescr for DoneWithThisFrameDescrInt {
 }
 
 /// `compile.py:640-647` `class DoneWithThisFrameDescrRef(_DoneWithThisFrameDescr)`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrRef(DoneWithThisFrameDescrBase);
 
@@ -1871,7 +1854,6 @@ impl FailDescr for DoneWithThisFrameDescrRef {
 }
 
 /// `compile.py:649-656` `class DoneWithThisFrameDescrFloat(_DoneWithThisFrameDescr)`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrFloat(DoneWithThisFrameDescrBase);
 
@@ -1916,7 +1898,6 @@ impl FailDescr for DoneWithThisFrameDescrFloat {
 }
 
 /// `compile.py:658-662` `class ExitFrameWithExceptionDescrRef(_DoneWithThisFrameDescr)`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ExitFrameWithExceptionDescrRef(DoneWithThisFrameDescrBase);
 
@@ -1974,7 +1955,6 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
 /// `MetaInterpStaticData.propagate_exception_descr` so
 /// `compile_tmp_callback` can reference it when emitting the
 /// `GUARD_NO_EXCEPTION` descriptor.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct PropagateExceptionDescr {
     /// `history.py:122` `index = -1` default.
@@ -2028,7 +2008,6 @@ impl FailDescr for PropagateExceptionDescr {
 /// pyre's `DescrContainer` trait (implemented by `MetaInterpStaticData`
 /// and the CPU stand-in) exposes the five `set_*` hooks that mirror
 /// the RPython `setattr(target, name, descr)` loop.
-#[allow(dead_code)]
 pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
     let void: DescrRef = Arc::new(DoneWithThisFrameDescrVoid::new());
     let int: DescrRef = Arc::new(DoneWithThisFrameDescrInt::new());
@@ -2053,7 +2032,6 @@ pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
 /// `make_and_attach_done_descrs(&mut [&mut sd, &mut *backend])`
 /// mirrors RPython's `make_and_attach_done_descrs([self, cpu])`
 /// exactly.
-#[allow(dead_code)]
 pub trait DescrContainer {
     fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef);
     fn set_done_with_this_frame_descr_int(&mut self, descr: DescrRef);

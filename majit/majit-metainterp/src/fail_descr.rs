@@ -96,7 +96,6 @@ impl FailDescr for MetaFailDescr {
 /// When a guard fails, the backend uses the resume data to reconstruct
 /// the interpreter state (virtual objects, frame variables, etc.).
 #[derive(Debug)]
-#[allow(dead_code)]
 struct ResumeGuardDescr {
     fail_index: u32,
     types: Vec<Type>,
@@ -162,11 +161,10 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
     })
 }
 
-/// Create a FailDescr with an explicit fail_index.
-///
-/// Used when the caller needs to control the fail_index (e.g., for
-/// bridge compilation where the fail_index must match the original guard).
-#[allow(dead_code)]
+/// Create a FailDescr with an explicit fail_index. Tests only — see
+/// `compile.rs::tests` for the invocation that needs a fixed fail_index
+/// to align against a synthesised bridge descr.
+#[cfg(test)]
 pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef {
     Arc::new(MetaFailDescr {
         fail_index,
@@ -257,22 +255,6 @@ pub fn make_resume_at_position_descr() -> DescrRef {
     })
 }
 
-/// Create a ResumeAtPositionDescr with resume data.
-#[allow(dead_code)]
-pub fn make_resume_at_position_descr_with_data(
-    types: Vec<Type>,
-    resume_data: ResumeData,
-) -> DescrRef {
-    Arc::new(ResumeAtPositionDescr {
-        inner: ResumeGuardDescr {
-            fail_index: alloc_fail_index(),
-            types,
-            resume_data,
-            vector_info: UnsafeCell::new(None),
-        },
-    })
-}
-
 /// compile.py:895-908: CompileLoopVersionDescr(ResumeGuardDescr)
 ///
 /// A guard descriptor for loop-version guards. These guards must never
@@ -330,17 +312,6 @@ impl FailDescr for CompileLoopVersionDescr {
     }
 }
 
-/// Create a CompileLoopVersionDescr with resume data copied from source.
-#[allow(dead_code)]
-pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData) -> DescrRef {
-    Arc::new(CompileLoopVersionDescr {
-        fail_index: alloc_fail_index(),
-        types: vec![Type::Int; num_live],
-        resume_data,
-        vector_info: UnsafeCell::new(None),
-    })
-}
-
 /// guard.py:89-91:
 ///   descr = CompileLoopVersionDescr()
 ///   descr.copy_all_attributes_from(self.op.getdescr())
@@ -355,7 +326,6 @@ pub fn make_compile_loop_version_descr(num_live: usize, resume_data: ResumeData)
 /// Panics if source_op has no descr or the descr is not a FailDescr —
 /// matching RPython's invariant that the source guard always has a
 /// ResumeGuardDescr (compile.py:861 assert).
-#[allow(dead_code)]
 pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
     let src_descr = source_op
         .descr
